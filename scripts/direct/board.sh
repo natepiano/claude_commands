@@ -16,7 +16,7 @@
 #                    (with --pid, the wait ends when that pid is gone: exit 4)
 #   board.sh release <session_dir> <agent> <resource> [--pid PID]
 #                    (without --pid, a token recorded for a live pid is refused)
-#   board.sh renew   <session_dir> <agent> <resource> [--hold SECONDS]
+#   board.sh renew   <session_dir> <agent> <resource> [--hold SECONDS] [--pid PID]
 #   board.sh role    <session_dir> <slot> <role> [note...]
 #   board.sh roles   <session_dir>
 #   board.sh locks   <session_dir>
@@ -182,6 +182,22 @@ except BlockingIOError:
   return 2
 }
 
+# A momentary board operation must not look like lost ownership. Bound each
+# guard wait; status 2 is inconclusive, distinct from an ownership refusal.
+wait_lock_guard() {
+  local attempt status
+  for ((attempt=0; attempt<200; attempt++)); do
+    if lock_guard "$1"; then
+      return 0
+    else
+      status=$?
+    fi
+    (( status == 1 )) || return "$status"
+    sleep 0.05
+  done
+  return 2
+}
+
 # Read a lock's metadata. Absent metadata means the directory was created a
 # moment ago and its holder has not written itself in yet; treat that as a live
 # lock held by an unknown agent rather than as a free one, so a race never
@@ -213,10 +229,39 @@ lock_stale_reason() {
     return 0
   fi
   if lock_is_expired "$1"; then
+    # A running step's group identity proves that its live holder still uses
+    # this lease. Expiry alone must not admit another build alongside it.
+    if [[ "$holder_pid" =~ ^[1-9][0-9]*$ ]] && [[ -f "$1/owned" ]] \
+        && owned_group_matches "$1/owned"; then
+      return 1
+    fi
     printf 'expired'
     return 0
   fi
   return 1
+}
+
+owned_group_matches() {
+  python3 - "$1" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+try:
+    record = json.loads(Path(sys.argv[1]).read_text())
+    group = int(record['group'])
+    if group <= 0:
+        sys.exit(1)
+    try:
+        start = Path(f'/proc/{group}/stat').read_text().rsplit(') ', 1)[1].split()[19]
+    except (OSError, IndexError):
+        start = subprocess.check_output(['ps', '-p', str(group), '-o', 'lstart='],
+                                        text=True, stderr=subprocess.DEVNULL).strip()
+    sys.exit(0 if start == str(record['start']) else 1)
+except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
+    sys.exit(1)
+PY
 }
 
 write_lock_meta() {
@@ -394,18 +439,9 @@ cmd_release() {
   fi
   local dir; dir="$(lock_dir "$session_dir" "$resource")"
   local guard="${session_dir}/locks/${resource}.guard"
-  local attempt lock_status guarded=0
+  local guarded=0
   if [[ -d "$dir" ]]; then
-    for ((attempt=0; attempt<200; attempt++)); do
-      if lock_guard "$guard"; then
-        guarded=1
-        break
-      else
-        lock_status=$?
-      fi
-      (( lock_status == 1 )) || break
-      sleep 0.05
-    done
+    if wait_lock_guard "$guard"; then guarded=1; fi
   fi
   if [[ ! -d "$dir" ]]; then
     (( guarded == 0 )) || exec 9>&-
@@ -478,22 +514,33 @@ cmd_renew() {
   local agent="${2:?renew needs <agent>}"
   local resource="${3:?renew needs <resource>}"
   shift 3
-  local hold="$DEFAULT_HOLD_SECONDS"
+  local hold="$DEFAULT_HOLD_SECONDS" holder_pid=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --hold) hold="${2:?--hold needs seconds}"; shift 2 ;;
+      --pid) [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]*$ ]] || die "--pid must be a positive integer"
+             holder_pid="$2"; shift 2 ;;
       *) die "renew: unknown option '$1'" ;;
     esac
   done
   [[ "$hold" =~ ^[0-9]+$ ]] && (( hold > 0 )) || die "--hold must be a positive integer"
   local dir; dir="$(lock_dir "$session_dir" "$resource")"
-  [[ -d "$dir" ]] || { printf 'board.sh: %s is not held\n' "$resource" >&2; return 1; }
+  mkdir -p "${session_dir}/locks"
+  wait_lock_guard "${session_dir}/locks/${resource}.guard" || return 2
+  [[ -d "$dir" ]] || { exec 9>&-; printf 'board.sh: %s is not held\n' "$resource" >&2; return 1; }
   local holder; holder="$(lock_holder "$dir")"
   [[ "$holder" == "$agent" ]] || {
     printf 'board.sh: %s does not hold %s (holder is %s)\n' "$agent" "$resource" "$holder" >&2
+    exec 9>&-
     return 1
   }
+  if [[ -n "$holder_pid" && "$(cat "$dir/holder_pid" 2>/dev/null)" != "$holder_pid" ]]; then
+    exec 9>&-
+    printf 'board.sh: %s pid %s does not hold %s\n' "$agent" "$holder_pid" "$resource" >&2
+    return 1
+  fi
   printf '%s' "$(( $(now_epoch) + hold ))" > "${dir}/expires"
+  exec 9>&-
   printf 'renewed %s\n' "$resource"
 }
 

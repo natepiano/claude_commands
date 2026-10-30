@@ -42,6 +42,7 @@ from account import (  # noqa: E402
     NAMED_ACCOUNT_VARIABLES,
 )
 import production_units  # noqa: E402
+from scripts.production import staff, staff_sources  # noqa: E402
 import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import inventory as inventory_work  # noqa: E402
@@ -123,7 +124,9 @@ class ShutdownServices(Protocol):
     SHOWRUNNER_TOLD_BACK: str
 
     def _unit_showrunner(self, saved: SessionShutdown) -> str: ...
-    def _reserve_showrunner_line(self, saved: SessionShutdown, told: str) -> bool: ...
+    def showrunner_was_told(self, saved: SessionShutdown) -> bool: ...
+    def send_showrunner_line(self, saved: SessionShutdown, told: str, showrunner: str,
+                            summary: str, text: str) -> SessionShutdown: ...
 
     def record_time(self) -> str: ...
     def local_machine(self) -> str: ...
@@ -275,7 +278,7 @@ class IncompleteShutdownStillLive:
     """The owner is running, so its unfinished shutdown remains unchanged."""
 
 
-INCOMPLETE_PROGRESS = frozenset({"waiting", "ready", "held by usage limit", "reaping", "stopping"})
+INCOMPLETE_PROGRESS = frozenset({"waiting", "ready", "held by usage limit", "reaping", "stopping", "stop failed"})
 
 
 def _recover_incomplete_shutdown(
@@ -290,15 +293,23 @@ def _recover_incomplete_shutdown(
             return IncompleteShutdownRefused(reason)
         case SessionNotLive():
             pass
+    # The session's Claude process is gone, so its stop is done. An unconfirmed
+    # worker pause or cleanup never holds the restart: every thread can resume.
+    gone: SessionProgress = {"kind": "already gone", "at": settle.record_time()}
     if dry_run:
-        return {**saved, "progress": {"kind": "already gone", "at": settle.record_time()}}
-    # The stop path proves worker and host cleanup too, and owns its stopping claim.
-    cleaned = stop_work.stop_session(saved)
-    if cleaned["request_id"] != saved["request_id"]:
+        return {**saved, "progress": gone}
+
+    def mark_gone(current: SessionShutdown) -> None:
+        if current["request_id"] == saved["request_id"] and current["progress"]["kind"] in INCOMPLETE_PROGRESS:
+            current["progress"] = gone
+
+    try:
+        marked = update_session(saved["login"], saved["session"]["session_id"], mark_gone)
+    except NoLiveRecord:
         return IncompleteShutdownRefused("shutdown request changed during recovery")
-    if cleaned["progress"]["kind"] not in RESTARTABLE_PROGRESS or _unfinished_cleanup(cleaned):
-        return IncompleteShutdownRefused("owner cleanup not confirmed: " + cleaned["progress"]["kind"])
-    return cleaned
+    if marked["request_id"] != saved["request_id"] or marked["progress"]["kind"] not in RESTARTABLE_PROGRESS:
+        return IncompleteShutdownRefused("shutdown request changed during recovery")
+    return marked
 
 
 @dataclass(frozen=True)
@@ -970,9 +981,10 @@ def _unit_argv(record: SessionShutdown, *, source_fallback: bool = False) -> lis
     # A legacy tmux unit recorded no plan; its Units row names one.
     recorded_plan = host["plan"] if host["kind"] == "unit" else None
     # The Units row first: a brief unit's row names its stub plan before any run record exists.
-    row_plan = _units_row_plan(host["doc"], host["unit"])
+    parent = staff_sources.unit_parent(host["unit"], session["session_id"])
+    row_plan = _units_row_plan(parent.doc, host["unit"])
     if row_plan is not None and production_units.plan_cell_is_retired(row_plan):
-        raise UnitRetired(f"{host['unit']} is retired in the Units table of {host['doc']}")
+        raise UnitRetired(f"{host['unit']} is retired in the Units table of {parent.doc}")
     plan_arguments: list[str]
     if row_plan in ("standby", "permanent"):
         plan_arguments = ["--" + row_plan]
@@ -981,12 +993,12 @@ def _unit_argv(record: SessionShutdown, *, source_fallback: bool = False) -> lis
     elif recorded_plan is not None and recorded_plan["kind"] == "plan":
         plan_arguments = ["--plan", recorded_plan["path"]]
     else:
-        raise NoUnitPlan(f"{host['unit']} has no Plan in the Units table of {host['doc']} and no run record")
+        raise NoUnitPlan(f"{host['unit']} has no Plan in the Units table of {parent.doc} and no run record")
     note_path = _note_path(record, session["session_id"])
     argv = [
         *_add_unit_command(),
         "--production",
-        host["doc"],
+        parent.doc,
         # The recorded id, exactly: add_unit strips one "-unit" before adding its own.
         host["unit"],
         *plan_arguments,
@@ -2027,7 +2039,7 @@ def move_checkout(record: SessionShutdown, *, dry_run: bool) -> SessionShutdown:
             fields = cast(dict[str, object], cast(object, session))
             if isinstance(cwd := fields.get("cwd"), str):
                 fields["cwd"] = _under(cwd, old, folder)
-            for part, key in (("checkout", "path"), ("host", "doc")):
+            for part, key in (("checkout", "path"),):
                 inner = cast(dict[str, object], fields.get(part, {}))
                 if isinstance(value := inner.get(key), str):
                     inner[key] = _under(value, old, folder)
@@ -2150,12 +2162,11 @@ def _try_source_fallback(saved: SessionShutdown, error: BaseException,
 
 def _tell_source_fallback(saved: SessionShutdown) -> None:
     lines = [line for line in saved.get("restart_issues", []) if " came back on " in line]
-    if not lines or "showrunner_told" not in saved or saved["showrunner_told"] == settle.SHOWRUNNER_TOLD_BACK:
+    if not lines or not settle.showrunner_was_told(saved):
         return
     showrunner = settle._unit_showrunner(saved)  # pyright: ignore[reportPrivateUsage]
-    if showrunner and settle._reserve_showrunner_line(saved, settle.SHOWRUNNER_TOLD_BACK):  # pyright: ignore[reportPrivateUsage]
-        _ = settle.send_message(showrunner, lines[-1], lines[-1], key=f"shutdown-unit-{saved['session']['session_id']}")
-        saved["showrunner_told"] = settle.SHOWRUNNER_TOLD_BACK
+    if showrunner:
+        _ = settle.send_showrunner_line(saved, settle.SHOWRUNNER_TOLD_BACK, showrunner, lines[-1], lines[-1])
 
 
 def _host_needs_manual_restart(host: Host) -> bool:
@@ -2273,7 +2284,7 @@ def launch_entry(
                 f"restart prompt not recorded: {_error_reason(error)}",
             )
         return EntrySettled()
-    except (NoUnitPlan, UnitRetired) as error:
+    except (NoUnitPlan, UnitRetired, staff.StaffUnreadable) as error:
         if dry_run:
             print(f"cannot restart {session['name']}: {error}")
         else:
@@ -2713,7 +2724,8 @@ def relaunch_session(
 
 def _unfinished_cleanup(record: SessionShutdown) -> bool:
     return bool(recovery_store.legacy_tmux_leftovers(record)) or any(
-        (issue["kind"] == "codex server left running" or issue["kind"] == "unit session left running")
+        recovery_store.stop_issue_blocks_completion(issue)
+        and (issue["kind"] == "codex server left running" or issue["kind"] == "unit session left running")
         and issue["cause"] == "stop not confirmed"
         for issue in record["stop_issues"]
     )
@@ -2931,7 +2943,8 @@ def watchdog_crash_signal(owner: Session) -> AgentCrashConfirmed | NoCrashSignal
     if host["kind"] != "unit":
         return NoCrashSignal()
     try:
-        marked = unit_lookup.marked_unit(host["production"], host["unit"])
+        parent = staff_sources.unit_parent(host["unit"], owner["session_id"])
+        marked = unit_lookup.marked_unit(parent.slug, host["unit"])
         if marked is None or marked.place.session != host["session_name"]:
             return NoCrashSignal()
         agents = herdr.Herdr(marked.place.session).agents()
@@ -2982,7 +2995,7 @@ def progress_line(action: str, name: str, detail: str = "") -> None:
 
 
 def _restore_workspace_names(records: Sequence[SessionShutdown]) -> frozenset[str]:
-    from showrunners import herdr_space as production_space, production_slug
+    from showrunners import herdr_space as production_space
     names: set[str] = set()
     for saved in records:
         owner = saved["session"]
@@ -2990,8 +3003,9 @@ def _restore_workspace_names(records: Sequence[SessionShutdown]) -> frozenset[st
             host = owner["host"]
             if host["kind"] in {"unit", "legacy tmux unit"}:
                 try:
-                    names.add(production_space(production_slug(host["doc"]), host["doc"]))
-                except ValueError:
+                    parent = staff_sources.unit_parent(host["unit"], owner["session_id"])
+                    names.add(production_space(parent.slug, parent.doc))
+                except (OSError, ValueError):
                     pass
         else:
             try:

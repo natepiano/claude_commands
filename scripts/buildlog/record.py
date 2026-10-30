@@ -8,13 +8,20 @@ port_lint.py writes its own call records through write_call() here.
       epoch seconds; TTY is 1 when a terminal watched the step (no log is
       captured then); LOG is the step's output handed off by run(), PEAK the
       file the cgroup scope wrote memory.peak and memory.pressure to. Either may be empty. Both
-      are deleted here. BUILDLOG_TREE_START is the tree key `key` printed
+      are deleted only after the row is durable. A pending step preserves
+      the original row and sources for collect() to finish after a failed
+      save. BUILDLOG_TEST_PHASE_FILE names the step's sampled test-phase
+      sidecar, retained with those sources; missing observations are unknown.
+      BUILDLOG_TREE_START is the tree key `key` printed
       before the step; the key taken here, after it, decides tree_key and
       tree_changed.
   record.py key ARGV...
       From invoke.sh's run(), before every step: print the tree key
       (treekey.py) of the worktree the step would be recorded under, or
       nothing.
+  record.py test-phase-context RESERVATION ARGV...
+      Before release, print the reservation's repository and filter metadata
+      with the actual post-share argv's test width. The sampler adds its window.
   record.py call OUTCOME STATUS CACHED WAIT WALL BUILD SAVED ELAPSED VERB [ARG...]
       From verify.sh, once per call. OUTCOME is ran, failed, interrupted,
       reused, replayed, cancelled (tree changed during a run, status 77), or superseded (a newer call of the same verb from the
@@ -57,8 +64,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, cast
@@ -68,14 +75,20 @@ if __package__:
 else:
     import store
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
+import memory_admit
+
 if TYPE_CHECKING:
     import sample
 
 RECORD_VERSION = 1
+TARGET_DIR_UNSET = "unset"
 GIT_TIMEOUT_S = 5
 RUSTC_TIMEOUT_S = 10
 LEDGER = Path.home() / ".local/state/verify/events.jsonl"
 LAUNCH_LOCK_NAME = "launches.lock"
+# Adding or renaming a host requires updating the folders carried by sync.
+SYNC_HOSTS = ("natedev", "Mac", "Nates-MacBook-Pro-2023")
 
 
 class GitFacts(TypedDict):
@@ -115,6 +128,75 @@ class InvalidLaunchState:
 class PublishedLaunch:
     added: bool
     unknown_worktree: bool
+
+
+@dataclass(frozen=True)
+class NoHeldLog:
+    pass
+
+
+@dataclass(frozen=True)
+class NoPeakFile:
+    pass
+
+
+@dataclass(frozen=True)
+class NoTestPhaseRecord:
+    pass
+
+
+NO_TEST_PHASE_RECORD = NoTestPhaseRecord()
+
+
+@dataclass(frozen=True)
+class UnobservedTestPhase:
+    pass
+
+
+@dataclass(frozen=True)
+class ObservedTestPhase:
+    peak_bytes: int
+    started_at: float
+
+
+class TestPhaseContext(TypedDict):
+    """Admission selection and actual width at the JSON persistence boundary."""
+
+    repo_identity: str | None
+    test_scope: Literal["full", "filtered"] | None
+    package: str | None
+    filters: list[str] | None
+    call_id: str | None
+    test_threads: int | None
+
+
+@dataclass(frozen=True)
+class TestPhaseRecord:
+    window: ObservedTestPhase | UnobservedTestPhase
+    context: TestPhaseContext
+
+
+@dataclass(frozen=True)
+class UnreadableTestPhaseRecord:
+    reason: str
+
+
+@dataclass(frozen=True)
+class PendingStep:
+    """The original event and its sources, retained until publication and cleanup finish."""
+
+    row_key: str
+    row: dict[str, object]
+    held_log: Path | NoHeldLog
+    peak_file: Path | NoPeakFile
+    month_row_end: int
+    test_phase_file: Path | NoTestPhaseRecord = NO_TEST_PHASE_RECORD
+    test_phase: TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord = NO_TEST_PHASE_RECORD
+
+
+@dataclass(frozen=True)
+class PublishedStep:
+    added: bool
 
 
 def hana_launch_record(fields: Mapping[str, object], directory: str) -> LaunchStep | InvalidLaunchState:
@@ -195,16 +277,15 @@ def pending_launches_root() -> Path:
     return store.root() / "pending-launches"
 
 
-def _save_pending_launch(row: LaunchStep) -> Path:
-    path = pending_launches_root() / _launch_row_path(row).with_suffix(".json").name
-    if path.exists():
+def _save_pending_record(path: Path, fields: Mapping[str, object], *, replace_existing: bool = False) -> Path:
+    if not replace_existing and path.exists():
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False)
     temporary_path = Path(temporary.name)
     try:
         with temporary:
-            json.dump(row, temporary, separators=(",", ":"))
+            json.dump(dict(fields), temporary, separators=(",", ":"))
             temporary.flush()
             os.fsync(temporary.fileno())
         os.replace(temporary_path, path)
@@ -212,6 +293,14 @@ def _save_pending_launch(row: LaunchStep) -> Path:
     finally:
         temporary_path.unlink(missing_ok=True)
     return path
+
+
+def _pending_launch_path(row: LaunchStep) -> Path:
+    return pending_launches_root() / _launch_row_path(row).with_suffix(".json").name
+
+
+def _save_pending_launch(row: LaunchStep) -> Path:
+    return _save_pending_record(_pending_launch_path(row), row)
 
 
 def finish_pending_launch(path: Path) -> PublishedLaunch:
@@ -242,7 +331,12 @@ def launch(state_path: Path, worktree: Path) -> bool:
         store.root().mkdir(parents=True, exist_ok=True)
         with (store.root() / LAUNCH_LOCK_NAME).open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            return finish_pending_launch(_save_pending_launch(row)).added
+            try:
+                return finish_pending_launch(_save_pending_launch(row)).added
+            except Exception:  # noqa: BLE001 -- retain the pending retry and report its error
+                pending = _pending_launch_path(row)
+                store.note_error(f"pending record {pending}" if pending.is_file() else f"launch {state_path}")
+                return False
     except Exception:  # noqa: BLE001 -- a recorder never fails its caller
         store.note_error(f"launch {state_path}")
         return False
@@ -418,15 +512,239 @@ def sent_tree_key() -> SentTreeKey | NoSentTreeKey:
     return NoSentTreeKey()
 
 
+def _log_relative_path(host: str, epoch: float, record_id: str) -> str:
+    return f"{host}/{store.LOGS_DIR}/{store.month(epoch)}/{record_id}.log.gz"
+
+
 def keep_log(data: bytes, host: str, epoch: float, record_id: str) -> str:
-    relative = f"{host}/{store.LOGS_DIR}/{store.month(epoch)}/{record_id}.log.gz"
+    relative = _log_relative_path(host, epoch, record_id)
     target = store.root() / relative
+    if target.is_file():
+        _sync_directory(target.parent)
+        return relative
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_name(target.name + f".{os.getpid()}.tmp")
-    with gzip.open(partial, "wb") as handle:
-        _ = handle.write(data)
-    _ = partial.replace(target)
+    try:
+        with partial.open("wb") as handle:
+            with gzip.GzipFile(fileobj=handle, mode="wb") as compressed:
+                _ = compressed.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(partial, target)
+        _sync_directory(target.parent)
+    finally:
+        partial.unlink(missing_ok=True)
     return relative
+
+
+def pending_steps_root() -> Path:
+    return store.root() / "pending-steps"
+
+
+def test_phase_context(reservation: Path, argv: list[str]) -> dict[str, object]:
+    """Copy admission's selection, using the argv that actually runs for its width."""
+    loaded = cast(object, json.loads(reservation.read_text()))
+    if not isinstance(loaded, dict):
+        raise ValueError("test-phase reservation is not an object")
+    fields = cast(dict[str, object], loaded)
+    # Admission's parser returns the first width. Supplying nextest's environment
+    # default last preserves an explicit flag, including a nonnumeric one.
+    width_argv = argv
+    if "NEXTEST_TEST_THREADS" in os.environ:
+        width_argv = [*argv, "--test-threads", os.environ["NEXTEST_TEST_THREADS"]]
+    context = _test_phase_context({**fields, "test_threads": memory_admit.test_threads(width_argv)})
+    return {
+        **context,
+        # Admission has no entry-charge record (bytes, cutoff, form, widths).
+        "test_phase_charge": None,
+    }
+
+
+def _test_phase_context(fields: Mapping[str, object]) -> TestPhaseContext:
+    text: dict[str, str | None] = {}
+    for key in ("repo_identity", "package", "call_id"):
+        value = fields.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"test-phase {key} is not text")
+        text[key] = value
+    scope, width, filters = fields.get("test_scope"), fields.get("test_threads"), fields.get("filters")
+    if scope is None:
+        test_scope: Literal["full", "filtered"] | None = None
+    elif scope == "full":
+        test_scope = "full"
+    elif scope == "filtered":
+        test_scope = "filtered"
+    else:
+        raise ValueError("test-phase scope is invalid")
+    if width is not None and (not isinstance(width, int) or isinstance(width, bool)):
+        raise ValueError("test-phase width is not an integer")
+    if filters is not None and (not isinstance(filters, list)
+                                or not all(isinstance(item, str) for item in cast(list[object], filters))):
+        raise ValueError("test-phase filters are not text")
+    return {
+        "repo_identity": text["repo_identity"], "test_scope": test_scope,
+        "package": text["package"], "call_id": text["call_id"],
+        "test_threads": width, "filters": cast(list[str] | None, filters),
+    }
+
+
+def _test_phase_record(fields: Mapping[str, object]) -> TestPhaseRecord:
+    peak, started = fields.get("test_phase_peak_bytes"), fields.get("test_phase_started_at")
+    if peak is None and started is None:
+        window: ObservedTestPhase | UnobservedTestPhase = UnobservedTestPhase()
+    elif (isinstance(peak, int) and not isinstance(peak, bool) and peak >= 0
+            and isinstance(started, (int, float)) and not isinstance(started, bool)
+            and math.isfinite(started) and started > 0):
+        window = ObservedTestPhase(peak, float(started))
+    else:
+        raise ValueError("test-phase peak or start time is invalid")
+    return TestPhaseRecord(window, _test_phase_context(fields))
+
+
+def read_test_phase(path: Path | NoTestPhaseRecord) -> TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord:
+    if isinstance(path, NoTestPhaseRecord):
+        return path
+    try:
+        loaded = cast(object, json.loads(path.read_text()))
+        if not isinstance(loaded, dict):
+            raise ValueError("test-phase sidecar is not an object")
+        return _test_phase_record(cast(dict[str, object], loaded))
+    except FileNotFoundError:
+        return NO_TEST_PHASE_RECORD
+    except (OSError, ValueError) as error:
+        return UnreadableTestPhaseRecord(str(error))
+
+
+def test_phase_fields(phase: TestPhaseRecord | NoTestPhaseRecord) -> dict[str, object]:
+    fields: dict[str, object] = {
+        "test_phase_peak_bytes": None, "test_phase_started_at": None, "test_phase_charge": None,
+    }
+    if isinstance(phase, TestPhaseRecord):
+        fields.update({key: value for key, value in phase.context.items() if key != "repo_identity"})
+        if isinstance(phase.window, ObservedTestPhase):
+            fields.update(test_phase_peak_bytes=phase.window.peak_bytes,
+                          test_phase_started_at=phase.window.started_at)
+    return fields
+
+
+def _save_pending_step(pending: PendingStep, *, replace_existing: bool = False) -> Path:
+    return _save_pending_record(pending_steps_root() / f"{pending.row_key}.json", {
+        "row_key": pending.row_key, "row": pending.row,
+        "held_log": str(pending.held_log) if isinstance(pending.held_log, Path) else None,
+        "peak_file": str(pending.peak_file) if isinstance(pending.peak_file, Path) else None,
+        "test_phase_file": str(pending.test_phase_file) if isinstance(pending.test_phase_file, Path) else None,
+        "test_phase_read_error": (pending.test_phase.reason
+                                  if isinstance(pending.test_phase, UnreadableTestPhaseRecord) else None),
+        "month_row_end": pending.month_row_end,
+    }, replace_existing=replace_existing)
+
+
+def _read_pending_step(path: Path) -> PendingStep:
+    loaded = cast(object, json.loads(path.read_text()))
+    if not isinstance(loaded, dict):
+        raise ValueError("pending step is not an object")
+    fields = cast(dict[str, object], loaded)
+    row_key, row = fields.get("row_key"), fields.get("row")
+    if not isinstance(row_key, str) or not isinstance(row, dict):
+        raise ValueError("pending step has no row identity")
+    row = cast(dict[str, object], row)
+    if (row.get("kind") != "step" or row.get("step") == "launch"
+            or not all(isinstance(row.get(key), str) for key in ("host", "id", "started_at"))):
+        raise ValueError("pending record is not a build step")
+    held, peak, phase = fields.get("held_log"), fields.get("peak_file"), fields.get("test_phase_file")
+    if ((held is not None and not isinstance(held, str))
+            or (peak is not None and not isinstance(peak, str))
+            or (phase is not None and not isinstance(phase, str))):
+        raise ValueError("pending step has invalid source paths")
+    boundary_key = "month_row_end" if "month_row_end" in fields else "month_offset"
+    saved_boundary = fields.get(boundary_key)
+    if not isinstance(saved_boundary, int) or isinstance(saved_boundary, bool) or saved_boundary < 0:
+        raise ValueError("pending step has no valid month row end")
+    # Legacy sizes can lie inside a tail that an append later cuts. Only a
+    # recorded row boundary is safe for a suffix scan; legacy rows scan from 0.
+    month_row_end = saved_boundary if boundary_key == "month_row_end" else 0
+    phase_error = fields.get("test_phase_read_error")
+    test_phase = (UnreadableTestPhaseRecord(phase_error) if isinstance(phase_error, str)
+                  else _test_phase_record(row) if isinstance(phase, str) else NO_TEST_PHASE_RECORD)
+    return PendingStep(row_key, row, Path(held) if isinstance(held, str) else NoHeldLog(),
+                       Path(peak) if isinstance(peak, str) else NoPeakFile(), month_row_end,
+                       Path(phase) if isinstance(phase, str) else NO_TEST_PHASE_RECORD, test_phase)
+
+
+def _step_month_file(row: Mapping[str, object]) -> Path:
+    return store.host_file(str(row["host"]), datetime.fromisoformat(str(row["started_at"])).timestamp())
+
+
+def write_step_line(pending: PendingStep) -> bool:
+    path = _step_month_file(pending.row)
+    store.append_line(path, pending.row)
+    _sync_directory(path.parent)
+    return True
+
+
+def _resume_step_line(pending: PendingStep) -> bool:
+    """Scan from the saved row boundary, or byte 0 for a legacy pending step."""
+    path = _step_month_file(pending.row)
+    added = True
+    with store.locked_append(path) as handle:
+        _ = handle.seek(pending.month_row_end)
+        for line in handle:
+            try:
+                row = cast(object, json.loads(line))
+            except ValueError:
+                continue
+            if isinstance(row, dict) and cast(dict[str, object], row).get("id") == pending.row["id"]:
+                added = False
+                break
+        if added:
+            store.append_locked(handle, pending.row)
+    _sync_directory(path.parent)
+    return added
+
+
+def _delete_step_sources(held: Path | NoHeldLog, peak: Path | NoPeakFile,
+                         phase: Path | NoTestPhaseRecord = NO_TEST_PHASE_RECORD) -> None:
+    for path in (held, peak, phase):
+        if isinstance(path, Path):
+            path.unlink(missing_ok=True)
+            if path.parent.is_dir():
+                _sync_directory(path.parent)
+
+
+def _finish_step(path: Path, pending: PendingStep, publish: Callable[[PendingStep], bool]) -> PublishedStep:
+    if isinstance(pending.test_phase, UnreadableTestPhaseRecord):
+        raise OSError(f"test-phase sidecar unreadable: {pending.test_phase.reason}")
+    row = pending.row
+    saved_log = row.get("log")
+    if isinstance(saved_log, str):
+        if not (store.root() / saved_log).is_file():
+            if not isinstance(pending.held_log, Path):
+                raise OSError("failed step has no held log to save")
+            started = datetime.fromisoformat(str(row["started_at"])).timestamp()
+            _ = keep_log(pending.held_log.read_bytes(), str(row["host"]), started, str(row["id"]))
+        if not (store.root() / saved_log).is_file():
+            raise OSError("failed step log was not saved")
+        _sync_directory((store.root() / saved_log).parent)
+    added = publish(pending)
+    _delete_step_sources(pending.held_log, pending.peak_file, pending.test_phase_file)
+    os.utime(path, None)
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+    os.replace(path, path.with_suffix(".done"))
+    _sync_directory(path.parent)
+    return PublishedStep(added)
+
+
+def finish_pending_step(path: Path) -> PublishedStep:
+    """Finish the saved context and sources, then retain proof of completion."""
+    pending = _read_pending_step(path)
+    if isinstance(pending.test_phase, UnreadableTestPhaseRecord):
+        phase = read_test_phase(pending.test_phase_file)
+        if isinstance(phase, UnreadableTestPhaseRecord):
+            raise OSError(f"test-phase sidecar unreadable: {phase.reason}")
+        pending = replace(pending, row={**pending.row, **test_phase_fields(phase)}, test_phase=phase)
+        _ = _save_pending_step(pending, replace_existing=True)
+    return _finish_step(path, pending, _resume_step_line)
 
 
 def step(args: list[str]) -> None:
@@ -435,14 +753,39 @@ def step(args: list[str]) -> None:
 
     status_text, start_text, end_text, tty_text, held, peak = args[:6]
     argv = args[6:]
+    host = store.host_name()
+    cwd = os.getcwd()
+    phase_path = os.environ.get("BUILDLOG_TEST_PHASE_FILE", "")
+    identity: list[object] = [host, cwd, args]
+    if phase_path:
+        identity.append(str(Path(phase_path).absolute()))
+    row_key = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+    pending_path = pending_steps_root() / f"{row_key}.json"
+    done_path = pending_path.with_suffix(".done")
+    held_log = Path(held).absolute() if held else NoHeldLog()
+    peak_file = Path(peak).absolute() if peak else NoPeakFile()
+    phase_file = Path(phase_path).absolute() if phase_path else NO_TEST_PHASE_RECORD
+    store.root().mkdir(parents=True, exist_ok=True)
     try:
-        start = float(start_text)
-        end = float(end_text) if end_text else time.time()
+        with (store.root() / LAUNCH_LOCK_NAME).open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if pending_path.exists():
+                _ = finish_pending_step(pending_path)
+                return
+            if (held or peak or phase_path) and done_path.exists():
+                return
+        try:
+            start = float(start_text)
+            end = float(end_text) if end_text else time.time()
+            status = int(status_text)
+            started_at, ended_at = store.utc_iso(start), store.utc_iso(end)
+        except (ValueError, OverflowError, OSError):
+            store.note_error(f"record.py step {' '.join(args)[:500]}")
+            _delete_step_sources(held_log, peak_file, phase_file)
+            return
         tty = tty_text == "1"
-        status = int(status_text)
-        host = store.host_name()
-        cwd = os.getcwd()
         directory = git_directory(argv, cwd)
+        repository = memory_admit.git_identity(argv, cwd)[0]
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
         sent_key = sent_tree_key()
@@ -459,22 +802,26 @@ def step(args: list[str]) -> None:
             except Exception:  # noqa: BLE001 -- a parser bug loses the facts, never the record
                 store.note_error(f"parse {name} {held}")
             if status != 0:
-                log = keep_log(data, host, start, record_id)
+                log = _log_relative_path(host, start, record_id)
         memory = peak_and_stall(peak)
         step_slice = "none" if not peak else "builds" if Path(peak).is_file() else "fallback"
+        phase = read_test_phase(phase_file)
         record: dict[str, object] = {
             "kind": "step",
             "v": RECORD_VERSION,
             "id": record_id,
             "host": host,
-            "started_at": store.utc_iso(start),
-            "ended_at": store.utc_iso(end),
+            "started_at": started_at,
+            "ended_at": ended_at,
             "duration_s": round(end - start, 3),
             "mem_wait_s": int(os.environ.get("BUILDLOG_MEM_WAIT_S", "0")),
             "slice": step_slice,
             "step": name,
             "argv": argv,
             "cwd": cwd,
+            "target_dir": str((Path(cwd) / os.environ["CARGO_TARGET_DIR"]).resolve())
+                          if "CARGO_TARGET_DIR" in os.environ else TARGET_DIR_UNSET,
+            "repo_identity": repository.key if isinstance(repository, memory_admit.RepositoryIdentity) else store.UNKNOWN_IDENTITY,
             **git_facts(directory),
             **tree,
             # A reusable test build needs verify's Cargo inputs as well as
@@ -492,15 +839,24 @@ def step(args: list[str]) -> None:
             "mem_stall_full_s": memory.stall_full_s if isinstance(memory.stall_full_s, float) else None,
             **facts,
             "log": log,
+            **(test_phase_fields(phase) if not isinstance(phase, UnreadableTestPhaseRecord) else {}),
         }
-        store.append_line(store.host_file(host, start), record)
-    finally:
-        for leftover in (held, peak):
-            if leftover:
-                try:
-                    os.unlink(leftover)
-                except OSError:
-                    pass
+        with (store.root() / LAUNCH_LOCK_NAME).open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if pending_path.exists():
+                _ = finish_pending_step(pending_path)
+                return
+            if (held or peak or phase_path) and done_path.exists():
+                return
+            month_file = store.host_file(host, start)
+            month_row_end = store.read_last_whole_row_end(month_file)
+            pending = PendingStep(row_key, record, held_log, peak_file, month_row_end, phase_file, phase)
+            _ = _finish_step(_save_pending_step(pending), pending, write_step_line)
+    except Exception:  # noqa: BLE001 -- retain every source needed for a retry
+        if pending_path.is_file():
+            store.note_error(f"pending record {pending_path}")
+        else:
+            store.note_error(f"record.py step {' '.join(args)[:500]}")
 
 
 def optional_int(text: str) -> int | None:
@@ -618,6 +974,17 @@ def queue_bump(actor: str, session: str, step: str, folder: str, old_position: i
         "kind": "queue_bump", "v": RECORD_VERSION,
         "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
         "actor": actor, "session": session, "step": step, "folder": folder, "old_position": old_position,
+    })
+
+
+def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step: str,
+                   need: int, free: int, reserve: int, why: str, set_by: str, at: float) -> None:
+    host = store.host_name()
+    store.append_line(store.host_file(host, at), {
+        "kind": "head_admission", "v": RECORD_VERSION,
+        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
+        "action": action, "unit": unit, "step": step, "need": need, "free": free,
+        "reserve": reserve, "why": why, "set_by": set_by,
     })
 
 
@@ -741,6 +1108,8 @@ def main(argv: list[str]) -> int:
             found = treekey.tree_key(git_directory(rest, os.getcwd()))
             if found:
                 print(found)
+        elif command == "test-phase-context":
+            print(json.dumps(test_phase_context(Path(rest[0]), rest[1:]), separators=(",", ":")))
         elif command == "hold-event":
             hold_event(rest)
         elif command == "hold-build":

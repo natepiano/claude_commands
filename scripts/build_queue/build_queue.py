@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.build_queue import head_facts
 from scripts.lint import memory_admit
 from scripts.lib.user_zone import user_zone
 from scripts.message import roster
@@ -90,7 +91,7 @@ def free_memory_text(threshold: int, need: int, growth: int, reserve: int, head_
     return f"needs {threshold / memory_admit.GIB:.1f} GiB free: " + ", ".join(parts)
 
 
-def head_reason_text(head: memory_admit.HeadExplanation, zone: ZoneInfo) -> str:
+def head_reason_text(head: memory_admit.HeadExplanation, zone: ZoneInfo, facts: head_facts.HeadFacts) -> str:
     decision = head.decision
     parts: list[str] = []
     if isinstance(decision.pressure, memory_admit.MemoryPressure):
@@ -105,16 +106,12 @@ def head_reason_text(head: memory_admit.HeadExplanation, zone: ZoneInfo) -> str:
         if not head.free.passes:
             parts.append(free_memory_text(head.free.threshold, head.free.need, head.free.growth,
                                           head.free.reserve, head.free.head_need))
-    until = local_minute(int(head.order.deadline // 60), zone)
-    if isinstance(head.order, memory_admit.BackfillUntil):
-        parts.append(f"younger steps may start until {until}")
-    else:
-        parts.append(f"younger steps wait until {until}")
+    parts.append(head_facts.order_text(facts, zone))
     return "head: " + "; ".join(parts)
 
 
 def reason_text(step: memory_admit.WaitingStep, reading: memory_admit.QueueRead, zone: ZoneInfo,
-                labels: Mapping[str, roster.UnitLabels]) -> str:
+                labels: Mapping[str, roster.UnitLabels], facts: head_facts.HeadFacts | memory_admit.NoWaiter) -> str:
     view = reading.view
     reason = step.reason
     match reason:
@@ -133,7 +130,9 @@ def reason_text(step: memory_admit.WaitingStep, reading: memory_admit.QueueRead,
                     + f"(waiting {age(reason.head_since, view.now)} min)")
         case memory_admit.HeadAdmissionStatus():
             head = reading.explanation.head
-            return head_reason_text(head, zone) if isinstance(head, memory_admit.HeadExplanation) else "nothing waits"
+            return (head_reason_text(head, zone, facts)
+                    if isinstance(head, memory_admit.HeadExplanation) and isinstance(facts, head_facts.HeadFacts)
+                    else "nothing waits")
         case memory_admit.ReadyForAdmission():
             return "ready for the next admission check"
         case _:
@@ -155,14 +154,14 @@ def local_minute(minute: int, zone: ZoneInfo) -> str:
 
 
 def head_line(explanation: memory_admit.QueueExplanation, labels: Mapping[str, roster.UnitLabels],
-              zone: ZoneInfo) -> HeadLine:
+              zone: ZoneInfo, facts: head_facts.HeadFacts | memory_admit.NoWaiter) -> HeadLine:
     head = explanation.head
-    if isinstance(head, memory_admit.NoWaiter):
+    if isinstance(head, memory_admit.NoWaiter) or isinstance(facts, memory_admit.NoWaiter):
         return {"text": "", "tone": "default"}
     if isinstance(explanation.host, memory_admit.ReadingUnavailable):
-        detail = "memory reading unavailable"
+        detail = "memory reading unavailable; " + head_facts.order_text(facts, zone)
     else:
-        detail = head_reason_text(head, zone).removeprefix("head: ")
+        detail = head_reason_text(head, zone, facts).removeprefix("head: ")
         if not head.budget.passes and not isinstance(head.decision.pressure, memory_admit.MemoryPressure):
             for running in explanation.running:
                 if running.charged <= 0:
@@ -172,6 +171,9 @@ def head_line(explanation: memory_admit.QueueExplanation, labels: Mapping[str, r
                 detail += (f"; {step_labels(running.step, labels).session} {running.step.step}: "
                            + f"charged {memory_text(running.charged)}, using {used}")
         detail += f"; free {memory_text(head.free.available)}, step needs {memory_text(head.free.need)}"
+    detail += "; " + head_facts.head_time_text(facts, zone, short=True)
+    detail += "; " + head_facts.bump_text(facts, zone, short=True)
+    detail += "; " + head_facts.cargo_token_text(facts)
     stalled = (explanation.now - head.waiter.since >= 15 * 60
                and isinstance(explanation.host, memory_admit.HostAvailable)
                and head.free.available >= head.free.need)
@@ -183,6 +185,7 @@ def head_line(explanation: memory_admit.QueueExplanation, labels: Mapping[str, r
 def queue_snapshot(reading: memory_admit.QueueRead, zone: ZoneInfo,
                    entries: Sequence[roster.RosterEntry] = (), problems: Sequence[str] = ()) -> QueueSnapshot:
     view = reading.view
+    facts = head_facts.read_head_facts(reading)
     labels = roster.unit_labels(entries)
     running_header = ["#", "Showrunner", "Unit", "Session", "Step", "Folder", "Promised", "Using", "Delta", "State"]
     waiting_header = ["#", "Showrunner", "Unit", "Session", "Step", "Folder", "Waiting since", "Needs", "Free", "Reason"]
@@ -214,9 +217,9 @@ def queue_snapshot(reading: memory_admit.QueueRead, zone: ZoneInfo,
         identity = step_labels(step, labels)
         waiting.append([field(cell) for cell in [str(position), identity.showrunner, identity.unit, identity.session,
                         step.step, folder, f"{since} ({age(step.since, view.now)} min)",
-                        memory_text(step.need), free, reason_text(step, reading, zone, labels)]])
+                        memory_text(step.need), free, reason_text(step, reading, zone, labels, facts)]])
     return {"running_header": running_header, "running": running, "waiting_header": waiting_header, "waiting": waiting,
-            "head": head_line(reading.explanation, labels, zone),
+            "head": head_line(reading.explanation, labels, zone, facts),
             "totals": {"promised": memory_text(promised_total), "measured": memory_text(measured_total),
                        "free": memory_text(view.available), "reserve": memory_text(view.reserve)},
             "problems": [field(problem) for problem in problems]}

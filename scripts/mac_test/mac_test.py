@@ -430,6 +430,8 @@ class CliArguments(argparse.Namespace):
         self.settings: str = ""
         self.repo_root: str = ""
         self.copy: bool = False
+        self.from_pid: int = 0
+        self.package: str = ""
 
 
 class StatePaths:
@@ -1969,16 +1971,16 @@ def stop_copy(holder: RunRecord) -> None:
         pass
 
 
-def command_claim(args: CliArguments, paths: StatePaths) -> int:
+def command_claim(args: CliArguments, paths: StatePaths, *, watch_claim: bool = True) -> int:
     scope = claim_scope(args.worktree)
     deadline = time.monotonic() + max(args.wait, 0.0)
     yield_deadline = 0.0
     stopped: set[tuple[int, str]] = set()
     while True:
         with locked(paths.lock):
-            attempt = claim_once(args, paths, scope)
+            attempt = adopt_wait_claim(args, paths, scope) if args.from_pid else claim_once(args, paths, scope)
         if isinstance(attempt, ClaimFinished):
-            if attempt.status in (0, 13):
+            if watch_claim and attempt.status in (0, 13):
                 start_claim_watcher(paths)
             return attempt.status
         if isinstance(attempt, ClaimHeldByCopy):
@@ -2009,6 +2011,43 @@ def command_claim(args: CliArguments, paths: StatePaths) -> int:
             )
             return 11
         time.sleep(min(2.0, remaining))
+
+
+def adopt_wait_claim(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> ClaimAttempt:
+    """Transfer a wait's process-bound claim to its runner without opening the scope."""
+    path = claim_path(paths, scope)
+    try:
+        record = read_run(path)
+        start = process_start_time(args.pid)
+        if (not isinstance(record, dict) or run_is_kept(record) or "remote_host" in record
+                or record["pid"] != args.from_pid
+                or process_start_time(args.from_pid) != record["proc_start"] or start is None):
+            return ClaimFinished(12)
+        record["pid"] = args.pid
+        record["proc_start"] = start
+        if isinstance(args.remote, str):
+            remote: RemoteJobClaim = {**record, "remote_host": args.remote}
+            write_json(path, remote)
+        else:
+            write_json(path, record)
+    except (OSError, StateReadError):
+        return ClaimFinished(12)
+    print("claimed")
+    return ClaimFinished(0)
+
+
+def command_claim_wait(args: CliArguments, paths: StatePaths) -> int:
+    """Leave a local wait only after holding the repository's Mac claim."""
+    settings = Path(args.settings) if args.settings else offload.DEFAULT_MAC_SETTINGS
+    config = offload.read_config(settings)
+    if isinstance(offload.mac_step_eligibility(config, Path(args.repo_root), args.package, "nextest"),
+                  offload.IneligibleMacStep):
+        return 1
+    args.worktree = args.repo_root
+    args.what = f"nextest {args.package or 'workspace'}"
+    # Use the ordinary copy-yield protocol, including its bounded retry outside
+    # state.lock. The runner starts the watcher when it adopts this wait claim.
+    return 0 if command_claim(args, paths, watch_claim=False) == 0 else 1
 
 
 def command_release(args: CliArguments, paths: StatePaths) -> int:
@@ -2382,6 +2421,13 @@ def parser() -> argparse.ArgumentParser:
     _ = claim.add_argument("--wait", type=float, default=0.0)
     _ = claim.add_argument("--remote", type=remote_host_argument, default=NO_REMOTE_JOB)
     _ = claim.add_argument("--copy", action="store_true")
+    _ = claim.add_argument("--from-pid", type=int, default=0)
+
+    wait_claim = commands.add_parser("claim-wait")
+    _ = wait_claim.add_argument("--pid", type=int, required=True)
+    _ = wait_claim.add_argument("--settings", default="")
+    _ = wait_claim.add_argument("--repo-root", required=True)
+    _ = wait_claim.add_argument("--package", default="")
 
     release = commands.add_parser("release")
     _ = release.add_argument("--pid", type=int, required=True)
@@ -2412,6 +2458,8 @@ def main() -> int:
     paths = state_paths()
     if args.command == "claim":
         return command_claim(args, paths)
+    if args.command == "claim-wait":
+        return command_claim_wait(args, paths)
     if args.command == "release":
         return command_release(args, paths)
     if args.command == "free-now":

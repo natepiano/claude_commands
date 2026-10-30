@@ -272,6 +272,18 @@ Each item is my call under the decision criteria unless it names the user. A one
 - The `NoSuchMember` test: with no matching row, add and resume make one with `ensure`; retire, wrap and promote skip that `retire`; rename and transfer exit 2 and change no source.
 - Full gate green.
 
+### Phase 3b — Staff move command  · status: done
+
+Inserted 2026-10-30 (user, via the showrunner). Work Order: `staff.py move <unit> <showrunner>` changes one field, the unit row's parent, and moves the unit's live tab into the new showrunner's workspace through herdr.py's existing pane move; `transfer_unit.py` becomes that move plus one message to the unit and one to each showrunner. No stop, no restart.
+
+
+### Phase 3c — Staff readers switch  · status: todo
+
+Inserted 2026-10-30 (user, via the showrunners). Work Order: unit lookup and the units table, the stall-watch stretch, the review pool holder, and `showrunners.py` parent and children read the staff record through `staff.snapshot()` and `staff_sources.member()`. No script finds a unit's showrunner from its folder or branch name. One staff record and one read API; nothing else stores who reports to whom. cargo-handler's three inputs stay byte-identical: `production_tree.py --json`, `~/.local/state/review-pool/<production>/pool.json`, and the launcher identity JSON under `/tmp/claude/unit/` and `/tmp/claude/delegate/`.
+
+### Phase 3d — Unit folder names  · status: todo
+
+Inserted 2026-10-30 (user, via the showrunners). Work Order: `staff.py` refuses a unit short name that already exists. `add_unit` makes the worktree `~/worktrees/<short name>` and the branch `<short name>`, computed from the short name in the staff record and stored nowhere. `/showrunner:add_unit` says unit names are unique. A one-step rename moves an existing unit's folder, branch and session history through the rename path, only at the unit's phase boundary and on its showrunner's word, one unit at a time.
 ### Phase 4 — Member names come from the staff row  · status: todo
 
 **Depends on:** Phase 1, Phase 3

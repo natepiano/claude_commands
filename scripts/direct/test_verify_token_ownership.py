@@ -32,6 +32,16 @@ class VerifyTokenOwnershipTests(VerifyTokenOwnershipFixture):
             second = subprocess.run(["bash", str(BOARD), "acquire", str(board), "second",
                                      "cargo", "--wait", "0"], capture_output=True, text=True,
                                     check=False, timeout=TEST_HANG_GUARD_SECS)
+            self.assertNotEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertNotIn("reclaimed from first", second.stdout)
+            self.assertEqual((lock / "holder_pid").read_text(), str(first.pid))
+            # A changed group identity removes the proof of a live step; expiry
+            # can then be reclaimed without signalling an unrelated group.
+            step_record["start"] = "not-the-running-group"
+            _ = (lock / "owned").write_text(json.dumps(step_record))
+            second = subprocess.run(["bash", str(BOARD), "acquire", str(board), "second",
+                                     "cargo", "--wait", "0"], capture_output=True, text=True,
+                                    check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertIn("reclaimed from first", second.stdout)
             self.assertIn("after its hold expired", (board / "board.log").read_text())

@@ -37,6 +37,14 @@ class VerifyTokenSameSlotTests(VerifyTokenOwnershipFixture):
                                       env=second_environment, stdout=subprocess.DEVNULL,
                                       stderr=subprocess.PIPE, text=True, start_new_session=True)
             self.started_groups.add(second.pid)
+            self.wait_for_waiter(board, second)
+            self.assertEqual((lock / "holder_pid").read_text(), str(first.pid))
+            self.assertFalse(second_running.exists(), "expired live step was reclaimed")
+            # Reclaim remains supported when the owned identity no longer
+            # describes the running group, even for two calls from one slot.
+            old_record = cast(dict[str, object], json.loads((lock / "owned").read_text()))
+            old_record["start"] = "not-the-running-group"
+            _ = (lock / "owned").write_text(json.dumps(old_record))
             self.wait_for_running(second_running, second)
             self.assertTrue(second_running.exists(), "second cargo did not start")
             self.assertEqual((lock / "holder_pid").read_text(), str(second.pid))
