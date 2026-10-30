@@ -29,7 +29,7 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
 
 ## Phases
 
-### Phase 1 — The merge gate finds every test module itself  · status: todo
+### Phase 1 — The merge gate finds every test module itself  · status: done
 **Depends on:** none
 
 #### Work Order
@@ -89,22 +89,14 @@ Source: the sdlc showrunner, 2026-10-30. 106 test files under `scripts/` each de
 ### Phase 3 — Close-route closes a route made before its phase record  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `findings.py close-route` closes every route that the routed-work list shows, including a route made before its run's phase record, so the receiving checkpoint can close it.
-
-**Spec:**
-
-- Cause: `scripts/history/routed.py:63-65` keys each route `<run id>:<phase instance id>:<finding id>` from its `finding_routed` event. A route made before the run's phase record has an empty phase instance id, so its key is `<run id>::<finding id>`. `scripts/direct/findings.py:1085-1087` (`_close_route`) refuses a `--from` with any empty part, so that route can never close. shutdown-unit cannot close F003, F007, F008, F009 and F012, which its phase 5 fixed (sdlc showrunner, 2026-10-30).
-- Fix at the cause: `close-route` requires a non-empty run id and a non-empty finding id, and accepts an empty phase instance id. One key format: `--from` stays the exact key the routed-work list prints; no second form and no translation. A `--from` without exactly three parts still refuses, and its message names the empty-phase form.
-- Tests: a route recorded with no phase instance id lists with key `<run id>::<finding id>`, and `close-route --from <run id>::<finding id>` closes it (the routed-work list shows it closed, not open); `<run id>:<phase instance id>:` and `:<phase instance id>:F001` still refuse.
+- `scripts/history/routed.py` keys each route `<run id>:<phase instance id>:<finding id>` from its `finding_routed` event. A route made before its run's phase record has an empty phase instance id, so the routed-work list prints its key as `<run id>::<finding id>`.
+- `findings.py close-route --from` takes the exact key that the routed-work list prints, and it accepts an empty phase instance id. It refuses a key without exactly three parts, and a key with an empty or blank run id or finding id. The refusal message names both forms: `<run id>:<phase instance id>:<finding id>` and `<run id>::<finding id>`.
+- The `finding_route_closed` event keeps its shape. No reader of it changed.
 
 **Files:**
-- `scripts/direct/findings.py`
-- `scripts/direct/test_findings.py`
+- `scripts/direct/findings.py` — `_close_route` checks the `--from` key.
+- `scripts/direct/test_findings.py` — one test closes a route from before a phase record through the real routed-work join (`routed_work`); one test shows that nine malformed keys refuse and record no event.
 
-**Workers:** `1 writer` — one validation change and its tests.
-
-**State:** none — the `finding_route_closed` event keeps its shape.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/direct -p test_findings.py` and `python3 -m unittest discover -s scripts/history -p test_routed.py` pass; basedpyright prints `0 errors, 0 warnings, 0 notes` on the changed Python files; after the merge, shutdown's `close-route --from <run id>::F003` succeeds.
+**Ruled out:** a second `--from` form, or a translation from one form to the other — `--from` is always the exact listed key.
