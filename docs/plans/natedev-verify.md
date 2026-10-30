@@ -46,48 +46,35 @@ i need changes to verify
 
 ### Phase 1 — Cut Python helper starts in each verify run  · status: done
 
-**Depends on:** none.
+#### As-built
 
-#### Work Order
-
-**Goal:** a `verify.sh` step spends at most 2 s of real CPU on Python helper starts, down from the ~11 s shutdown-unit measured, with every output and record unchanged.
-
-**Spec:**
-
-1. **Measure first.** Add an opt-in trace: with `VERIFY_PY_TRACE=<file>` set, wrap `$PY` so each call appends one line: helper name (script basename or the `-c` constant's variable name), wall ms and CPU ms (from `/proc/self/stat` deltas or `times`). Run the verify pipeline tests (`test_verify_final_pass.py`, `test_verify_dev_features.py`, `test_verify_checks_fail_closed.py`, `test_verify_doc.py`) and one real `verify.sh test` and one `verify.sh lint` on a small crate (for example `cargo-handler`) with the trace on. Record the per-helper table (calls, total CPU ms, import ms from `python -X importtime` for the top three) in the phase report. Keep the trace in the code: it is how a later change proves its cost.
-2. **Remove starts that need no Python.**
-   - Clock reads (`time.monotonic()` at lines 1070, 1670, 1685, 1759): use bash `$EPOCHREALTIME`. Bash 5 is on natedev and the Mac's verify path; confirm the Mac bash version from `scripts/mac_test/offload.py`'s remote shell before the change, and keep the Python fallback only if the Mac runs bash 3.2.
-   - The hash at line 2238: `sha256sum` / `shasum -a 256` by platform, same first 16 hex chars.
-   - `STEP_OWNER_PY` at line 2520 runs through plain `python3`: move it to `$PY` (invariant), and fold it into the step-record call if the trace shows them always paired.
-3. **One `cargo metadata` parse per run.** `MEMBER_PY`, `EXAMPLE_FEATURES_PY`, `TEST_TARGETS_PY`, `BUILD_TARGETS_PY`, `UNTESTED_EXAMPLES_PY` and the `workspace_root` read at 2777 each start Python and parse the same metadata JSON. Replace them with one helper module `scripts/direct/verify_metadata.py` that reads the metadata once and prints every value the run needs as `NAME=value` lines (shell-quoted with `shlex.quote`), which `verify.sh` reads with one `eval` or a `while read` loop. Each old `-c` constant goes away. Edge: a verb that needs no metadata (`doc` early exits, the query path at line 183) must not start the new helper.
-4. **Slow imports in this unit's helpers.** For `final_pass.py`, `step_record.py` and `local_release_wait.py`: where `-X importtime` shows a module import over 30 ms that only some subcommands need, move the import into that subcommand. For helpers owned by other units (`record.py`, `mac_idle.py`, `build_targets.py`, `progress_history.py`): write the measured cost and the proposed fix into the phase report and the checkpoint notice for the showrunner to route; do not edit them.
-5. **Merge repeated per-step calls** only where the trace shows two calls of this unit's helpers always run back to back with no shell work between them (candidate: `step_record.py state` then `remove`); give the helper one subcommand that does both.
-6. builds 2026-10-29 (hana's showrunner, organon 21:4x EDT): `token_wait_note` reads `locks/cargo.d/holder` with `read -r holder < … || holder=""`. The holder file has no trailing newline (`w74`), so `read` returns 1 after it fills `holder`, and the `||` clears it: the log says "it came free just now" while w74 holds the lock. Keep the value `read` fills when it returns non-zero at end of file (check every `read` of a board file in verify.sh for the same form). Test: a holder file `w74` with no newline gives "w74 holds it".
-
-Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step. If the floor sits above 2 s only because of other units' helpers, the phase ends with this unit's share removed and the rest named per owner.
+- `verify.sh` reads `cargo metadata` once per run: `read_metadata` prints `GATE_METADATA` or runs `cargo metadata --no-deps --format-version 1`, and `load_metadata` (once, `METADATA_READY`) sends it to one `verify_metadata.py` start with every request the verb needs. `require_member`, `example_features` and `take_test_targets` read the shell values it sets. The query path and early `doc` exits start no metadata helper.
+- `verify_metadata.py` reads the JSON on stdin and prints `NAME=<shlex-quoted value>` per request: `member:<pkg>`, `example-features:<pkg>:<example>`, `test-targets:<pkg>:<features>`, `build-targets:<pkg>:<kind>:<name>`, `untested-examples:<scope>`, `workspace-root`, `target-directory`. Refusals keep the old stdout, stderr and exit 2.
+- `VERIFY_PY_TRACE=<file>` makes `$PY` a runner that runs each helper in the same interpreter and appends one row, `helper<TAB>wall ms<TAB>CPU ms`. CPU excludes child processes. The helper is the script basename, or `VERIFY_PY_HELPER` for an inline `-c` or stdin script. A row is written once, at exit, exec or SIGTERM; SIGTERM is sent again, so the exit status stays. Unset, it adds no start.
+- Clock reads use `$EPOCHREALTIME`. `step_record.py write --clock-offset` prints wall minus monotonic microseconds (`VERIFY_MONOTONIC_OFFSET_US`), so Mac retry deadlines stay in `mac_idle.py`'s monotonic time. `token_waiters_key` hashes with `sha256sum` or `shasum -a 256` (first 16 hex). `STEP_OWNER_PY` runs through `$PY`.
+- `step_record.py` parses `write`, `state`, `remove` and `stopped` from one table, `_COMMAND_ARGUMENTS`, before `argparse`, `dataclasses` and `inspect` load. Help, other syntax and record diagnostics fall through to `main()`, whose argparse parser comes from the same table.
+- `token_wait_note` keeps a holder name read from a file with no trailing newline (`read … || true`).
+- Real lint run: this unit's helper CPU 2529 → 1824 ms over 48 starts (`step_record.py` 30 starts, 1860 → 1247 ms). The other 525 ms is in helpers outside this phase: `build_targets.py` 199, `mac_idle.py` 122, `nix_env.py` 96, `record.py` 71, `user_zone.py` 37.
 
 **Files:**
-- `scripts/direct/verify.sh` — trace wrapper, bash clock and hash, one metadata call, `$PY` for `STEP_OWNER_PY`
-- `scripts/direct/verify_metadata.py` — new: one parse of `cargo metadata`, prints the run's values
-- `scripts/direct/test_verify_metadata.py` — new: each value the old `-c` constants printed, on a fixture metadata JSON (workspace with members, features, examples, test targets; a package with no tests; an unknown package → exit 2 like `MEMBER_PY`)
-- `scripts/direct/final_pass.py`, `scripts/direct/step_record.py`, `scripts/direct/local_release_wait.py` — lazy imports, merged subcommand if the trace supports it
-- `scripts/direct/test_verify_final_pass.py` — expectations unchanged; holds the new trace test: `VERIFY_PY_TRACE` writes one line per helper start
-- `scripts/direct/test_verify_dev_features.py`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_doc.py` — expectations unchanged; edit only when a removed `-c` constant or helper call is named in them
-- `pyrightconfig.json` — one entry for the new module if the include list names files (builds-unit lists it as touched)
+- `scripts/direct/verify.sh` — trace runner, `read_metadata`, `load_metadata`, Bash clocks, `token_waiters_key`, `token_wait_note`
+- `scripts/direct/verify_metadata.py` — `answer`, `main`: one metadata parse per run
+- `scripts/direct/step_record.py` — `_COMMAND_ARGUMENTS`, `_parse_record_arguments`, `_execute_record_command`, `--clock-offset`
+- `scripts/direct/test_verify_metadata.py`, `scripts/direct/fixtures/verify_metadata/` — 55 golden outputs of the old inline helpers on three fixture workspaces
+- `scripts/direct/test_verify_final_pass_script.py` — trace rows, query row, unset trace, SIGTERM
+- `scripts/direct/test_step_record.py` — the CLI path loads no `argparse`, `dataclasses` or `inspect`
+- `scripts/direct/test_verify_step_owner.py` — holder with no trailing newline
+- `scripts/direct/test_verify_assertion_guard.py`, `verify_hold_wait_test_support.py`, `verify_lint_scope_test_support.py`, `verify_step_routes_test_support.py`, `verify_mac_offload_test_support.py` — harnesses on the metadata route, the `$PY` shim, the SHA tool and Bash clocks; one metadata call per lint
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `scripts/direct/verify.sh`, `scripts/direct/verify_metadata.py`, `final_pass.py`, `step_record.py`, `local_release_wait.py`; hub: `scripts/direct/verify.sh` (every change routes through it)
-- `test` opens as impl — `scripts/direct/test_verify_metadata.py` and the trace test, written from the Spec alone
+**Gotchas:** a harness that runs `verify.sh`'s lint case needs `read_metadata`, `METADATA_READY=0`, `load_metadata` and `require_member` from `verify.sh`. `DEV_FEATURES_PY` reads `Cargo.toml`, not metadata, so a malformed list refuses before Cargo; `CHANGED_MEMBERS_PY` still decodes the cached JSON after mend. The clock offset is read once, so a wall clock jump moves a Mac retry deadline.
 
-**Constraints from prior phases:** none. Merge `origin/natedev` before dispatch so phases-unit's `TOKEN_WAITED` fix is in the tree.
-
-**Acceptance gate:** merge gate `--tests-only` green on a tree merged with `origin/natedev`; basedpyright `0 errors, 0 warnings` on `scripts/direct scripts/mac_test` and every caller module; `bash -n` clean; the before/after trace table in the phase report shows ≤ 2 s CPU of helper starts per step for this unit's share, with the other owners' remaining cost named.
+**Ruled out:** merging `STEP_OWNER_PY` with the step record (different lifetimes) or `state` with `remove` (shell work between them); lazy imports in `final_pass.py` and `local_release_wait.py` (no import over 30 ms); a Bash 3.2 clock fallback (the Mac's verify path runs Bash 5.3.9).
 
 ### Phase 1b — Refuse a step with a failing exit, and read a process start on the Mac  · status: todo
 
-**Depends on:** Phase 1 (same files: `step_record.py`, `verify.sh`).
+**Depends on:** Phase 1 (same files: `step_record.py`, `verify.sh`). Phase 7 lands first (shared extractor, board.sh and verify.sh).
 
-**Origin:** builds showrunner order 2026-10-30 03:5x EDT, a wrong-result defect from hana (trunk P170 board, 02:53 EDT). Runs in this worktree right after Phase 1, which owns the same files; ahead of Phase 7.
+**Origin:** builds showrunner order 2026-10-30 03:5x EDT, a wrong-result defect from hana (trunk P170 board, 02:53 EDT). Runs in this worktree.
 
 #### Work Order
 
@@ -95,7 +82,7 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 
 **Defect:** on the Mac, `verify.sh`'s step recorder (`step_record.py process_start`) reads `/proc/<pid>/stat`, which Darwin does not have. The step is refused, but the wrapper exits 0, so the failure reads as a pass.
 
-**Spec:** (1) a refused step exits non-zero on every host, at the one place the wrapper turns a refusal into its exit status. (2) Process start comes from one shared helper in `scripts/lib/` that works on Linux (`/proc/<pid>/stat` field 22) and Darwin (`ps -o lstart=` under `LC_ALL=C TZ=UTC`, based on `message/sessions.py process_start`'s tested form) with one return type. `scripts/lib/` belongs to natedev: builds approved the path as outside this unit's Owns (03:5x); the checkpoint notice names it in its also-touches line. `step_record.py` and the inline readers in `scripts/direct/verify.sh` and `scripts/direct/board.sh` use it; no second copy. The other copies (`message/sessions.py`, `build_hold/build_hold.py`, `lint/memory_admit.py`, `lint/tmp_sweep.py`, `production/retire_unit.py`) go to their owners through builds after 1b merges: build_hold, memory_admit and tmp_sweep to resources; sessions.py and retire_unit.py to natedev.
+**Spec:** (1) a refused step exits non-zero on every host, at the one place the wrapper turns a refusal into its exit status. (2) Process start comes from one shared helper in `scripts/lib/` that works on Linux (`/proc/<pid>/stat` field 22) and Darwin (`ps -o lstart=` under `LC_ALL=C TZ=UTC`, based on `message/sessions.py process_start`'s tested form) with one return type. `scripts/lib/` belongs to natedev: builds approved the path as outside this unit's Owns (03:5x); the checkpoint notice names it in its also-touches line. `step_record.py` and the inline readers in `scripts/direct/verify.sh` and `scripts/direct/board.sh` use it; no second copy. The other copies (`message/sessions.py`, `build_hold/build_hold.py`, `lint/memory_admit.py`, `lint/tmp_sweep.py`, `production/retire_unit.py`) go to their owners through builds after 1b merges: build_hold, memory_admit and tmp_sweep to resources; sessions.py and retire_unit.py to natedev. `step_record.py stopped` (`consume_stopped_build`) also reads `/proc/sys/kernel/random/boot_id`, which Darwin does not have; the Darwin test covers it too. (3) Test-local Bash function extractors use the shared `shell_functions(path, *names)` in `scripts/direct/shell_function_test_support.py` (each named top-level definition, in the order given; `ValueError` for a missing name). In `scripts/direct/test_verify_step_owner.py`, delete `shell_function` and call `shell_functions(VERIFY, "token_wait_note")`, `shell_functions(INVOKE, "buildlog_exec")` and `shell_functions(INVOKE, "sweep_after_step")`. In `scripts/direct/test_verify_assertion_guard.py`, `VerifyAssertionGuardTests.lint` replaces the `read_metadata() {` … `require_taplo() {` text slice with `shell_functions(VERIFY, "read_metadata", "load_metadata", "require_member")` plus a `METADATA_READY=0` line in its script (the slice carried that line), and the `assertion_rulings_args() {` slice with `shell_functions(VERIFY, "assertion_rulings_args")`. No assertion changes.
 
 **Files:**
 - `scripts/lib/process_start.py` — new: one process-start reader for Linux and Darwin, one return type
@@ -104,12 +91,14 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 - `scripts/direct/verify.sh`
 - `scripts/direct/board.sh`
 - `scripts/direct/test_step_record.py`
+- `scripts/direct/test_verify_step_owner.py` — Spec (3): shared extractor in place of `shell_function`
+- `scripts/direct/test_verify_assertion_guard.py` — Spec (3): shared extractor in the `lint` harness
 
 **Workers:** 1 writer (the helper, its callers and their tests share one owner set).
 
-**Constraints from prior phases:** Phase 1 lands first in the same files; build on its `step_record.py` and `verify.sh` as merged onto builds d0e2efe6.
+**Constraints from prior phases:** Phase 1 is merged onto builds 31eaac9c in checkpoint 766b3e87; build on that `step_record.py` and `verify.sh`. In `step_record.py`, `process_start(pid)` reads `$VERIFY_PROC_ROOT` (default `/proc`) and treats a zombie (`Z`) as ended; `write` stores it as `proc_start`, and `_read_fields` calls a record stale on `FileNotFoundError`, `ProcessLookupError` or a different start. The CLI path (`write`, `state`, `remove`, `stopped`) runs before `argparse`, `dataclasses` and `inspect` load; `StepRecordTests.test_cli_updates_records_without_importing_argument_or_dataclass_machinery` fails if the helper import brings any of them. A CLI error prints `step record: <error>; step refused` and exits 2; `verify.sh` takes the `write` status at `VERIFY_MONOTONIC_OFFSET_US="$(… write … --clock-offset)" || exit 2`. The `verify.sh` inline reader is `identity(pid)` in `STEP_OWNER_PY`, run as `"$PY" -c`, so `scripts/lib/` is not on its `sys.path` unless it is given.
 
-**Acceptance gate:** a test for each fix: a refused step makes `verify.sh` exit non-zero (a fake process root with no `stat`); the helper reads a start on Darwin (faked `sys.platform` and `ps`) and on Linux, and both reads agree with the record's stale check. A second hana hit is its own test case: `verify.sh` run directly on the Mac refused at step recording with `[Errno 2] No such file or directory: /proc/22626/stat; step refused (exit 2)` while widget took P34's Mac shots (builds, 2026-10-30). The test runs `verify.sh`'s step record on a faked Darwin host with no `/proc` and expects the step recorded, not refused. basedpyright 0/0/0 on changed files; the merge gate passes. Hana is told when it lands.
+**Acceptance gate:** `test_verify_step_owner` and `test_verify_assertion_guard` pass with no assertion change. A test for each fix: a refused step makes `verify.sh` exit non-zero (a fake process root with no `stat`); the helper reads a start on Darwin (faked `sys.platform` and `ps`) and on Linux, and both reads agree with the record's stale check. A second hana hit is its own test case: `verify.sh` run directly on the Mac refused at step recording with `[Errno 2] No such file or directory: /proc/22626/stat; step refused (exit 2)` while widget took P34's Mac shots (builds, 2026-10-30). The test runs `verify.sh`'s step record on a faked Darwin host with no `/proc` and expects the step recorded, not refused. basedpyright 0/0/0 on changed files; the merge gate passes. Hana is told when it lands.
 
 ### Phase 2 — Cancel a test or lint run when the tree changes under it  · status: done
 
@@ -317,5 +306,7 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 - `scripts/lint/memory_admit.py` — read only here: resources-unit's 45e60cc9 on builds-resources (merged to builds by the showrunner before this phase). `python3 scripts/lint/memory_admit.py blocker --waiter <waiter file>` prints one JSON line `{"session_id","session_name","pool":"memory"}`, or `{"unit"}` when only a systemd unit is known, or `{}`; exit 2 when the waiter file is gone. On the existing `check` poll, `BUILDLOG_MEM_BLOCKER=1` adds the same JSON as pipe field 16 (field 19 with `BUILDLOG_MEM_DETAIL=1`); a `|` in a name comes escaped. Use the `check` field inside the memory wait loop (no extra process per poll); without the opt-in the output is unchanged
 
 **Workers:** 1 writer + 1 tester.
+
+**Constraints from prior phases:** an inline `-c` or stdin Python helper in `verify.sh` runs as `VERIFY_PY_HELPER=<NAME> "$PY" …`, so a `VERIFY_PY_TRACE=<file>` run names its start (Phase 1).
 
 **Acceptance gate:** merge gate `--tests-only` green on a tree merged with origin/builds; basedpyright 0/0 on changed files and callers.
