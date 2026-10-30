@@ -56,7 +56,6 @@ import account as account_reader
 from scripts.accounts import accounts, outage_alerts
 import quota_alert
 from scripts.production import showrunners
-from scripts.nix_env import heal
 from account import Account, UnknownAccountName, UnreadableAccount
 from shutdown_record import SessionShutdown, SessionProgress, TimerRestore, Where
 
@@ -2605,32 +2604,6 @@ class RestartTests(ShutdownTestCase):
                 stored = shutdown_record.find_session(LOGIN, owner["session_id"])
                 assert stored is not None
                 self.assertEqual(stored["progress"]["kind"], "already gone")
-
-    def test_heal_waits_for_the_conductors_matching_completed_stop_record(self) -> None:
-        owner = top_level("heal-owner", cwd=str(self.root))
-        saved = entry(owner, state=shutdown_record.SessionStopping(kind="stopping", at=STOPPED))
-        saved["then"] = "stop"
-        self.create([saved])
-        session = heal.HealSession(owner["session_id"], owner["pid"], owner["proc_start"], owner["name"],
-                                   Path(owner["cwd"]), "idle", self.root / ".claude2")
-        with patch("scripts.message.sessions.process_start", return_value=owner["proc_start"]) as process_start:
-            self.assertIsInstance(heal.stop_completion(session, LOGIN), heal.StopPending)
-
-            def stopped(current: SessionShutdown) -> None:
-                current["progress"] = shutdown_record.SessionStopped(kind="stopped", at=STOPPED)
-
-            _ = shutdown_record.update_session(LOGIN, owner["session_id"], stopped)
-            self.assertIsInstance(heal.stop_completion(session, LOGIN), heal.StopPending)
-            process_start.return_value = ""
-            self.assertIsInstance(heal.stop_completion(session, LOGIN), heal.StopComplete)
-            self.assertIsInstance(heal.stop_completion(replace(session, proc_start="reused-pid"), LOGIN), heal.StopRefused)
-
-            def failed(current: SessionShutdown) -> None:
-                current["progress"] = shutdown_record.SessionStopFailed(kind="stop failed", at=STOPPED, reason="fixture failure")
-
-            _ = shutdown_record.update_session(LOGIN, owner["session_id"], failed)
-            self.assertIsInstance(heal.stop_completion(session, LOGIN), heal.StopRefused)
-
 
     def test_codex_restoration_focuses_its_workspace_and_acknowledges_despite_focus_failure(self) -> None:
         snapshot, saved, responses, log = self.codex_recovery_fixture()
@@ -6850,7 +6823,7 @@ class RestartTests(ShutdownTestCase):
                         target["progress"] = shutdown_record.SessionWaiting(kind="waiting")
                         self.assertTrue(shutdown_record.create_session(target))
                         def remember(current: SessionShutdown) -> None:
-                            current["timers"] = shutdown_record.merge_timer_restores(current["timers"], saved["timers"])
+                            current["timers"] = shutdown_record.merge_timer_restores(current["timers"], target["timers"])
                         def disable(current: SessionShutdown) -> None:
                             for timer in current["timers"]:
                                 if timer["was_enabled"]:

@@ -13,11 +13,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, cast, override
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from scripts.herdr import fake_herdr
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.cli_fixture import invoke_cli
@@ -26,8 +28,6 @@ from scripts.production.staff_test_support import StaffTestCase
 from scripts.shutdown import stop_resume
 from scripts.production import staff
 from scripts.lib.atomic_file import write_text_atomic
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_showrunner
 from scripts.production import fake_unit_host
@@ -262,7 +262,7 @@ class UnitRenameFixture(StaffTestCase):
                               self.env, cwd or self.checkout, production_state=True)
 
     @contextmanager
-    def shutdown_boundary(self) -> Iterator[None]:
+    def shutdown_boundary(self) -> Generator[None]:
         """Use the same recording stop fake for in-process and child-process apply."""
         with (mock.patch.object(rename_unit, "SHUTDOWN", Path(self.env.get("RENAME_UNIT_SHUTDOWN")
                                                                or str(SCRIPT.parents[1] / "shutdown/shutdown.py"))),
@@ -332,7 +332,9 @@ class UnitRenameFixture(StaffTestCase):
             readable, _, _ = select.select([process.stdout], [], [], remaining)
             self.assertTrue(readable, f"timed out waiting for {expected!r}")
             chunk = os.read(process.stdout.fileno(), 1)
-            self.assertTrue(chunk, f"stdout closed before {expected!r}: {output!r}")
+            if not chunk:
+                stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                self.fail(f"stdout closed before {expected!r}: {output!r}{stdout}; {stderr}")
             output.extend(chunk)
             if chunk == b"\n" and expected in output.decode():
                 return output.decode()

@@ -711,7 +711,7 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {found.claude.reason}")
     if not identity and len(records) == 1:
         identity = records[0]["session"]["session_id"]
-    if identity:
+    if identity and found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
         result = stop_resume.stop(identity)
         if not isinstance(result, (stop_resume.Stopped, stop_resume.NotRunning)):
             reason = result.reason if isinstance(result, stop_resume.StopFailed) else "no local session tab"
@@ -723,6 +723,8 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
                 _ = shutdown_record.update_session(saved["login"], identity,
                     lambda current: current.update(progress=shutdown_record.SessionStopped(
                         kind="stopped", at=datetime.now(UTC).isoformat(timespec="seconds"))))
+    if any(saved["stop_issues"] for saved in records):
+        raise RenameRefused(f"{rename.old}: old worker cleanup is incomplete; needs a clean stop")
     _stop_runs(rename)
     unit_move.close_unit_pane(pane)
 
