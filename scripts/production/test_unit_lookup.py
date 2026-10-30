@@ -140,6 +140,39 @@ class UnitLookupTests(unittest.TestCase):
                 self.assertEqual(listed.stdout.split("\t")[:6],
                                  ["trunk-unit", "herdr:still-old:w4:p1", "still-old", "live", "still-old", "id-still-old"])
 
+    def test_grouping_resolves_former_slugs_without_discovering_processes(self) -> None:
+        self.renamed_production()
+        unit = unit_lookup.MarkedUnit("trunk-unit", LiveClaude("report", "report-id", "/fixture.sock", 123),
+                                      herdr.HerdrPlace("old-pane", "w4:p1"))
+        with mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("no process scan")) as scan:
+            found = unit_lookup.group_marked_units(iter([("old", unit)]))
+        self.assertEqual(found.units, {"new": {"trunk-unit": unit}})
+        self.assertEqual(found.faults, {})
+        scan.assert_not_called()
+
+    def test_grouping_reports_duplicate_alias_marks_and_retains_unambiguous_units(self) -> None:
+        self.renamed_production()
+        before = unit_lookup.MarkedUnit("trunk-unit", LiveClaude("before", "before-id", "/before.sock", 123),
+                                        herdr.HerdrPlace("before", "w4:p1"))
+        after = unit_lookup.MarkedUnit("trunk-unit", LiveClaude("after", "after-id", "/after.sock", 124),
+                                       herdr.HerdrPlace("after", "w5:p1"))
+        other = unit_lookup.MarkedUnit("other-unit", ClaudeNotRunning(), herdr.HerdrPlace("other", "w6:p1"))
+        found = unit_lookup.group_marked_units([("old", before), ("new", after), ("new", other)])
+        self.assertEqual(found.units, {"new": {"other-unit": other}})
+        holders = "pid 123 (claude) in herdr:before:w4:p1 and pid 124 (claude) in herdr:after:w5:p1"
+        self.assertEqual(found.faults, {
+            "new": {"trunk-unit": f"trunk-unit: its mark is on herdr sessions {holders}"},
+        })
+
+    def test_grouping_prefers_live_claude_over_inherited_child_marks(self) -> None:
+        self.renamed_production()
+        director = unit_lookup.MarkedUnit("trunk-unit", LiveClaude("report", "report-id", "/report.sock", 123),
+                                          herdr.HerdrPlace("director", "w4:p1"))
+        detached = unit_lookup.MarkedUnit("trunk-unit", ClaudeNotRunning(), herdr.HerdrPlace("build", "w5:p1"))
+        found = unit_lookup.group_marked_units([("old", detached), ("new", director)])
+        self.assertEqual(found.units, {"new": {"trunk-unit": director}})
+        self.assertEqual(found.faults, {})
+
 
     def test_former_and_current_marks_cannot_hide_duplicate_unit_sessions(self) -> None:
         self.renamed_production()

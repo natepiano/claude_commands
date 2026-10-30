@@ -2425,32 +2425,32 @@ class RestartTests(ShutdownTestCase):
         _ = cast(object, self.enterContext(patch.object(herdr, "server_environment", return_value={})))
         _ = cast(object, self.enterContext(patch.object(herdr.Herdr, "pane_activity", return_value=herdr.PaneAtShell())))
         # The fake server records a tab as a workspace it creates; workspace layout is herdr's own test.
-        def open_tab(name: str, _space: str, _title: str, cwd: str, environment: dict[str, str], *, label: str = "") -> str:
+        def open_tab(name: str, _space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
             client = herdr.Herdr(name)
             arguments = ["workspace", "create", "--label", name, "--cwd", cwd]
             for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
                 arguments.extend(["--env", f"{key}={value}"])
             root_pane = herdr.json_object(client.result(*arguments, "--no-focus").get("root_pane"), "fake root pane")
             pane = herdr.json_text(root_pane.get("pane_id"), "fake root pane id")
-            _ = client.run("pane", "rename", pane, label or name)
+            _ = client.run("pane", "rename", pane, title)
             return pane
 
         _ = cast(object, self.enterContext(patch.object(herdr, "open_tab", open_tab)))
         return owner, responses, log
 
-    def test_restart_display_rename_keeps_saved_layout_pane_keys_and_attach_hint(self) -> None:
+    def test_restart_keeps_session_name_in_saved_layout_pane_and_attach_hint(self) -> None:
         from scripts.herdr.test_herdr import TitledLayoutHerdr
         owner = self.herdr_restart_fixture()[0]
         _ = self.enterContext(patch.object(herdr, "herdr_processes", return_value=[]))
         old = TitledLayoutHerdr()
-        _ = old.open_tab("ad-hoc", "sdlc · roles · unit director", owner["cwd"], {}, label=owner["name"])
-        _ = old.open_tab("ad-hoc", "another tab", owner["cwd"], {}, label="other-key")
+        _ = old.open_tab("ad-hoc", owner["name"], owner["cwd"], {})
+        _ = old.open_tab("ad-hoc", "other-key", owner["cwd"], {})
         fresh = TitledLayoutHerdr()
-        _ = fresh.open_tab("ad-hoc", "another tab", owner["cwd"], {}, label="other-key")
+        _ = fresh.open_tab("ad-hoc", "other-key", owner["cwd"], {})
 
-        def open_tab(host: str, space: str, title: str, cwd: str, environment: dict[str, str], *, label: str = "") -> str:
+        def open_tab(host: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
             self.assertEqual(host, "fixture")
-            return fresh.open_tab(space, title, cwd, environment, label=label)
+            return fresh.open_tab(space, title, cwd, environment)
 
         parts = restart._resume_parts(owner, "restart")  # pyright: ignore[reportPrivateUsage]
         parts = replace(parts, environment={**parts.environment, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"})
@@ -2465,8 +2465,8 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual([tab["pane_label"] for tab in fresh.tabs], [owner["name"], "other-key"])
         found = fresh.lookup(owner["name"])
         self.assertIsInstance(found, herdr.PaneFound)
-        self.assertIn("coordinator", fresh.tabs[0]["label"])
-        self.assertIsInstance(fresh.lookup(fresh.tabs[0]["label"]), herdr.NoPane)
+        self.assertEqual(fresh.tabs[0]["label"], owner["name"])
+        self.assertEqual(fresh.lookup(fresh.tabs[0]["label"]), found)
         self.assertTrue(herdr.attach_hint("ad-hoc", owner["name"]).endswith("tab " + owner["name"]))
 
     def test_shared_tab_restart_carries_its_destination_transcript_and_failed_submit_outcome(self) -> None:

@@ -101,6 +101,25 @@ class TranscriptReadCounter(io.BufferedReader):
         return value
 
 
+class InventoryImportTests(unittest.TestCase):
+    def test_package_inventory_imports_without_shutdown_on_search_path(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", """
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+assert str(root / "scripts/shutdown") not in sys.path
+from scripts.shutdown import inventory
+assert inventory.codex_seats([]) == []
+""", str(root)],
+            cwd=root / "scripts" / "herdr",
+            capture_output=True, text=True, check=False, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 @final
 class InventoryTests(ShutdownTestCase):
     seed: ClassVar[ImmutableGitSeed]

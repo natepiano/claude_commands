@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
@@ -29,6 +30,8 @@ SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or Path(__file__).resolve().paren
 PARENT_FILE = "parent"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone_name  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
+from sessions import SessionRecord, messaging_socket_exists  # noqa: E402
 
 RULES = "Read the Nested showrunners rules in ~/.claude/commands/showrunner/produce.md."
 
@@ -189,27 +192,45 @@ def _timer(instance: Path) -> Timer:
     return Timer(instance.name.removeprefix("showrunner-"), target, doc.path, user_zone_name())
 
 
-def _registered(instance: Path) -> Showrunner:
+class DiscoverSessions(NamedTuple):
+    """No registry snapshot was supplied; resolve sessions from their current records."""
+
+
+DISCOVER_SESSIONS = DiscoverSessions()
+
+
+def _registered(instance: Path, *,
+                known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS) -> Showrunner:
     timer = _timer(instance)
-    socket = socket_for(timer.target)
-    name = _session_name(timer.target[8:]) if socket is not None else ""
+    if isinstance(known_sessions, DiscoverSessions):
+        socket = socket_for(timer.target) or ""
+        name = _session_name(timer.target[8:]) if socket else ""
+    else:
+        record = known_sessions.get(timer.target[8:])
+        live = record is not None and messaging_socket_exists(record)
+        socket = record["messagingSocketPath"] if record is not None and live else ""
+        name = record["name"] if record is not None and live else ""
     return Showrunner(session=name, socket=socket or "", slug=timer.slug, zone=timer.zone, doc=str(timer.doc))
 
 
-def registered_showrunners(state_dir: Path | None = None) -> list[Showrunner]:
+def registered_showrunners(
+    state_dir: Path | None = None, *,
+    known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS,
+) -> list[Showrunner]:
     """Every showrunner that has an update timer, running or not.
 
     The timer is addressed to the Claude session id and holds the production doc, so it is the one
     record of a showrunner and holds no name: the name is looked up here, at each call. Raises OSError
     when the session records cannot say whether a showrunner runs; a timer that is not a complete
-    showrunner's is left out, with the reason on stderr.
+    showrunner's is left out, with the reason on stderr. Supplied live session records avoid
+    rereading the registry or starting the sessions subprocess; an empty mapping means none are live.
     """
     found: list[Showrunner] = []
     for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
         if not instance.is_dir():
             continue
         try:
-            found.append(_registered(instance))
+            found.append(_registered(instance, known_sessions=known_sessions))
         except (KeyError, ValueError, UnicodeError) as error:
             print(f"showrunners: skipping {instance.name}: {error}", file=sys.stderr)
     return found

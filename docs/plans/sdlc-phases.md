@@ -356,7 +356,7 @@ Phase 10 sent builds' part of the design. The builds showrunner answered at 13:5
 **Goal:** `docs/plans/sdlc-run-cancel-design.md` carries each owner's answer, and the design goes to the sdlc showrunner.
 
 **Spec:**
-- Copy paths follow the user's rule of 2026-10-29 (`/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, names from `roster.py unit_labels`, owned by verify-unit's `docs/plans/verify-copies.md`). The design points to that rule and defines no second path; the run-stop provenance goes in a file inside that folder.
+- Copy paths follow the user's rule of 2026-10-29 (`/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, the folder name from `roster.UnitLabels.folder_name()` on labels from `roster.unit_labels_for`, owned by verify-unit's `docs/plans/verify-copies.md`). The design points to that rule and defines no second path; the run-stop provenance goes in a file inside that folder.
 - `board.sh` is natedev's file. The TERM and release order builds on verify-unit's token fix (no reclaim from a live holder, token renewed with `--pid`).
 - Fold in verify-unit's and resources-unit's answers on items 1-4, 6 and the grace numbers. An answer that changes a decision is stated as theirs; an item still open stays under Open questions.
 - No code changes.
