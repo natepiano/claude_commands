@@ -6,6 +6,8 @@ from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass
 from functools import cached_property
+from enum import Enum, auto
+import re
 from typing import final
 
 import declarations
@@ -34,10 +36,19 @@ class EnclosingItem:
     kind: str
     first: int
     last: int
+    unproved_lines: range = range(0)
 
 
 class UnreadableSourceItems(ValueError):
     """The item parser could not establish all enclosing identities in this blob."""
+
+
+class NestedSyntax(Enum):
+    STATEMENTS = auto()
+    FIELDS = auto()
+    VARIANTS = auto()
+    ARMS = auto()
+    CONTINUATION = auto()
 
 
 class SourceSites:
@@ -102,86 +113,223 @@ class SourceSites:
             offsets.append(offsets[-1] + len(line))
         result: list[EnclosingItem] = []
 
+        item_keywords = {
+            "fn", "struct", "enum", "union", "trait", "impl", "mod", "type", "const", "static",
+            "macro_rules", "use", "extern",
+        }
+        # item_prefix remains the only qualifier scanner. This grammar validates its
+        # complete result, including order and restricted visibility, before recording.
+        name = r"(?:r#)?[A-Za-z_][A-Za-z_0-9]*"
+        visibility_path = rf"{name}(?: :: {name})*"
+        qualifiers = re.compile(
+            rf"(?:pub(?: \( (?:crate|self|super|in {visibility_path}) \))? )?"
+            + r"(?:default )?(?:const )?(?:async )?(?:unsafe )?(?:extern(?: ABI)? )?"
+        )
+
+        def item_prefix_is_closed(start: int, keyword: int) -> bool:
+            while start in attributes:
+                start = attributes[start]
+            spelling = " ".join("ABI" if spans[index].token.kind == "literal" else words[index]
+                                for index in range(start, keyword))
+            return qualifiers.fullmatch(spelling + (" " if spelling else "")) is not None
+
         def record(item: style_footprint.SourceItem, start: int, owner: tuple[str, ...]) -> bool:
             first, keyword, last = start + item.start, start + item.keyword, start + item.end
+            first_line = bisect_right(offsets, spans[first].start)
+            last_line = bisect_right(offsets, spans[last - 1].end - 1)
             identity = (*owner, item.title)
-            result.append(EnclosingItem(identity, item.kind,
-                                        bisect_right(offsets, spans[first].start),
-                                        bisect_right(offsets, spans[last - 1].end - 1)))
-            # Container bodies consist of items. Function, type and initializer bodies also
-            # contain statements, but any nested item still belongs to this complete chain.
+            position = len(result)
+            result.append(EnclosingItem(identity, item.kind, first_line, last_line))
+
+            def refuse_body() -> bool:
+                # An unparsed body may conceal descendants. Retain its outer span
+                # as a refusal, and keep independent sibling owners readable.
+                del result[position:]
+                result.append(EnclosingItem(identity, item.kind, first_line, last_line,
+                                            range(first_line, last_line + 1)))
+                return True
+
+            if not item_prefix_is_closed(first, keyword):
+                return refuse_body()
+            if item.kind in {"macro_rules", "macro"}:
+                opening = keyword + (3 if item.kind == "macro_rules" else 2)
+                if opening not in ends:
+                    return refuse_body()
+                result[position] = EnclosingItem(identity, item.kind, first_line, last_line,
+                    range(bisect_right(offsets, spans[opening].start),
+                          bisect_right(offsets, spans[ends[opening]].end - 1) + 1))
+                return True
             cursor = keyword + 1
             while cursor < last:
                 if words[cursor] in {"{", "(", "["}:
                     close = ends.get(cursor)
                     if close is None or close >= last:
-                        return False
-                    if item.kind in {"mod", "impl", "trait"} and words[cursor] == "{" and close == last - 1:
-                        return visit(cursor + 1, close, identity)
-                    if not nested(cursor + 1, close, identity,
-                                  at_item=words[cursor] == "{" and item.kind not in {"struct", "enum", "union"}):
-                        return False
+                        return refuse_body()
+                    if item.kind in {"mod", "impl", "trait", "extern"} and words[cursor] == "{" and close == last - 1:
+                        return visit(cursor + 1, close, identity) or refuse_body()
+                    syntax = NestedSyntax.CONTINUATION
+                    if words[cursor] == "{":
+                        syntax = (NestedSyntax.FIELDS if item.kind in {"struct", "union"}
+                                  else NestedSyntax.VARIANTS if item.kind == "enum" else NestedSyntax.STATEMENTS)
+                    if not nested(cursor + 1, close, identity, syntax):
+                        return refuse_body()
                     cursor = close + 1
                 else:
                     cursor += 1
             return True
 
-        def statement_start(start: int, keyword: int, end: int) -> bool:
-            """Only recognized expressions/statements may occupy a non-item boundary."""
+        def qualified_path(start: int, end: int) -> bool:
+            depth = 0
+            for cursor in range(start, end):
+                word = words[cursor]
+                if word == "<":
+                    depth += 1
+                elif word == ">":
+                    depth -= 1
+                    if depth == 0:
+                        return (cursor > start + 1 and words[cursor + 1:cursor + 2] == ("::",)
+                                and cursor + 2 < end and spans[cursor + 2].token.kind == "identifier")
+                elif word not in {"::", "&", "'", ","} and spans[cursor].token.kind != "identifier":
+                    return False
+            return False
+
+        def statement_start(start: int, end: int) -> bool:
+            """Admit named expression starts; subsequent tokens remain item-aware."""
             word = words[start]
-            if keyword != start:
-                # These qualifiers can lead block/closure expressions as well as items.
-                prefix = words[start:keyword]
-                return (all(part in {"async", "unsafe", "const"} for part in prefix)
-                        and words[keyword:keyword + 1] in (("{",), ("move",), ("|",), ("||",)))
-            if word in {"let", "if", "else", "match", "while", "for", "loop", "return", "break", "continue",
-                        "yield", "move", "try", "const", "{", "(", "[", ";", "&", "&&", "*", "!", "-", "|", "||"}:
-                return True
+            expression_starts = {
+                "let", "if", "else", "match", "while", "for", "loop", "return", "break", "continue",
+                "yield", "move", "try", "const", "async", "unsafe", "self", "super", "crate", "Self", "true", "false",
+            }
+            if word in style_footprint.RUST_KEYWORDS - expression_starts:
+                return False
             if word == "'":
                 return (start + 2 < end and spans[start + 1].token.kind == "identifier"
                         and words[start + 2] == ":")
-            if spans[start].token.kind == "literal":
-                return True
-            # A plain name starts a path, call, macro, operator expression or a bare value.
-            # An unknown modifier followed by an item keyword is none of these: refuse it.
-            return (spans[start].token.kind == "identifier" and word not in style_footprint.RUST_KEYWORDS - {"self", "super", "crate", "Self", "true", "false"}
-                    and (start + 1 == end or words[start + 1] in {
-                        "::", "(", "[", "{", "!", ".", "?", ";", "=", "+", "-", "*", "/", "%", "&", "&&", "|", "||",
-                        "^", "<", ">", "==", "!=", "<=", ">=",
-                    }))
+            if word == "<":
+                return qualified_path(start, end)
+            return (spans[start].token.kind in {"literal", "identifier"}
+                    or word in {"{", "(", "[", ";", "&", "&&", "*", "!", "-", "|", "||", ".", "::"})
 
-        def nested(start: int, end: int, owner: tuple[str, ...], *, at_item: bool) -> bool:
-            cursor = start
+        def starts_item(cursor: int, end: int) -> bool:
+            word = words[cursor]
+            following = words[cursor + 1:cursor + 2]
+            if word == "const" and following in (("{",), ("move",), ("|",), ("||",)):
+                return False
+            if word in {"union", "macro_rules"}:
+                return following == ("!",) if word == "macro_rules" else (
+                    cursor + 1 < end and spans[cursor + 1].token.kind == "identifier")
+            # A function pointer has no declared name; every named fn is an item.
+            return word in item_keywords and not (word == "fn" and following == ("(",))
+
+        def nested(start: int, end: int, owner: tuple[str, ...], syntax: NestedSyntax) -> bool:
+            cursor, segment = start, start
+            at_item = syntax in {NestedSyntax.STATEMENTS, NestedSyntax.ARMS}
+            at_field = syntax in {NestedSyntax.FIELDS, NestedSyntax.VARIANTS}
             while cursor < end:
-                keyword = cursor
-                if at_item:
-                    # Attributes, visibility and function qualifiers belong to the item that follows.
-                    while keyword in attributes:
-                        keyword = attributes[keyword]
-                    keyword, _ = style_footprint.item_prefix(words, ends, keyword)
+                if words[cursor] == "$" or spans[cursor].token.kind == "unknown":
+                    return False
+                if words[cursor] == "@":
+                    pattern = cursor + 1
+                    while pattern < end and (spans[pattern].token.kind == "identifier" or words[pattern] == "::"):
+                        pattern += 1
+                    if (cursor == start or spans[cursor - 1].token.kind != "identifier"
+                            or pattern == cursor + 1 or words[pattern:pattern + 1] != ("{",)):
+                        return False
+                statement = cursor
+                while statement in attributes:
+                    statement = attributes[statement]
+                if statement >= end:
+                    return True
+                if statement != cursor:
+                    cursor = statement
+                    segment = cursor
+                if at_field:
+                    field, _ = style_footprint.item_prefix(words, ends, cursor)
+                    # Field visibility is the shared pub scanner's closed subset.
+                    if field != cursor and (words[cursor] != "pub" or not item_prefix_is_closed(cursor, field)):
+                        return False
+                    if words[field:field + 2] == (".", "."):
+                        cursor = field + 2
+                    elif field < end and spans[field].token.kind == "identifier" and words[field] not in item_keywords:
+                        cursor = field + 1
+                        if words[cursor:cursor + 1] == (":",):
+                            cursor += 1
+                    else:
+                        return False
+                    at_field, at_item = False, False
+                    continue
+                keyword, _ = style_footprint.item_prefix(words, ends, cursor) if at_item else (cursor, "")
                 word = words[keyword] if keyword < end else ""
-                if (at_item and word in {"fn", "impl", "trait", "mod", "struct", "enum", "union", "type", "const", "static"}
-                        and not (word == "const" and words[keyword + 1:keyword + 2] == ("{",))):
-                    last = style_footprint.item_end(words, ends, keyword + 1,
-                                                    body=word not in {"type", "const", "static"})
+                if at_item and keyword < end and starts_item(keyword, end):
+                    if not item_prefix_is_closed(cursor, keyword):
+                        return False
+                    body = word not in {"type", "const", "static", "use"} and not (
+                        word == "extern" and words[keyword + 1:keyword + 2] == ("crate",))
+                    last = style_footprint.item_end(words, ends, keyword + 1, body=body)
                     if last is None or last > end:
                         return False
                     items = style_footprint.source_items(words[cursor:last])
                     if items is None or len(items) != 1 or not record(items[0], cursor, owner):
                         return False
-                    cursor = last
+                    cursor = segment = last
                     at_item = True
-                elif at_item and not statement_start(cursor, keyword, end):
+                elif starts_item(cursor, end):
+                    # Every unrecorded item keyword refuses, even after an expression
+                    # operator, closure prefix, generic argument or opaque group.
+                    return False
+                elif at_item and not statement_start(cursor, end):
                     return False
                 elif words[cursor] in {"{", "(", "["}:
                     close = ends.get(cursor)
+                    if close is None or close >= end:
+                        return False
+                    child = NestedSyntax.CONTINUATION
                     block = words[cursor] == "{"
-                    if close is None or close >= end or not nested(cursor + 1, close, owner, at_item=block):
+                    if block:
+                        lead = words[segment:cursor]
+                        child = NestedSyntax.STATEMENTS
+                        if lead[:1] == ("match",):
+                            child = NestedSyntax.ARMS
+                        elif (cursor > segment and spans[cursor - 1].token.kind == "identifier"
+                              and words[cursor - 1] not in {"else", "unsafe", "async", "const", "try", "loop"}
+                              and lead[:1] not in (("if",), ("while",), ("for",))):
+                            child = NestedSyntax.FIELDS
+                    if not nested(cursor + 1, close, owner, child):
                         return False
                     cursor = close + 1
-                    at_item = block
+                    # Only an actual statement block creates a fresh item position.
+                    at_item = block and child in {NestedSyntax.STATEMENTS, NestedSyntax.ARMS}
+                    if block and cursor < end:
+                        continuation = words[cursor]
+                        if continuation == "=>" and syntax == NestedSyntax.ARMS:
+                            cursor += 1
+                            segment = cursor
+                            at_item = True
+                        elif continuation == "=" and child == NestedSyntax.FIELDS:
+                            cursor += 1
+                            at_item = True
+                        elif continuation == "," and syntax in {NestedSyntax.ARMS, NestedSyntax.FIELDS, NestedSyntax.VARIANTS}:
+                            at_item = False
+                        elif continuation in {"?", "."}:
+                            at_item = False
+                        elif continuation == "else":
+                            at_item = True
+                    if at_item:
+                        segment = cursor
                 else:
-                    at_item = words[cursor] == ";"
+                    word = words[cursor]
+                    if word == ";":
+                        at_item = syntax == NestedSyntax.STATEMENTS
+                        segment = cursor + 1
+                    elif word == ",":
+                        at_field = syntax in {NestedSyntax.FIELDS, NestedSyntax.VARIANTS}
+                        at_item = syntax == NestedSyntax.ARMS
+                        segment = cursor + 1
+                    elif word == "=>" and syntax == NestedSyntax.ARMS:
+                        at_item = True
+                        segment = cursor + 1
+                    else:
+                        at_item = False
                     cursor += 1
             return True
 
@@ -206,6 +354,8 @@ class SourceSites:
         return reading
 
     def owner_chain(self, line: int) -> tuple[tuple[str, ...], ...]:
+        if any(line in item.unproved_lines for item in self.items):
+            raise UnreadableSourceItems("site inside an unproved owner body")
         return tuple(item.identity for item in self.items if item.first <= line <= item.last)
 
     def same_owner(self, old_line: int, other: SourceSites, new_line: int) -> bool:

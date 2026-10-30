@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 import os
@@ -33,37 +32,10 @@ def field(value: str) -> str:
     return " ".join(value.split())
 
 
-@dataclass(frozen=True)
-class SessionLabels:
-    session: str
-    showrunner: str = "—"
-    director: str = "—"
-
-
-def session_labels(entries: Sequence[roster.RosterEntry]) -> dict[str, SessionLabels]:
-    labels: dict[str, SessionLabels] = {}
-    for entry in entries:
-        showrunner = director = "—"
-        if isinstance(entry.showrunner, roster.UnderShowrunner):
-            showrunner = entry.showrunner.name
-        elif isinstance(entry.showrunner, roster.RunsProduction):
-            showrunner = entry.name
-        if isinstance(entry.director, roster.UnderDirector):
-            director = entry.director.name
-        elif isinstance(entry.director, roster.DirectsUnit):
-            director = entry.name
-        identity = SessionLabels(field(entry.name), field(showrunner), field(director))
-        if entry.kind == "claude" and isinstance(entry.session, roster.ClaudeSession):
-            labels[entry.session.session_id] = identity
-        elif entry.kind == "codex" and isinstance(entry.thread, roster.CodexThread):
-            labels[entry.thread.thread_id] = identity
-    return labels
-
-
 def step_labels(step: memory_admit.RunningStep | memory_admit.WaitingStep,
-                labels: Mapping[str, SessionLabels]) -> SessionLabels:
+                labels: Mapping[str, roster.UnitLabels]) -> roster.UnitLabels:
     folder = step.folder.rstrip("/").rpartition("/")[2] or "unknown"
-    return labels.get(step.session_id, SessionLabels(field(step.session_name) or folder))
+    return labels.get(step.session_id, roster.UnitLabels(field(step.session_name) or folder))
 
 
 def read_roster() -> roster.Roster:
@@ -117,7 +89,7 @@ def head_reason_text(reason: memory_admit.HeadAdmissionStatus, zone: ZoneInfo) -
 
 
 def reason_text(step: memory_admit.WaitingStep, view: memory_admit.QueueView, zone: ZoneInfo,
-                labels: Mapping[str, SessionLabels]) -> str:
+                labels: Mapping[str, roster.UnitLabels]) -> str:
     reason = step.reason
     match reason:
         case memory_admit.ReadingUnavailable():
@@ -130,7 +102,7 @@ def reason_text(step: memory_admit.WaitingStep, view: memory_admit.QueueView, zo
         case memory_admit.NeedsMemory():
             return free_memory_text(reason.threshold, reason.need, reason.growth, reason.reserve, reason.head_need)
         case memory_admit.BehindHead():
-            head = labels.get(reason.head_session_id, SessionLabels(field(reason.head_name)))
+            head = labels.get(reason.head_session_id, roster.UnitLabels(field(reason.head_name)))
             return (f"behind {head.session} "
                     + f"(waiting {age(reason.head_since, view.now)} min)")
         case memory_admit.HeadAdmissionStatus():
@@ -157,9 +129,9 @@ def local_minute(minute: int, zone: ZoneInfo) -> str:
 
 def render_queue(view: memory_admit.QueueView, zone: ZoneInfo,
                  entries: Sequence[roster.RosterEntry] = (), problems: Sequence[str] = ()) -> list[str]:
-    labels = session_labels(entries)
-    running_header = ["#", "Showrunner", "Unit director", "Session", "Step", "Folder", "Promised", "Using", "Delta", "State"]
-    waiting_header = ["#", "Showrunner", "Unit director", "Session", "Step", "Folder", "Waiting since", "Needs", "Free", "Reason"]
+    labels = roster.unit_labels(entries)
+    running_header = ["#", "Showrunner", "Unit", "Session", "Step", "Folder", "Promised", "Using", "Delta", "State"]
+    waiting_header = ["#", "Showrunner", "Unit", "Session", "Step", "Folder", "Waiting since", "Needs", "Free", "Reason"]
     lines = ["**Running**", "", table_row(running_header), table_row(["---"] * len(running_header))]
     promised_total, measured_total, position = 0, 0, 0
     for step in view.running:
@@ -177,7 +149,7 @@ def render_queue(view: memory_admit.QueueView, zone: ZoneInfo,
         promised_total += step.promise
         folder = step.folder.rstrip("/").rpartition("/")[2] or "unknown"
         identity = step_labels(step, labels)
-        lines.append(table_row([str(position), identity.showrunner, identity.director, identity.session, step.step, folder,
+        lines.append(table_row([str(position), identity.showrunner, identity.unit, identity.session, step.step, folder,
                                 memory_text(step.promise), using, delta, state]))
     if not position:
         lines.append(table_row(["empty"] + [""] * (len(running_header) - 1)))
@@ -188,7 +160,7 @@ def render_queue(view: memory_admit.QueueView, zone: ZoneInfo,
         since = local_minute(int(step.since // 60), zone)
         folder = step.folder.rstrip("/").rpartition("/")[2] or "unknown"
         identity = step_labels(step, labels)
-        lines.append(table_row([str(position), identity.showrunner, identity.director, identity.session, step.step, folder,
+        lines.append(table_row([str(position), identity.showrunner, identity.unit, identity.session, step.step, folder,
                                 f"{since} ({age(step.since, view.now)} min)",
                                 memory_text(step.need), free, reason_text(step, view, zone, labels)]))
     if not view.waiting:
@@ -196,11 +168,11 @@ def render_queue(view: memory_admit.QueueView, zone: ZoneInfo,
     lines.extend(["", f"Totals: promised {memory_text(promised_total)}; measured {memory_text(measured_total)}; "
                   + f"free {memory_text(view.available)}; reserve {memory_text(view.reserve)}"])
     if problems:
-        lines.append(f"Roster: {field(problems[0])}; Showrunner and Unit director show — for unmatched steps")
+        lines.append(f"Roster: {field(problems[0])}; Showrunner and Unit show — for unmatched steps")
     return lines
 
 
-def bump_selector(selector: str, view: memory_admit.QueueView, labels: Mapping[str, SessionLabels]) -> str:
+def bump_selector(selector: str, view: memory_admit.QueueView, labels: Mapping[str, roster.UnitLabels]) -> str:
     matches = [(position, step) for position, step in enumerate(view.waiting, 1)
                if step_labels(step, labels).session == selector]
     if len(matches) > 1:
@@ -227,7 +199,7 @@ def main() -> int:
         view, sessions = read_queue_and_roster()
         if arguments.command == "bump":
             actor = caller()
-            labels = session_labels(sessions.entries)
+            labels = roster.unit_labels(sessions.entries)
             moved = memory_admit.bump_waiter(bump_selector(arguments.selector, view, labels), actor)
             print(f"{field(actor)} moved {step_labels(moved, labels).session}: "
                   + f"{field(moved.step)} in {field(moved.folder)} to the head; memory limits still apply")

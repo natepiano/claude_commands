@@ -1,8 +1,8 @@
-"""Keep a Claude session's pane identity and shown tab title current.
+"""Keep a Claude session's tab and pane names current.
 
 A launcher titles the tab with the name it gives the session. A later `/rename` changes only
-the session record, so at the end of each turn this hook updates the pane's identity and the tab's
-shown title, and orders changed tabs again. It acts only in a pane of the shared herdr
+the session record, so at the end of each turn this hook updates both names
+and orders changed tabs again. It acts only in a pane of the shared herdr
 session, and it never stops the turn: a fault leaves the title as it was.
 """
 
@@ -48,20 +48,7 @@ def sync(payload: StopPayload, environment: Mapping[str, str]) -> bool:
     name = current_name(session_id)
     if not name:
         return False
-    production = environment.get("SHOWRUNNER_UNIT", "")
-    unit = environment.get("SHOWRUNNER_UNIT_ID", "")
-    if not production:
-        # Timer records identify showrunners without a roster or process scan.
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
-        import showrunners
-
-        state = Path(environment.get("NOTIFIER_STATE_DIR") or os.environ.get("NOTIFIER_STATE_DIR")
-                     or Path.home() / ".local/state/notifier")
-        doc = showrunners.production_of(session_id, state)
-        if doc is not None:
-            production = showrunners.production_slug(str(doc))
-    title = herdr.session_title(name, production, unit)
-    return herdr.Herdr(shared).retitle(pane, title, label=name)
+    return herdr.Herdr(shared).retitle(pane, name)
 
 
 def main() -> int:
