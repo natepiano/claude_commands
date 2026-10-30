@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Explain the first waiting build from admission's own read-only snapshot."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+import io
+import os
+from pathlib import Path
+import sys
+import unicodedata
+from contextlib import redirect_stderr
+from typing import assert_never
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.build_queue import build_queue
+from scripts.lint import memory_admit as gate
+from scripts.lib.user_zone import user_zone
+from scripts.message import roster
+
+
+def gib(value: int) -> str:
+    return f"{value / gate.GIB:.1f} GiB"
+
+
+def minute(instant: float, zone: ZoneInfo) -> str:
+    return datetime.fromtimestamp(instant, zone).strftime("%H:%M")
+
+
+def _terminal_width(text: str) -> int:
+    return sum(0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+               for char in text)
+
+
+def aligned_table(headers: Sequence[str], rows: Sequence[Sequence[str]], numeric: frozenset[int]) -> list[str]:
+    widths = [max(_terminal_width(header), *(_terminal_width(row[index]) for row in rows))
+              for index, header in enumerate(headers)]
+
+    def row_text(row: Sequence[str]) -> str:
+        cells = [(" " * (widths[index] - _terminal_width(cell)) + cell) if index in numeric
+                 else (cell + " " * (widths[index] - _terminal_width(cell)))
+                 for index, cell in enumerate(row)]
+        return "| " + " | ".join(cells) + " |"
+
+    return [row_text(headers), *(row_text(row) for row in rows)]
+
+
+def charge_text(basis: gate.ChargeBasis, zone: ZoneInfo) -> str:
+    if isinstance(basis, gate.PromiseNoReading):
+        return "promise: no reading yet"
+    if isinstance(basis, gate.RampPromise):
+        return f"ramp promise: first {gate.RAMP_SECONDS // 60} min after admission"
+    if isinstance(basis, gate.PeakSoFar):
+        text = f"compiling, peak so far {gib(basis.bytes)}"
+        if isinstance(basis.peak_at, float):
+            text += f" at {minute(basis.peak_at, zone)}"
+        if basis.old_sampler:
+            text += "; old-sampler rule: peak drops 25 min after its last new peak"
+        return text
+    if isinstance(basis, gate.PeakDecayed):
+        text = f"peak decayed at {minute(basis.decayed_at, zone)}; using now"
+        if basis.old_sampler:
+            text += "; old-sampler rule: peak drops 25 min after its last new peak"
+        return text
+    if isinstance(basis, gate.PeakFileUnreadable):
+        return "peak file unreadable: promise kept"
+    if isinstance(basis, gate.UsingNow):
+        return "using now"
+    match basis:
+        case gate.EndedCharge():
+            return "step ended"
+        case _:
+            assert_never(basis)
+
+
+def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:
+    if isinstance(source, gate.NeedSourceNotRecorded):
+        return "source not recorded"
+    if source.source == "measured":
+        text = f"measured process-memory p90 of {source.runs} runs"
+    elif source.source == "buildlog":
+        text = f"build-log peak × {gate.ANON_SHARE:.2f} of {source.runs} runs"
+    elif source.source == "pooled":
+        text = f"pooled over all repos, {source.runs} runs"
+    elif source.source == "fallback":
+        text = "fallback: fewer than 5 runs"
+    else:
+        assert_never(source.source)
+    text += f", last {source.history_days} days"
+    if source.scope == "filtered":
+        text += f", filtered tests ({source.package}, {len(source.filters)} filters)"
+    else:
+        text += ", full tests" if source.package else ", full scope"
+    if isinstance(source.test_threads, int):
+        text += f", width {source.test_threads}"
+    return text
+
+
+def budget_text(check: gate.BudgetCheck) -> str:
+    total = check.charged + check.need + check.head_need
+    terms = f"charged {check.charged / gate.GIB:.1f} + need {check.need / gate.GIB:.1f}"
+    if check.head_need:
+        terms += f" + head need {check.head_need / gate.GIB:.1f}"
+    relation = "<=" if total <= check.budget else ">"
+    result = "pass" if check.passes else "blocked"
+    exception = "; run-alone exception" if check.passes and total > check.budget else ""
+    return (f"Build budget: {terms} = {gib(total)} {relation} {gib(check.budget)}: {result}{exception}; "
+            + f"starts when charged falls to {gib(check.starts_at)}")
+
+
+def free_text(check: gate.FreeCheck) -> str:
+    terms = f"need {check.need / gate.GIB:.1f} + earlyoom {check.reserve / gate.GIB:.1f}"
+    terms += f" + promise not yet used {check.growth / gate.GIB:.1f}"
+    if check.head_need:
+        terms += f" + head need {check.head_need / gate.GIB:.1f}"
+    relation = ">=" if check.passes else "<"
+    result = "pass" if check.passes else "blocked"
+    return f"Free memory: free {gib(check.available)} {relation} {terms} = {gib(check.threshold)}: {result}"
+
+
+def pressure_text(pressure: gate.MemoryPressure, zone: ZoneInfo) -> str:
+    if pressure.next_start_at:
+        return f"recovery spacing: starts 30 s apart, next start at {minute(pressure.next_start_at, zone)}"
+    return (f"memory pressure: full avg10 {pressure.full_avg10:.1f}%, "
+            + f"some avg10 {pressure.some_avg10:.1f}%, swap used {pressure.swap_used_percent:.1f}%")
+
+
+def release_text(explanation: gate.QueueExplanation,
+                 labels: Mapping[str, roster.UnitLabels]) -> str:
+    release = gate.smallest_head_release(explanation)
+    if isinstance(release, gate.HeadAdmitsAfterEnd):
+        if not release.ended:
+            return "no running step needs to end"
+        names = [build_queue.step_labels(explanation.running[index].step, labels).session
+                 + " " + explanation.running[index].step.step for index in release.ended]
+        return (f"{' + '.join(names)} end (budget charge drops {gib(release.charge_drop)}; "
+                + f"free memory rises {gib(release.freed)} and promise not yet used drops {gib(release.growth_drop)})")
+    if isinstance(release, gate.HeadStillHeld):
+        return "all running steps ending still leaves " + ", ".join(release.causes) + " holding the head"
+    if isinstance(release, gate.ReadingUnavailable):
+        return "admission memory reading unavailable"
+    return "nothing waits"
+
+
+def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
+                       labels: Mapping[str, roster.UnitLabels]) -> list[str]:
+    host = explanation.host
+    if isinstance(host, gate.ReadingUnavailable):
+        raise ValueError("host memory unavailable")
+    total = gib(host.total) if isinstance(host.total, int) else "total unavailable"
+    header = (f"Build queue at {minute(explanation.now, zone)}: free {gib(host.available)} of {total}; "
+              + f"build charges {gib(explanation.totals.charged)} of {gib(host.budget)} budget")
+    if isinstance(host.pressure, gate.MemoryPressure):
+        header += "; " + pressure_text(host.pressure, zone)
+    load_path = Path(os.environ.get("BUILDLOG_PROC", "/proc")) / "loadavg"
+    try:
+        load = float(load_path.read_text().split()[0])
+        header += f"; load {load:.2f} (1 min) on {os.cpu_count() or 1} cores"
+    except (OSError, ValueError, IndexError):
+        header += "; load unavailable"
+    lines = [header, "", "Running:"]
+    rows: list[list[str]] = []
+    for running in explanation.running:
+        identity = build_queue.step_labels(running.step, labels)
+        rows.append([build_queue.field(cell) for cell in (
+            identity.showrunner, identity.unit, identity.session, running.step.step,
+            (f"{build_queue.age(running.admitted_at, explanation.now)} min"
+             if isinstance(running.admitted_at, float) else "—"), gib(running.promise),
+            gib(running.charged), gib(running.measured), charge_text(running.basis, zone))])
+    if rows:
+        lines.extend(aligned_table(("Showrunner", "Unit", "Session", "Step", "Age", "Promise", "Charged",
+                                    "Using now", "Charge basis"), rows, frozenset((4, 5, 6, 7))))
+    else:
+        lines.append("None.")
+    lines.append(f"Total: charged {gib(explanation.totals.charged)}, using {gib(explanation.totals.measured)}")
+    head = explanation.head
+    if isinstance(head, gate.NoWaiter):
+        return [*lines, "", "Nothing waits."]
+    identity = build_queue.step_labels(head.waiter, labels)
+    lines.extend(("", f"First in line: {identity.showrunner} / {identity.unit} / {identity.session}, "
+        + f"{head.waiter.step}; waiting {build_queue.age(head.waiter.since, explanation.now)} min; "
+        + f"need {gib(head.waiter.need)}; {need_text(head.need_source)}", "",
+        budget_text(head.budget), free_text(head.free)))
+    if isinstance(head.decision.pressure, gate.MemoryPressure):
+        lines.append("Pressure: " + pressure_text(head.decision.pressure, zone))
+    deadline = minute(head.order.deadline, zone)
+    order = (f"strict until {deadline}: younger steps wait" if isinstance(head.order, gate.StrictUntil)
+             else f"backfill until {deadline}: younger steps that fit may start")
+    if not head.has_priority and isinstance(head.order, gate.StrictUntil):
+        order += "; head priority is not active"
+    if isinstance(head.bump, gate.QueueBump):
+        kind = "bumped by position" if head.bump.by_position else "head priority recorded"
+        order += f"; {kind} at {minute(head.bump.priority_since, zone)}"
+    lines.extend(("", "Order rule: " + order))
+    line = explanation.line
+    lines.append(f"The line: {line.count} waiting behind it; {line.fitting} would fit now under both checks; "
+                 + f"needs from {line.smallest_need / gate.GIB:.1f} to {gib(line.largest_need)}; "
+                 + f"oldest wait {build_queue.age(line.oldest_since, explanation.now)} min")
+    causes: list[str] = []
+    if not head.budget.passes:
+        causes.append("build budget")
+    if not head.free.passes:
+        causes.append("free memory")
+    if isinstance(head.decision.pressure, gate.MemoryPressure):
+        causes.append(pressure_text(head.decision.pressure, zone))
+    if head.decision.state == "admit":
+        causes = ["ready for the next admission check"]
+    elif not causes:
+        causes = ["queue order"]
+    releases = release_text(explanation, labels)
+    if isinstance(head.decision.pressure, gate.MemoryPressure):
+        releases += "; the pressure hold or recovery spacing must also clear"
+    lines.extend(("", "Waiting because: " + ", ".join(causes) + ". Frees when: " + releases + "."))
+    return lines
+
+
+def main() -> int:
+    try:
+        # A damaged recovery record must not turn the one-line failure protocol into a traceback.
+        with redirect_stderr(io.StringIO()):
+            explanation = gate.explain_queue()
+            session_ids = [row.step.session_id for row in explanation.running]
+            if isinstance(explanation.head, gate.HeadExplanation):
+                session_ids.append(explanation.head.waiter.session_id)
+            labels = roster.unit_labels_for(session_ids, os.environ)
+            lines = render_explanation(explanation, user_zone(), labels)
+    except Exception:
+        print("build-why: the admission state could not be read.")
+        return 2
+    print("\n".join(lines))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

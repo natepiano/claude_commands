@@ -54,6 +54,10 @@ LintTool = Literal["clippy", "mend", "rustfmt"]
 ProcessedTipReason = Literal["linted", "own hand-off"]
 # How long every ledger connection waits for another writer's lock before it fails.
 BUSY_TIMEOUT_SECONDS = 30
+FINDING_REPLACEMENT_GUIDANCE = (
+    "The After text replaces the whole Before span. Supply the full replacement, never the old wording with a new line added. "
+    + "Rewrite a comment to name the constructs and keep every reason."
+)
 
 
 class DeclaredInputScope(StrEnum):
@@ -1011,6 +1015,14 @@ class BuiltRename:
 
 
 @dataclass(frozen=True)
+class BuiltRenameEvidence:
+    """Built findings and their rename sites at one ledger version and repository tip."""
+
+    findings: tuple[HeldFinding, ...]
+    renames: tuple[BuiltRename, ...]
+
+
+@dataclass(frozen=True)
 class UnrestrictedTraitMembership:
     """The declaration is not an impl or trait member, so trait membership does not restrict it."""
 
@@ -1341,6 +1353,39 @@ def removed_cell(ticket_id: str, rule: str, path: str, commit: str) -> RemovedCe
 
 def removed_line(removed: RemovedCell) -> str:
     return f"{removed['rule']} {removed['path']}: {removed['state']}"
+
+
+@dataclass(frozen=True)
+class BatchOwner:
+    """The durable batch intent that exclusively owns a ticket claim."""
+
+    batch: str
+
+    def __post_init__(self) -> None:
+        if not self.batch:
+            raise ValueError("a batch owner requires a batch id")
+
+
+@dataclass(frozen=True)
+class UnbatchedTicket:
+    """An ordinary or legacy ticket has no batch recovery owner."""
+
+
+UNBATCHED_TICKET = UnbatchedTicket()
+
+
+@dataclass(frozen=True)
+class UnrestrictedTicketOwner:
+    """Ordinary ticket operations do not require a batch recovery owner."""
+
+
+_UNRESTRICTED_TICKET_OWNER = UnrestrictedTicketOwner()
+
+
+class TicketBatchMismatch(LedgerError):
+    def __init__(self, ticket: str, owner: BatchOwner | UnbatchedTicket) -> None:
+        description = f"batch {owner.batch}" if isinstance(owner, BatchOwner) else "no batch owner"
+        super().__init__(f"{ticket}: kept unchanged; ledger records {description}")
 
 
 class TicketRecord(TypedDict):
@@ -2013,6 +2058,12 @@ MIGRATIONS = {
             ticket TEXT PRIMARY KEY, predecessor TEXT NOT NULL
         );
     """,
+    # Claim ownership is immutable and independent of checkpoint proof sharing.
+    28: """
+        CREATE TABLE IF NOT EXISTS ticket_batch_owners (
+            ticket TEXT PRIMARY KEY REFERENCES tickets(id), batch TEXT NOT NULL CHECK(batch <> '')
+        );
+    """,
 }
 
 
@@ -2107,6 +2158,7 @@ class Ledger:
         self._site_maps: dict[tuple[str, str, str], dict[int, int]] = {}
         self._site_evidence: dict[tuple[HeldFinding, str], SiteEvidence] = {}
         self._follow_evidence: dict[tuple[HeldFinding, str], SiteEvidence] = {}
+        self._built_rename_evidence: dict[str, BuiltRenameEvidence] = {}
         self._site_rows_version: tuple[int, int] = (-1, -1)
         self._site_rows: dict[tuple[str, str], tuple[Judgment, ...]] = {}
         self._site_holding_rows: dict[tuple[str, str], list[tuple[str, Judgment]]] = {}
@@ -2116,6 +2168,7 @@ class Ledger:
         self._extern_names: dict[tuple[str, str], frozenset[str] | UnresolvedTypeArguments] = {}
         self._crate_names: dict[tuple[str, str, str], bool] = {}
         self._outside_bodies: dict[tuple[str, str, str, DeclaredItem, str, DeclaredItem], tuple[int, int, tuple[OutsideFailure, ...]]] = {}
+        self._item_bodies: dict[tuple[str, str, DeclaredItem], declarations.ReadableBody | declarations.UnreadableBody] = {}
         database.parent.mkdir(parents=True, exist_ok=True)
         self._connection: sqlite3.Connection = sqlite3.connect(database, timeout=BUSY_TIMEOUT_SECONDS)
         try:
@@ -2332,6 +2385,7 @@ class Ledger:
         files: list[str], rules: list[str], rule: str = "", sites: list[dict[str, object]] | None = None,
         proposal: str = "", cells: tuple[tuple[str, str], ...] = (),
         finding_ids: tuple[str, ...] = (),
+        *, batch_owner: BatchOwner | UnbatchedTicket = UNBATCHED_TICKET,
     ) -> None:
         if kind == "listed" and (not rule or rule not in rules or rule.endswith("#uncovered")):
             raise LedgerError(f"{id}: listed ticket requires its canonical rule in rules")
@@ -2355,6 +2409,8 @@ class Ledger:
             exists = cast(list[tuple[str]], self._connection.execute("SELECT id FROM tickets WHERE id=?", (id,)).fetchall())
             if exists:
                 previous = self._ticket(id)
+                if self.ticket_batch_owner(id) != batch_owner:
+                    raise LedgerError(f"{id}: ticket already exists with a different batch owner")
                 if (previous["unit"], previous["kind"], previous["family"], previous["crate"], previous["files"], previous["rules"], previous["rule"], previous["sites"], previous["proposal"], previous["cells"], previous["finding_ids"]) != (unit, kind, family, crate, files, rules, rule, sites or [], proposal, [list(cell) for cell in cells], list(finding_ids)):
                     raise LedgerError(f"{id}: ticket already exists in state {previous['state']} with different fields")
                 return True
@@ -2406,12 +2462,22 @@ class Ledger:
                     (id, unit, kind, family, rule, crate, json.dumps(files), json.dumps(sites or []),
                      json.dumps(rules), json.dumps(pins, sort_keys=True), now, now, proposal, json.dumps(cells), json.dumps(finding_ids)),
                 )
+                if isinstance(batch_owner, BatchOwner):
+                    _ = self._connection.execute(
+                        "INSERT INTO ticket_batch_owners VALUES (?,?)", (id, batch_owner.batch),
+                    )
                 for finding_id in finding_ids:
                     _ = self._connection.execute(
                         "UPDATE held_findings SET build_ticket=?,updated_at=? WHERE finding_id=?", (id, now, finding_id),
                     )
 
         retry_on_change(attempt)
+
+    def ticket_batch_owner(self, id: str) -> BatchOwner | UnbatchedTicket:
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT batch FROM ticket_batch_owners WHERE ticket=?", (id,),
+        ).fetchall())
+        return BatchOwner(rows[0][0]) if rows else UNBATCHED_TICKET
 
     def pinned_rule_texts(self, ticket_id: str) -> tuple[PinnedRuleText, ...]:
         ticket = self._ticket(ticket_id)
@@ -2968,7 +3034,9 @@ class Ledger:
         return False
 
     def _ticket_transition(self, id: str, target: TicketState, commit: str = "", branch: str = "",
-                           reservation: tuple[str, str] = ("", "")) -> tuple[FindingNotBuilt, ...]:
+                           reservation: tuple[str, str] = ("", ""), *,
+                           required_owner: BatchOwner | UnrestrictedTicketOwner = _UNRESTRICTED_TICKET_OWNER,
+                           ) -> tuple[FindingNotBuilt, ...]:
         """Move the ticket to target. A proposal merge returns each of its findings that stays filed.
 
         A checkpoint stores the reservation's run folder and phase in the same write as its state.
@@ -2980,6 +3048,10 @@ class Ledger:
         def arrived(ticket: TicketRecord) -> bool:
             """Whether the ticket is already at target; refuses a move its state does not allow."""
             nonlocal assignment_tip
+            if isinstance(required_owner, BatchOwner):
+                owner = self.ticket_batch_owner(id)
+                if owner != required_owner:
+                    raise TicketBatchMismatch(id, owner)
             if self._ticket_arrived(ticket, target, commit, branch, reservation):
                 return True
             if target == "checkpointed":
@@ -3417,6 +3489,19 @@ class Ledger:
     def ticket_drop(self, id: str) -> None:
         _ = self._ticket_transition(id, "dropped")
 
+    @_ticket_operation("recover")
+    def ticket_drop_batch(self, id: str, owner: BatchOwner) -> None:
+        """Release only this intent's claim, rechecking ownership under the transition write lock."""
+        exists = cast(list[tuple[str]], self._connection.execute("SELECT id FROM tickets WHERE id=?", (id,)).fetchall())
+        if not exists:
+            return
+        actual = self.ticket_batch_owner(id)
+        if actual != owner:
+            raise TicketBatchMismatch(id, actual)
+        if self._ticket(id)["state"] in FINAL_TICKET_STATES:
+            return
+        _ = self._ticket_transition(id, "dropped", required_owner=owner)
+
     def ticket_open(self, unit: str) -> tuple[TicketRecord, ...]:
         rows = cast(list[tuple[str]], self._connection.execute(
             "SELECT id FROM tickets WHERE unit=? AND state IN ('assigned','checkpointed') ORDER BY created_at,id", (unit,),
@@ -3535,6 +3620,12 @@ class Ledger:
             raise LedgerError(f"{rule}: {path} is outside rule reach")
         if kind not in ("rename", "type", "restructure") or line < 1:
             raise LedgerError("held finding requires a valid kind and positive line")
+        before_lines, after_lines = before.splitlines(), after.splitlines()
+        if before_lines and len(after_lines) > len(before_lines) and any(
+            after_lines[start:start + len(before_lines)] == before_lines
+            for start in range(len(after_lines) - len(before_lines) + 1)
+        ):
+            raise LedgerError(f"{rule}: after text must replace the whole before span, not keep it with added lines")
         change = (kind, before, after)
         site = (rule, path, line, text, rule_blob)
         # The first id names the site. When a different change holds it, the change gets the second id, which also names
@@ -4340,8 +4431,8 @@ class Ledger:
                             item: DeclaredItem) -> tuple[int, int, tuple[OutsideFailure, ...]]:
         key = (read, old_path, commit, old, path, item)
         if key not in self._outside_bodies:
-            old_body = declarations.item_body(self._declared_file(read, old_path), old)
-            body = declarations.item_body(self._declared_file(commit, path), item)
+            old_body = self._item_body(read, old_path, old)
+            body = self._item_body(commit, path, item)
             count = len(old_body.lines) if isinstance(old_body, declarations.ReadableBody) else 0
             unchanged = 0
             failures: tuple[OutsideFailure, ...] = ()
@@ -4353,6 +4444,13 @@ class Ledger:
                     failures = (OutsideFailure.BODY_FAILED,)
             self._outside_bodies[key] = (unchanged, count, failures)
         return self._outside_bodies[key]
+
+    def _item_body(self, commit: str, path: str, item: DeclaredItem) -> declarations.ReadableBody | declarations.UnreadableBody:
+        """An immutable item's body is shared by every candidate comparison."""
+        key = (commit, path, item)
+        if key not in self._item_bodies:
+            self._item_bodies[key] = declarations.item_body(self._declared_file(commit, path), item)
+        return self._item_bodies[key]
 
     def _outside_extern_names(self, commit: str, path: str) -> frozenset[str] | UnresolvedTypeArguments:
         """Read extern names only to refuse argument proof, never to resolve an alias."""
@@ -4732,6 +4830,7 @@ class Ledger:
         self._site_rows_version = version
         self._site_evidence.clear()
         self._follow_evidence.clear()
+        self._built_rename_evidence.clear()
         pinned = cast(list[tuple[str, bytes]], self._connection.execute("SELECT blob,text FROM rule_texts").fetchall())
         self._site_rule_families.clear()
         for blob, text in pinned:
@@ -4829,12 +4928,22 @@ class Ledger:
 
     def finding_site(self, finding: HeldFinding, at: str) -> SiteEvidence:
         """The shared follow result consumed by filing and both refill rank gates."""
+        return self.finding_sites((finding,), at)[finding.finding_id]
+
+    def finding_sites(self, findings: Iterable[HeldFinding], at: str) -> dict[str, SiteEvidence]:
+        """Read missing site evidence together; changed rows never borrow another row's proof."""
+        requested = tuple(findings)
+        if not requested:
+            return {}
         self._refresh_site_rows()
         tip = self._tip(at)
-        key = (finding, tip.commit)
-        if key not in self._follow_evidence:
-            _ = self._declaration_reading((finding.finding_id,), tip, lambda _: False)
-        return self._follow_evidence.get(key, NeedsJudgment("finding changed while reading"))
+        missing = tuple(dict.fromkeys(finding.finding_id for finding in requested
+                                      if (finding, tip.commit) not in self._follow_evidence))
+        if missing:
+            _ = self._declaration_reading(missing, tip, lambda _: False)
+        return {finding.finding_id: self._follow_evidence.get((finding, tip.commit),
+                                                             NeedsJudgment("finding changed while reading"))
+                for finding in requested}
 
     def _site_after_refusal(self, outcome: DeclarationNotRead | DeclarationInPlace, tip: RepositoryTip) -> DeclarationOutcome:
         evidence = self._site_proof(outcome.finding, tip.commit)
@@ -5292,10 +5401,10 @@ class Ledger:
                 found[path] = current
         return found
 
-    def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip,
-                             approved: Callable[[Path], bool]) -> DeclarationReading:
-        self._prepare_sites(tuple(self._held(finding_id) for finding_id in finding_ids), tip)
-        rust_files = frozenset(tip.rust_files)
+    def _built_renames(self, tip: RepositoryTip) -> BuiltRenameEvidence:
+        self._refresh_site_rows()
+        if tip.commit in self._built_rename_evidence:
+            return self._built_rename_evidence[tip.commit]
         built_renames: list[BuiltRename] = []
         built_findings = self.held_findings(HeldFindingsInState("built"))
         for finding in built_findings:
@@ -5316,10 +5425,18 @@ class Ledger:
                     rename, finding.path, read.commit, before_path, judged.commit, finding.state.proposal,
                     self._trait_site_position(judged.commit, before_path, before_line, finding.before),
                     self._trait_site_position(read.commit, finding.path, finding.line, finding.after)))
-        renames = tuple(built_renames)
+        evidence = BuiltRenameEvidence(built_findings, tuple(built_renames))
+        self._built_rename_evidence[tip.commit] = evidence
+        return evidence
+
+    def _declaration_reading(self, finding_ids: tuple[str, ...], tip: RepositoryTip,
+                             approved: Callable[[Path], bool]) -> DeclarationReading:
+        self._prepare_sites(tuple(self._held(finding_id) for finding_id in finding_ids), tip)
+        rust_files = frozenset(tip.rust_files)
+        built = self._built_renames(tip)
         self._refresh_site_rows()
-        outcomes = tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, renames,
-                                                   built_findings) for finding_id in finding_ids)
+        outcomes = tuple(self._declaration_outcome(self._held(finding_id), tip, rust_files, approved, built.renames,
+                                                   built.findings) for finding_id in finding_ids)
         for outcome in outcomes:
             finding = outcome.finding
             if isinstance(outcome, FindingSite):
@@ -6651,8 +6768,10 @@ def main() -> None:
             elif name == "tip":
                 _ = command.add_argument("--tip", required=True)
             elif action == "add":
-                for field in ("rule", "path", "text", "before", "after", "rule-blob", "ticket"):
+                for field in ("rule", "path", "text", "rule-blob", "ticket"):
                     _ = command.add_argument(f"--{field}", required=True)
+                _ = command.add_argument("--before", required=True, help="The whole span to replace. " + FINDING_REPLACEMENT_GUIDANCE)
+                _ = command.add_argument("--after", required=True, help=FINDING_REPLACEMENT_GUIDANCE)
                 _ = command.add_argument("--line", type=int, required=True)
                 _ = command.add_argument("--kind", choices=("rename", "type", "restructure"), required=True)
             elif action == "list":

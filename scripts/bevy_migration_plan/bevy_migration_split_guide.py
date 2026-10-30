@@ -10,11 +10,17 @@ Usage:
 """
 
 import argparse
+import hashlib
+import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, cast
+
+COMPLETION = ".split-complete.json"
 
 
 class Section(NamedTuple):
@@ -118,49 +124,87 @@ def parse_sections(content: str) -> list[Section]:
     return sections
 
 
+class GuidePublication:
+    """A complete staged set replaces the live directory; the previous set survives until then."""
+
+    def __init__(self, live: Path) -> None:
+        self.live: Path = live
+        self.staging: Path = live.with_name(f".{live.name}.staging")
+        self.previous: Path = live.with_name(f".{live.name}.previous")
+
+    def recover(self) -> None:
+        if not self.live.exists() and self.previous.exists():
+            if (self.staging / COMPLETION).is_file():
+                os.replace(self.staging, self.live)
+            else:
+                os.replace(self.previous, self.live)
+        if (self.live / COMPLETION).is_file():
+            # The marker certifies publication, not immutable content: preserve later user edits.
+            for obsolete in (self.staging, self.previous):
+                if obsolete.exists():
+                    shutil.rmtree(obsolete)
+
+
 def write_sections(sections: list[Section], output_dir: Path) -> int:
-    """Write sections to individual files."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for existing in output_dir.glob("*.md"):
-        existing.unlink()
-
-    used_filenames: set[str] = set()
-    written = 0
-
+    """Build a complete directory before either publication rename."""
+    publication = GuidePublication(output_dir)
+    publication.recover()
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    if publication.staging.exists():
+        shutil.rmtree(publication.staging)
+    publication.staging.mkdir()
+    manifest: dict[str, str] = {}
     for section in sections:
         filename = section.filename
         counter = 1
-        while filename in used_filenames:
-            base = section.filename.rsplit('.', 1)[0]
-            filename = f"{base}_{counter}.md"
+        while filename in manifest:
+            filename = f"{section.filename.rsplit('.', 1)[0]}_{counter}.md"
             counter += 1
-
-        used_filenames.add(filename)
-
-        filepath = output_dir / filename
+        filepath = publication.staging / filename
         _ = filepath.write_text(section.content)
-        written += 1
+        manifest[filename] = hashlib.sha256(filepath.read_bytes()).hexdigest()
+    _ = (publication.staging / COMPLETION).write_text(json.dumps(manifest, sort_keys=True) + "\n")
+    if output_dir.exists():
+        os.replace(output_dir, publication.previous)
+    os.replace(publication.staging, output_dir)
+    if publication.previous.exists():
+        shutil.rmtree(publication.previous)
+    return len(manifest)
 
-    return written
+
+def guides_complete(output_dir: Path) -> bool:
+    """A published set, or a legacy set with no interrupted swap, belongs to its user."""
+    publication = GuidePublication(output_dir)
+    publication.recover()
+    if not output_dir.is_dir():
+        return False
+    if (output_dir / COMPLETION).is_file():
+        return True
+    return (not publication.staging.exists() and not publication.previous.exists()
+            and any(output_dir.glob("*.md")))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Split consolidated Bevy migration guide into individual files"
     )
+    _ = parser.add_argument("--check-dir", type=Path)
     _ = parser.add_argument(
         "--version",
-        required=True,
         help="Bevy version (e.g., 0.18.0)"
     )
     _ = parser.add_argument(
         "--output-dir",
-        required=True,
         help="Output directory for individual guide files"
     )
 
     args = parser.parse_args()
+
+    check_dir = cast(object, getattr(args, "check_dir"))
+    if isinstance(check_dir, Path):
+        sys.exit(0 if guides_complete(check_dir) else 1)
+    if not args.version or not args.output_dir:  # pyright: ignore[reportAny]
+        parser.error("--version and --output-dir are required")
 
     version: str = str(getattr(args, "version"))  # pyright: ignore[reportAny]
     output_dir_arg: str = str(getattr(args, "output_dir"))  # pyright: ignore[reportAny]

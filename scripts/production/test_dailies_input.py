@@ -11,7 +11,7 @@ import sys
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import TextIO, cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -1354,6 +1354,37 @@ class DailiesInputTests(DailiesInputFixture):
         result = self.run_builder()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.unit()["eta"], {"none": "no ETA stated yet"})
+
+    def test_eta_request_output_is_retried_after_an_interrupted_input_run(self) -> None:
+        self.open_phase_record(eta={
+            "time": "2026-10-06T23:40:00+00:00", "earliest": None, "latest": None,
+            "source": "stated", "stated_at": "2026-10-06T23:30:00+00:00",
+            "basis": "the panel pass remained", "as_of": None,
+        })
+        self.status_lines(f"== {ALPHA}", "● Checking panel labels")
+        expected = self.run_builder()
+        self.assertEqual(expected.returncode, 0, expected.stdout + expected.stderr)
+        requests = [line for line in expected.stdout.splitlines() if line.startswith("request /unit:eta:")]
+        self.assertEqual(requests, [f"request /unit:eta: {ALPHA}"])
+        seen = self.state / "eta_seen.json"
+        expected_seen = seen.read_bytes()
+        expected_report = self.output.read_bytes()
+        seen.unlink()
+        real_print = print
+
+        def stop_request(*values: object, sep: str | None = None, end: str | None = "\n",
+                         file: TextIO | None = None, flush: bool = False) -> None:
+            if values and str(values[0]).startswith("request /unit:eta:"):
+                raise RuntimeError("output stopped")
+            real_print(*values, sep=sep, end=end, file=file, flush=flush)
+
+        with mock.patch("builtins.print", side_effect=stop_request), self.assertRaises(RuntimeError):
+            _ = self.run_builder()
+        retried = self.run_builder()
+        self.assertEqual(retried.returncode, 0, retried.stdout + retried.stderr)
+        self.assertEqual([line for line in retried.stdout.splitlines() if line.startswith("request /unit:eta:")], requests)
+        self.assertEqual(seen.read_bytes(), expected_seen)
+        self.assertEqual(self.output.read_bytes(), expected_report)
 
     def test_eta_request_first_makes_no_eta_report_requested_without_repeating_request(self) -> None:
         self.status_lines(f"== {ALPHA}", "● Checking panel labels")

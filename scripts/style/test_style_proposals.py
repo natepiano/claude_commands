@@ -2204,6 +2204,17 @@ class StyleProposalsTests(unittest.TestCase):
             self.assertEqual(self.calls, [])
             self.assertEqual(ledger.held_findings(style_ledger.HeldFindingsInState("unfiled")), (finding,))
 
+    def test_issue_examples_define_after_as_the_whole_before_span_replacement(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.hold(ledger)
+            issue, = self.file(ledger)
+        body = issue.read_text()
+        self.assertIn("The After text replaces the whole Before span.", body)
+        self.assertIn("never the old wording with a new line added", body)
+        self.assertIn("Rewrite a comment to name the constructs and keep every reason.", body)
+        self.assertIn("Before:\n```\n" + finding.before + "\n```", body)
+        self.assertIn("After:\n```\n" + finding.after + "\n```", body)
+
     def test_decisions_group_by_rule_and_crate_with_ledger_sites_and_issue_fields(self) -> None:
         with self.ledger() as ledger:
             first = self.hold(ledger)

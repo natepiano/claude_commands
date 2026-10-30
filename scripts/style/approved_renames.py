@@ -795,14 +795,26 @@ class _BindingScan:
         return frozenset(result)
 
 
+class BindingScopeReader:
+    """Binding locations and refusals sharing one immutable source scan."""
+
+    def __init__(self, source: str) -> None:
+        self._scan: _BindingScan | NoBindingScope
+        try:
+            self._scan = _BindingScan(source)
+        except style_footprint.UnreadableTokenSpans as error:
+            self._scan = NoBindingScope(str(error))
+
+    def scope(self, rename: BindingRename) -> BindingScope | NoBindingScope:
+        if isinstance(self._scan, NoBindingScope):
+            return self._scan
+        refusal = self._scan.file_refusal(rename)
+        return NoBindingScope(refusal) if refusal else self._scan.locate(rename)
+
+
 def binding_scope(source: str, rename: BindingRename) -> BindingScope | NoBindingScope:
     """Locate one binding and subtract each inner pattern and scope that shadows its old name."""
-    try:
-        scan = _BindingScan(source)
-    except style_footprint.UnreadableTokenSpans as error:
-        return NoBindingScope(str(error))
-    refusal = scan.file_refusal(rename)
-    return NoBindingScope(refusal) if refusal else scan.locate(rename)
+    return BindingScopeReader(source).scope(rename)
 
 
 RESOLVABLE_NAME_REFUSALS = frozenset({"new name already occurs in file", "old name also occurs as an item or type"})

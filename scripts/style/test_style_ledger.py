@@ -103,7 +103,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
         ledger.ticket_checkpoint("names-9", self.initial_tip)
         schema = {"bulk_workspace_tickets", "bulk_workspace_batch", "ticket_predecessors", "tickets_one_assigned"}
         with closing(sqlite3.connect(ledger.database)) as fresh:
-            self.assertEqual(fresh.execute("SELECT version FROM schema_version").fetchone(), (27,))
+            self.assertEqual(fresh.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
             names = cast(list[tuple[str]], fresh.execute("SELECT name FROM sqlite_master").fetchall())
             self.assertTrue(schema.issubset({row[0] for row in names}))
         for version in (25, 26):
@@ -128,7 +128,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                     with style_ledger.Ledger(self.repo, database):
                         pass
                 with closing(sqlite3.connect(database)) as copy:
-                    self.assertEqual(copy.execute("SELECT version FROM schema_version").fetchone(), (27,))
+                    self.assertEqual(copy.execute("SELECT version FROM schema_version").fetchone(), (max(style_ledger.MIGRATIONS),))
                     names = cast(list[tuple[str]], copy.execute("SELECT name FROM sqlite_master").fetchall())
                     self.assertTrue(schema.issubset({row[0] for row in names}))
                     self.assertEqual(copy.execute("SELECT * FROM tickets").fetchall(), rows)

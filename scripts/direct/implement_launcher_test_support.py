@@ -21,10 +21,11 @@ import unittest
 from pathlib import Path
 from typing import TypedDict, ClassVar, cast, override
 
-from scripts.direct.recorder_fixture import STUB_ATOMIC_JSON_WRITER, communicate_launcher, invoke_recorder
+from scripts.direct.recorder_fixture import (
+    STUB_ATOMIC_JSON_WRITER, TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS,
+    communicate_launcher, invoke_recorder,
+)
 
-
-TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
 
 DIRECT_DIR = Path(__file__).parent
 AGENTS_DIR = DIRECT_DIR.parent / "agents"
@@ -350,10 +351,12 @@ class ImplementLauncherFixture(unittest.TestCase):
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # location, so the copy needs the interpreter shim beside it too.
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "atomic_file.py", lib / "atomic_file.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "nix_env.py", lib / "nix_env.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "codex_models_cache.py", lib / "codex_models_cache.py")
         home_lib = self.root / ".claude" / "scripts" / "lib"
         home_lib.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", home_lib / "py")

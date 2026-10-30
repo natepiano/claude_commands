@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import time
+from tempfile import NamedTemporaryFile
 from typing import Literal, TypedDict, cast
 import unicodedata
 from urllib.error import HTTPError, URLError
@@ -184,6 +185,24 @@ def _pending(path: Path) -> dict[str, float]:
         raise TypeSafeError("Cannot read pending spend reservations") from error
 
 
+def _write_pending(path: Path, pending: Mapping[str, float]) -> None:
+    """A stopped replacement leaves the last complete reservation set intact."""
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                            prefix=path.name + ".", delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            _ = handle.write(json.dumps(pending))
+            handle.flush()
+            os.fsync(handle.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 @contextmanager
 def _reserve(path: Path, maximum_cost: float) -> Generator[str]:
     """Reserve a byte-based upper bound across threads and CLI processes.
@@ -199,14 +218,14 @@ def _reserve(path: Path, maximum_cost: float) -> Generator[str]:
         if spent >= BUDGET_USD or spent + sum(pending.values()) + maximum_cost > BUDGET_USD:
             raise BudgetExceeded(f"TypeSafe spend would exceed the ${BUDGET_USD:.2f} budget")
         pending[reservation] = maximum_cost
-        _ = pending_path.write_text(json.dumps(pending), encoding="utf-8")
+        _write_pending(pending_path, pending)
     try:
         yield reservation
     finally:
         with _ledger_lock(path):
             pending = _pending(pending_path)
             _ = pending.pop(reservation, 0.0)
-            _ = pending_path.write_text(json.dumps(pending), encoding="utf-8")
+            _write_pending(pending_path, pending)
 
 
 def _record_usage(path: Path, model: str, usage: Usage) -> None:
