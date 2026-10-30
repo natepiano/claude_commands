@@ -30,8 +30,8 @@ Read those constants for current policy; do not copy a threshold or proposal-fie
 Bump the question version for adopted wording; retest a model change against the pinned model.
 [records.py](../scripts/issue_score/records.py) owns saved shapes and `STATE_DIR` (`~/.local/state/issue-score/`).
 [decide.py](../scripts/issue_score/decide.py) owns the shared sure rule; [evaluate.py](../scripts/issue_score/evaluate.py) uses it too.
-`Supported(threshold)` permits sure answers, `Unsupported` keeps a field agent-only, and `ReportOnly` reports it without a sure gate.
-Split distributions, disagreeing Choice orders and an unresolved goal dependency stay unsure. One exception: when the `area_fits` Noul is below `EVIDENCE_ABSENT`, area becomes `unfiled` with confidence `1 - fits`, judged by that Noul instead of the area Choice orders, and it is sure only when that confidence passes the area threshold (`is_sure()`); an `area_fits` between `EVIDENCE_ABSENT` and `EVIDENCE_PRESENT` keeps area unsure. Cached raw answers get new decisions under current policy.
+`Supported(threshold)` gates by the decision's confidence (the selected median level's probability for Scores); `MinimumGap(gap)` gates by the top-two averaged probability gap (or `1 - fits` minus `fits` for the area fallback); `Unsupported` keeps a field agent-only, and `ReportOnly` reports it without a sure gate.
+Split distributions, disagreeing Choice orders and an unresolved goal dependency stay unsure. One exception: when the `area_fits` Noul is below `EVIDENCE_ABSENT`, area becomes `unfiled` with confidence `1 - fits`, judged by that Noul instead of the area Choice orders, and it is sure only when the configured policy passes (`is_sure()`); a gap policy compares `1 - fits` against `fits`; an `area_fits` between `EVIDENCE_ABSENT` and `EVIDENCE_PRESENT` keeps area unsure. Cached raw answers get new decisions under current policy.
 
 ## Question rules
 

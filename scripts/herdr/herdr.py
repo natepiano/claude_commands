@@ -1345,13 +1345,12 @@ class Herdr:
         from scripts.production import staff
 
         membership = staff.initial_snapshot() if record is None else record
-        parent = next((row for row in membership.find(kind="showrunner") if row.name == name), None)
-        unit_names: set[str] = {row.name for row in membership.find(kind="unit", parent=parent.id)} if parent else set()
-        unit_panes = unit_director_panes(self.session, herdr_processes(), membership)
+        classifier = UnitTabClassifier(self.session, herdr_processes(), membership)
         unit_director_titles = {
             json_text(tab.get("label"), "herdr tab label") for tab in tabs
-            if tab.get("label") in unit_names
-            or any(pane in unit_panes for pane in panes_of.get(json_text(tab.get("tab_id"), "herdr tab id"), []))}
+            if isinstance(classifier.classify(
+                name if isinstance(name, str) else "", json_text(tab.get("label"), "herdr tab label"),
+                panes_of.get(json_text(tab.get("tab_id"), "herdr tab id"), [])), UnitTab)}
         titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
         unsaved: list[SavedName] = []
         kept = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), unsaved)
@@ -3087,11 +3086,44 @@ def has_unit_marks(environment: dict[str, str]) -> bool:
     return all(environment.get(mark) for mark in UNIT_MARKS)
 
 
-def unit_director_panes(session: str, processes: Sequence[HerdrProcess], record: staff.StaffSnapshot) -> set[str]:
-    """The session's panes whose durable identity names a recorded unit."""
-    units = {row.id for row in record.find(kind="unit")}
-    return {process.place.pane for process in processes
-            if process.place.session == session and process.marks.get("STAFF_ID") in units}
+@dataclass(frozen=True)
+class UnitTab:
+    """A tab's unit identity and its current staff parent."""
+
+    row: staff.StaffRow
+    parent: staff.StaffRow
+
+
+@dataclass(frozen=True)
+class OtherTab:
+    """The tab has no recorded unit identity or matching workspace membership."""
+
+
+class UnitTabClassifier:
+    """Share the staff identity and workspace/title join between ordering and listing."""
+
+    by_pane: dict[str, UnitTab]
+    by_workspace: dict[str, dict[str, UnitTab]]
+
+    def __init__(self, session: str, processes: Sequence[HerdrProcess], record: staff.StaffSnapshot) -> None:
+        parents = {row.id: row for row in record.find(kind="showrunner")}
+        units: dict[str, UnitTab] = {row.id: UnitTab(row, parents[row.parent]) for row in record.find(kind="unit")
+                                     if row.parent is not None and row.parent in parents}
+        self.by_pane = {process.place.pane: units[ident] for process in processes
+                        if process.place.session == session and (ident := process.marks.get("STAFF_ID")) in units}
+        self.by_workspace = {}
+        for unit in units.values():
+            self.by_workspace.setdefault(unit.parent.name, {})[unit.row.name] = unit
+
+    def has_unit_title(self, title: str) -> bool:
+        """Whether a title needs its workspace resolved before it can be classified."""
+        return any(title in units for units in self.by_workspace.values())
+
+    def classify(self, workspace: str, title: str, panes: Sequence[str]) -> UnitTab | OtherTab:
+        for pane in panes:
+            if pane in self.by_pane:
+                return self.by_pane[pane]
+        return self.by_workspace.get(workspace, {}).get(title, OtherTab())
 
 
 def _scan_herdr_processes() -> list[HerdrProcess]:

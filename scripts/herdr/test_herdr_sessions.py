@@ -25,6 +25,8 @@ from sessions import SessionRecord, UnreadableSessionRecord, read_session
 import showrunners
 from scripts.shutdown import launch_permission
 from scripts.accounts import accounts
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
@@ -51,6 +53,7 @@ class HerdrSessionsTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.proc = self.root / "proc"
         self.records = self.root / "sessions"
         self.state = self.root / "state"
@@ -159,7 +162,9 @@ class HerdrSessionsTests(unittest.TestCase):
         self.respond(["agents", "other"], tabs=("unit", "showrunner", "standalone", None))
         self.server(100, "agents")
         self.server(900, "other")
-        marks = {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "herdr-trial-unit"}
+        parent = showrunner_relationship("build-followups")
+        unit = staff.ensure("unit", name="herdr-trial-unit", parent=parent.id)
+        marks = {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "herdr-trial-unit", "STAFF_ID": unit.id}
         self.claude(101, 100, "old-unit-name", pane="w1:p1", marks=marks)
         self.claude(102, 100, "new-unit-name", pane="w1:p1", updated=2, marks=marks)
         self.claude(103, 100, "dead-newest", pane="w1:p1", updated=3, live=False)
@@ -181,16 +186,47 @@ class HerdrSessionsTests(unittest.TestCase):
     def test_unit_role_takes_precedence_over_showrunner(self) -> None:
         self.respond(["agents"], tabs=("unit",))
         self.server(100, "agents")
-        self.claude(101, 100, "director", pane="w1:p1", marks={"SHOWRUNNER_UNIT": "build", "SHOWRUNNER_UNIT_ID": "one"})
+        unit = unit_membership("build", "one")
+        self.claude(101, 100, "director", pane="w1:p1", marks={"SHOWRUNNER_UNIT": "build", "SHOWRUNNER_UNIT_ID": "one",
+                                                              "STAFF_ID": unit.id})
         self.register_showrunner(101)
         self.assertEqual(self.call("list"), (0, "unit\tunit build/one\tdirector\n", ""))
 
     def test_unit_marks_are_visible_without_a_claude_record(self) -> None:
         self.respond(["agents"], tabs=("unit",))
         self.server(100, "agents")
+        unit = unit_membership("build", "one")
         self.process(101, 100, ["sleep", "600"], {"HERDR_PANE_ID": "w1:p1", "SHOWRUNNER_UNIT": "build",
-                                                "SHOWRUNNER_UNIT_ID": "one"})
+                                                "SHOWRUNNER_UNIT_ID": "one", "STAFF_ID": unit.id})
         self.assertEqual(self.call("list"), (0, "unit\tunit build/one\t\n", ""))
+
+    def test_list_classifies_unmarked_units_and_transferred_identity_from_one_staff_read(self) -> None:
+        self.respond(["agents"], tabs=("herdr", "shutdown", "style", "former-name", "terminal"))
+        self.server(100, "agents")
+        for name in ("herdr", "shutdown", "style"):
+            _ = unit_membership("sdlc", name)
+        pinned = unit_membership("sdlc", "models")
+        for pid, pane, name in ((101, "w1:p1", "herdr"), (102, "w1:p2", "shutdown"), (103, "w1:p3", "style")):
+            self.claude(pid, 100, name, pane=pane)
+        self.claude(104, 100, "models", pane="w1:p4", marks={
+            "STAFF_ID": pinned.id, "SHOWRUNNER_UNIT": "natedev", "SHOWRUNNER_UNIT_ID": "old-unit"})
+        self.process(105, 100, ["sleep", "600"], {"HERDR_PANE_ID": "w1:p5", "SHOWRUNNER_UNIT": "sdlc",
+                                                "SHOWRUNNER_UNIT_ID": "missing-unit"})
+        replies = cast(dict[str, CommandResponse], json.loads(self.responses.read_text()))
+        panes = [{"pane_id": f"w1:p{index}", "label": name, "workspace_id": "w1"}
+                 for index, name in enumerate(("herdr", "shutdown", "style", "former-name", "terminal"), 1)]
+        panes.append({"pane_id": "w2:p1", "label": "style", "workspace_id": "w2"})
+        replies["--session agents pane list"] = {"stdout": json.dumps({"result": {"panes": panes}}), "code": 0}
+        replies["--session agents workspace list"] = {"stdout": json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1", "label": "sdlc"}, {"workspace_id": "w2", "label": "natedev"}]}}), "code": 0}
+        _ = self.responses.write_text(json.dumps(replies))
+
+        with patch.object(staff, "snapshot", wraps=staff.snapshot) as read:
+            self.assertEqual(self.call("list"), (0,
+                "herdr\tunit sdlc/herdr\therdr\nshutdown\tunit sdlc/shutdown\tshutdown\n"
+                + "style\tunit sdlc/style\tstyle\nformer-name\tunit sdlc/models\tmodels\n"
+                + "terminal\tstandalone\t\nstyle\tstandalone\t\n", ""))
+        read.assert_called_once_with()
 
     def test_partial_unit_marks_do_not_make_a_unit_role(self) -> None:
         self.respond(["agents"], tabs=("solo",))
@@ -199,9 +235,6 @@ class HerdrSessionsTests(unittest.TestCase):
         self.assertEqual(self.call("list"), (0, "solo\tstandalone\tsolo-name\n", ""))
 
     def test_sort_tabs_ignores_saved_order_saves_unit_groups_and_keeps_split_workspaces(self) -> None:
-        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
-
-        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         for name in ("mike", "zulu"):
             _ = unit_membership("boss", name)
         self.respond(["agents"])

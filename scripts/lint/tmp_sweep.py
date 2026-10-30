@@ -87,6 +87,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field, replace
@@ -239,12 +240,25 @@ class Roots:
     scratch: tuple[str, ...] = ()
     wide: tuple[str, ...] = ()
     sessions: tuple[str, ...] = ()
+    copies: tuple[str, ...] = ()
 
     def all(self) -> tuple[str, ...]:
-        return self.plain + self.runs + self.projects + self.temp + self.scratch + self.sessions
+        return self.plain + self.runs + self.projects + self.temp + self.scratch + self.sessions + self.copies
 
     def entries(self, root: str) -> Iterator[os.DirEntry[str]]:
         """The entries of root the sweep judges, without retaining the directory."""
+        if root in self.copies:
+            for pair in listing(root):
+                if pair.is_dir(follow_symlinks=False):
+                    for entry in listing(pair.path):
+                        copy = scratch.removal_target(Path(entry.path))
+                        if copy is not None:
+                            removal = scratch.pending_removal(copy)
+                            if isinstance(removal, scratch.Registered) or (
+                                    isinstance(removal, scratch.NotRegistered) and not os.path.lexists(entry.path)):
+                                continue
+                        yield entry
+            return
         for entry in listing(root):
             if root not in self.temp or self.judged_temp(root, entry):
                 yield entry
@@ -278,11 +292,17 @@ class Roots:
             running = verify_running(int(verify.group(1)), made, now, proc)
             return Limit(float("-inf"), VERIFY_RUNS) if running else Limit(float("inf"), RECENT)
         if root in self.scratch:
-            task = scratch.task_of(Path(entry.path))
-            if task is not None and scratch.ended(task, now):
+            record = scratch.task_of(Path(entry.path))
+            if isinstance(record, scratch.Registered) and scratch.ended(record.task, now):
                 return Limit(float("inf"), RECENT)
-            if task is not None:
+            if isinstance(record, scratch.Registered):
                 return Limit(now - TASK_IDLE_SECONDS, TASK_OPEN)
+        if root in self.copies:
+            if isinstance(scratch.pending_removal(Path(entry.path)), scratch.Registered):
+                return Limit(float("inf"), TASK_OPEN)
+            record = scratch.task_of(Path(entry.path))
+            landed = isinstance(record, scratch.Registered) and record.task.startswith("landed:")
+            return Limit(now - WIDE_IDLE_SECONDS if landed else float("inf"), TASK_OPEN)
         # systemd-tmpfiles-clean sets each folder's times back after it reads it, which moves the
         # folder's ctime, so in a temp folder only a folder's mtime counts.
         if self.is_wide(root, entry):
@@ -336,7 +356,8 @@ def default_roots(tmp_root: str = TMP_ROOT, run_roots: Sequence[str] = RUN_ROOTS
     return Roots((os.path.realpath(tmp_root),), tuple(os.path.realpath(root) for root in run_roots), projects,
                  temp_real, tuple(os.path.realpath(root) for root in task_roots if os.path.isdir(root)),
                  tuple(real for root in wide if (real := os.path.realpath(root)) in temp_real),
-                 tuple(os.path.realpath(root) for root in session_temp if os.path.isdir(root)))
+                 tuple(os.path.realpath(root) for root in session_temp if os.path.isdir(root)),
+                 (os.path.realpath(os.path.join(tmp_root, "copies")),))
 
 
 def session_scratch_roots() -> tuple[str, ...]:
@@ -871,8 +892,10 @@ def owner_reason(entry: os.DirEntry[str], root: str, roots: Roots, live: frozens
     if entry.path in roots.all() or (root in roots.runs and entry.name == RUN_MARKERS):
         return ROOT
     if root in roots.scratch:
-        task = scratch.task_of(Path(entry.path))
-        return ROW_WAITS if task is not None and task.startswith("row:") else None
+        record = scratch.task_of(Path(entry.path))
+        if isinstance(record, scratch.UnreadableRecord):
+            return record.reason
+        return ROW_WAITS if isinstance(record, scratch.Registered) and record.task.startswith("row:") else None
     if root in roots.projects or root in roots.sessions:
         if live is None:
             return NO_SESSIONS
@@ -953,10 +976,17 @@ def judge_entries(roots: Roots, now: float, proc: str) -> Iterator[KeptEntry | R
         print(f"tmp sweep: {path}: {UNREADABLE}; keeping scratch and top-level /tmp/claude entries", file=sys.stderr)
     temp_live = None if live is None else live | workers.threads
     judged = roots.all() + inner + temp_parents(roots, temp_live)
-    uses = entry_uses(paths.paths, judged)
+    pairs = tuple(pair.path for root in roots.copies for pair in listing(root) if pair.is_dir(follow_symlinks=False))
+    uses = entry_uses(paths.paths, judged + pairs)
     for root in judged:
         for entry in roots.entries(root):
             reason = owner_reason(entry, root, roots, temp_live, marked)
+            if root in roots.copies and reason is None:
+                state = scratch.lifetime(Path(entry.path), now)
+                if isinstance(state, scratch.Live):
+                    reason = state.why
+                elif isinstance(state, scratch.Unknown):
+                    reason = state.reason
             # Apply to every deletion path, including entries inside a protected run's tmp/.
             if reason != ROOT:
                 # Resolve only the parents: a link inside a protected run is judged where it lies.
@@ -980,7 +1010,8 @@ def judge_entries(roots: Roots, now: float, proc: str) -> Iterator[KeptEntry | R
             if root in inner and size < SESSION_ENTRY_MIN_BYTES:
                 yield KeptEntry(entry.path, SMALL_IN_LIVE_SESSION)
                 continue
-            git = git_work(Path(entry.path))
+            pending = root in roots.copies and isinstance(scratch.pending_removal(Path(entry.path)), scratch.Registered)
+            git = GitWork.SAVED if pending else git_work(Path(entry.path))
             if git is not GitWork.SAVED:
                 yield KeptEntry(entry.path, git.value)
                 continue
@@ -988,9 +1019,32 @@ def judge_entries(roots: Roots, now: float, proc: str) -> Iterator[KeptEntry | R
 
 
 def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool) -> bool:
+    lock = scratch.judgment_lock if dry_run else scratch.removal_lock
+    with lock(Path(entry.path)) as idle, scratch.copy_record_lock(Path(entry.path)):
+        if not idle:
+            result.keep(entry.path, "busy: .claude-busy is locked")
+            return False
+        if scratch.copy_folder(Path(entry.path)) == Path(entry.path).resolve():
+            state = scratch.record_lifetime(Path(entry.path), time.time())
+            if not isinstance(state, scratch.Ended):
+                result.keep(entry.path, state.why if isinstance(state, scratch.Live) else state.reason)
+                return False
+            pending = isinstance(scratch.pending_removal(Path(entry.path)), scratch.Registered)
+            git = GitWork.SAVED if pending else git_work(Path(entry.path))
+            if git is not GitWork.SAVED:
+                result.keep(entry.path, git.value)
+                return False
+        return remove_idle_entry(entry, result, dry_run)
+
+
+def remove_idle_entry(entry: RemovableEntry, result: Sweep, dry_run: bool) -> bool:
     if not dry_run:
         try:
-            delete_tree(entry.path)
+            path = Path(entry.path)
+            if scratch.copy_folder(path) == path.resolve():
+                scratch.remove_marked(path, lambda folder: delete_tree(str(folder)))
+            else:
+                delete_tree(entry.path)
         except OSError as error:
             if os.path.lexists(entry.path):
                 result.failed.append(FailedEntry(path=entry.path, error=str(error)))
@@ -1022,6 +1076,10 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
             os.rmdir(root)
         except OSError:
             pass
+    if not dry_run:
+        for root in roots.copies:
+            scratch.clear_finished_copy_removals(Path(root))
+            scratch.remove_empty_copy_pairs(Path(root))
     return result
 
 
@@ -1048,9 +1106,11 @@ def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: st
                         for worker in roster.values()):
                     return CleanupEndReason.WORKERS_ENDED
         if entry.root in roots.scratch:
-            task = scratch.task_of(Path(entry.path))
-            if task is not None and scratch.ended(task, now):
+            record = scratch.task_of(Path(entry.path))
+            if isinstance(record, scratch.Registered) and scratch.ended(record.task, now):
                 return CleanupEndReason.TASK_ENDED
+        if entry.root in roots.copies and isinstance(scratch.lifetime(Path(entry.path), now), scratch.Ended):
+            return CleanupEndReason.TASK_ENDED
         verify = VERIFY_TEMP_NAME.fullmatch(Path(entry.path).name) if entry.root in roots.temp else None
         if verify is not None and verify.group(1):
             made = os.stat(entry.path, follow_symlinks=False).st_mtime
@@ -1120,8 +1180,17 @@ def write_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str) -> int:
         path = entry.path if isinstance(entry, KeptEntry) else entry.entry.path
         rows.append(PlanEntry(path=path, action=action, reason=reason))
     # An existing plan is never replaced; apply uses exactly the reviewed remove list.
-    with plan.open("x", encoding="utf-8") as handle:
-        _ = handle.write(json.dumps({"version": 1, "entries": rows}, indent=2) + "\n")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=plan.parent,
+                                     prefix=f".{plan.name}.", delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            _ = handle.write(json.dumps({"version": 1, "entries": rows}, indent=2) + "\n")
+            handle.close()
+            os.link(temporary, plan)
+        except FileExistsError:
+            raise FileExistsError(f"plan {plan} already exists; inspect it and remove it before making a new plan") from None
+        finally:
+            temporary.unlink(missing_ok=True)
     for row in rows:
         print(f"{row['action']} {row['path']}: {row['reason']}")
     print(f"tmp sweep: plan {plan}")

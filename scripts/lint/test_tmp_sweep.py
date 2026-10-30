@@ -5,6 +5,7 @@ of the clock, so every file a test writes is old, ctime included, unless the tes
 from __future__ import annotations
 
 import io
+import fcntl
 import json
 import os
 import subprocess
@@ -139,6 +140,173 @@ class TmpSweepCase(unittest.TestCase):
     def log(self) -> list[dict[str, object]]:
         lines = (self.state / tmp_sweep.LOG_NAME).read_text().splitlines()
         return [cast(dict[str, object], json.loads(line)) for line in lines]
+
+
+class CopyTests(TmpSweepCase):
+    now: float = 0.0
+
+    def copy(self, name: str, **fields: object) -> Path:
+        path = self.tmp / "copies" / "show-maker" / name
+        path.mkdir(parents=True)
+        record: dict[str, object] = {"task": "until:2000-01-01T0000Z", "owner_unit": "maker-unit"}
+        record.update(fields)
+        _ = write(path / scratch.RECORD, json.dumps(record))
+        self.enterContext(mock.patch.dict(os.environ, {"SCRATCH_COPIES_ROOT": str(self.tmp / "copies")}))
+        self.now += 8 * DAY
+        return path
+
+    def test_copy_entries_are_individual_and_empty_pair_goes_after_last_copy(self) -> None:
+        old = self.copy("old")
+        live = self.copy("live", task="gate:live")
+        result = self.sweep()
+        self.assertFalse(old.exists())
+        self.assertTrue(live.exists())
+        self.assertTrue(live.parent.exists())
+        self.assertIn(str(self.tmp / "copies"), result.kept[tmp_sweep.ROOT])
+        _ = write(live / scratch.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
+        self.now += 8 * DAY
+        _ = self.sweep()
+        self.assertFalse(live.parent.exists())
+        self.assertTrue((self.tmp / "copies").is_dir())
+
+    def test_dry_run_does_not_add_a_busy_mark_to_an_unregistered_copy(self) -> None:
+        path = self.copy("unknown")
+        (path / scratch.RECORD).unlink()
+        _ = self.sweep(True)
+        self.assertFalse((path / scratch.BUSY).exists())
+
+    def test_sweep_resumes_recordless_removal_and_does_not_keep_a_possible_parent(self) -> None:
+        parent = self.copy("parent")
+        child = self.copy("child", borrows_from=str(parent / ".git"))
+
+        def stopped_removal(folder: str) -> None:
+            (Path(folder) / scratch.RECORD).unlink()
+            raise OSError("stopped after record unlink")
+
+        with mock.patch.object(tmp_sweep, "delete_tree", side_effect=stopped_removal):
+            result = self.sweep()
+        self.assertTrue(result.failed)
+        self.assertFalse((child / scratch.RECORD).exists())
+        _ = self.sweep()
+        self.assertFalse(child.exists())
+        self.assertFalse(parent.exists())
+
+    def test_reused_path_with_unsaved_work_does_not_resume_the_old_copys_removal(self) -> None:
+        path = self.copy("reused")
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, descriptor)
+        delete_tree = tmp_sweep.delete_tree
+
+        def stopped_after_tree_removal(folder: str) -> None:
+            delete_tree(folder)
+            raise KeyboardInterrupt("stopped before removal certificate unlink")
+
+        with mock.patch.object(tmp_sweep, "delete_tree", stopped_after_tree_removal):
+            with self.assertRaises(KeyboardInterrupt):
+                _ = self.sweep()
+        self.assertFalse(path.exists())
+        self.assertTrue(scratch.removal_mark(path).is_file())
+        _ = self.copy("reused")
+        _ = subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
+        scratch.exclude_copy_metadata(path)
+        _ = write(path / "ordinary", "new owner's unsaved work")
+        self.now += 8 * DAY
+        result = self.sweep()
+        self.assertTrue((path / "ordinary").is_file())
+        self.assertIn(str(path), result.kept[tmp_sweep.UNSAVED_WORK])
+        self.assertFalse(scratch.removal_mark(path).exists())
+
+    def test_busy_copy_keeps_even_without_a_record_and_rechecks_before_delete(self) -> None:
+        path = self.copy("busy")
+        (path / scratch.RECORD).unlink()
+        with (path / ".claude-busy").open("w") as holder:
+            fcntl.flock(holder, fcntl.LOCK_SH)
+            result = self.sweep()
+        self.assertTrue(path.is_dir())
+        self.assertTrue(any("busy" in reason and str(path) in paths for reason, paths in result.kept.items()))
+        _ = write(path / scratch.RECORD, json.dumps({"task": "until:2000-01-01T0000Z"}))
+        original = tmp_sweep.remove_entry
+        with (path / ".claude-busy").open("a") as holder:
+            def start_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool) -> bool:
+                fcntl.flock(holder, fcntl.LOCK_SH)
+                return original(entry, result, dry_run)
+            with mock.patch.object(tmp_sweep, "remove_entry", side_effect=start_before_remove):
+                _ = self.sweep()
+        self.assertTrue(path.is_dir())
+
+    def test_open_phase_and_unknown_records_survive_at_any_age(self) -> None:
+        run = self.tmp.parent / "run"
+        progress = write(run / "progress_history_state.json", json.dumps({"phase": {"id": "21", "status": "active"}}))
+        live = self.copy("phase", task="phase:maker-unit/21", run_dir=str(run), phase_id="21")
+        unknown = self.copy("unknown")
+        _ = (unknown / scratch.RECORD).write_text("bad json")
+        self.now += 30 * DAY
+        result = self.sweep(True)
+        self.assertTrue(live.is_dir())
+        self.assertTrue(unknown.is_dir())
+        self.assertNotIn(str(live), [entry["path"] for entry in result.deleted])
+        self.assertTrue(any("record" in reason and str(unknown) in paths for reason, paths in result.kept.items()))
+        _ = progress.write_text("bad progress")
+        result = self.sweep()
+        self.assertTrue(live.is_dir())
+        self.assertTrue(any("progress" in reason and str(live) in paths for reason, paths in result.kept.items()))
+
+    def test_landed_copy_needs_seven_idle_days_and_readable_target(self) -> None:
+        path = self.copy("landed", task="landed:maker-unit/work", land_target="origin/main",
+                         source_path=str(self.tmp / "copies" / "show-maker" / "landed"))
+        environment = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+        for arguments in (("init", "-q"),
+                          ("-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-qm", "base"),
+                          ("remote", "add", "origin", "https://example.invalid/repo.git"),
+                          ("update-ref", "refs/remotes/origin/work", "HEAD"),
+                          ("update-ref", "refs/remotes/origin/main", "HEAD")):
+            _ = subprocess.run(["git", "-C", str(path), *arguments], check=True, capture_output=True, env=environment)
+        scratch.exclude_copy_metadata(path)
+        self.now = time.time() + DAY
+        _ = self.sweep()
+        self.assertTrue(path.is_dir())
+        _ = subprocess.run(["git", "-C", str(path), "update-ref", "-d", "refs/remotes/origin/main"],
+                           check=True, capture_output=True, env=environment)
+        self.now += 30 * DAY
+        result = self.sweep()
+        self.assertTrue(path.is_dir())
+        self.assertTrue(any("land target" in reason and str(path) in paths for reason, paths in result.kept.items()))
+        _ = subprocess.run(["git", "-C", str(path), "update-ref", "refs/remotes/origin/main", "HEAD"],
+                           check=True, capture_output=True, env=environment)
+        _ = self.sweep()
+        self.assertFalse(path.exists())
+
+    def test_new_unsaved_work_between_scan_and_remove_keeps_copy(self) -> None:
+        path = self.copy("edited")
+        _ = subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
+        scratch.exclude_copy_metadata(path)
+        original = tmp_sweep.remove_entry
+
+        def edit_before_remove(entry: tmp_sweep.RemovableEntry, result: tmp_sweep.Sweep, dry_run: bool) -> bool:
+            if entry.path == str(path):
+                _ = write(path / "ordinary", "unsaved work")
+            return original(entry, result, dry_run)
+
+        with mock.patch.object(tmp_sweep, "remove_entry", side_effect=edit_before_remove):
+            result = self.sweep()
+        self.assertTrue((path / "ordinary").is_file())
+        self.assertIn(str(path), result.kept[tmp_sweep.UNSAVED_WORK])
+
+    def test_borrowed_parent_stays_until_its_last_child_is_gone(self) -> None:
+        parent = self.copy("parent")
+        child = self.copy("child", task="gate:child", borrows_from=str(parent / ".git"))
+        result = self.sweep()
+        self.assertTrue(parent.is_dir())
+        self.assertTrue(child.is_dir())
+        self.assertTrue(any("borrow" in reason and str(parent) in paths for reason, paths in result.kept.items()))
+        _ = (child / scratch.RECORD).write_text(json.dumps({"task": "until:2000-01-01T0000Z",
+                                                           "borrows_from": str(parent / ".git")}))
+        _ = self.sweep()
+        self.assertTrue(parent.is_dir())
+        self.assertFalse(child.exists())
+        _ = self.sweep()
+        self.assertFalse(parent.exists())
+        self.assertFalse(child.exists())
 
 
 class IdleTests(TmpSweepCase):
@@ -824,6 +992,27 @@ class RunFolderTests(TmpSweepCase):
 
 
 class HandCleanupTests(TmpSweepCase):
+    def test_stopped_plan_write_can_be_planned_again(self) -> None:
+        ended = self.ended_run("ended")
+        plan = self.tmp.parent / "plan.json"
+        with mock.patch.object(json, "dumps", side_effect=RuntimeError("stopped during serialization")):
+            with self.assertRaisesRegex(RuntimeError, "stopped during serialization"):
+                _ = tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
+        self.assertFalse(plan.exists())
+        self.assertEqual(tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc)), 0)
+        self.assertEqual(tmp_sweep.planned_removals(plan), [str(ended)])
+        before = plan.read_bytes()
+        with self.assertRaises(FileExistsError):
+            _ = tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
+        self.assertEqual(plan.read_bytes(), before)
+
+    def test_incomplete_legacy_plan_names_file_and_clear_action(self) -> None:
+        plan = self.tmp.parent / "plan.json"
+        _ = plan.write_text('{"version":')
+        with self.assertRaisesRegex(FileExistsError, str(plan) + ".*remove"):
+            _ = tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
+        self.assertEqual(plan.read_text(), '{"version":')
+
     def ended_run(self, name: str) -> Path:
         run = write(self.unit / name / "board.log").parent
         _ = write(run / "mesh_roster.json", json.dumps({"fix": {"status": "ended"}}))
