@@ -28,7 +28,7 @@ Agents' test builds linked far more than the tests they ran, and the daily build
 
 1. `## Builds, <Weekday YYYY-MM-DD>`
 2. `### Waiting` (build-folder turns behind another worker and behind its own call, memory admission, CI queue; see `docs/as-built/build-memory-admission.md`)
-3. `### Rebuilds`, always present: compile and other time by rebuild bin (none, edited crate, cascade, cold), nextest's compile against test time, and edited-crate nextest rebuilds by package (Rebuilds section below)
+3. `### Rebuilds`, always present: compile and other time by rebuild bin (none, edited crate, cascade, first build here, cold), nextest's compile against test time, and edited-crate nextest rebuilds by package (Rebuilds section below)
 4. `### <kind>` for each kind seen that day (`KIND_ORDER` first), one row per caller by run count, the scratch row among them
 5. `### Memory pressure`, always present: memory waits, the sccache, unsliced-step and memory-kill lines, the stall table and the sample line (`docs/as-built/buildlog-memory-stalls.md`, `docs/as-built/build-memory-admission.md`)
    - `### CPU and disk pressure`, always present: one line per sampled host with CPU and IO stall shares and CPU idle and iowait shares, or `CPU and IO samples: none.` (`docs/as-built/buildlog-memory-stalls.md`)
@@ -51,22 +51,27 @@ Every average carries a `p95` beside it, by nearest rank (`nearest_rank(values, 
 
 **Steps and times.** `known_crate_steps` reads the day's (`ON_DAY`) `steps` rows with `step <> 'sweep'` and a known `crates_compiled` into `KnownCrateStep` rows. Compile is cargo's own `finished_s` (its "Finished … in" time; NULL counts as 0 and leaves the step's compile time unknown). Other is duration minus compile, floored at 0 per step. `RebuildTiming` sums both for a group of steps (`rebuild_timings` builds one per bin). Shares are whole percent through `whole_percent`, `0%` when the total is 0.
 
-**Bins.** `rebuild_bin(crates_compiled)` is the one definition of rebuild bins:
+**Bins.** `rebuild_bin(crates_compiled, warm)` is the one definition of rebuild bins. `warm` comes from `warm_step_clause()`, the one warm rule, which `known_crate_steps` and `profile_step_durations` select in SQL. A step is warm when earlier finished steps on the same host, with the same `target_folder` and `build_base` and an earlier `started_at_us`, together cover every item in its `build_items`. `--bins`, `--tests`, `--examples` and `--benches` cover their named members. `--all-targets` covers every item except `--doc`, and also `[]`. Otherwise only `[]` covers `[]`.
 
 | Crates compiled | Label constant | Label |
 | --- | --- | --- |
 | 0 | `NO_REBUILD_LABEL` | `none` |
-| 1–3 | `EDITED_CRATE_LABEL` | `edited crate (1–3 crates)` |
-| 4–49 | `CASCADE_LABEL` | `cascade (4–49 crates)` |
+| 1–3, warm | `EDITED_CRATE_LABEL` | `edited crate (1–3 crates)` |
+| 4–49, warm | `CASCADE_LABEL` | `cascade (4–49 crates)` |
+| 1–49, not warm | `FIRST_BUILD_LABEL` | `first build here (1–49 crates)` |
 | 50+ | `COLD_BUILD_LABEL` | `cold (50+ crates)` |
 
 The edges are `NO_REBUILD_CRATES = 0`, `EDITED_CRATE_MAX_CRATES = 3` and `CASCADE_MAX_CRATES = 49`; `EDITED_CRATE_MIN_CRATES`, `CASCADE_MIN_CRATES` and `COLD_BUILD_MIN_CRATES` derive from them, and each label is built from its edges. `REBUILD_LABELS` holds the labels in order. Code compares against the named labels, never a tuple index.
 
+**Recorded build identity.** Step rows keep `compiled_crate_names` in counted log order, including repeats, with the same length as `crates_compiled`; both are null when compilation was not measured. `target_dir` is the absolute, resolved `CARGO_TARGET_DIR` path, or `"unset"` (`record.TARGET_DIR_UNSET`). `repo_identity` is the repository key from `memory_admit.git_identity`, or `"unknown"` (`store.UNKNOWN_IDENTITY`). The index stores those fields and derives `target_folder` (an absolute `target_dir`, else `worktree`, else `cwd`), `build_base` (cargo command, profile, target set, package scope and features), `build_items` (sorted target selectors; `[]` is the default selection), and `started_at_us` (UTC epoch microseconds). Non-cargo steps have null `build_base` and `build_items`.
+
+Missing matching history puts a step that compiled 1–49 crates in `first build here`. Rows written before 4f index absent `target_dir` and `repo_identity` as `"unknown"`; their build keys still come from recorded argv and their folder falls back to `worktree` or `cwd`. A symlinked `target/` or `.cargo/config` `target-dir` is not discovered when `CARGO_TARGET_DIR` is unset, so the folder also falls back to the worktree. These gaps can miss shared output history. A sweep that deletes output leaves no build-log row, so it is invisible to the warm rule and can leave a step classified as warm after its output was removed.
+
 **Layout**, top to bottom:
 
 - `nextest: <compile> compiling, <other> running tests (<n>% compiling).` (`nextest_rebuild_lines`), summed over the day's nextest steps, then a blank line. With no nextest step both are left out.
-- The table `Rebuild | Steps | Compile | Other | Total | Share of compile | Share of time` (`rebuild_rows`): all four bins in `REBUILD_LABELS` order, always present; an empty bin shows `0` steps and `—` in every other cell. Share of compile is the bin's compile over all bins' compile; share of time is the bin's total over all bins' total. Directly beneath it: `Source: steps with a known crate count; compile is cargo's own "Finished … in" time, other is the rest of the step.`
-- Only when edited-crate nextest steps exist: the title `Edited-crate rebuilds by package (nextest):`, a blank line, the table `Package | Steps | p50 | p95 | Compile` (`package_rebuild_rows`), and directly beneath it `Source: nextest steps that compiled 1–3 crates, by the first package(…) in the test filter; p50 and p95 are of compile time.` The rows are the top 5 packages by compile, ties by name. A step's package is the first `PACKAGE_PATTERN` (`package\(([^)&|\s]+)\)`) match in its argv (`rebuild_package`), else `(unknown)`. p50 and p95 come from `nearest_rank()` over the package's steps with a known compile time (`PackageRebuilds`), `—` when there are none; Compile is the package's total.
+- The table `Rebuild | Steps | Compile | Other | Total | Share of compile | Share of time` (`rebuild_rows`): all five bins in `REBUILD_LABELS` order, always present; an empty bin shows `0` steps and `—` in every other cell. Share of compile is the bin's compile over all bins' compile; share of time is the bin's total over all bins' total. Directly beneath it: `Source: steps with a known crate count; compile is cargo's own "Finished … in" time, other is the rest of the step. Edited-crate and cascade rows count only steps whose folder had built the same target with the same features before.`
+- Only when warm edited-crate nextest steps exist: the title `Edited-crate rebuilds by package (nextest):`, a blank line, the table `Package | Steps | p50 | p95 | Compile` (`package_rebuild_rows`), and directly beneath it `Source: warm nextest steps that compiled 1–3 crates (the edited-crate row), by the first package(…) in the test filter; p50 and p95 are of compile time.` The package table counts only warm steps. The rows are the top 5 packages by compile, ties by name. A step's package is the first `PACKAGE_PATTERN` (`package\(([^)&|\s]+)\)`) match in its argv (`rebuild_package`), else `(unknown)`. p50 and p95 come from `nearest_rank()` over the package's steps with a known compile time (`PackageRebuilds`), `—` when there are none; Compile is the package's total.
 
 ### Test target selection
 
