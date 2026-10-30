@@ -122,6 +122,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
 
     @gate_suites("lib")
     def test_memory_cap_admits_two_overlapping_module_processes(self) -> None:
+        self.record_module_peaks({"lib/test_first.py": 48.0, "lib/test_second.py": 48.0})
         self.write(self.state / "barrier", "two")
         result = self.run_gate("--tests-only", "--memory-cap-mib", "268", ignored_signals=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -194,7 +195,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
 
     @gate_suites("lib")
     def test_smaller_memory_cap_serializes_modules_without_dropping_any(self) -> None:
-        # Two jobs need two 96 MiB reservations, so a cap under 192 MiB runs one module at a time;
+        # Each unrecorded job reserves 640 MiB, so this cap runs one module at a time;
         # 128 MiB stays far above the measured peak of the runner and one module (about 48 MiB).
         result = self.run_gate("--tests-only", "--memory-cap-mib", "128")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -245,7 +246,6 @@ class MergeGateResourcesTests(GateSuitesFixture):
             kill(job)
 
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(merge_gate, "TEST_SUITES", ("hooks",)), \
                 mock.patch.object(merge_gate, "in_builds_slice", return_value=False), \
                 mock.patch("scripts.production.merge_gate.time.monotonic", side_effect=module_clock), \
                 mock.patch.object(merge_gate, "process_memory_mib", side_effect=sample), \

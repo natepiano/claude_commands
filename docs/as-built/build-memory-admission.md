@@ -61,6 +61,18 @@ In `invoke.sh`, `run_once` checks natedev holds before memory admission, runs th
 
 `BUILDLOG_SCOPE_SH` also writes the scope's cgroup directory to `"$BUILDLOG_PEAK.cgroup"`. `run_once` passes the step's argv to the gate and runs one `buildlog_sample_anon` sampler, which reads the scope's `anon` every second, keeps the maximum in the `.max` file beside the reservation, and exits when its parent is gone. `buildlog_finish_memory` stops the sampler, releases the reservation and removes the sidecar on every path; the release appends the maximum to `anon_peaks.jsonl` (host, repo, step, worktree, anon peak, exit status, UTC end time, `test_threads`, `call_id`), and nothing for an unscoped step. `scripts/lint/test_memory_admit.py` covers the rule, the ledger and the shell gate over a fake meminfo, index and cgroup tree; its shell tests run the gate under `set -e`, as `invoke.sh` does.
 
+### Admit the waiting head
+
+A registered showrunner session may run `python3 scripts/lint/memory_admit.py admit-head [--why "<text>"]`.
+Codex workers cannot use an inherited showrunner session id. The command replaces one atomic
+`admission/admit-head.json` record for the current first waiter. On its next locked check, that
+same head may exceed the build budget when `MemAvailable - reserve` covers its current need.
+Pressure and recovery holds still apply. If memory is short, the record stays. It never changes
+queue order or admits another step. The record is deleted when the head starts, or on the next
+locked check after that waiter leaves. Nothing waiting gives a refusal and writes no override.
+The build log gets a `head_admission` row when set and when admitted or lapsed, with the unit,
+step, need, free memory, reserve, reason and showrunner id.
+
 ### Name the reservation that blocks a waiter
 
 `python3 scripts/lint/memory_admit.py blocker --waiter <waiter file>` reads the admission ledger under a shared lock. It does not create the lock, prune stale records, or change state files. It prints one JSON line and exits 0:
