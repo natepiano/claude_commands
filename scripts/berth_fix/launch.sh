@@ -96,10 +96,21 @@ with open(os.environ["RECORD"], "w") as handle:
 # A terminal session takes the id it is given, so the conversation is pinned
 # before it starts; only `--bg` assigns its own and forces discovery afterwards.
 resume_flags=()
+project_history() {
+    local projects=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects encoded
+    encoded=$(python3 -c 'import re, sys; print(re.sub(r"[^a-zA-Z0-9]", "-", sys.argv[1]))' "$1") || return 1
+    printf '%s/%s\n' "$projects" "$encoded"
+}
+
 set_resume_flags() {
-    local remembered
+    local remembered history
     if remembered=$(recorded_session); then
-        resume_flags=(-r "$remembered")
+        history=$(project_history "$worktree") || return 1
+        if [ -f "$history/$remembered.jsonl" ]; then
+            resume_flags=(-r "$remembered")
+        else
+            resume_flags=(--session-id "$remembered")
+        fi
         return 0
     fi
     remembered=$(python3 -c 'import uuid; print(uuid.uuid4())') || return 1
@@ -112,18 +123,27 @@ set_resume_flags() {
 # the recorded conversation is filed under the old directory, so its project
 # history moves with it or the next resume finds nothing to continue.
 relocate_legacy_worktree() {
-    local projects=$HOME/.claude/projects
     git -C "$repository" worktree move "$legacy_worktree" "$worktree" || return 1
-    if [ -d "$projects/${legacy_worktree//\//-}" ] && [ ! -d "$projects/${worktree//\//-}" ]; then
-        mv "$projects/${legacy_worktree//\//-}" "$projects/${worktree//\//-}"
+}
+
+# Repair a launch interrupted after the checkout moved, including account history.
+relocate_project_history() {
+    local old_history new_history
+    old_history=$(project_history "$legacy_worktree") || return 1
+    new_history=$(project_history "$worktree") || return 1
+    if [ -d "$old_history" ] && [ ! -e "$new_history" ]; then
+        mv "$old_history" "$new_history" || return 1
     fi
 }
 
 # The worktree is permanent: it outlives every engagement, and the fixer catches
 # it up from main when a new report arrives.
 ensure_worktree() {
+    if [ ! -d "$worktree" ] && [ -d "$legacy_worktree" ]; then
+        relocate_legacy_worktree || return 1
+    fi
+    relocate_project_history || return 1
     [ -d "$worktree" ] && return 0
-    [ -d "$legacy_worktree" ] && { relocate_legacy_worktree; return; }
     if git -C "$repository" show-ref --verify --quiet "refs/heads/$branch"; then
         git -C "$repository" worktree add "$worktree" "$branch" || return 1
     else
