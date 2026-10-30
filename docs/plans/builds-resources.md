@@ -913,7 +913,7 @@ The replay script (Spec 1) lives in the run folder, not in the repository.
 - The notice has `also touches` lines for `merge_gate.py`, its test and `merge-gate-and-test-speed.md` (natedev showrunner, against `origin/natedev`) and for `build_why.py` and its test (report-unit, against `origin/builds-report`).
 - Change-Review line: a merge gate holds its whole memory cap in the queue | on natedev, while a merge gate runs, type `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` | the gate's row shows a 6.0 GiB need from `the merge gate's memory cap`, and its charge stays 6.0 GiB after its first 2 min while it uses less, from its start to its end.
 
-### Phase 28 — The working-set command files a Node helper under its own script  · status: todo
+### Phase 28 — The working-set command files a Node helper under its own script  · status: done
 **Depends on:** Phase 7 (the command). Showrunner ruling 2026-10-30: a wrong result, current work, holds no phase. Parallel branch: its files are disjoint from every other todo phase, so it runs beside 24 Part B and the 4 → 29 branch.
 
 #### Work Order
