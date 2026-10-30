@@ -1524,7 +1524,13 @@ def live_unit_director(run: Path) -> LiveUnitDirector | NoLiveUnitDirector:
         same_run = isinstance(runs, list) and any(
             isinstance(value, str) and Path(value).resolve() == run.resolve()
             for value in cast(list[object], runs))
-        same_unit = bool(production and unit and host.get("production") == production and host.get("unit") == unit)
+        same_unit = False
+        if production and unit and host.get("unit") == unit:
+            from scripts.production import staff_sources
+            try:
+                same_unit = staff_sources.unit_parent(str(unit), str(previous.get("session_id", ""))).slug == production
+            except OSError:
+                pass
         if not (same_run or same_unit or (director and previous.get("session_id") == director)):
             continue
         for name in (previous.get("name"), host.get("session_name")):
