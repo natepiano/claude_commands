@@ -186,7 +186,7 @@ including the details to make it clear
 
 **Ruled out:** one file per step row (index cost); source absence as proof of a finish.
 
-### Phase 4c — Each scoped test step records its test-phase memory peak  · status: todo
+### Phase 4c — Each scoped test step records its test-phase memory peak  · status: done
 
 #### Work Order
 
