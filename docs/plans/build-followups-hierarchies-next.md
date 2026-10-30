@@ -2,8 +2,8 @@
 
 ## Items to consider
 
-- [ ] **A second run of an answer within 48 hours of a production or unit rename repeats the first answer instead of failing**
-  - Target: `scripts/production/rename.py`, `scripts/production/rename_state.py`, `scripts/production/update_registration.py` and their tests
-  - Why needed: a production rename moves `outstanding/<slug>.answered.jsonl` but keeps the old slug in its records, and a unit rename keeps the old `asked_by`, so `answer` refuses those records (update_registration.py answer path) and the rerun fails instead of repeating its relay line.
-  - Completion condition: tests run answer, then a production rename and a unit rename, then the same answer again within 48 hours; each rerun exits 0 and prints "already answered <time>" with the relay line for the current name.
+- [ ] **An answer replay within 48 hours of a production or unit rename uses the current names**
+  - Target: `scripts/production/rename.py`, `scripts/production/rename_unit.py`, `scripts/production/rename_state.py`, `scripts/production/update_registration.py` and their tests
+  - Why needed: a production rename moves answered history but keeps its old slug, so `answer` skips the replay; a unit rename keeps the old `asked_by`, so the replay succeeds with the former unit name in its relay line.
+  - Completion condition: separate tests answer an item, rename its production or asking unit, then replay the same answer within 48 hours; each replay exits 0, prints "already answered <time>" with the original answer time, and names the current relay destination.
   - Revealed by: Phase 14

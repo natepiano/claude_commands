@@ -48,6 +48,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
+from collections import deque
 from collections.abc import Generator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Literal, TextIO, TypedDict, cast, final, override
@@ -236,6 +237,48 @@ class LifecycleTestClock:
         return future.result()
 
 
+class FixtureModelDefaults:
+    """Reuse real resolution only for the module's unchanged baseline fixture.
+
+    Custom registries and injected subprocess failures always run the product
+    resolver. No second registry parser or model-selection rule lives here.
+    """
+
+    def __init__(self, resolve: Callable[[argparse.Namespace], tuple[str, str]]) -> None:
+        self.resolve: Callable[[argparse.Namespace], tuple[str, str]] = resolve
+        self.environment: dict[str, str] = self.resolver_environment()
+        self.files: dict[Path, tuple[int, bytes]] = {
+            Path(os.environ[key]): (Path(os.environ[key]).stat().st_mtime_ns, Path(os.environ[key]).read_bytes())
+            for key in ("AGENTS_CONFIG_FILE", "CODEX_CONFIG_FILE", "CODEX_PACER_TIER_FILE",
+                        "CODEX_CATALOG_SYNC_STATE_FILE")
+        }
+        self.run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run
+        self.defaults: dict[tuple[str, ...], tuple[str, str]] = {}
+
+    @staticmethod
+    def resolver_environment() -> dict[str, str]:
+        return {key: value for key, value in os.environ.items()
+                if (key.startswith(("AGENTS_", "CODEX_")) or key in ("BASH_ENV", "ENV", "PATH", "SHELLOPTS", "BASHOPTS"))
+                and key not in ("CODEX_HOME",)}
+
+    def unchanged(self) -> bool:
+        if self.resolver_environment() != self.environment or subprocess.run is not self.run:
+            return False
+        return all(path.is_file() and (path.stat().st_mtime_ns, path.read_bytes()) == value
+                   for path, value in self.files.items())
+
+    def __call__(self, args: argparse.Namespace) -> tuple[str, str]:
+        if getattr(args, "model", "") not in ("", "gpt-test") or not self.unchanged():
+            return self.resolve(args)
+        key = tuple(str(getattr(args, name, "")) for name in ("role", "task", "model", "effort"))
+        if key not in self.defaults:
+            value = self.resolve(args)
+            if self.unchanged():
+                self.defaults[key] = value
+            return value
+        return self.defaults[key]
+
+
 def bounded_fixture[**P, R](callback: Callable[P, R]) -> Callable[P, R]:
     # Created inside each test: no call histories or budgets survive across tests.
     budget = FixtureLoopBudget(callback.__qualname__)
@@ -311,6 +354,18 @@ def setUpModule() -> None:
     _ = write_registry(Path(tier_files["AGENTS_CONFIG_FILE"]))
     for key, value in tier_files.items():
         unittest.addModuleCleanup(set_environment(key, value))
+    # The complete shared fixture costs seconds to validate in Bash. Reuse
+    # its proven defaults; every changed registry/config and fault injection
+    # still takes the real send-time resolver path.
+    baseline = FixtureModelDefaults(codex_mesh._turn_model_effort)  # pyright: ignore[reportPrivateUsage]
+
+    @functools.wraps(codex_mesh._turn_model_effort)  # pyright: ignore[reportPrivateUsage]
+    def baseline_defaults(args: argparse.Namespace) -> tuple[str, str]:
+        return baseline(args)
+
+    defaults = patch.object(codex_mesh, "_turn_model_effort", baseline_defaults)
+    _ = defaults.start()
+    unittest.addModuleCleanup(defaults.stop)
     authority = patch.object(role_map, "is_role_map_host", new=lambda: True)
     _ = authority.start()
     unittest.addModuleCleanup(authority.stop)
@@ -598,6 +653,36 @@ def _notice(method: str, params: dict[str, object]) -> dict[str, object]:
 
 def _as_test_dict(value: object) -> dict[str, object]:
     return cast("dict[str, object]", value) if isinstance(value, dict) else {}
+
+
+class FixtureModelDefaultsTests(unittest.TestCase):
+    def test_only_unchanged_baseline_results_are_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            registry = write_registry(Path(root) / "agents.conf")
+            with patch.dict(os.environ, {"AGENTS_CONFIG_FILE": str(registry)}):
+                resolve = MagicMock(return_value=("gpt-test", "high"))
+                defaults = FixtureModelDefaults(resolve)
+                args = argparse.Namespace(role="impl", task="", model="gpt-test", effort="high")
+                self.assertEqual(defaults(args), ("gpt-test", "high"))
+                self.assertEqual(defaults(args), ("gpt-test", "high"))
+                self.assertEqual(resolve.call_count, 1)
+                _ = write_registry(registry, {"direct.codex": {"impl": "gpt-test:max"}}, update=True)
+                resolve.return_value = ("gpt-test", "max")
+                self.assertEqual(defaults(args), ("gpt-test", "max"))
+                self.assertEqual(defaults(args), ("gpt-test", "max"))
+                self.assertEqual(resolve.call_count, 3, "changed registries must resolve on every turn")
+
+    def test_custom_registry_and_subprocess_faults_bypass_baseline_reuse(self) -> None:
+        resolve = MagicMock(return_value=("gpt-test", "high"))
+        defaults = FixtureModelDefaults(resolve)
+        args = argparse.Namespace(role="review", task="", model="gpt-test", effort="high")
+        self.assertEqual(defaults(args), ("gpt-test", "high"))
+        with patch.dict(os.environ, {"AGENTS_CONFIG_FILE": "/tmp/custom-mesh-registry"}):
+            self.assertEqual(defaults(args), ("gpt-test", "high"))
+            self.assertEqual(defaults(args), ("gpt-test", "high"))
+        with patch.object(subprocess, "run"):
+            self.assertEqual(defaults(args), ("gpt-test", "high"))
+        self.assertEqual(resolve.call_count, 4)
 
 
 class StubServerShutdownTests(unittest.TestCase):
@@ -1150,38 +1235,89 @@ class MeshCommandFixture(unittest.TestCase):
             timeout=self.start_args_timeout, resident=False, role="impl", lens=None,
         )
 
-    def controlled_stream_deadlines(self, *, submission_method: str = "turn/start") -> None:
-        """Expire quiet deadlines only after all scripted response frames were consumed."""
+    def controlled_stream_deadlines(self, *, submission_method: str = "turn/start",
+                                    activity_method: str = "") -> None:
+        """Advance scripted quiet waits, preserving every real notice before their boundary.
+
+        Opt in only for deterministic scripts. Event-wakeup tests keep the real
+        synchronization path. Activity deadlines are monotonic; frame deadlines
+        are wall time. Both advance the same LifecycleTestClock.
+        """
         self.lifecycle_clock.freeze()
         self.server.coalesce_response_frames = True
         respond = self.server.respond
         read = codex_mesh.Client.next_frame
+        raw_read = codex_mesh.Client._read  # pyright: ignore[reportPrivateUsage]
+        raw_pending = cast(property, vars(codex_mesh.Client)["has_pending_frames"])
+        wire_frames: dict[codex_mesh.Client, deque[codex_mesh.RpcMessage]] = {}
         quiet_ready = False
+        activity_ready = False
         first_submission = self.turn_starts + 1
+        waits = FixtureLoopBudget("controlled stream waits", max_calls=32)
 
         def response(request: dict[str, object]) -> list[dict[str, object]] | None:
             frames = respond(request)
-            if (frames is not None and request.get("method") == submission_method
-                    and (submission_method != "turn/start" or self.turn_starts >= first_submission)):
-                return [*frames, _notice("fixture/quiet", {})]
-            return frames
+            method = request.get("method")
+            if frames is None:
+                return None
+            return [*frames, _notice("fixture/quiet", {
+                "activity": method == activity_method and self.turn_starts < first_submission,
+                "stream": method == submission_method and (
+                    submission_method != "turn/start" or self.turn_starts >= first_submission),
+            })]
+
+        def advance(seconds: float) -> None:
+            waits.check_calls()
+            self.lifecycle_clock.advance(max(0.0, seconds))
+
+        def response_frames(client: codex_mesh.Client, deadline: float,
+                            wake: codex_mesh.FollowEvents | codex_mesh.SocketOnlyWait = codex_mesh.SOCKET_ONLY_WAIT
+                            ) -> codex_mesh.RpcMessage | None:
+            # Consume the fixture boundary below both RPC and stream reads.
+            # Keep read-ahead frames here, not in Client._pending: call appends
+            # each notice returned by _read, so preloading its queue reorders it.
+            nonlocal quiet_ready, activity_ready
+            frames = wire_frames.setdefault(client, deque())
+            if frames:
+                return frames.popleft()
+            boundary = FixtureLoopBudget("scripted response boundary", max_calls=128)
+            while True:
+                boundary.check_calls()
+                value = raw_read(client, deadline, wake)
+                if value is None:
+                    if frames:
+                        raise AssertionError("scripted response ended before its quiet boundary")
+                    return None
+                if value.get("method") == "fixture/quiet":
+                    params = _as_test_dict(value.get("params"))
+                    quiet_ready = quiet_ready or bool(params.get("stream"))
+                    activity_ready = activity_ready or bool(params.get("activity"))
+                    break
+                frames.append(value)
+            if not frames:
+                return None
+            return frames.popleft()
+
+        def pending(client: codex_mesh.Client) -> bool:
+            return bool(wire_frames.get(client)) or cast(bool, raw_pending.__get__(client))
 
         def frame(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
-            nonlocal quiet_ready
             if quiet_ready and not client.has_pending_frames:
-                self.lifecycle_clock.advance(min(codex_mesh.UNSEEN_END_CHECK_SECS,
-                                                  max(0.0, deadline - self.lifecycle_clock.time())))
+                advance(min(codex_mesh.UNSEEN_END_CHECK_SECS,
+                            max(0.0, deadline - self.lifecycle_clock.time())))
                 return None
-            value = read(client, deadline)
-            if value is not None and value.get("method") == "fixture/quiet":
-                quiet_ready = True
-                self.lifecycle_clock.advance(min(codex_mesh.UNSEEN_END_CHECK_SECS,
-                                                  max(0.0, deadline - self.lifecycle_clock.time())))
-                return None
-            return value
+            return read(client, deadline)
+
+        def activity(_client: codex_mesh.Client, _wake: codex_mesh.FollowEvents, deadline: float) -> None:
+            self.assertTrue(activity_ready, "activity wait preceded its scripted response boundary")
+            advance(deadline - self.lifecycle_clock.monotonic())
 
         self.server.respond = response
+        _ = self.patches.enter_context(patch.object(codex_mesh.Client, "_read", response_frames))
+        _ = self.patches.enter_context(patch.object(codex_mesh.Client, "has_pending_frames", property(pending)))
         _ = self.patches.enter_context(patch.object(codex_mesh.Client, "next_frame", frame))
+        if activity_method:
+            _ = self.patches.enter_context(patch.object(codex_mesh.Client, "wait_for_activity", activity))
 
     def roster(self) -> dict[str, object]:
         with (self.session_dir / codex_mesh.ROSTER_FILE).open(encoding="utf-8") as handle:
@@ -1683,6 +1819,32 @@ class RecordedTurnSettingsTests(unittest.TestCase):
 @final
 class MeshCommandTests(MeshCommandFixture):
     """Launcher and recovery behavior against the shared bounded fake server."""
+
+    def test_accelerated_reader_preserves_wire_order_around_an_rpc_reply(self) -> None:
+        notices = [_notice(f"notice/{name}", {}) for name in ("A", "B", "C")]
+        respond = self.server.respond
+
+        def response(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "fixture/ordered":
+                return [*notices[:2], _reply(request, {"acknowledged": True}), notices[2]]
+            return respond(request)
+
+        self.server.respond = response
+        self.controlled_stream_deadlines(submission_method="fixture/ordered")
+        with contextlib.closing(codex_mesh.Client(self.server.port, "ordered-reader")) as client:
+            self.assertEqual(client.call("fixture/ordered", {}).get("result"), {"acknowledged": True})
+            started_at = self.lifecycle_clock.monotonic()
+            received: list[codex_mesh.RpcMessage | None] = []
+            for notice in notices:
+                self.assertTrue(client.has_pending_frames, f"a buffered wire notice was hidden: {notice}")
+                received.append(client.next_frame(self.lifecycle_clock.time() + codex_mesh.UNSEEN_END_CHECK_SECS))
+                self.assertEqual(self.lifecycle_clock.monotonic(), started_at,
+                                 "the accelerated reader advanced past a buffered wire notice")
+            self.assertEqual(received, notices)
+            self.assertFalse(client.has_pending_frames)
+            self.assertIsNone(client.next_frame(self.lifecycle_clock.time() + codex_mesh.UNSEEN_END_CHECK_SECS),
+                              "the fixture quiet boundary reached the product")
+            self.assertGreater(self.lifecycle_clock.monotonic(), started_at)
 
     def test_held_turn_with_current_binding_reuses_the_server_without_blocking(self) -> None:
         design = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
@@ -4628,8 +4790,6 @@ class MeshCommandTests(MeshCommandFixture):
                 submissions += 1
                 if submissions == 1:
                     return self.quota_completion(request)
-                if later_failure == "disconnect":
-                    self.server.close_after_turn_start = True
                 frames = original(request)
                 assert frames is not None
                 frames.insert(-1, _notice("item/completed", {"threadId": THREAD_ID,
@@ -4650,6 +4810,51 @@ class MeshCommandTests(MeshCommandFixture):
             self.record_fixture_refusal(source, recovered=True)
             return subprocess.CompletedProcess(command, 0, "", "")
 
+        delivered_continuation = threading.Event()
+        if later_failure == "disconnect":
+            # "Completed, then disconnected" means the client processed the
+            # completion, not merely that the server queued its bytes. Force a
+            # file-wake readback in the gap before final output; keep serving
+            # RPCs until the continuation's completion is actually handled.
+            output_prefix = threading.Event()
+            readback_started = threading.Event()
+            send = _send_frame
+            call = codex_mesh.Client.call
+            on_frame = codex_mesh._on_frame  # pyright: ignore[reportPrivateUsage]
+
+            def send_with_gap(connection: socket.socket, frame: dict[str, object]) -> None:
+                send(connection, frame)
+                item = _as_test_dict(_as_test_dict(frame.get("params")).get("item"))
+                if submissions == 2 and item.get("type") == "userMessage":
+                    output_prefix.set()
+                    with codex_mesh._pending_file(str(self.session_dir), "worker") as handle:  # pyright: ignore[reportPrivateUsage]
+                        codex_mesh._write_pending(handle, THREAD_ID, [], accepting_messages=True)  # pyright: ignore[reportPrivateUsage]
+                    LauncherHangGuard("readback before continuation output").event(readback_started)
+
+            def readback(client: codex_mesh.Client, method: str, params: dict[str, object],
+                         timeout: float = codex_mesh.CALL_TIMEOUT_SECS) -> codex_mesh.RpcMessage:
+                if method == "thread/read" and output_prefix.is_set():
+                    readback_started.set()
+                return call(client, method, params, timeout)
+
+            def processed_frame(stream: codex_mesh.TurnStream, log: TextIO,
+                                frame: codex_mesh.RpcMessage) -> codex_mesh.StreamStep | codex_mesh.FailedWithThread:
+                result = on_frame(stream, log, frame)
+                if (submissions == 2 and frame.get("method") == "turn/completed"
+                        and stream.replies == 2):
+                    delivered_continuation.set()
+                    # EOF follows delivery even if a lifecycle RPC overtook
+                    # the final frames; closing with unread RPCs used to race it.
+                    for connection in self.server.connections:
+                        with contextlib.suppress(OSError):
+                            connection.shutdown(socket.SHUT_WR)
+                return result
+
+            _ = self.patches.enter_context(patch(f"{__name__}._send_frame", send_with_gap))
+            _ = self.patches.enter_context(patch.object(codex_mesh.Client, "call", readback))
+            _ = self.patches.enter_context(patch.object(codex_mesh, "_on_frame", processed_frame))
+            self.addCleanup(readback_started.set)
+
         self.server.respond = respond
         if later_failure == "timeout":
             self.controlled_stream_deadlines()
@@ -4662,6 +4867,8 @@ class MeshCommandTests(MeshCommandFixture):
               contextlib.redirect_stderr(io.StringIO()) as errors):
             code = codex_mesh.command_start(args)
         self.assertEqual(code, 1, errors.getvalue())
+        if later_failure == "disconnect":
+            self.assertTrue(delivered_continuation.is_set(), "disconnect preceded continuation delivery")
         self.assertEqual(submissions, 2)
         self.assertEqual(self.turn_inputs, ["Continue where you stopped."])
         self.assertIn("recovered task finished", (self.session_dir / "worker.log").read_text())
@@ -6486,14 +6693,47 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(record["port"], new.port)
 
     def test_checked_initial_turn_waits_for_a_live_thread_then_starts_once(self) -> None:
+        self.assert_checked_initial_turn_waits_for_a_live_thread_then_starts_once()
+
+    def assert_checked_initial_turn_waits_for_a_live_thread_then_starts_once(self) -> None:
         self.live_turn = "outgoing-turn"
         self.announce_live_completion = True
+        self.controlled_stream_deadlines(activity_method="thread/read")
+        started_at = self.lifecycle_clock.monotonic()
+        respond = self.server.respond
+
+        def checked_response(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if self.live_turn:
+                self.assertEqual(self.methods("turn/start"), [])
+            return respond(request)
+
+        self.server.respond = checked_response
         code, errors = self.run_start()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(len(self.methods("turn/start")), 1)
         self.assertGreaterEqual(len(self.methods("thread/read")), 2)
         self.assertEqual(self.live_turn, "")
         self.assertEqual(self.worker_record()["status"], "done")
+        self.assertGreaterEqual(self.lifecycle_clock.monotonic() - started_at, 60,
+                                "controlled initial wait did not advance lifecycle time")
+
+    def test_controlled_initial_wait_requires_clock_advancement(self) -> None:
+        with patch.object(self.lifecycle_clock, "advance"):
+            with self.assertRaisesRegex(AssertionError, "controlled initial wait did not advance|controlled stream waits"):
+                self.assert_checked_initial_turn_waits_for_a_live_thread_then_starts_once()
+
+    def test_controlled_initial_wait_never_submits_without_the_scripted_transition(self) -> None:
+        self.live_turn = "outgoing-turn"
+        self.controlled_stream_deadlines(activity_method="thread/read")
+        started_at = self.lifecycle_clock.monotonic()
+        code, errors = self.run_start()
+        self.assertEqual(code, 1, errors)
+        self.assertIn("still live at the timeout", errors)
+        self.assertEqual(self.methods("turn/start"), [])
+        # Failed-launch cleanup interrupts the old turn; it never submits new work.
+        self.assertEqual([_as_test_dict(item["params"]).get("turnId")
+                          for item in self.methods("turn/interrupt")], ["outgoing-turn"])
+        self.assertGreaterEqual(self.lifecycle_clock.monotonic() - started_at, self.start_args_timeout)
 
     def test_initial_turn_waits_for_an_event_before_retrying_live_state(self) -> None:
         with contextlib.closing(codex_mesh.Client(self.server.port, "worker")) as client:
@@ -8063,6 +8303,11 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.worker_record()["status"], "done")
 
     def test_resident_idle_ticks_skip_move_requests_when_home_and_port_match(self) -> None:
+        self.assert_resident_idle_ticks_skip_move_requests_when_home_and_port_match()
+
+    def assert_resident_idle_ticks_skip_move_requests_when_home_and_port_match(self) -> None:
+        self.controlled_stream_deadlines()
+        started_at = self.lifecycle_clock.monotonic()
         args = self.start_args()
         args.resident = True
         empty = [0]
@@ -8080,6 +8325,13 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         self.assertEqual(empty[0], 3)
         self.assertEqual(move.call_count, 2)
+        self.assertGreaterEqual(self.lifecycle_clock.monotonic() - started_at, 120,
+                                "controlled resident ticks did not advance lifecycle time")
+
+    def test_controlled_resident_ticks_require_clock_advancement(self) -> None:
+        with patch.object(self.lifecycle_clock, "advance"):
+            with self.assertRaisesRegex(AssertionError, "controlled resident ticks did not advance"):
+                self.assert_resident_idle_ticks_skip_move_requests_when_home_and_port_match()
 
     def test_lost_new_server_turn_reply_cleans_up_that_server_and_thread(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
@@ -9781,7 +10033,8 @@ class GuardedWorkerEndTests(MeshCommandFixture):
             self.assertEqual(self.methods("turn/interrupt"), [])
             self.assertEqual(self.worker_record()["status"], "ended")
             clock_offset = 0
-            code, output, errors = self.run_mesh(["end", "--to", "worker"])
+            code, output, errors = self.run_mesh(["end", "--to", "worker",
+                "--expected-thread-id", THREAD_ID, "--cleanup-only"])
         self.assertEqual(code, 0, output + errors)
         self.assertEqual(self.queued, [])
         self.assertEqual(self.live_turn, "")

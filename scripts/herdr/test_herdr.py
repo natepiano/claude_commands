@@ -33,6 +33,8 @@ from scripts.lib.process_start_test_support import write_stat
 import fake_herdr
 import trust_survey
 from fake_herdr import CommandResponse
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 GIT_BINARY = shutil.which("git") or "git"
 
@@ -1016,8 +1018,18 @@ class HerdrTests(unittest.TestCase):
             "FAKE_HERDR_RESPONSES": str(self.responses_path), "PATH": str(self.root / "no-tools"),
             "HOME": str(self.root / "home"), "XDG_CONFIG_HOME": str(self.root / "config"),
         }, clear=True)))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
         self.configure([], "")
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": []}}))
+
+    def test_unmarked_child_cannot_inherit_its_directors_staff_identity(self) -> None:
+        with patch.dict(os.environ, {"STAFF_ID": "s123456789ab", "SHOWRUNNER_UNIT": "old",
+                                     "SHOWRUNNER_UNIT_ID": "alpha-unit", "KEPT_SETTING": "kept"}):
+            environment = herdr.unmarked_environment()
+        self.assertNotIn("STAFF_ID", environment)
+        self.assertNotIn("SHOWRUNNER_UNIT", environment)
+        self.assertNotIn("SHOWRUNNER_UNIT_ID", environment)
+        self.assertEqual(environment["KEPT_SETTING"], "kept")
 
     def configure(self, arguments: list[str], stdout: str = "", code: int = 0, stderr: str = "") -> None:
         self.responses[" ".join(arguments)] = {"stdout": stdout, "code": code, "stderr": stderr}
@@ -2236,6 +2248,7 @@ class HerdrTests(unittest.TestCase):
                 self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "workspace tabs", ""))
 
     def test_move_pane_to_workspace_uses_its_id_and_returns_the_pane_after_ordering(self) -> None:
+        _ = unit_membership("target", "models")
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
             {"workspace_id": "w1", "label": "source"}, {"workspace_id": "w2", "label": "target"}]}}))
         for pane, tab, moved in (("w1:p2", "w2:t7", "w2:p9"), ("w2:p9", "w2:t8", "w2:p11"),
@@ -2331,6 +2344,7 @@ class HerdrTests(unittest.TestCase):
                     ["tab", "focus", "w1:t1"]] if split_first else [])
 
     def test_order_tabs_detects_a_unit_in_any_pane_of_an_unchanged_split_tab(self) -> None:
+        _ = unit_membership("boss", "zulu")
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
             {"workspace_id": "w1", "label": "boss", "focused": True, "active_tab_id": "w1:t1"}]}}))
         self.configure_herdr(["tab", "list", "--workspace", "w1"], json.dumps({"result": {"tabs": [
@@ -3391,12 +3405,17 @@ class HerdrTests(unittest.TestCase):
     def test_process_snapshot_serves_roster_units_inventory_and_codex_from_one_scan(self) -> None:
         from scripts.message import roster
         from scripts.shutdown import inventory
+        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        unit = unit_membership("production", "unit")
 
         server = self.process(10, 1, ["/fixture/herdr", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
         self.socket_fd(server, 100)
         _ = self.process(12, 10, ["/bin/claude"], {
             "HERDR_PANE_ID": "pane-unit", "SHOWRUNNER_UNIT": "production", "SHOWRUNNER_UNIT_ID": "unit",
+            "STAFF_ID": unit.id,
         })
         _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex"})
         import unit_lookup as lookup
@@ -3866,6 +3885,7 @@ class SavedLayoutTests(unittest.TestCase):
         _ = self.enterContext(patch.object(herdr, "herdr_processes", return_value=[]))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"XDG_STATE_HOME": str(self.root / "state"),
                                                                     "HOME": str(self.root)})))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
 
     def running(self) -> LayoutHerdr:
         client = LayoutHerdr()
@@ -3972,6 +3992,7 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(shown["fps"], ["performance", "alpha", "benchmark", "frame-cost", "metrics-gathering"])
 
     def test_move_pane_to_workspace_orders_the_unit_tab_and_saves_its_destination(self) -> None:
+        _ = unit_membership("target", "models")
         client = LayoutHerdr()
         _ = client.open_tab("source", "source", "/repo", {})
         pane = client.open_tab("source", "models", "/unit", {})
@@ -4008,6 +4029,8 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(herdr.tab_order("boss", ["delta", "boss", "alpha"], [], set()), [1, 2, 0])
 
     def test_unit_directors_sort_before_other_tabs_from_their_panes_marks(self) -> None:
+        for name in ("mike", "zulu"):
+            _ = unit_membership("boss", name)
         client = LayoutHerdr()
         client.spaces.append(("w1", "boss"))
         for title in ("apple", "zulu", "boss", "beta", "mike", "able", "aardvark"):
@@ -4023,6 +4046,7 @@ class SavedLayoutTests(unittest.TestCase):
         self.assertEqual(client.layout(), [("boss", ["boss", "mike", "zulu", "aardvark", "able", "apple", "beta"])])
 
     def test_new_unit_environment_sorts_before_terminals_before_its_process_starts(self) -> None:
+        _ = unit_membership("boss", "zulu")
         client = LayoutHerdr()
         _ = client.open_tab("boss", "boss", "/repo", {})
         _ = client.open_tab("boss", "apple", "/repo", {})
@@ -4035,6 +4059,33 @@ class SavedLayoutTests(unittest.TestCase):
             _ = client.open_tab("boss", "banana", "/repo", {})
             _ = client.open_tab("boss", "aardvark", "/repo", {"SHOWRUNNER_UNIT": "prod"})
         self.assertEqual(client.layout(), [("boss", ["boss", "zulu", "aardvark", "apple", "banana"])])
+
+    def test_sort_tabs_uses_staff_identity_and_membership_after_hand_resume_or_transfer(self) -> None:
+        client = LayoutHerdr()
+        client.spaces.extend([("w1", "sdlc"), ("w2", "natedev")])
+        for title in ("sdlc", "devtools", "roles", "style", "shutdown", "herdr", "a-terminal", "renamed-tab"):
+            _ = client.add_tab("w1", title)
+        _ = client.add_tab("w2", "natedev")
+        for name in ("devtools", "roles", "style", "shutdown", "herdr", "pinned"):
+            _ = unit_membership("sdlc", name)
+        pinned = next(row for row in staff.snapshot().find(kind="unit") if row.name == "pinned")
+        # Hand resumes have no marks; a transferred process can retain the old production mark.
+        processes = [
+            herdr.HerdrProcess(1, herdr.HerdrPlace("fixture", client.tabs[7]["pane_id"]),
+                               {"STAFF_ID": pinned.id, "SHOWRUNNER_UNIT": "natedev"}, "claude", "/repo"),
+            herdr.HerdrProcess(2, herdr.HerdrPlace("fixture", client.tabs[6]["pane_id"]),
+                               {"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "gone-unit"}, "claude", "/repo"),
+        ]
+        with patch.object(herdr, "herdr_processes", return_value=processes), \
+                patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+            _ = client.sort_tabs()
+        self.assertEqual(reads.call_count, 1)
+        self.assertEqual(client.layout(), [
+            ("sdlc", ["sdlc", "devtools", "herdr", "renamed-tab", "roles", "shutdown", "style", "a-terminal"]),
+            ("natedev", ["natedev"]),
+        ])
+        self.assertEqual([tab["name"] for tab in herdr.saved_layout("fixture")["workspaces"][0]["tabs"]],
+                         client.layout()[0][1])
 
     def test_saved_tab_order_wins_over_unit_groups_and_alphabetical_order(self) -> None:
         titles = ["boss", "apple", "zulu", "mike"]

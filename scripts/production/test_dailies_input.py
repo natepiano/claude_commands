@@ -1565,6 +1565,16 @@ class DailiesInputTests(DailiesInputFixture):
         saved = cast(dict[str, object], json.loads(self.saved_report("example").read_text(encoding="utf-8")))
         self.assertIsNone(saved["interval"])
 
+    def test_style_ledger_uses_its_child_environment_after_rules_were_imported(self) -> None:
+        with mock.patch.object(sys, "path", [str(SCRIPT.parent.parent / "style"), *sys.path]):
+            import style_rules
+
+        outer_catalog = self.root / "outer-catalog"
+        with mock.patch.object(style_rules, "NATE_STYLE_DIR", outer_catalog):
+            summary = self.prepare_style_ledger()
+            self.assertEqual(summary["rules_total"], 1)
+            self.assertEqual(style_rules.NATE_STYLE_DIR, outer_catalog)
+
     def test_style_summary_is_saved_only_for_a_style_production_and_keeps_every_ledger_key(self) -> None:
         summary = self.prepare_style_ledger()
         original_doc = self.doc.read_text(encoding="utf-8")

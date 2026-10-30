@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import sys
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
@@ -94,15 +95,13 @@ def read_registry() -> RegistryRead:
     unreadable: list[Path] = []
     for path in paths:
         try:
-            raw = cast(object, json.loads(path.read_text()))
-            record = parse_session(raw)
-        except (OSError, ValueError, TypeError):
-            record = UnreadableSessionRecord.FOUND
-            raw = {}
-        if isinstance(record, UnreadableSessionRecord):
+            observation = _read_observation(path)
+        except FileNotFoundError:
+            continue  # A session can remove its registry entry after the directory read.
+        if isinstance(observation, UnreadableSessionRecord):
             unreadable.append(path)
         else:
-            entries.append(RegistryObservation(record, cast(RegistryDetails, raw)))
+            entries.append(observation)
     return RegistryRead(tuple(entries), tuple(unreadable))
 
 
@@ -145,11 +144,29 @@ def parse_session(parsed: object) -> RegistryEntry:
     )
 
 
+def _read_observation(path: Path) -> RegistryObservation | UnreadableSessionRecord:
+    """Read across a concurrent registry rewrite, without hiding persistent corruption."""
+    for attempt in range(3):
+        try:
+            raw = cast(object, json.loads(path.read_text()))
+            record = parse_session(raw)
+            if not isinstance(record, UnreadableSessionRecord):
+                return RegistryObservation(record, cast(RegistryDetails, raw))
+        except FileNotFoundError:
+            raise
+        except (OSError, ValueError, TypeError):
+            pass
+        if attempt < 2:
+            time.sleep(0.05)
+    return UnreadableSessionRecord.FOUND
+
+
 def read_session(path: Path) -> RegistryEntry:
     try:
-        return parse_session(cast(object, json.loads(path.read_text())))
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        observation = _read_observation(path)
+    except FileNotFoundError:
         return UnreadableSessionRecord.FOUND
+    return observation if isinstance(observation, UnreadableSessionRecord) else observation.record
 
 
 def remote_control(record: SessionRecord) -> Literal["active", "absent"]:
@@ -209,18 +226,12 @@ class SessionProcesses:
 
 
 def _session_observations(session_id: str) -> Iterator[LiveSessionProcess | SessionLivenessUnknown]:
-    try:
-        paths = [path for path in sessions_dir().iterdir() if path.suffix == ".json"]
-    except OSError as error:
-        reason = str(error).splitlines()
-        yield SessionLivenessUnknown(f"session registry unreadable: {reason[0] if reason else type(error).__name__}")
+    registry = read_registry()
+    if sessions_dir() in registry.unreadable:
+        yield SessionLivenessUnknown("session registry unreadable: " + str(sessions_dir()))
         return
-    unreadable_records: list[str] = []
-    for path in paths:
-        registered = read_session(path)
-        if isinstance(registered, UnreadableSessionRecord):
-            unreadable_records.append(path.name)
-            continue
+    for observation in registry.entries:
+        registered = observation.record
         if registered["sessionId"] != session_id:
             continue
         if running_session(registered):
@@ -229,8 +240,8 @@ def _session_observations(session_id: str) -> Iterator[LiveSessionProcess | Sess
             observed = process_liveness(registered["pid"], registered.get("procStart", ""))
             if not isinstance(observed, SessionNotLive):
                 yield observed
-    if unreadable_records:
-        yield SessionLivenessUnknown("unreadable session registry record: " + unreadable_records[0])
+    if registry.unreadable:
+        yield SessionLivenessUnknown("unreadable session registry record: " + registry.unreadable[0].name)
 
 
 def session_liveness(session_id: str) -> LiveSessionProcess | SessionNotLive | SessionLivenessUnknown:
@@ -330,7 +341,13 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 3
-    reads = [read_session(path) for path in paths]
+    reads: list[RegistryEntry] = []
+    for path in paths:
+        try:
+            observation = _read_observation(path)
+        except FileNotFoundError:
+            continue
+        reads.append(observation if isinstance(observation, UnreadableSessionRecord) else observation.record)
     unreadable = any(read is UnreadableSessionRecord.FOUND for read in reads)
     records = (read for read in reads if not isinstance(read, UnreadableSessionRecord))
     if command != "id" and target.startswith("session:"):

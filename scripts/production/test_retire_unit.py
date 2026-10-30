@@ -4,6 +4,7 @@ pool and build_hold are recording stand-ins, and the unit's Claude sessions are 
 writes: nothing real stops."""
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import os
@@ -13,7 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast, final, override
 from unittest import mock
@@ -36,10 +37,11 @@ from scripts.production.fake_unit_host import PaneShellFixture, stopped_record
 if TYPE_CHECKING:
     from scripts.message import sessions
     from scripts.message.sessions import SessionRecord
-    from scripts.shutdown import shutdown_record
+    from scripts.shutdown import shutdown, shutdown_record
     from scripts.shutdown.shutdown_record import SessionShutdown
 else:
     # retire_unit puts the message and shutdown folders on the path.
+    import shutdown
     import shutdown_record
     import sessions
     from sessions import SessionRecord
@@ -66,6 +68,29 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
     return SessionRecord(pid=pid, sessionId=session_id, name=name, messagingSocketPath="/nonexistent.sock",
                          updatedAt=0, tmux="", formerNames=[])
 
+
+
+class _Parsed(Exception):
+    """Raised after shutdown.py's parser accepts a command line, before anything runs."""
+
+
+def shutdown_parses(arguments: list[str]) -> bool:
+    """Whether shutdown.py's own parser takes this command line; nothing runs."""
+    parse = argparse.ArgumentParser.parse_args
+
+    def parse_only(parser: argparse.ArgumentParser, args: list[str] | None = None,
+                   namespace: argparse.Namespace | None = None) -> argparse.Namespace:
+        _ = parse(parser, args, namespace)
+        raise _Parsed
+
+    with mock.patch.object(argparse.ArgumentParser, "parse_args", parse_only), redirect_stderr(io.StringIO()):
+        try:
+            _ = shutdown.main(arguments)
+        except _Parsed:
+            return True
+        except SystemExit:
+            return False
+    return False
 
 @final
 class RetireUnitTests(unittest.TestCase):
@@ -449,13 +474,21 @@ class RetireUnitTests(unittest.TestCase):
         self.assertIn("invalid backend", output)
         self.assertIn(str(store.path), output)
 
+    def test_every_shutdown_call_retire_makes_parses(self) -> None:
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        calls = [call[1:] for call in self.calls if call[0] == "shutdown.py"]
+        self.assertIn("down", [call[0] for call in calls])
+        for arguments in calls:
+            with self.subTest(arguments=arguments):
+                self.assertTrue(shutdown_parses(arguments), f"shutdown.py refuses {arguments}")
+
     def test_retires_a_unit_with_a_seat_a_worker_and_a_reviewer(self) -> None:
         code, output = self.retire()
 
         self.assertEqual(code, 0, output)
         self.assertEqual(self.stops(), [
-            ["shutdown.py", "down", "--here", "--only", f"{DIRECTOR},{SEAT}",
-             "--why", "retired; /showrunner:resume_unit brings it back."],
+            ["shutdown.py", "down", "--here", "--only", f"{DIRECTOR},{SEAT}"],
             ["shutdown.py", "forget", DIRECTOR],
             ["shutdown.py", "forget", SEAT],
             ["codex_mesh.py", "stop", "--session-dir", str(self.run_folder)],
@@ -570,8 +603,7 @@ class RetireUnitTests(unittest.TestCase):
         folder = self.outside_director()
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        self.assertIn(["shutdown.py", "down", "--here", "--only", DIRECTOR,
-                       "--why", "retired; /showrunner:resume_unit brings it back."], self.calls)
+        self.assertIn(["shutdown.py", "down", "--here", "--only", DIRECTOR], self.calls)
         self.assertIn(["shutdown.py", "forget", DIRECTOR], self.calls)
         self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
         self.assertFalse(self.worktree.exists())

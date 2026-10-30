@@ -199,6 +199,11 @@ class HerdrSessionsTests(unittest.TestCase):
         self.assertEqual(self.call("list"), (0, "solo\tstandalone\tsolo-name\n", ""))
 
     def test_sort_tabs_ignores_saved_order_saves_unit_groups_and_keeps_split_workspaces(self) -> None:
+        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        for name in ("mike", "zulu"):
+            _ = unit_membership("boss", name)
         self.respond(["agents"])
         self.server(100, "agents")
         for pid, pane in ((101, "w1:p2"), (102, "w1:p4")):
