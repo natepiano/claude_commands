@@ -36,7 +36,7 @@ from dailies_render import (UNREADABLE_LIST, InputError, plumbing, read_outstand
     DeferredUntil, Outstanding, OutstandingReminder, Ranking, ReviewedOutstandingQuestion,
     ReviewUnavailableOutstandingQuestion)
 import urgency
-import atomic_file
+from atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     from ..usage import agents_log
@@ -171,8 +171,8 @@ def record_answer(outstanding: Path, slug: str, item: OutstandingItem, now: date
         entry["question"] = item["question"]
     if "asked_by" in item:
         entry["asked_by"] = item["asked_by"]
-    atomic_file.replace_text(outstanding.with_suffix(".answered.jsonl"),
-                             "".join(json.dumps(saved) + "\n" for saved in [*retained, entry]))
+    write_text_atomic(outstanding.with_suffix(".answered.jsonl"),
+                      "".join(json.dumps(saved) + "\n" for saved in [*retained, entry]))
 
 
 def replay_answer(production: Production, item: AnsweredItem) -> None:
@@ -648,7 +648,7 @@ def mark_important(production: Production, words: str) -> None:
         for key in ("urgency", "due", "marked"):
             _ = entry.pop(key, None)
         entry.update(urgency.fields(urgency.mark(datetime.now(production.zone).replace(tzinfo=None))))
-        atomic_file.replace_text(path, json.dumps(entries) + "\n")
+        write_text_atomic(path, json.dumps(entries) + "\n")
     report("mark-important", "ok", text)
 
 
@@ -692,7 +692,7 @@ def ask(production: Production, text: str, question: str, unit: str, rank: Ranki
         if any(stored["text"] == text for stored in entries):
             raise RegistrationFailure("ask", f"{text}: an item with this text is already open")
         record_question_history(outstanding, [entry], now)
-        atomic_file.replace_text(outstanding, json.dumps([*entries, entry]) + "\n")
+        write_text_atomic(outstanding, json.dumps([*entries, entry]) + "\n")
     filed = accepted.reviewed if isinstance(accepted, ReviewedQuestion) else question
     print("filed question: " + filed)
     report("ask", "ok", f"{text}: on the open-questions list of {production.slug}, not shown to the user")
@@ -737,7 +737,7 @@ def answer(production: Production, words: str) -> None:
         if removed is None:
             raise RegistrationFailure("answer", f"{text}: no longer open in {slug}")
         record_answer(path, slug, removed, datetime.now(production.zone))
-        atomic_file.replace_text(path, json.dumps([entry for entry in entries if entry["text"] != text]) + "\n")
+        write_text_atomic(path, json.dumps([entry for entry in entries if entry["text"] != text]) + "\n")
     print(relay_line(production, slug, question_asker(removed, OpenItemWithoutAsker())))
     report("answer", "ok", f"{slug}: {text}")
 
@@ -814,7 +814,7 @@ def record_question_history(outstanding: Path, items: list[OutstandingItem], now
         if "reviewed" in item:
             entry["reviewed"] = item["reviewed"]
         retained.append(entry)
-    atomic_file.replace_text(history, "".join(json.dumps(item) + "\n" for item in retained))
+    write_text_atomic(history, "".join(json.dumps(item) + "\n" for item in retained))
 
 
 def store_ranking(entry: OutstandingItem, rank: Ranking) -> None:
@@ -884,8 +884,7 @@ def questions(production: Production, path: Path | None) -> None:
             replace_outstanding(production, outstanding, state.outstanding)
     if isinstance(state.reports, ReplaceReports):
         reports = reports_path(production.slug)
-        reports.parent.mkdir(parents=True, exist_ok=True)
-        atomic_file.replace_text(reports, json.dumps(list(state.reports.items)) + "\n")
+        write_text_atomic(reports, json.dumps(list(state.reports.items)) + "\n")
     report("questions", "ok", "recorded")
 
 
@@ -944,7 +943,7 @@ def replace_outstanding(production: Production, outstanding: Path, replacement: 
             entries.append(stored)
             report("questions", "kept", f"{stored['text']}: asked by {asker}; it leaves only through `answer`")
     record_question_history(outstanding, [entry for entry in entries if entry["text"] not in previous], now)
-    atomic_file.replace_text(outstanding, json.dumps(entries) + "\n")
+    write_text_atomic(outstanding, json.dumps(entries) + "\n")
     for item in pending:
         accepted_text = item.reviewed if isinstance(item, ReviewedQuestion) else item.question
         print("reviewed question: " + accepted_text)

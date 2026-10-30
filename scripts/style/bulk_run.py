@@ -110,7 +110,8 @@ def select(ledger: ledger_api.Ledger, definition: rules.Rule) -> Selection:
     return Selection(tuple(ready), tuple(skipped))
 
 
-def claim(ledger: ledger_api.Ledger, selected: Selection, family: str, branch: str) -> dict[str, str]:
+def claim(ledger: ledger_api.Ledger, selected: Selection, family: str, branch: str,
+          intent: bulk.BatchIntent) -> dict[str, str]:
     """Normal tickets retain original approvals and later checkpoint the same commit.
 
     Called under refill_lock. ticket_add rechecks exclusive finding ownership under its SQL lock.
@@ -120,21 +121,27 @@ def claim(ledger: ledger_api.Ledger, selected: Selection, family: str, branch: s
         if isinstance(finding.state, ledger_api.Filed):
             groups[str(finding.state.proposal)].append(finding)
     owned: dict[str, str] = {}
+    planned: list[tuple[str, str, str, list[ledger_api.HeldFinding]]] = []
+    for proposal, findings in groups.items():
+        unit = "bulk-" + hashlib.sha256((findings[0].rule + proposal).encode()).hexdigest()[:16] + f"-{family}-unit"
+        ticket = ledger.next_ticket_id(unit)
+        planned.append((ticket, unit, proposal, findings))
+        owned.update((finding.finding_id, ticket) for finding in findings)
+    # ticket_add commits independently: persist every planned claim before the first one.
+    intent.begin((), sorted(set(owned.values())), sorted(owned))
     created: list[str] = []
     try:
-        for proposal, findings in groups.items():
-            unit = "bulk-" + hashlib.sha256((findings[0].rule + proposal).encode()).hexdigest()[:16] + f"-{family}-unit"
-            ticket = ledger.next_ticket_id(unit)
+        for ticket, unit, proposal, findings in planned:
             ledger.ticket_add(ticket, unit, "proposal", family, ".", sorted({f.path for f in findings}),
                               sorted({f.rule for f in findings}), proposal=proposal,
-                              finding_ids=tuple(f.finding_id for f in findings))
+                              finding_ids=tuple(f.finding_id for f in findings),
+                              batch_owner=ledger_api.BatchOwner(intent.batch_id))
             created.append(ticket)
             ledger.ticket_assign(ticket, branch)
             _ = ledger.ticket_base(ticket)
-            owned.update((f.finding_id, ticket) for f in findings)
     except BaseException:
         for ticket in created:
-            ledger.ticket_drop(ticket)
+            ledger.ticket_drop_batch(ticket, ledger_api.BatchOwner(intent.batch_id))
         raise
     return owned
 
@@ -355,6 +362,16 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger, s
     repo = repo.resolve()
     if repo != ledger.repo.resolve():
         raise bulk.BulkRenameError("ledger belongs to a different checkout")
+    intent = bulk.BatchIntent(repo, f"bulk_run --rule {rule} --base-tree {base_tree} --repo {repo}")
+    interrupted_tickets = intent.recover()
+    interrupted_owner = ledger_api.BatchOwner(intent.batch_id)
+    with ledger_api.refill_lock(repo):
+        for ticket in interrupted_tickets:
+            try:
+                ledger.ticket_drop_batch(ticket, interrupted_owner)
+            except ledger_api.TicketBatchMismatch as error:
+                print(f"bulk recovery: {error}")
+    intent.finish()
     base = require_base(repo, base_tree)
     definition = next((item for item in rules.load_rules(repo) if item.rule_id == rule or item.name == rule), None)
     if definition is None or definition.family != "names":
@@ -363,7 +380,7 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger, s
     started = time.monotonic()
     with ledger_api.refill_lock(repo):
         selected = select(ledger, definition)
-        owned = claim(ledger, selected, definition.family, git(repo, "symbolic-ref", "HEAD"))
+        owned = claim(ledger, selected, definition.family, git(repo, "symbolic-ref", "HEAD"), intent)
         # Claiming changes build_ticket; the shared site proof must receive that current row.
         selected = Selection(ledger.named_held(owned), selected.skipped)
     times["select"] = time.monotonic() - started
@@ -415,6 +432,7 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger, s
         _ = require_base(repo, base_tree)
         for file in candidates:
             available(repo, file.path)
+        intent.record_edits(candidates)
         for file in candidates:
             _ = (repo / file.path).write_bytes(file.edited.encode())
         kept = set(workspace.files)
@@ -519,7 +537,8 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger, s
     folder = ledger.database.parent / "bulk_review"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / ("workspace-" + hashlib.sha256((definition.rule_id + base).encode()).hexdigest()[:16] + ".json")
-    _ = path.write_text(json.dumps(report, indent=2) + "\n")
+    bulk.atomic_json(path, report)
+    intent.finish()
     print(report["summary"])
     return path
 
@@ -539,7 +558,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if socket.gethostname().split(".")[0] != "natedev":
             raise bulk.BulkRenameError("workspace bulk tests must run on natedev")
-        _ = require_base(args.repo, args.base_tree)
         with ledger_api.open_ledger(args.repo) as ledger, bulk.RustAnalyzer(args.repo) as server:
             report = run_rule(args.repo, args.rule, args.base_tree, ledger, server)
             status = bulk.object_fields(cast(object, json.loads(report.read_text()))).get("status", "")

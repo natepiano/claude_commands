@@ -1,6 +1,8 @@
 """Tests for setting every unit director's effort and the launch row together."""
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import contextlib
 import io
 import json
@@ -72,9 +74,7 @@ class UnitEffortTests(unittest.TestCase):
         self.records = self.root / "sessions"
         self.records.mkdir()
         self.registry = self.root / "agents.conf"
-        _ = self.registry.write_text(
-            "[assignments]\nproduction=claude\n\n[production.claude]\ndirector=opus:xhigh\n\n"
-            + "[claude.agents]\nopus=low,medium,high,xhigh,max\n", encoding="utf-8")
+        _ = write_registry(self.registry, {'assignments': {'production': 'claude'}, 'production.claude': {'director': 'opus:xhigh'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max'}})
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": '{"sessions": []}'}}))
         synced = self.root / "catalog-sync-success"
         synced.touch()

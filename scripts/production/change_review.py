@@ -75,7 +75,7 @@ from pathlib import Path
 from typing import TypeVar, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-import atomic_file  # noqa: E402
+from atomic_file import write_text_atomic  # noqa: E402
 import scratch  # noqa: E402
 import urgency  # noqa: E402
 from user_zone import user_zone  # noqa: E402
@@ -438,7 +438,7 @@ def _edit(path: Path, production: Path, day: date, write: Callable[[list[str]], 
             return result
         _sort(path, lines)
         _stamp(path, lines, production, day)
-        atomic_file.replace_text(path, "".join(lines))
+        write_text_atomic(path, "".join(lines))
         _commit(path, what(result))
         return result
     finally:

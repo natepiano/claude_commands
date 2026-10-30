@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import io
+from contextlib import redirect_stdout
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -87,6 +90,59 @@ for record in records:
         raise SystemExit(0)
 raise SystemExit(1)
 """)
+
+    def test_adoption_retries_a_partial_file_or_directory_copy(self) -> None:
+        for name, directory in (("unit_status", True), ("showrunner_state.json", False)):
+            with self.subTest(name=name), mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state):
+                scratch = self.root / f"scratch-{name}"
+                scratch.mkdir()
+                source = scratch / name
+                if directory:
+                    source.mkdir()
+                    _ = (source / "first").write_text("first state")
+                    _ = (source / "last").write_text("last state")
+                else:
+                    _ = source.write_text('{"complete": true}\n')
+
+                def interrupted_copy(source: Path, destination: Path) -> None:
+                    if source.is_dir():
+                        destination.mkdir()
+                        _ = (destination / "first").write_text("partial")
+                    else:
+                        _ = destination.write_text("partial")
+                    raise InterruptedError("copy stopped")
+
+                with mock.patch.object(shutil, "copytree" if directory else "copy2",
+                                       side_effect=interrupted_copy), self.assertRaises(InterruptedError):
+                    _ = showrunners.copy_session_state(name, scratch)
+                copied = showrunners.copy_session_state(name, scratch)
+                self.assertEqual(copied, [name])
+                target = showrunners.session_state_dir(name) / name
+                if directory:
+                    self.assertEqual({p.name: p.read_bytes() for p in target.iterdir()},
+                                     {p.name: p.read_bytes() for p in source.iterdir()})
+                else:
+                    self.assertEqual(target.read_bytes(), source.read_bytes())
+                self.assertEqual(sorted(p.name for p in target.parent.iterdir()), [name])
+                self.assertEqual(showrunners.copy_session_state(name, scratch), [])
+
+    def test_attach_retries_routing_notices_after_the_parent_was_saved(self) -> None:
+        self.showrunner("top")
+        self.showrunner("mid")
+        with mock.patch.dict(os.environ, self.environment()), \
+                mock.patch.object(showrunners, "SHOWRUNNER_STATE_DIR", self.state), \
+                mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier), \
+                mock.patch.object(showrunners, "registered_showrunners", return_value=[]), \
+                mock.patch.object(showrunners, "tell_others", side_effect=RuntimeError("before notices")), \
+                redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+            _ = showrunners.main(["attach", "mid", "top"])
+        self.assertEqual((self.state / "mid/parent").read_text(), "top\n")
+        self.assertEqual(self.successful("attach", "mid", "top").splitlines(),
+                         ["mid now reports to top", "told mid", "told top"])
+        notices = self.messages()
+        self.assertEqual(len(notices), 2)
+        self.assertIn("send it each item for the user", notices[0][1])
+        self.assertIn("never a unit", notices[1][1])
 
     def close_processes(self) -> None:
         for child in self.children:

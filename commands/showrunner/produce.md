@@ -1119,7 +1119,9 @@ at once, in the turn it arrives:
 1. Stop mid-step and start nothing new: no merge, gate or launch that has not
    begun. Leave uncommitted work in place.
 2. Append a `### STATE` block to your LOG, and stop any build you started or name
-   it in the line below.
+   it in the line below. For a move, leave Codex workers running; the mover pauses
+   them after you exit. For a stop, if ready names a running Codex worker, retry
+   when its turn finishes; start no new turns.
 3. Run the `shutdown.py ready --where "<one line>"` command the message gives.
 4. End the turn.
 
