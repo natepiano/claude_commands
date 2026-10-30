@@ -222,9 +222,12 @@ class MergeGateResourcesTests(GateSuitesFixture):
 
     @gate_suites("lib")
     def test_smaller_memory_cap_serializes_modules_without_dropping_any(self) -> None:
+        # Keep the test process above the gate's cap throughout the call.
+        ballast = bytearray(b"\1") * (192 * 1024 * 1024)
+        self.addCleanup(ballast.clear)
         # Each unrecorded job reserves 640 MiB, so this cap runs one module at a time;
         # 128 MiB stays far above the measured peak of the runner and one module (about 48 MiB).
-        result = self.run_gate("--tests-only", "--memory-cap-mib", "128")
+        result = self.run_gate("--tests-only", "--memory-cap-mib", "128", own_process=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         events = self.module_events()
         self.assertEqual(len(events), 2 * self.module_count)
