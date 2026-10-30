@@ -1,6 +1,7 @@
 """An interrupted publication keeps the last complete text available."""
 from pathlib import Path
 import os
+import stat
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -9,6 +10,36 @@ from scripts.lib.atomic_file import write_text_atomic
 
 
 class AtomicFileTests(unittest.TestCase):
+    def test_replacement_syncs_parent_folder_after_publishing_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state"
+            _ = path.write_text("old state", encoding="utf-8")
+            sync = os.fsync
+            synced_versions: list[tuple[bool, str]] = []
+
+            def record_sync(descriptor: int) -> None:
+                synced_versions.append((stat.S_ISDIR(os.fstat(descriptor).st_mode),
+                                        path.read_text(encoding="utf-8")))
+                sync(descriptor)
+
+            with patch("scripts.lib.atomic_file.os.fsync", side_effect=record_sync):
+                write_text_atomic(path, "new complete state")
+            self.assertEqual(synced_versions, [(False, "old state"), (True, "new complete state")])
+
+    def test_durable_text_write_preserves_previous_file_when_content_sync_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "note.txt"
+            write_text_atomic(path, "old text\n")
+            before = path.read_bytes()
+            with patch("scripts.lib.atomic_file.os.fsync", side_effect=OSError("injected content sync failure")):
+                with self.assertRaisesRegex(OSError, "injected content sync failure"):
+                    write_text_atomic(path, "replacement \N{SNOWMAN}\n")
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(path.parent.glob(".note.txt.*")), [])
+            write_text_atomic(path, "replacement \N{SNOWMAN}\n")
+            self.assertEqual(path.read_text(encoding="utf-8"), "replacement \N{SNOWMAN}\n")
+            self.assertEqual(list(path.parent.glob(".note.txt.*")), [])
+
     def test_new_file_after_interrupted_publish_uses_the_default_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "report"
