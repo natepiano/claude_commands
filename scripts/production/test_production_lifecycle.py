@@ -20,6 +20,7 @@ import production_lifecycle
 import showrunners
 from production_units import read_production
 from fake_unit_host import HostedUnit
+from scripts.production import production_doc
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -59,6 +60,29 @@ SEND = '''import json, os, sys
 with open(os.environ["TEST_SENT"], "a") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\\n")
 '''
+
+
+@final
+class ProductionNameTests(unittest.TestCase):
+    def test_shared_reader_returns_the_trimmed_heading_name(self) -> None:
+        lines = ["# Another document", "# Production —  example  ", "# Production — later"]
+        self.assertEqual(production_doc.production_name(lines), production_doc.ProductionName("example"))
+        self.assertEqual(production_lifecycle.production_name(lines), "example")
+
+    def test_shared_reader_reports_a_missing_production_heading(self) -> None:
+        self.assertEqual(production_doc.production_name(["# Another document"]),
+                         production_doc.ProductionNameNotRecorded("production doc lacks its name"))
+
+    def test_empty_heading_is_a_recorded_name_and_remains_valid_for_lifecycle(self) -> None:
+        lines = ["# Production — "]
+        self.assertEqual(production_doc.production_name(lines), production_doc.ProductionName(""))
+        self.assertEqual(production_lifecycle.production_name(lines), "")
+
+    def test_lifecycle_missing_heading_keeps_its_stop_fields(self) -> None:
+        with self.assertRaises(production_lifecycle.LifecycleStop) as stopped:
+            _ = production_lifecycle.production_name(["# Another document"])
+        self.assertEqual((stopped.exception.step, stopped.exception.state, stopped.exception.detail),
+                         ("input", "failed", "production doc lacks its name"))
 
 
 @final
