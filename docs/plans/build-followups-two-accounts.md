@@ -2833,64 +2833,28 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 
 ### Phase 100 — All consumers import shared whoami modules by one name  · status: done
 
-**Depends on:** Phase 94d, Phase 94e, Phase 96, Phase 97, Phase 98 (order only; each edits files whose imports this phase changes), and the completed Phase 99 remerge: natedev with shutdown-unit phase 5 merged in, the `settle.py` timer save fixed on it, and its new hash merged by the showrunner
+#### As-built
 
-**Also touches:** the herdr, shutdown, message, production and agents owners.
-
-#### Work Order
-
-**Goal:** Every consumer imports each shared whoami module by its package name, `scripts.whoami.<module>`, and the two-name registrations go. Today sibling imports (`import note_file`) and package imports (`from scripts.whoami import note_file`) coexist. Six modules register both names in `sys.modules` to keep one module object, so type identity and patched settings stay shared: `agent_accounts`, `account`, `note_file`, `session_table`, `run_out` and `usage_store`.
-
-**Spec:**
-- The package name is the one name: it works from every directory with only the repository root on `sys.path`, and the agents, herdr, usage and nix_env consumers already use it.
-- Change every bare import of the six modules (`import <module>`, `from <module> import …`, also inside functions) to the package form. Bare-import consumers found at planning:
-  - `scripts/whoami`: `five_hour.py`, `quota_alert.py`, `codex_pacer.py`, `agent_notes.py`, `run_out.py`, `session_table.py`, `whoami.py`, `profile_notes_pass.py` (added by Phase 94b; also string imports `import_module("<module>")` of three of the six).
-  - `scripts/accounts`: `accounts.py`, `new_account.py`, `refusal_watch.py`, `refusals.py`, `unit_watchdog.py`.
-  - `scripts/shutdown`: `inventory.py`, `pane_record.py`, `pane_restore.py`, `shutdown_record.py`, `restart.py`, `settle.py`, `shutdown.py`.
-  - `scripts/production`: `cli_fixture.py`, `dailies_render.py`, `showrunner_move.py`.
-  - `scripts/message/roster.py`; `scripts/nightly_review/nightly_review.py` (not in the next-items entry; found at planning).
-  - The test files and test support files listed under Files, in `scripts/whoami`, `scripts/accounts`, `scripts/shutdown`, `scripts/production` and `scripts/nightly_review` (28 test files and 2 support files at `5ad6542f`).
-  - `scripts/agents/agent_exec.sh`: its inline Python puts only `scripts/whoami` on `sys.path` and runs `from agent_accounts import workers_home`. It puts the repository root (`$script_dir/../..`) on `sys.path` and imports `scripts.whoami.agent_accounts`.
-- The repository root must be on `sys.path` before the first `scripts.` import of each consumer. Today many consumers get the root only as a side effect of a bare `import account` or `import agent_accounts` (`account.py:19` and `agent_accounts.py:46` insert `parents[2]`); `settle.py:42` and `restart.py:28` already import `scripts.accounts` through that side effect. After the change the package import must find the root first. Each consumer file that has no module-level root insert adds `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))` before its first `scripts.` import. Found at planning: `scripts/whoami/whoami.py` (its root insert is inside a function, line 69), `run_out.py`, `session_table.py`; `scripts/accounts/refusals.py`, `unit_watchdog.py`; `scripts/production/dailies_render.py`, `cli_fixture.py`; `scripts/shutdown/inventory.py`, `pane_record.py`, `pane_restore.py`, `shutdown_record.py`, `restart.py`, `settle.py`, `shutdown.py`. Also files that already import `scripts.*` with no module-level root insert: `scripts/whoami/usage_store.py` (line 28), `scripts/production/add_unit_test_support.py` (line 5), `scripts/whoami/quota_alert_test_support.py` (line 5).
-- Remove the `if __name__ == "<module>": … elif __name__ == "scripts.whoami.<module>": …` block from each of the six modules.
-- Other whoami modules (`quota_alert`, `five_hour`, `codex_pacer`, `agent_notes`) keep their current import names; `scripts/lib/nix_env.py` keeps its own two-name block. Both are out of scope.
-- No other behavior changes.
+- Every consumer imports `agent_accounts`, `account`, `note_file`, `session_table`, `run_out` and `usage_store` as `scripts.whoami.<module>`, also inside functions and in `import_module` strings. Code and tests share one module object, so type identity (`KnownCodexAccount`, `Report`, `UsageClaimFailed`, `UsageSaveFailed`) and patched settings such as `note_file.AGENTS_DIR` hold.
+- The six modules carry no `if __name__ == "<module>": … elif __name__ == "scripts.whoami.<module>": …` two-name registration block; no `sys.modules.setdefault` remains in `scripts/whoami`.
+- Root-insert rule: each consumer puts `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))` at module level before its first `scripts.` import, and none depends on the side-effect insert in `account.py` or `agent_accounts.py`. The inline Python in `scripts/agents/agent_exec.sh` puts the repository root (`$script_dir/../..`) on `sys.path` and imports `scripts.whoami.agent_accounts`.
+- `quota_alert`, `five_hour`, `codex_pacer` and `agent_notes` keep their own import names; `scripts/lib/nix_env.py` keeps its own two-name block.
+- The one approved relative import is `from ..whoami import account, agent_accounts` in `scripts/message/test_roster.py`.
 
 **Files:**
-- `scripts/whoami/agent_accounts.py`, `scripts/whoami/account.py`, `scripts/whoami/note_file.py`, `scripts/whoami/session_table.py`, `scripts/whoami/run_out.py`, `scripts/whoami/usage_store.py` — the registration blocks.
-- `scripts/whoami/five_hour.py`, `scripts/whoami/quota_alert.py`, `scripts/whoami/codex_pacer.py`, `scripts/whoami/agent_notes.py`, `scripts/whoami/whoami.py` — consumers.
-- `scripts/accounts/accounts.py`, `scripts/accounts/new_account.py`, `scripts/accounts/refusal_watch.py`, `scripts/accounts/refusals.py`, `scripts/accounts/unit_watchdog.py` — consumers.
-- `scripts/shutdown/inventory.py`, `scripts/shutdown/pane_record.py`, `scripts/shutdown/pane_restore.py`, `scripts/shutdown/shutdown_record.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py` — consumers.
-- `scripts/production/cli_fixture.py`, `scripts/production/dailies_render.py`, `scripts/production/showrunner_move.py` — consumers.
-- `scripts/message/roster.py`, `scripts/nightly_review/nightly_review.py` — consumers.
-- `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_codex_alert_accounts.py`, `scripts/whoami/test_codex_homes.py`, `scripts/whoami/test_codex_pacer.py`, `scripts/whoami/test_five_hour.py`, `scripts/whoami/test_note_file.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_run_out.py`, `scripts/whoami/test_session_table.py`, `scripts/whoami/test_usage_store.py`, `scripts/whoami/test_quota_zero_episode.py`, `scripts/whoami/test_quota_alert_claude.py`, `scripts/whoami/test_quota_alert_delivery.py` — tests; the last two import `agent_accounts` bare at lines 14 and 21.
-- `scripts/whoami/quota_alert_test_support.py` — test support: bare imports of `agent_accounts`, `session_table`, `note_file`, `account` and `usage_store` (lines 27–34) and `import usage_store` inside a function (line 275).
-- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_cutover_home.py`, `scripts/accounts/test_new_account.py`, `scripts/accounts/test_refusals.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/accounts/test_unit_watchdog.py` — tests.
-- `scripts/shutdown/test_account_move.py`, `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_pane_record.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_shutdown_status.py`, `scripts/shutdown/test_stop.py`, `scripts/shutdown/test_bounded_stop.py`, `scripts/shutdown/test_staff_parent.py` — tests; the last two import bare at lines 27 (`from account import Account`) and 16.
-- `scripts/production/test_add_showrunner.py`, `scripts/production/test_transfer_unit.py`, `scripts/production/add_unit_test_support.py`, `scripts/nightly_review/test_nightly_review.py` — tests; the support file has `import usage_store` at line 39, and `test_transfer_unit.py` a bare import at line 383.
-- `scripts/production/test_dailies_render.py` — test: its multi-name `import dailies_render, showrunners, note_file` (line 253), found at the production suite.
-- `scripts/whoami/profile_notes_pass.py` — consumer: `import usage_store` and `from agent_accounts import …` inside a function, and `import_module("usage_store")`, `import_module("run_out")`, `import_module("agent_accounts")` in `load_pass` and `patch_list`.
-- `scripts/agents/agent_exec.sh` — the inline Python import.
-- `scripts/agents/codex_mesh.py`, `scripts/herdr/herdr_sessions.py` — already package form; read to confirm, change only a bare import found.
+- `scripts/whoami/{agent_accounts,account,note_file,session_table,run_out,usage_store}.py` — the six shared modules, registered under the package name only.
+- Consumers and tests in `scripts/{whoami,accounts,shutdown,production,message,nightly_review}` — package imports and module-level root inserts.
+- `scripts/whoami/profile_notes_pass.py` — loads and patches the package modules; `test_profile_notes_pass.py` takes the save counter key from the real patch entry.
+- `scripts/agents/agent_exec.sh` — inline Python imports the package name.
 
-**Workers:** 2 writers, split by directory (no file in both). Both lanes freeze their files before the shared acceptance run, so the run tests one tree.
-- `whoami` — `scripts/whoami` modules and tests, the six registration blocks.
-- `consumers` — `scripts/accounts`, `scripts/shutdown`, `scripts/production`, `scripts/message`, `scripts/nightly_review`, `scripts/agents`, `scripts/herdr`, and their tests.
-
-**Constraints from prior phases:** Tests sit beside the code (Delegation Context); after this phase they import the six modules by the package name, the same object the code uses. Tests never touch live dirs: `HOME`, `AGENT_NOTES_DIR` and the patched `note_file.AGENTS_DIR` point at scratch folders. No `Any`, no file-level ignores.
-- Phase 94c: `scripts/accounts/accounts.py` now also calls `agent_accounts.usage_store_warning_line` and reads `agent_accounts.UsageClaimFailed`, `UsageSaveFailed` and `Report.store_warnings`; type identity of these classes depends on the one module object. `scripts/accounts/role_map.py` has no bare import of the six modules.
-- Phases 96–99 edit `accounts.py`, `role_map.py`, `refusal_watch.py`, `quota_alert.py`, `five_hour.py` and `settle.py` bodies. Phase 99 changes `settle.py` `begin`, `now`, the timer save and `send_showrunner_line`, and `scripts/message/send.py`; this phase starts only after its remerge (Depends on) and changes imports only. herdr-unit also edits `settle.py`; merge origin/natedev before the work starts and before the gate.
-- Phase 99 behavior this phase keeps (plan review 2026-10-30). The shutdown and message gates must still pass these tests unchanged: `test_settle.py` `test_archived_restart_reports_back_after_retrying_its_stopping_line`, `test_rerun_down_releases_abandoned_account_registration`, `test_legacy_registration_releases_when_its_last_session_finishes` and `test_rerun_down_keeps_timer_snapshot_for_cancel_after_stop`; `test_restart.py` `test_outcome_replays_a_queued_fallback_without_a_second_back_line`; `test_send.py` `test_a_failed_keyed_session_send_retries_but_a_delivered_send_keeps_its_window` and its queued-copy and later-run tests. Phase 7 proves that the showrunner receives the lines.
-- The `grep` in the acceptance gate found these bare-import files at `5ad6542f`; rerun it at the start to catch files added since.
-- Merge timing: no checkpoint merge during the natedev build hold, 00:05–03:05 EDT (showrunner, 2026-10-29). While any natedev build hold is in force, run no tests, gates or type checks unless this unit holds it; check `build_hold.py status` first.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `whoami`, `accounts`, `shutdown`, `production`, `message`, `nightly_review`, `agents`, `herdr`, `usage`, `nix_env` and `lib`; `basedpyright` on every changed file and each caller module reads `0 errors, 0 warnings, 0 notes`; `grep -rnE '^\s*(import|from) (agent_accounts|account|note_file|session_table|run_out|usage_store)\b' scripts` finds nothing (it covers the `.sh` inline Python too); `grep -rnE 'import_module\("(agent_accounts|account|note_file|session_table|run_out|usage_store)"\)' scripts` finds nothing; `grep -rnE 'import\s+([A-Za-z_][A-Za-z_0-9.]*\s*,\s*)*(agent_accounts|account|note_file|session_table|run_out|usage_store)\b' scripts --include=*.py --include=*.sh | grep -v 'scripts\.whoami'` finds only the approved relative import in `scripts/message/test_roster.py`; no `sys.modules.setdefault` remains in `scripts/whoami`; with `/tmp` as the working directory and only the file's own directory on `sys.path` (as a script run has it), `python3 -c 'import sys; sys.path.insert(0, "<dir>"); import <module>'` imports each changed non-test consumer without `ModuleNotFoundError` (import only; never call its `main`). A file whose name is not an identifier (a hook with hyphens) loads through `importlib.util.spec_from_file_location` and `exec_module` instead. A `.sh` file's changed inline Python runs once in a scratch `HOME` from `/tmp`, import only.
+**Binds later work:** a new consumer of the six modules uses the package form with a module-level root insert. `test_consumers_share_the_one_account_module` compares the `quota_alert` and `accounts` bindings with the one module object.
 
 **Gotchas:**
-- A test that imports a module by the other name gets a second module object. Its `patch.object(note_file, "AGENTS_DIR", …)` then misses the object the code uses, and the code can write to the live notes dir. Change each test's import in the same commit as its module's consumers.
-- Type identity: a `KnownCodexAccount` or `Report` made from one module object fails `isinstance` against the other. A remaining bare import shows as a failing `isinstance` test, not an import error.
-- The unit suites run from the repository root, so the working directory puts the root on `sys.path` and hides a missing root insert. Only the import check from `/tmp` in the acceptance gate finds one.
-- `scripts/whoami/profile_notes_pass.py` patches the pass's write and act calls to no-ops on the module objects it loads. If it keeps a bare name after the registration blocks go, its patches attach to a second module object, and a director's profile run can write the live usage store and run_out log or start a live Codex read. `test_profile_notes_pass.py` `test_argument_free_pass_keeps_all_input_files_unchanged` (zero `usage_store.save_timer_usage` calls, read through the package import) is the guard.
+- Suites run from the repository root put the root on `sys.path` and hide a missing root insert; only an import check from `/tmp`, with only the file's own directory on `sys.path`, finds one.
+- A name built from `owner.__name__` follows the package name, so a literal Counter key such as `"usage_store.save_timer_usage"` reads zero; take the key from the real patch entry.
+- A test that compares two import forms of one module now compares the module with itself and always passes; compare consumer bindings with the one module instead.
+- A module loaded under a second name is a second object: its patches miss the code's object (writes can reach live dirs), and the failure shows as a failing `isinstance`, not an import error.
+- A multi-name import (`import dailies_render, showrunners, note_file`) escapes a `^(import|from) <module>` grep; the multi-name grep catches it.
 
 ### Phase 100b — Every consumer imports the showrunner registry by one name  · status: todo
 
@@ -2927,6 +2891,8 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 - `consumers` — every other folder above.
 
 **Constraints from prior phases:** Phase 100's constraints hold here: tests never touch live dirs, no `Any`, no file-level ignores, no tests or type checks during a natedev build hold this unit does not hold. Merge origin/natedev before the work starts and before the gate.
+- Phase 100 review findings to check here. A name built from `owner.__name__` follows the new package name, so a literal key for it reads zero from a `Counter` and its guard can never fail (`profile_notes_pass.py` counts patches this way). A test that compares two import forms of one module compares it with itself once one form goes; test real consumers instead. Grep both forms.
+- The Files list predates shutdown's one move path (`f62a75dc`), which added `scripts/shutdown/stop_resume.py` and `scripts/accounts/move_test_support.py` and cut `scripts/production/showrunner_move.py` to a small wrapper. Rerun the grep at the start and take its list as the current one.
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `production`, `shutdown`, `message`, `style`, `hooks`, `bevy_upgrade`, `herdr`, `lint`, `accounts` and `whoami`; `basedpyright` on every changed file and each caller module reads `0 errors, 0 warnings, 0 notes`; `grep -rnE '^\s*(import showrunners\b|from showrunners import)|import_module\("showrunners"\)|patch(\.object)?\("showrunners\.' scripts` finds nothing, and `grep -rn 'import showrunners' scripts` finds no embedded or generated import (it covers `.sh` inline Python too); the import check from `/tmp` in Phase 100's gate passes for each changed non-test consumer; the four `test_unit_watchdog.py` grace and slow-probe tests pass with a poisoned outer registry (a fake `showrunners` module on `sys.path` whose `NOTIFIER_STATE_DIR` names a scratch folder), as at `33c970ec`.
 
