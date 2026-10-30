@@ -118,3 +118,47 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 **Acceptance:** the touched test modules and their callers' suites pass; basedpyright clean on changed Python files.
 
 **Residual (review, minor follow-up):** if `shutdown.py down` itself stops after `settle.begin()` writes the shutdown record and before its conductor starts, the heal stop keeps `stop_request_sent: false` with a record present, and a rerun of `down` skips the existing record (`settle.py:819`, an accounts-unit row of the same sweep). The repair belongs in settle's rerun of an unfinished record, not in heal.
+
+### Phase 11 — verify.sh loads the nix environment with one helper start, and both helpers import less  · status: done
+
+**Source:** showrunner of natedev, 2026-10-30 (measured by builds' verify unit): verify.sh starts `scripts/lib/nix_env.py` (96 ms CPU per start) and `scripts/lib/user_zone.py` (37 ms) on every verify step, on both machines. Give each a cheap entry path with fewer imports, keep one implementation of each (no copy), measure before and after at the parent commit.
+
+**Baseline (natedev, 2026-10-30, parent 8c53e312, child CPU user+sys, mean of 30 runs):** `python3 -c pass` 14.2 ms, `python3 -S -c pass` 9.2 ms; `lib/py nix_env.py ensure <dir with no .envrc>` 49 ms; `lib/py nix_env.py ensure ~/rust/cargo-liner` 126 ms, of which `direnv export json` is 75 ms and `direnv allow` 2 ms; `python3 user_zone.py` 26.5 ms. Outside a nix shell, verify.sh runs `nix_env.py ensure`, then a second Python only to read `IN_NIX_SHELL` from its JSON, then `nix_env.py exec`, which runs direnv export again: about 270 ms in a repo with an `.envrc`, 67 ms without. Own imports (`-X importtime`): nix_env.py — dataclasses 10.5 ms (inspect 9.2), subprocess 5.0, json 4.5, pathlib 2.4, typing 2.4; user_zone.py — pathlib 6.8 ms, zoneinfo 3.6.
+
+#### Work Order
+
+**Goal:** verify.sh outside a nix shell starts `nix_env.py` once and runs direnv export at most once; `nix_env.py` and `user_zone.py` load only the modules their command-line path uses; each has one implementation.
+
+**Spec:**
+1. `scripts/lib/nix_env.py` `exec` names the envrc it loaded: for `Loaded` it sets `NIX_ENV_ENVRC=<resolved envrc path>` in the program's environment; for `NoEnvrc` it removes any inherited `NIX_ENV_ENVRC`. `ensure` and its JSON output are unchanged.
+2. `scripts/direct/verify.sh` nix block (lines 186-208): when `IN_NIX_SHELL` is empty and `VERIFY_NIX_ENV_REEXEC` is unset, export `VERIFY_NIX_ENV_REEXEC=1` and `exec "$dir/../lib/py" -S "$dir/../lib/nix_env.py" exec "<absolute verify.sh>" "$@"`. No `ensure` call and no inline `python -c` JSON check. In the re-run (marker set): `IN_NIX_SHELL` set → print the existing notice line `verify.sh: not in the nix shell; re-running under nix_env.py exec` once to stderr and continue; `IN_NIX_SHELL` empty and `NIX_ENV_ENVRC` set → the existing refusal line `verify.sh: nix_env.py re-exec still has no nix shell (IN_NIX_SHELL unset)`, exit 1; both empty → no envrc: continue silently with the caller's environment. A nix_env refusal still exits 1 with only nix_env's reason line. Unset the marker after the block, as now. No new exec loop is possible.
+3. `nix_env.py` command-line path imports less: the result types `Loaded`, `NoEnvrc`, `Refused` stop using `dataclasses` (use `typing.NamedTuple`: same names, fields, keyword construction, attribute access and `isinstance` checks for every caller, e.g. `scripts/notify/review.py:745`, `scripts/nix_env/heal.py`); `subprocess`, `shlex` and `json` load only on the path that needs them (direnv run, refusal hint, JSON in/out), each local import with a one-line comment naming the start-up cost; `Mapping` is a type-checking-only import. No second copy of any function.
+4. `scripts/lib/user_zone.py` imports no `pathlib`: `CONF` becomes a `str` path built with `os.path` (same value: `USER_ZONE_CONF`, else `<repo>/config/user_zone.conf` from the resolved file). The `zone=` reader becomes public, `stored_zone(path: str) -> str` (empty when the file or line is missing), and is the one reader of that file.
+5. `scripts/lib/zone.py` (owner: unit-board) uses it: `stored(conf)` returns `user_zone.stored_zone(str(conf)) or user_zone.DEFAULT_ZONE` (its own copy of the reader is removed); `checkout_of(Path(user_zone.CONF))` and `conf = Path(user_zone.CONF)` at its two uses.
+6. `verify.sh` `user_clock` runs `python3 -S` on `user_zone.py`.
+7. `docs/as-built/nix-shell-launch.md` (verify.sh paragraph near line 86, the exec description near line 38) describes the new flow and `NIX_ENV_ENVRC`.
+
+**Files:**
+- `scripts/lib/nix_env.py` — NamedTuple results, deferred imports, `NIX_ENV_ENVRC` on exec
+- `scripts/direct/verify.sh` — one-exec nix block; `python3 -S` in `user_clock`
+- `scripts/lib/user_zone.py` — str `CONF`, public `stored_zone`, no pathlib
+- `scripts/lib/zone.py` — uses `stored_zone`; wraps `CONF` in `Path`
+- `docs/as-built/nix-shell-launch.md` — verify.sh flow, `NIX_ENV_ENVRC`
+- `scripts/direct/test_verify_nix_shell.py`, `scripts/lib/test_nix_env.py`, `scripts/lib/test_user_zone.py`, `scripts/lib/test_zone.py` — tests
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `scripts/lib/nix_env.py`, `scripts/direct/verify.sh`, `scripts/lib/user_zone.py`, `scripts/lib/zone.py`, `docs/as-built/nix-shell-launch.md`
+- `test` — `scripts/direct/test_verify_nix_shell.py`, `scripts/lib/test_nix_env.py`, `scripts/lib/test_user_zone.py`, `scripts/lib/test_zone.py`: one-call flow (helper calls `["exec"]`, direnv export once with an envrc, none without), `NIX_ENV_ENVRC` set and cleared by exec, lost shell still refused, `stored_zone` shared by zone.py, and an import-budget test per helper (run it with `-S -X importtime`; nix_env `ensure` on a dir with no envrc loads none of `dataclasses`, `inspect`, `subprocess`, `shlex`; `user_zone.py` loads no `pathlib`)
+
+**State:** none
+
+**Assertion changes (ruled by the unit director, Phase 11 design: verify.sh now loads the env with one `nix_env.py exec`):**
+- Assertion-Change: scripts/direct/test_verify_nix_shell.py::test_refusal_stops_before_tool_setup_with_only_the_helper_line — helper calls become ["exec"]
+- Assertion-Change: scripts/direct/test_verify_nix_shell.py::test_no_envrc_has_no_notice_no_reexec_and_no_direnv_call — helper calls become ["exec"]; verify.sh is re-run once with no envrc
+- Assertion-Change: scripts/direct/test_verify_nix_shell.py::test_reexec_losing_proof_refuses_without_another_exec — helper calls become ["exec"]; direnv export runs once; stderr becomes LOOP_REFUSAL alone, since the notice prints only when the re-run has the shell
+- Assertion-Change: scripts/direct/test_verify_nix_shell.py::test_missing_shell_reexec_preserves_cwd_arguments_and_exit_status — helper calls and direnv count drop to one exec
+- Assertion-Change: scripts/direct/test_verify_nix_shell.py::test_nearest_ancestor_envrc_is_found_by_the_helper — helper calls and direnv count drop to one exec
+
+**Result (natedev, 2026-10-30, child CPU user+sys, mean of 30 runs, parent 8c53e312 → this phase):** `verify.sh` with an unknown verb outside a nix shell: repo with an `.envrc` 649.3 → 468.0 ms, repo without 446.1 → 383.8 ms. `user_zone.py` in `user_clock`'s call form: 26.0 → 16.8 ms. The `verify.sh` numbers include its later `build_targets.py` start, which this phase does not change.
+
+**Acceptance:** the unit director measures with the same harness at the parent commit (8c53e312) and at the checkpoint, N=30 on natedev: `verify.sh` with an unknown verb outside a nix shell, in a repo with an `.envrc` and in one without; `user_zone.py` in `user_clock`'s call form. The touched test modules and their callers' suites pass; basedpyright clean on changed Python files.
