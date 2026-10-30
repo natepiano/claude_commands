@@ -19,7 +19,8 @@ from collections.abc import Callable
 from contextlib import redirect_stdout
 from datetime import timedelta
 from pathlib import Path
-from typing import cast, override
+from types import SimpleNamespace
+from typing import cast, final, override
 from unittest.mock import Mock, patch
 
 from test_support import ShutdownTestCase, linux_process_fixture, empty_session_registry
@@ -48,6 +49,19 @@ class FlushedOutput(io.StringIO):
     def flush(self) -> None:
         self.flushed.append(self.getvalue())
         super().flush()
+
+
+@final
+class InlineThread:
+    """A thread that runs its target at start, so only the fake clock orders the stop's steps."""
+
+    def __init__(self, target: Callable[..., object], args: tuple[object, ...] = (), daemon: bool = False) -> None:
+        del daemon
+        self._target = target
+        self._args = args
+
+    def start(self) -> None:
+        _ = self._target(*self._args)
 
 
 class BoundedShutdownTests(ShutdownTestCase):
@@ -80,6 +94,9 @@ class BoundedShutdownTests(ShutdownTestCase):
             shown = subprocess.run(arguments, capture_output=True, text=True, check=True, timeout=timeout)
             return shown.stdout, -1
         _ = self.enterContext(patch.object(inventory, "_collect_process_table", collect, create=True))
+        # A real thread finishes at a time the machine's load sets, while the fake clock
+        # moves only when the stop sleeps; under load the two orders differed.
+        _ = self.enterContext(patch.object(stop, "threading", SimpleNamespace(Thread=InlineThread, Event=threading.Event)))
 
     def process(self, pid: int, parent: int = 1, *, started: str = "", arguments: tuple[str, ...] = (),
                 session_id: str = "", run_dir: str = "", build_unit: str = "") -> None:
