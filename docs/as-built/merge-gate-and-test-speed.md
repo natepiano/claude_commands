@@ -266,4 +266,15 @@ Lint cache checks run by subject in `test_verify_lint_cache.py` (fixed and forma
 
 Usage collector tests use `collect_test_support.py`, which builds one source fixture per class and restores private copies at the same paths per test. `test_collect.py` covers local collection; the Mac reader, role evidence, stream recovery and process lifetime checks run in `test_collect_mac.py`, `test_collect_mac_roles.py`, `test_collect_mac_recovery.py` and `test_collect_processes.py`. Ordinary CLI calls and their empty watcher fixture run in-process; explicit watcher handoff, durability tracing, pass-lock children, fake SSH and the real remote reader retain their process boundaries. Socket readiness and release events replace the Mac lock test’s marker polling. A pipe signals when the local record iterator resumes after processing attribution; the fake SSH then checks the committed role snapshot through its own SQLite connection. Existing assertions and timing bounds remain; 300-second deadlines only guard hangs.
 
+`test_verify_tree_cancel.py` keeps source and external-document coverage; lint,
+progress-history, token reacquisition and Mac cancellation live in
+`test_verify_tree_cancel_{lint,history,reacquire,mac}.py`.
+`verify_tree_cancel_test_support.py` seeds the full Git workspace once per class
+and restores private copies at the same absolute path. The real verifier,
+watcher, Git edits, process descendants, cancellation signals and original
+completion bounds stay in use. Fake lint rewrites wait for parent acknowledgments,
+which also check that judgment watching has not begun; memory transitions use
+file events. Simple tool replies use shell builtins, and session cleanup reuses
+the token ownership fixture's process metadata observer.
+
 Lint repair ordering runs in `test_verify_lint_fixes.py` (successive fixes before judgment, with cache off and on) and `test_verify_lint_fix_failures.py` (formatting after failed repair and preservation of the final judgment status). Both reuse the committed lint-scope fixture, which builds once per class and restores private copies at the same paths. The convergence test inherits `VerifyLintCacheFixture`, enabling pass records through `UNIT_RUN_DIR` without an unrelated director token or progress window. Real Bash verification, source hashing, fake Cargo/Taplo/Git processes and every original assertion remain. There are no fixture sleeps or polling intervals; the existing 300-second deadline only guards hangs.
