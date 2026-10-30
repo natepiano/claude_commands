@@ -1225,6 +1225,44 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertEqual(copy.returncode, -15)
         self.assertEqual(self.repository_claim("hana")["pid"], taker.pid)
 
+    def test_queued_test_stops_a_copy_before_claiming_the_mac(self) -> None:
+        hana = self.repository("hana")
+        self.write_config(offload="on", ci_repo="", **{"linux_only.hana": ""})
+        copy, taker = self.start_child(), self.start_child()
+        self.assert_command(self.copy_claim(copy.pid, hana), 0, "claimed\n")
+        reaper = threading.Thread(target=copy.wait)
+        reaper.start()
+        try:
+            result = self.command("claim-wait", "--pid", str(taker.pid),
+                                  "--repo-root", str(hana), "--package", "hana")
+            self.assert_command(result, 0, "claimed\n")
+            reaper.join(timeout=10)
+            self.assertEqual(copy.returncode, -15)
+            self.assertEqual(self.repository_claim("hana")["pid"], taker.pid)
+        finally:
+            if copy.poll() is None:
+                copy.kill()
+            reaper.join(timeout=10)
+
+    def test_queued_test_keeps_waiting_when_a_copy_does_not_yield(self) -> None:
+        hana = self.repository("hana")
+        self.write_config(offload="on", ci_repo="", **{"linux_only.hana": ""})
+        copy = self.start_script_child("import signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)")
+        taker = self.start_child()
+        try:
+            self.assert_command(self.copy_claim(copy.pid, hana), 0, "claimed\n")
+            held = self.repository_claim("hana")
+            started = time.monotonic()
+            result = self.command("claim-wait", "--pid", str(taker.pid),
+                                  "--repo-root", str(hana), "--package", "hana",
+                                  environment={**self.environment, "MAC_TEST_COPY_YIELD_S": "0.5"})
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertGreaterEqual(time.monotonic() - started, 0.5)
+            self.assertIsNone(copy.poll())
+            self.assertEqual(self.repository_claim("hana"), held)
+        finally:
+            copy.kill()
+
     def test_copy_that_does_not_stop_leaves_the_new_test_busy(self) -> None:
         hana = self.repository("hana")
         copy = self.start_script_child("import signal\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)")

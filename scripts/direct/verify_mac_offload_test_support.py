@@ -462,6 +462,15 @@ import os
 from pathlib import Path
 import sys
 
+# The routing simulator shares its availability schedule with the new
+# claim-wait hook. Real claim locking and transfer are tested separately.
+if sys.argv[1] == "release":
+    raise SystemExit(0)
+if sys.argv[1] == "claim-wait":
+    assert sys.argv[-4] == "--pid" and sys.argv[-2] == "--package", sys.argv
+    assert int(sys.argv[-3]) > 0, sys.argv
+    sys.argv = [sys.argv[0], "free-now", *sys.argv[2:-4]]
+
 root = Path(os.environ["TEST_RUNNER_STATE"])
 with (root / "free-now-roots").open("a") as output:
     output.write(" ".join(sys.argv[4:]) + "\n")

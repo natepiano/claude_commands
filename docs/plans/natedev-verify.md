@@ -2,7 +2,7 @@
 
 > **Status: IMPLEMENTATION PLAN — phased, direct-ready.** Owner of `verify.sh`, its final pass, its cache, its lint and test scope, its speed and the Mac test code; first change: cut the Python helper start time in each verify run.
 
-> **Production: natedev** — unit `verify-unit`; production doc `docs/plans/natedev-production.md`
+> **Production: builds** — unit `verify-unit`; production doc `docs/plans/builds-production.md`
 
 ## Source
 
@@ -80,7 +80,7 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 
 **Acceptance gate:** merge gate `--tests-only` green on a tree merged with `origin/natedev`; basedpyright `0 errors, 0 warnings` on `scripts/direct scripts/mac_test` and every caller module; `bash -n` clean; the before/after trace table in the phase report shows ≤ 2 s CPU of helper starts per step for this unit's share, with the other owners' remaining cost named.
 
-### Phase 2 — Cancel a test or lint run when the tree changes under it  · status: todo
+### Phase 2 — Cancel a test or lint run when the tree changes under it  · status: done
 
 **Depends on:** none (runs beside Phase 1 in its own worktree; the second to land merges the first in `scripts/direct/verify.sh`).
 
@@ -158,7 +158,7 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 
 **Acceptance gate:** merge gate `--tests-only` green; basedpyright `0 errors, 0 warnings` on changed files and callers; a test shows `test hana --filter native_rate` with filtered history promised that history's p90, without history the floor rule, and an unfiltered run unchanged.
 
-### Phase 4 — Promise a fresh test run only its test memory  · status: todo
+### Phase 4 — Promise a fresh test run only its test memory  · status: done
 
 **Depends on:** Phase 3 (same function). Runs in Phase 3's worktree `/home/natepiano/worktrees/claude-build-followups-verify-memory`, branch `natedev-verify-memory`, after Phase 3's checkpoint.
 
@@ -176,6 +176,7 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 4. A compile run keeps Phase 3's promise. Full-suite compile runs are unchanged.
 5. Report the fresh and compile promises for `test hana --filter native_rate` from real history, before and after.
 6. Showrunner 2026-10-29 (hana's trunk found it): the lint cache key leaves out the assertion guard's base (Phase 5 picks it), so after origin/HEAD moved, lint replayed an old recorded failure. Put the guard base commit, and any other input the guard reads, in the lint key. A test moves origin/HEAD and sees lint re-run.
+7. builds 2026-10-29 (hana's writer found it, 12:10 EDT): (a) the assertion guard reads `Assertion-Change:` rulings only from `UNIT_SESSION_DIR`, and a Codex mesh worker has only `UNIT_RUN_DIR`, so it never sees the rulings; (b) the lint key must change when those rulings change. One reading of the rulings folders — `UNIT_SESSION_DIR` and `UNIT_RUN_DIR`, each when set — feeds both the guard's `--rulings` and the lint key. Tests: a run with only `UNIT_RUN_DIR` reads a ruling there; adding a ruling re-runs a cached failed lint.
 
 **Files:**
 - `scripts/lint/memory_admit.py` — the fresh-run rule and promise
@@ -256,3 +257,62 @@ Done when the trace on the same runs shows ≤ 2 s CPU of helper starts per step
 **Constraints from prior phases:** Phase 5's base order stays as it is. Never change origin/HEAD in tests.
 
 **Acceptance gate (showrunner bump):** basedpyright `0 errors, 0 warnings` on changed files; the guard and hook test files pass; tests show a merge whose other parent removed assertions passes, our own removal on a merge still blocks, and the hook and the guard return the same answer for a staged commit with a ruling in its `-F` file.
+
+### Phase 7 — Keep the cargo token through a long lint, and keep a run's queue place when the Mac is taken  · status: done
+
+**Depends on:** none. Urgent, ahead of Phases 1, 2 and 4. Runs in `/home/natepiano/worktrees/claude-build-followups-verify-guard`, branch `natedev-verify-token` (from origin/natedev d41fbd8c).
+
+#### Work Order
+
+**Source:** natedev and builds showrunners, 2026-10-29, from hana. (1) Lint run 20261029T062917-3558291-d939 (`verify.sh lint hana`, 06:29-12:37 EDT) lost the cargo token before fmt and exited 125. verify.sh holds the token with `--hold 3600` and never renews it, and board.sh reclaims an expired hold while its holder lives (board.log: "12:33:40 [splash] claim: token cargo reclaimed from panels after its hold expired"). clippy ran past the hour because the tree key hashes verify.sh's own file. The ~/.claude main checkout moved verify.sh three times during the run, so the fix loop saw "changed" and ran two more passes (the last took 3801 s), and `cache_record` printed a false "tree changed" notice. `lint_failure_is_the_tree` counts 125 as the tree's lint failure. (2) widget run 20261029T070857-3319484-a8ef left the memory wait 12 times on an unlocked `mac_test.py free-now` read. Each time it lost the real claim to another hana step, ran `run_nextest` again without `BUILDLOG_MEM_WAIT_SINCE`, and queued at the back.
+
+**Goal:** a run that holds the cargo token never loses it between or during its steps; a change to verify's own scripts never makes a run do more work or print a tree-changed notice; a run that does not get the Mac keeps its memory-queue place.
+
+**Spec:**
+
+1. While verify.sh holds the cargo token, it renews the hold before each step and from a background loop while a step runs (well inside the hold), and stops renewing when it releases. Use `board.sh renew`; add `--pid` to `cmd_renew` so verify renews for its holder pid.
+2. The fix loop's "did the fixes change anything" check and the tree-changed notice use tree content only, not the hashes of verify.sh, invoke.sh or lint.conf. The pass-record key may keep them.
+3. `lint_failure_is_the_tree` never counts status 125, or any lost-token status, as the tree's lint failure.
+4. In `run_local_test`, the first memory-wait start (`BUILDLOG_MEM_WAIT_FROM`) carries through a call file to every later `run_nextest` as `BUILDLOG_MEM_WAIT_SINCE`, so a run whose Mac claim failed keeps its queue place. The recorded memory wait (`BUILDLOG_MEM_WAIT_S`, the build record's `mem_wait_s`) counts from that first start, so a run that rejoined 12 times records its whole wait, not the last part (builds, 2026-10-29, from resources-unit: widget's 4 h 34 min wait recorded 1428 s).
+5. board.sh `lock_stale_reason` never reclaims an expired hold while `holder_pid` is alive and its `owned` group record still matches; a dead holder is still freed.
+6. One decision point for the Mac: the memory wait's leave hook takes the Mac claim under `state.lock` (as `claim_once` does) and hands the held claim to the runner, instead of reading `free-now`. A step leaves the wait only when it already holds the Mac; a refused claim keeps waiting in place.
+7. Script hashes stay in the pass-record (cache) key, so a lint result does not survive a lint-script change (builds, 2026-10-29).
+
+**Files:**
+- `scripts/direct/verify.sh` — specs 1-4
+- `scripts/direct/board.sh` — spec 5 and renew --pid (owner: natedev; name it in the notice)
+- `scripts/mac_test/mac_test.py`, `scripts/mac_test/offload.py` — spec 6 claim handoff
+- `scripts/lint/memory_gate.sh` — spec 6 leave hook (owner: resources-unit; trial-merge against origin/builds-resources)
+- `scripts/direct/test_verify_token_renew.py` — new: regressions for specs 1-6
+
+**Workers:** 1 writer (the idle cancel test worker, `claude-build-followups-verify-cancel-test`, slot `test`), source and tests.
+
+**Constraints:** never change origin/HEAD in tests. builds approved the board.sh, mac_test.py, offload.py and memory_gate.sh edits (2026-10-29); memory_admit.py stays read only.
+
+**Acceptance gate:** `bash -n`; basedpyright `0 errors, 0 warnings` on the new test file; `python3 -m unittest discover -s scripts/direct -p 'test_verify*.py'` passes; regressions show: a step that runs past the hold keeps the token; a verify.sh content change during lint runs no extra fix pass and prints no notice; 125 is not cached as a lint FAIL; a failed Mac claim reuses the first wait start.
+
+### Phase 8 — Name the holder of what a wait is on  · status: todo
+
+**Depends on:** sdlc phases-unit Phase 11 merged on builds (adds `start-wait --holder-*` and `wait-holder`; builds tells verify-unit, ETA 18:30 EDT). Needed by hierarchies' wait experiment.
+
+#### Work Order
+
+**Source:** sdlc hand-off, approved by builds 2026-10-29.
+
+**Goal:** every wait verify.sh records names who holds what it waits on.
+
+**Spec:**
+
+1. `phase_wait_start` passes the holder to `progress_history.py start-wait`: `--holder-resource-kind slot|memory --holder-resource <slot name | memory pool> --holder-session <session id>`, or `--holder-unit <unit>` when only the unit is known. All flags or none; none records `HolderNotNamed`.
+2. The holder is: for a slot, the board token owner; for memory, the owner of the reservation that blocks admission (a read function in `memory_admit.py`, resources-unit's); for a build hold, the hold's holder.
+3. When the holder changes during the same wait, call `progress_history.py wait-holder --session-dir <dir> --wait-id <id>` with the same flags.
+4. Tests: one per resource kind, a holder change mid-wait, and the no-holder case.
+
+**Files:**
+- `scripts/direct/verify.sh` — holder lookup and the two calls
+- `scripts/direct/test_verify_wait_holder.py` — new
+- `scripts/lint/memory_admit.py` — read only here: resources-unit adds `memory_admit.py blocker --waiter <file>` (`current_blocker`), JSON `{session_id, session_name, pool}` | `{unit}` | `{}`, and the same object in `check` output; on builds-resources by 17:00 EDT
+
+**Workers:** 1 writer + 1 tester.
+
+**Acceptance gate:** merge gate `--tests-only` green on a tree merged with origin/builds; basedpyright 0/0 on changed files and callers.

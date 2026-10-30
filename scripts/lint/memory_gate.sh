@@ -14,7 +14,7 @@
 # after the first; status 0 ends the wait with BUILDLOG_MEM_OUTCOME=LeftQueue
 # and no reservation, so the caller can run the step elsewhere. A poll that
 # admits never runs it: a step that can start here starts at once.
-# mac_test.py free-now is written as this hook: local state only, 130 ms.
+# verify's Mac hook atomically claims capacity before returning success.
 
 BUILD_OVERRIDE_GUARD_DIR="${BASH_SOURCE[0]%/*}"
 [[ "$BUILD_OVERRIDE_GUARD_DIR" != "${BASH_SOURCE[0]}" ]] || BUILD_OVERRIDE_GUARD_DIR=.
@@ -25,6 +25,17 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../build_targets" && pwd)/build_targets.py}"
 BUILDLOG_MEM_ADMIT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/memory_admit.py"
 USER_ZONE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/user_zone.py"
+
+# A rejoined wait reports its full age; a fresh wait retains the local
+# elapsed clock (also used by launch callers with no queue identity).
+buildlog_memory_wait_time() {
+    if [[ -n "${BUILDLOG_MEM_WAIT_SINCE:-}" ]]; then
+        BUILDLOG_MEM_WAIT_S=$(( ${EPOCHSECONDS:-$(date +%s)} - BUILDLOG_MEM_WAIT_FROM ))
+        (( BUILDLOG_MEM_WAIT_S >= 0 )) || BUILDLOG_MEM_WAIT_S=0
+    else
+        BUILDLOG_MEM_WAIT_S=$(( SECONDS - $1 ))
+    fi
+}
 
 buildlog_memory_python() {
     if [[ -x "$HOME/.claude/scripts/lib/py" ]]; then
@@ -190,6 +201,10 @@ buildlog_wait_for_memory() {
     [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || interval=5
     [[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 0 ]] || limit=900
     BUILDLOG_MEM_WAIT_FROM="${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHSECONDS:-$(date +%s)}}"
+    if [[ -n "${BUILDLOG_MEM_WAIT_FIRST_FILE:-}" && -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
+        read -r BUILDLOG_MEM_WAIT_FROM < "$BUILDLOG_MEM_WAIT_FIRST_FILE"
+    fi
+    [[ "$BUILDLOG_MEM_WAIT_FROM" =~ ^[0-9]+$ ]] || { buildlog_memory_refuse 'invalid first wait time'; return 2; }
     while [[ -r "$meminfo" ]]; do
         available_kb=""
         while IFS= read -r line || [[ -n "$line" ]]; do
@@ -205,7 +220,7 @@ buildlog_wait_for_memory() {
             break
         fi
         if (( announced != 0 )); then
-            BUILDLOG_MEM_WAIT_S=$(( SECONDS - started ))
+            buildlog_memory_wait_time "$started"
             if (( $# > 0 && BUILDLOG_MEM_WAIT_S >= limit && noticed == 0 )); then
                 noticed=1
                 printf 'still waiting for memory after %d min: this step is now first in line, and no build starts without memory\n' "$(( BUILDLOG_MEM_WAIT_S / 60 ))" >&2
@@ -245,10 +260,11 @@ buildlog_wait_for_memory() {
         # A refreshed estimate replaces the shell cache on every answer.
         cached_repo=$repo cached_step=$step cached_worktree=$worktree
         cached_need=$need cached_source=$source cached_count=$count
+        if [[ -n "${BUILDLOG_MEM_WAIT_SINCE:-}" ]]; then buildlog_memory_wait_time "$started"; fi
         if [[ "$state" == admit ]]; then
             BUILDLOG_MEM_RESERVATION="$reservation"
             BUILDLOG_MEM_OUTCOME=Granted
-            if (( announced != 0 )); then
+            if (( announced != 0 || BUILDLOG_MEM_WAIT_S > 0 )); then
                 buildlog_memory_line done "$available" "$threshold" "$need" "$source" "$count" "$promised" "$running" "$reserve" "$summary"
             fi
             break
@@ -259,6 +275,9 @@ buildlog_wait_for_memory() {
             return 2
         fi
         if (( announced == 0 )); then
+            if [[ -n "${BUILDLOG_MEM_WAIT_FIRST_FILE:-}" && ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
+                printf '%s\n' "$BUILDLOG_MEM_WAIT_FROM" > "$BUILDLOG_MEM_WAIT_FIRST_FILE"
+            fi
             started=$SECONDS
             announced=1
             buildlog_memory_line first "$available" "$threshold" "$need" "$source" "$count" "$promised" "$running" "$reserve" "$summary" "$repo" "$step" "${measured:-0}" "${head_need:-0}" "${head_label:-}"
@@ -273,7 +292,9 @@ buildlog_wait_for_memory() {
         fi
         sleep "$interval"
     done
-    if (( announced != 0 )); then BUILDLOG_MEM_WAIT_S=$(( SECONDS - started )); fi
+    if (( announced != 0 )) || [[ -n "${BUILDLOG_MEM_WAIT_SINCE:-}" ]]; then
+        buildlog_memory_wait_time "$started"
+    fi
     case "$BUILDLOG_MEM_OUTCOME" in
         Granted|LeftQueue) return 0 ;;
         *) buildlog_memory_refuse "cannot read MemAvailable from $meminfo" ;;

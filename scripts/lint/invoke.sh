@@ -229,7 +229,11 @@ run_once() {
                 buildlog_release_memory "$status"
                 return "$status"
             }
-            memory_wait=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
+            if [[ -n "${BUILDLOG_MEM_WAIT_SINCE:-}" ]]; then
+                memory_wait=$BUILDLOG_MEM_WAIT_S
+            else
+                memory_wait=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
+            fi
             if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
                 buildlog_release_memory 0
                 BUILDLOG_MEM_WAIT_S=$memory_wait BUILDLOG_START="" BUILDLOG_TREE=""

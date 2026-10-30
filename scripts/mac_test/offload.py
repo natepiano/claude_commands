@@ -259,6 +259,18 @@ MacSource = RepositoryWorkingTree | StagedDocSnapshot
 
 
 @dataclass(frozen=True)
+class UnclaimedMacRun:
+    """The runner still needs to acquire Mac capacity."""
+
+
+@dataclass(frozen=True)
+class MacClaimFromWait:
+    """Capacity already held by the local wait's live process."""
+
+    owner_pid: int
+
+
+@dataclass(frozen=True)
 class OffloadRequest:
     """One Mac verb, its arguments and the metadata sent with it.
 
@@ -274,6 +286,7 @@ class OffloadRequest:
     copy: bool = False
     verb: MacVerb = "nextest"
     source: MacSource = RepositoryWorkingTree()
+    admission: UnclaimedMacRun | MacClaimFromWait = UnclaimedMacRun()
 
     @property
     def source_root(self) -> Path:
@@ -518,6 +531,7 @@ class CliArguments(argparse.Namespace):
         self.copy: bool = False
         self.nextest_words: list[str] = []
         self.verb: MacVerb = "nextest"
+        self.claim_owner_pid: int = 0
 
 
 class ProcessController:
@@ -878,6 +892,7 @@ def parse_probe(output: str) -> ProbeResult:
 
 def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]:
     copy_words = ["--copy"] if request.copy else []
+    handoff = ["--from-pid", str(request.admission.owner_pid)] if isinstance(request.admission, MacClaimFromWait) else []
     return [
         sys.executable,
         str(Path(__file__).with_name("mac_test.py")),
@@ -891,6 +906,7 @@ def claim_arguments(request: OffloadRequest, config: OffloadConfig) -> list[str]
         "--remote",
         config.host,
         *copy_words,
+        *handoff,
     ]
 
 
@@ -1480,6 +1496,7 @@ def parser() -> argparse.ArgumentParser:
     _ = run.add_argument("--last-decline", choices=("busy", "blocked"), default="")
     _ = run.add_argument("--filter-run", action="store_true")
     _ = run.add_argument("--copy", action="store_true")
+    _ = run.add_argument("--claim-owner-pid", type=int, default=0)
     _ = run.add_argument("--result")
     _ = run.add_argument("nextest_words", nargs=argparse.REMAINDER)
     return root
@@ -1504,6 +1521,7 @@ def request_from_arguments(arguments: CliArguments) -> OffloadRequest:
         last_decline=last_decline,
         copy=arguments.copy,
         verb=arguments.verb,
+        admission=MacClaimFromWait(arguments.claim_owner_pid) if arguments.claim_owner_pid > 0 else UnclaimedMacRun(),
     )
 
 

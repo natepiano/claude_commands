@@ -219,6 +219,20 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 # repo needs >= 3.11.
 PY="${HOME}/.claude/scripts/lib/py"
 
+# Keep the identity of the code loaded by this shell, even when lint's fixes
+# require a new tree key. An updated script belongs to the next invocation.
+lint_code_key() {
+    "$PY" -c 'import hashlib, pathlib, sys
+key = hashlib.sha256()
+for name in sys.argv[1:]:
+    path = pathlib.Path(name)
+    key.update(path.read_bytes() if path.is_file() else b"absent")
+    key.update(b"\0")
+print(key.hexdigest())' "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
+        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" 2>/dev/null || true
+}
+LINT_LOADED_CODE_KEY="$(lint_code_key)"
+
 # The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
 # invoke_clippy_fix, invoke_clippy, and sandbox-failure detection come from here.
 # shellcheck source=/dev/null
@@ -1112,6 +1126,7 @@ if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
 fi
 RUN_LOG=""
 VERDICT_KEY=""
+VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
 RUN_STARTED=0
 CALL_NOTED=0
@@ -1142,7 +1157,11 @@ if [[ "$CMD" == test && "$LOCAL_ONLY" -eq 1 ]]; then
 fi
 
 tree_key() {
-    local words=("$CMD" "${ARGS[@]}") names=() name scope=()
+    local words=("$CMD" "${ARGS[@]}") names=() name scope=() scripts=()
+    if [[ "${1:-}" != --tree-content ]]; then
+        scripts=("${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh"
+            "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}")
+    fi
     if [[ "$CMD" == lint && ${#ARGS[@]} -eq 1 ]]; then
         words=(lint)
     elif [[ "${FILTER_RUN}" -eq 1 ]]; then
@@ -1166,8 +1185,7 @@ tree_key() {
         # Keyed on the package's own build, read from the call's metadata.
         scope=(--package "${ARGS[0]}")
     fi
-    "$PY" -c "$TREE_KEY_PY" ${scope[@]+"${scope[@]}"} "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
-        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" -- "${words[@]}" \
+    "$PY" -c "$TREE_KEY_PY" ${scope[@]+"${scope[@]}"} ${scripts[@]+"${scripts[@]}"} -- "${words[@]}" \
         <<< "${GATE_METADATA}" 2>/dev/null || true
 }
 
@@ -1379,6 +1397,9 @@ try_mac_test() {
     local result_seconds="" result_holder="" mac_words=0 line
     local runner_args=(run --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
         --package "$PKG" --call-id "$BUILDLOG_CALL_ID" --settings "$1")
+    if [[ -n "${MAC_WAIT_CLAIM_FILE:-}" && -f "$MAC_WAIT_CLAIM_FILE" ]]; then
+        runner_args+=(--claim-owner-pid "$$")
+    fi
     if [[ "$MAC_VERB" != nextest ]]; then runner_args+=(--verb "$MAC_VERB"); fi
     if [[ -n "$MAC_SOURCE_ROOT" ]]; then runner_args+=(--source-root "$MAC_SOURCE_ROOT"); fi
     if [[ "${2:-}" == busy || "${2:-}" == blocked ]]; then
@@ -1400,6 +1421,7 @@ try_mac_test() {
     # when the Mac run began, with the output it printed.
     if [[ -n "${CACHE_DIR}" ]]; then
         VERDICT_KEY="$(tree_key)"
+        VERDICT_TREE_KEY="$(tree_key --tree-content)"
     fi
     MAC_LOG_FILE="$(mktemp)"
     step_state on_mac
@@ -1413,6 +1435,7 @@ try_mac_test() {
     trap - INT TERM HUP
     eval "$caller_traps"
     MAC_RUNNER_PID=""
+    release_wait_claim
 
     if [[ -f "$MAC_RESULT_FILE" && -r "$MAC_RESULT_FILE" \
           && -s "$MAC_RESULT_FILE" ]]; then
@@ -1678,7 +1701,7 @@ remember_mac_retry() {
 }
 
 # The same command gates routing retries and both local wait hooks. The
-# deadline uses the call's monotonic clock. free-now reads local state only.
+# deadline uses the call's monotonic clock. Memory waits claim before leaving.
 mac_retry_hook() {
     if [[ "$2" != 0 ]]; then
         printf '{ '
@@ -1686,8 +1709,18 @@ mac_retry_hook() {
         printf '%q ' "$PY" -c 'import sys, time; sys.exit(time.monotonic() < float(sys.argv[1]))' "$2"
         printf '; } && '
     fi
-    printf '%q ' "$PY" "$MAC_TEST_SCRIPT" free-now --settings "$1" \
+    printf '%q ' "$PY" "$MAC_TEST_SCRIPT" "${3:-free-now}" --settings "$1" \
         --repo-root "${DOC_REPO_TOP:-$(git rev-parse --show-toplevel)}"
+    if [[ "${3:-}" == claim-wait ]]; then
+        printf '%q ' --pid "$$" --package "$PKG"
+        printf '&& touch %q' "$MAC_WAIT_CLAIM_FILE"
+    fi
+}
+
+release_wait_claim() {
+    [[ -n "${MAC_WAIT_CLAIM_FILE:-}" && -f "$MAC_WAIT_CLAIM_FILE" ]] || return 0
+    "$PY" "$MAC_TEST_SCRIPT" release --pid "$$" >/dev/null 2>&1 || true
+    rm -f "$MAC_WAIT_CLAIM_FILE"
 }
 
 route_test() {
@@ -1877,19 +1910,19 @@ finish_copy_win() {
 }
 
 # Runs the tests on natedev. While MAC_LEAVE_SETTINGS names a Mac, a run held
-# in the memory wait leaves once mac_test.py free-now says that Mac is free,
+# in the memory wait leaves only after mac_test.py claim-wait holds that Mac,
 # and its Mac result counts as one from route_test: a failure or a pass ends
 # the call. Other results keep the hook unless the Mac excludes this test.
 # Non-busy declines wait for the retry deadline. Once the step compiles,
 # copy_watch.py may run a copy on the Mac; a copy result that finishes first
 # ends the call (finish_copy_win).
 run_local_test() {
-    local status hook copy_watch
+    local status hook copy_watch first_wait="" first_wait_file="$HOLD_WAIT_DIR/memory-wait-first"
     while true; do
         hook=""
         copy_watch=0
         if [[ -n "$MAC_LEAVE_SETTINGS" ]]; then
-            hook="$(mac_retry_hook "$MAC_LEAVE_SETTINGS" "$MAC_RETRY_AFTER")"
+            hook="$(mac_retry_hook "$MAC_LEAVE_SETTINGS" "$MAC_RETRY_AFTER" claim-wait)"
             if [[ -f "$MAC_COPY_WATCH" && -f "$MAC_RUNNER" ]]; then
                 copy_watch=1
             fi
@@ -1900,7 +1933,9 @@ run_local_test() {
         if [[ "$copy_watch" -eq 1 ]]; then
             start_copy_watch
         fi
-        LINT_QUEUE_LEAVE_HOOK="$hook" run_nextest "${NEXTEST_ARGS[@]}" || status=$?
+        if [[ -s "$first_wait_file" ]]; then read -r first_wait < "$first_wait_file"; fi
+        BUILDLOG_MEM_WAIT_SINCE="$first_wait" BUILDLOG_MEM_WAIT_FIRST_FILE="$first_wait_file" \
+            LINT_QUEUE_LEAVE_HOOK="$hook" run_nextest "${NEXTEST_ARGS[@]}" || status=$?
         if [[ "$copy_watch" -eq 1 ]]; then
             stop_copy_watch
             if [[ "$COPY_WORD" == won ]]; then
@@ -1984,10 +2019,15 @@ user_clock() {
 
 cache_record() {
     local kind=$1 repeat=$2 host=${3:-} key verb=passed other=fail
+    if [[ "$CMD" == lint ]]; then
+        [[ -n "$LINT_LOADED_CODE_KEY" && "$(lint_code_key)" == "$LINT_LOADED_CODE_KEY" ]] || return 1
+    fi
     key="$(tree_key)"
     [[ -n "${key}" && -n "${VERDICT_KEY}" ]] || return 1
     if [[ "${key}" != "${VERDICT_KEY}" ]]; then
-        echo "verify.sh: the tree changed while ${CMD} ran, so this result was not recorded; the next ${CMD} runs again."
+        if [[ -z "$VERDICT_TREE_KEY" || "$(tree_key --tree-content)" != "$VERDICT_TREE_KEY" ]]; then
+            echo "verify.sh: the tree changed while ${CMD} ran, so this result was not recorded; the next ${CMD} runs again."
+        fi
         return 1
     fi
     if [[ "${kind}" == fail ]]; then
@@ -2037,7 +2077,7 @@ record_mac_pass() {
 lint_failure_is_the_tree() {
     [[ "$CMD" == lint ]] || return 1
     (( CLIPPY_FIX_LIMIT_REACHED == 0 )) || return 1
-    (( EXIT_STATUS != 2 && EXIT_STATUS != 3 && EXIT_STATUS < 128 )) || return 1
+    (( EXIT_STATUS != 2 && EXIT_STATUS != 3 && EXIT_STATUS != 125 && EXIT_STATUS < 128 )) || return 1
     (( ${RUN_LAST_ATTEMPT_KILLED:-0} == 0 ))
 }
 
@@ -2085,6 +2125,7 @@ if [[ "$CMD" == test && -n "${CACHE_DIR}" && -z "${GATE_METADATA}" ]]; then
 fi
 
 HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
+MAC_WAIT_CLAIM_FILE="$HOLD_WAIT_DIR/mac-wait-claim"
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
 export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
@@ -2178,6 +2219,12 @@ fi
 TOKEN_USED=0
 TOKEN_HELD=0
 TOKEN_WAITER_PID=""
+TOKEN_HOLD_S=${VERIFY_TOKEN_HOLD_S:-3600}
+TOKEN_RENEW_S=${VERIFY_TOKEN_RENEW_S:-60}
+[[ "$TOKEN_HOLD_S" =~ ^[1-9][0-9]*$ ]] || TOKEN_HOLD_S=3600
+[[ "$TOKEN_RENEW_S" =~ ^[0-9]+([.][0-9]+)?$ ]] || TOKEN_RENEW_S=60
+TOKEN_RENEW_S=$(awk -v interval="$TOKEN_RENEW_S" -v hold="$TOKEN_HOLD_S" \
+    'BEGIN { if (interval <= 0 || interval > hold / 3) interval = hold / 3; print interval }')
 token_wait_clock() {
     # Tests can advance a disposable clock while acquisition still blocks on
     # the real board. Normal calls retain Bash's elapsed-seconds clock.
@@ -2332,7 +2379,7 @@ token_wait_superseded() {
     exit "$VERIFY_SUPERSEDED_STATUS"
 }
 # Waits until this run holds the token, with no time limit: the pid reclaim and
-# the 3600 s hold already free a dead or stuck holder, and the queue above
+# the pid reclaim frees a dead holder, and the queue above
 # drops a waiter whose verify.sh ended. Sets TOKEN_WAITED to the seconds it
 # waited.
 acquire_token() {
@@ -2376,7 +2423,7 @@ acquire_token() {
             # Two tries 3 s apart, then the queue is read again.
             pause=1
             bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-                --pid $$ --hold 3600 --wait 3 >/dev/null 2>&1 &
+                --pid $$ --hold "$TOKEN_HOLD_S" --wait 3 >/dev/null 2>&1 &
             TOKEN_WAITER_PID=$!
             status=0
             wait "$TOKEN_WAITER_PID" || status=$?
@@ -2516,10 +2563,37 @@ sys.exit(shell_status(subprocess.call(command)))
 # Preserve the shared invocation policy (including systemd scopes and its
 # fallback), changing only the command it launches while this token is held.
 eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
+renew_token() {
+    bash "${BOARD_HELPER}" renew "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
+        --pid $$ --hold "$TOKEN_HOLD_S" >/dev/null 2>&1
+}
+
 buildlog_exec() {
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-        buildlog_exec_unowned python3 -c "$STEP_OWNER_PY" \
-            "${BOARD_DIR}/locks/cargo.d" "$$" "$@"
+        if ! renew_token; then
+            echo 'verify.sh: this run lost the cargo token before its step started; run it again.' >&2
+            return 125
+        fi
+        (
+            delay_pid=""
+            trap 'if [[ -n "$delay_pid" ]]; then
+                kill "$delay_pid" 2>/dev/null || true
+                wait "$delay_pid" 2>/dev/null || true
+            fi; exit 0' INT TERM HUP
+            while kill -0 "$$" 2>/dev/null; do
+                "$PY" -c 'import sys, time; time.sleep(float(sys.argv[1]))' "$TOKEN_RENEW_S" &
+                delay_pid=$!
+                wait "$delay_pid" || break
+                delay_pid=""
+                renew_token || break
+            done
+        ) &
+        local renewer=$! step_status=0
+        buildlog_exec_unowned "$PY" -c "$STEP_OWNER_PY" \
+            "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
+        kill "$renewer" 2>/dev/null || true
+        wait "$renewer" 2>/dev/null || true
+        return "$step_status"
     else
         buildlog_exec_unowned "$@"
     fi
@@ -2553,7 +2627,7 @@ try_token_now() {
     count_token_waiters_ahead
     (( TOKEN_WAITERS_AHEAD == 0 )) || return 1
     bash "${BOARD_HELPER}" acquire "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-        --pid $$ --hold 3600 --wait 0 >/dev/null 2>&1 || return 1
+        --pid $$ --hold "$TOKEN_HOLD_S" --wait 0 >/dev/null 2>&1 || return 1
     TOKEN_HELD=1
 }
 
@@ -2567,21 +2641,29 @@ try_token_now() {
 # token wait reaches the call record through TOKEN_WAIT_FILE.
 eval "$(declare -f buildlog_wait_for_memory | sed '1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/')"
 buildlog_wait_for_memory() {
-    local memory_wait
     step_state waiting_hold
     if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
         : > "${TOKEN_WAIT_FILE}.given_back"
     fi
     buildlog_wait_for_memory_only "$@" || return $?
+    # Publish an actual memory wait to run_once as well as later admission
+    # passes. An immediate grant must not turn a later build hold into memory
+    # wait; the call file also identifies waits shorter than one second.
+    if [[ -n "${BUILDLOG_MEM_WAIT_SINCE:-}" || -s "${BUILDLOG_MEM_WAIT_FIRST_FILE:-}" ]] \
+            || (( BUILDLOG_MEM_WAIT_S > 0 )); then
+        BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM
+    fi
     [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
     TOKEN_WAITED=0
     if ! try_token_now; then
         buildlog_release_memory 0
         acquire_token || return $?
-        memory_wait=$BUILDLOG_MEM_WAIT_S
-        # The second pass keeps the step's place in the memory queue from its first wait.
-        BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@" || return $?
-        BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
+        # The second pass reports the whole wait from its first start.
+        buildlog_wait_for_memory_only "$@" || return $?
+        if [[ -n "${BUILDLOG_MEM_WAIT_SINCE:-}" || -s "${BUILDLOG_MEM_WAIT_FIRST_FILE:-}" ]] \
+                || (( BUILDLOG_MEM_WAIT_S > 0 )); then
+            BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM
+        fi
         if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
             if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
                 : > "${TOKEN_WAIT_FILE}.given_back"
@@ -2641,6 +2723,7 @@ if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
     # waited is part of the tree it runs on.
     VERDICT_KEY="$(tree_key)"
+    VERDICT_TREE_KEY="$(tree_key --tree-content)"
     RUN_LOG="${CACHE_DIR}/run.$$.log"
     : > "${RUN_LOG}"
     exec > >(tee -a "${RUN_LOG}") 2> >(tee -a "${RUN_LOG}" >&2)
@@ -2693,6 +2776,7 @@ verify_cleanup() {
         interrupted) outcome=interrupted code="" ;;
     esac
     note_event "${outcome}" "${RUN_STARTED}" $(( SECONDS - RUN_STARTED )) "" 0 "${code}" || true
+    release_wait_claim
     finish_hold_wait
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "$MEM_KILL_FILE"
     [[ -z "${MEM_KILL_FILE:-}" ]] || rm -f "${MEM_KILL_FILE}.stopped"
@@ -2854,9 +2938,9 @@ case "$CMD" in
                 :
             else
                 mend_status=${PIPESTATUS[0]}
-                if (( mend_status == 137 )); then
+                if (( mend_status == 137 || mend_status == 125 )); then
                     rm -f "$MEND_LOG"
-                    exit 137
+                    exit "$mend_status"
                 fi
                 if grep -qiE 'rolled back|revert' "$MEND_LOG"; then
                     echo "verify.sh: cargo mend --fix rolled its rewrites back; the tree reproduces it — run /mend_fix" >&2
@@ -2897,6 +2981,7 @@ case "$CMD" in
         # Record the tree Taplo reads; clippy fix and fmt update the key below.
         if [[ -n "${RUN_LOG}" ]]; then
             VERDICT_KEY="$(tree_key)"
+            VERDICT_TREE_KEY="$(tree_key --tree-content)"
         fi
         # Cargo's workspace root can differ from the caller's directory.
         # Run there so Taplo uses the same config and scope as the push gate.
@@ -2920,11 +3005,11 @@ case "$CMD" in
         fi
         if lint_config_enabled clippy; then
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy start'
-            clippy_tree_before="$(tree_key)"
+            clippy_tree_before="$(tree_key --tree-content)"
             for ((clippy_fix_pass=1; HOLD_LINT == 0 && clippy_fix_pass<=3; clippy_fix_pass++)); do
                 invoke_clippy_fix --workspace --all-targets --all-features --keep-going || true
                 fmt_cargo "${FMT_SCOPE[@]}"
-                clippy_tree_after="$(tree_key)"
+                clippy_tree_after="$(tree_key --tree-content)"
                 if [[ -n "$clippy_tree_before" && "$clippy_tree_before" == "$clippy_tree_after" ]]; then
                     break
                 fi
@@ -2936,6 +3021,7 @@ case "$CMD" in
             done
             if [[ -n "${RUN_LOG}" ]]; then
                 VERDICT_KEY="$(tree_key)"
+                VERDICT_TREE_KEY="$(tree_key --tree-content)"
             fi
             invoke_clippy --workspace --all-targets --all-features --keep-going
             [[ "$PKG" != --workspace ]] || echo 'style-lint: clippy passed'
