@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tomllib
 from typing import NotRequired, TypedDict, cast, override
 import unittest
@@ -166,6 +167,7 @@ class Fake:
         self.window_level: str = "Normal"
         self.refuse_window_level_raise_once: bool = False
         self.refuse_window_level_restore: bool = False
+        self.stop_on_shutdown: bool = False
         self.screenshot_started: threading.Event = threading.Event()
         self.release: threading.Event = threading.Event()
         self.lock: threading.Lock = threading.Lock()
@@ -302,6 +304,9 @@ def handler_for(fake: Fake) -> type[BaseHTTPRequestHandler]:
             request = cast(Request, json.loads(self.rfile.read(length)))
             reply = {"jsonrpc": "2.0", "id": 1, **fake.answer(request["method"], request.get("params") or {})}
             body = json.dumps(reply).encode()
+            if request["method"] == "brp_extras/shutdown" and fake.stop_on_shutdown:
+                self.server.shutdown()
+                self.server.server_close()
             try:
                 self.send_response(200)
                 self.send_header("content-type", "application/json")
@@ -319,6 +324,7 @@ def handler_for(fake: Fake) -> type[BaseHTTPRequestHandler]:
 
 
 class HanaShotTest(unittest.TestCase):
+    fake_listeners: list[ThreadingHTTPServer] = []
     scratch: Path = Path()
     fake: Fake = Fake()
     port: int = 0
@@ -328,6 +334,7 @@ class HanaShotTest(unittest.TestCase):
         self.scratch = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.fake = Fake()
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(self.fake))
+        self.fake_listeners = [server]
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
@@ -885,6 +892,275 @@ class LaunchBuildWarningTests(unittest.TestCase):
         self.assertEqual(state.get("uncommitted_paths"), paths)
         saved = cast(dict[str, object], json.loads((self.root / "launch.json").read_text()))
         self.assertEqual(saved["uncommitted_paths"], paths)
+
+
+class LaunchRecordRecoveryTests(HanaShotTest):
+    state_path: Path = Path()
+    root: Path = Path()
+    executable: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.fake.stop_on_shutdown = True
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, self.script_environment(), clear=True)))
+        self.state_path = hana_shot.launch_state_path(self.port)
+        self.state_path.parent.mkdir(parents=True)
+        self.root = self.scratch / "worktree"
+        (self.root / "crates" / "hana").mkdir(parents=True)
+        self.executable = self.root / "hana"
+        _ = self.executable.write_bytes(b"fixture binary; never execute")
+
+    def launch_without_starting_hana(self) -> hana_shot.LaunchState:
+        launch_scratch = self.scratch / "new-launch-scratch"
+        launch_scratch.mkdir()
+        process = cast(subprocess.Popen[bytes], mock.Mock(pid=424242))
+        with (
+            mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
+            mock.patch.object(tempfile, "mkdtemp", return_value=str(launch_scratch)),
+            mock.patch.object(subprocess, "Popen", return_value=process),
+            mock.patch.object(hana_shot, "wait_ready"),
+            redirect_stderr(io.StringIO()),
+        ):
+            state, _ = hana_shot.launch(self.port, str(self.root), str(self.executable))
+        return state
+
+    def stop_fake_listener(self) -> None:
+        server = self.fake_listeners[-1]
+        server.shutdown()
+        server.server_close()
+
+    def restart_fake_listener(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", self.port), handler_for(self.fake))
+        self.fake_listeners.append(server)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+    def shutdown_command(self) -> tuple[int, str]:
+        diagnostics = io.StringIO()
+        handlers = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        try:
+            with redirect_stderr(diagnostics):
+                exit_code = hana_shot.main(["shutdown", "--port", str(self.port)])
+        finally:
+            for number, handler in handlers.items():
+                _ = signal.signal(number, handler)
+        return exit_code, diagnostics.getvalue()
+
+    def assert_unreadable_shutdown_then_relaunch(self, reason: str) -> None:
+        with (
+            mock.patch.object(hana_shot, "process_alive", side_effect=AssertionError("unidentified pid wait")),
+            mock.patch.object(hana_shot, "same_binary", side_effect=AssertionError("unidentified binary")),
+            mock.patch.object(os, "killpg", side_effect=AssertionError("unidentified process group")),
+        ):
+            exit_code, diagnostics = self.shutdown_command()
+
+        self.assertEqual(exit_code, 0, diagnostics)
+        self.assertEqual(self.fake.methods("brp_extras/shutdown"), [{}])
+        self.assertFalse(self.state_path.exists())
+        unreadable = [line for line in diagnostics.splitlines() if "is unreadable (" in line]
+        self.assertEqual(len(unreadable), 1, diagnostics)
+        line = unreadable[0]
+        self.assertIn(f"hana_shot: launch record {self.state_path} is unreadable (", line)
+        self.assertIn(reason, line.lower())
+        self.assertIn(f"asked Hana on port {self.port} to stop and removed the record", line)
+        self.assertIn(str(Path(tempfile.gettempdir())), line)
+        self.assertRegex(line.lower(), r"check.*scratch|scratch.*check")
+        state = self.launch_without_starting_hana()
+        self.assertEqual(json.loads(self.state_path.read_text()), state)
+
+    def test_partial_launch_record_shuts_down_and_allows_a_new_launch(self) -> None:
+        _ = self.state_path.write_text('{"pid": 1, "po')
+
+        self.assert_unreadable_shutdown_then_relaunch("json")
+
+    def test_launch_record_without_binary_shuts_down_and_allows_a_new_launch(self) -> None:
+        unknown_scratch = self.scratch / "unidentified-scratch"
+        unknown_scratch.mkdir()
+        _ = self.state_path.write_text(json.dumps({
+            "pid": 1, "port": self.port, "scratch": str(unknown_scratch),
+            "log": str(unknown_scratch / "hana.log"),
+        }))
+
+        self.assert_unreadable_shutdown_then_relaunch("binary")
+        self.assertTrue(unknown_scratch.is_dir(), "a broken record cannot identify scratch to remove")
+
+    def test_failed_atomic_replace_leaves_no_record_or_temporary_file_then_shutdown_works(self) -> None:
+        self.stop_fake_listener()
+        with mock.patch.object(os, "fsync", wraps=os.fsync) as sync:
+            def interrupt_replace(source: str | Path, destination: str | Path) -> None:
+                temporary = Path(source)
+                self.assertEqual(temporary.parent, self.state_path.parent)
+                self.assertEqual(Path(destination), self.state_path)
+                self.assertFalse(self.state_path.exists())
+                written = cast(dict[str, object], json.loads(temporary.read_text()))
+                self.assertEqual(written["binary"], str(self.executable))
+                self.assertEqual(written["port"], self.port)
+                sync.assert_called()
+                raise OSError("stopped before record replacement")
+
+            with mock.patch.object(os, "replace", side_effect=interrupt_replace), self.assertRaisesRegex(
+                OSError, "stopped before record replacement",
+            ):
+                _ = self.launch_without_starting_hana()
+
+        self.assertEqual(list(self.state_path.parent.iterdir()), [])
+        self.restart_fake_listener()
+        exit_code, diagnostics = self.shutdown_command()
+        self.assertEqual(exit_code, 0, diagnostics)
+        self.assertEqual(self.fake.methods("brp_extras/shutdown"), [{}])
+
+    def test_shutdown_removes_abandoned_temporary_records_only_for_its_port(self) -> None:
+        stale = self.state_path.with_name(f".{self.state_path.name}.abandoned.tmp")
+        other_port = self.state_path.with_name(".1024.json.abandoned.tmp")
+        unrelated = self.state_path.with_name("notes.txt")
+        for path in (stale, other_port, unrelated):
+            _ = path.write_text('{"pid": 1, "po')
+
+        exit_code, diagnostics = self.shutdown_command()
+
+        self.assertEqual(exit_code, 0, diagnostics)
+        self.assertEqual(self.fake.methods("brp_extras/shutdown"), [{}])
+        self.assertFalse(stale.exists())
+        self.assertFalse(self.state_path.exists())
+        self.assertTrue(other_port.exists())
+        self.assertTrue(unrelated.exists())
+
+    def test_whole_launch_record_still_waits_for_pid_and_removes_scratch(self) -> None:
+        self.stop_fake_listener()
+        state = self.launch_without_starting_hana()
+        self.restart_fake_listener()
+        scratch = Path(state["scratch"])
+        _ = Path(state["log"]).write_text("fixture panic: preserved diagnostic\n")
+        pid_checks: list[int] = []
+
+        def process_alive(pid: int) -> bool:
+            self.assertEqual(self.fake.methods("brp_extras/shutdown"), [{}])
+            self.assertTrue(scratch.exists(), "scratch must survive until the process exits")
+            pid_checks.append(pid)
+            return len(pid_checks) == 1
+
+        with (
+            mock.patch.object(hana_shot, "process_alive", side_effect=process_alive),
+            mock.patch.object(time, "sleep"),
+            mock.patch.object(os, "killpg", side_effect=AssertionError("exited process must not be killed")),
+        ):
+            exit_code, diagnostics = self.shutdown_command()
+
+        self.assertEqual(exit_code, 0, diagnostics)
+        self.assertEqual(pid_checks, [state["pid"], state["pid"]])
+        self.assertFalse(scratch.exists())
+        self.assertFalse(self.state_path.exists())
+        self.assertIn("fixture panic: preserved diagnostic", diagnostics)
+        self.assertNotIn("unreadable", diagnostics)
+
+    def test_shutdown_recovers_newest_whole_temporary_record_and_checks_binary_before_killing(self) -> None:
+        scratch = self.scratch / "interrupted-launch"
+        scratch.mkdir()
+        log = scratch / "hana.log"
+        _ = log.write_text("temporary launch panic: kept diagnostic\n")
+        state: hana_shot.LaunchState = {
+            "pid": 424242, "binary": str(self.executable), "log": str(log),
+            "scratch": str(scratch), "port": self.port, "started": "2026-10-29T00:00:00+00:00",
+        }
+        older = self.state_path.with_name(f".{self.state_path.name}.older.tmp")
+        newest_whole = self.state_path.with_name(f".{self.state_path.name}.whole.tmp")
+        newest_broken = self.state_path.with_name(f".{self.state_path.name}.broken.tmp")
+        _ = older.write_text(json.dumps({**state, "pid": 111111}))
+        _ = newest_whole.write_text(json.dumps(state))
+        _ = newest_broken.write_text('{"pid": 1, "po')
+        for stamp, path in enumerate((older, newest_whole, newest_broken), start=1):
+            os.utime(path, ns=(stamp * 1_000_000_000, stamp * 1_000_000_000))
+        identity_checks: list[tuple[int, str]] = []
+        signals: list[tuple[int, int]] = []
+
+        def identify(pid: int, binary: str) -> bool:
+            self.assertTrue(scratch.exists())
+            identity_checks.append((pid, binary))
+            return True
+
+        def kill_group(pid: int, number: int) -> None:
+            self.assertEqual(identity_checks, [(state["pid"], state["binary"])])
+            signals.append((pid, number))
+
+        with (
+            mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 21.0]),
+            mock.patch.object(time, "sleep"),
+            mock.patch.object(hana_shot, "process_alive", return_value=True) as alive,
+            mock.patch.object(hana_shot, "same_binary", side_effect=identify),
+            mock.patch.object(os, "killpg", side_effect=kill_group),
+        ):
+            exit_code, diagnostics = self.shutdown_command()
+
+        self.assertEqual(exit_code, 0, diagnostics)
+        self.assertEqual(self.fake.methods("brp_extras/shutdown"), [{}])
+        alive.assert_called_once_with(state["pid"])
+        self.assertEqual(signals, [(state["pid"], signal.SIGTERM), (state["pid"], signal.SIGKILL)])
+        self.assertFalse(scratch.exists())
+        self.assertEqual(list(self.state_path.parent.iterdir()), [])
+        self.assertIn("temporary launch panic: kept diagnostic", diagnostics)
+
+    def test_shutdown_never_kills_recovered_pid_when_binary_identity_changed(self) -> None:
+        self.stop_fake_listener()
+        scratch = self.scratch / "reused-pid-scratch"
+        scratch.mkdir()
+        temporary = self.state_path.with_name(f".{self.state_path.name}.whole.tmp")
+        _ = temporary.write_text(json.dumps({
+            "pid": 424242, "binary": str(self.executable),
+            "log": str(scratch / "hana.log"), "scratch": str(scratch),
+        }))
+        with (
+            mock.patch.object(time, "monotonic", side_effect=[0.0, 0.0, 21.0]),
+            mock.patch.object(time, "sleep"),
+            mock.patch.object(hana_shot, "process_alive", return_value=True),
+            mock.patch.object(hana_shot, "same_binary", return_value=False) as identity,
+            mock.patch.object(os, "killpg", side_effect=AssertionError("reused pid must not be killed")),
+        ):
+            exit_code, diagnostics = self.shutdown_command()
+
+        self.assertEqual(exit_code, 0, diagnostics)
+        identity.assert_called_once_with(424242, str(self.executable))
+        self.assertFalse(temporary.exists())
+        self.assertFalse(scratch.exists())
+        self.assertIn(f"Hana on port {self.port} shut down", diagnostics)
+
+    def test_shutdown_without_launch_or_listener_reports_no_answer_and_allows_relaunch(self) -> None:
+        self.stop_fake_listener()
+
+        exit_code, diagnostics = self.shutdown_command()
+
+        self.assertEqual(exit_code, 0, diagnostics)
+        self.assertIn(f"hana_shot: no Hana answered on port {self.port};", diagnostics)
+        self.assertIn("run shutdown again when the next launch reports the port in use", diagnostics)
+        self.assertNotIn("shut down", diagnostics)
+        state = self.launch_without_starting_hana()
+        self.assertEqual(json.loads(self.state_path.read_text()), state)
+
+    def test_shutdown_keeps_broken_records_when_unidentified_listener_outlives_deadline(self) -> None:
+        self.fake.stop_on_shutdown = False
+        partial = '{"pid": 1, "po'
+        _ = self.state_path.write_text(partial)
+        temporary = self.state_path.with_name(f".{self.state_path.name}.broken.tmp")
+        _ = temporary.write_text(partial)
+        with (
+            mock.patch.object(time, "monotonic", side_effect=[0.0, 21.0]),
+            mock.patch.object(time, "sleep"),
+            mock.patch.object(hana_shot, "process_alive", side_effect=AssertionError("unidentified pid wait")),
+            mock.patch.object(hana_shot, "same_binary", side_effect=AssertionError("unidentified binary")),
+            mock.patch.object(os, "killpg", side_effect=AssertionError("unidentified process group")),
+        ):
+            exit_code, diagnostics = self.shutdown_command()
+
+        self.assertNotEqual(exit_code, 0, diagnostics)
+        self.assertEqual(self.fake.methods("brp_extras/shutdown"), [{}])
+        self.assertIn(str(self.port), diagnostics)
+        self.assertIn("next step", diagnostics.lower())
+        self.assertIn("shutdown", diagnostics.lower())
+        self.assertNotIn("shut down", diagnostics)
+        self.assertEqual(self.state_path.read_text(), partial)
+        self.assertEqual(temporary.read_text(), partial)
+        self.assertTrue(hana_shot.port_answers(self.port))
 
 
 class PortGuardTests(HanaShotTest):

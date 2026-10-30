@@ -41,6 +41,36 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         return own_review_with_legacy_flags(self, session_dir, lens=lens, phase=phase, early=early,
                                            reviewer_type=reviewer_type, pass_index=pass_index)
 
+    def test_pool_review_uses_launcher_worktree_without_any_run_state(self) -> None:
+        session = self.start_implementation("old-run-without-state")
+        self.finish_implementation(session)
+        (session / "progress_history_state.json").unlink()
+        self.assertFalse((session / "working_dir").exists())
+        environment = self.pool_fixture()
+        environment["UNIT_WORKERS_STATE"] = str(self.root / "unit-workers")
+        # Run actual resolution with the launcher's worktree and no roster cwd.
+        resolver = self.root / "scripts/direct/workers.py"
+        _ = resolver.write_text(
+            "import sys\n"
+            + f"sys.path.insert(0, {str(DIRECT_DIR.resolve().parents[1])!r})\n"
+            + "from scripts.direct.workers import main\nraise SystemExit(main())\n")
+        _ = (session / "mesh_roster.json").write_text(json.dumps({"project-review": {
+            "thread_id": "thread-fixture", "status": "paused", "paused_from": "done", "role": "review",
+            "model": "fixture-model", "effort": "high"}}))
+
+        result = subprocess.run(support.ReviewLauncherFixture.pool_command(self, session), env=environment,
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("no unit reviewer", result.stderr)
+        roster = cast(dict[str, dict[str, object]], json.loads((session / "mesh_roster.json").read_text()))
+        self.assertEqual(set(roster), {"project-review"})
+        self.assertEqual(roster["project-review"]["thread_id"], "thread-fixture")
+        self.assertEqual(self.turn_records(session)[0]["reviewer"], "project-review")
+        self.assertEqual((session / "review_status_contract").read_text(), "reviewed\n")
+        self.assertFalse((session / "progress_history_state.json").exists())
+        self.assertFalse((session / "working_dir").exists())
+
     def test_unit_review_adopts_one_of_three_old_leases_with_the_real_resolver(self) -> None:
         session = self.start_implementation("three-old-reviewers")
         self.finish_implementation(session)

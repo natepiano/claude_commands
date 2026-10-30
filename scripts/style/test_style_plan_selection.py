@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import sqlite3
+import subprocess
 import sys
 import unittest
 from contextlib import closing
@@ -19,10 +21,35 @@ import rules
 import style_ledger
 
 from style_plan_test_support import StylePlanFixture
+from unit_plans import AllCrates
 
 
 @final
 class StylePlanTests(StylePlanFixture):
+    def test_refill_blob_failures_do_not_reissue_held_cells(self) -> None:
+        read = self.rule("read", "tier: C\nfamily: names\ninput_scope: crate\n")
+        self.sync()
+        _ = self.held_proposal(read, self.sources[0])
+        with self.ledger() as ledger:
+            cell = style_ledger.Cell(read, self.sources[0], "crates/alpha", "C", "names", "stale")
+            # Exercise the fallback before any later ticket-selection Git reads can fail.
+            for code in (errno.EMFILE, errno.ENOENT):
+                with self.subTest(errno=code):
+                    failure = OSError(code, "PRIVATE launch failure")
+                    with mock.patch.object(subprocess, "run", side_effect=failure):
+                        with self.assertRaises(style_ledger.GitReadFailed) as refused:
+                            _ = style_plan._refill_cells(ledger, (cell,), style_plan.NoUnitBranch(),  # pyright: ignore[reportPrivateUsage]
+                                                         "names", AllCrates(), {})
+                    self.assertIs(refused.exception.__cause__, failure)
+            # An actually removed file cannot prove that this held cell is unchanged.
+            _ = self.git("rm", self.sources[0])
+            removed_tip = self.commit()
+            ledger.set_tip(removed_tip, "style/main")
+            result = style_plan._refill_cells(ledger, (cell,), style_plan.NoUnitBranch(),  # pyright: ignore[reportPrivateUsage]
+                                              "names", AllCrates(), {})
+            self.assertEqual(result.cells, (cell,))
+            self.assertEqual(result.judged_at_base, frozenset())
+
     def test_reserved_unmerged_dirty_and_other_open_ticket_files_are_excluded(self) -> None:
         rule = self.rule("read")
         self.sync()
