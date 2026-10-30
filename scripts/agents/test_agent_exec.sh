@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+export AGENTS_CONFIG_PUBLISH=0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_agents_registry.sh"
@@ -94,6 +95,9 @@ run_dry() {
         "$1" "$2" "$WORKING_DIR" "$PROMPT_FILE" "$OUTPUT_FILE" "$LOG_FILE"
 }
 
+# Keep command discovery independent of the machine's installed Claude binary.
+claude_command="$HOME/.claude/scripts/lib/py $SCRIPT_DIR/../lib/nix_env.py exec $TEST_DIR/bin/claude"
+
 codex_write="$(run_dry codex_case.task write)"
 assert_equal "codex write command is wrong" \
     "env CODEX_HOME=$HOME/.codex1 codex exec -m gpt-test -c model_reasoning_effort=\\\"high\\\" --ephemeral --sandbox danger-full-access -C $WORKING_DIR -o $OUTPUT_FILE - < $PROMPT_FILE > $LOG_FILE 2>&1" \
@@ -106,12 +110,12 @@ assert_equal "codex readonly command is wrong" \
 
 claude_write="$(run_dry claude_case.task write)"
 assert_equal "claude write command is wrong" \
-    "cd $WORKING_DIR && $HOME/.claude/scripts/lib/py $SCRIPT_DIR/../lib/nix_env.py exec $CLAUDE_BIN --print --dangerously-skip-permissions --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "cd $WORKING_DIR && $claude_command --print --dangerously-skip-permissions --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$claude_write"
 
 claude_readonly="$(run_dry claude_case.task readonly)"
 assert_equal "claude readonly command is wrong" \
-    "cd $WORKING_DIR && $HOME/.claude/scripts/lib/py $SCRIPT_DIR/../lib/nix_env.py exec $CLAUDE_BIN --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "cd $WORKING_DIR && $claude_command --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$claude_readonly"
 
 bare_command="$(run_dry bare_case.task write)"
@@ -126,7 +130,7 @@ assert_equal "codex command did not carry the function's service tier" \
 
 tier_claude_command="$(run_dry tier_case.claude_task readonly)"
 assert_equal "claude command carried a codex service tier" \
-    "cd $WORKING_DIR && $HOME/.claude/scripts/lib/py $SCRIPT_DIR/../lib/nix_env.py exec $CLAUDE_BIN --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
+    "cd $WORKING_DIR && $claude_command --print --permission-mode plan --settings \\{\\\"sandbox\\\":\\{\\\"enabled\\\":false\\}\\} --verbose --output-format stream-json --model opus --effort max < $PROMPT_FILE > $LOG_FILE 2>&1" \
     "$tier_claude_command"
 
 extra_command="$(AGENT_EXEC_EXTRA_ARGS='--add-dir /tmp/extra' run_dry codex_case.task write)"
