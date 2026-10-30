@@ -19,6 +19,9 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.atomic_file import write_text_atomic
+
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
@@ -276,10 +279,16 @@ def copy_session_state(slug: str, scratch: Path) -> list[str]:
         source, destination = scratch / name, target / name
         if destination.exists() or not source.exists():
             continue
-        if source.is_dir():
-            _ = shutil.copytree(source, destination)
+        complete = target / f".{name}.copying"
+        if complete.is_dir():
+            shutil.rmtree(complete)
         else:
-            _ = shutil.copy2(source, destination)
+            complete.unlink(missing_ok=True)
+        if source.is_dir():
+            _ = shutil.copytree(source, complete)
+        else:
+            _ = shutil.copy2(source, complete)
+        os.replace(complete, destination)
         copied.append(name)
     return copied
 
@@ -539,7 +548,7 @@ def attach(child: str, parent: str) -> None:
         if runner["slug"] in (child, parent) and runner["socket"] and (why := name_refusal(runner["slug"], runner["session"])):
             raise ValueError(why)
     tree = edges(known)
-    if child in tree:
+    if child in tree and tree[child] != parent:
         raise ValueError(f"{child} already reports to {tree[child]}; detach it first")
     above = parent
     while above in tree:
@@ -548,10 +557,7 @@ def attach(child: str, parent: str) -> None:
             raise ValueError(f"{parent} already reports to {child}, directly or through others")
     path = SHOWRUNNER_STATE_DIR / child / PARENT_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Written beside the file and moved over it, so a reader never sees half a slug.
-    temporary = path.with_name(f".{PARENT_FILE}.{os.getpid()}")
-    _ = temporary.write_text(f"{parent}\n", encoding="utf-8")
-    _ = temporary.replace(path)
+    write_text_atomic(path, f"{parent}\n")
 
 
 def detach(child: str) -> str:

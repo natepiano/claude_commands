@@ -144,7 +144,7 @@ main(
 
 Exits: `0` success, `unchanged` included. `1` when `check` finds errors or `changelog --compare` finds differences. `2` for every refusal: one stderr line `feature_log: <reason>`, no stdout, nothing written; argparse errors take the same path. A forwarded verb returns the ssh status.
 
-Every write holds `locked()`, an exclusive `flock` on `state_dir()/"lock"`. A note or JSON file is written as `.<name>.tmp` in its target folder and moved with `os.replace`. Each successful write appends one event.
+Every write holds `locked()`, an exclusive `flock` on `state_dir()/"lock"`. A note or JSON file uses `scripts.lib.atomic_file.write_text_atomic`: a sibling temporary file is flushed and fsynced, then moved with `os.replace`. Each successful write appends one event.
 
 | Verb | Arguments | Result | Prints |
 | --- | --- | --- | --- |
@@ -507,3 +507,7 @@ Changelog comparison for the 13 published crates:
 The 217 entries stay pending until each crate's release stamps them.
 
 Old claim records convert old worker field names once on their first ledger read. The CLI accepts only `--worker` when marking a claimed record.
+
+### Rerun recovery (2026-10-29)
+
+New amend events carry `content`, the SHA256 of the complete rendered note. Older events stay readable. An unchanged amend checks the newest event for that note against its current content. If the event is missing or holds older content, the retry appends the missing event. Digest prints and flushes the selected changes under the lock before advancing its cursor. A stop during output leaves the changes available on rerun.
