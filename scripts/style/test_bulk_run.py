@@ -184,6 +184,26 @@ class WorkspaceRunTests(CargoProjectTests):
         self.runner = FakeRunner()
         self.server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
 
+    def test_doc_parameter_and_derive_field_share_one_tested_rename_commit(self) -> None:
+        source = '/// Add `old`.\nfn run(old: usize) -> usize { old + 1 }\n'
+        derived = '#[derive(serde::Serialize)]\nstruct R { old: usize }\n'
+        _ = (self.repo / 'src/lib.rs').write_text(source)
+        _ = (self.repo / 'beta/src/lib.rs').write_text(derived)
+        _ = (self.repo / 'README.md').write_text('run takes `old`.\n')
+        _ = self.git('add', '.')
+        _ = self.git('commit', '-qm', 'documented and derived fixture')
+        self.base, self.tree = self.git('rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD^{tree}')
+        ledger, definition, _ = self.setup_findings()
+        self.addCleanup(ledger.close)
+        self.server = self.derive_server(lambda text, offset, new: word_edits(text, 'old', new))
+        report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (2, 0, 0))
+        self.assertEqual((self.repo / 'src/lib.rs').read_text(), source.replace('old', 'number'))
+        self.assertIn('#[serde(rename = "old")] number:', (self.repo / 'beta/src/lib.rs').read_text())
+        self.assertEqual((self.repo / 'README.md').read_text(), 'run takes `old`.\n')
+        self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
+        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
+
     def test_metadata_only_rule_edit_selects_approved_findings_but_body_edit_is_stale(self) -> None:
         ledger, definition, findings = self.setup_findings()
         self.addCleanup(ledger.close)
