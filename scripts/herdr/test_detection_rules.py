@@ -13,6 +13,7 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from typing import cast, final, override
+from unittest.mock import patch
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
 TEST_HANG_GUARD_SECS = 300
@@ -20,6 +21,7 @@ TEST_HANG_GUARD_SECS = 300
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import detection_rules
+import herdr
 
 REMOTE = """id = "claude"
 version = "2026.10.11.1"
@@ -98,15 +100,21 @@ class BuiltRulesTests(unittest.TestCase):
 @final
 class RefreshTests(unittest.TestCase):
     root: Path = Path()
+    reloaded: list[str] = []
 
     @override
     def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
+        self.reloaded = []
         for key, value in {"XDG_STATE_HOME": self.root / "state", "XDG_CONFIG_HOME": self.root / "config"}.items():
             self.addCleanup(_restore, key, os.environ.get(key))
             os.environ[key] = str(value)
+
+    def reload(self, session: str) -> bool:
+        self.reloaded.append(session)
+        return True
 
     def write_remote(self, text: str) -> None:
         path = detection_rules.remote_path()
@@ -115,33 +123,98 @@ class RefreshTests(unittest.TestCase):
 
     def test_refresh_writes_once_and_reloads_each_running_session(self) -> None:
         self.write_remote(REMOTE)
-        reloaded: list[str] = []
-        self.assertTrue(detection_rules.refresh({"probe", "agents"}, reloaded.append))
+        reloaded = self.reloaded
+        self.assertTrue(detection_rules.refresh({"probe", "agents"}, self.reload))
         self.assertEqual(reloaded, ["agents", "probe"])
         self.assertEqual(detection_rules.override_path().read_text(encoding="utf-8"),
                          detection_rules.built_rules(REMOTE))
-        self.assertFalse(detection_rules.refresh({"agents"}, reloaded.append))
+        self.assertFalse(detection_rules.refresh({"agents"}, self.reload))
         self.assertEqual(reloaded, ["agents", "probe"])
 
     def test_an_upstream_update_is_built_again(self) -> None:
         self.write_remote(REMOTE)
-        _ = detection_rules.refresh(set(), lambda _: None)
+        _ = detection_rules.refresh(set(), self.reload)
         _ = detection_rules.remote_path().write_text(REMOTE.replace("2026.10.11.1", "2026.10.30.1"), encoding="utf-8")
-        self.assertTrue(detection_rules.refresh(set(), lambda _: None))
+        self.assertTrue(detection_rules.refresh(set(), self.reload))
         self.assertIn('version = "2026.10.30.1.1"', detection_rules.override_path().read_text(encoding="utf-8"))
 
+    def test_failed_herdr_reload_is_retried_without_reloading_confirmed_sessions(self) -> None:
+        self.write_remote(REMOTE)
+        errors = io.StringIO()
+        with patch.object(herdr.Herdr, "run", side_effect=["", herdr.HerdrFailure("not ready"), ""]) as run:
+            with redirect_stderr(errors):
+                self.assertTrue(detection_rules.refresh({"agents", "probe"}, herdr.reload_agent_rules))
+            self.assertIn("probe: detection rules not reloaded: not ready", errors.getvalue())
+            receipt = detection_rules.override_path().with_suffix(".loaded").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(receipt[1:], ["agents"])
+            self.assertFalse(detection_rules.refresh({"agents", "probe"}, herdr.reload_agent_rules))
+            self.assertEqual(run.call_count, 3)
+            self.assertFalse(detection_rules.refresh({"agents", "probe"}, herdr.reload_agent_rules))
+            self.assertEqual(run.call_count, 3)
+
+    def test_new_session_reloads_only_rules_missing_from_the_current_receipt(self) -> None:
+        self.write_remote(REMOTE)
+        reloaded = self.reloaded
+
+        self.assertTrue(detection_rules.refresh({"agents"}, self.reload))
+        reloaded.clear()
+        self.assertFalse(detection_rules.refresh({"agents", "probe"}, self.reload))
+        self.assertEqual(reloaded, ["probe"])
+        self.assertFalse(detection_rules.refresh({"agents", "probe"}, self.reload))
+        self.assertEqual(reloaded, ["probe"])
+
+    def test_failed_reload_retries_every_live_session_on_the_next_refresh(self) -> None:
+        self.write_remote(REMOTE)
+        reloaded = self.reloaded
+
+        def fail_last(session: str) -> bool:
+            reloaded.append(session)
+            if session == "probe":
+                raise RuntimeError("reload failed")
+            return True
+
+        with self.assertRaisesRegex(RuntimeError, "reload failed"):
+            _ = detection_rules.refresh({"agents", "probe"}, fail_last)
+        self.assertTrue(detection_rules.override_path().is_file())
+        reloaded.clear()
+        self.assertFalse(detection_rules.refresh({"agents", "probe"}, self.reload))
+        self.assertEqual(reloaded, ["agents", "probe"])
+
+    def test_override_without_reload_confirmation_reloads_live_sessions(self) -> None:
+        self.write_remote(REMOTE)
+        target = detection_rules.override_path()
+        target.parent.mkdir(parents=True)
+        _ = target.write_text(detection_rules.built_rules(REMOTE), encoding="utf-8")
+        reloaded = self.reloaded
+        self.assertFalse(detection_rules.refresh({"agents"}, self.reload))
+        self.assertEqual(reloaded, ["agents"])
+
+    def test_failed_rebuild_does_not_reuse_an_older_reload_receipt(self) -> None:
+        self.write_remote(REMOTE)
+        _ = detection_rules.refresh({"agents"}, self.reload)
+        _ = detection_rules.override_path().write_text("replaced externally", encoding="utf-8")
+        def fail_reload(_session: str) -> bool:
+            raise RuntimeError("reload failed")
+
+        with self.assertRaisesRegex(RuntimeError, "reload failed"):
+            _ = detection_rules.refresh({"agents"}, fail_reload)
+        reloaded = self.reloaded
+        reloaded.clear()
+        self.assertFalse(detection_rules.refresh({"agents"}, self.reload))
+        self.assertEqual(reloaded, ["agents"])
+
     def test_no_downloaded_rules_writes_nothing(self) -> None:
-        self.assertFalse(detection_rules.refresh({"agents"}, lambda _: None))
+        self.assertFalse(detection_rules.refresh({"agents"}, self.reload))
         self.assertFalse(detection_rules.override_path().exists())
 
     def test_a_rules_change_keeps_the_old_override(self) -> None:
         self.write_remote(REMOTE)
-        _ = detection_rules.refresh(set(), lambda _: None)
+        _ = detection_rules.refresh(set(), self.reload)
         before = detection_rules.override_path().read_text(encoding="utf-8")
         _ = detection_rules.remote_path().write_text(REMOTE.replace("❯", ">"), encoding="utf-8")
         errors = io.StringIO()
         with redirect_stderr(errors):
-            self.assertFalse(detection_rules.refresh({"agents"}, lambda _: None))
+            self.assertFalse(detection_rules.refresh({"agents"}, self.reload))
         self.assertEqual(detection_rules.override_path().read_text(encoding="utf-8"), before)
         self.assertIn("kept the old override", errors.getvalue())
 

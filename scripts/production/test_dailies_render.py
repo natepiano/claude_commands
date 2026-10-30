@@ -890,6 +890,33 @@ class EtaResolutionTests(unittest.TestCase):
             logged = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
         return result, saved, logged
 
+    def test_interrupted_state_publish_preserves_first_eta_and_same_command_reruns(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            source = Path(scratch) / "input.json"
+            state = Path(scratch) / "state.json"
+            fields = report(held=False)
+            fields["units"] = [{**unit(False), "eta": {"time": "11:20", "percent": 60}}]
+            _ = source.write_text(json.dumps(fields), encoding="utf-8")
+            previous = {"widget-enhancements": {
+                "phase": "Phase 2 of 3: small text reads clearly", "eta": "2026-10-04T11:20:00",
+                "eta_text": "11:20", "held": None, "first": "2026-10-04T11:20:00"}}
+            original = json.dumps(previous)
+            _ = state.write_text(original, encoding="utf-8")
+            arguments = [str(source), "--at", AT, "--state", str(state)]
+            expected = run(arguments, scratch)
+            self.assertEqual(expected.code, 0, expected.error)
+            complete_state = state.read_bytes()
+            _ = state.write_text(original, encoding="utf-8")
+            with mock.patch("atomic_file.os.replace", side_effect=OSError("stopped while saving")):
+                stopped = run(arguments, scratch)
+            self.assertNotEqual(stopped.code, 0)
+            self.assertEqual(state.read_text(), original)
+            finished = run(arguments, scratch)
+            self.assertEqual(finished, expected)
+            self.assertEqual(state.read_bytes(), complete_state)
+            self.assertEqual(load_state(state)["widget-enhancements"].first,
+                             datetime.fromisoformat("2026-10-04T11:20:00"))
+
     def test_unchanged_eta_uses_saved_moment_in_report_chart_state_and_log(self) -> None:
         fields = report(held=False)
         current = {**unit(False), "eta": {"time": "19:35", "percent": 60}}

@@ -10,8 +10,10 @@ import socket
 import subprocess
 import time
 import unittest
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, override
+from typing import TYPE_CHECKING, cast, override
 
 import unittest.mock
 
@@ -60,6 +62,7 @@ class FolderAuditTests(unittest.TestCase):
     root: Path = Path()
     rust: Path = Path()
     temp: Path = Path()
+    recorded_ctimes: dict[str, float] = {}
 
     @override
     def setUp(self) -> None:
@@ -68,9 +71,45 @@ class FolderAuditTests(unittest.TestCase):
         self.temp = self.root / "tmp"
         self.rust.mkdir()
         self.temp.mkdir()
+        self.recorded_ctimes = {}
+        scan = os.scandir
+
+        @contextmanager
+        def recorded_scan(path: str | int | os.PathLike[str]) -> Generator[Iterator[os.DirEntry[str]]]:
+            with scan(path) as entries:
+                if isinstance(path, int):
+                    yield entries
+                    return
+                recorded: list[os.DirEntry[str]] = []
+                for entry in entries:
+                    info = entry.stat(follow_symlinks=False)
+                    fields = list(info)
+                    fields[9] = self.recorded_ctimes.get(entry.path, info.st_mtime)
+                    fake = unittest.mock.Mock(wraps=entry)
+                    fake.configure_mock(**{"stat.return_value": os.stat_result(fields, {"st_blocks": info.st_blocks})})
+                    fake.name = entry.name
+                    fake.path = entry.path
+                    recorded.append(cast(os.DirEntry[str], fake))
+                yield iter(recorded)
+
+        _ = self.enterContext(unittest.mock.patch.object(os, "scandir", side_effect=recorded_scan))
         state = self.root / "state"
         self.enterContext(unittest.mock.patch.dict(os.environ, {"FOLDER_SWEEP_STATE_DIR": str(state),
                                                                 "SCRATCH_HOLDS": str(state / "holds.json")}))
+
+    def test_copied_folder_needs_seven_days_since_its_last_metadata_change(self) -> None:
+        now = time.time()
+        proc = self.root / "proc"
+        proc.mkdir()
+        copied = folder(self.temp / "copied-backup", 8)
+        old = folder(self.temp / "old-backup", 8)
+        self.recorded_ctimes[str(copied / "file")] = now - 5 * 3600
+        self.recorded_ctimes[str(old / "file")] = now - 8 * DAY
+        found = folder_audit.audit(self.rust, [self.temp], frozenset[str](), now, files=[],
+                                   removing=True, proc=str(proc), sockets=str(self.root / "unix"))
+        self.assertTrue(copied.is_dir())
+        self.assertFalse(old.exists())
+        self.assertIn((old, folder_audit.REMOVED), [(entry.path, entry.outcome) for entry in found])
 
     def test_process_uses_distinguishes_known_empty_from_unavailable(self) -> None:
         proc = self.root / "proc"

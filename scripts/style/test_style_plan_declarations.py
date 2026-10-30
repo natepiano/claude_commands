@@ -96,15 +96,15 @@ class StylePlanTests(StylePlanFixture):
         source = "pub struct Parent {\n    old: u32,\n}\n"
         first, second = "crates/alpha/src/one.rs", "crates/alpha/src/two.rs"
         issue, finding, output = self.refill_after_declaration_move({second: source, first: source})
-        self.assertIn(f"waiting {issue}: {finding.finding_id} declared in 2 files: {first}, {second}", output)
+        self.assertIn(f"waiting {issue}: {finding.path} declared in 2 files: {first}, {second}", output)
         row, = self.ledger().proposal_findings(issue)
         self.assertEqual((row.path, row.state, row.follow), (finding.path, style_ledger.Filed(issue), style_ledger.NotFollowed()))
 
     def test_decision_refill_leaves_a_finding_declared_in_two_files_out_of_the_ticket(self) -> None:
         parent = "pub struct Parent {\n    old: u32,\n}\n"
         issue, finding, output = self.refill_after_declaration_move({"crates/alpha/src/one.rs": parent, "crates/alpha/src/two.rs": parent})
-        self.assertIn(f"waiting {issue}: {finding.finding_id} declared in 2 files: crates/alpha/src/one.rs, crates/alpha/src/two.rs; outside rename not proved: old name still declared in crate; "
-                      + "candidates: none; mapped site unresolved: source site deleted\n", output)
+        self.assertIn(f"waiting {issue}: {finding.path} declared in 2 files: crates/alpha/src/one.rs, crates/alpha/src/two.rs; outside rename not proved: old name still declared in crate; "
+                      + "candidates: none; mapped site unresolved: source site deleted (1 finding)\n", output)
         self.assertEqual([(held.path, held.line, held.state, held.follow) for held in self.ledger().proposal_findings(issue)],
                          [(finding.path, 2, style_ledger.Filed(issue), style_ledger.NotFollowed())])
         self.assertNotEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "proposal")
@@ -115,7 +115,7 @@ class StylePlanTests(StylePlanFixture):
         issue, (finding,) = self.judged_findings(self.rule("read"), ((site, 2, "old: u32,"),))
         self.commit_files({site: "pub fn other() {}\n"})
         output = self.refill_decisions()
-        self.assertIn(f"waiting {issue}: {finding.finding_id} outside rename not proved:", output)
+        self.assertIn(f"waiting {issue}: {finding.path} outside rename not proved:", output)
         self.assertEqual([(held.path, held.line, held.state, held.follow) for held in self.ledger().proposal_findings(issue)],
                          [(site, 2, style_ledger.Filed(issue), style_ledger.NotFollowed())])
         self.assertNotEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "proposal")
@@ -129,7 +129,7 @@ class StylePlanTests(StylePlanFixture):
         self.write_generated_body(issue)
         self.commit_files({site: source.replace("impl Trait", "impl external::Trait")})
         output = self.refill_decisions()
-        self.assertIn(f"waiting {issue}: {finding.finding_id} trait identity uncertain\n", output)
+        self.assertIn(f"waiting {issue}: {finding.path} trait identity uncertain (1 finding)\n", output)
         self.assertEqual(self.ledger().proposal_findings(issue)[0].state, style_ledger.Filed(issue))
         self.assertFalse(any(finding.finding_id in ticket["finding_ids"] for ticket in self.ledger().ticket_open("names-unit")))
 

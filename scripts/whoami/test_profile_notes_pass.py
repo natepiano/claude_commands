@@ -1,6 +1,8 @@
 """The timer profiler measures reads without changing the input state."""
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import io
 import json
 import os
@@ -66,6 +68,7 @@ class ProfileNotesPassTests(unittest.TestCase):
             "SHOWRUNNERS_CONFIG": str(self.home / "showrunners.json"),
             "USER_ZONE": "UTC", "PYTHONDONTWRITEBYTECODE": "1",
         }, clear=True))
+        _ = write_registry(self.home / "agents.conf")
         pass_ = profile.load_pass()
         # Modules may already be imported by another suite. Replace only input paths.
         for entry in profile.state_copies(pass_):
