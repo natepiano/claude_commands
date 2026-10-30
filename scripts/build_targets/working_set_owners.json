@@ -275,22 +275,6 @@
       "owner": "models-unit"
     },
     {
-      "path": "scripts/production/add_unit.py",
-      "owner": "enh-showrunner-unit"
-    },
-    {
-      "path": "scripts/production/merge_checkpoint.py",
-      "owner": "enh-showrunner-unit"
-    },
-    {
-      "path": "scripts/production/showrunners.py",
-      "owner": "enh-showrunner-unit"
-    },
-    {
-      "path": "scripts/production/stall_watch.py",
-      "owner": "enh-showrunner-unit"
-    },
-    {
       "path": "scripts/bevy_upgrade/",
       "owner": "bevy-upgrade-unit"
     },

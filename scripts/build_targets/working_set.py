@@ -269,7 +269,7 @@ def render(report: WorkingSet) -> str:
     lines = ["Memory in MiB; PSS is resident shared memory divided between its users.",
              f"{'Category / script [owner]':76} {'Count':>5} {'PSS':>10} {'Swap':>10}"]
     for group in report.groups:
-        label = f"  {group.script} [{group.owner}]" if group.script else group.category
+        label = f"  {group.script} [{group.owner.removesuffix('-unit')}]" if group.script else group.category
         # Escape control characters from process-controlled names before terminal output.
         label = label.encode("unicode_escape").decode("ascii")
         lines.append(f"{label:76} {group.count:5d} {group.pss_kib / 1024:10.1f} {group.swap_kib / 1024:10.1f}")
