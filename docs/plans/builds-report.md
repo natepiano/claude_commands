@@ -95,55 +95,28 @@ including the details to make it clear
 
 ### Phase 3 — build-why says at once why the first waiting step waits, from admission's own numbers  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `build-why` at the command line prints in under 1 s what runs, what waits first and why, with each check's arithmetic, from one read-only explain record in `memory_admit.py` that admission's own functions fill.
-
-**Spec:**
-- One decision point. Add one read-only function to `scripts/lint/memory_admit.py`, `explain_queue() -> QueueExplanation`, that takes the shared admission lock as `queue_view()` (memory_admit.py:1525) does. It fills every number with admission's own functions on the same pass: `reservation_memory`/`step_memory` (or `reservation_lifetime` once resources' Phase 14 lands: never a copy of the "pid start time matches" check, so an orphaned step the queue still charges stays in the list), `build_charge`, `growth_headroom`, `decide`, `head_priority`, `head_window`, `queue_decision`, `read_meminfo`, `recovery_pressure`. `read_queue` (memory_admit.py:1465) and `explain_queue` build from one shared internal pass, so the two cannot disagree; `queue_view()` returns the same `QueueView` as now. No second calculation of any rule. Every number in the record is a typed field in bytes or epoch seconds; text is made only by the caller.
-- `QueueExplanation` (frozen dataclasses, one variant per case, per `~/.claude/docs/type_design.md`):
-  - host: available, total, earlyoom reserve (5% of total, as `decide`), build budget, pressure (`NoPressureHold` or `MemoryPressure` with its recovery spacing time), reading unavailable as its own variant.
-  - running: per step the identity as `RunningStep` has it, admitted time, promise (`need`), measured bytes, charged (`build_charge`), and a `ChargeBasis` variant naming the `build_charge` term that sets the charge: promise with no reading yet; ramp promise (inside `RAMP_SECONDS` of admission); peak so far (observed peak, with the time of that peak where the tree records it); peak decayed (the 25-min decay and the old-sampler rule from resources' Phase 12 patches B and C on origin/builds, with their times); peak file unreadable (promise kept); using now. One variant per rule the merged tree has; a rule resources adds later (Phase 15 test-phase peak) adds its variant when it lands; whoever lands second resolves it.
-  - totals: charged and using now over all running steps, and the promise not yet used (`growth_headroom` sum).
-  - head: no waiter, or the first waiter in `waiter_order` with its identity, wait start, need, need source (below), and its decision from `queue_decision` on the same inputs; the budget check (charged, need, head need, budget, pass or fail, and the charge it starts at: budget − need − head need); the free check (free, need, earlyoom reserve, promise not yet used, head need, threshold, pass or fail); the order rule from `head_window` (`StrictUntil` or `BackfillUntil` with its deadline), whether `head_priority` gives the head priority, and its bump (`bump_order` < 0 or `holds_younger`, with `priority_since`).
-  - line: the waiters behind the head; for each, whether `decide` with no head need admits it under both checks now; and their count, largest and smallest need, oldest wait start.
-- The waiter row records where its need came from, at estimate time, in `check` (memory_admit.py:1227-1236). New `Waiter` fields: `need_source` (`ExpectedPeak.source`: measured / buildlog / pooled / fallback), `need_runs` (`ExpectedPeak.count`), `test_threads` (the width `test_threads(argv)` reads, or null). The window is `HISTORY_DAYS`; test scope, package and filters are on the row already. A row without `need_source` (written before this change) reads as "source not recorded". `explain_queue` never opens the build-log index or any SQLite file.
-- `scripts/build_queue/build_why.py` (new, run as `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py`; natedev adds the `build-why` PATH wrapper after main): prints `explain_queue()` in plain words, a unit on every number (GiB with one decimal, minutes, HH:MM in the user's zone as `build_queue.py` does), with Showrunner and Unit names from `build_queue.py`'s roster labels. Sections, in order:
-  1. Header: time; free of total memory; build charges of the 21.0 GiB budget; the pressure hold or recovery spacing, if any; load (`/proc/loadavg`, the 1-min value of the core count).
-  2. Running: one line per step: Showrunner, Unit, session, step, age, charged, using now, and why it is charged that much (the `ChargeBasis` in words: `compiling, peak so far 10.8 GiB`, `peak decayed at 21:40`, `old-sampler rule: peak drops 25 min after its last new peak`, `promise: no reading yet`). Then `Total: charged X GiB, using Y GiB`.
-  3. First in line: Showrunner, Unit, session, step, wait in minutes, need, and where the need comes from (for example `measured process-memory p90 of 7 runs, last 14 days, filtered tests (pkg, 2 filters), width 8`, `build-log peak × 0.65 of 12 runs`, `pooled over all repos, 31 runs`, `fallback: fewer than 5 runs`, `source not recorded`).
-  4. The two checks, each with its arithmetic and result: `Build budget: charged 18.1 + need 11.8 = 29.9 GiB > 21.0 GiB: blocked; starts when charged falls to 9.2 GiB` and `Free memory: free 16.3 GiB < need 11.8 + earlyoom 3.0 + promise not yet used 5.5 = 20.3 GiB: blocked`. A head need term appears only when it is non-zero. Pressure, when it holds, is its own line.
-  5. Order rule: `strict until HH:MM: younger steps wait` or `backfill until HH:MM: younger steps that fit may start`, and any bump (`bumped by position at HH:MM`).
-  6. The line: `N waiting behind it; M would fit now under both checks; needs from A to B GiB; oldest wait W min`.
-  7. Last line: `Waiting because: <the failing checks, the order rule if it binds>. Frees when: <the fewest running steps, largest charge first, whose end brings the failing check to pass, by how much>` — for the budget, the drop needed is charged + need + head need − budget; for free memory, threshold − free. With no waiter: `Nothing waits.`
-  A read failure prints one fixed line, `build-why: the admission state could not be read.`, and exits 2; never a traceback.
-- `build_queue.py`'s head line (Phase 1) prints from the same `QueueExplanation` fields, never its own copy of the budget arithmetic. Write this change only after Phase 1's checkpoint commit (both phases edit `build_queue.py`).
-- Fast: under 1 s on natedev with tonight's queue size: reads only the admission state files, `/proc`, `/proc/meminfo` and `/proc/loadavg`.
+- `memory_admit.explain_queue() -> QueueExplanation` is a read-only record filled on the same locked pass as `read_queue` (`locked_queue_read`), from admission's own functions: host (free, total, earlyoom reserve, budget, pressure, or reading unavailable), each running step's charge with its `ChargeBasis`, totals, the head's budget, free and order checks with their numbers, and the line behind it. No SQLite is opened.
+- `head_after_steps_end` reapplies `head_priority` and `queue_decision` (run-alone rule included) to the record minus named running steps, and returns `HeadAdmitsAfterEnd` or `HeadStillHeld` with its causes. `smallest_head_release` returns the smallest set by count, then charge, then Running order, judged by that verdict.
+- Each waiting row records `need_source`, `need_runs` and `test_threads` at estimate time; an older row reads "source not recorded".
+- `scripts/build_queue/build_why.py` prints the record in seven sections in under 1 s (0.3–0.8 s live under load); every number and its unit form one right-aligned cell and text is left-aligned, measured in terminal cells. A read failure prints `build-why: the admission state could not be read.` and exits 2.
+- `/build:queue`'s head line prints from the same `QueueExplanation`; its Markdown number columns are `---:`, and the pane right-aligns numbers.
+- `roster.unit_labels_for` also resolves Codex thread ids from run `mesh_roster.json` records, with no process scan, so build-why names every holder as the full roster does.
 
 **Files:**
-- `scripts/lint/memory_admit.py` — `explain_queue`, `QueueExplanation` and its variants, the shared pass with `read_queue`, the waiter's need-source fields (owner resources-unit; showrunner allowed this change 2026-10-29 22:0x)
-- `scripts/build_queue/build_why.py` — new: the command
-- `scripts/build_queue/build_queue.py` — head line from `QueueExplanation` (after Phase 1's checkpoint)
-- `scripts/build_queue/test_build_why.py` — new: fixture from tonight's 21:51 case; output and verdict checks
-- `scripts/lint/test_memory_admit.py` — new tests only: waiter need-source fields; `explain_queue` equals `read_queue`'s decision on the same files; no SQLite opened
-- `docs/as-built/build-memory-admission.md` — the explain record and the waiter's need-source fields
-- `commands/build/queue.md` — one line naming `build-why`
+- `scripts/lint/memory_admit.py` — `explain_queue`, `QueueExplanation` and variants, `head_after_steps_end`, `smallest_head_release`, waiter need-source fields, `READ_HOST_ADMISSION_LIMITS` default
+- `scripts/build_queue/build_why.py` — the command
+- `scripts/build_queue/build_queue.py` — head line from `QueueExplanation`; aligned tables
+- `scripts/message/roster.py` — `unit_labels_for` resolves Codex workers
+- `mods/unit-board/hooks/queue.tsx` — number columns right-aligned
+- `commands/build/queue.md` — names `build-why`
+- `docs/as-built/build-memory-admission.md` — the explain record and need-source fields
+- tests: `test_memory_admit.py`, `test_build_why.py`, `test_build_queue.py`, `test_roster.py`, `mods/unit-board/tests/queue.test.ts`
 
-**Workers:** 1 writer + 1 tester.
-- `impl2` — `memory_admit.py`, `build_why.py`, `build_queue.py`, the as-built and `queue.md`; hub: `memory_admit.py` (both test files import its types)
-- `test2` — `test_build_why.py` and the new `test_memory_admit.py` tests, from this Spec. Fixture: tonight's 21:51 case as admission state files plus fake `/proc` and meminfo (as `test_build_queue.py` and `test_memory_admit.py` build them): running widget, demo, organon and frame-cost; inspectors at the head; numbers so the head shows charged 18.1 GiB, need 11.8 GiB, free 16.3 GiB, earlyoom 3.0 GiB, promise not yet used 5.5 GiB. Checks: `build_why.py`'s verdict for the head equals `memory_admit.read_queue`'s head reason and `queue_decision` state on the same files; each section's numbers; an old waiter row without `need_source`; `sqlite3.connect` patched to fail does not change the output; a read failure prints the fixed line and exits 2.
+**Binds later work:** release advice and the head line only print admission's answer; no caller repeats budget or free arithmetic. build-why uses `unit_labels_for`, never the 4–7 s full roster.
 
-**State:** new fields in each `*.waiting` row (written by `check`; readers ignore unknown fields)
-
-**Depends on:** Phase 1 for the `build_queue.py` head line only; the rest runs beside it.
-
-**Constraints from prior phases:** Phase 1: `build_queue.py --json` and the head line exist; the mod pane reads `--json`, so the head line's JSON field keeps its shape. Merge origin/builds first: it carries resources' Phase 12 patches B and C (peak decay) in `memory_admit.py`. Resources' Phase 14 (in review 22:0x) adds `reservation_lifetime(row, owner_live)` and keeps every signature; Phase 15 adds a test-phase peak estimate source. Also-touches resources: trial-merge and test against origin/builds-resources before the notice.
-
-**Acceptance gate:** `python3 -m unittest scripts.build_queue.test_build_why scripts.build_queue.test_build_queue scripts.lint.test_memory_admit` green (prefix `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY`); basedpyright 0/0/0 on the changed Python files. Live: `build_why.py` on natedev finishes under 1 s, and its head verdict matches `/build:queue` run at the same time.
-
-**Repairs reached (review, 2026-10-29):** `scripts/message/roster.py` and `test_roster.py` — `unit_labels_for` also resolves Codex worker thread ids from run `mesh_roster.json` records, so build-why names every holder as the full roster does (owner sdlc-roles; trial-merged clean against its tip). `mods/unit-board/hooks/queue.tsx` and its test — the user's alignment rule: every number column right-aligned with its unit in one cell, every text column left-aligned, in `/build:queue` text, the pane and build-why.
-
-Assertion-Change: scripts/build_queue/test_build_queue.py::test_empty_queue_reads_once_without_subprocess_or_wait — numeric columns right-aligned (---:) per the user's alignment rule
+**Gotchas:** origin/builds-resources' Phase 14 rewrites `queue_rows`; on merge, take its `owner_live` + `reservation_lifetime` form (one hunk).
 
 ### Phase 4 — App launches reach the build log again, with their memory wait  · status: todo
 
@@ -170,7 +143,7 @@ Assertion-Change: scripts/build_queue/test_build_queue.py::test_empty_queue_read
 
 **State:** build-log rows; the backfill's launches state
 
-**Depends on:** Phase 2 (both edit `scripts/buildlog/`; Phase 3 reads index rows).
+**Depends on:** Phase 2 (both edit `scripts/buildlog/`; this phase reads index rows).
 
 **Constraints from prior phases:** Phase 2: the index never rewrites a source log.
 
@@ -200,6 +173,6 @@ Assertion-Change: scripts/build_queue/test_build_queue.py::test_empty_queue_read
 
 **Depends on:** Phase 1 (the typed `UnmatchedWaiter` refusal) and Phase 3 (both edit `memory_admit.py`).
 
-**Constraints from prior phases:** Phase 1: a selector refusal is `memory_admit.UnmatchedWaiter`, printed on stdout with exit 3; the mod forwards only that.
+**Constraints from prior phases:** Phase 1: a selector refusal is `memory_admit.UnmatchedWaiter`, printed on stdout with exit 3; the mod forwards only that. Phase 3: a waiting row's `session_id` is the writer's `CODEX_THREAD_ID` first, then `CLAUDE_CODE_SESSION_ID` (`waiter_identity`), so the identity `bump_selector` returns must be read from the row, never from the caller's environment; `read_queue` and `explain_queue` share one locked pass (`locked_queue_read`); the /build:queue head line prints from `QueueExplanation` and does no arithmetic. When origin/builds-resources' Phase 14 is merged, `queue_rows` keeps a reservation by `reservation_lifetime`, not by a live owner.
 
 **Acceptance gate:** `python3 -m unittest scripts.build_queue.test_build_queue scripts.lint.test_memory_admit` green (prefix `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY`); basedpyright 0/0/0 on the changed files.
