@@ -129,20 +129,30 @@ def pressure_text(pressure: gate.MemoryPressure, zone: ZoneInfo) -> str:
 
 
 def release_text(explanation: gate.QueueExplanation,
-                 labels: Mapping[str, roster.UnitLabels]) -> str:
+                 labels: Mapping[str, roster.UnitLabels], zone: ZoneInfo) -> str:
     release = gate.smallest_head_release(explanation)
-    if isinstance(release, gate.HeadAdmitsAfterEnd):
+    if isinstance(release, gate.HeadRelease):
         if not release.ended:
-            return "no running step needs to end"
-        names = [build_queue.step_labels(explanation.running[index].step, labels).session
-                 + " " + explanation.running[index].step.step for index in release.ended]
-        return (f"{' + '.join(names)} end (budget charge drops {gib(release.charge_drop)}; "
-                + f"free memory rises {gib(release.freed)} and promise not yet used drops {gib(release.growth_drop)})")
-    if isinstance(release, gate.HeadStillHeld):
-        return "all running steps ending still leaves " + ", ".join(release.causes) + " holding the head"
-    if isinstance(release, gate.ReadingUnavailable):
-        return "admission memory reading unavailable"
-    return "nothing waits"
+            text = "no running step needs to end"
+        else:
+            names = [build_queue.step_labels(explanation.running[index].step, labels).session
+                     + " " + explanation.running[index].step.step for index in release.ended]
+            text = (f"{' + '.join(names)} end (budget charge drops {gib(release.charge_drop)}; "
+                    + f"free memory rises {gib(release.freed)} and promise not yet used drops {gib(release.growth_drop)})")
+        if isinstance(release, gate.HeadStartsAt):
+            starts_at = datetime.fromtimestamp(release.at, zone).strftime("%H:%M:%S %Z")
+            text += ("; then " if release.ended else "; ") + f"recovery spacing starts it at {starts_at}"
+    elif isinstance(release, gate.HeadStillHeld):
+        text = "all running steps ending still leaves " + ", ".join(release.causes) + " holding the head"
+    elif isinstance(release, gate.ReadingUnavailable):
+        text = "admission memory reading unavailable"
+    else:
+        text = "nothing waits"
+    head = explanation.head
+    if (isinstance(head, gate.HeadExplanation) and isinstance(head.decision.pressure, gate.MemoryPressure)
+            and not isinstance(release, gate.HeadStartsAt)):
+        text += "; the pressure hold or recovery spacing must also clear"
+    return text
 
 
 def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
@@ -210,9 +220,7 @@ def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
         causes = ["ready for the next admission check"]
     elif not causes:
         causes = ["queue order"]
-    releases = release_text(explanation, labels)
-    if isinstance(head.decision.pressure, gate.MemoryPressure):
-        releases += "; the pressure hold or recovery spacing must also clear"
+    releases = release_text(explanation, labels, zone)
     lines.extend(("", "Waiting because: " + ", ".join(causes) + ". Frees when: " + releases + "."))
     return lines
 

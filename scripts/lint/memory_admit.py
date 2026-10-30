@@ -599,12 +599,22 @@ class HeadAdmitsAfterEnd:
 
 
 @dataclass(frozen=True)
+class HeadStartsAt:
+    at: float
+    ended: tuple[int, ...]
+    charge_drop: int
+    freed: int
+    growth_drop: int
+
+
+@dataclass(frozen=True)
 class HeadStillHeld:
     decision: AdmissionDecision
     causes: tuple[Literal["build budget", "free memory", "pressure", "queue order"], ...]
 
 
-HeadAfterEnd = HeadAdmitsAfterEnd | HeadStillHeld | NoWaiter | ReadingUnavailable
+HeadRelease = HeadAdmitsAfterEnd | HeadStartsAt
+HeadAfterEnd = HeadRelease | HeadStillHeld | NoWaiter | ReadingUnavailable
 
 
 @dataclass(frozen=True)
@@ -2045,9 +2055,10 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
         waiter["bump_order"] = -1 if head.bump.by_position else 0
     priority = head_priority([waiter], available, total, remaining, explanation.now, limits=limits)
     decision = queue_decision(available, total, waiter, remaining, priority, host.pressure, limits=limits)
+    charge_drop = sum(row.charged for row in released)
+    growth_drop = sum(growth_headroom(row.step.measured) for row in released)
     if decision.state == "admit":
-        return HeadAdmitsAfterEnd(ended, decision, sum(row.charged for row in released), freed,
-                                 sum(growth_headroom(row.step.measured) for row in released))
+        return HeadAdmitsAfterEnd(ended, decision, charge_drop, freed, growth_drop)
     causes: list[Literal["build budget", "free memory", "pressure", "queue order"]] = []
     if not decision.budget_passes:
         causes.append("build budget")
@@ -2055,6 +2066,8 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
         causes.append("free memory")
     if isinstance(decision.pressure, MemoryPressure):
         causes.append("pressure")
+        if causes == ["pressure"] and decision.pressure.next_start_at:
+            return HeadStartsAt(decision.pressure.next_start_at, ended, charge_drop, freed, growth_drop)
     if not causes:
         causes.append("queue order")
     return HeadStillHeld(decision, tuple(causes))
@@ -2067,7 +2080,7 @@ def smallest_head_release(explanation: QueueExplanation) -> HeadAfterEnd:
         return current
     count = len(explanation.running)
     all_ended = head_after_steps_end(explanation, tuple(range(count)))
-    if not isinstance(all_ended, HeadAdmitsAfterEnd):
+    if not isinstance(all_ended, HeadRelease):
         return all_ended
     head = explanation.head
     if not isinstance(head, HeadExplanation):
@@ -2093,12 +2106,12 @@ def smallest_head_release(explanation: QueueExplanation) -> HeadAfterEnd:
                            for size in range(count - start + 1)])
         max_free.append([sum(free_order[:size]) for size in range(count - start + 1)])
     for size in range(1, count + 1):
-        best: HeadAdmitsAfterEnd | HeadStillHeld = current
+        best: HeadRelease | HeadStillHeld = current
         def search(start: int, slots: int, selected: tuple[int, ...], charge: int, freed: int) -> None:
             nonlocal best
             if slots > count - start:
                 return
-            if isinstance(best, HeadAdmitsAfterEnd) and charge + min_charge[start][slots] >= best.charge_drop:
+            if isinstance(best, HeadRelease) and charge + min_charge[start][slots] >= best.charge_drop:
                 return
             missing_builds = builds.difference(selected)
             can_empty = len(missing_builds) <= slots and all(index >= start for index in missing_builds)
@@ -2107,13 +2120,13 @@ def smallest_head_release(explanation: QueueExplanation) -> HeadAfterEnd:
                 return
             if slots == 0:
                 result = head_after_steps_end(explanation, selected)
-                if isinstance(result, HeadAdmitsAfterEnd):
+                if isinstance(result, HeadRelease):
                     best = result
                 return
             for index in range(start, count - slots + 1):
                 search(index + 1, slots - 1, (*selected, index), charge + charges[index], freed + free_releases[index])
         search(0, size, (), 0, 0)
-        if isinstance(best, HeadAdmitsAfterEnd):
+        if isinstance(best, HeadRelease):
             return best
     return all_ended
 

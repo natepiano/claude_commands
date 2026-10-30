@@ -122,7 +122,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Ruled out:** a first-builds column in `rebuilds`; the shared-folder sweep extension computes first builds from build-log records.
 
 ### Phase 4 — Short-lived clones share one build folder per repository  · status: todo
-**Depends on:** Phase 3, Phase 9 (the sweep change this phase extends), and the case D verdict of verify-unit's Phase 1 trial (Spec 1–2, frozen). Global order: 21 → 16 → 25 → 24 → 26 → 20 → **4** → 11 → 17 → 18 → 19 → 8. The Change-Review uses `copies.py` (verify-copies Phase 3, verify-unit).
+**Depends on:** Phase 3, Phase 9 (the sweep change this phase extends), and the case D verdict of verify-unit's Phase 1 trial (Spec 1–2, frozen). Global order: 21 → 16 → 25 → 24 → 26 → 15 → 27 → 20 → **4** → 11 → 17 → 18 → 19 → 8. The Change-Review uses `copies.py` (verify-copies Phase 3, verify-unit).
 
 #### Work Order
 
@@ -379,57 +379,78 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 
 **Ruled out:** tree equality as proof for a promote rerun (it does not show the commit is the gate's own).
 
-### Phase 15 — After its compile, a nextest step is charged its test phase's measured peak  · status: todo
-**Depends on:** Phase 14 (same file, `memory_admit.py`; its row 3 charges a step by the step cgroup that the `invoke.sh` sampler reads, and adds cleanup paths that must remove this phase's new sidecar). Merge `origin/builds` first. report-unit's build-why change (Phase 20's prerequisite: `explain_queue`, `ChargeBasis`, waiter `need_source`) may land first; if it is on `origin/builds`, merge it before dispatch. **Parked** (builds showrunner 2026-10-30): both replay arms (history max, max + 10%) failed the landing rule, so the same-width charge stays as today. report-unit records `test_phase_peak_bytes` (the per-step test-phase peak) in a new phase; this phase resumes only after that phase merges on `origin/builds` and a replay on its data passes. Global order: 21 → 16 → 25 → 24 → 26 → 20 → 4 → 11 → 17 → 18 → 19 → 8; this phase merges on top when it resumes.
+### Phase 15 — A nextest step's charge falls to its test-phase need when its tests start  · status: todo
+**Depends on:** Phase 26 (same file, `memory_admit.py`; Phase 24 Part B → 26 → 15 land one after another), and report-unit's Phase 4c (the test-phase file `$BUILDLOG_PEAK.test-phase.json`, `test_phase_peak_bytes`, `record.read_test_phase`) merged on `origin/builds` and installed on natedev. On 2026-10-30, 4c is on `origin/builds-report` (`f88d8012`), not on `origin/builds`. Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → **15** → 27 → 20 → 4 → 11 → 17 → 18 → 19 → 8.
 
-**Approved:** showrunner 2026-10-29 (ETA 04:30 EDT 2026-10-30).
+**Approved:** builds showrunner 2026-10-30, option A: the narrow key (repository + scope + package + filters), margin × 1.2, a test for each case, acceptance at most 2.3 % of test phases above their charge per repository on 4c data, and a 24 h check after the merge (steps above their charge, `mem_wait_s` against the 24 h before, earlyoom kills).
 
 #### Work Order
 
-**Goal:** a nextest step that has finished its compile is charged what its test phase uses, measured with all its parallel test processes, not its compile peak. Waiters behind it start sooner, and a test phase does not go above its charge more often than today.
+**Goal:** when a nextest step's tests start, its charge falls from its compile peak to `max(test-phase peak so far, N) × 1.2`, where N is the p90 test-phase peak of earlier runs of the same family. A step with no N keeps today's charge.
 
-**Measured (code, at `a650d945`; line numbers move with Phase 14, so find each by its function):**
-- `build_charge` (`memory_admit.py` :478) charges a running step `max(ramp_promise, bytes, observed_peak, unknown_peak_promise)`. `reservation_memory` (:778) keeps the `.max` peak until the `.wave` time is `PEAK_DECAY_SECONDS` (:78, 1500 s) old (:805). So a hana nextest step keeps its compile peak for up to 25 min into its test phase.
-- `buildlog_sample_anon` (`invoke.sh` :172) reads the scope's `anon` every second and writes only `.max` (the peak) and `.wave` (`"<peak> <epoch>"`). It overwrites both. `release` (:1596) writes one `anon_peaks.jsonl` row per step with the whole-step peak (:1609-1615). No record holds a per-step memory series or a compile-end time.
-- The build log has the compile time of each nextest step: `steps.finished_s` is cargo's own `Finished … in` time (`index.py` STEP_COLUMNS :56), and `started_at` is set after the memory wait (`run_once`, `invoke.sh` :290-293). Index read 2026-10-29 22:59 EDT: `finished_s` is NULL on 109 of 1067 hana nextest rows since 2026-10-22 (all hosts). Machine samples (`samples.builds_anon_bytes`, every 60 s) cover the whole `builds.slice`, not one step.
-- Test width: `run_nextest` (`invoke.sh` :496) runs at the logical core count (`LINT_TEST_WIDTH=logical`, :390; 32 on natedev). `nextest_share_claim` (:474) asks `nextest_budget.py claim` (:51) for `shared_width(full, runs)` = `min(full, max(FLOOR, full // runs))`, `FLOOR = 4` (:28). A narrower share goes into the reservation through `set_width` (`memory_admit.py` :1626). `check` writes `test_threads(argv)` (:499) at admission.
+**Measured (code at `bc36e49f`; Phases 24 and 26 move the line numbers, so find each by its name):**
+- Need: `check` (`memory_admit.py` :1582) stores the p90 whole-step anon peak from `expected_peak` (:845) or `filtered_peak` (:943) as the reservation's `need`.
+- Running charge: `charge_basis` (:797) takes the largest of `UsingNow`, `RampPromise`, `PeakSoFar` and `PeakFileUnreadable`, and `decide` (:771) sums it. `reservation_memory` (:1155) reads `.max` and `.wave` (`"<peak> <epoch>"`), which the sampler `buildlog_sample_anon` (`invoke.sh` :172) writes. The peak decays `PEAK_DECAY_SECONDS` (:78, 1500 s) after the last sample at or above half the peak. So a nextest step keeps its compile peak far into its test phase. Live, 2026-10-30 07:51 EDT: a widget nextest step had a charge of 11.2 GiB while its test binary used 0.38 GiB.
+- Admission has no compile-end signal. Report-unit's Phase 4c adds one. The same sampler writes `$BUILDLOG_PEAK.test-phase.json`: `test_phase_started_at` (the first tick a test binary in a `deps` folder runs in the step's scope), the live `test_phase_peak_bytes` (scope anon, all parallel tests together), and the context (`repo_identity`, `test_scope`, `package`, `filters`, `call_id`, `test_threads`). Its path is the reservation's `sidecar` (`$BUILDLOG_PEAK.cgroup`) with `.cgroup` replaced by `.test-phase.json`. Its one parser is `record.read_test_phase` (`scripts/buildlog/record.py` :603 at `f88d8012`). It returns `TestPhaseRecord` (window `ObservedTestPhase(peak_bytes, started_at)` or `UnobservedTestPhase`), `NoTestPhaseRecord` or `UnreadableTestPhaseRecord`. `buildlog_finish_memory` releases the reservation before `buildlog_end` runs `record.py`, and `record.py` deletes the file after it reads it, so the file still exists at release. The build-log row gets `test_phase_peak_bytes`, and `test_phase_charge` stays null (admission records no charge yet). On 2026-10-30 08:00 EDT, 0 natedev build-log rows had `test_phase_peak_bytes`.
+- Replay (helper, 2026-10-30, data to 08:00 EDT; `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/nextest_charge/report.md`). Rule at the mark: charge = max(test peak so far, N) × m, no decay. N stand-in: the p90 of the family's no-compile nextest runs. At m = 1.2 it frees 795 GiB·min on 10-29 and 320 GiB·min on 10-30, at most 11.6–11.7 GiB at one time. The queue model fails its check (it gives 90 of 592 waited admissions on 10-29 and 97 of 146 on 10-30), so the wait minutes saved (0–140 and 31–199) show sensitivity only.
+- Risk, no-compile runs from 2026-10-16 to 10-30 against N from earlier runs: on the narrow key (repository + scope + package + filters), 20 of 869 runs (2.3 %) went above N × 1.2. With rows widened to the package or the repository, 60 of 1,399 (4.3 %). Worst at 1.2: a hana filtered run at width 16, 6.04 GiB against 1.65 GiB. A margin of 1.314 removes only 2–13 more and frees 15 % less.
+- The parked arms (same-width history max, max + 10 %) failed: test phases went above that lower charge more often than above today's charge.
 
 **Spec:**
 
-1. **Signal and replay first.**
-   - Pick the compile-end mark: the time the first test binary starts in the step's scope. Candidates: (a) the sampler reads the scope's `cgroup.procs` and finds a process whose executable is in the cargo target folder's `deps/` (nextest's list pass runs each test binary, so this mark falls after the last compile); (b) nextest's `Starting N tests across M binaries` line in `run_once`'s tee log (:312-317), which a terminal run (`-t 1`, :300) does not have. Choose the one that works for terminal and non-terminal runs, and measure its added sampler cost per second. Record the choice and the cost in the phase report.
-   - Replay on the last 14 days of the natedev build log (`~/.local/state/buildlog/index.sqlite`, tables `steps`, `samples`; `admission/anon_peaks.jsonl`). A past test-phase peak exists only as a proxy: for a nextest step that ran alone in `builds.slice`, the largest `builds_anon_bytes` sample in `[started_at + finished_s, ended_at]`. Count such steps first; leave out rows with no `finished_s`. Key each by its family (repository + test filter: `test_scope`, `package`, `filters`) and record its test width apart from the key.
-   - For each nextest step, compute the charge after compile under Spec 3 from the history before it, with and without the `fitted` form (Spec 4). Compare today's charge and the new charge on the same eligible steps (nextest steps that ran alone and have `finished_s`). Report per repository: how often the test phase went above today's charge and above its new charge, by how much (p50 and max, GiB), and the wait minutes saved by waiters that the lower charge admits sooner. State the queue model, and check it first: the replay of today's rule must give total wait minutes close to the recorded `steps.mem_wait_s` sum; print both.
-   - Save the replay script in the run folder (`phases/15/`), not in the repository. Its first run (`phases/15/replay_report.md`) failed the model check (639.56 times the recorded wait); Phase 20 Spec 1 owns its calibration, so rerun this replay only on Phase 20's calibrated model.
-2. **Record the test phase.** The sampler writes a new sidecar beside `.max`, `<reservation>.tests` = `"<first test start epoch> <test-phase anon peak>"`, atomically as `.max` is written (temporary file, then `mv -f`). `release` adds `test_phase_started_at` and `test_phase_peak_bytes` to the `anon_peaks.jsonl` row when the sidecar exists, and the stored `EstimatedTestPhaseCharge` (bytes, history cutoff, width form, recorded widths) when the reservation has one, so the 24-hour check compares each test phase with the charge it really had. Every path that deletes a reservation removes `.tests` with `.max` and `.wave`: `release`, `live_reservations` (:986-988), the `check` cleanup (:1233-1236), and Phase 14's cgroup-liveness paths.
-3. **The charge after compile.** `check` computes an `EstimatedTestPhaseCharge` for a nextest step at admission, outside the admission lock, as it computes `expected_peak`. It holds the bytes, the history cutoff, the recorded widths it used and the width form (Spec 4), or `NoTestPhaseHistory`. It is stored in the reservation and lives until the reservation is released; a later width change (`set_width`) computes it again outside the lock. When a reservation has a `.tests` mark, `reservation_memory` drops the compile peak and charges `max(current memory, the stored test-phase charge)`. The test-phase charge is the p90 of earlier test-phase peaks of the same family (repository + test filter), from `anon_peaks.jsonl` rows that carry `test_phase_peak_bytes`, over `HISTORY_DAYS`; Spec 4 picks which recorded widths supply it. It is the whole test phase with all its parallel test processes, never one test's allowance. The single-test p90 of the repository (filtered, no-compile runs) is a floor only. With no test-phase history for the key, the step keeps its compile charge until it ends: no decay. The 1500 s decay stays only for steps with no mark: steps other than nextest, and agent, alias or unknown cargo calls (`steps.caller`).
-4. **Width rule.** The run's width is the reservation's `test_threads` (the share after `set_width`); it is not part of the family key. The form is a closed set, picked in this order: `same_width` — the family has rows at the run's width: their p90; `fitted` — the family has rows at two or more other widths: a fixed part plus a per-thread part, fitted from them; `wider_unscaled` — rows only at wider widths: the p90 of the nearest wider width, no scale-down; `scaled_up` — rows only at narrower widths: the p90 of the widest narrower width × width / recorded width. The replay reports the charge with and without `fitted`, so the showrunner sees what the fit changes.
-5. **Build-why names.** Phase 20 owns the handoff with report-unit's build-why change (`explain_queue() -> QueueExplanation`, `ChargeBasis`, waiter `need_source`, `build_why.py`) and confirms its names. This phase adds the basis variant `TestPhasePeak(bytes, runs, width, recorded_widths, form)` with `form` one of `same_width | fitted | wider_unscaled | scaled_up`, and the need source `"test_phase_peak"`. If build-why is on `origin/builds`, add the variant and its words in `build_why.py`; if not, add only the typed value that `reservation_memory` returns, and report-unit adds the variant.
-6. **Tests** in `scripts/lint/test_memory_admit.py`: the compile charge holds until the mark; after the mark the charge is the stored test-phase charge with history and the compile peak without it (no decay); a step with no mark still decays at 1500 s; each width form: `same_width`, `fitted` with two other widths, `wider_unscaled` with no scale-down, `scaled_up`; the estimate is computed outside the lock and stored in the reservation; the floor; `.tests` is removed on every delete path; the `release` row carries the two new fields. Sampler tests in `scripts/lint/test_invoke_scope.py` (owner verify-unit): the mark appears when a fake test binary starts in a fake scope, and a sampler from before this change (no `.tests`) keeps today's charge. Every test fakes both memory readings (`fake_memory_readings`).
-7. **Docs.** `docs/as-built/build-memory-admission.md`: the mark, the sidecar, the charge after compile, the width rule, the replay table. Update the running-charge constraints of Phases 11, 17 and 20 in this plan: the running charge is as Phases 12 and 15 built it.
+1. **Read the mark.** One helper, `test_phase_path(row) -> Path | NoTestPhaseFile`, gives the file path from the reservation's `sidecar`. An empty `sidecar`, or one that does not end in `.cgroup`, gives `NoTestPhaseFile`. Read the file only with `record.read_test_phase`, through the `record` module that `memory_admit.py` already loads (:61); add the function to that module's Protocol (:43). Do not write a second parser. Call it at run time only: `record.py` imports `memory_admit` when it loads, so `memory_admit` must not use `record` attributes while it loads. Admission never writes or deletes the file; `record.py` owns it.
+   - In `reservation_memory` (:1155), an `ObservedTestPhase` window and a stored `TestPhaseNeed` (Spec 2) give a new `PeakHistory` variant, `TestPhaseStarted(started_at, peak_so_far, need)`, with `peak_so_far` = the window's `peak_bytes`. Every other case keeps today's history (`PeakSoFar`, `PeakDecayed`): no file, no window yet, an unreadable file, or no stored need. The `.max` read stays first, so an unreadable `.max` keeps today's `PeakFileUnreadable`.
+2. **N, the test-phase need.**
+   - **Rows.** This host's `anon_peaks.jsonl` rows over `HISTORY_DAYS` with `step` `nextest`, an integer `test_phase_peak_bytes` above 0, and the same `repo_identity`, `test_scope`, `package` and sorted `filters` as the step. Use no rows of other filters, other packages or other repositories (no widening: 4.3 % against 2.3 % in the replay).
+   - **Width.** The run's width is the reservation's `test_threads` (the share after `set_width`); it is not part of the key. The form is a closed set, picked in this order: `same_width`: rows at the run's width, their p90; `wider_unscaled`: rows only at wider widths, the p90 of the nearest wider width, no scale-down; `scaled_up`: rows only at narrower widths, the p90 of the widest narrower width × width / recorded width, rounded up. No `fitted` form (the replay ran without it). The p90 is `percentile` (:821). The floor is `FILTERED_FLOOR` (:68, the existing single-test floor, 1 GiB): N = max(form value, `FILTERED_FLOOR`). No second floor rule.
+   - **Types.** `TestPhaseNeed(bytes, runs, width, recorded_width, form)`, or `NoTestPhaseNeed(reason)` with a closed reason: `no_width`, `no_history`, or `not_recorded` (a reservation from before this phase).
+   - **One rule, one reader.** Split N into a pure function over rows (the rule) and the reader that feeds it, so the replay and the 24 h check call the same rule. `anon_peaks.jsonl` has three parse loops today: `gate_estimate` (:691), `expected_peak` (:870) and `filtered_peak` (:960). Do not add a fourth. Make one reader that returns typed rows for a host and a time window, move the three loops onto it, and feed the rule from it. If Phase 24 Part B or Phase 26 already made one reader, use it.
+   - **When.** Outside the admission lock (Phase 12), once for each admitted nextest step, never on each poll. After `check` admits a nextest step and leaves the lock, it computes N from the row's key and `test_threads` and writes it into the reservation. `set_width` (:2203) computes N for the new width before it takes the lock, and writes it with the width. One locked update helper writes reservation fields by atomic replace (today's read, change and `os.replace` in `set_width`); both callers use it, and it skips a reservation that is gone. The field `test_phase_need` is tagged JSON through the encoder and decoder that Phase 24 adds for `need_basis`; no second encoder. A row with no field reads as `NoTestPhaseNeed(not_recorded)`.
+3. **The charge after the mark.** In `charge_basis` (:797), for `TestPhaseStarted` the observed-peak term becomes `TestPhaseCharge(bytes, peak_so_far, need)`, with `bytes = ceil(max(peak_so_far, need.bytes) × TEST_PHASE_MARGIN)` and `TEST_PHASE_MARGIN = 1.2`. Comment the constant with the replay: 2.3 % of 869 no-compile runs above N × 1.2 on the narrow key; 1.314 removed only 2–13 more and freed 15 % less. The other terms stay: `UsingNow`, the promise (a nextest step keeps `RampPromise` for 120 s, then `NoPromise`, as Phase 24 left it) and `PeakFileUnreadable`. After the mark, the compile `.max` peak and its `.wave` decay no longer count, and the test-phase charge does not decay. The sampler still writes `.max` for the history row. `growth_headroom` (:813) does not change: the test-phase charge is a budget charge, as the observed peak is today. With no mark or no N, the step keeps today's charge and its 1500 s decay.
+   - **Where the types sit.** `TestPhaseCharge` is one more `ChargeBasis` variant, beside `RampPromise` and Phase 24's `LifetimePromise`. It is not a promise: Phase 24's `RampPromise | LifetimePromise | NoPromise` on `MeasuredMemory` does not change. `TestPhaseNeed` is not a `NeedBasis` variant: `NeedBasis` explains the admission `need`, and this phase does not change `need`. So the charge after the mark has one type, and N has one type.
+4. **The history row.** Phase 24's one finalizer adds three fields to the `anon_peaks.jsonl` row, from the same `test_phase_path` read: `test_phase_peak_bytes` and `test_phase_started_at` when the window is observed, and `test_phase_need` (tagged JSON) when the reservation has one. With no file or no window, the row has no window fields. N's history starts at this merge: coverage grows over about a day, and until then a family has no N and keeps today's charge.
+5. **Build-why words.** `build_why.charge_text` (:51) ends in `assert_never`, so the new variant needs its text: `tests since <HH:MM>: peak so far <GiB>, need <GiB> (<form>, p90 of <runs> runs at width <width>), × 1.2`.
+6. **Tests.** In `scripts/lint/test_memory_admit.py`, on `MemoryQueueFixture` (:890) with `fake_memory_readings`. Extend `MemoryQueueFixture.running` (:912) to take a sidecar, a `.max` peak and a test-phase file; write no second reservation writer. Write history rows through one module-level row writer, and move the three writers that the classes have today (`HistoryTests.add_measured` :137, `FilteredPromiseTests.samples` :242, `RepositoryHistoryTests.samples` :538) onto it. One test for each case:
+   - `test_nextest_charge_falls_to_test_phase_need_at_mark`: `.max` 11 GiB, a mark with peak 0.4 GiB, N 2 GiB: the charge is 2.4 GiB, and a held 12 GiB waiter is admitted.
+   - `test_test_phase_charge_follows_peak_so_far`: peak so far 5 GiB, N 2 GiB: the charge is 6 GiB.
+   - `test_test_phase_charge_does_not_decay`: 1500 s after the last near-peak time, the charge stays.
+   - `test_no_history_keeps_compile_peak`: a mark and no N: today's `PeakSoFar`, with its 1500 s decay.
+   - `test_no_mark_keeps_today`: no file, a file with no window, and an unreadable file each keep today's charge.
+   - The need: `same_width`, `wider_unscaled` (no scale-down) and `scaled_up` (rounded up); the `FILTERED_FLOOR` floor; rows of other filters, another package or another repository give `no_history`; no width gives `no_width`; a reservation with no field gives `not_recorded`.
+   - `test_need_stored_outside_lock_and_on_width_change`: N is computed while the lock is free and stored in the reservation; `set_width` computes it again for the new width.
+   - The history row: the finalizer row carries `test_phase_peak_bytes`, `test_phase_started_at` and `test_phase_need`; with no file it has none of them; admission leaves the test-phase file in place.
+   - The one reader: the existing `gate_estimate`, `expected_peak` and `filtered_peak` tests pass unchanged.
+   - In `scripts/build_queue/test_build_why.py`: `charge_text` for `TestPhaseCharge`.
+
+   Every test fakes both memory readings.
+7. **Docs.** `docs/as-built/build-memory-admission.md`: the mark read, N with its key, width forms and floor, the charge after the mark and its margin, the history row fields, and the replay table.
+
+**State:** the reservation's `test_phase_need` field (written after admission and by `set_width`, under the lock, by atomic replace) and three new fields on the finalizer's `anon_peaks.jsonl` row. No new files; the test-phase file stays `record.py`'s.
 
 **Constraints from prior phases:**
-- Phase 12: a step keeps the sampler it started with, so a step already running with no `.tests` file keeps today's charge and decay. Any path that deletes a reservation removes every sidecar.
-- Phase 12's "a change to estimates leaves the running charge unchanged" stays true; this phase changes the running charge on purpose, only for steps with a mark.
+- Phase 12: estimates run outside the admission lock. A step keeps the sampler it started with, so a step that started before 4c's sampler (no test-phase file) keeps today's charge and decay.
 - Phase 10: the blocker lookup reuses `decide` and `reservation_memory`, so it follows the new charge with no copy of the rule.
+- Phase 24: one finalizer writes every history row and ends every reservation; `ChargeBasis` has `LifetimePromise`; `MeasuredMemory` carries `RampPromise | LifetimePromise | NoPromise`; a nextest step keeps `RampPromise` for 120 s; `need_basis` is tagged JSON.
+- Phase 26: same file; it changes `queue_decision`, `bump_waiter` and the waiter row, and this phase does not.
 - Phases 1–2: tests never read live `/proc/meminfo`, `/proc/pressure/memory` or the cgroup tree; the merge gate trips a module that does.
 
 **Files:**
-- `scripts/lint/invoke.sh` — Spec 2, the sampler mark (owner verify-unit; trial-merge against `origin/natedev-verify` and `origin/natedev`).
-- `scripts/lint/memory_admit.py` — Specs 2–5.
-- `scripts/lint/test_memory_admit.py`, `scripts/lint/memory_test_support.py` — Spec 6 (the support file only for a fake test binary or scope).
-- `scripts/lint/test_invoke_scope.py` — Spec 6, sampler tests (owner verify-unit).
-- `scripts/build_queue/build_why.py` — Spec 5, only if build-why landed first (owner report-unit; trial-merge against `origin/builds-report`).
-- `docs/as-built/build-memory-admission.md`, `docs/plans/builds-resources.md` — Spec 7.
+- `scripts/lint/memory_admit.py` — Specs 1–4.
+- `scripts/lint/test_memory_admit.py` — Spec 6.
+- `scripts/build_queue/build_why.py` — Spec 5 (owner report-unit; trial-merge against `origin/builds-report`).
+- `scripts/build_queue/test_build_why.py` — Spec 6, the charge text test (owner report-unit).
+- `docs/as-built/build-memory-admission.md` — Spec 7.
+
+The replay and 24 h check scripts live in the run folder (`phases/15/`), not in the repository; both call Spec 2's rule.
 
 **Workers:** `1 writer`
 
 **Acceptance gate:**
-- The changed test modules pass; `basedpyright` over every changed Python file reports `0 errors, 0 warnings, 0 notes`; `bash -n scripts/lint/invoke.sh`; the merge gate is green.
-- The replay table (with and without `fitted`) is in the phase report and the checkpoint notice: per repository, on one eligible cohort, test phases above today's charge and above the new charge (count, p50 and max excess) and wait minutes saved, next to the model check against recorded `mem_wait_s`. The change lands only when the share above the new charge is not higher than the share above today's charge, for every repository.
-- Post-merge check, 24 h after the merge reaches main: from `anon_peaks.jsonl` rows with `test_phase_peak_bytes` and the stored charge, how often a test phase went above the charge it had; from `steps.mem_wait_s`, wait minutes against the 24 h before the merge; earlyoom kills and `calls.mem_kills` in both windows. The phase report records when the check is due; the result goes in a follow-up notice.
-- The notice has `also touches` lines for `invoke.sh` and `test_invoke_scope.py` (verify-unit, against `origin/natedev-verify` and `origin/natedev`) and, if changed, `build_why.py` (report-unit, against `origin/builds-report`).
-- Change-Review line: a nextest step's charge falls to its test-phase peak once its tests start | on natedev, start `~/.claude/scripts/direct/verify.sh test hana_diegetic` in `~/rust/hana`; after its compile, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` (before build-why lands: `cat ~/.local/state/buildlog/admission/*.tests`) | the step's charge reads as the test-phase peak with its width form, below its compile peak.
+- The memory admission and build-why tests pass; `basedpyright` over `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `scripts/build_queue/build_why.py` and `scripts/build_queue/test_build_why.py` reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
+- A test phase is above its charge when its `test_phase_peak_bytes` is above N × 1.2, its charge at the mark. The replay on 4c data uses natedev build-log rows with `test_phase_peak_bytes`, each with N from earlier rows by Spec 2's rule. For every repository, at most 2.3 % of test phases with an N are above their charge. The table (per repository: test phases, test phases with an N, test phases above the charge, worst excess in GiB) goes in the checkpoint notice. If a repository is above 2.3 %, the numbers go to the builds showrunner before the checkpoint.
+- The notice has an `also touches scripts/build_queue/build_why.py, test_build_why.py (owner report-unit)` line, tested against `origin/builds-report`.
+- The 24 h check, 24 h after the merge reaches main: from `anon_peaks.jsonl` rows with `test_phase_peak_bytes` and `test_phase_need`, per repository, the nextest steps that got a `TestPhaseCharge` and the test phases above their charge; the `steps.mem_wait_s` total against the 24 h before the merge; earlyoom kills (journal) and `calls.mem_kills` in both windows. The phase report records when the check is due; the result goes in a follow-up notice.
+- Change-Review line: a nextest step's charge falls to its test-phase need once its tests start | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic` two times; during the second run, after its compile, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` | the step's charge reads `tests since …` with its need and width form, below its compile peak.
 
 ### Phase 16 — Python test gates take a place in the shared admission queue  · status: done
 
@@ -456,7 +477,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 **Ruled out:** a split of cargo waits by gate presence from old logs (no gate recorded its start); the 24 h check after `queue_times.jsonl` reaches main makes it.
 
 ### Phase 17 — The nextest promise splits by compile size  · status: todo
-**Depends on:** Phase 11 (same `expected_peak`; Phase 11 splits compile runs from no-compile runs). Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → 20 → 4 → 11 → **17** → 18 → 19 → 8.
+**Depends on:** Phase 11 (same `expected_peak`; Phase 11 splits compile runs from no-compile runs). Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → 15 → 27 → 20 → 4 → 11 → **17** → 18 → 19 → 8.
 
 **Approved:** showrunner 2026-10-29 (no ETA given).
 
@@ -479,7 +500,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 
 **Constraints from prior phases:**
 - Phase 11: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; the compile-run promise wins over `min(filtered, full)`; fresh runs keep `fresh_test_peak`.
-- Running charge: the band changes `need` and so the ramp promise only; it leaves the running charge as built (`build_charge` :793, `charge_basis` :797, `growth_headroom` :813, `reservation_memory` :1155 at `bc36e49f`; `docs/as-built/build-memory-admission.md`): a running step charges the largest of its current resident and swap bytes, its observed `.max` peak, its promise during `RAMP_SECONDS` (120 s), and its promise when the peak is unknown. After Phase 24, a release-profile `build` step holds its promise for its whole life (`LifetimePromise`, in the budget charge and the free-memory growth term); nextest steps keep the ramp. The `.max` peak expires `PEAK_DECAY_SECONDS` (1500 s) after the last near-peak time in `.wave`, or after the `.max` mtime when `.wave` is absent. Phase 15 is parked; its test-phase charge after the mark applies only if Phase 15 lands first, and the band leaves that charge unchanged too.
+- Running charge: the band changes `need` and so the ramp promise only; it leaves the running charge as built (`build_charge` :793, `charge_basis` :797, `growth_headroom` :813, `reservation_memory` :1155 at `bc36e49f`; `docs/as-built/build-memory-admission.md`): a running step charges the largest of its current resident and swap bytes, its observed `.max` peak, its promise during `RAMP_SECONDS` (120 s), and its promise when the peak is unknown. After Phase 24, a release-profile `build` step holds its promise for its whole life (`LifetimePromise`, in the budget charge and the free-memory growth term); nextest steps keep the ramp. The `.max` peak expires `PEAK_DECAY_SECONDS` (1500 s) after the last near-peak time in `.wave`, or after the `.max` mtime when `.wave` is absent. Phase 15 lands before this phase: after report 4c's test-phase mark the running charge is `TestPhaseCharge`, and the band leaves that charge unchanged too.
 - Phase 24: `NeedBasis` and its path to the waiter row, build-why and the shell are Phase 24's; this phase adds one variant on that path. `build` steps keep Phase 24's same-shape rule; bands apply to nextest steps only.
 
 **Files:**
@@ -500,7 +521,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - Change-Review line: a small-compile test run on a warm tree gets a small promise | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic --filter <one test>` once, then add a comment line to one source file of that crate (a small compile that is not zero; an unchanged tree takes the freshness path instead), run it again and read that run's memory wait line | its need is near the small band's p90 that the replay gives, and its basis names the compile band it picked.
 
 ### Phase 18 — History splits on the dylib feature and each step's commit, not on a time  · status: todo
-**Depends on:** Phase 17 (same `expected_peak`). Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → 20 → 4 → 11 → 17 → **18** → 19 → 8.
+**Depends on:** Phase 17 (same `expected_peak`). Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → 15 → 27 → 20 → 4 → 11 → 17 → **18** → 19 → 8.
 
 **Approved:** showrunner 2026-10-29 (no ETA given).
 
@@ -544,7 +565,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - Change-Review line: a dylib hana test is promised only from dylib history | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh test hana_diegetic` and read its first memory wait line | the need and its source match the dylib-side p90 that the replay gives.
 
 ### Phase 19 — Measure where admission estimates come from, then make the 0.65 fallback rare  · status: todo
-**Depends on:** Phase 18 (same `expected_peak`). Runs before Phase 8. Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → 20 → 4 → 11 → 17 → 18 → **19** → 8.
+**Depends on:** Phase 18 (same `expected_peak`). Runs before Phase 8. Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → 15 → 27 → 20 → 4 → 11 → 17 → 18 → **19** → 8.
 
 **Approved:** showrunner 2026-10-29, rescoped (no ETA given).
 
@@ -583,7 +604,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - Change-Review line: few admissions use the 0.65 fallback | on natedev while builds wait, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` | the waiting rows name source `measured` and few name `buildlog`. If Spec 2 stops the phase: Change-Review: none — measurement only.
 
 ### Phase 20 — Replay a looser head rule, and adopt it only on the replay  · status: todo
-**Depends on:** Phase 16 (same file, `memory_admit.py`); Phase 24 (the one reservation finalizer) and Phase 26 (`queue_times.jsonl`, queue-order backfill, `head_since`); report-unit's build-why change on `origin/builds` (`explain_queue`, Spec 2). Runs before Phase 4. Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → **20** → 4 → 11 → 17 → 18 → 19 → 8.
+**Depends on:** Phase 16 (same file, `memory_admit.py`); Phase 24 (the one reservation finalizer) and Phase 26 (`queue_times.jsonl`, queue-order backfill, `head_since`); report-unit's build-why change on `origin/builds` (`explain_queue`, Spec 2). Runs before Phase 4. Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → 15 → 27 → **20** → 4 → 11 → 17 → 18 → 19 → 8.
 
 **Approved:** showrunner 2026-10-29 (ETA 08:30 EDT 2026-10-30). The showrunner decides adoption from the replay table. Spec 0 (every step's queue life in the shared record): builds showrunner 2026-10-30.
 
@@ -609,7 +630,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 
 **Constraints from prior phases:**
 - Phase 10: the blocker lookup reuses `decide` and `queue_decision`; no second rule.
-- Running charge: the replay uses the running charge as built after Phase 24 (`build_charge` :793, `growth_headroom` :813, `reservation_memory` :1155 at `bc36e49f`; `docs/as-built/build-memory-admission.md`): a running step charges the largest of its current resident and swap bytes, its observed `.max` peak, its promise during `RAMP_SECONDS` (120 s), and its promise when the peak is unknown; a release-profile `build` step holds its promise for its whole life, in the budget charge and the free-memory growth term (`LifetimePromise`). The `.max` peak expires `PEAK_DECAY_SECONDS` (1500 s) after the last near-peak time in `.wave`, or after the `.max` mtime when `.wave` is absent. Phase 15 is parked; its test-phase charge after the mark applies only if Phase 15 lands before this phase dispatches; then the replay uses it for steps with a `.tests` mark.
+- Running charge: the replay uses the running charge as built after Phase 24 (`build_charge` :793, `growth_headroom` :813, `reservation_memory` :1155 at `bc36e49f`; `docs/as-built/build-memory-admission.md`): a running step charges the largest of its current resident and swap bytes, its observed `.max` peak, its promise during `RAMP_SECONDS` (120 s), and its promise when the peak is unknown; a release-profile `build` step holds its promise for its whole life, in the budget charge and the free-memory growth term (`LifetimePromise`). The `.max` peak expires `PEAK_DECAY_SECONDS` (1500 s) after the last near-peak time in `.wave`, or after the `.max` mtime when `.wave` is absent. Phase 15 lands before this phase: the replay charges a nextest step `TestPhaseCharge` after report 4c's test-phase mark, as Phase 15 builds it.
 - Phase 16: merge gates are queue steps; the replay counts them only from Spec 0's rebuilt intervals.
 - Phase 26: queue-order backfill and `head_since` live in `queue_decision` and the queue pass; Spec 2's one function takes them with the rest.
 - report-unit's build-why change (on `origin/builds` since `228b45ae`): `explain_queue() -> QueueExplanation` in `memory_admit.py`, `ChargeBasis` and the waiter `need_source` as closed unions, and `scripts/build_queue/build_why.py`. `read_queue` and `explain_queue` share one internal pass (`read_queue_pass` :1891); the policy result goes in that pass. Keep its reader contract: `queue_rows` (:1799) keeps every reservation row, readers skip `GoneMemory` rows (:1866, :1902), and `Waiter.need_source` is the typed `NeedSource` (:110).
@@ -698,7 +719,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 **Gotchas:** a rebuilt cycle has no delivery evidence, so a session can get a notice twice (at-least-once).
 
 ### Phase 24 — A build's promise comes from builds of the same shape and holds until the build ends  · status: todo
-**Depends on:** Phase 16 (checkpointed, `d927f744`) and Phase 25 (same files, `memory_admit.py` and `build_why.py`; global order). Part A is complete but not committed: `scripts/lint/build_shape.py` and `scripts/lint/test_build_shape.py` are untracked files in the `builds-resources` worktree, and Part B's checkpoint commits them. Part B is the rest of this Work Order. Merge `origin/builds` first. Global order: 21 → 16 → 25 → **24** → 26 → 20 → 4 → 11 → 17 → 18 → 19 → 8.
+**Depends on:** Phase 16 (checkpointed, `d927f744`) and Phase 25 (same files, `memory_admit.py` and `build_why.py`; global order). Part A is complete but not committed: `scripts/lint/build_shape.py` and `scripts/lint/test_build_shape.py` are untracked files in the `builds-resources` worktree, and Part B's checkpoint commits them. Part B is the rest of this Work Order. Merge `origin/builds` first. Global order: 21 → 16 → 25 → **24** → 26 → 15 → 27 → 20 → 4 → 11 → 17 → 18 → 19 → 8.
 
 **Approved:** builds showrunner 2026-10-30 05:2x EDT, design accepted as written (wrong-result defect, fixed at the cause in the gate).
 
@@ -754,8 +775,8 @@ The replay script (Spec 1) lives in the run folder, not in the repository.
 - The replay: no `build` step with same-shape history goes above its new promise; the incident's argv gets a promise at or above 14.4 GiB (14,720 MiB). The table, the GiB-hours cost and the most extra room held at one time go in the checkpoint notice.
 - Change-Review line: a release build is promised from release builds and keeps its promise until it ends | on natedev in `~/rust/hana`, run `~/.claude/scripts/direct/verify.sh build hana --bin hana --release --features bevy/trace_chrome` and read its reservation in `~/.local/state/buildlog/admission` | its `need` is at or above 14.4 GiB with the shape in the row, and the build-why charge stays at the need while its memory is lower.
 
-### Phase 25 — Build-why names when a recovery spacing hold ends  · status: todo
-**Depends on:** Phase 16 (same file, `memory_admit.py`); report-unit's build-why change (`explain_queue`, `head_after_steps_end`, `build_why.py`), on `origin/builds` since `228b45ae`. Merge `origin/builds` first. Global order: 21 → 16 → **25** → 24 → 26 → 20 → 4 → 11 → 17 → 18 → 19 → 8.
+### Phase 25 — Build-why names when a recovery spacing hold ends  · status: done
+**Depends on:** Phase 16 (same file, `memory_admit.py`); report-unit's build-why change (`explain_queue`, `head_after_steps_end`, `build_why.py`), on `origin/builds` since `228b45ae`. Merge `origin/builds` first. Global order: 21 → 16 → **25** → 24 → 26 → 15 → 27 → 20 → 4 → 11 → 17 → 18 → 19 → 8.
 
 **Approved:** builds showrunner 2026-10-30, a text fix with its test, after Phase 16 (the 158 min head wait question: the hold was right, the text was wrong).
 
@@ -791,7 +812,7 @@ The replay script (Spec 1) lives in the run folder, not in the repository.
 - Change-Review line: build-why says when recovery spacing starts the first waiting step | on natedev, during the 120 s after a pressure hold ends, type `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` | the release line says no running step needs to end and names the start time.
 
 ### Phase 26 — The memory queue starts steps in queue order and records when a step became first  · status: todo
-**Depends on:** Phase 24 Part B (same file, `memory_admit.py`). Runs before Phase 20, whose single head policy (Spec 2) then reads these fields. Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → **26** → 20 → 4 → 11 → 17 → 18 → 19 → 8.
+**Depends on:** Phase 24 Part B (same file, `memory_admit.py`). Runs before Phase 20, whose single head policy (Spec 2) then reads these fields. Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → **26** → 15 → 27 → 20 → 4 → 11 → 17 → 18 → 19 → 8.
 
 **Approved:** builds showrunner 2026-10-30 (two wrong results from the 158 min head wait; `head_since` and the token record for report-unit's Phase 4e). Who may bump is a user question the showrunner takes; this phase does not change it.
 
@@ -842,3 +863,45 @@ The replay script (Spec 1) lives in the run folder, not in the repository.
 - The memory admission, build-queue, gate admission and verify token-wait tests pass; `basedpyright` over `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `scripts/build_queue/build_queue.py`, `scripts/build_queue/test_build_queue.py`, `scripts/production/merge_gate.py`, `scripts/production/test_merge_gate_suites_admission.py` and `scripts/direct/test_verify_token_wait.py` reports `0 errors, 0 warnings, 0 notes`; `bash -n scripts/lint/memory_gate.sh scripts/direct/verify.sh`; the merge gate is green.
 - The notice has `also touches` lines for `verify.sh` and `test_verify_token_wait.py` (verify-unit, against `origin/natedev-verify`), `build_queue.py` and its test (report-unit, against `origin/builds-report`), and `merge_gate.py` and its test (natedev showrunner, against `origin/natedev`).
 - Change-Review line: steps that fit start in queue order and a bump near the front changes nothing | on natedev, type `/build:queue` while steps wait, then `/build:queue bump 2` | rows start top-down in a backfill window, the bump prints `already at position 2; nothing changed`, and each first row shows when it became first.
+
+### Phase 27 — The merge gate holds its whole memory cap in the admission queue  · status: todo
+**Depends on:** devtools-unit's merge-gate checkpoint that raises the gate memory cap to 6 GiB (`DEFAULT_MEMORY_CAP_MIB`), on `main` and then on `origin/builds`; Phase 15 (same files, `memory_admit.py` and `build_why.py`; 24 Part B → 26 → 15 → 27 land one after another). On 2026-10-30, `main`'s `merge_gate.py` still has `DEFAULT_MEMORY_CAP_MIB = 4096`. Merge `origin/builds` first. Global order: 21 → 16 → 25 → 24 → 26 → 15 → **27** → 20 → 4 → 11 → 17 → 18 → 19 → 8.
+
+**Approved:** builds showrunner 2026-10-30 (natedev item: after devtools' 6 GiB cap lands on `main`, each gate holds its cap as one queue row from start to end, with a test).
+
+#### Work Order
+
+**Goal:** a merge gate reserves its whole memory cap as one row in the admission queue from its start to its end, so a build that starts beside it never counts on room the gate can still use.
+
+**Measured (2026-10-30, `builds-resources` `01441cc0`):**
+- `merge_gate.py` `gate_reservation` (:359-372) opens one `GateProfile` row with `NoGateHistory(cap)`. `memory_admit.py` `check` (:1601-1603) replaces that estimate every `HEAD_SECONDS` with `gate_estimate` (:695-716): the p90 of the host's `merge-gate` rows in `admission/anon_peaks.jsonl` over 14 days, else the cap. So the row promises the p90 peak, not the cap.
+- Inside the gate, its own admission lets its modules use up to the cap. The Phase 25 gate on 2026-10-30 sampled 4.050 GiB against its 4.000 GiB cap. The gate can use its whole cap; its queue row promises less.
+- `build_why.py` `need_text` (:79-92) prints `fallback: fewer than 5 runs` for a `fallback` source, which is the gate row's source with no history today. That text is not true for a row sized by the cap.
+
+**Spec:**
+
+1. **The row holds the cap.** `GateProfile.peak` is `ExpectedPeak(cap_bytes, "cap", 0)` for every check, from start to end. `"cap"` is a new closed value of the need source, used only by the gate. Remove `gate_estimate`, `MeasuredGatePeak`, `NoGateHistory`, `GateEstimate`, the `estimate` and `estimated_at` fields and their refresh in `check`, after a grep of the tree shows no other reader. The `merge-gate` rows in `anon_peaks.jsonl` are still written for report-unit; only the read for the estimate goes.
+2. **One cap value.** `gate_reservation` sizes the row from the gate's own cap (`--memory-cap-mib`, default `DEFAULT_MEMORY_CAP_MIB`, 6 GiB after devtools' change) and nothing else.
+3. **Text.** `need_text` prints `the merge gate's memory cap` for the `"cap"` source; every other source keeps its text.
+4. **Tests.** In `scripts/lint/test_memory_admit.py`: a gate row holds `cap_bytes` with ten `merge-gate` history rows at 2 GiB; the row keeps the cap on a check after `HEAD_SECONDS`. In `scripts/production/test_merge_gate_suites_admission.py`: the gate's reservation equals `--memory-cap-mib` from start to its last module. In `scripts/build_queue/test_build_why.py`: a gate row's need line reads `the merge gate's memory cap`. This Work Order approves replacing the tests that assert `MeasuredGatePeak` or `NoGateHistory` (`test_memory_admit.py` :945-1028, `test_merge_gate_suites_admission.py` :170-180); put one `Assertion-Change:` line per replaced test in the summary. Fake both memory readings.
+5. **Docs.** `docs/as-built/build-memory-admission.md`: the gate paragraph says the row holds the cap.
+
+**Constraints from prior phases:**
+- Phase 16: a gate holds one queue row from start to end through `gate_reservation`; keep that one row.
+- Phase 14: a gate run again after a stop finishes, and its row is released on every exit path.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — Spec 1.
+- `scripts/lint/test_memory_admit.py` — Spec 4.
+- `scripts/production/merge_gate.py` — Spec 2 (owner natedev showrunner; trial-merge against `origin/natedev`).
+- `scripts/production/test_merge_gate_suites_admission.py` — Spec 4 (owner natedev showrunner).
+- `scripts/build_queue/build_why.py` — Spec 3 (owner report-unit; trial-merge against `origin/builds-report`).
+- `scripts/build_queue/test_build_why.py` — Spec 4 (owner report-unit).
+- `docs/as-built/build-memory-admission.md` — Spec 5.
+
+**Workers:** `1 writer`
+
+**Acceptance gate:**
+- The memory admission, gate admission and build-why tests pass; `basedpyright` over the six Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
+- The notice has `also touches` lines for `merge_gate.py` and its test (natedev showrunner, against `origin/natedev`) and for `build_why.py` and its test (report-unit, against `origin/builds-report`).
+- Change-Review line: a merge gate holds its whole memory cap in the queue | on natedev, while a merge gate runs, type `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py` | the gate's row shows a 6.0 GiB need from `the merge gate's memory cap`, from its start to its end.

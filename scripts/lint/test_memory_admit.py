@@ -3497,6 +3497,61 @@ class QueueExplanationTests(MemoryQueueFixture):
         self.assertIsInstance(running.basis, gate.PromiseNoReading)
         self.assertEqual((running.promise, running.measured, running.charged), (8 * GIB, 0, 8 * GIB))
 
+    def test_recovery_spacing_alone_names_the_start_without_any_endings(self) -> None:
+        _ = self.running(100, 6, age=30)
+        _ = self.waiting(300, 4 * GIB, 20)
+        starts_at = NOW.timestamp() + 37
+        gate.write_recovery(gate.admission_dir(self.root), gate.RecoveryStarts(NOW.timestamp() + 120, starts_at))
+        explanation = gate.explain_queue()
+        for result in (gate.head_after_steps_end(explanation, ()), gate.smallest_head_release(explanation)):
+            with self.subTest(result=result):
+                if not isinstance(result, gate.HeadStartsAt):
+                    self.fail(f"expected a timed start, got {result}")
+                self.assertEqual(result.at, starts_at)
+                self.assertEqual(result.ended, ())
+                self.assertEqual((result.charge_drop, result.freed, result.growth_drop), (0, 0, 0))
+
+    def test_real_pressure_still_holds_after_every_running_step_ends(self) -> None:
+        _ = self.running(100, 6, age=30)
+        _ = self.waiting(300, 4 * GIB, 20)
+        _ = (self.root / "pressure").write_text("full avg10=11.00 avg60=0.00 avg300=0.00 total=0\n")
+        explanation = gate.explain_queue()
+        for result in (gate.head_after_steps_end(explanation, (0,)), gate.smallest_head_release(explanation)):
+            with self.subTest(result=result):
+                if not isinstance(result, gate.HeadStillHeld):
+                    self.fail(f"expected a pressure hold, got {result}")
+                self.assertEqual(result.causes, ("pressure",))
+
+    def test_recovery_spacing_does_not_hide_a_failed_budget_check(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: {40 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        _ = self.running(100, 20, age=30)
+        _ = self.waiting(300, 4 * GIB, 20)
+        gate.write_recovery(gate.admission_dir(self.root),
+                            gate.RecoveryStarts(NOW.timestamp() + 120, NOW.timestamp() + 37))
+        result = gate.head_after_steps_end(gate.explain_queue(), ())
+        if not isinstance(result, gate.HeadStillHeld):
+            self.fail(f"expected budget and timer holds, got {result}")
+        self.assertEqual(result.causes, ("build budget", "pressure"))
+
+    def test_recovery_spacing_release_keeps_the_required_endings_and_drops(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: {40 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        _ = self.waiting(300, 4 * GIB, 20)
+        starts_at = NOW.timestamp() + 37
+        gate.write_recovery(gate.admission_dir(self.root), gate.RecoveryStarts(NOW.timestamp() + 120, starts_at))
+        for charges, ended, drop, freed in (((20,), (0,), 20, 1), ((14, 6), (1,), 6, 2)):
+            with self.subTest(charges=charges):
+                for path in gate.admission_dir(self.root).glob("*.reservation"):
+                    path.unlink()
+                for pid, charge in zip((100, 200), charges):
+                    _ = self.running(pid, charge, age=30)
+                result = gate.smallest_head_release(gate.explain_queue())
+                if not isinstance(result, gate.HeadStartsAt):
+                    self.fail(f"expected endings followed by a timed start, got {result}")
+                self.assertEqual(result.at, starts_at)
+                self.assertEqual(result.ended, ended)
+                self.assertEqual((result.charge_drop, result.freed, result.growth_drop),
+                                 (drop * GIB, freed * GIB, (drop - freed) * GIB))
+
     def test_pressure_and_recovery_spacing_match_the_head_decision_without_writing(self) -> None:
         _ = self.waiting(300, GIB, 20)
         directory = self.root / "admission"
