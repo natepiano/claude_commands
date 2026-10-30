@@ -63,7 +63,9 @@ and runs the preflight again first. Stop is `rename_unit.stop_unit` through the 
 `rename_unit.StopTarget` protocol: a transfer keeps the id, so the old and new ids are the same.
 
 The doc commits use `git commit --only` on the doc, and an earlier run's commit is adopted by its
-subject. They are not pushed: each goes out with its showrunner's next merge push, as add_unit's
+subject. If a run stops between a row write and its commit, the journaled step accepts only
+its exact row change computed from HEAD (with the index still at HEAD or that same change),
+then finishes the commit; unrelated document edits still refuse. They are not pushed: each goes out with its showrunner's next merge push, as add_unit's
 row commit does (user, 2026-10-08). The unit takes the receiving merge branch at its own next merge.
 
 ## verify

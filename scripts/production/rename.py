@@ -297,6 +297,10 @@ def _completed_steps(fields: dict[str, object]) -> tuple[str, ...] | None:
 def _current_production(old: str, new: str, completed: tuple[str, ...]) -> production_units.Production:
     slug = new if "_rename_timer" in completed else old
     step = next((name for name in APPLY_STEP_NAMES if name not in completed), "apply complete")
+    # The timer move may have completed before its journal save. Only that pending
+    # step can adopt the destination, and only when the source is actually gone.
+    if step == "_rename_timer" and not unit_move.exists(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{old}"):
+        slug = new
     context = f"rename {old} -> {new} at {step}: expected {slug}'s update timer"
     checked = showrunners.checked_doc(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}")
     if isinstance(checked, showrunners.NoCheckedDoc):
@@ -538,7 +542,9 @@ def _check_edits(plan: RenamePlan) -> None:
 
 
 def _rename_branch(plan: RenamePlan) -> None:
-    if unit_move.git(plan.checkout, "rev-parse", f"refs/heads/{plan.merge_branch}") != plan.base:
+    # A kept merge branch itself receives the rename commit. Validate that tip
+    # below, where a retry can recognize the commit and finish its push.
+    if plan.renames_branch and unit_move.git(plan.checkout, "rev-parse", f"refs/heads/{plan.merge_branch}") != plan.base:
         raise RenameRefused(f"{plan.merge_branch} moved during the rename")
     branch = unit_move.git(plan.checkout, "branch", "--show-current")
     if branch not in (plan.merge_branch, plan.branch):
