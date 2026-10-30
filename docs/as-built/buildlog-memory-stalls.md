@@ -43,7 +43,7 @@ Launches skip memory admission by design. Their `mem_wait_s` is null and the rep
 
 ### Machine samples: `buildlog sample` → monthly JSONL → `samples`
 
-1. `sample()` checks that `/proc/meminfo`, `/proc/pressure/memory` and `/proc/sys/kernel/random/boot_id` exist. It parses all three, reads `/proc/pressure/cpu`, `/proc/pressure/io` and `/proc/stat` once each, reads the slice counters and the power profile, and appends one line to `store.sample_file(host, now)` through `store.append_line`, which writes one line under a flock with `O_APPEND`:
+1. `sample()` checks that `/proc/meminfo`, `/proc/pressure/memory` and `/proc/sys/kernel/random/boot_id` exist. It parses all three, reads `/proc/pressure/cpu`, `/proc/pressure/io` and `/proc/stat` once each, reads the slice counters and the power profile, and appends one line to `store.sample_file(host, now)` through `store.append_line`, which first cuts an unfinished tail back to the last newline, then writes one line under the same flock with `O_APPEND`:
    `{"kind":"sample","host":…,"at":<UTC ISO ms Z>,"boot_id":…,"mem_used_bytes":…,"swap_used_bytes":…,"builds_anon_bytes":…,"sccache_in_service":…,"ci_anon_bytes":…,"stall_some_us":…,"stall_full_us":…,"cpu_stall_some_us":…,"cpu_stall_full_us":…,"io_stall_some_us":…,"io_stall_full_us":…,"cpu_idle_ticks":…,"cpu_iowait_ticks":…,"cpu_total_ticks":…,"power_profile":…,"power_profile_since":…}`
    - `mem_used_bytes` is MemTotal minus MemAvailable.
    - `swap_used_bytes` is SwapTotal minus SwapFree.

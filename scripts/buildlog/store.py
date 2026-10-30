@@ -7,13 +7,16 @@ same way. index.py derives the SQLite index from these lines and can rebuild it
 from nothing. BUILDLOG_DIR moves the root, for tests.
 
 Many processes append at once (every lint step on the machine). Each append
-repairs an interrupted tail, writes its line and fsyncs under an exclusive flock.
+cuts an unfinished tail back to the last newline, writes its line and fsyncs
+under an exclusive flock. Even a complete JSON object needs its final newline.
+Row-end captures take a shared flock; tail mappings cannot race with a cut.
 """
 
 from __future__ import annotations
 
 import fcntl
 import json
+import mmap
 import os
 import socket
 import traceback
@@ -70,6 +73,34 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def last_whole_row_end(handle: BinaryIO) -> int:
+    """Find the byte after the last newline, without reading an ordinary row.
+
+    The caller must hold this file's shared or exclusive flock so a tail cut
+    cannot shrink the read-only mapping. Only bytes after this boundary can
+    be cut. The handle's position changes; its contents do not.
+    """
+    fd = handle.fileno()
+    end = os.lseek(fd, 0, os.SEEK_END)
+    if not end:
+        return 0
+    _ = os.lseek(fd, end - 1, os.SEEK_SET)
+    if os.read(fd, 1) == b"\n":
+        return end
+    with mmap.mmap(fd, end, access=mmap.ACCESS_READ) as contents:
+        return contents.rfind(b"\n") + 1
+
+
+def read_last_whole_row_end(path: Path) -> int:
+    """Capture a recovery boundary under a shared flock; an absent file is 0."""
+    try:
+        with path.open("rb") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            return last_whole_row_end(handle)
+    except FileNotFoundError:
+        return 0
+
+
 @contextmanager
 def locked_append(path: Path) -> Generator[BinaryIO]:
     """Keep tail repair, any recovery scan and publication under one file lock."""
@@ -77,10 +108,10 @@ def locked_append(path: Path) -> Generator[BinaryIO]:
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
     with os.fdopen(fd, "r+b", buffering=0) as handle:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        if os.lseek(fd, 0, os.SEEK_END):
-            _ = os.lseek(fd, -1, os.SEEK_END)
-            if os.read(fd, 1) != b"\n":
-                _write_all(fd, b"\n")
+        end = last_whole_row_end(handle)
+        if end != os.fstat(fd).st_size:
+            os.ftruncate(fd, end)
+        _ = handle.seek(end)
         yield handle
         os.fsync(handle.fileno())
 

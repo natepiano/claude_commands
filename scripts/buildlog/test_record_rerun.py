@@ -12,8 +12,8 @@ import subprocess
 import sys
 import time
 import unittest
-from collections.abc import Callable
-from contextlib import ExitStack, chdir, closing
+from collections.abc import Callable, Generator
+from contextlib import ExitStack, chdir, closing, contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
@@ -338,7 +338,7 @@ class RecordRerunTests(unittest.TestCase):
         pending_paths = list(record.pending_steps_root().glob("*.json"))
         self.assertEqual(len(pending_paths), 1)
         saved = cast(dict[str, object], json.loads(pending_paths[0].read_text()))
-        self.assertEqual(saved["month_offset"], len(prefix))
+        self.assertEqual(saved["month_row_end"], len(prefix))
         original_row = cast(dict[str, object], saved["row"])
         store.append_line(month, indexed_step("intervening-append", host="original-host"))
         before_recovery = month.read_bytes()
@@ -364,26 +364,118 @@ class RecordRerunTests(unittest.TestCase):
         self.assertEqual(self.run_step(), 0)
         self.assertEqual(month.read_bytes(), final_bytes)
 
-    def test_normal_step_appends_without_opening_month_history_for_reading(self) -> None:
+    def test_normal_step_reads_only_tail_bytes_without_scanning_month_history(self) -> None:
         month = store.host_file("original-host", record_tests.START)
         store.append_line(month, indexed_step("earlier-step", host="original-host"))
-        open_path = Path.open
+        original_size = month.stat().st_size
+        read = os.read
+        read_sizes: list[int] = []
 
-        def refuse_history_read(path: Path, mode: str = "r", buffering: int = -1,
-                                encoding: str | None = None, errors: str | None = None,
-                                newline: str | None = None) -> object:
-            if path == month and ("r" in mode or "+" in mode):
-                raise AssertionError("a normal step read the monthly history")
-            return cast(object, open_path(path, mode, buffering, encoding, errors, newline))
+        def read_month_tail(fd: int, size: int) -> bytes:
+            if os.fstat(fd).st_ino == month.stat().st_ino:
+                self.assertEqual(size, 1)
+                self.assertEqual(os.lseek(fd, 0, os.SEEK_CUR), original_size - 1)
+                with month.open("rb") as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                read_sizes.append(size)
+            return read(fd, size)
 
-        with mock.patch.object(Path, "open", new=refuse_history_read):
+        with mock.patch.object(os, "read", side_effect=read_month_tail):
             self.assertEqual(self.run_step(), 0)
+        self.assertEqual(read_sizes, [1, 1])
         rows = self.step_records()
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["id"], "earlier-step")
         self.assertEqual(rows[1]["status"], 1)
         self.assertFalse(self.held.exists())
         self.assertFalse(self.peak.exists())
+
+    def test_rerun_after_tail_cut_and_failed_month_fsync_keeps_one_step_row(self) -> None:
+        month = store.host_file("original-host", record_tests.START)
+        store.append_line(month, indexed_step("old-month-prefix", host="original-host"))
+        prefix = month.read_bytes()
+        with month.open("ab") as handle:
+            tail = b'{"id":"unfinished","padding":"' + b"x" * 65536
+            self.assertEqual(handle.write(tail), len(tail))
+        with self.month_fsync_failure(month) as failed_syncs:
+            self.assertEqual(self.run_step(), 0)
+        self.assertEqual(len(failed_syncs), 1)
+        pending_paths = list(record.pending_steps_root().glob("*.json"))
+        self.assertEqual(len(pending_paths), 1)
+        saved = cast(dict[str, object], json.loads(pending_paths[0].read_text()))
+        rows = self.step_records()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["id"], "old-month-prefix")
+        self.assert_original_step(rows[1], str(rows[1]["id"]))
+        self.assertEqual(self.held.read_bytes(), self.output)
+        self.assertEqual(self.peak.read_bytes(), self.peak_contents)
+        published = month.read_bytes()
+
+        self.assertEqual(self.run_step(), 0)
+
+        self.assertEqual(self.step_records(), rows)
+        self.assertEqual(month.read_bytes(), published)
+        self.assertEqual(saved["month_row_end"], len(prefix))
+        self.assertFalse(self.held.exists())
+        self.assertFalse(self.peak.exists())
+        self.assertEqual(list(record.pending_steps_root().glob("*.json")), [])
+        self.assertTrue(pending_paths[0].with_suffix(".done").is_file())
+        self.assertEqual(index.update(), 2)
+        self.assertEqual(self.run_step(), 0)
+        self.assertEqual(month.read_bytes(), published)
+
+    @contextmanager
+    def month_fsync_failure(self, month: Path) -> Generator[list[int]]:
+        fsync = os.fsync
+        failed_syncs: list[int] = []
+
+        def fail_month_save(fd: int) -> None:
+            if os.fstat(fd).st_ino == month.stat().st_ino:
+                failed_syncs.append(fd)
+                raise OSError("fixture monthly fsync failed after row publication")
+            fsync(fd)
+
+        with mock.patch.object(os, "fsync", side_effect=fail_month_save):
+            yield failed_syncs
+
+    def test_legacy_offset_inside_cut_tail_recovers_one_row_after_failed_fsync(self) -> None:
+        pending, original = self.interrupt_month_append(complete_object=False)
+        month = store.host_file("original-host", record_tests.START)
+        with month.open("ab") as handle:
+            padding = b"x" * 65536
+            self.assertEqual(handle.write(padding), len(padding))
+        saved = cast(dict[str, object], json.loads(pending.read_text()))
+        if "month_row_end" in saved:
+            del saved["month_row_end"]
+        saved["month_offset"] = month.stat().st_size
+        _ = pending.write_text(json.dumps(saved))
+
+        with self.month_fsync_failure(month) as failed_syncs:
+            with self.assertRaisesRegex(OSError, "fixture monthly fsync failed"):
+                _ = record.finish_pending_step(pending)
+        self.assertEqual(len(failed_syncs), 1)
+        rows = self.step_records()
+        self.assertEqual(len(rows), 1)
+        self.assert_original_step(rows[0], str(original["id"]))
+        self.assertLess(month.stat().st_size, saved["month_offset"])
+        self.assertTrue(pending.is_file())
+        self.assertEqual(self.held.read_bytes(), self.output)
+        self.assertEqual(self.peak.read_bytes(), self.peak_contents)
+        published = month.read_bytes()
+
+        finished = record.finish_pending_step(pending)
+
+        self.assertEqual(self.step_records(), rows)
+        self.assertEqual(month.read_bytes(), published)
+        self.assertFalse(finished.added)
+        self.assertFalse(pending.exists())
+        self.assertTrue(pending.with_suffix(".done").is_file())
+        self.assertFalse(self.held.exists())
+        self.assertFalse(self.peak.exists())
+        self.assertEqual(index.update(), 1)
+        self.assertEqual(self.run_step(), 0)
+        self.assertEqual(month.read_bytes(), published)
 
     def interrupt_month_append(self, complete_object: bool) -> tuple[Path, dict[str, object]]:
         write = os.write
@@ -429,17 +521,17 @@ class RecordRerunTests(unittest.TestCase):
         pending, original = self.interrupt_month_append(complete_object)
         month = store.host_file("original-host", record_tests.START)
         if stop_after_repair:
-            write = os.write
+            truncate = os.ftruncate
 
-            def stop_after_newline(fd: int, data: bytes | memoryview) -> int:
-                self.assertEqual(bytes(data), b"\n")
-                _ = write(fd, data)
+            def stop_after_cut(fd: int, length: int) -> None:
+                self.assertEqual(length, 0)
+                truncate(fd, length)
                 raise RecorderStopped("immediately after tail repair")
 
-            with mock.patch.object(os, "write", side_effect=stop_after_newline):
+            with mock.patch.object(os, "ftruncate", side_effect=stop_after_cut):
                 with self.assertRaises(RecorderStopped):
                     _ = record.finish_pending_step(pending)
-            self.assertTrue(month.read_bytes().endswith(b"\n"))
+            self.assertEqual(month.read_bytes(), b"")
             self.assertTrue(pending.is_file())
             self.assertEqual(self.held.read_bytes(), self.output)
             self.assertEqual(self.peak.read_bytes(), self.peak_contents)
@@ -465,7 +557,7 @@ class RecordRerunTests(unittest.TestCase):
 
         with mock.patch.object(json, "loads", side_effect=scan_under_lock):
             finished = record.finish_pending_step(pending)
-        self.assertEqual(finished.added, not complete_object)
+        self.assertTrue(finished.added)
         self.assertTrue(scanned)
         rows = self.complete_month_rows()
         self.assertEqual(len(rows), 3)
@@ -491,10 +583,10 @@ class RecordRerunTests(unittest.TestCase):
     def test_complete_object_without_newline_then_other_writers_recovers_without_duplicate(self) -> None:
         self.assert_short_append_recovers(complete_object=True, stop_after_repair=False)
 
-    def test_stop_after_fragment_repair_newline_recovers_without_losing_later_rows(self) -> None:
+    def test_stop_after_fragment_tail_cut_recovers_without_losing_later_rows(self) -> None:
         self.assert_short_append_recovers(complete_object=False, stop_after_repair=True)
 
-    def test_stop_after_complete_object_repair_newline_recovers_without_duplicate(self) -> None:
+    def test_stop_after_complete_object_tail_cut_recovers_without_duplicate(self) -> None:
         self.assert_short_append_recovers(complete_object=True, stop_after_repair=True)
 
     def test_late_finish_refreshes_completion_before_rename_and_survives_a_stop(self) -> None:

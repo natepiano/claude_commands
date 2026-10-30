@@ -37,14 +37,72 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(cast(dict[str, object], json.loads(path.read_text())), record)
             self.assertFalse(store.host_file("natedev", epoch).exists())
 
-    def test_append_separates_an_interrupted_tail_before_the_next_row(self) -> None:
+    def test_append_discards_an_unfinished_tail_before_the_next_row(self) -> None:
         path = self.root / "natedev" / "2026-10.jsonl"
         path.parent.mkdir(parents=True)
         for tail in (b'{"id":"cut"', b'{"id":"complete"}'):
             with self.subTest(tail=tail):
                 _ = path.write_bytes(tail)
                 store.append_line(path, {"id": "next"})
-                self.assertEqual(path.read_bytes(), tail + b'\n{"id":"next"}\n')
+                self.assertEqual(path.read_bytes(), b'{"id":"next"}\n')
+
+    def test_append_discards_a_failed_short_write_and_keeps_every_line_parseable(self) -> None:
+        path = self.root / "natedev" / "2026-10.jsonl"
+        old_rows = [{"id": "old-one"}, {"id": "old-two"}]
+        for row in old_rows:
+            store.append_line(path, row)
+        prefix = path.read_bytes()
+        write = os.write
+        wrote_fragment = False
+
+        def fail_after_fragment(fd: int, data: bytes | memoryview) -> int:
+            nonlocal wrote_fragment
+            if wrote_fragment:
+                raise OSError("fixture disk full after a short write")
+            wrote_fragment = True
+            return write(fd, bytes(data)[:7])
+
+        with mock.patch.object(os, "write", side_effect=fail_after_fragment):
+            with self.assertRaisesRegex(OSError, "fixture disk full"):
+                store.append_line(path, {"id": "interrupted"})
+        self.assertEqual(path.read_bytes(), prefix + b'{"id":"')
+
+        store.append_line(path, {"id": "next"})
+        contents = path.read_bytes()
+        self.assertEqual(contents, prefix + b'{"id":"next"}\n')
+        self.assertEqual([cast(dict[str, object], json.loads(line)) for line in contents.splitlines()],
+                         [*old_rows, {"id": "next"}])
+
+    def test_append_keeps_whole_rows_before_a_long_unfinished_tail(self) -> None:
+        path = self.root / "natedev" / "2026-10.jsonl"
+        store.append_line(path, {"id": "old"})
+        prefix = path.read_bytes()
+        with path.open("ab") as handle:
+            tail = b'{"id":"cut","padding":"' + b"x" * (1024 * 1024 + 7)
+            self.assertEqual(handle.write(tail), len(tail))
+
+        store.append_line(path, {"id": "next"})
+
+        self.assertEqual(path.read_bytes(), prefix + b'{"id":"next"}\n')
+
+    def test_short_reads_during_tail_repair_preserve_whole_rows(self) -> None:
+        path = self.root / "natedev" / "2026-10.jsonl"
+        path.parent.mkdir(parents=True)
+        read = os.read
+        for empty_tail_read in (False, True):
+            with self.subTest(empty_tail_read=empty_tail_read):
+                _ = path.write_bytes(b'{"id":"kept"}\n{"id":"cut')
+                read_sizes: list[int] = []
+
+                def short_read(fd: int, size: int) -> bytes:
+                    read_sizes.append(size)
+                    return read(fd, 0 if empty_tail_read and size == 1 else min(size, 4))
+
+                with mock.patch.object(os, "read", side_effect=short_read):
+                    store.append_line(path, {"id": "next"})
+
+                self.assertTrue(read_sizes, "tail repair must inspect the existing file")
+                self.assertEqual(path.read_bytes(), b'{"id":"kept"}\n{"id":"next"}\n')
 
     def test_append_reads_only_the_tail_byte_and_keeps_the_lock_through_fsync(self) -> None:
         path = self.root / "natedev" / "2026-10.jsonl"

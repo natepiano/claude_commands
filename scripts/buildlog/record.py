@@ -189,7 +189,7 @@ class PendingStep:
     row: dict[str, object]
     held_log: Path | NoHeldLog
     peak_file: Path | NoPeakFile
-    month_offset: int
+    month_row_end: int
     test_phase_file: Path | NoTestPhaseRecord = NO_TEST_PHASE_RECORD
     test_phase: TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord = NO_TEST_PHASE_RECORD
 
@@ -635,7 +635,7 @@ def _save_pending_step(pending: PendingStep, *, replace_existing: bool = False) 
         "test_phase_file": str(pending.test_phase_file) if isinstance(pending.test_phase_file, Path) else None,
         "test_phase_read_error": (pending.test_phase.reason
                                   if isinstance(pending.test_phase, UnreadableTestPhaseRecord) else None),
-        "month_offset": pending.month_offset,
+        "month_row_end": pending.month_row_end,
     }, replace_existing=replace_existing)
 
 
@@ -656,14 +656,18 @@ def _read_pending_step(path: Path) -> PendingStep:
             or (peak is not None and not isinstance(peak, str))
             or (phase is not None and not isinstance(phase, str))):
         raise ValueError("pending step has invalid source paths")
-    month_offset = fields.get("month_offset")
-    if not isinstance(month_offset, int) or isinstance(month_offset, bool) or month_offset < 0:
-        raise ValueError("pending step has no valid month offset")
+    boundary_key = "month_row_end" if "month_row_end" in fields else "month_offset"
+    saved_boundary = fields.get(boundary_key)
+    if not isinstance(saved_boundary, int) or isinstance(saved_boundary, bool) or saved_boundary < 0:
+        raise ValueError("pending step has no valid month row end")
+    # Legacy sizes can lie inside a tail that an append later cuts. Only a
+    # recorded row boundary is safe for a suffix scan; legacy rows scan from 0.
+    month_row_end = saved_boundary if boundary_key == "month_row_end" else 0
     phase_error = fields.get("test_phase_read_error")
     test_phase = (UnreadableTestPhaseRecord(phase_error) if isinstance(phase_error, str)
                   else _test_phase_record(row) if isinstance(phase, str) else NO_TEST_PHASE_RECORD)
     return PendingStep(row_key, row, Path(held) if isinstance(held, str) else NoHeldLog(),
-                       Path(peak) if isinstance(peak, str) else NoPeakFile(), month_offset,
+                       Path(peak) if isinstance(peak, str) else NoPeakFile(), month_row_end,
                        Path(phase) if isinstance(phase, str) else NO_TEST_PHASE_RECORD, test_phase)
 
 
@@ -679,11 +683,11 @@ def write_step_line(pending: PendingStep) -> bool:
 
 
 def _resume_step_line(pending: PendingStep) -> bool:
-    """Only a recovery reads the monthly suffix that may contain its original row."""
+    """Scan from the saved row boundary, or byte 0 for a legacy pending step."""
     path = _step_month_file(pending.row)
     added = True
     with store.locked_append(path) as handle:
-        _ = handle.seek(pending.month_offset)
+        _ = handle.seek(pending.month_row_end)
         for line in handle:
             try:
                 row = cast(object, json.loads(line))
@@ -845,8 +849,8 @@ def step(args: list[str]) -> None:
             if (held or peak or phase_path) and done_path.exists():
                 return
             month_file = store.host_file(host, start)
-            month_offset = month_file.stat().st_size if month_file.exists() else 0
-            pending = PendingStep(row_key, record, held_log, peak_file, month_offset, phase_file, phase)
+            month_row_end = store.read_last_whole_row_end(month_file)
+            pending = PendingStep(row_key, record, held_log, peak_file, month_row_end, phase_file, phase)
             _ = _finish_step(_save_pending_step(pending), pending, write_step_line)
     except Exception:  # noqa: BLE001 -- retain every source needed for a retry
         if pending_path.is_file():
