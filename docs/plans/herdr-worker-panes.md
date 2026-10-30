@@ -325,7 +325,7 @@ Inserted 2026-10-30 (user, via the showrunner). Work Order: `staff.py move <unit
 
 **Ruled out:** a second pane-list parser.
 
-### Phase 3f — One showrunner lookup  · status: todo
+### Phase 3f — One showrunner lookup  · status: done
 
 **Depends on:** Phase 3e
 
