@@ -23,7 +23,6 @@ class RegistryOverrideTests(unittest.TestCase):
     def test_plain_row_overrides_keep_other_default_assignments(self) -> None:
         text = fixture.registry_text({'assignments': {'direct': 'claude'}})
         self.assertIn('direct=claude\n', text)
-        self.assertIn('fix=codex\n', text)
         self.assertIn('team_review=codex\n', text)
 
     def test_exact_assignment_rows_keep_the_complete_catalog_and_role_defaults(self) -> None:

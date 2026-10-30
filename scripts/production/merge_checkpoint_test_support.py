@@ -24,12 +24,14 @@ import merge_checkpoint
 import change_review
 from scripts.direct import progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.production import staff
 from scripts.production.cli_fixture import invoke_cli
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host
 from scripts.message import sessions
+from scripts.production.staff_test_support import isolated_staff_file
 
 
 def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Path,
@@ -285,7 +287,7 @@ class MergeCheckpointFixture(unittest.TestCase):
         self.bin = self.root / "bin"
         self.state = self.root / "stub-state"
         home = self.root / "home"
-        self.env = {**os.environ, "HOME": str(home),
+        self.env = {**os.environ, "HOME": str(home), "STAFF_FILE": str(home / ".local/state/staff/staff.json"),
                     "MERGE_CHECKPOINT_STYLE_SYNC": str(self.bin / "style_sync.py"),
                     "MERGE_CHECKPOINT_STYLE_LEDGER": str(self.bin / "style_ledger.py"),
                     "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
@@ -338,6 +340,8 @@ class MergeCheckpointFixture(unittest.TestCase):
             directory = home / relative
             directory.mkdir(parents=True)
             self.executable(directory / name, STUB)
+        with isolated_staff_file(Path(self.env["STAFF_FILE"]), self.env):
+            _ = staff.ensure("showrunner", name="example")
         self.production_doc()
 
     def git(self, *args: str, cwd: Path | None = None) -> str:

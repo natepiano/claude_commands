@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import registry_text, write_registry
-
 import base64
 import io
 import json
@@ -18,17 +16,19 @@ from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.test_agents_registry import registry_text, write_registry
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import note_file
+from scripts.whoami import note_file
 import quota_alert
-import agent_accounts as sibling_agent_accounts
 from scripts.whoami import agent_accounts
-from agent_accounts import CodexHomeSource, Quota, Report
+from scripts.whoami.agent_accounts import CodexHomeSource, Quota, Report
 from scripts.accounts import accounts, moves, next_moves, refusals, role_map
 from scripts.lib import agents_registry
 from scripts.production import showrunners
-import usage_store
+from scripts.whoami import usage_store
 from push_texts import RenderedPush, catalog, render_entry
 from user_action import ActionRequired
 from test_quota_alert import REGISTRY
@@ -1476,9 +1476,13 @@ class CodexAccountAlertTests(unittest.TestCase):
                 self.assertTrue(any(attempted_failure in line for line in log), log)
         self.assertIn("direct=codex", registry_view())
 
-    def test_account_import_forms_share_module_and_identity_class(self) -> None:
-        self.assertIs(sibling_agent_accounts, agent_accounts)
-        self.assertIs(sibling_agent_accounts.KnownCodexAccount, agent_accounts.KnownCodexAccount)
+    def test_consumers_share_the_one_account_module(self) -> None:
+        for consumer in (quota_alert, accounts):
+            with self.subTest(consumer=consumer.__name__):
+                bound_accounts = cast(object, getattr(consumer, "agent_accounts"))
+                self.assertIs(bound_accounts, agent_accounts)
+                self.assertIs(cast(object, getattr(bound_accounts, "KnownCodexAccount")),
+                              agent_accounts.KnownCodexAccount)
 
     def test_account_identity_reads_leave_the_import_path_unchanged(self) -> None:
         a = self.account(1)

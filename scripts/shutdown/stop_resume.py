@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import os
+import argparse
 import json
 import shlex
 import signal
 import sys
 import subprocess
+import time
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
@@ -17,17 +19,23 @@ from io import StringIO
 from threading import Event
 from time import monotonic
 from typing import cast
+from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for dependency in ("herdr", "message", "whoami", "lib"):
+for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
 import herdr
 import pane_record
 import sessions
 from shutdown_record import PausedSeat
+from launch_permission import shutdown_state_root
 
 STOP_GRACE_SECONDS = 2.0
+KILL_GRACE_SECONDS = 5.0
+START_SECONDS = 20.0
+STAY_SECONDS = 10.0
+RESUME_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -55,6 +63,11 @@ class Resumed:
 
 
 @dataclass(frozen=True)
+class MoveHandedOff:
+    session_id: str
+
+
+@dataclass(frozen=True)
 class ResumeFailed:
     session_id: str
     reason: str
@@ -66,26 +79,36 @@ class SessionNotFound:
 
 
 def _tab_of(session: str) -> herdr.TabSession | SessionNotFound:
-    """The session's tab by id or label; herdr drops the id at exit, so the pane's launch entry supplies it."""
+    """Find an existing pane, retaining its saved conversation when herdr's id is stale."""
     client = herdr.Herdr(herdr.shared_session())
     entries = pane_record.read(client.session)
-    tabs = [tab if tab.session_id or tab.pane_id not in entries
-            else replace(tab, session_id=entries[tab.pane_id]["session_id"])
-            for tab in client.tab_sessions()]
+    tabs: list[herdr.TabSession] = []
+    for pane in client.panes():
+        identity = pane["session_id"]
+        entry = entries.get(pane["pane_id"])
+        label = pane.get("label") or ""
+        if entry is not None and entry["session_id"] != identity and (
+                session == entry["session_id"] or session == label):
+            if identity:
+                live = sessions.session_liveness(identity)
+                if isinstance(live, sessions.SessionLivenessUnknown):
+                    raise OSError(live.reason)
+                if isinstance(live, sessions.LiveSessionProcess):
+                    continue  # A saved entry cannot displace another running conversation.
+            identity = entry["session_id"]
+        tabs.append(herdr.TabSession(pane["pane_id"], label, pane["workspace_id"], identity))
     matches = [tab for tab in tabs if tab.session_id == session] or [tab for tab in tabs if tab.label == session]
     if len(matches) > 1:
         raise ValueError(f"{session}: several tabs match")
     return matches[0] if matches and matches[0].session_id else SessionNotFound(session)
 
 
-def _same_claude(session_id: str, pid: int, started: str) -> bool:
-    live = sessions.session_liveness(session_id)
-    if isinstance(live, sessions.SessionLivenessUnknown):
-        raise OSError(live.reason)
+def _same_claude(pid: int, started: str) -> bool:
+    """Registry removal is not exit: only the saved pid and start time say the Claude is gone."""
     identity = sessions.process_liveness(pid, started)
     if isinstance(identity, sessions.SessionLivenessUnknown):
         raise OSError(identity.reason)
-    return isinstance(live, sessions.LiveSessionProcess) and live.pid == pid and isinstance(identity, sessions.LiveSessionProcess)
+    return isinstance(identity, sessions.LiveSessionProcess)
 
 
 def _record_launches() -> None:
@@ -120,12 +143,18 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         started = sessions.process_start(live.pid)
         if not started:
             return StopFailed(identity, f"process identity unreadable for pid {live.pid}")
-        if not _same_claude(identity, live.pid, started):
+        if not _same_claude(live.pid, started):
             return NotRunning(identity)
         os.kill(live.pid, signal.SIGTERM)
         _ = Event().wait(STOP_GRACE_SECONDS)
-        if _same_claude(identity, live.pid, started):
+        if _same_claude(live.pid, started):
             os.kill(live.pid, signal.SIGKILL)
+            deadline = monotonic() + KILL_GRACE_SECONDS
+            while _same_claude(live.pid, started):
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    return StopFailed(identity, f"pid {live.pid} is still running after SIGKILL")
+                _ = Event().wait(min(0.1, remaining))
         return Stopped(identity, live.pid)
     except ProcessLookupError:
         return NotRunning(identity)
@@ -181,10 +210,16 @@ def resume_message(why: str, *, moved_from: str | None = None, moved_to: str | N
 
 def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account: str, message: str) -> None:
     """Run the account command in the session's own pane, with one resume message."""
-    command = ["env", *(f"{key}={value}" for key, value in entry["environment"].items()),
+    client = herdr.Herdr(herdr.shared_session())
+    pane = next((pane for pane in client.panes() if pane["pane_id"] == tab.pane_id), None)
+    if pane is None:
+        raise herdr.HerdrFailure(f"no pane {tab.pane_id!r}")
+    # A tab moved between workspaces keeps its shell's old marks; hooks must see this pane.
+    environment = {**entry["environment"], "HERDR_PANE_ID": tab.pane_id, "HERDR_WORKSPACE_ID": pane["workspace_id"]}
+    command = ["env", "-u", "HERDR_TAB_ID", *(f"{key}={value}" for key, value in environment.items()),
                sys.executable, str(SCRIPTS / "accounts/accounts.py"), "exec", account,
                *resume_arguments(entry), message]
-    herdr.Herdr(herdr.shared_session()).run_in_pane(tab.pane_id, command)
+    client.run_in_pane(tab.pane_id, command)
 
 
 def resume(session: str, *, why: str, to: str | None = None) -> Resumed | ResumeFailed | SessionNotFound:
@@ -215,13 +250,61 @@ def resume(session: str, *, why: str, to: str | None = None) -> Resumed | Resume
         workers = ResumeWorkers(codex_seats([Path(run) for run in unit_runs.held(identity)]), entry["cwd"])
         message = resume_message(why, moved_from=source.name.removeprefix(".") if to else None,
                                  moved_to=to, workers=workers)
-        _start_session(tab, entry, label, message)
-        return Resumed(identity, tab.pane_id, label)
+        reason = "never started"
+        for _attempt in range(RESUME_ATTEMPTS):
+            live = sessions.session_liveness(identity)
+            if isinstance(live, sessions.SessionLivenessUnknown):
+                return ResumeFailed(identity, live.reason)
+            if isinstance(live, sessions.SessionNotLive):
+                _start_session(tab, entry, label, message)
+            deadline = monotonic() + START_SECONDS
+            while isinstance(live, sessions.SessionNotLive):
+                live = sessions.session_liveness(identity)
+                remaining = deadline - monotonic()
+                if not isinstance(live, sessions.SessionNotLive) or remaining <= 0:
+                    break
+                time.sleep(min(0.5, remaining))
+            if isinstance(live, sessions.SessionLivenessUnknown):
+                return ResumeFailed(identity, live.reason)
+            if isinstance(live, sessions.SessionNotLive):
+                reason = "never started"
+                continue
+            started = monotonic()
+            while isinstance(live, sessions.LiveSessionProcess):
+                remaining = STAY_SECONDS - (monotonic() - started)
+                if remaining <= 0:
+                    return Resumed(identity, tab.pane_id, label)
+                time.sleep(min(0.5, remaining))
+                live = sessions.session_liveness(identity)
+            if isinstance(live, sessions.SessionLivenessUnknown):
+                return ResumeFailed(identity, live.reason)
+            reason = f"ended after {monotonic() - started:g} s"
+        return ResumeFailed(identity, reason)
     except (OSError, ValueError, herdr.HerdrFailure) as error:
         return ResumeFailed(identity, str(error))
 
 
-MoveResult = Resumed | StopFailed | ResumeFailed | SessionNotFound
+MoveResult = Resumed | MoveHandedOff | StopFailed | ResumeFailed | SessionNotFound
+
+
+def _handoff_batch(selected: list[str], target: str, why: str, warn_seconds: int) -> None:
+    """Keep the batch coordinator outside every session it will stop."""
+    logs = shutdown_state_root() / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    log = logs / f"move-{uuid4().hex}.log"
+    environment = dict(os.environ)
+    _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
+    command = [sys.executable, str(Path(__file__).resolve()), "batch", "--target", target,
+               "--why", why, "--warn-seconds", str(warn_seconds), "--log", str(log), "--", *selected]
+    if sys.platform == "darwin":
+        _ = subprocess.Popen(command, env=environment, start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        # The user manager has its own environment; unset the caller there too.
+        _ = subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--no-block",
+                            "env", "-u", "CLAUDE_CODE_SESSION_ID", *command],
+                           env=environment, stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, check=True, timeout=15)
 
 
 def _warn_session(session: str, target: str, why: str, seconds: int) -> None:
@@ -241,6 +324,17 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
     selected = list(dict.fromkeys(sessions))
     if not selected:
         return []
+    _record_launches()  # Herdr learns a new session's id late; the launch entry knows it now.
+    caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if caller:
+        try:
+            tabs = [_tab_of(session) for session in selected]
+            if any(isinstance(tab, herdr.TabSession) and tab.session_id == caller for tab in tabs):
+                _handoff_batch(selected, target, why, warn_seconds)
+                return [MoveHandedOff(tab.session_id) if isinstance(tab, herdr.TabSession) and tab.session_id
+                        else SessionNotFound(session) for session, tab in zip(selected, tabs)]
+        except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
+            return [StopFailed(session, f"cannot hand off move: {error}") for session in selected]
     with ThreadPoolExecutor(max_workers=len(selected)) as pool:
         if warn_seconds:
             warning_until = monotonic() + warn_seconds
@@ -251,7 +345,6 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
                 except Exception:
                     pass  # An undeliverable warning cannot prevent the requested interruption.
             _ = Event().wait(max(0.0, warning_until - monotonic()))
-        _record_launches()
         stops = [pool.submit(_stop, session) for session in selected]
         stopped: list[Stopped | NotRunning | StopFailed | SessionNotFound] = []
         for session, future in zip(selected, stops):
@@ -359,3 +452,28 @@ def _resumed_launcher_command(command: list[str], seat: str, prompt: str) -> str
         return None
     arguments[2] = prompt
     return shlex.join([*command[:index + 1], *options, "--to", seat, *arguments])
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    batch = commands.add_parser("batch")
+    _ = batch.add_argument("--target", required=True)
+    _ = batch.add_argument("--why", required=True)
+    _ = batch.add_argument("--warn-seconds", type=int, default=0)
+    _ = batch.add_argument("--log", type=Path, required=True)
+    _ = batch.add_argument("sessions", nargs="+")
+    args = parser.parse_args(argv)
+    # Even a directly invoked batch must not hand itself off a second time.
+    _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+    log = cast(Path, args.log)
+    with log.open("a", encoding="utf-8") as output:
+        results = move_sessions(cast(list[str], args.sessions), cast(str, args.target),
+                                why=cast(str, args.why), warn_seconds=cast(int, args.warn_seconds))
+        for result in results:
+            _ = output.write(json.dumps({"result": type(result).__name__, **asdict(result)}) + "\n")
+    return int(any(not isinstance(result, Resumed) for result in results))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

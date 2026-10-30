@@ -13,7 +13,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import staff
 from scripts.accounts import accounts
-from account import Account
+from scripts.whoami.account import Account
 from scripts.production.staff_test_support import StaffTestCase
 import restart
 import shutdown_record

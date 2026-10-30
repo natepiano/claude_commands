@@ -64,6 +64,15 @@ def showrunner_launch(row: staff.StaffRow, session_id: str, environment: dict[st
         pane_record.write("agents", launch)
 
 
+def unit_membership(showrunner: str, unit: str) -> staff.StaffRow:
+    """Add an intended fixture member using its displayed short name."""
+    from scripts.production import unit_names
+
+    parents = [row for row in staff.initial_snapshot().find(kind="showrunner") if row.name == showrunner]
+    parent = parents[0] if parents else staff.ensure("showrunner", name=showrunner)
+    return staff.ensure("unit", name=unit_names.name(unit), parent=parent.id)
+
+
 def fixture_showrunner_name(slug: str, doc: Path) -> str:
     """Keep the real doc's workspace name; extra fixture productions use their slugs."""
     from scripts.production import showrunners, production_units

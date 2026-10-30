@@ -40,6 +40,8 @@ SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "herdr"))
 sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import herdr  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
 
@@ -173,7 +175,7 @@ def _environment(parts: Sequence[bytes]) -> dict[str, str]:
 
 def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
     # Imported here: the Linux hook never needs the account module.
-    from account import kern_procargs2, procargs2_parts
+    from scripts.whoami.account import kern_procargs2, procargs2_parts
 
     parts = procargs2_parts(kern_procargs2(pid), _needed)
     return list(parts.arguments), parts.environment

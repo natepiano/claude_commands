@@ -184,27 +184,21 @@ if [[ "${1:-}" == final-pass || ( "${1:-}" == --session-dir && "${3:-}" == final
     exec "$VERIFY_QUERY_DIR/../lib/py" "$VERIFY_QUERY_DIR/final_pass.py" query "$VERIFY_QUERY_DIR/verify.sh" "$@"
 fi
 if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR"; fi
-# Ask the shared helper which envrc applies, before tool setup or record access.
-# With no envrc, ensure returns the unchanged env without invoking direnv.
-if [[ -z "${IN_NIX_SHELL:-}" ]]; then
-    if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" ]]; then
+# Load the environment once through the shared helper, before tool setup or records.
+if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" ]]; then
+    if [[ -n "${IN_NIX_SHELL:-}" ]]; then
+        printf '%s\n' 'verify.sh: not in the nix shell; re-running under nix_env.py exec' >&2
+    elif [[ -n "${NIX_ENV_ENVRC:-}" ]]; then
         printf '%s\n' 'verify.sh: nix_env.py re-exec still has no nix shell (IN_NIX_SHELL unset)' >&2
         exit 1
     fi
+elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
     VERIFY_NIX_SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
     [[ "$VERIFY_NIX_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_NIX_SCRIPT_DIR=.
     VERIFY_NIX_SCRIPT_DIR="$(cd -- "$VERIFY_NIX_SCRIPT_DIR" && pwd -P)"
-    VERIFY_NIX_ENV_JSON="$("$VERIFY_NIX_SCRIPT_DIR/../lib/py" \
-        "$VERIFY_NIX_SCRIPT_DIR/../lib/nix_env.py" ensure "$PWD")"
-    if "$VERIFY_NIX_SCRIPT_DIR/../lib/py" -c \
-        'import json, sys; sys.exit(0 if json.load(sys.stdin).get("IN_NIX_SHELL") else 1)' \
-        <<< "$VERIFY_NIX_ENV_JSON"; then
-        printf '%s\n' 'verify.sh: not in the nix shell; re-running under nix_env.py exec' >&2
-        export VERIFY_NIX_ENV_REEXEC=1
-        exec "$VERIFY_NIX_SCRIPT_DIR/../lib/py" "$VERIFY_NIX_SCRIPT_DIR/../lib/nix_env.py" \
-            exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
-    fi
-    unset VERIFY_NIX_ENV_JSON VERIFY_NIX_SCRIPT_DIR
+    export VERIFY_NIX_ENV_REEXEC=1
+    exec "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/py" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
+        exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
 fi
 unset VERIFY_NIX_ENV_REEXEC
 
@@ -2024,7 +2018,7 @@ build_seconds() {
 # or when the tree has changed since that verdict.
 # The time in the user's zone setting, with its label; UTC (labeled) when the setting cannot be read.
 user_clock() {
-    TZ="$(python3 "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%Y-%m-%d %H:%M:%S %Z'
+    TZ="$(python3 -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%Y-%m-%d %H:%M:%S %Z'
 }
 
 cache_record() {

@@ -26,13 +26,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, Never, Protocol, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.accounts import outage_alerts
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
-from account import (  # noqa: E402
+from scripts.whoami.account import (  # noqa: E402
     Account,
     UnknownAccountName,
     UnreadableAccount,
@@ -150,7 +152,7 @@ SEND = SCRIPTS / "message" / "send.py"
 RESTART_LAUNCH_WORKERS = 256
 SESSION_WAIT_SECONDS = 90.0
 SESSION_POLL_SECONDS = 0.5
-CONDUCTOR_ONLY_VARIABLES = frozenset({"REFUSAL_WATCH_INVENTORY", "PYTHONUNBUFFERED", "SHUTDOWN_PARENT_LAUNCH_CLAIM"})
+CONDUCTOR_ONLY_VARIABLES = frozenset({"REFUSAL_WATCH_INVENTORY", "PYTHONUNBUFFERED", "SHUTDOWN_PARENT_LAUNCH_CLAIM", "STAFF_OPERATION_FD"})
 # herdr lists a stopped agent as live for a few seconds after its process ends.
 AGENT_EXIT_SECONDS = 15.0
 REMOTE_CONTROL_WAIT_SECONDS = 10.0
@@ -809,7 +811,7 @@ def resume_command(session: Session, target: str, source_label: str = "", why: s
     """The stable manual move command printed before shutdown and at restart."""
     if not source_label:
         directory = Path(session.get("config_dir", str(Path.home() / ".claude")))
-        from account import claude_account
+        from scripts.whoami.account import claude_account
         identity = claude_account(directory)
         source_label = identity.label if identity is not None else str(directory)
     note = account_move_note(session, target, source_label, why, times=times)
@@ -1641,7 +1643,7 @@ def _target_config_dir(record: SessionShutdown) -> RecordedConfigDir | NoRecorde
 
 
 def _live_config_dir(record: SessionShutdown) -> ObservedConfigDir | LiveObservationUnavailable:
-    import account
+    from scripts.whoami import account
     live = next((item for item in sessions.live_sessions() if item["sessionId"] == record["session"]["session_id"]), None)
     if live is None:
         return LiveObservationUnavailable("not live")

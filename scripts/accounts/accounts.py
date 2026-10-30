@@ -38,13 +38,13 @@ _ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
 sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
 
-import account  # noqa: E402
-from account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
+from scripts.whoami import account  # noqa: E402
+from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
 from scripts.lib import atomic_file, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
-import agent_accounts  # noqa: E402
-import note_file  # noqa: E402
-import usage_store  # noqa: E402
+from scripts.whoami import agent_accounts  # noqa: E402
+from scripts.whoami import note_file  # noqa: E402
+from scripts.whoami import usage_store  # noqa: E402
 from scripts.accounts import refusals  # noqa: E402
 from scripts.accounts import moves, worker_names, role_map  # noqa: E402
 from scripts.accounts.refusals import (  # noqa: E402
@@ -3014,7 +3014,7 @@ class SessionMoveRefused:
     reason: str
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.Resumed | SessionMoveRefused, ...]:
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.Resumed | stop_resume.MoveHandedOff | SessionMoveRefused, ...]:
     """Stop and resume each selected local owner through the shared move API."""
     from scripts.shutdown import stop_resume
 
@@ -3041,10 +3041,10 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_
             refused[identity] = SessionMoveRefused(identity, "already on " + checked.destination.label)
         else:
             eligible.append(identity)
-    outcomes: dict[str, stop_resume.Resumed | SessionMoveRefused] = dict(refused)
+    outcomes: dict[str, stop_resume.Resumed | stop_resume.MoveHandedOff | SessionMoveRefused] = dict(refused)
     results = stop_resume.move_sessions(eligible, checked.destination.label, why=why)
     for identity, result in zip(eligible, results):
-        if isinstance(result, stop_resume.Resumed):
+        if isinstance(result, (stop_resume.Resumed, stop_resume.MoveHandedOff)):
             outcomes[identity] = result
         else:
             reason = ("session has no tab on this machine" if isinstance(result, stop_resume.SessionNotFound)
@@ -3053,9 +3053,13 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_
     return tuple(outcomes[identity] for identity in selected)
 
 
-def move_result_line(result: stop_resume.Resumed | SessionMoveRefused) -> str:
+def move_result_line(result: stop_resume.Resumed | stop_resume.MoveHandedOff | SessionMoveRefused) -> str:
     if isinstance(result, SessionMoveRefused):
         return f"{result.session_id}: not moved: {result.reason}"
+    from scripts.shutdown import stop_resume
+
+    if isinstance(result, stop_resume.MoveHandedOff):
+        return f"{result.session_id}: moving now"
     return f"{result.session_id}: resumed on {result.account} in {result.pane_id}"
 
 
@@ -3192,7 +3196,7 @@ def move_preview_line(member: ListedSession, target: str) -> str:
     return f"{member.name}: {member.session_id} · stop, then resume on {target} (from {session_account_label(member)})"
 
 
-def _move_output(results: tuple[stop_resume.Resumed | SessionMoveRefused, ...],
+def _move_output(results: tuple[stop_resume.Resumed | stop_resume.MoveHandedOff | SessionMoveRefused, ...],
                  notices: tuple[str, ...]) -> tuple[str, str, int]:
     stdout = "".join(line + "\n" for line in notices)
     stderr = ""

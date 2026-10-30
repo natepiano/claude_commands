@@ -129,6 +129,34 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(staff_sources.member(staff_sources.UnitMember("sdlc", "models-unit"), record), staff_sources.MemberFound(unit))
         self.assertEqual(staff_sources.member(staff_sources.ShowrunnerMember("sdlc"), record), staff_sources.MemberFound(showrunner))
 
+    def test_unit_parent_agrees_with_showrunner_members_after_transfer(self) -> None:
+        original, unit, _worker = self.tree()
+        old_doc = self.production("sdlc", "models-unit", workspace="sdlc")
+        new_doc = self.production("receiving", workspace="new-tools")
+        destination = staff.ensure("showrunner", name="new-tools")
+        destination = staff.rename(destination.id, "control")
+        self.pane("w1:showrunner", session_id="session-receiving", environment={"STAFF_ID": destination.id})
+        self.pane("w1:unit", session_id="unit-session", environment={
+            "STAFF_ID": unit.id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
+        })
+        for slug, expected_parent, doc in (("sdlc", original, old_doc), ("receiving", destination, new_doc)):
+            with self.subTest(slug=slug):
+                _ = staff.move(unit.id, expected_parent.id)
+                record = staff.snapshot()
+                members = staff_sources.showrunner_members(record)
+                with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as snapshot, \
+                        mock.patch.object(pane_record, "read_strict", wraps=pane_record.read_strict) as launches, \
+                        mock.patch.object(showrunners, "read_sources", wraps=showrunners.read_sources) as productions:
+                    parent = staff_sources.unit_parent("models-unit", "unit-session")
+                self.assertEqual(parent, staff_sources.UnitProduction(slug, str(doc)))
+                self.assertEqual(members[parent.slug], expected_parent)
+                recorded_unit = record.by_id(unit.id)
+                assert recorded_unit is not None
+                self.assertEqual(members[parent.slug].id, recorded_unit.parent)
+                self.assertEqual(snapshot.call_count, 1)
+                self.assertEqual(launches.call_count, 1)
+                self.assertEqual(productions.call_count, 1)
+
     def test_member_with_unresolved_or_wrong_kind_id_does_not_take_an_unrelated_name(self) -> None:
         showrunner, _unit, worker = self.tree()
         _ = self.production("sdlc", "models-unit")
