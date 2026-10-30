@@ -10,13 +10,13 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import final, override
+from typing import Literal, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import agents_registry, atomic_file  # noqa: E402
 from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry  # noqa: E402
-from scripts.direct.recorder_fixture import TEST_HANG_GUARD_SECS  # noqa: E402
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS  # noqa: E402
 
 AGENTS = Path(__file__).resolve().parent
 REPO = AGENTS.parents[1]
@@ -94,12 +94,13 @@ class RegistryFixture(unittest.TestCase):
         for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_CONFIG", "GIT_CONFIG_COUNT"):
             _ = self.environment.pop(key, None)
 
-    def command(self, *arguments: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    def command(self, *arguments: str, cwd: Path | None = None,
+                input_text: str | None = None) -> subprocess.CompletedProcess[str]:
         require_isolated_registry(self.environment)
         configured = Path(self.environment["AGENTS_CONFIG_FILE"]).resolve()
         self.assertTrue(configured.is_relative_to(self.root), "registry fixture escaped its temporary folder")
         return subprocess.run(arguments, cwd=cwd or self.command_directory, env=self.environment, text=True,
-                              capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                              input=input_text, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def bash(self, operation: str, *arguments: str) -> subprocess.CompletedProcess[str]:
         return self.command("bash", "-c", 'source "$1"; shift; ' + operation,
@@ -488,6 +489,96 @@ agents_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         self.assert_published(before)
         self.assertIn("review=gpt-b:low", self.registry.read_text())
 
+    def commit_local_work(self) -> str:
+        local_file = self.checkout / "local-commit.txt"
+        _ = local_file.write_text("local history\n")
+        _ = self.git("add", "local-commit.txt")
+        _ = self.git("commit", "--only", "-m", "local work", "--", "local-commit.txt")
+        return self.git("rev-parse", "HEAD").strip()
+
+    def test_an_ahead_checkout_publishes_one_registry_commit_on_its_local_tip(self) -> None:
+        local_head = self.commit_local_work()
+        self.assertEqual(self.git("rev-parse", "origin/main").strip(), self.initial)
+        before = self.dirty_state()
+        unrelated_index = self.git("ls-files", "--stage", "--", ".", ":(exclude)config/agents.conf")
+        unrelated_files = {name: (self.checkout / name).read_bytes()
+                           for name in ("dirty.txt", "staged.txt", "local-commit.txt")}
+
+        self.assert_ok(self.edit())
+
+        self.assert_published(before)
+        self.assertEqual(self.git("rev-parse", "HEAD^").strip(), local_head)
+        self.assertEqual(self.git("rev-list", "--count", f"{local_head}..HEAD").strip(), "1")
+        self.assertEqual(self.git("--git-dir", str(self.remote), "show", "main:local-commit.txt"),
+                         "local history\n")
+        self.assertEqual(self.git("ls-files", "--stage", "--", ".", ":(exclude)config/agents.conf"),
+                         unrelated_index)
+        for name, contents in unrelated_files.items():
+            self.assertEqual((self.checkout / name).read_bytes(), contents)
+
+    def test_an_already_contained_target_leaves_the_registry_index_and_head_unchanged(self) -> None:
+        _ = self.registry.write_text(self.registry.read_text().replace("impl=gpt-a:high", "impl=gpt-b:max"))
+        index = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+        registry_bytes, index_bytes = self.registry.read_bytes(), index.read_bytes()
+        program = ("import sys; from pathlib import Path; from scripts.lib import agents_registry; "
+                   + "agents_registry._fast_forward(Path.cwd(), agents_registry.registry_path(), "
+                   + "sys.argv[1], registry_already_shared=True)")
+        self.assert_ok(self.command(sys.executable, "-c", program, self.initial))
+        self.assertEqual(self.registry.read_bytes(), registry_bytes)
+        self.assertEqual(index.read_bytes(), index_bytes)
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.initial)
+
+    def assert_unfinished_merge_is_refused(self, *, ahead: bool, unmerged: bool,
+                                          merge_head_present: bool = True) -> None:
+        if ahead:
+            _ = self.commit_local_work()
+        merge_head = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD").strip())
+        if merge_head_present:
+            _ = merge_head.write_text(self.initial + "\n")
+        blob = self.git("rev-parse", "HEAD:dirty.txt").strip()
+        merge_file = self.checkout / "merge-work.txt"
+        _ = merge_file.write_text("resolved local work\n")
+        if unmerged:
+            result = self.command(GIT, "update-index", "--index-info",
+                                  input_text="".join(f"100644 {blob} {stage}\tmerge-work.txt\n" for stage in (1, 2, 3)))
+            self.assert_ok(result)
+        else:
+            _ = self.git("add", "merge-work.txt")
+        index = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+        registry_bytes, index_bytes = self.registry.read_bytes(), index.read_bytes()
+        head, remote = self.git("rev-parse", "HEAD"), self.git("--git-dir", str(self.remote), "rev-parse", "main")
+        merge_bytes = merge_head.read_bytes() if merge_head_present else b""
+        unmerged_entries = self.git("ls-files", "--unmerged")
+
+        refused = self.edit()
+
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertIn("registry edit refused before writing", refused.stdout + refused.stderr)
+        self.assertEqual(self.registry.read_bytes(), registry_bytes)
+        self.assertEqual(index.read_bytes(), index_bytes)
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main"), remote)
+        self.assertEqual(merge_head.exists(), merge_head_present)
+        if merge_head_present:
+            self.assertEqual(merge_head.read_bytes(), merge_bytes)
+        self.assertEqual(self.git("ls-files", "--unmerged"), unmerged_entries)
+        self.assertEqual(merge_file.read_text(), "resolved local work\n")
+
+    def test_an_equal_remote_refuses_a_fully_staged_unfinished_merge_before_publication(self) -> None:
+        self.assert_unfinished_merge_is_refused(ahead=False, unmerged=False)
+
+    def test_an_equal_remote_refuses_an_unresolved_merge_before_publication(self) -> None:
+        self.assert_unfinished_merge_is_refused(ahead=False, unmerged=True)
+
+    def test_an_ahead_checkout_refuses_a_fully_staged_unfinished_merge_before_publication(self) -> None:
+        self.assert_unfinished_merge_is_refused(ahead=True, unmerged=False)
+
+    def test_an_ahead_checkout_refuses_an_unresolved_merge_before_publication(self) -> None:
+        self.assert_unfinished_merge_is_refused(ahead=True, unmerged=True)
+
+    def test_unmerged_index_entries_refuse_publication_even_without_merge_head(self) -> None:
+        self.assert_unfinished_merge_is_refused(ahead=False, unmerged=True, merge_head_present=False)
+
     def test_divergence_refuses_before_writing_the_registry_or_touching_other_changes(self) -> None:
         _ = (self.checkout / "local-commit.txt").write_text("local history\n")
         _ = self.git("add", "local-commit.txt")
@@ -505,7 +596,9 @@ agents_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertEqual(self.dirty_state(), before)
 
-    def install_push_race(self, *, always_refuse: bool) -> Path:
+    def install_push_race(self, *, always_refuse: bool, obstruction: str = "",
+                          unfinished_merge: bool = False,
+                          accepted_merge: Literal["none", "merge_head", "unmerged_index"] = "none") -> Path:
         binaries = self.root / "bin"
         binaries.mkdir()
         count = self.root / "push-count"
@@ -513,43 +606,158 @@ agents_registry.store_registry(p, text, text.replace('impl=gpt-a:high', 'impl=gp
         _ = wrapper.write_text('''#!/usr/bin/env python3
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 arguments = sys.argv[1:]
 real = os.environ["TEST_REAL_GIT"]
+def start_merge(git_dir, unmerged=False):
+    if unmerged:
+        blob = subprocess.check_output([real, "rev-parse", "HEAD:dirty.txt"], text=True).strip()
+        entries = "".join(f"100644 {blob} {stage}\\tmerge-work.txt\\n" for stage in (1, 2, 3))
+        subprocess.run([real, "update-index", "--index-info"], input=entries, text=True, check=True)
+    else:
+        head = subprocess.check_output([real, "rev-parse", "HEAD"], text=True)
+        (git_dir / "MERGE_HEAD").write_text(head)
+def snapshot_state(name, git_dir, counter):
+    snapshot = counter.parent / name
+    snapshot.mkdir()
+    shutil.copyfile("config/agents.conf", snapshot / "agents.conf")
+    shutil.copyfile(git_dir / "index", snapshot / "index")
+    (snapshot / "HEAD").write_bytes(subprocess.check_output([real, "rev-parse", "HEAD"]))
+def advance_peer(accepted=False):
+    peer = pathlib.Path(os.environ["TEST_COMPETITOR"])
+    if accepted:
+        subprocess.run([real, "pull", "--ff-only", "origin", "main"], cwd=peer, check=True, capture_output=True)
+    registry = peer / "config/agents.conf"
+    text = registry.read_text()
+    if accepted:
+        text = text.replace("impl=gpt-b:max", "impl=gpt-a:low")
+    else:
+        text = text.replace("impl=gpt-a:high", "impl=gpt-a:low").replace("review=gpt-a:high", "review=gpt-b:low")
+    registry.write_text(text)
+    paths = ["config/agents.conf"]
+    obstruction = os.environ["TEST_OBSTRUCTION"]
+    if obstruction:
+        (peer / obstruction).write_text("peer work\\n")
+        paths.append(obstruction)
+    subject = "config(agents): later peer edit" if accepted else "concurrent row edits"
+    for command in (["add", *paths], ["commit", "-m", subject], ["push", "origin", "main"]):
+        subprocess.run([real, *command], cwd=peer, check=True, capture_output=True)
 if "push" in arguments:
     counter = pathlib.Path(os.environ["TEST_PUSH_COUNT"])
     attempt = int(counter.read_text()) + 1 if counter.exists() else 1
     counter.write_text(str(attempt))
+    if attempt == 1:
+        git_dir = pathlib.Path(subprocess.check_output([real, "rev-parse", "--absolute-git-dir"], text=True).strip())
+        accepted_merge = os.environ["TEST_ACCEPTED_MERGE"]
+        if accepted_merge != "none":
+            subprocess.run([real, *arguments], check=True)
+            start_merge(git_dir, unmerged=accepted_merge == "unmerged_index")
+            snapshot_state("after-push", git_dir, counter)
+            sys.exit(0)
+        if os.environ["TEST_UNFINISHED_MERGE"] == "1":
+            start_merge(git_dir)
+        snapshot_state("before-retry", git_dir, counter)
     if os.environ.get("TEST_LOSE_ACK") == "1":
         result = subprocess.run([real, *arguments], check=False)
         if result.returncode == 0 and os.environ.get("TEST_ADVANCE_ACCEPTED") == "1":
-            peer = pathlib.Path(os.environ["TEST_COMPETITOR"])
-            subprocess.run([real, "pull", "--ff-only", "origin", "main"], cwd=peer, check=True, capture_output=True)
-            registry = peer / "config/agents.conf"
-            registry.write_text(registry.read_text().replace("impl=gpt-b:max", "impl=gpt-a:low"))
-            for command in (["add", "config/agents.conf"], ["commit", "-m", "config(agents): later peer edit"],
-                            ["push", "origin", "main"]):
-                subprocess.run([real, *command], cwd=peer, check=True, capture_output=True)
+            advance_peer(accepted=True)
         sys.exit(result.returncode or 1)
     if os.environ["TEST_REJECT_ALL"] == "1":
         print("! [rejected] main -> main (test remote refused push)", file=sys.stderr)
         sys.exit(1)
     if attempt == 1:
-        peer = pathlib.Path(os.environ["TEST_COMPETITOR"])
-        registry = peer / "config/agents.conf"
-        registry.write_text(registry.read_text().replace("impl=gpt-a:high", "impl=gpt-a:low")
-                            .replace("review=gpt-a:high", "review=gpt-b:low"))
-        for command in (["add", "config/agents.conf"], ["commit", "-m", "concurrent row edits"],
-                        ["push", "origin", "main"]):
-            subprocess.run([real, *command], cwd=peer, check=True, capture_output=True)
+        advance_peer()
 os.execv(real, [real, *arguments])
 ''')
         wrapper.chmod(0o755)
         self.environment.update(PATH=str(binaries) + os.pathsep + self.environment["PATH"],
                                 TEST_REAL_GIT=GIT, TEST_PUSH_COUNT=str(count),
-                                TEST_COMPETITOR=str(self.competitor), TEST_REJECT_ALL="1" if always_refuse else "0")
+                                TEST_COMPETITOR=str(self.competitor), TEST_REJECT_ALL="1" if always_refuse else "0",
+                                TEST_OBSTRUCTION=obstruction, TEST_UNFINISHED_MERGE="1" if unfinished_merge else "0",
+                                TEST_ACCEPTED_MERGE=accepted_merge)
         return count
+
+    def assert_accepted_push_preserves_local_merge(self, *, unmerged: bool) -> None:
+        count = self.install_push_race(always_refuse=False,
+                                       accepted_merge="unmerged_index" if unmerged else "merge_head")
+
+        refused = self.edit()
+
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertIn(f"{self.registry} is shared, but local reconciliation failed", refused.stderr)
+        self.assertNotIn("refused before writing", refused.stderr)
+        self.assertEqual(count.read_text(), "1")
+        snapshot = self.root / "after-push"
+        index = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+        self.assertEqual(self.registry.read_bytes(), (snapshot / "agents.conf").read_bytes())
+        self.assertEqual(index.read_bytes(), (snapshot / "index").read_bytes())
+        head = (snapshot / "HEAD").read_text()
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        remote = self.git("--git-dir", str(self.remote), "rev-parse", "main").strip()
+        self.assertNotEqual(remote, head.strip())
+        self.assertEqual(self.git("rev-parse", f"{remote}^"), head)
+        self.assertEqual(self.git("diff-tree", "--no-commit-id", "--name-only", "-r", remote).splitlines(),
+                         ["config/agents.conf"])
+        self.assertEqual(self.git("show", f"{remote}:config/agents.conf").encode(),
+                         (snapshot / "agents.conf").read_bytes())
+        self.assertIn("impl=gpt-b:max", self.git("show", f"{remote}:config/agents.conf"))
+        merge_head = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD").strip())
+        self.assertEqual(merge_head.exists(), not unmerged)
+        if unmerged:
+            self.assertIn("merge-work.txt", self.git("ls-files", "--unmerged"))
+        else:
+            self.assertEqual(merge_head.read_text(), head)
+
+    def test_a_successful_push_preserves_a_merge_started_before_local_reconciliation(self) -> None:
+        self.assert_accepted_push_preserves_local_merge(unmerged=False)
+
+    def test_a_successful_push_preserves_unmerged_entries_without_merge_head_before_local_reconciliation(self) -> None:
+        self.assert_accepted_push_preserves_local_merge(unmerged=True)
+
+    def assert_retry_refuses_before_rewriting(self, *, obstruction: str = "", unfinished_merge: bool = False,
+                                            accepted: bool = False) -> None:
+        if obstruction == "untracked.txt":
+            _ = (self.checkout / obstruction).write_text("untracked local work\n")
+        count = self.install_push_race(always_refuse=False, obstruction=obstruction,
+                                       unfinished_merge=unfinished_merge)
+        if accepted:
+            self.environment.update(TEST_LOSE_ACK="1", TEST_ADVANCE_ACCEPTED="1")
+        obstruction_bytes = (self.checkout / obstruction).read_bytes() if obstruction else b""
+        head = self.git("rev-parse", "HEAD")
+
+        refused = self.edit()
+
+        self.assertNotEqual(refused.returncode, 0, refused.stdout + refused.stderr)
+        self.assertEqual(count.read_text(), "1", refused.stdout + refused.stderr)
+        expected = "is shared, but local reconciliation failed" if accepted else "is edited but not shared"
+        self.assertIn(expected, refused.stdout + refused.stderr)
+        self.assertNotIn("refused before writing", refused.stdout + refused.stderr)
+        snapshot = self.root / "before-retry"
+        index = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "index").strip())
+        self.assertEqual(self.registry.read_bytes(), (snapshot / "agents.conf").read_bytes())
+        self.assertEqual(index.read_bytes(), (snapshot / "index").read_bytes())
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main"),
+                         self.git("rev-parse", "HEAD", cwd=self.competitor))
+        if obstruction:
+            self.assertEqual((self.checkout / obstruction).read_bytes(), obstruction_bytes)
+        if unfinished_merge:
+            merge_head = Path(self.git("rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD").strip())
+            self.assertEqual(merge_head.read_text(), head)
+
+    def test_a_rejected_push_refuses_a_new_unfinished_merge_before_another_write_or_push(self) -> None:
+        self.assert_retry_refuses_before_rewriting(unfinished_merge=True)
+
+    def test_a_rejected_push_refuses_a_dirty_peer_path_before_another_write_or_push(self) -> None:
+        self.assert_retry_refuses_before_rewriting(obstruction="dirty.txt")
+
+    def test_a_rejected_push_refuses_an_untracked_peer_path_before_another_write_or_push(self) -> None:
+        self.assert_retry_refuses_before_rewriting(obstruction="untracked.txt")
+
+    def test_an_accepted_push_reports_a_local_reconciliation_obstruction_as_shared(self) -> None:
+        self.assert_retry_refuses_before_rewriting(obstruction="dirty.txt", accepted=True)
 
     def test_a_rejected_push_reapplies_the_same_row_on_the_new_remote_tip(self) -> None:
         count = self.install_push_race(always_refuse=False)
@@ -569,6 +777,21 @@ os.execv(real, [real, *arguments])
         self.assertEqual(count.read_text(), "3")
         self.assertRegex(result.stdout + result.stderr, "(?i)edited.*not shared")
         self.assertIn("impl=gpt-b:max", self.registry.read_text())
+        self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
+        self.assertEqual(self.dirty_state(), before)
+
+    def test_an_ahead_checkout_keeps_its_local_parent_when_retrying_a_rejected_push(self) -> None:
+        local_head = self.commit_local_work()
+        count = self.install_push_race(always_refuse=True)
+        before = self.dirty_state()
+
+        refused = self.edit()
+
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertEqual(count.read_text(), "3")
+        self.assertIn("is edited but not shared", refused.stdout + refused.stderr)
+        self.assertIn("impl=gpt-b:max", self.registry.read_text())
+        self.assertEqual(self.git("rev-parse", "HEAD").strip(), local_head)
         self.assertEqual(self.git("--git-dir", str(self.remote), "rev-parse", "main").strip(), self.initial)
         self.assertEqual(self.dirty_state(), before)
 
