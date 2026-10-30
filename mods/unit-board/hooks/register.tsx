@@ -7,11 +7,14 @@ import { BoardView } from './board';
 import { UnitView } from './unit';
 import { AccountsView } from './accounts';
 import type { StoredAccountsStatus } from '../types/accounts';
+import { QueueView } from './queue';
+import type { QueuePaneState, QueueSnapshot } from '../types/queue';
 
 const PANE = 'unit-board';
 const ACCOUNTS = 'accounts-board';
 const ACCOUNT_PANES = { plugin: 'unit-board', key: 'accountsPanes' } as const;
-type OpenAccountsPane = { timer: Timer; busy: boolean; paths: RefreshPaths[]; zone: string };
+const QUEUE = 'build-queue';
+const QUEUE_PANES = { plugin: 'unit-board', key: 'queuePanes' } as const;
 const PANES = { plugin: 'unit-board', key: 'panes' } as const;
 
 type Selection = { kind: 'board' } | { kind: 'unit'; production: string; unit: string };
@@ -104,11 +107,6 @@ const select = async ($: EngineInterface, opened: Map<string, OpenPane>, id: str
   await put($, id, viewState(current.data, selection, current.now), () => opened.get(id) === active);
 };
 
-const putAccounts = async ($: EngineInterface, state: AccountsPaneState<StoredAccountsStatus>, isOpen: () => boolean) => {
-  if (!isOpen()) return;
-  const previous = (await $.state.get(ACCOUNT_PANES)).value ?? {};
-  if (isOpen()) await $.state.set(ACCOUNT_PANES, { ...previous, [ACCOUNTS]: state });
-};
 function accountsCalls($: EngineInterface): AccountsLoader {
   return {
     home: () => $.env.get('HOME'), now: () => $.clock.now(),
@@ -121,57 +119,193 @@ function zoneSettings($: EngineInterface): UserZoneSettings {
     home: () => $.env.get('HOME'), read: path => $.fs.read(path),
   };
 }
-const readAccounts = async ($: EngineInterface, opened: Map<string, OpenAccountsPane>, active: OpenAccountsPane) => {
-  const isOpen = () => opened.get(ACCOUNTS) === active;
-  try {
-    const data = await loadAccounts(accountsCalls($), isOpen, paths => { if (isOpen()) active.paths = paths; });
-    await putAccounts($, { kind: 'accounts', data, zone: active.zone, now: await $.clock.now() / 1000 }, isOpen);
-  } catch {
-    // Never include process output or a login in an error or command result.
-    await putAccounts($, { kind: 'failed', reason: 'Stored accounts status could not be read.' }, isOpen);
-  }
-};
-const tickAccounts = async ($: EngineInterface, opened: Map<string, OpenAccountsPane>) => {
-  const active = opened.get(ACCOUNTS);
-  if (!active || active.busy) return;
-  const isOpen = () => opened.get(ACCOUNTS) === active;
-  active.busy = true;
-  try {
-    const regenerated = await refreshIfChanged({ stat: path => $.fs.stat(path) }, active.paths,
-      () => loadAccounts(accountsCalls($), isOpen, paths => { if (isOpen()) active.paths = paths; }),
-      async data => putAccounts($, { kind: 'accounts', data, zone: active.zone, now: await $.clock.now() / 1000 }, isOpen), isOpen);
-    if (regenerated || !isOpen()) return;
-    const state = (await $.state.get(ACCOUNT_PANES)).value?.[ACCOUNTS] as AccountsPaneState<StoredAccountsStatus> | undefined;
-    if (state?.kind === 'accounts') {
-      await putAccounts($, { ...state, now: await $.clock.now() / 1000 }, isOpen);
+type TablePaneState<Ready> = { kind: 'loading' } | { kind: 'failed'; reason: string } | Ready;
+type ClosedTablePane = { kind: 'closed'; generation: number };
+type PreparingTablePane = { kind: 'preparing'; generation: number };
+type OpenTablePane<Context> = { kind: 'open'; generation: number; timer: Timer; busy: boolean;
+  refreshRequested: boolean; paths: RefreshPaths[]; context: Context };
+type TablePaneLifecycle<Context> = ClosedTablePane | PreparingTablePane | OpenTablePane<Context>;
+interface TablePaneSettings {
+  failure: string;
+  refresh: 'changed' | 'always';
+}
+interface TablePaneCalls<Ready, Context> {
+  prepare(isOpen: () => boolean): Promise<Context>;
+  load(context: Context, isOpen: () => boolean, watch: (paths: RefreshPaths[]) => void): Promise<Ready>;
+  advance(state: Ready): Promise<Ready>;
+  read(): Promise<TablePaneState<Ready> | undefined>;
+  put(state: TablePaneState<Ready>, isOpen: () => boolean): Promise<void>;
+  drop(isClosed: () => boolean): Promise<void>;
+  open(): Promise<unknown>;
+  every(callback: () => void): Timer;
+  stat(path: string): Promise<{ mtimeMs: number }>;
+}
+
+/** One lifecycle for one-shot table readers; closing invalidates every pending await. */
+function tablePane<Ready extends { kind: 'accounts' | 'queue' }, Context>(settings: TablePaneSettings) {
+  let lifecycle: TablePaneLifecycle<Context> = { kind: 'closed', generation: 0 };
+  let latestGeneration = 0;
+  const read = async (calls: TablePaneCalls<Ready, Context>, current: OpenTablePane<Context>) => {
+    const isOpen = () => lifecycle === current;
+    const fresh = await calls.load(current.context, isOpen, paths => { if (isOpen()) current.paths = paths; });
+    if (isOpen()) await calls.put(fresh, isOpen);
+  };
+  const refresh = async (calls: TablePaneCalls<Ready, Context>, force = false) => {
+    const current = lifecycle;
+    if (current.kind !== 'open') return;
+    if (current.busy) {
+      if (force) current.refreshRequested = true;
+      return;
     }
-  } catch {
-    await putAccounts($, { kind: 'failed', reason: 'Stored accounts status could not be read.' }, isOpen);
-  } finally { active.busy = false; }
-};
-const startAccounts = ($: EngineInterface, opened: Map<string, OpenAccountsPane>, zone: string) => {
-  const previous = opened.get(ACCOUNTS);
-  previous?.timer.cancel();
-  const active: OpenAccountsPane = { busy: false, paths: previous?.paths ?? [], zone,
-    timer: $.clock.every(10_000, () => { void tickAccounts($, opened); }) };
-  opened.set(ACCOUNTS, active);
-  return active;
-};
-const stopAccounts = async ($: EngineInterface, opened: Map<string, OpenAccountsPane>) => {
-  opened.get(ACCOUNTS)?.timer.cancel();
-  opened.delete(ACCOUNTS);
-  const panes = { ...(await $.state.get(ACCOUNT_PANES)).value };
-  delete panes[ACCOUNTS];
-  await $.state.set(ACCOUNT_PANES, panes);
-};
+    const isOpen = () => lifecycle === current;
+    current.busy = true;
+    try {
+      if (force || settings.refresh === 'always' || !current.paths.length) {
+        await read(calls, current);
+        return;
+      }
+      const regenerated = await refreshIfChanged({ stat: path => calls.stat(path) }, current.paths,
+        () => calls.load(current.context, isOpen, paths => { if (isOpen()) current.paths = paths; }),
+        fresh => calls.put(fresh, isOpen), isOpen);
+      if (regenerated || !isOpen()) return;
+      const state = await calls.read();
+      if (state && state.kind !== 'loading' && state.kind !== 'failed' && isOpen()) {
+        const fresh = await calls.advance(state);
+        if (isOpen()) await calls.put(fresh, isOpen);
+      }
+    } catch {
+      await calls.put({ kind: 'failed', reason: settings.failure }, isOpen);
+    } finally {
+      current.busy = false;
+      if (isOpen() && current.refreshRequested) {
+        current.refreshRequested = false;
+        await refresh(calls, true);
+      }
+    }
+  };
+  const start = async (calls: TablePaneCalls<Ready, Context>, open: boolean) => {
+    const preparing: PreparingTablePane = { kind: 'preparing', generation: ++latestGeneration };
+    const paths = lifecycle.kind === 'open' ? lifecycle.paths : [];
+    if (lifecycle.kind === 'open') lifecycle.timer.cancel();
+    lifecycle = preparing;
+    const isCurrent = () => lifecycle === preparing && latestGeneration === preparing.generation;
+    const context = await calls.prepare(isCurrent);
+    if (!isCurrent()) return false;
+    if (open) await calls.open();
+    if (!isCurrent()) return false;
+    const current: OpenTablePane<Context> = { kind: 'open', generation: preparing.generation,
+      context, paths, busy: false, refreshRequested: false,
+      timer: calls.every(() => { void refresh(calls); }) };
+    lifecycle = current;
+    if (open) {
+      current.busy = true;
+      try { await calls.put({ kind: 'loading' }, () => lifecycle === current); }
+      finally { current.busy = false; }
+    }
+    await refresh(calls, open);
+    return lifecycle === current;
+  };
+  const stop = async (calls: TablePaneCalls<Ready, Context>) => {
+    const closed: ClosedTablePane = { kind: 'closed', generation: ++latestGeneration };
+    if (lifecycle.kind === 'open') lifecycle.timer.cancel();
+    lifecycle = closed;
+    await calls.drop(() => lifecycle === closed && latestGeneration === closed.generation);
+  };
+  return { start, stop, refresh, checkpoint: () => ++latestGeneration,
+    resume: async (calls: TablePaneCalls<Ready, Context>, generation: number) => {
+      if (generation === latestGeneration) await start(calls, false);
+    } };
+}
+
+type AccountsReady = Extract<AccountsPaneState<StoredAccountsStatus>, { kind: 'accounts' }>;
+type AccountsZone = Awaited<ReturnType<typeof resolveUserZone>>;
+function accountsPaneCalls($: EngineInterface): TablePaneCalls<AccountsReady, AccountsZone> {
+  return {
+    open: () => $.ui.open({ id: ACCOUNTS, title: 'Accounts', closeOnEscape: true }),
+    every: callback => $.clock.every(10_000, callback),
+    stat: path => $.fs.stat(path),
+    prepare: isOpen => resolveUserZone(zoneSettings($), isOpen),
+    load: async (zone, isOpen, watch) => {
+      if (zone.kind !== 'resolved') throw new Error('Pane closed.');
+      const data = await loadAccounts(accountsCalls($), isOpen, watch);
+      if (!isOpen()) throw new Error('Pane closed.');
+      return { kind: 'accounts', data, zone: zone.name, now: await $.clock.now() / 1000 };
+    },
+    advance: async state => ({ ...state, now: await $.clock.now() / 1000 }),
+    read: async () => (await $.state.get(ACCOUNT_PANES)).value?.[ACCOUNTS] as AccountsPaneState<StoredAccountsStatus> | undefined,
+    put: async (state, isOpen) => {
+      if (!isOpen()) return;
+      const previous = (await $.state.get(ACCOUNT_PANES)).value ?? {};
+      if (isOpen()) await $.state.set(ACCOUNT_PANES, { ...previous, [ACCOUNTS]: state });
+    },
+    drop: async isClosed => {
+      if (!isClosed()) return;
+      const panes = { ...(await $.state.get(ACCOUNT_PANES)).value };
+      if (!isClosed()) return;
+      delete panes[ACCOUNTS];
+      await $.state.set(ACCOUNT_PANES, panes);
+    },
+  };
+}
+
+async function queueRun($: EngineInterface, args: string[], isOpen = () => true) {
+  const home = await $.env.get('HOME');
+  if (!home || !isOpen()) throw new Error('Build queue could not be read.');
+  const result = await $.process.run([`${home}/.claude/scripts/lib/py`,
+    `${home}/.claude/scripts/build_queue/build_queue.py`, ...args]);
+  if (!isOpen()) throw new Error('Build queue could not be read.');
+  if (args[0] === 'bump' && result.exitCode === 3 && !result.isStdoutTruncated) {
+    const refusal = result.stdout.trim();
+    if (/^build queue: [^\r\n]+$/.test(refusal)) return refusal;
+  }
+  if (result.exitCode !== 0 || result.isStdoutTruncated) throw new Error('Build queue could not be read.');
+  return result.stdout;
+}
+
+type QueueReady = Extract<QueuePaneState, { kind: 'queue' }>;
+function queuePaneCalls($: EngineInterface): TablePaneCalls<QueueReady, void> {
+  return {
+    open: () => $.ui.open({ id: QUEUE, title: 'Build queue', closeOnEscape: true }),
+    every: callback => $.clock.every(10_000, callback),
+    stat: path => $.fs.stat(path),
+    prepare: async () => {},
+    load: async (_context, isOpen) => {
+      const data = JSON.parse(await queueRun($, ['--json'], isOpen)) as QueueSnapshot;
+      const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(cell => typeof cell === 'string');
+      const rows = (value: unknown): value is string[][] => Array.isArray(value) && value.every(strings);
+      if (!data || !strings(data.running_header) || !rows(data.running) || !strings(data.waiting_header)
+        || !rows(data.waiting) || !strings(data.problems) || typeof data.head?.text !== 'string'
+        || !['default', 'error'].includes(data.head.tone) || !data.totals
+        || !['promised', 'measured', 'free', 'reserve'].every(key => typeof data.totals[key as keyof QueueSnapshot['totals']] === 'string')
+        || data.running.some(row => row.length !== data.running_header.length)
+        || data.waiting.some(row => row.length !== data.waiting_header.length)) throw new Error('Invalid queue snapshot.');
+      return { kind: 'queue', data };
+    },
+    advance: async state => state,
+    read: async () => (await $.state.get(QUEUE_PANES)).value?.[QUEUE],
+    put: async (state, isOpen) => {
+      if (!isOpen()) return;
+      const previous = (await $.state.get(QUEUE_PANES)).value ?? {};
+      if (isOpen()) await $.state.set(QUEUE_PANES, { ...previous, [QUEUE]: state });
+    },
+    drop: async isClosed => {
+      if (!isClosed()) return;
+      const panes = { ...(await $.state.get(QUEUE_PANES)).value };
+      if (!isClosed()) return;
+      delete panes[QUEUE];
+      await $.state.set(QUEUE_PANES, panes);
+    },
+  };
+}
 
 export const register: Register = on => {
   const opened = new Map<string, OpenPane>();
-  const accounts = new Map<string, OpenAccountsPane>();
-  let accountsLifecycle = 0;
+  const accounts = tablePane<AccountsReady, AccountsZone>({ failure: 'Stored accounts status could not be read.', refresh: 'changed' });
+  const queue = tablePane<QueueReady, void>({ failure: 'Build queue could not be read.', refresh: 'always' });
 
   on('session.start', async ($, e, next) => {
-    const lifecycle = ++accountsLifecycle;
+    const accountsGeneration = accounts.checkpoint();
+    const queueGeneration = queue.checkpoint();
     await $.command.register({ name: ACCOUNTS, description: 'Show the stored accounts pane' });
     const panes = await $.ui.panes();
     if (panes.some(pane => pane.id === PANE)) {
@@ -184,17 +318,10 @@ export const register: Register = on => {
       }
       await tick($, opened, PANE);
     }
-    if (panes.some(pane => pane.id === ACCOUNTS)) {
-      const zone = await resolveUserZone(zoneSettings($), () => accountsLifecycle === lifecycle);
-      if (zone.kind === 'resolved' && accountsLifecycle === lifecycle) {
-        const active = startAccounts($, accounts, zone.name);
-        if (active.paths.length) await tickAccounts($, accounts);
-        else {
-          active.busy = true;
-          try { await readAccounts($, accounts, active); } finally { active.busy = false; }
-        }
-      }
-    }
+    await Promise.all([
+      panes.some(pane => pane.id === ACCOUNTS) ? accounts.resume(accountsPaneCalls($), accountsGeneration) : Promise.resolve(),
+      panes.some(pane => pane.id === QUEUE) ? queue.resume(queuePaneCalls($), queueGeneration) : Promise.resolve(),
+    ]);
     return next(e);
   });
   on('command.run', { command: 'showrunner:unit_board' }, async ($, e) => {
@@ -231,21 +358,29 @@ export const register: Register = on => {
       await $.ui.close({ id: ACCOUNTS });
       return { text: 'Accounts closed.' };
     }
-    const lifecycle = ++accountsLifecycle;
-    accounts.get(ACCOUNTS)?.timer.cancel();
-    accounts.delete(ACCOUNTS);
-    const zone = await resolveUserZone(zoneSettings($), () => accountsLifecycle === lifecycle);
-    if (zone.kind === 'cancelled' || accountsLifecycle !== lifecycle) return { text: 'Accounts closed.' };
-    await $.ui.open({ id: ACCOUNTS, title: 'Accounts', closeOnEscape: true });
-    if (accountsLifecycle !== lifecycle) return { text: 'Accounts closed.' };
-    const active = startAccounts($, accounts, zone.name);
-    const isOpen = () => accounts.get(ACCOUNTS) === active;
-    active.busy = true;
-    try {
-      await putAccounts($, { kind: 'loading' }, isOpen);
-      await readAccounts($, accounts, active);
-    } finally { active.busy = false; }
-    return { text: 'Accounts opened.' };
+    return { text: await accounts.start(accountsPaneCalls($), true) ? 'Accounts opened.' : 'Accounts closed.' };
+  });
+  on('command.run', { command: 'build:queue' }, async ($, e) => {
+    const wanted = e.args.trim();
+    if (wanted === 'close') {
+      await $.ui.close({ id: QUEUE });
+      return { text: 'Build queue closed.' };
+    }
+    if (/^bump(?:\s|$)/.test(wanted)) {
+      const selector = wanted.slice(4).trim();
+      let line: string;
+      try {
+        if (!selector) throw new Error('Missing selector.');
+        const output = await queueRun($, ['bump', selector]);
+        line = output.trim();
+        if (!line || /[\r\n]/.test(line)) throw new Error('Invalid bump result.');
+      } catch { return { text: 'Build queue could not be read.' }; }
+      try { await queue.refresh(queuePaneCalls($), true); }
+      catch { /* A pane refresh failure cannot replace the settled bump result. */ }
+      return { text: line };
+    }
+    await queue.start(queuePaneCalls($), true);
+    return { text: 'Build queue opened.' };
   });
   on('turn.complete', async ($, e, next) => {
     if (opened.size === 0) return next(e);
@@ -254,10 +389,8 @@ export const register: Register = on => {
   });
   on('ui.close', async ($, e, next) => {
     if (e.id === PANE) await stop($, opened, e.id);
-    if (e.id === ACCOUNTS) {
-      accountsLifecycle++;
-      await stopAccounts($, accounts);
-    }
+    if (e.id === ACCOUNTS) await accounts.stop(accountsPaneCalls($));
+    if (e.id === QUEUE) await queue.stop(queuePaneCalls($));
     return next(e);
   });
   on('ui.render', { component: 'Pane', requestId: ACCOUNTS }, async ($, e) => {
@@ -267,6 +400,14 @@ export const register: Register = on => {
     if (!state || state.kind === 'loading') return <Text color="inactive">Loading accounts…</Text>;
     if (state.kind === 'failed') return <Text color="error">{state.reason}</Text>;
     return AccountsView(elements, e.props.bodyColumns, state.data, state.zone, state.now);
+  });
+  on('ui.render', { component: 'Pane', requestId: QUEUE }, async ($, e) => {
+    const state = (await $.state.get(QUEUE_PANES)).value?.[QUEUE];
+    const elements = $.ui.resolve(e);
+    const { Text } = elements;
+    if (!state || state.kind === 'loading') return <Text color="inactive">Loading build queue…</Text>;
+    if (state.kind === 'failed') return <Text color="error">{state.reason}</Text>;
+    return QueueView(elements, e.props.bodyColumns, state.data);
   });
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const state = await readPane($, PANE);

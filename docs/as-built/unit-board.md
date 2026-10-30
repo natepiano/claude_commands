@@ -2,7 +2,7 @@
 
 ## What it is
 
-A production runs several `/unit:direct` units at once, and `/unit:report` used to answer "where is this unit" with long recorder tables in the terminal. The unit board gives that answer three ways. Every ETA a unit director states is recorded against the phase it names, and the phase chain predicts later phases from that stated ETA, so a phase's first promise, its moves and its latest promise are all on disk. A Claude Code mod, `mods/unit-board/`, draws those records in a pane the user opens on demand: `/showrunner:unit_board` shows the board of the showrunner's production and every production below it (every unit's phase strip, ETA, gate, finish and workers) or one unit's detail, and `/accounts-board` shows the accounts table that `accounts.py` reports from stored readings, with no login addresses. `/unit:report` prints a short report (phase, stage, one ETA line, the summary table, workers, summary sentences), and adds the recorder's round table only when asked with `tables`.
+A production runs several `/unit:direct` units at once, and `/unit:report` used to answer "where is this unit" with long recorder tables in the terminal. The unit board gives that answer three ways. Every ETA a unit director states is recorded against the phase it names, and the phase chain predicts later phases from that stated ETA, so a phase's first promise, its moves and its latest promise are all on disk. A Claude Code mod, `mods/unit-board/`, draws those records in a pane the user opens on demand: `/showrunner:unit_board` shows the board of the showrunner's production and every production below it (every unit's phase strip, ETA, gate, finish and workers) or one unit's detail, `/accounts-board` shows the accounts table that `accounts.py` reports from stored readings, with no login addresses, and `/build:queue` shows running and waiting build steps with the reason the head waits. `/unit:report` prints a short report (phase, stage, one ETA line, the summary table, workers, summary sentences), and adds the recorder's round table only when asked with `tables`.
 
 ## How it works
 
@@ -18,6 +18,7 @@ director states an ETA ──► progress_history.py eta ──► eta_stated ev
                                                            │
                                        mod: /showrunner:unit_board ── reads JSON, stats sources while open
                                        mod: /accounts-board ── runs accounts.py status --json --stored
+                                       mod: /build:queue ── runs build_queue.py --json
 ```
 
 ### Recording ETAs
@@ -95,25 +96,30 @@ progress_history.py eta --session-dir <dir> --time <t> --basis <basis>
 | `hooks/board.tsx` | `BoardView`, `RulerView` (the detail view's ruler), `healthTone`, and the detail view's text helpers `etaText`, `gateText`, `finishText`. |
 | `hooks/unit.tsx` | `UnitView`: one unit's detail. |
 | `hooks/accounts.tsx` | `AccountsView`, `accountDisplay`, the shared accounts table and its forms, and the display types. It uses the line helpers `span`, `wrapLine` and `pairedLines` that `board.tsx` exports. |
-| `types/board.d.ts`, `types/accounts.d.ts` | Wire contracts of the generator and of `accounts.py`. |
+| `hooks/queue.tsx` | `QueueView` and `queueLines`: formatted running and waiting cells, head hold, totals and roster problems; aligned tables when they fit, labeled wrapped cells otherwise. |
+| `types/board.d.ts`, `types/accounts.d.ts`, `types/queue.d.ts` | Wire contracts of the board, accounts and build queue readers. |
 | `types/index.d.ts` | `BoardSnapshot`, `PaneState`, `AccountsPaneState`, the `PluginState` keys. |
-| `tests/` | `kit.ts` fixtures; `geometry`, `register` and `accounts` tests. |
+| `tests/` | `kit.ts` fixtures; `geometry`, `register`, `accounts` and `queue` tests. |
 
 **Commands.**
 
 - `/showrunner:unit_board [<unit>|close]` opens pane `unit-board` (title `Units`, closes on Escape), stores `loading`, runs the generator once with `--cwd <session cwd> --session <$.session.id()>` (the open pane keeps both, so every refresh passes them), reads each listed file and stores the unit view for `<unit>` (the first board holding that key), else the board view. With no files the pane shows `Run /showrunner:unit_board in a showrunner session.`; it replies `Unit board opened.` Pressing a unit name on the board and the `board` button on a unit switch views. `close` replies `Unit board closed.`
 - A mod command name allows only letters, digits, `_` and `-`, so [`commands/showrunner/unit_board.md`](../../commands/showrunner/unit_board.md) gives the name. The mod answers it with a `command.run` hook on `{ command: 'showrunner:unit_board' }` that returns `{ text }` and never calls `next`, so no model turn starts. In a session without the mod, the file's body makes the model reply one line naming `unit-board@nate-local`.
 - `/accounts-board [close]` resolves the user zone, opens pane `accounts-board` (title `Accounts`), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/accounts/accounts.py, "status", "--json", "--stored"]` once and replies `Accounts opened.`; `close` replies `Accounts closed.` Every open and refresh runs exactly that argv; the text table is never parsed.
-- `session.start` only registers `accounts-board` and, if `$.ui.panes()` shows a pane already open (a reload), restarts that pane's refresh.
+- `/build:queue [close|bump <selector>]` is intercepted by `command.run` on `{ command: 'build:queue' }` without calling `next`. It opens `build-queue` (title `Build queue`, Escape closes), stores `loading`, runs `[~/.claude/scripts/lib/py, ~/.claude/scripts/build_queue/build_queue.py, "--json"]` and replies `Build queue opened.`; `close` replies `Build queue closed.`. Bump passes the selector as one argument to `build_queue.py bump`, replies with its result line and forces a refresh if open. Failed reads, malformed JSON and failed bumps show only `Build queue could not be read.`.
+- `build_queue.py` formats text and JSON from `queue_snapshot`: `running_header`, `running`, `waiting_header`, `waiting`, `head {text, tone}`, `totals {promised, measured, free, reserve}` and `problems`. Cells and totals are strings; empty row lists stay empty in JSON and draw as `empty`. Times use the Python user-zone resolver. Both views put the head line above Waiting. It reads `memory_admit.queue_view()`'s admission decision; budget holds list every charged running step with `build_charge` and measured use (`— (starting)` until measured), memory holds compare free memory and need, and pressure holds use the existing pressure reason. At 15 min with enough free memory for the head's need, the line starts `Stalled:` in `error` tone. An unavailable memory reading never claims a stall.
+- `session.start` only registers `accounts-board` and, if `$.ui.panes()` shows a pane already open (a reload), restarts that pane's refresh. A colon command keeps its name in `commands/build/queue.md`; its body still runs the script without the mod. Sessions started before these hooks need `/reload-plugins`.
 
-**State.** Plugin state `unit-board` holds two keys, each a record keyed by pane id; a missing entry is a closed pane.
+**State.** Plugin state `unit-board` holds the board and accounts records, each keyed by pane id; a missing entry is a closed pane.
 
 - `panes`: `PaneState<BoardData>` = `loading` | `board {data, now}` | `unit {data, production, unit, now}` | `failed {reason}`. `data` is a `BoardSnapshot {files, watch, loadedAt, boards}`.
 - `accountsPanes`: `AccountsPaneState<StoredAccountsStatus>` = `loading` | `accounts {data, zone, now}` | `failed {reason}`. `now` (seconds) is set on each load, and each unchanged 10 s tick sets a fresh `now` with no process run.
 
-Timers stay module-level and are never persisted: `OpenPane {timer, cwd, busy, paths, selection}` (`Selection = {kind:'board'} | {kind:'unit'; production; unit}`) and `OpenAccountsPane {timer, busy, paths, zone}`. Paths and selection survive a failed refresh. An `accountsLifecycle` counter, bumped on `session.start`, open and `ui.close`, cancels an accounts load or zone lookup that a close overtook.
+- `queuePanes`: `QueuePaneState` = `loading` | `queue {data: QueueSnapshot}` | `failed {reason}`. It belongs to the same `unit-board` state namespace, under its own pane id.
 
-**Refresh on change.** Both panes share:
+Timers stay module-level and are never persisted. The board retains `OpenPane {timer, cwd, busy, paths, selection}` (`Selection = {kind:'board'} | {kind:'unit'; production; unit}`). Accounts and queue use the same `tablePane` helper in `register.tsx`: open/loading, one reader at a time, a 10 s timer, fixed failure reason, reload and close. Each instance keeps its own context, watched paths and lifecycle counter. Close invalidates pending work and zone lookups; a forced refresh during a read is coalesced into one following read. Paths and board selection survive a failed refresh.
+
+**Refresh on change.** The board and accounts panes share:
 
 ```ts
 refreshIfChanged<T>(files: RefreshFiles, paths: readonly RefreshPaths[],
@@ -124,7 +130,7 @@ type RefreshPaths =
   | { kind: 'discovery'; sources: string[]; loadedAt: number } // sources vs the load time
 ```
 
-It stats each source; one newer than its reference (or a failed stat) runs the generator once and stores the result. `isOpen` is checked before every stat, before the generator and before the set. The board ticks on a `$.clock.every(10_000)` timer and on `turn.complete`; an unchanged board tick only moves `now`, so `in 2h 16m`/`late …` and the detail ruler's now mark advance without a process. The accounts pane ticks on its own 10 s timer, with a `busy` guard, and ignores `turn.complete`. `loadAccounts` watches `~/.local/state/agent-notes/usage.json`, `~/.local/state/accounts/groups.json`, `~/.claude/config/accounts.json` and `~/.local/state/accounts/role_map_cache.json` as one `discovery` path; a missing input is watched through its nearest existing parent directory. `ui.close` (any origin) cancels the pane's timer and drops its state.
+It stats each source; one newer than its reference (or a failed stat) runs the generator once and stores the result. `isOpen` is checked before every stat, before the generator and before the set. The board ticks on a `$.clock.every(10_000)` timer and on `turn.complete`; an unchanged board tick only moves `now`, so `in 2h 16m`/`late …` and the detail ruler's now mark advance without a process. The accounts pane ticks on its own 10 s timer, with a `busy` guard, and ignores `turn.complete`. `loadAccounts` watches `~/.local/state/agent-notes/usage.json`, `~/.local/state/accounts/groups.json`, `~/.claude/config/accounts.json` and `~/.local/state/accounts/role_map_cache.json` as one `discovery` path; a missing input is watched through its nearest existing parent directory. `ui.close` (any origin) cancels the pane's timer and drops its state. The build queue has live process-memory readings, so its shared-helper policy runs `--json` once every 10 s while open, independently of file changes and `turn.complete`.
 
 **Views.** Views draw the `as_of` snapshot and never recompute an ETA (`in …`/`late …` is display arithmetic on recorded times). Colours are theme keys only. Facts draw in the default colour; `inactive` is the only grey, for labels (`workers`, `as of`), separators and history. There is no `subtle` and no `dimColor`: the user found the dim grey hard to read.
 
@@ -173,22 +179,22 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 ## Invariants
 
 - **Nothing shows by itself.** A pane opens only from its slash command or a press inside an open pane, and closes from its command, Escape or its close mark. No pane at `session.start`, no `AbovePrompt` band, no status line, no toast.
-- **A closed pane does no work.** With a pane closed there is no timer, no `$.fs` call and no `$.process.run` for it; with no board pane open, `turn.complete` passes straight to `next`, and it never refreshes accounts. While open, refresh is `$.fs.stat` of existing files, and a process starts only on open or when a stat shows a change.
-- **No new long-running process.** No daemon, service or timer job exists outside the mod; the generator and `accounts.py` are one-shot runs.
+- **A closed pane does no work.** With a pane closed there is no timer, no `$.fs` call and no `$.process.run` for it; with no board pane open, `turn.complete` passes straight to `next`, and it never refreshes accounts. While open, board and accounts refresh through `$.fs.stat` of existing files; the queue runs its reader every 10 s for live measurements.
+- **No new long-running process.** No daemon, service or timer job exists outside the mod; the generator, `accounts.py` and `build_queue.py` are one-shot runs.
 - **The mod never opens a credential file and never asks for a login.** It never reads `.claude.json`, `auth.json` or any `id_token`, and `accounts.py status --json` has no login field, so no login address reaches the mod.
-- **A failed accounts run shows a fixed reason**, never process output, in the pane, a command reply, a log, a toast or a message.
+- **A failed accounts or queue run shows a fixed reason**, never process output, in the pane, a command reply, a log, a toast or a message.
 - **User-facing times use the user zone.** Python writes them with `astimezone(user_zone())`; the mod resolves the zone in `scripts/lib/user_zone.py`'s order; board times use the production's registered zone. `scripts/lib/test_user_zone` scans every script.
 - **The ETA is the latest stated promise**, never the schedule end an overdue phase is advanced to. `eta.at`, `first` and `trail` hold promises only; `schedule_end` is never a trail entry; the ruler's ETA mark is `eta.at`.
 - **Readers place an ETA by `eta_phase_id`**, never `phase_id`, which names the phase active when it was recorded.
 - **The mod never computes ETAs or predictions**; it draws the board JSON. The recorder never writes the board file; only `board_json.py` does.
 - **`board.d.ts` is the generator's contract**, and every output key is tested against it.
 - **Imports stay one-way.** `phase_table` imports `plan_history`, never `progress_history`; `progress_history` imports `phase_table` only inside function bodies (`_project_chain_eta`, `_phase_eta_line`). basedpyright's import-cycle check is file-level with no line anchor, so a cycle must be removed, not suppressed.
-- **The board and accounts panes are independent**: separate state keys, timers and lifecycles, so either opens and closes without touching the other. Engine calls stay in `register.tsx`.
+- **The board, accounts and queue panes are independent**: separate state records, timers and lifecycles, so each opens and closes without touching the others. Engine calls stay in `register.tsx`.
 - `settings.json` is never edited to install the mod. `.gitignore` allows `mods/**` and excludes `mods/**/.claude-plugin/types/`.
 
 ## Calibration and gotchas
 
-- Refresh interval: 10 s for both panes (`$.clock.every(10_000)`), plus `turn.complete` for the board.
+- Refresh interval: 10 s for all panes (`$.clock.every(10_000)`), plus `turn.complete` for the board.
 - Phase strip: above 30 phases, or more phases than the room, it shows `N/M done` instead of cells.
 - Ruler horizon: 10 % beyond the later of the promise and now; board ruler width is `bodyColumns - 4`, unit `bodyColumns - 2`, minimum 8.
 - `doing` is cut to 80 characters, after the `launcher: ` prefix and the summary or findings path are removed.
@@ -201,13 +207,19 @@ It stats each source; one newer than its reference (or a failed stat) runs the g
 - Taking worker cells from the round table's last row blanks them once the director opens an activity; reading the next gated phase instead of the reported one gives the wrong ETA line.
 - A failed stat counts as a change: a `failed` board pane retries each tick while a source stays newer than the board file, and recovers on the next good run.
 - A close during a pending `session.start` load or zone lookup must not restart the accounts timer; the lifecycle counter guards it.
-- The mod runs the generator and `accounts.py` installed under `~/.claude/scripts`, not a worktree's copy, so a live check of the mod proves only promoted code; a contract change can only be checked live after it reaches main.
+- The mod runs the generator, `accounts.py` and `build_queue.py` installed under `~/.claude/scripts`, not a worktree's copy, so a live check of the mod proves only promoted code; a contract change can only be checked live after it reaches main.
 - `accounts.py status` with no flags can print login addresses in its problem notes. Never run it to look up an account label; take the label from the folder name (`~/.claude2` → `claude2`).
 - A fresh checkout's `tsc` reports `TS2307` for `claude-code` until a live session loads the folder and the engine writes `mods/unit-board/.claude-plugin/types/`.
 - Tests patch `plan_history.now_epoch` for the clock.
 - A session loads mod hooks when it starts. A session started before a mod change keeps the old hooks until `/reload-plugins`, and the command file's fallback line answers in their place; the line names `/reload-plugins` for that reason. The natedev showrunner hit this on 2026-10-18.
 - The board reads the style ledger with `sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0)`, never through `style_ledger.Ledger`, which takes a write lock (`BEGIN IMMEDIATE`) and loads the rule catalog. SQLite's default 5 s busy timeout made a locked ledger stall each standing unit in turn; `timeout=0` gives 0 at once. `style_plan.py` writes a ticket heading as `### Phase <n> — <ticket id>`, so the phase id is the bare number; the ledger's open ticket names the ticket, and it can run one ticket ahead of the run record after refill.
 - The Units report (`style_units.py`) counts recent built findings with `built_at` on schema 25. A ledger before schema 25 has no such column; the report then uses `style_ledger.legacy_built_at_sql("h")`, the rule migration 25 uses to fill `built_at`: the merged build ticket's `updated_at`, else the finding's `updated_at`. A ledger without the `tickets` table or the `build_ticket` column uses the finding's `updated_at`, because that SQL fails there. The report stays read-only and never migrates the ledger. The totals ETA uses the same recent count.
+
+## Checks
+
+From the repository root, run `command claude plugin test mods/unit-board` for the whole mod suite and `nix shell nixpkgs#typescript --command tsc --noEmit -p mods/unit-board` for the mod type check. The ignored `.claude-plugin/types/` declarations from a loaded session are required by `tsc`; the test command alone did not generate them in this checkout.
+
+The queue reader checks are `python3 -m unittest scripts.build_queue.test_build_queue` and `basedpyright scripts/build_queue/build_queue.py`. A live pane check requires the installed code and `/reload-plugins`: compare its rows and head explanation with the script at the same time.
 
 ## Why
 
