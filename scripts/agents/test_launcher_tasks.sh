@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export AGENTS_CONFIG_PUBLISH=0
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_agents_registry.sh"

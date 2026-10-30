@@ -143,6 +143,8 @@ def session_directory(run_id: str) -> Path:
 
 
 def workers(session: Path, sources: set[Path], mesh_prefix: str = "") -> list[dict[str, object]]:
+    from scripts.agents.codex_mesh import recorded_turn_settings
+
     roster = read_object(session / "mesh_roster.json")
     sources.update((session, session / "mesh_roster.json", session / "board.log"))
     metadata = list(session.glob("impl_worker_*.json"))
@@ -193,9 +195,12 @@ def workers(session: Path, sources: set[Path], mesh_prefix: str = "") -> list[di
         record = fields(roster[name])
         meta = by_name.get(name, {}) or by_slot.get(slot, {})
         status = text(record.get("status"))
+        settings = recorded_turn_settings(record)
+        model_label = f"{settings.model}:{settings.effort}" if settings.model and settings.effort else settings.model
         state = {"done": "idle"}.get(status, status)
         result.append({"slot": slot, "role": text(record.get("role")), "state": state,
-                       "model": "/".join(part for part in (text(meta.get("family")), text(meta.get("model"))) if part),
+                       "model": "/".join(part for part in (text(meta.get("family")), model_label) if part),
+                       "effort": settings.effort,
                        "doing": newest.get(slot, "")})
     return result
 
