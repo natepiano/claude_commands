@@ -212,11 +212,51 @@ def _git(repo: Path, *arguments: str) -> str:
     return result.stdout
 
 
+def registered_productions() -> Iterable[Path]:
+    """Production docs named by the registered update timers."""
+    import showrunners
+
+    return showrunners.timer_docs().values()
+
+
+def common_git_directory(repo: Path) -> Path:
+    """The repository directory shared by all its worktrees."""
+    directory = Path(_git(repo, "rev-parse", "--git-common-dir").strip())
+    return (repo / directory).resolve()
+
+
+def reviewed_merge_refs(repo: Path, productions: Callable[[], Iterable[Path]]) -> list[str]:
+    """Origin branches whose readable productions in this repository already write review rows."""
+    try:
+        common = common_git_directory(repo)
+        available = set(_git(repo, "for-each-ref", "--format=%(refname)", "refs/remotes/origin/").splitlines())
+        docs = tuple(productions())
+    except (OSError, UnicodeError, ValueError, Refusal, ChangeReviewError):
+        return []
+    refs: list[str] = []
+    for doc in docs:
+        try:
+            lines = doc.read_text(encoding="utf-8").splitlines()
+            if list_path(doc) is None:
+                continue
+            where = Path(production_field(lines, "Repository")).expanduser()
+            if common_git_directory(where) != common:
+                continue
+            branch = production_field(lines, "Merge branch")
+            if f"refs/remotes/origin/{branch}" in available:
+                refs.append(f"origin/{branch}")
+        except (OSError, UnicodeError, ValueError, Refusal, ChangeReviewError):
+            continue
+    return list(dict.fromkeys(refs))
+
+
 def unit_commits(repo: Path, checkpoint: str, previous: str, merge_branch: str,
-                 checked_from: int = CHECKED_FROM) -> list[Commit]:
-    """The unit's own commits since its last checkpoint, without what it merged from the merge branch."""
+                 checked_from: int = CHECKED_FROM, *,
+                 productions: Callable[[], Iterable[Path]] = registered_productions) -> list[Commit]:
+    """The unit's commits, excluding origin merge branches that already write review rows."""
+    excluded = list(dict.fromkeys([f"origin/{merge_branch}", *reviewed_merge_refs(repo, productions)]))
     records = _git(repo, "log", "--no-merges", "--format=%H %ct", checkpoint, f"^{previous}",
-                   f"^origin/{merge_branch}", "--").splitlines()
+                   *(f"^{ref}" for ref in excluded), "--").splitlines()
     return [Commit(sha, *_described(repo, sha)) for sha, stamp in (record.split() for record in records)
             if int(stamp) >= checked_from]
 

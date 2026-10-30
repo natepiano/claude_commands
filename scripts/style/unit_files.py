@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
+
+from git_process import GitExitAnswers, run_git
 
 import style_ledger
 from production_units import read_production
@@ -24,18 +25,12 @@ class UnitWorktree:
 
 
 def git(repo: Path, *arguments: str) -> str:
-    result = subprocess.run(["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=False)
-    if result.returncode:
-        raise style_ledger.CheckCouldNotRun(result.stderr.strip() or f"git {' '.join(arguments)} failed")
-    return result.stdout
+    return run_git(("git", "-C", str(repo), *arguments)).stdout.decode().replace("\r\n", "\n").replace("\r", "\n")
 
 
 def file_text(repo: Path, commit: str, path: str) -> str:
-    """The text of the file at path in commit. Bytes that are not UTF-8 read as U+FFFD, so a latin-1 file never raises."""
-    shown = subprocess.run(["git", "-C", str(repo), "cat-file", "blob", f"{commit}:{path}"], capture_output=True, check=False)
-    if shown.returncode:
-        raise style_ledger.CheckCouldNotRun(shown.stderr.decode(errors="replace").strip() or f"git cat-file {commit}:{path} failed")
-    return shown.stdout.decode(errors="replace")
+    """Read a Git blob, replacing non-UTF-8 bytes with U+FFFD."""
+    return run_git(("git", "-C", str(repo), "cat-file", "blob", f"{commit}:{path}")).stdout.decode(errors="replace")
 
 
 def unit_worktrees(doc: Path) -> tuple[UnitWorktree, ...]:
@@ -55,8 +50,9 @@ def unit_file_holders(repo: Path, doc: Path, ledger: style_ledger.Ledger, own_un
     holders: dict[str, frozenset[str]] = {}
     for row in units:
         busy: set[str] = set()
-        exists = subprocess.run(["git", "-C", str(repo), "show-ref", "--verify", "--quiet",
-                                 "refs/heads/" + row.branch.removeprefix("refs/heads/")], check=False)
+        exists = run_git(("git", "-C", str(repo), "show-ref", "--verify", "--quiet",
+                          "refs/heads/" + row.branch.removeprefix("refs/heads/")),
+                         answers=GitExitAnswers(frozenset({0, 1})))
         if exists.returncode == 0:
             busy.update(filter(None, git(repo, "diff", "--name-only", "--no-renames", "-z", f"{row.merge_branch}...{row.branch}").split("\0")))
         if (row.worktree / ".git").exists():

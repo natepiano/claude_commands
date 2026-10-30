@@ -46,6 +46,24 @@ class RuleTests(unittest.TestCase):
         _ = (member / "Cargo.toml").write_text('[package]\nname = "public-member"\nversion = "0.1.0"\n')
         return repo
 
+    def test_manifest_read_failure_remains_the_original_file_error(self) -> None:
+        repo = self.member_repo()
+        path = repo / "docs/member/style/rule.md"
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("---\ntier: C\nfamily: names\n---\n# Rule\n")
+        failure = PermissionError("manifest unreadable")
+        original = Path.read_text
+
+        def read(source: Path) -> str:
+            if source.name == "Cargo.toml":
+                raise failure
+            return original(source)
+
+        with mock.patch.object(Path, "read_text", read):
+            with self.assertRaises(PermissionError) as refused:
+                _ = rules.load_rules(repo)
+        self.assertIs(refused.exception, failure)
+
     def test_loads_each_tier_and_preserves_scheduling_metadata(self) -> None:
         _ = self.write_rule("tool", "tier: A\nmechanism: clippy\n")
         _ = self.write_rule("listed", "tier: B\nfamily: names\npre_filter: 'Some<'\nmode: propose\n")

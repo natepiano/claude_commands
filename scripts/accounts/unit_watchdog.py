@@ -70,7 +70,9 @@ class RecoveryStillRunning:
 
 @dataclass(frozen=True)
 class RecoveryFinished:
+    """The worker result has been read but not consumed."""
     failure: str
+    result_path: Path
 
 
 @dataclass(frozen=True)
@@ -278,8 +280,7 @@ def _recovery_result(job: RecoveryJob, now: datetime) -> RecoveryStillRunning | 
                else "detached restart did not finish within 5 minutes")
     if not isinstance(failure, str):
         raise ValueError("invalid watchdog recovery result")
-    result.unlink(missing_ok=True)
-    return RecoveryFinished(failure)
+    return RecoveryFinished(failure, result)
 
 
 def _alert_without_record(session_id: str, context: RecoveryAlertContext, outage: DownOutage, cause: str) -> None:
@@ -395,8 +396,10 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                                 outcome = _recovery_result(job, now)
                                 if isinstance(outcome, RecoveryStillRunning):
                                     continue
-                                _ = outage.pop("job")
+                                # Keep the job retryable if result cleanup fails.
+                                outcome.result_path.unlink(missing_ok=True)
                                 outage["dropped"] = outcome.failure or "restart did not make the session live"
+                                _ = outage.pop("job")
                             if "dropped" in outage:
                                 text = f"watchdog: {unit}: {outage['dropped']}"
                                 lines.append(text)
@@ -451,13 +454,16 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                         if isinstance(outcome, RecoveryStillRunning):
                             continue
                         failure = outcome.failure
-                        _ = outage.pop("job", None)
-                        # Consume our finished job before a stale restart claim can block it.
+                        # A finished job can own the source's restart claim.
                         owns_claim = source.restart_claim and (job.get("source") == source.identity or source.snapshot_restore)
                         if (source.blocked and not owns_claim) or _held(source, dry_run=False):
+                            outcome.result_path.unlink(missing_ok=True)
                             del retained[key]
                             continue
                         restored = _live_account(doc, unit)
+                        # Keep the result and job if the fresh read is unreadable.
+                        outcome.result_path.unlink(missing_ok=True)
+                        _ = outage.pop("job")
                         since = datetime.fromisoformat(outage["first_seen"]).astimezone(user_zone()).strftime("%H:%M %Z")
                         text = (f"watchdog: {unit} was down since {since}; restarted on {restored}" if restored else
                             f"watchdog: {unit} was down since {since}; {failure or 'restart did not make the session live'}; "

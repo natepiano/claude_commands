@@ -306,6 +306,159 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertFalse(any("restarted on" in line for line in self.notices))
         cleared.assert_not_called()
 
+    def finished_recovery(self) -> tuple[dict[str, unit_watchdog.DownOutage], Path]:
+        _ = self.add_unit("unit")
+        self.finish_jobs = False
+        self.die("unit")
+        _ = self.pass_at(0)
+        _ = self.pass_at(2)
+        state = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
+        outage = state["unit"]
+        assert "job" in outage
+        job = outage["job"]
+        result = Path(job["result"])
+        _ = result.write_text('"fixture evidence"')
+        self.revive("unit", "claude4")
+        return state, result
+
+    def test_finished_recovery_keeps_evidence_when_the_second_fresh_read_is_unreadable(self) -> None:
+        state, result = self.finished_recovery()
+        with (patch.object(unit_watchdog, "_live_account", side_effect=["", OSError("fixture unreadable")]) as live,
+              patch.object(outage_alerts, "clear") as cleared):
+            lines = self.pass_at(3)
+        self.assertEqual(live.call_count, 2)
+        self.assertEqual(result.read_text(), '"fixture evidence"')
+        self.assertEqual(unit_watchdog._read_state(), state)  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("watchdog: fixture: fixture unreadable", lines)
+        self.assertFalse(any("restarted on" in line or "retry from" in line for line in [*lines, *self.notices]))
+        self.assertEqual(len(self.pending), 1)
+        cleared.assert_not_called()
+
+    def test_finished_recovery_consumes_evidence_only_after_live_confirmation(self) -> None:
+        state, result = self.finished_recovery()
+        checks: list[str] = []
+
+        def confirm(_doc: Path, _unit: str) -> str:
+            checks.append("checked")
+            self.assertEqual(result.read_text(), '"fixture evidence"')
+            self.assertEqual(unit_watchdog._read_state(), state)  # pyright: ignore[reportPrivateUsage]
+            return "" if len(checks) == 1 else "claude4"
+
+        with patch.object(unit_watchdog, "_live_account", side_effect=confirm):
+            lines = self.pass_at(3)
+        self.assertEqual(len(checks), 2)
+        self.assertFalse(result.exists())
+        self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
+        self.assertTrue(any("restarted on claude4" in line for line in lines))
+        self.assertEqual(len(self.pending), 1)
+
+    def test_finished_recovery_consumes_evidence_after_absent_confirmation_and_retries(self) -> None:
+        state, result = self.finished_recovery()
+        checks: list[str] = []
+
+        def confirm(_doc: Path, _unit: str) -> str:
+            checks.append("checked")
+            self.assertEqual(result.read_text(), '"fixture evidence"')
+            return ""
+
+        with patch.object(unit_watchdog, "_live_account", side_effect=confirm):
+            lines = self.pass_at(3)
+        self.assertEqual(len(checks), 2)
+        self.assertFalse(result.exists())
+        after = unit_watchdog._read_state()["unit"]  # pyright: ignore[reportPrivateUsage]
+        before = state["unit"]
+        assert "job" in after and "job" in before
+        self.assertNotEqual(after["job"], before["job"])
+        self.assertTrue(any("fixture evidence; retry from claude4's recovery record" in line for line in lines))
+        self.assertFalse(any("restarted on" in line for line in [*lines, *self.notices]))
+        self.assertEqual(len(self.pending), 2)
+
+    def test_held_unit_discards_finished_recovery_evidence_without_retry(self) -> None:
+        _, result = self.finished_recovery()
+        _ = self.hold("claude4", terminal=True)
+        with (patch.object(unit_watchdog, "_live_account", return_value="") as live,
+              patch.object(launch_permission, "launch_permission", return_value=launch_permission.BlockedByShutdown("terminal stop"))):
+            lines = self.pass_at(3)
+        live.assert_called_once()
+        self.assertFalse(result.exists())
+        self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(any("restarted on" in line or "retry from" in line for line in [*lines, *self.notices]))
+        self.assertEqual(len(self.pending), 1)
+
+    def test_blocked_unit_discards_finished_recovery_evidence_without_retry(self) -> None:
+        _, result = self.finished_recovery()
+        saved = record.SessionShutdown(login="four@example.invalid", label="claude4", machine="natedev",
+            requested_at=NOW.isoformat(), request_id="terminal-stop", requested_by=record.FromTerminal(kind="terminal"),
+            hold="session", then="stop", force="wait for ready", alerts="none", probe=False,
+            session=self.units["unit"], workers=[], timers=[], settle_message=record.SettleMessageNotSent(kind="not sent"),
+            where=record.WhereNotSaid(kind="not said"), progress=record.SessionStopped(kind="stopped", at=NOW.isoformat()),
+            stop_issues=[], trail=[])
+        self.assertTrue(record.create_session(saved))
+        with patch.object(unit_watchdog, "_live_account", return_value="") as live:
+            lines = self.pass_at(3)
+        live.assert_called_once()
+        self.assertFalse(result.exists())
+        self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
+        self.assertFalse(any("restarted on" in line or "retry from" in line for line in [*lines, *self.notices]))
+        self.assertEqual(len(self.pending), 1)
+
+    def test_finished_recovery_without_a_source_records_failure_and_consumes_the_result(self) -> None:
+        state, result = self.finished_recovery()
+        del state["unit"]["recovery"]
+        unit_watchdog._write_state(state)  # pyright: ignore[reportPrivateUsage]
+        for snapshot in record.all_snapshots():
+            snapshot["sessions"] = []
+            record.write_snapshot(snapshot)
+        self.die("unit")
+        lines = self.pass_at(3)
+        outage = unit_watchdog._read_state()["unit"]  # pyright: ignore[reportPrivateUsage]
+        assert "dropped" in outage
+        self.assertEqual(outage["dropped"], "fixture evidence")
+        self.assertNotIn("job", outage)
+        self.assertFalse(result.exists())
+        self.assertIn("watchdog: unit: fixture evidence", lines)
+        self.assertIn("watchdog: unit: no recovery record or snapshot", lines)
+        self.assertEqual(len(self.pending), 1)
+
+    def test_failed_result_cleanup_retries_when_a_recovery_source_returns(self) -> None:
+        state, result = self.finished_recovery()
+        self.pending.clear()
+        del state["unit"]["recovery"]
+        unit_watchdog._write_state(state)  # pyright: ignore[reportPrivateUsage]
+        snapshots = record.all_snapshots()
+        for snapshot in snapshots:
+            empty = snapshot.copy()
+            empty["sessions"] = []
+            record.write_snapshot(empty)
+        self.die("unit")
+        unlink = Path.unlink
+        failures: list[Path] = []
+
+        def remove(path: Path, *, missing_ok: bool = False) -> None:
+            if path == result and not failures:
+                failures.append(path)
+                raise PermissionError("fixture result cleanup denied")
+            unlink(path, missing_ok=missing_ok)
+
+        with patch.object(Path, "unlink", remove):
+            lines = self.pass_at(3)
+            self.assertIn("watchdog: fixture: fixture result cleanup denied", lines)
+            self.assertTrue(result.exists())
+            after_failure = unit_watchdog._read_state()["unit"]  # pyright: ignore[reportPrivateUsage]
+            self.assertIn("job", after_failure)
+            for snapshot in snapshots:
+                record.write_snapshot(snapshot)
+            lines = self.pass_at(4)
+        self.assertFalse(result.exists())
+        self.assertTrue(any("fixture evidence; retry from claude4's recovery record" in line for line in lines))
+        self.assertFalse(any("no longer exists" in line for line in lines))
+        self.assertEqual(len(self.pending), 1)
+        self.finish_jobs = True
+        lines = self.pass_at(5)
+        self.assertTrue(any("restarted on claude4" in line for line in lines))
+        self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
+        self.assertIn("unit", {entry["sessionId"] for entry in self.fixture.live})
+
     def test_10_26_auto_move_clears_a_stale_hold_and_every_unit_recovers(self) -> None:
         _ = self.fixture.groups(units="claude4")
         for name in ("alpha", "beta", "gamma"):
