@@ -14,12 +14,10 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 
 from scripts.direct.verify_mac_offload_test_support import stub_build_tool_path
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
-HANG_SECONDS = TEST_HANG_GUARD_SECS
 FIXED_RUSTC = "rustc 1.90.0 (1159e78c4 2025-09-14)"
 
 
@@ -241,7 +239,7 @@ esac
             capture_output=True,
             text=True,
             check=False,
-            timeout=HANG_SECONDS,
+            timeout=TEST_HANG_GUARD_SECS,
         )
 
     def calls_made(self) -> list[str]:

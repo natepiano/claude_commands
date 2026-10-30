@@ -21,6 +21,10 @@ from unittest import mock
 
 import tmp_sweep
 if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
+if TYPE_CHECKING:
     from ..lib import scratch
     from ..message import sessions
 else:
@@ -909,7 +913,7 @@ class HandCleanupTests(TmpSweepCase):
 class WorkerAndGitTests(TmpSweepCase):
     def git(self, repo: Path, *arguments: str) -> None:
         _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@test",
-                            *arguments], check=True, capture_output=True, timeout=10,
+                            *arguments], check=True, capture_output=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
 
     def clone(self, name: str, *options: str) -> Path:

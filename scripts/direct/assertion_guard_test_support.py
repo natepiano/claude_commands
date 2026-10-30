@@ -16,10 +16,9 @@ from unittest.mock import patch
 from scripts.direct import assertion_guard
 from scripts.production import showrunners
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 GUARD = Path(assertion_guard.__file__)
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 class GitRepositoryFixture(unittest.TestCase):
     root: Path = Path()
@@ -52,7 +51,7 @@ class GitRepositoryFixture(unittest.TestCase):
         result = subprocess.run(
             ["git", "-C", str(self.repo), "-c", "user.name=t", "-c", "user.email=t@t",
              "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *arguments],
-            env=self.environment, capture_output=True, text=True, check=True, timeout=5,
+            env=self.environment, capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
         )
         return result.stdout.strip()
 
@@ -71,7 +70,7 @@ class GitRepositoryFixture(unittest.TestCase):
     def guard(self, *arguments: str, stdin: str = "") -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(GUARD), "--repo", str(self.repo), *arguments],
-            env=self.environment, input=stdin, capture_output=True, text=True, check=False, timeout=5,
+            env=self.environment, input=stdin, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def change(self, path: str, before: str, after: str) -> None:

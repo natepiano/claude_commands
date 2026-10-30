@@ -20,7 +20,8 @@ from typing import cast
 from unittest import mock
 
 from scripts.production import staff
-from scripts.production.staff_test_support import CHECKOUT, PROCESS_TIMEOUT, STAFF_SCRIPT, StaffTestCase
+from scripts.production.staff_test_support import CHECKOUT, STAFF_SCRIPT, StaffTestCase
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 MISSING_ID = staff.StaffId("s00000000000")
@@ -44,7 +45,7 @@ def concurrent_ensure(
     """Release both real writer processes together and return an id or failure."""
     with result:
         try:
-            _ = ready.wait(timeout=PROCESS_TIMEOUT)
+            _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
             row = staff.ensure(kind, name=name, parent=parent)
             result.send((True, str(row.id)))
         except Exception as error:
@@ -87,9 +88,9 @@ class StaffTests(StaffTestCase):
                 processes.append(process)
                 process.start()
                 send.close()
-            _ = ready.wait(timeout=PROCESS_TIMEOUT)
+            _ = ready.wait(timeout=TEST_HANG_GUARD_SECS)
             for process in processes:
-                process.join(timeout=PROCESS_TIMEOUT)
+                process.join(timeout=TEST_HANG_GUARD_SECS)
                 self.assertFalse(process.is_alive(), "concurrent staff writer did not finish")
                 self.assertEqual(process.exitcode, 0)
             ids: list[str] = []
@@ -102,7 +103,7 @@ class StaffTests(StaffTestCase):
             for process in processes:
                 if process.is_alive():
                     process.terminate()
-                process.join(timeout=PROCESS_TIMEOUT)
+                process.join(timeout=TEST_HANG_GUARD_SECS)
                 process.close()
             for result in results:
                 result.close()
@@ -411,7 +412,7 @@ class StaffTests(StaffTestCase):
         before = self.staff_file.read_bytes()
         killed = subprocess.run(
             [sys.executable, "-c", KILLED_WRITER], cwd=CHECKOUT,
-            capture_output=True, text=True, check=False, timeout=PROCESS_TIMEOUT,
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(killed.returncode, 73, killed.stderr)
         self.assertEqual(self.staff_file.read_bytes(), before)
@@ -612,7 +613,7 @@ class StaffTests(StaffTestCase):
                     pending = self.start_script(STAFF_SCRIPT, "move", unit.id, f"--parent={destination.id}", "--json")
                     self.assert_operation_blocks(pending, listener)
                 self.assertEqual(staff.by_id(unit.id), unit)
-            output, errors = pending.communicate(timeout=PROCESS_TIMEOUT)
+            output, errors = pending.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(pending.returncode, 0, errors)
         self.assertEqual(cast(object, json.loads(output)), replace(unit, parent=destination.id).to_json())
         self.assertEqual(staff.by_id(unit.id), replace(unit, parent=destination.id))
@@ -651,12 +652,12 @@ class StaffTests(StaffTestCase):
                 "from scripts.production import staff; " +
                 "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='child')\")"],
                 cwd=CHECKOUT, pass_fds=staff.operation_fds(), capture_output=True,
-                text=True, timeout=PROCESS_TIMEOUT, check=False)
+                text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(child.returncode, 0, child.stderr)
             with self.lock_notice(self.staff_file.parent / "operation.lock") as listener:
                 seed = self.start_script(STAFF_SCRIPT, "ensure", "showrunner", "--name=after")
                 self.assert_operation_blocks(seed, listener)
-        output, errors = seed.communicate(timeout=PROCESS_TIMEOUT)
+        output, errors = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(seed.returncode, 0, output + errors)
         self.assertEqual({row.name for row in staff.snapshot().rows}, {"outer", "child", "after"})
 
@@ -667,13 +668,13 @@ class StaffTests(StaffTestCase):
             exited = subprocess.Popen([sys.executable, "-c",
                 "import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)", str(inherited.fileno())],
                 pass_fds=(inherited.fileno(),))
-            self.assertEqual(exited.wait(timeout=PROCESS_TIMEOUT), 0)
+            self.assertEqual(exited.wait(timeout=TEST_HANG_GUARD_SECS), 0)
             environment = {**os.environ, "STAFF_OPERATION_FD": str(inherited.fileno())}
             child = subprocess.run([sys.executable, "-c",
                 "from scripts.production import staff; " +
                 "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='orphan')\")"],
                 cwd=CHECKOUT, env=environment, pass_fds=(inherited.fileno(),), capture_output=True,
-                text=True, timeout=3, check=False)
+                text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(child.returncode, 0, child.stderr)
         self.assertEqual([row.name for row in staff.find()], ["orphan"])
 
@@ -701,7 +702,7 @@ class StaffTests(StaffTestCase):
                     env=environment, pass_fds=(unlocked.fileno(),), stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True)
                 self.assert_operation_blocks(child, listener)
-        output, errors = child.communicate(timeout=PROCESS_TIMEOUT)
+        output, errors = child.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(child.returncode, 0, output + errors)
         self.assertEqual(len(staff.find(kind="showrunner")), 1)
 

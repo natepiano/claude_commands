@@ -15,9 +15,7 @@ from collections.abc import Iterable
 from contextlib import closing
 from pathlib import Path
 from typing import BinaryIO, Literal, TypedDict, cast
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class SshConfiguration(TypedDict):

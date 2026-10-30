@@ -7,7 +7,7 @@ import unittest
 # Existing suites import these fixture names from this module.
 from scripts.direct.verify_examples_test_support import (
     ExampleWorkspaceFixture as ExampleWorkspaceFixture,
-    FIXED_RUSTC as FIXED_RUSTC, HANG_SECONDS as HANG_SECONDS, VERIFY as VERIFY,
+    FIXED_RUSTC as FIXED_RUSTC, VERIFY as VERIFY,
     rust_tool_path as rust_tool_path, workspace_metadata as workspace_metadata,
     SeededExampleWorkspaceFixture,
 )

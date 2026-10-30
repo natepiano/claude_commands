@@ -7,8 +7,9 @@ import subprocess
 import sys
 from unittest.mock import patch
 from scripts.direct.verify_token_wait_test_support import VERIFY
-from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture, TEST_HANG_GUARD_SECS
+from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenCancellationTests(VerifyTokenOwnershipFixture):
@@ -53,7 +54,7 @@ class VerifyTokenCancellationTests(VerifyTokenOwnershipFixture):
 
             # The signal goes to verify alone, as a caller's kill would.
             os.kill(second.pid, signal.SIGTERM)
-            self.assertEqual(second.wait(timeout=10), -signal.SIGTERM)
+            self.assertEqual(second.wait(timeout=TEST_HANG_GUARD_SECS), -signal.SIGTERM)
             self.wait_for_group_exit(second.pid)
             self.assertEqual(self.live_group_processes(second.pid), [],
                              "the token wait outlived its verify")

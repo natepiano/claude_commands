@@ -13,6 +13,7 @@ from typing import override
 from zoneinfo import ZoneInfo
 
 import log_backup
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("log_backup.py")
@@ -57,7 +58,7 @@ class LogBackupTests(unittest.TestCase):
         return sorted(path.name for path in self.backups.iterdir()) if self.backups.exists() else []
 
     def run_script(self, script: list[str]) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(script, capture_output=True, text=True, check=False, timeout=300,
+        return subprocess.run(script, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
                               env={**os.environ, "HOME": str(self.root), "SHOWRUNNER_STATE_DIR": str(self.state)})
 
     def test_a_log_is_copied_under_its_stamp(self) -> None:

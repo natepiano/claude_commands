@@ -18,9 +18,8 @@ import nightly_review
 import account
 from scripts.accounts import accounts
 from scripts.production import showrunners
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 # `messages` reads the message review from its own folder, as the timer does.
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(nightly_review.__file__).resolve().parents[1] / "notify"))
 if TYPE_CHECKING:

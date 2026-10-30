@@ -12,10 +12,9 @@ from typing import cast, override
 from scripts.direct.test_tree_watch import write_workspace
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 CANCEL_LINE = ("verify.sh: cancelled — the tree changed while {cmd} ran, so this result "
                + "would be stale. Resubmit the {cmd} when your edits are done.")
@@ -68,7 +67,7 @@ if stage == os.environ.get("TEST_BLOCK_STAGE", "test"):
         from scripts.direct.wait_for_test_state import wait_for_file
         wait_for_file(root / "release")
         child.terminate()
-        child.wait(timeout=10)
+        child.wait(timeout=int(os.environ["TEST_HANG_GUARD_SECS"]))
     else:
         signal.alarm(int(os.environ["TEST_HANG_GUARD_SECS"]))
         signal.pause()
@@ -87,7 +86,7 @@ child = subprocess.Popen([sys.executable, "-c", "import os, signal; signal.alarm
 
 def cancel(signum, _frame):
     child.terminate()
-    child.wait(timeout=10)
+    child.wait(timeout=int(os.environ["TEST_HANG_GUARD_SECS"]))
     (root / "mac-cancelled").write_text(str(signum))
     raise SystemExit(128 + signum)
 
@@ -198,14 +197,14 @@ if __name__ == "__main__":
             super().wait_for_running(path, process)
         except (AssertionError, TimeoutError):
             if process.poll() is not None:
-                output, errors = process.communicate(timeout=10)
+                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 self.fail(f"verify exited before {path.name}: {output!r} {errors!r}")
             raise
 
     def finish_process(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is None:
             self.end_group(process.pid)
-        _ = process.communicate(timeout=30)
+        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def cargo_calls(self) -> list[list[str]]:
         return [cast(list[str], json.loads(line)) for line in
@@ -230,7 +229,7 @@ if __name__ == "__main__":
         self.assertEqual(list((self.root / "verify-steps").glob("*.json")), [], "cancel kept its active step")
         pid = int((self.control / "descendant.pid").read_text())
         state = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
-                               capture_output=True, text=True, check=False, timeout=10).stdout.strip()
+                               capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS).stdout.strip()
         self.assertTrue(not state or state.startswith("Z"), f"cargo descendant {pid} survived: {state}")
 
     def assert_no_cache_verdict(self) -> None:
@@ -239,7 +238,7 @@ if __name__ == "__main__":
                              "cancelled run recorded a cache verdict")
 
     def assert_cancelled(self, process: subprocess.Popen[str], command: str) -> None:
-        output, errors = process.communicate(timeout=15)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 77, output + errors)
         self.assertEqual((output + errors).splitlines().count(CANCEL_LINE.format(cmd=command)), 1,
                          output + errors)

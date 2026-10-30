@@ -30,6 +30,10 @@ else:
     from scripts.direct import step_record
     from scripts.lint.memory_test_support import fake_memory_readings
 from test_index import use_test_log
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 use_test_log()
 
@@ -334,7 +338,7 @@ test "$BUILDLOG_MEM_OUTCOME" = LeftQueue
 '''
         result = subprocess.run(["bash", "-c", command, "memory-marker-test",
             str(mac_idle.SCRIPTS / "lint/memory_gate.sh")], env={**os.environ, "BUILDLOG_MEMINFO": str(meminfo),
-            "TEST_RETRY_MARKER": str(marker)}, capture_output=True, text=True, timeout=300, check=False)
+            "TEST_RETRY_MARKER": str(marker)}, capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(marker.exists())
 

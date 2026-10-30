@@ -17,12 +17,12 @@ from unittest.mock import patch
 
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "shutdown"))
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from scripts.shutdown.test_support import ShutdownTestCase
 from scripts.lib import relaunch
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SUPERVISOR = Path(__file__).with_name("relaunch.py")
 

@@ -25,6 +25,7 @@ from scripts.review_links import review_link, serve
 
 
 from typing import TYPE_CHECKING, cast
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 if TYPE_CHECKING:
@@ -142,7 +143,7 @@ class ReviewLinkTests(unittest.TestCase):
     def run_link(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [sys.executable, str(SCRIPT), *arguments], env=self.env,
-            text=True, capture_output=True, check=False, timeout=10,
+            text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def linked_snapshot(self, url: str) -> Path:
@@ -222,7 +223,7 @@ class ReviewLinkTests(unittest.TestCase):
         with serve.ReviewLinksServer(("127.0.0.1", 0), self.snapshots) as server:
             thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
             thread.start()
-            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
             try:
                 connection.request("GET", urlsplit(first.stdout.strip()).path)
                 response = connection.getresponse()
@@ -231,7 +232,7 @@ class ReviewLinkTests(unittest.TestCase):
             finally:
                 connection.close()
                 server.shutdown()
-                thread.join(5)
+                thread.join(TEST_HANG_GUARD_SECS)
 
     def test_a_different_file_set_gets_a_new_id(self) -> None:
         first = self.source("first.txt", "first")
@@ -302,7 +303,7 @@ class ReviewLinkTests(unittest.TestCase):
             thread.start()
             try:
                 for url in (original_url, alias_url):
-                    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                    connection = HTTPConnection("127.0.0.1", server.server_port, timeout=TEST_HANG_GUARD_SECS)
                     try:
                         connection.request("GET", urlsplit(url).path)
                         response = connection.getresponse()
@@ -312,7 +313,7 @@ class ReviewLinkTests(unittest.TestCase):
                         connection.close()
             finally:
                 server.shutdown()
-                thread.join(5)
+                thread.join(TEST_HANG_GUARD_SECS)
         repeated_original = self.run_link(str(original))
         repeated_alias = self.run_link(str(alias))
         self.assertEqual(repeated_original.returncode, 0, repeated_original.stderr)
@@ -477,11 +478,11 @@ class SnapshotIdAllocationTests(unittest.TestCase):
                 if first_read:
                     # Keep the first read open until the other publisher is
                     # contending for the real lock, with a finite failure guard.
-                    self.assertTrue(second_lock_attempt.wait(2), "second publisher never attempted the lock")
+                    self.assertTrue(second_lock_attempt.wait(TEST_HANG_GUARD_SECS), "second publisher never attempted the lock")
                 return index
 
             def publish(source: Path) -> list[str]:
-                _ = start.wait(timeout=5)
+                _ = start.wait(timeout=TEST_HANG_GUARD_SECS)
                 return review_link.snapshot([source])
 
             with patch.dict(os.environ, {"REVIEW_LINKS_ROOT": str(snapshots), "REVIEW_LINKS_HOST": "natedev"}):
@@ -489,7 +490,7 @@ class SnapshotIdAllocationTests(unittest.TestCase):
                       patch.object(review_link, "read_snapshot_index", side_effect=hold_first_read),
                       ThreadPoolExecutor(max_workers=2) as workers):
                     runs = [workers.submit(publish, source) for source in sources]
-                    urls = [run.result(timeout=5) for run in runs]
+                    urls = [run.result(timeout=TEST_HANG_GUARD_SECS) for run in runs]
                 index = cast(dict[str, str], json.loads((snapshots / ".index.json").read_text(encoding="utf-8")))
                 self.assertEqual(len(index), 2)
                 self.assertEqual(lock_attempts, 2)

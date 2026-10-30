@@ -32,9 +32,9 @@ from scripts.usage.collect_test_support import (
     SESSION,
     SNAPSHOT_COMMIT_SCRIPT as SNAPSHOT_COMMIT_SCRIPT,
     SshBehavior as SshBehavior,
-    TEST_HANG_GUARD_SECS,
     THREAD,
 )
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final

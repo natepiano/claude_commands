@@ -57,12 +57,71 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
 
 **Ruled out:** a `"types"` suite name to select the type check; a retry path built again from suite and module names.
 
-### Phase 2 — Every test uses the one hang guard  · status: todo
-**Depends on:** Phase 1; models' checkpoint that moves the hang guard to `scripts/lib` and moves `scripts/agents` onto it (ETA 10:45 EDT, 2026-10-30)
+### Phase 2 — Every test uses the one hang guard  · status: done
+**Depends on:** Phase 1; models' dc80ee4c (`scripts/lib/test_hang_guard.py`, `scripts/agents` on it), on origin/sdlc and merged here at d721ac43
 
-Source: the sdlc showrunner, 2026-10-30. 106 test files under `scripts/` each define their own `TEST_HANG_GUARD_SECS` (105 at 300 s, `recorder_fixture.py` at 600 s), and many set their own short real-time limits that fail under load (the cause of the `agents/test_codex_mesh.py` red in Phase 1's gate). After models' checkpoint, one mechanical checkpoint from devtools: every other test imports the one guard; each short real-time limit goes onto the guard, or onto the shared `LifecycleTestClock` where time is the behavior under test; and a check refuses a new local copy. Owners are many; tell natedev which natedev-owned folders it touches. The merge gate finds every `scripts/**/test_*.py` itself (Phase 1), so the copy check runs in every gate from any folder with no list edit; a test file directly in `scripts/` is refused. The Work Order is written when models sends the import form.
+#### Work Order
 
-From Phase 4: `scripts/production/test_merge_gate_suites_resources.py` has CPU workloads that burn real CPU and sleep in real time so `os.wait4` can tell them apart. The sweep moves their hang guard but keeps those workloads and their assertions, and the merge gate CPU tests are in the acceptance run.
+**Goal:** every test that needs a hang guard imports the one guard from `scripts/lib/test_hang_guard.py`; a short real-time wait for an expected event uses that guard; and a test refuses a new local copy.
+
+**Spec:**
+- Source: the sdlc showrunner, 2026-10-30. Short real-time limits fail under load; that caused the `agents/test_codex_mesh.py` red in Phase 1's gate.
+- The one place: `scripts/lib/test_hang_guard.py` (`TEST_HANG_GUARD_SECS = 600`, `LauncherHangGuard`). Its value and behavior do not change. Import it as `scripts/agents/test_heartbeat.py:16` (`from scripts.lib.test_hang_guard import LauncherHangGuard`) and `scripts/direct/recorder_fixture.py:5` (`from scripts.lib import test_hang_guard`) do.
+- **Copies.** 104 files assign `TEST_HANG_GUARD_SECS` themselves (103 at 300 s): `grep -rlE '^\s*TEST_HANG_GUARD_SECS\s*[:=]' scripts --include='*.py'`, without `scripts/lib/test_hang_guard.py`. Each deletes its assignment and imports the name. A file that takes the name from a sibling support module (`test_verify_hold_mac.py`, `test_verify_hold_events.py`, `usage/test_collect.py` and others) imports it from `scripts.lib.test_hang_guard` directly; no support module passes it on. The fixture script text in `scripts/production/merge_gate_test_support.py` (lines 40 and 101, written into a fixture repo with no `scripts.lib`) keeps its `__TEST_HANG_GUARD_SECS__` placeholder; the value put in comes from the imported name.
+- The copies were 300 s and the guard is 600 s. A test that asserts on the 300 value, or uses it as a pass or fail limit, is not changed: report it.
+- **Short waits.** A literal timeout under 120 s on a wait for something the test expects to happen (`Event.wait`, `Thread.join`, `Future.result`, `Queue.get`, `subprocess` `timeout=`, `communicate`, `wait_until`) becomes the guard: `timeout=TEST_HANG_GUARD_SECS` or a `LauncherHangGuard`. Keep a wait that proves something does not happen in a window, a sleep that is the behavior under test, and a timeout given to product code as its own setting. Do not change an assertion on elapsed wall time: list each with `path:line` in the summary. The stub named a shared `LifecycleTestClock` for those, but it lives only in `scripts/agents/test_codex_mesh.py` and retires with the mesh, so a shared test clock is follow-up work. An AST count on d721ac43 found 176 literal waits under 120 s in 75 test files.
+- **Out of scope.** `scripts/agents/` (models moved it in dc80ee4c). Code held for a user decision (sdlc showrunner, 2026-10-30: a natedev proposal may delete it): `scripts/shutdown/` and the tests of `transfer_unit`, `rename`, `rename_unit` and `lib/relaunch`. Their four copies (`production/transfer_unit_test_support.py`, `production/rename_test_support.py`, `production/rename_unit_test_support.py`, `lib/test_relaunch.py`) get only the import change; no other edit goes in held code.
+- `scripts/production/test_merge_gate_suites_resources.py` keeps its CPU workloads, which burn real CPU and sleep in real time so `os.wait4` can tell them apart, and their assertions; only its hang guard moves.
+- **The check.** New `scripts/lib/test_one_hang_guard.py` parses every `scripts/**/*.py`. It refuses (1) an assignment to `TEST_HANG_GUARD_SECS` (plain or annotated, at any level) outside `scripts/lib/test_hang_guard.py`, and (2) an import of `TEST_HANG_GUARD_SECS` or `LauncherHangGuard` from any module but `scripts.lib.test_hang_guard`. Each refusal names `path:line` and says "import it from scripts/lib/test_hang_guard.py". Text in a string is not code, so fixture script text passes. A second test runs the same check on a temporary tree with one copy and expects that refusal. The merge gate finds the module itself (Phase 1).
+- `docs/as-built/merge-gate-and-test-speed.md`: each "300-second hang guard" names the one 600-second guard in `scripts/lib/test_hang_guard.py`.
+
+**Files:**
+- `scripts/lib/test_one_hang_guard.py` — new: the copy check
+- `scripts/direct/` — its copies and short waits (the copy grep and the short-wait rule above pick the files)
+- `scripts/accounts/` — its copies and short waits
+- `scripts/astra/` — its copies and short waits
+- `scripts/bevy_migration_plan/` — its copies and short waits
+- `scripts/bevy_upgrade/` — its copies and short waits
+- `scripts/build_hold/` — its copies and short waits
+- `scripts/build_queue/` — its copies and short waits
+- `scripts/build_targets/` — its copies and short waits
+- `scripts/buildlog/` — its copies and short waits
+- `scripts/feature_log/` — its copies and short waits
+- `scripts/hana_shot/` — its copies and short waits
+- `scripts/herdr/` — its copies and short waits
+- `scripts/hierarchies/` — its copies and short waits
+- `scripts/history/` — its copies and short waits
+- `scripts/hooks/` — its copies and short waits
+- `scripts/issue_score/` — its copies and short waits
+- `scripts/lib/` — its copies and short waits
+- `scripts/lint/` — its copies and short waits
+- `scripts/mac_test/` — its copies and short waits
+- `scripts/message/` — its copies and short waits
+- `scripts/nightly_review/` — its copies and short waits
+- `scripts/notify/` — its copies and short waits
+- `scripts/prioritize/` — its copies and short waits
+- `scripts/production/` — its copies and short waits
+- `scripts/review_links/` — its copies and short waits
+- `scripts/settings/` — its copies and short waits
+- `scripts/shot_report/` — its copies and short waits
+- `scripts/style/` — its copies and short waits
+- `scripts/usage/` — its copies and short waits
+- `scripts/whoami/` — its copies and short waits
+- `docs/as-built/merge-gate-and-test-speed.md` — the guard's value and place
+
+**Workers:** `2 writers` — split by folder; nothing is a hub file.
+- `impl` — `scripts/direct/`
+- `test` (opens as impl) — `scripts/lib/test_one_hang_guard.py` first, then every other folder, and the as-built doc
+
+**State:** none
+
+**Constraints from prior phases:** the merge gate finds every `scripts/**/test_*.py` itself (Phase 1). The merge gate CPU tests keep their real CPU workloads (Phase 4).
+
+**Acceptance gate:**
+- `python3 -m unittest scripts.lib.test_one_hang_guard` green, and its temporary-tree test sees the refusal.
+- The AST check in `scripts/lib/test_one_hang_guard.py` is the copy acceptance: it finds no local assignment, module-level alias or indirect import of the guard. The text copy grep also prints `scripts/production/merge_gate_test_support.py`, for its two fixture-text lines (40 and 101), which are a string and not an assignment (review pass 1).
+- basedpyright prints `0 errors, 0 warnings, 0 notes` on each slot's changed files.
+- The full merge gate is green (`--tests-only --full`), the merge gate CPU tests included.
 
 ### Phase 3 — Close-route closes a route made before its phase record  · status: done
 **Depends on:** none

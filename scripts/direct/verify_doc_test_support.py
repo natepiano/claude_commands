@@ -12,11 +12,10 @@ from typing import ClassVar, TypedDict, cast, override
 import unittest
 
 from scripts.lint.memory_test_support import fake_memory_readings
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 class DocPassRecord(TypedDict):

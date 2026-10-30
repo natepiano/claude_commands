@@ -4,8 +4,9 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from typing import final
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, HANG_GUARD_S as HANG_GUARD_S
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture
 import signal
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -51,7 +52,7 @@ class VerifyMacSignalBoundariesTests(VerifyMacOffloadFixture):
             # Release that command by event; the pending TERM must still stop
             # verify before the runner command itself can execute.
             (self.runner_state / "continue-runner").touch()
-            output, errors = process.communicate(timeout=HANG_GUARD_S)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         except BaseException:
             self.stop_verify(process)
             raise

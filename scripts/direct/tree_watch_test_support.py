@@ -22,13 +22,12 @@ from unittest import mock
 
 from scripts.direct import tree_watch
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 WATCHER = Path(tree_watch.__file__)
 WATCH_INTERVAL = 0.5
 # Preserve the real change-detection and parent-exit speed bound.
 WATCH_DEADLINE = WATCH_INTERVAL + 2
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 def write_workspace(root: Path) -> dict[str, object]:
     """A virtual workspace, including an unrelated member and a path dependency."""

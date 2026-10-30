@@ -23,10 +23,9 @@ from unittest.mock import patch
 from scripts.direct import review_pool_report
 from scripts.usage import collect
 from scripts.usage.agents_log import RoleLog
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("review_pool_report.py")
 SINCE = "2026-10-12"

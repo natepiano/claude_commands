@@ -21,6 +21,7 @@ from typing import cast, override
 
 from scripts.direct import review_pool
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("review_pool.py")
 
@@ -161,10 +162,10 @@ class ReviewPoolTests(unittest.TestCase):
             gate.touch()
         for process in self.processes:
             try:
-                _ = process.communicate(timeout=300)
+                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             except subprocess.TimeoutExpired:
                 process.kill()
-                _ = process.communicate(timeout=300)
+                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.temporary.cleanup()
 
     def test_pool_write_syncs_by_default_and_flushes_without_sync_for_disposable_state(self) -> None:
@@ -208,7 +209,7 @@ class ReviewPoolTests(unittest.TestCase):
     def run_pool(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             self.command(*arguments), env=self.environment(), capture_output=True,
-            text=True, check=False, timeout=300,
+            text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def succeed(self, *arguments: str) -> str:
@@ -225,7 +226,7 @@ class ReviewPoolTests(unittest.TestCase):
         return process
 
     def finish(self, process: subprocess.Popen[str]) -> tuple[int, str, str]:
-        output, errors = process.communicate(timeout=300)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         assert process.returncode is not None
         return process.returncode, output.strip(), errors
 
@@ -626,7 +627,7 @@ class ReviewPoolTests(unittest.TestCase):
 
     def test_dead_owner_is_idle_and_last_allocated_is_refreshed(self) -> None:
         child = subprocess.Popen([sys.executable, "-c", "pass"])
-        _ = child.wait(timeout=300)
+        _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
         self.seed({"code1": {**self.idle("unit"), "busy_pid": child.pid, "last_allocated": 0}})
         self.assertEqual(self.allocate()["reviewer"], "code1")
         self.assertNotEqual(self.reviewer("code1")["last_allocated"], 0)
@@ -814,7 +815,7 @@ class ReviewPoolTests(unittest.TestCase):
 
     def test_retire_removes_a_reservation_whose_owner_died(self) -> None:
         child = subprocess.Popen([sys.executable, "-c", "pass"])
-        _ = child.wait(timeout=300)
+        _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
         self.seed({"code1": {**self.idle("unit"), "thread_id": "", "busy_pid": child.pid}})
         self.assertEqual(self.succeed("retire", "--unit", "unit"), "code1")
         self.assertNotIn("code1", self.reviewers())
@@ -835,7 +836,7 @@ class ReviewPoolTests(unittest.TestCase):
     def test_removed_dead_reservation_does_not_free_its_issued_reviewer_name(self) -> None:
         self.seed({})
         child = subprocess.Popen([sys.executable, "-c", "pass"])
-        _ = child.wait(timeout=300)
+        _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
         gate = self.hold("fork:code1")
         arguments = self.allocation_args()
         arguments[arguments.index("--pid") + 1] = str(child.pid)

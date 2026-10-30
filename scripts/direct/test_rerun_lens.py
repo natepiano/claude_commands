@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("rerun_lens.py")
 
@@ -22,7 +23,7 @@ class RerunLensTests(unittest.TestCase):
             path = Path(directory) / "phase.diff"
             _ = path.write_text(diff)
             result = subprocess.run([sys.executable, str(SCRIPT), "arm", "--diff", str(path)],
-                                    capture_output=True, text=True, check=False, timeout=30)
+                                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(path.read_text(), diff)
             self.assertEqual(list(Path(directory).iterdir()), [path])

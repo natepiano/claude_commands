@@ -18,9 +18,10 @@ from unittest import mock
 from scripts.lib import names
 from scripts.lib.test_names import NAMES_TOML
 
-from scripts.production.update_registration_test_support import RegistrationFixture, registration, dailies_render, review, read_production, TEST_HANG_GUARD_SECS
+from scripts.production.update_registration_test_support import RegistrationFixture, registration, dailies_render, review, read_production
 
 from scripts.production.update_registration_test_support import setUpModule as setUpModule
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class RegistrationTests(RegistrationFixture):

@@ -38,6 +38,7 @@ import unit_move
 import unit_names
 import unit_lookup
 from cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("rename.py")
 
@@ -200,7 +201,6 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 '''
 
 # load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
                wrapper: str = "") -> subprocess.CompletedProcess[str]:

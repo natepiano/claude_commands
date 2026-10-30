@@ -13,11 +13,15 @@ import unittest
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 import index
 import parse
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 CLI = Path(__file__).with_name("cli.py")
 TESTDATA = Path(__file__).with_name("testdata")
@@ -388,7 +392,7 @@ class IndexTests(unittest.TestCase):
 
     def test_schema_command_lists_samples_and_stall_columns(self) -> None:
         result = subprocess.run(
-            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=60
+            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TABLE samples", result.stdout)
@@ -735,7 +739,7 @@ class IndexTests(unittest.TestCase):
 
     def test_schema_describes_target_and_hold_wait(self) -> None:
         result = subprocess.run(
-            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=60,
+            [sys.executable, str(CLI), "schema"], capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout, r"target\s+TEXT\s+where the call was when it ended: mac, natedev, or empty")
@@ -836,7 +840,7 @@ class IndexTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = cast(list[dict[str, object]], json.loads(result.stdout))
@@ -850,7 +854,7 @@ class IndexTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(failed.returncode, 1)
         self.assertIn("readonly", failed.stderr)

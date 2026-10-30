@@ -24,10 +24,7 @@ from approved_renames import AppliedInCode
 
 
 from ledger_test_support import (LedgerTestCase, LedgerStatus, PARENT_FILE)
-
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final

@@ -15,6 +15,7 @@ from typing import override
 from unittest import mock
 
 from scripts.lib import zone, user_zone
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("zone.py")
 CONF_TEXT = "# The zone every time shown to the user is written in.\nzone=America/New_York\n"
@@ -102,7 +103,7 @@ class SetTests(unittest.TestCase):
 
     def run_zone(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.env, capture_output=True,
-                              text=True, check=False, timeout=60)
+                              text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
 
     def log(self, name: str) -> list[list[str]]:
         path = self.fakes / name

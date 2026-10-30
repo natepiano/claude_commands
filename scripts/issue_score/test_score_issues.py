@@ -28,9 +28,7 @@ if PRODUCTION_DIR not in sys.path:
     sys.path.insert(0, PRODUCTION_DIR)
 from scripts.production.issues import Issue as ProposalIssue
 from scripts.production.proposals_table import proposal_score
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 FIXTURES = Path(__file__).with_name("fixtures")
 

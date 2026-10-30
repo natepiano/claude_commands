@@ -12,10 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from scripts.usage import rollouts
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 def record(record_type: str, at: str, payload: dict[str, object]) -> str:
     return json.dumps({"timestamp": at, "type": record_type, "payload": payload})

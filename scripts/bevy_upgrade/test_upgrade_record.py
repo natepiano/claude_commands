@@ -14,14 +14,15 @@ from typing import TYPE_CHECKING, cast, final
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 import production_units
 import pins
 import upgrade_record
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 if TYPE_CHECKING:
     from typing import override
@@ -105,7 +106,7 @@ class RecordTests(unittest.TestCase):
         )
         result = subprocess.run([sys.executable, "-c", script, str(directory), str(shutdown)],
                                 env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-                                capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+                                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_start_builds_the_specified_record_without_default_answers(self) -> None:

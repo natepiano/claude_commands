@@ -11,10 +11,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import cast, override
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("history.py")
 BASE = 1_792_454_400

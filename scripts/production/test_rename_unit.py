@@ -14,7 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 
-from scripts.production.rename_unit_test_support import UnitRenameFixture, SCRIPT, SLUG, TEST_HANG_GUARD_SECS
+from scripts.production.rename_unit_test_support import UnitRenameFixture, SCRIPT, SLUG
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final

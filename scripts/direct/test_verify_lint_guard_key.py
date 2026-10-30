@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import cast, override
 
 from scripts.direct import verify_lint_scope_test_support as support
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyLintGuardKeyTests(support.VerifyLintScopeFixture):
@@ -52,7 +53,7 @@ class VerifyLintGuardKeyTests(support.VerifyLintScopeFixture):
         result = subprocess.run(
             ["git", "-C", str(self.root), "-c", "user.name=fixture", "-c", "user.email=fixture@test",
              "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *arguments],
-            env=self.environment, capture_output=True, text=True, check=True, timeout=5,
+            env=self.environment, capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
         )
         return result.stdout.strip()
 
@@ -87,7 +88,7 @@ class VerifyLintGuardKeyTests(support.VerifyLintScopeFixture):
             input=json.dumps(metadata), cwd=self.root,
             env={**self.environment, "VERIFY_COMPUTE_TEST_BUILD": "1",
                  "VERIFY_TEST_BUILD_INPUTS_FILE": str(output), **(extra_environment or {})},
-            capture_output=True, text=True, check=True, timeout=10,
+            capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS,
         )
         lines = output.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(lines), 2)
@@ -208,7 +209,7 @@ run_once cargo nextest run -E "package(sample) & test(native_rate)"
             ["bash", str(harness)], cwd=self.root,
             env={**self.environment, "TEST_METADATA": json.dumps(metadata),
                  "BUILDLOG_OFF": "0", "BUILDLOG_SYNC": "1"},
-            capture_output=True, text=True, check=False, timeout=60,
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         before_hold = cast(dict[str, object], json.loads((self.root / "before-hold.json").read_text()))

@@ -11,9 +11,9 @@ import unittest
 from unittest import mock
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
+INJECTED_EDIT_TIMEOUT_SECS = 300
 
 setUpModule = support.setUpModule
 
@@ -52,7 +52,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
 
                 def expire_when_ready(input: str | None = None, timeout: float | None = None) -> tuple[str, str]:
                     if timeout is not None:
-                        self.assertEqual(timeout, TEST_HANG_GUARD_SECS)
+                        self.assertEqual(timeout, INJECTED_EDIT_TIMEOUT_SECS)
                         try:
                             self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0])
                             self.assertEqual(ready.readline(), b"ready\n")
@@ -66,11 +66,11 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
                 return process
 
             with (mock.patch.object(quota_alert, "AGENTS", editor),
-                  mock.patch.object(quota_alert, "EDIT_TIMEOUT", TEST_HANG_GUARD_SECS),
+                  mock.patch.object(quota_alert, "EDIT_TIMEOUT", INJECTED_EDIT_TIMEOUT_SECS),
                   mock.patch.object(subprocess, "Popen", side_effect=start_editor)):
                 line = self.refuse()
             self.assertEqual(line, "switch to claude for codex1 failed: agents_set_all_assignments took longer "
-                             + f"than {TEST_HANG_GUARD_SECS} s and was stopped")
+                             + f"than {INJECTED_EDIT_TIMEOUT_SECS} s and was stopped")
             self.assertTrue(select.select([ready], [], [], TEST_HANG_GUARD_SECS)[0])
             self.assertEqual(ready.read(), b"", "an editor descendant can still change the registry")
         self.assertEqual(self.assignments()["direct"], "codex")

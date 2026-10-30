@@ -24,6 +24,7 @@ import showrunners as showrunners
 import dailies_render as dailies_render
 from production_units import read_production as read_production
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 if TYPE_CHECKING:
     from scripts.notify import review as review
@@ -72,10 +73,6 @@ else:
 def setUpModule() -> None:
     """The times these tests expect are Pacific; the user's zone setting must not change them."""
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
-
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 class RegistrationFixture(unittest.TestCase):

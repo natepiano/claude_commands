@@ -22,6 +22,7 @@ import change_review
 from scripts.direct import progress_history
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Path,
@@ -61,8 +62,6 @@ def invoke_checkpoint(arguments: list[str], environment: dict[str, str], cwd: Pa
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("merge_checkpoint.py")
 STARTED = "2026-10-06T12:00:00-07:00"

@@ -17,6 +17,7 @@ from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 from scripts.direct.verify_mac_offload_test_support import RUSTC_STUB, stub_build_tool_path
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -24,8 +25,6 @@ VERIFY = Path(__file__).with_name("verify.sh")
 
 BOARD = VERIFY.with_name("board.sh")
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 Record = dict[str, object]

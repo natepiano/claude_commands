@@ -20,6 +20,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
 import phase_reservation  # noqa: E402
 from scripts.astra import design_roles  # noqa: E402
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")
 DIRECTOR = "sid-director"
@@ -138,7 +139,7 @@ class BerthHookTests(unittest.TestCase):
     def hook(self, patch: str, tool: str = "apply_patch", cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         payload = {"tool_name": tool, "cwd": str(cwd or self.repo), "tool_input": {"command": patch}}
         return subprocess.run([sys.executable, str(HOOK)], input=json.dumps(payload), capture_output=True,
-                              text=True, check=False, env=self.environment, timeout=60)
+                              text=True, check=False, env=self.environment, timeout=TEST_HANG_GUARD_SECS)
 
     def bind_designer(self, directory: Path, phase: str) -> None:
         design_id = "00000000-0000-4000-8000-000000000036"
@@ -579,7 +580,7 @@ class BerthHookTests(unittest.TestCase):
         self.open_second_phase()
         other = self.root / "other-worktree"
         _ = subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "other", str(other)],
-                           check=True, capture_output=True, timeout=60)
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.claim_phase_worktree("15", self.repo)
         self.claim_phase_worktree("16", other)
         directory = phase_reservation.phase_directory(self.session_dir, "16")
@@ -610,7 +611,7 @@ class BerthHookTests(unittest.TestCase):
     def test_edit_outside_all_claimed_phase_worktrees_checks_the_bare_session(self) -> None:
         other = self.root / "other-worktree"
         _ = subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "other", str(other)],
-                           check=True, capture_output=True, timeout=60)
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.claim_phase_worktree("15", other)
         directory = phase_reservation.phase_directory(self.session_dir, "15")
         before = {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
@@ -626,7 +627,7 @@ class BerthHookTests(unittest.TestCase):
     def test_record_active_outside_the_phases_worktree_keeps_its_state(self) -> None:
         other = self.root / "other-worktree"
         _ = subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "-b", "other", str(other)],
-                           check=True, capture_output=True, timeout=60)
+                           check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.claim_phase_worktree("15", other)
         _ = (self.repo / "src/lib.rs").write_text("fn changed() {}\n")
 

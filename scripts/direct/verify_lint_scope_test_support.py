@@ -11,14 +11,11 @@ import sys
 import tempfile
 from typing import ClassVar, TypedDict, cast, override
 import unittest
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
 SCRIPTS = VERIFY.parent.parent
-# A hang limit, not a speed check. One `verify.sh lint` call starts about 60 processes: 10 s at
-# load 75 on natedev, and over 30 s at load 160 (two merge gates went red at 30 s, 2026-10-18).
-# A real hang still fails, after this many seconds.
-TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
 
 
 class CargoInvocation(TypedDict):

@@ -28,9 +28,10 @@ import unit_move
 from production_units import Production, read_production
 from shutdown_record import SessionShutdown
 
-from scripts.production.staff_test_support import CHECKOUT, PROCESS_TIMEOUT, StaffTestCase
+from scripts.production.staff_test_support import CHECKOUT, StaffTestCase
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 RUN_COMMAND = retire_unit.run
 
@@ -213,18 +214,18 @@ class ResumeUnitTests(unittest.TestCase):
             with self.staff.lock_notice(self.staff.staff_file.parent / "operation.lock") as listener:
                 process.start()
                 child.close()
-                self.assertTrue(parent.poll(PROCESS_TIMEOUT), "nested add_unit did not join resume's lock")
+                self.assertTrue(parent.poll(TEST_HANG_GUARD_SECS), "nested add_unit did not join resume's lock")
                 staff_id = staff.StaffId(cast(str, parent.recv()))
                 self.assertIn("retired", self.row())
                 seed = self.staff.start_script(CHECKOUT / "scripts/production/staff_sources.py", "seed")
                 self.staff.assert_operation_blocks(seed, listener)
                 parent.send("finish")
-                self.assertTrue(parent.poll(PROCESS_TIMEOUT), "resume did not clear the retired note")
+                self.assertTrue(parent.poll(TEST_HANG_GUARD_SECS), "resume did not clear the retired note")
                 code, output = cast(tuple[int, str], parent.recv())
                 self.assertEqual(code, 0, output)
-                process.join(timeout=PROCESS_TIMEOUT)
+                process.join(timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.exitcode, 0)
-                output, errors = seed.communicate(timeout=PROCESS_TIMEOUT)
+                output, errors = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(seed.returncode, 0, output + errors)
             self.assertNotIn("retired", self.row())
             row = staff.by_id(staff_id)
@@ -237,11 +238,11 @@ class ResumeUnitTests(unittest.TestCase):
             child.close()
             if process.is_alive():
                 process.terminate()
-                process.join(timeout=PROCESS_TIMEOUT)
+                process.join(timeout=TEST_HANG_GUARD_SECS)
             process.close()
             if seed is not None and seed.returncode is None:
                 seed.kill()
-                _ = seed.communicate(timeout=PROCESS_TIMEOUT)
+                _ = seed.communicate(timeout=TEST_HANG_GUARD_SECS)
 
     def test_resumes_the_recorded_session_in_a_worktree_made_from_the_merge_branch(self) -> None:
         self.assert_resumed(*self.resume())

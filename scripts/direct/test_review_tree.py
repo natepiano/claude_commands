@@ -14,6 +14,7 @@ from typing import final, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import phase_reservation, recorder_state, review_tree  # noqa: E402
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -49,7 +50,7 @@ class OtherPhasesPathsTests(unittest.TestCase):
             ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "base"],
             ["worktree", "add", "-q", "-b", "other", str(second)],
         ):
-            _ = subprocess.run(["git", "-C", str(first), *command], check=True, capture_output=True, timeout=60)
+            _ = subprocess.run(["git", "-C", str(first), *command], check=True, capture_output=True, timeout=TEST_HANG_GUARD_SECS)
         self.open_phases({"1": "shared.txt\n", "2": "shared.txt\n", "3": "reviewed.txt\n"})
         for name, root in (("1", first), ("2", second)):
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as errors:

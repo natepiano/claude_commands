@@ -10,8 +10,8 @@ import subprocess
 import sys
 from typing import final
 from scripts.direct.wait_for_test_state import wait_until
-from scripts.production.merge_gate_test_support import TEST_HANG_GUARD_SECS
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final

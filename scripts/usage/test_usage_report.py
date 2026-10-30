@@ -19,10 +19,8 @@ from zoneinfo import ZoneInfo
 from scripts.usage import collect, weights
 from scripts.usage.test_collect import FIXTURES as COLLECT_FIXTURES, MacStreamReport, REPOSITORY, SNAPSHOT_COMMIT_SCRIPT, SshBehavior
 from scripts.usage.test_outcomes import OutcomeFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 FIXTURES = Path(__file__).with_name("fixtures") / "report"
 REPORT = Path(__file__).with_name("usage_report.py")

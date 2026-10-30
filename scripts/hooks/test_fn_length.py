@@ -15,13 +15,11 @@ from pathlib import Path
 from typing import Callable, cast, override
 from unittest.mock import patch
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fn_length_lib
 from scripts.hooks import hook_dispatch
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 HOOK = Path(__file__).with_name("post-tool-use-fn-length.py")

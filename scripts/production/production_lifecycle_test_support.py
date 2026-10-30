@@ -22,8 +22,6 @@ import tidy_wrapped
 from scripts.production.cli_fixture import invoke_cli
 
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 SCRIPT = Path(__file__).with_name("production_lifecycle.py")
 STUB = '''#!__PYTHON__
 import os
@@ -63,6 +61,7 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 
 
 from scripts.production.staff_test_support import StaffTestCase
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class LifecycleFixture(unittest.TestCase):
     staff: StaffTestCase = StaffTestCase()

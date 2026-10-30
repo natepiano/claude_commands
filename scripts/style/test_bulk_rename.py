@@ -27,10 +27,8 @@ import style_ledger
 import style_rules
 from scripts.direct.test_verify_untested_examples import rust_tool_path, workspace_metadata
 from approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename_check, binding_scope
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 class ScriptedServer:
     def __init__(self, edit: Callable[[str, int, str], tuple[bulk.SourceEdit, ...]]) -> None:

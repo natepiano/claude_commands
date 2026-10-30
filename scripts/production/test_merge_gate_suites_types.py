@@ -8,8 +8,9 @@ import subprocess
 from typing import final
 from unittest import mock
 from scripts.production import merge_gate
-from scripts.production.merge_gate_test_support import TEST_HANG_GUARD_SECS, gate_suites
+from scripts.production.merge_gate_test_support import gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final

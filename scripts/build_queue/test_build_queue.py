@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 from scripts.build_queue import build_queue
 from scripts.lint import memory_admit
 from scripts.message import roster
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 GIB = memory_admit.GIB
 NOW = 1793214000.0
@@ -395,7 +396,7 @@ class QueueTests(unittest.TestCase):
             "Roster: roster lookup failed; Showrunner and Unit show — for unmatched steps"])
 
     def test_queue_and_local_roster_reads_overlap(self) -> None:
-        rendezvous = threading.Barrier(2, timeout=2)
+        rendezvous = threading.Barrier(2, timeout=TEST_HANG_GUARD_SECS)
         view = memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW)
 
         def queue_read() -> memory_admit.QueueRead:

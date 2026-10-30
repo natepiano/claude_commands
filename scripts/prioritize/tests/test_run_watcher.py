@@ -13,6 +13,7 @@ from typing import final, override
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from test_renumber import GOALS, issue_text  # pyright: ignore[reportImplicitRelativeImport]
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 PRIORITIZE_DIR = Path(__file__).parents[1]
 RUN_WATCHER = PRIORITIZE_DIR / "run_watcher.sh"
@@ -138,7 +139,7 @@ raise SystemExit(2)
         return self.state / "last-status"
 
     def wait_for_runner_lock(self) -> None:
-        deadline = time.monotonic() + 2.0
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while time.monotonic() < deadline:
             result = subprocess.run(
                 [
@@ -200,7 +201,7 @@ class RunWatcherTests(ScriptRepositoryTestCase):
             self.assertTrue((self.fixture.state / "pending").exists())
         finally:
             owner.terminate()
-            _ = owner.wait(timeout=2)
+            _ = owner.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def test_daemon_retries_after_busy_owner_fails(self) -> None:
         owner = self._start_lock_owner(
@@ -217,7 +218,7 @@ class RunWatcherTests(ScriptRepositoryTestCase):
             start_new_session=True,
         )
         try:
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             log = ""
             while time.monotonic() < deadline:
                 if self.fixture.event_log.exists():
@@ -232,9 +233,9 @@ class RunWatcherTests(ScriptRepositoryTestCase):
                 )
 
             _ = self.fixture.owner_release.write_text("release\n", encoding="utf-8")
-            self.assertEqual(owner.wait(timeout=2), 2)
+            self.assertEqual(owner.wait(timeout=TEST_HANG_GUARD_SECS), 2)
 
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             status = ""
             while time.monotonic() < deadline:
                 log = self.fixture.event_log.read_text(encoding="utf-8")
@@ -257,10 +258,10 @@ class RunWatcherTests(ScriptRepositoryTestCase):
         finally:
             if owner.poll() is None:
                 owner.terminate()
-                _ = owner.wait(timeout=2)
+                _ = owner.wait(timeout=TEST_HANG_GUARD_SECS)
             if daemon.poll() is None:
                 os.killpg(daemon.pid, signal.SIGTERM)
-                _ = daemon.wait(timeout=2)
+                _ = daemon.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def test_daemon_absorbs_its_own_canonical_rank_writes(self) -> None:
         issue = self.fixture.issues / "issue.md"
@@ -299,7 +300,7 @@ raise SystemExit(0)
             start_new_session=True,
         )
         try:
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             log = ""
             while time.monotonic() < deadline:
                 if self.fixture.event_log.exists():
@@ -317,7 +318,7 @@ raise SystemExit(0)
         finally:
             if daemon.poll() is None:
                 os.killpg(daemon.pid, signal.SIGTERM)
-                _ = daemon.wait(timeout=2)
+                _ = daemon.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def _make_filtered_git_vault(self) -> Path:
         """Turn the fixture root into a vault wired exactly like the real one.
@@ -570,7 +571,7 @@ raise SystemExit(0)
             start_new_session=True,
         )
         try:
-            deadline = time.monotonic() + 5.0
+            deadline = time.monotonic() + TEST_HANG_GUARD_SECS
             log = ""
             status = ""
             while time.monotonic() < deadline:
@@ -592,7 +593,7 @@ raise SystemExit(0)
         finally:
             if daemon.poll() is None:
                 os.killpg(daemon.pid, signal.SIGTERM)
-                _ = daemon.wait(timeout=2)
+                _ = daemon.wait(timeout=TEST_HANG_GUARD_SECS)
 
 
 if __name__ == "__main__":

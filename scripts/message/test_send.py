@@ -46,6 +46,7 @@ else:
 from test_support import ShutdownTestCase, ShutdownSendLeaf
 from user_zone import user_zone
 from user_action import REFUSED_BEFORE_SENDING, ActionRequired, NoActionRequired, first_line
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 def stream(*events: dict[str, object]) -> str:
@@ -1023,7 +1024,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         state = self.root / "cli-state"
         result = subprocess.run([sys.executable, "-c", program, str(Path(send.__file__)), "ack", "notice"],
                                 env={**os.environ, "XDG_STATE_HOME": str(state)},
-                                capture_output=True, text=True, check=False, timeout=300)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("notice", result.stdout)
         with mock.patch.object(send, "STATE", state / "message"):

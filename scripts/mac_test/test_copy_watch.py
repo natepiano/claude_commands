@@ -15,15 +15,18 @@ import time
 import unittest
 from unittest import mock
 from collections.abc import Callable
-from typing import TypedDict, cast, final, override
+from typing import TYPE_CHECKING, TypedDict, cast, final, override
 
 import copy_watch
 import mac_test
 import offload
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 
 SCRIPT = Path(__file__).with_name("copy_watch.py")
-HANG_GUARD_S = 60.0
 # Ticks of the watcher at BUILD_TARGETS_POLL_S=0.05, enough for it to act on a
 # change it would act on at all.
 SETTLE_S = 0.5
@@ -220,7 +223,7 @@ class StopTests(unittest.TestCase):
                     result = root / "copy.result"
                     _ = result.write_text(f"mac={mac}\nreason=busy\nseconds=1.0\n")
                     process = subprocess.Popen([sys.executable, "-c", f"raise SystemExit({status})"])
-                    _ = process.wait(timeout=HANG_GUARD_S)
+                    _ = process.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                     watch.copy = copy_watch.RunningCopy(process, result, time.monotonic())
                     watch.copy_count = 1
                     report = watch.stop()
@@ -333,7 +336,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         for process in (self.watcher, self.step):
             if process is not None and process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=HANG_GUARD_S)
+                _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         _ = (self.root / "release-runner").write_text("go\n")
 
     def start_step(self) -> subprocess.Popen[bytes]:
@@ -357,7 +360,7 @@ class CopyWatchProcessTests(unittest.TestCase):
                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     def wait_until(self, condition: Callable[[], bool], what: str) -> None:
-        deadline = time.monotonic() + HANG_GUARD_S
+        deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
         while time.monotonic() < deadline:
             if condition():
                 return
@@ -369,7 +372,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         assert watcher is not None
         if terminate:
             watcher.terminate()
-        output, _ = watcher.communicate(timeout=HANG_GUARD_S)
+        output, _ = watcher.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(watcher.returncode, 0, output)
         lines = self.result.read_text().splitlines()
         return dict(line.split("=", 1) for line in lines)
@@ -392,7 +395,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.start_watcher("failed")
         self.compile_and_wait_for_copies(1)
         values = self.finish_watcher(terminate=False)
-        self.assertEqual(step.wait(timeout=HANG_GUARD_S), 143)
+        self.assertEqual(step.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS), 143)
         self.assertTrue((self.root / "terminated").exists())
         self.assertTrue(Path(f"{self.info}.stopped").exists())
         self.assertEqual((values["copy"], values["copy_count"], values["mac"], values["runner_status"],
@@ -412,7 +415,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.start_watcher("passed", filter_run=True)
         self.compile_and_wait_for_copies(1)
         values = self.finish_watcher(terminate=False)
-        self.assertEqual(step.wait(timeout=HANG_GUARD_S), 143)
+        self.assertEqual(step.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS), 143)
         self.assertEqual((values["copy"], values["mac"], values["runner_status"], values["stopped_natedev"]),
                          ("won", "passed", "0", "1"))
         self.assertIn("--filter-run", self.runner_events()[0])
@@ -422,7 +425,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.start_watcher("passed")
         self.compile_and_wait_for_copies(1)
         values = self.finish_watcher(terminate=False)
-        self.assertEqual(step.wait(timeout=HANG_GUARD_S), 143)
+        self.assertEqual(step.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS), 143)
         self.assertEqual((values["copy"], values["mac"], values["runner_status"], values["stopped_natedev"]),
                          ("won", "passed", "0", "1"))
         self.assertNotIn("--filter-run", self.runner_events()[0])
@@ -486,7 +489,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.compile_and_wait_for_copies(1)
         self.wait_until((self.root / "runner-ready").exists, "the copy to run")
         _ = (self.root / "finish").write_text("go\n")
-        self.assertEqual(step.wait(timeout=HANG_GUARD_S), 0)
+        self.assertEqual(step.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS), 0)
         _ = (self.root / "release-runner").write_text("go\n")
         values = self.finish_watcher(terminate=False)
         self.assertEqual((values["copy"], values["copy_count"]), ("natedev_won", "1"))
@@ -558,7 +561,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         watcher = self.watcher
         assert watcher is not None
         watcher.send_signal(signal.SIGHUP)
-        _ = watcher.communicate(timeout=HANG_GUARD_S)
+        _ = watcher.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertLess(time.monotonic() - started, 5.0)
         self.assertEqual(self.result.read_text(), "copy=\ncopy_s=\ncopy_count=\nnatedev_s_at_end=\n")
 

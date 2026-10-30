@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, override
 
 import review_pause
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 if TYPE_CHECKING:
     from ..hooks import showrunner_footer
 else:
@@ -88,7 +89,7 @@ class ReviewPauseTests(unittest.TestCase):
     def run_script(self, *args: str, session: str = "current") -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True,
                               text=True, check=False,
-                              env={**self.environment, "CLAUDE_CODE_SESSION_ID": session}, timeout=300)
+                              env={**self.environment, "CLAUDE_CODE_SESSION_ID": session}, timeout=TEST_HANG_GUARD_SECS)
 
     def stop_dailies(self) -> None:
         self.enabled.unlink()

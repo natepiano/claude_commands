@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 import select
 import signal
 import unittest
 from offload_test_support import OffloadCommandFixture
 # The fixture loads offload's sibling script paths before the tree-key import.
 import treekey
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 
 class OffloadCommandTests(OffloadCommandFixture):
@@ -30,11 +32,11 @@ class OffloadCommandTests(OffloadCommandFixture):
             self.assertEqual([event["command"] for event in self.events()], ["ssh", "rsync"])
             self.assert_claimed_commands()
             _ = (self.stub_directory / "continue-copy").write_text("continue\n")
-            text, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            text, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         finally:
             if process.poll() is None:
                 process.kill()
-                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, text)
         self.assertEqual(text.count("mac_test: running on the Mac (macOS, host Mac); tree copied in "), 1)
         self.assert_wire("passed", "")
@@ -153,10 +155,10 @@ class OffloadCommandTests(OffloadCommandFixture):
             _ = (self.stub_directory / "continue-run").write_text(
                 "continue\n", encoding="utf-8"
             )
-            remaining_output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            remaining_output, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         except BaseException:
             process.send_signal(signal.SIGTERM)
-            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             raise
         output = output_before_gate + remaining_output
         self.assertEqual(process.returncode, 0, output)
@@ -173,11 +175,11 @@ class OffloadCommandTests(OffloadCommandFixture):
                 try:
                     self.wait_for_path(self.stub_directory / "run-started")
                     process.send_signal(signal.SIGTERM)
-                    output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    output, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 finally:
                     if process.poll() is None:
                         process.kill()
-                        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
                 self.assert_leftover_diagnostic(output, outcome)
                 self.assert_claim_is_kept()
@@ -195,11 +197,11 @@ class OffloadCommandTests(OffloadCommandFixture):
                 try:
                     self.wait_for_path(self.stub_directory / f"{stage}-started")
                     process.send_signal(signal.SIGTERM)
-                    output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    output, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 finally:
                     if process.poll() is None:
                         process.kill()
-                        _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                        _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
                 self.assertFalse(self.claim_file.exists())
                 self.assertEqual(self.leftover_events(), [])
@@ -216,10 +218,10 @@ class OffloadCommandTests(OffloadCommandFixture):
                 try:
                     self.wait_for_path(self.stub_directory / "run-started")
                     process.send_signal(signal_number)
-                    output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    output, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 except BaseException:
                     process.kill()
-                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                     raise
                 self.assertEqual(process.returncode, 128 + signal_number, output)
                 self.assertTrue(
@@ -260,13 +262,13 @@ class OffloadCommandTests(OffloadCommandFixture):
             _ = (self.stub_directory / "continue-cleanup").write_text(
                 "continue\n", encoding="utf-8"
             )
-            output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            output, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         except BaseException:
             process.kill()
             _ = (self.stub_directory / "continue-cleanup").write_text(
                 "continue\n", encoding="utf-8"
             )
-            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             raise
 
         self.assertEqual(process.returncode, 128 + signal.SIGTERM, output)
@@ -309,11 +311,11 @@ class OffloadCommandTests(OffloadCommandFixture):
         try:
             self.wait_for_path(marker)
             process.send_signal(signal.SIGINT)
-            output, _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            output, _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         except BaseException:
             process.kill()
             _ = gate.write_text("continue\n", encoding="utf-8")
-            _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+            _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             raise
 
         self.assertEqual(process.returncode, -signal.SIGINT, output)

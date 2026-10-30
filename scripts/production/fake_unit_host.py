@@ -23,9 +23,9 @@ if TYPE_CHECKING:
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 import herdr
 from fake_herdr import CommandResponse, herdr_listener
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 PANE_RESULT = herdr.Herdr.result
-TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
 
 
 @dataclass(frozen=True)
@@ -143,7 +143,7 @@ def live_pid(test: unittest.TestCase) -> int:
 
     def close() -> None:
         child.terminate()
-        _ = child.wait(timeout=30)
+        _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 
     test.addCleanup(close)
     return child.pid

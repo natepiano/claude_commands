@@ -29,6 +29,7 @@ from scripts.direct.progress_history import _supplier_message  # pyright: ignore
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.history.rounds import load_phases
 from scripts.history import history as stage_history
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 SCRIPT = Path(__file__).with_name("progress_history.py")
@@ -225,7 +226,7 @@ print('two homes isolated; recorder lock retained; caller restored')
         environment = {**os.environ, "HOME": str(caller),
                        "USER_ZONE_CONF": str(caller / "zone.conf")}
         result = subprocess.run([sys.executable, "-c", program, str(self.root), str(self.working_dir)],
-                                env=environment, capture_output=True, text=True, check=False, timeout=300)
+                                env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("two homes isolated; recorder lock retained; caller restored", result.stdout)
 
@@ -2285,7 +2286,7 @@ with patch.object(fcntl, "flock", admission):
         if finish.stdout is None:
             raise AssertionError("finish fixture has no output pipe")
         finish_output = cast(TextIO, finish.stdout)
-        self.assertTrue(select.select([finish_output], [], [], 15)[0], "finish never reaches publication")
+        self.assertTrue(select.select([finish_output], [], [], TEST_HANG_GUARD_SECS)[0], "finish never reaches publication")
         self.assertEqual(finish_output.readline().strip(), "publishing")
         start: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", start_program, "start-checkpoint-wait", "--commit", commit,
                                   "--working-dir", str(self.working_dir), "--phase-id", "6", "--owner-session", "receiver"],
@@ -2295,11 +2296,11 @@ with patch.object(fcntl, "flock", admission):
             if start.stdout is None:
                 raise AssertionError("start fixture has no output pipe")
             start_output = cast(TextIO, start.stdout)
-            self.assertTrue(select.select([start_output], [], [], 15)[0], "external start never attempts admission")
+            self.assertTrue(select.select([start_output], [], [], TEST_HANG_GUARD_SECS)[0], "external start never attempts admission")
             self.assertEqual(start_output.readline().strip(), "blocked")
         finally:
-            finished_out, finished_errors = finish.communicate("release\n", timeout=30)
-        started_out, started_errors = start.communicate(timeout=30)
+            finished_out, finished_errors = finish.communicate("release\n", timeout=TEST_HANG_GUARD_SECS)
+        started_out, started_errors = start.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(finish.returncode, 0, finished_out + finished_errors)
         self.assertEqual(start.returncode, 0, started_out + started_errors)
         wait_id = started_out.strip()

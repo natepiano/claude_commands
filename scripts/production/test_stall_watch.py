@@ -22,9 +22,6 @@ from pathlib import Path
 from typing import cast, override
 from zoneinfo import ZoneInfo
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
@@ -36,6 +33,7 @@ import stall_watch
 import context_usage
 import rca
 from cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")

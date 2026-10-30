@@ -8,13 +8,14 @@ import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import override
+from typing import TYPE_CHECKING, override
 
 import test_build_hold
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 MEMORY_GATE = Path(__file__).resolve().parent.parent / "lint" / "memory_gate.sh"
 BASH = shutil.which("bash") or "/bin/bash"
@@ -63,7 +64,7 @@ printf '%s %s %s\\n' "$shortcut" "$wait_status" "$admission"
 '''
         return subprocess.run([BASH, "-c", script, "bash", str(MEMORY_GATE)],
                               cwd=self.scratch, env={**self.environment, **extra},
-                              capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                              capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
 
     def assert_checks(self, *, shortcut: int, status: int = 0, setting: str = "",
                       extra: Mapping[str, str] = EMPTY_ENVIRONMENT, starts: bool = True) -> None:
@@ -188,7 +189,7 @@ trap 'if (( BASH_SUBSHELL > 0 )); then printf "%s\\n" "$BASH_SUBSHELL" >&3; fi' 
 for ((n=0; n<2000; n++)); do build_hold_nothing_held; done
 [[ "$n" -eq 2000 ]]
 ''', "bash", str(MEMORY_GATE), str(empty_path), str(forks)], cwd=self.scratch,
-                                env=self.environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+                                env=self.environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertEqual(forks.read_text(), "", "the shortcut must not fork subshells")

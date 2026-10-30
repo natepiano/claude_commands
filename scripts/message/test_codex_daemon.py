@@ -20,10 +20,8 @@ from unittest import mock
 
 from scripts.lib.socket_test_support import short_socket_directory
 import codex_daemon
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 RpcMessage = dict[str, object]
 
@@ -365,7 +363,7 @@ class CodexDaemonTests(unittest.TestCase):
                         _reply(connection, initialize, {})
                         self.assertEqual(_receive_frame(connection)["method"], "initialized")
                         self.assertEqual(_receive_frame(connection)["method"], "thread/queue/add")
-                    connection.settimeout(2)
+                    connection.settimeout(TEST_HANG_GUARD_SECS)
                     self.assertEqual(connection.recv(1), b"")
 
                 with FakeDaemon(chosen, conversation), mock.patch.dict(os.environ, {

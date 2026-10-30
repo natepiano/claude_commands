@@ -21,7 +21,7 @@ import contextlib
 from contextlib import closing, redirect_stdout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol, TextIO, cast, override
+from typing import TYPE_CHECKING, Protocol, TextIO, cast, override
 from unittest import mock
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -31,6 +31,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import memory_admit as gate
 import nextest_budget as budget
 from memory_test_support import fake_memory_readings
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 store = gate.store
 
 
@@ -1977,7 +1981,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         with maximum.open() as before:
             result = subprocess.run(["bash", "-c", "buildlog_sample_anon() {" + program +
                 '\n}\nsleep() { exit 0; }\nbuildlog_sample_anon "$1" "$2" "$$"',
-                "sampler-test", str(sidecar), str(maximum)], capture_output=True, text=True, timeout=10)
+                "sampler-test", str(sidecar), str(maximum)], capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(int(maximum.read_text()), 13 * GIB)
             self.assertEqual(int(before.read()), 12 * GIB)
@@ -2519,7 +2523,7 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
         result = subprocess.run(
             [sys.executable, str(MEMORY_GATE.with_name("memory_admit.py")), "check", "/proc/meminfo",
              str(os.getpid()), "", "0", "test", "check", "test", str(GIB), "fallback", "0", "/bin/true"],
-            env=dict(os.environ), capture_output=True, text=True, check=False, timeout=10,
+            env=dict(os.environ), capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(result.stdout, "")
@@ -2544,7 +2548,7 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
                 del environment[variable]
                 result = subprocess.run(
                     ["bash", "-c", 'source "$1"; buildlog_wait_for_memory', "test", str(MEMORY_GATE)],
-                    env=environment, capture_output=True, text=True, check=False, timeout=10,
+                    env=environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                 )
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(result.stdout, "")
@@ -3105,7 +3109,7 @@ class ShellTests(unittest.TestCase):
             for kind in ("first", "periodic"):
                 result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), kind],
                                         env={**os.environ, "BUILDLOG_DIR": folder}, capture_output=True,
-                                        text=True, check=False, timeout=300)
+                                        text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(len(result.stderr.splitlines()), 1)
                 self.assertIn("head clone88ci nextest (verify pid 300) needs 10.9 GiB", result.stderr)
@@ -3126,7 +3130,7 @@ class ShellTests(unittest.TestCase):
                         result = subprocess.run(
                             ["bash", "-c", command, "test", str(MEMORY_GATE), kind, reason],
                             env={**os.environ, "BUILDLOG_DIR": folder}, capture_output=True,
-                            text=True, check=False, timeout=300)
+                            text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(len(result.stderr.splitlines()), 1)
                         self.assertTrue(result.stderr.endswith(f"; {reason}; 3.0 GiB kept for earlyoom)\n"))
@@ -3142,7 +3146,7 @@ class ShellTests(unittest.TestCase):
                 with self.subTest(kind=kind):
                     result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), kind],
                                             env={**os.environ, "BUILDLOG_DIR": folder}, capture_output=True,
-                                            text=True, check=False, timeout=300)
+                                            text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(len(result.stderr.splitlines()), 1)
                     self.assertTrue(result.stderr.endswith(
@@ -3199,7 +3203,7 @@ class ShellTests(unittest.TestCase):
                        'printf "MemAvailable: 41943040 kB\\n" > "$BUILDLOG_MEMINFO"; fi; }; '
                        'buildlog_wait_for_memory cargo nextest')
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(wrapper)],
-                                    capture_output=True, text=True, check=False, timeout=300,
+                                    capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
                                     env={**os.environ, "HOME": folder, "BUILDLOG_DIR": str(root / "log"),
                                          "BUILDLOG_MEMINFO": str(meminfo), "BUILDLOG_PROC": str(root / "proc"),
                                          "BUILD_HOLD_DIR": str(root / "holders"),
@@ -3311,7 +3315,7 @@ class ShellTests(unittest.TestCase):
             command = 'source "$1"; sweep_after_step() { :; }; run_once true'
             for _ in range(2):
                 result = subprocess.run(["bash", "-c", command, "test", str(INVOKE)],
-                                        capture_output=True, text=True, timeout=300, check=False,
+                                        capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                                         env=environment)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -3323,7 +3327,7 @@ class ShellTests(unittest.TestCase):
             command = 'source "$1"; buildlog_wait_for_memory /bin/true; printf "%s|%s|" "$BUILDLOG_MEM_OUTCOME" "$BUILDLOG_MEM_RESERVATION"; if [[ -n "$BUILDLOG_MEM_RESERVATION" && -f "$BUILDLOG_MEM_RESERVATION" ]]; then echo exists; else echo missing; fi; path=$BUILDLOG_MEM_RESERVATION; buildlog_release_memory 0; if [[ -n "$path" && ! -e "$path" ]]; then echo gone; else echo remains; fi'
             result = subprocess.run(
                 ["bash", "-c", command, "test", str(MEMORY_GATE)],
-                capture_output=True, text=True, timeout=300, check=False,
+                capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                 env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -3356,7 +3360,7 @@ class ShellTests(unittest.TestCase):
             maximum = reservation.with_suffix(".max")
             command = 'source "$1"; buildlog_sample_anon "$2" "$3" & p=$!; sleep 1.2; kill "$p"; wait "$p" 2>/dev/null || true'
             result = subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(sidecar), str(maximum)],
-                                    capture_output=True, text=True, timeout=300, check=False,
+                                    capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -3379,7 +3383,7 @@ class ShellTests(unittest.TestCase):
             command = ('set -e; source "$1"; sleep() { SECONDS=$((SECONDS + 1)); }; '
                        'buildlog_wait_for_memory; printf "step started\\n"')
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
-                                    capture_output=True, text=True, timeout=300, check=False,
+                                    capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -3408,7 +3412,7 @@ class ShellTests(unittest.TestCase):
                 'buildlog_wait_for_memory'
             )
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
-                                    capture_output=True, text=True, timeout=300, check=False,
+                                    capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -3438,7 +3442,7 @@ class ShellTests(unittest.TestCase):
                 'path=$BUILDLOG_MEM_RESERVATION; buildlog_release_memory 0; if [[ -n "$path" && ! -e "$path" ]]; then echo gone; else echo remains; fi'
             )
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
-                                    capture_output=True, text=True, timeout=300, check=False,
+                                    capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -3463,7 +3467,7 @@ class ShellTests(unittest.TestCase):
             command = ('source "$1"; sleep() { printf "MemAvailable: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"; SECONDS=1; }; '
                        'buildlog_wait_for_memory /bin/true; printf "%s\n" "$BUILDLOG_MEM_OUTCOME"; buildlog_release_memory 0')
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
-                                    capture_output=True, text=True, timeout=300, check=False,
+                                    capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -3486,7 +3490,7 @@ class ShellTests(unittest.TestCase):
             _ = broken.write_text('raise RuntimeError("broken lookup")\n')
             command = 'set -e; source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory /bin/true; printf "step started\\n"'
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(broken)],
-                                    capture_output=True, text=True, timeout=300, check=False,
+                                    capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -3510,7 +3514,7 @@ class ShellTests(unittest.TestCase):
                     _ = meminfo.write_text(contents)
                     result = subprocess.run(
                         ["bash", "-c", command, "test", str(MEMORY_GATE)],
-                        capture_output=True, text=True, timeout=300, check=False,
+                        capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                         env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -3533,7 +3537,7 @@ class ShellTests(unittest.TestCase):
             _ = wrapper.write_text(f'import sys\nsys.path.insert(0, {str(MEMORY_GATE.parent)!r})\nimport memory_admit as gate\ngate.process_start_time = lambda pid: None\ngate.main()\n')
             command = 'set -e; source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory /bin/true; printf "step started\\n"'
             result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(wrapper)],
-                                    capture_output=True, text=True, timeout=300, check=False,
+                                    capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
                                     env={**os.environ,
                                          "BUILD_HOLD_DIR": str(root / "holders"),
                                          "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
@@ -3595,7 +3599,7 @@ class QueueLeaveTests(unittest.TestCase):
                    + f'status=0; {step} || status=$?; '
                    + 'printf "%s|%s|%s\\n" "$status" "$BUILDLOG_MEM_OUTCOME" "${BUILDLOG_START:-}"')
         return subprocess.run(["bash", "-c", command, "test", str(INVOKE), str(self.ran)],
-                              capture_output=True, text=True, timeout=300, check=False, env=environment)
+                              capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False, env=environment)
 
     def hook_calls(self) -> int:
         return len(self.calls.read_text().splitlines()) if self.calls.exists() else 0

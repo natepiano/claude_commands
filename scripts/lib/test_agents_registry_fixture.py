@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import override
 
 from scripts.lib import test_agents_registry as fixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class RegistryOverrideTests(unittest.TestCase):
@@ -55,7 +56,7 @@ class RegistryOverrideTests(unittest.TestCase):
         result = subprocess.run([
             'bash', '-c', 'source "$1"; write_test_registry "$2" --replace-section assignments assignments/direct=codex',
             'fixture', str(Path(fixture.__file__).with_suffix('.sh')), str(self.path),
-        ], capture_output=True, text=True, env={**os.environ, 'AGENTS_CONFIG_PUBLISH': '0'}, timeout=10)
+        ], capture_output=True, text=True, env={**os.environ, 'AGENTS_CONFIG_PUBLISH': '0'}, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.path.read_text(), fixture.registry_text({
             'assignments': fixture.ExactRows({'direct': 'codex'})}))

@@ -25,9 +25,6 @@ import showrunners
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
-
 SCRIPT = Path(__file__).with_name("add_showrunner.py")
 SHARED = herdr.SHARED_SESSION
 PARENT_SESSION = "11111111-2222-3333-4444-555555555555"
@@ -64,6 +61,7 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 
 
 from scripts.production.staff_test_support import StaffTestCase
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class AddShowrunnerFixture(unittest.TestCase):
     staff: StaffTestCase = StaffTestCase()

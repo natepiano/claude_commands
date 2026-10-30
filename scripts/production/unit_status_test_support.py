@@ -25,12 +25,11 @@ import fake_unit_host
 from fake_unit_host import HostedUnit
 from sessions import SessionRecord
 from fake_herdr import CommandResponse
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("unit_status.sh")
 SESSION_ID = "test-session"
 # Only bound fixture hangs; no tested wait uses a clock.
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 def setUpModule() -> None:

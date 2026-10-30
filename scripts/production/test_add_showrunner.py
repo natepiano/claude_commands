@@ -28,13 +28,14 @@ import herdr as runtime
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
-from scripts.production.add_showrunner_test_support import AddShowrunnerFixture, SCRIPT, TEST_HANG_GUARD_SECS
+from scripts.production.add_showrunner_test_support import AddShowrunnerFixture, SCRIPT
 
 
 from scripts.production import staff
 from scripts.production import completion_receipt
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import sessions
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class AddShowrunnerTests(AddShowrunnerFixture):
     def assert_dead_launch_recovers(self, *, transcript_exists: bool) -> None:

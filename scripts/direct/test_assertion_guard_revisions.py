@@ -14,6 +14,7 @@ from unittest.mock import patch
 from scripts.direct.assertion_guard import commit_bases, default_base
 from scripts.production import showrunners
 from scripts.direct.assertion_guard_test_support import GUARD, AssertionFindingFixture, SeededGitRepositoryFixture, SeededMergeInProgressFixture, CLEAN, TILE_OLD, TILE_NEW
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class AssertionRevisionTests(AssertionFindingFixture):
     def test_module_path_import_allows_pairing_but_statement_macro_refuses(self) -> None:
@@ -958,7 +959,7 @@ else:
                 result = subprocess.run(
                     [sys.executable, "-c", script, str(self.repo), mode, self.base],
                     cwd=GUARD.resolve().parents[2], env=self.environment,
-                    capture_output=True, text=True, check=False, timeout=5)
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(result.stdout.strip(), expected)
                 self.assertEqual(result.stderr, "")

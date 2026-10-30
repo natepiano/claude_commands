@@ -5,6 +5,7 @@ import subprocess
 import unittest
 
 from scripts.direct.verify_tree_cancel_test_support import CANCEL_LINE as CANCEL_LINE, VerifyTreeCancelFixture as VerifyTreeCancelFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTreeCancelTests(VerifyTreeCancelFixture):
@@ -25,7 +26,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
             _ = process.communicate(timeout=1)
         # A Cargo-owned handshake makes this a live span, not an already-ended run.
         _ = (self.control / "release").touch()
-        output, errors = process.communicate(timeout=30)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertNotIn("cancelled", output + errors)
         self.assert_no_cache_verdict()

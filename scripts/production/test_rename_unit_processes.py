@@ -31,8 +31,9 @@ else:
     # rename_unit puts the shutdown folder on the path.
     import shutdown_record
 
-from scripts.production.rename_unit_test_support import SLUG, TEST_HANG_GUARD_SECS, UnitRenameFixture
+from scripts.production.rename_unit_test_support import SLUG, UnitRenameFixture
 from scripts.production.fake_unit_host import stopped_record
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # An app-server's idle-stop watcher, as codex_mesh starts it: the run folder is its fourth argument.

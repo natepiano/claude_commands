@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import unittest
 from typing import cast
-from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, TEST_HANG_GUARD_SECS
+from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenQueueTests(VerifyTokenWaitFixture):

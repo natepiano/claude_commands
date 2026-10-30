@@ -17,6 +17,7 @@ from merge_checkpoint import ChildHandoffEntry, CodeCheckpoint, MergeEntry, NoMe
 
 
 from scripts.production.merge_checkpoint_test_support import MergeCheckpointFixture, SCRIPT, STARTED, configure_test_environment
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 def setUpModule() -> None:
@@ -263,7 +264,7 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         result = subprocess.run([
             sys.executable, str(SCRIPT), "--from-child", "old-style", "--checkpoint", checkpoint,
             "--production", str(self.doc), "--started", STARTED,
-        ], cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False, timeout=300)
+        ], cwd=self.checkout, env=self.env, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.git("log", "-1", "--format=%s"),
                          f"Merge example-style hand-off ({checkpoint[:7]}) into production")

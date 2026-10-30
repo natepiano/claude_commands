@@ -17,12 +17,11 @@ import tempfile
 from typing import ClassVar, cast, override
 import unittest
 from unittest import mock
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 HOOK = Path(__file__).with_name("pre-tool-use-checkpoint-doc-gate.py")
 CHECKPOINT = 'git commit -m "checkpoint(efficiency): phase 1"'
 DOC_COMMAND = "~/.claude/scripts/direct/verify.sh doc"
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 DECIDE = cast(Callable[[str], str], runpy.run_path(str(HOOK))["decide"])
 
 

@@ -24,10 +24,8 @@ from unittest import mock
 from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWaiting, Running, SessionGone,
                            StillWaiting, TicksFailing, UnitRow, status_blocks)
 from unit_lookup import UnitState
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("dailies_input.py")
 RENDERER = SCRIPT.with_name("dailies_render.py")

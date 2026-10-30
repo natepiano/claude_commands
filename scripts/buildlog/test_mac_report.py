@@ -20,8 +20,6 @@ import launches
 import mac_report
 import mac_outcome
 import store
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
@@ -31,6 +29,10 @@ from test_holds import hold_event, timed_hold_events, write_mac_block
 from test_index import Record, call, encode, point_root_at, step
 from test_report import MeasuredCliRun, measure_cli_work
 from user_zone import user_zone
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 CLI = Path(__file__).with_name("cli.py")
 NOW = datetime(2026, 10, 12, 15, 9, tzinfo=UTC)
@@ -221,7 +223,7 @@ class MacReportTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(Path(__file__).with_name("record.py")), "step", "1",
              str(started), str(started + 1), "0", "", "", "cargo", "nextest", "run"],
-            cwd=mirror, env=environment, capture_output=True, text=True, check=False, timeout=60,
+            cwd=mirror, env=environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         rows = [
@@ -539,7 +541,7 @@ class MacReportTests(unittest.TestCase):
         for args in (["mac-report", "--hours", "2"], ["schema"]):
             result = subprocess.run(
                 [sys.executable, str(CLI), *args], env={**os.environ, "BUILDLOG_DIR": str(self.root)},
-                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             if args[0] == "mac-report":

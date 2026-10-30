@@ -13,6 +13,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import TypedDict, cast, final, override
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -206,7 +207,7 @@ class MacRunTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=300,
+            timeout=TEST_HANG_GUARD_SECS,
         )
 
     def mac_run(
@@ -263,7 +264,7 @@ class MacRunTests(unittest.TestCase):
         self.assertFalse((self.state_directory / "run.json").exists())
 
     def wait_for_path(self, path: Path) -> None:
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while time.monotonic() < deadline:
             if path.exists():
                 return
@@ -447,10 +448,10 @@ class MacRunTests(unittest.TestCase):
                 try:
                     self.wait_for_path(self.stub_state / "build-started")
                     os.killpg(process.pid, signal_number)
-                    output, errors = process.communicate(timeout=300)
+                    output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 except BaseException:
                     os.killpg(process.pid, signal.SIGKILL)
-                    _ = process.communicate(timeout=300)
+                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     raise
 
                 self.assertEqual(

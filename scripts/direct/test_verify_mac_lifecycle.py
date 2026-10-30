@@ -7,7 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import final
 from scripts.build_hold import build_hold
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, HANG_GUARD_S as HANG_GUARD_S, VERIFY as VERIFY
+from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, VERIFY as VERIFY
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final
@@ -28,7 +29,7 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
         self.wait_for_path(self.runner_state / "free-now-events", (process,))
         self.assertEqual(len(self.runner_events()), 1)
         _ = mac_free.write_text("free\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 42, output + errors)
         self.assertIn("another machine is free after", output)
         self.assertEqual(self.local_runs(), [])
@@ -57,21 +58,21 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
         # The step gave the token back for its memory wait, and a peer takes it.
         lock = self.board / "locks" / "cargo.d"
         self.assertFalse(lock.exists())
-        peer = subprocess.Popen(["bash", "-c", 'read -r -t "$1" _; :', "peer", str(HANG_GUARD_S)],
+        peer = subprocess.Popen(["bash", "-c", 'read -r -t "$1" _; :', "peer", str(TEST_HANG_GUARD_SECS)],
                                 stdin=subprocess.PIPE)
 
         def stop_peer() -> None:
             assert peer.stdin is not None
             peer.stdin.close()
-            _ = peer.wait(timeout=HANG_GUARD_S)
+            _ = peer.wait(timeout=TEST_HANG_GUARD_SECS)
 
         self.addCleanup(stop_peer)
         acquired = subprocess.run(["bash", str(VERIFY.with_name("board.sh")), "acquire", str(self.board),
                                    "peer", "cargo", "--pid", str(peer.pid)],
-                                  capture_output=True, text=True, check=False, timeout=HANG_GUARD_S)
+                                  capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(acquired.returncode, 0, acquired.stderr)
         _ = mac_free.write_text("free\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 0, output + errors)
         self.assertEqual(self.local_runs(), [])
         self.assertEqual(self.last_call()["mac"], "passed_full")
@@ -101,7 +102,7 @@ class VerifyMacLifecycleTests(VerifyMacOffloadFixture):
         self.wait_until(waiting_on_the_hold, "the hold wait", (process,))
         self.assertEqual(len(self.runner_events()), 1)
         _ = mac_free.write_text("free\n")
-        output, errors = process.communicate(timeout=HANG_GUARD_S)
+        output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(process.returncode, 42, output + errors)
         self.assertIn("leaving natedev's hold wait to run there", output + errors)
         self.assertEqual(self.local_runs(), [])

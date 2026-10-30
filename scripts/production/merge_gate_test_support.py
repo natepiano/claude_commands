@@ -20,10 +20,8 @@ from unittest import mock
 from scripts.production import merge_gate
 from scripts.production.cli_fixture import invoke_cli
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
 SCRIPT = Path(__file__).with_name("merge_gate.py")

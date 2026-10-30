@@ -24,6 +24,10 @@ from zoneinfo import ZoneInfo
 
 import sweep
 if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
+if TYPE_CHECKING:
     from ..build_hold import build_hold
     from ..message import process_table, sessions
     from ..notify import review
@@ -2463,7 +2467,7 @@ class BudgetTests(unittest.TestCase):
                        "NOTIFIER_SESSIONS_DIR": str(base / "sessions"),
                        "PYTHONPATH": str(Path(__file__).resolve().parent)}
         result = subprocess.run([sys.executable, "-c", "import sweep"], cwd=base, env=environment,
-                                capture_output=True, text=True, check=False, timeout=300)
+                                capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_config_reads_as_lint_config_sh_does(self) -> None:

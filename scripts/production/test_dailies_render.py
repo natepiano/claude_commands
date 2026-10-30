@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
                             check_render_state, last_report, load_state)
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("dailies_render.py")
 AT = "2026-10-04T11:00"
@@ -115,7 +116,7 @@ def run(arguments: list[str], scratch: str, holders: list[dict[str, str]] | None
                    "MAC_TEST_STATE_DIR": str(Path(scratch) / "mac-test")}
     if subprocess_cli:
         result = subprocess.run([sys.executable, str(SCRIPT), *arguments], env=environment,
-                                capture_output=True, text=True, check=False, timeout=300)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
     else:
         result = invoke_cli(dailies_render, lambda: dailies_render.main(arguments), arguments,
                             environment, Path(scratch), production_state=True)
@@ -271,7 +272,7 @@ for name in ("first", "second"):
     paths(caller)
 '''
             result = subprocess.run([sys.executable, "-c", program], env=environment,
-                                    cwd=SCRIPT.parent, capture_output=True, text=True, timeout=300)
+                                    cwd=SCRIPT.parent, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_counts_print_on_one_line_above_the_chart_in_every_length(self) -> None:

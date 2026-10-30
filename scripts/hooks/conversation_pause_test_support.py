@@ -8,12 +8,11 @@ import json
 import os
 from pathlib import Path
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
-from types import FrameType, ModuleType
-from typing import ClassVar, NoReturn, cast, override
+from types import ModuleType
+from typing import ClassVar, cast, override
 import unittest
 from unittest.mock import patch
 
@@ -23,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 import conversation_pause as conversation_pause
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS, LauncherHangGuard
 
 LIBRARY = Path(__file__).with_name("conversation_pause.py")
 PROMPT_HOOK = Path(__file__).with_name("user-prompt-submit-conversation-pause.py")
@@ -30,8 +30,6 @@ STOP_HOOK = Path(__file__).with_name("stop-conversation-pause.py")
 SETTINGS = LIBRARY.parent.parent.parent / "settings.json"
 SESSION = "session-1"
 NOW = 10_000
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 QUESTION = (
     "conversation-pause: the user has been quiet here for 15 minutes. Ask them this, "
     "word for word, and nothing else: Return to automatic updates? (yes / no) They "
@@ -177,7 +175,7 @@ import shutil
 import sys
 import threading
 
-TEST_HANG_GUARD_SECS = 300
+TEST_HANG_GUARD_SECS = __TEST_HANG_GUARD_SECS__
 
 args = sys.argv[1:]
 with Path(os.environ["NOTIFIER_LOG"]).open("a") as log:
@@ -223,7 +221,7 @@ elif action == "new":
     (instance / "state").write_text("ENABLED=1\\nNEXT_DUE=1\\n")
 elif action == "remove":
     shutil.rmtree(instance, ignore_errors=True)
-"""
+""".replace("__TEST_HANG_GUARD_SECS__", str(TEST_HANG_GUARD_SECS))
         )
         self.notifier_stub.chmod(0o755)
         self.sessions_stub = self.root / "sessions.py"
@@ -403,7 +401,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         now: int = NOW,
         extra: dict[str, object] | None = None,
         extra_env: dict[str, str] | None = None,
-        timeout: float = TEST_HANG_GUARD_SECS,
     ) -> subprocess.CompletedProcess[str]:
         payload: dict[str, object] = {"session_id": SESSION, "prompt": prompt}
         if extra is not None:
@@ -421,7 +418,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
             text=True,
             check=False,
             env=environment,
-            timeout=timeout,
         )
 
     def run_stop(
@@ -430,7 +426,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
         now: int = NOW,
         extra: dict[str, object] | None = None,
         extra_env: dict[str, str] | None = None,
-        timeout: float = TEST_HANG_GUARD_SECS,
     ) -> subprocess.CompletedProcess[str]:
         payload: dict[str, object] = {"session_id": SESSION}
         if extra is not None:
@@ -448,7 +443,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
             text=True,
             check=False,
             env=environment,
-            timeout=timeout,
         )
 
     def run_cli(
@@ -471,7 +465,6 @@ with open(os.environ["AUTO_SILENCE_LOG"], "a") as log:
             text=True,
             check=False,
             env=environment,
-            timeout=TEST_HANG_GUARD_SECS,
         )
 
     def run_tick_with_prompt_during_send(
@@ -536,14 +529,14 @@ print("SENT: delivered")
         return [cast(list[str], json.loads(line)) for line in self.activity_log.read_text().splitlines()]
 
     def invoke(self, command: list[str], *, input: str = "", capture_output: bool = True,
-               text: bool = True, check: bool = False, env: dict[str, str],
-               timeout: float = TEST_HANG_GUARD_SECS) -> subprocess.CompletedProcess[str]:
+               text: bool = True, check: bool = False,
+               env: dict[str, str]) -> subprocess.CompletedProcess[str]:
         # Alarm expiry, blocked flock, re-entrant delivery and executable diagnostics
         # keep their actual process boundary. Other cases exercise the same scripts
         # and stand-ins in fresh namespaces, including every write and error path.
         if self.run_in_subprocess:
             return subprocess.run(command, input=input, capture_output=capture_output,
-                                  text=text, check=check, env=env, timeout=timeout)
+                                  text=text, check=check, env=env, timeout=TEST_HANG_GUARD_SECS)
 
         real_run = subprocess.run
 
@@ -559,23 +552,15 @@ print("SENT: delivered")
             return real_run(command, capture_output=capture_output, text=text,
                             check=check, timeout=timeout)
 
-        def hang_guard(_signal: int, _frame: FrameType | None) -> NoReturn:
-            raise TimeoutError("conversation-pause fixture exceeded its hang guard")
-
         children: list[subprocess.Popen[str] | subprocess.Popen[bytes]] = []
-        alarm_handler = signal.getsignal(signal.SIGALRM)
-        alarm_timer = signal.getitimer(signal.ITIMER_REAL)
         try:
-            _ = signal.signal(signal.SIGALRM, hang_guard)
-            _ = signal.alarm(int(timeout))
-            with patch.object(subprocess, "run", run_child), patch.object(
+            with LauncherHangGuard("conversation-pause fixture").protect(), patch.object(
+                subprocess, "run", run_child,
+            ), patch.object(
                 subprocess, "Popen", retain_children(subprocess.Popen, children),
             ):
                 return self.execute_script(Path(command[1]), command[2:], env, input)
         finally:
-            _ = signal.alarm(0)
-            _ = signal.signal(signal.SIGALRM, alarm_handler)
-            _ = signal.setitimer(signal.ITIMER_REAL, *alarm_timer)
             for child in children:
                 _ = child.wait(timeout=TEST_HANG_GUARD_SECS)
 

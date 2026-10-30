@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 import ast
 import io
 import os
@@ -17,10 +18,11 @@ from pathlib import Path
 from unittest import mock
 
 import override_guard
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 CHECKOUT_SCRIPT = SCRIPT_DIRECTORY / "build_hold.py"
@@ -89,7 +91,7 @@ def refusal_line(script: Path, name: str, value: str, home: Path) -> str:
 def run_shell(program: str, arguments: Sequence[str], environment: Mapping[str, str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [BASH, "-c", program, "override-guard-test", str(SHELL_GUARD), *arguments],
-        env=dict(environment), capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+        env=dict(environment), capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
     )
 
 
@@ -101,7 +103,7 @@ class OverrideGuardPythonTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, "-c", "from scripts.build_hold import build_hold"],
             cwd=SCRIPT_DIRECTORY.parent.parent, env=environment,
-            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
@@ -191,7 +193,7 @@ class OverrideGuardPythonTests(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, "-c", "import override_guard; print(override_guard.user_home())"],
             cwd=SCRIPT_DIRECTORY, env=child_environment({"HOME": "/nonexistent"}),
-            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+            capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, str(Path(pwd.getpwuid(os.getuid()).pw_dir)) + "\n")

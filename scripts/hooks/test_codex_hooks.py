@@ -15,10 +15,8 @@ from typing import cast, override
 from unittest import mock
 
 import codex_hooks
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 INSTALLER = Path(__file__).with_name("codex_hooks.py")
 FN_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/post-tool-use-fn-length.py"'

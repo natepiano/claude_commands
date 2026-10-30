@@ -40,9 +40,7 @@ import agent_accounts
 import usage_store
 import quota_alert
 from scripts.whoami import run_out
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 send_role_map_command = role_map.ssh_role_map
 

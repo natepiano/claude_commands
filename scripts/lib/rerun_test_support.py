@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from collections.abc import Mapping
 from typing import override
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -26,7 +27,7 @@ def initialize_repository(path: Path, remote: Path, environment: Mapping[str, st
     ):
         _ = subprocess.run(
             ["git", "-C", str(path), *arguments], env=environment,
-            text=True, capture_output=True, check=True, timeout=30,
+            text=True, capture_output=True, check=True, timeout=TEST_HANG_GUARD_SECS,
         )
 
 
@@ -97,7 +98,7 @@ sys.exit(86 if stop else code)
     def run_in_repo(self, *command: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             command, cwd=self.repo, env=self.environment,
-            text=True, capture_output=True, check=False, timeout=30,
+            text=True, capture_output=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def git(self, *arguments: str) -> subprocess.CompletedProcess[str]:

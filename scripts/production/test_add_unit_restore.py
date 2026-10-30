@@ -32,6 +32,7 @@ from scripts.herdr.fake_herdr import CommandResponse
 
 
 from add_unit_test_support import AddUnitTestCase, configure_test_zone, SHARED, SUBMITTED_PROMPT
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 def setUpModule() -> None:
@@ -540,7 +541,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
-            creator_stdout, creator_stderr = creator.communicate(timeout=30)
+            creator_stdout, creator_stderr = creator.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(creator.returncode, 0, (creator_stdout, creator_stderr))
             self.assertEqual(len(launch_permission.pending_launches()), 1)
             lock_path = Path(self.env["SHUTDOWN_STATE_DIR"]) / "launch.lock"
@@ -554,7 +555,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
-            stdout, stderr = creator.communicate(timeout=300)
+            stdout, stderr = creator.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.assertEqual(creator.returncode, 0, (stdout, stderr))
 
         error = io.StringIO()

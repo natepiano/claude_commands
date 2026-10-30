@@ -20,9 +20,7 @@ from agent_notes import local_reset
 from scripts.accounts import accounts, moves, next_moves, role_map
 from user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_RECIPIENTS, REAL_TELL_USER, REGISTRY as REGISTRY, running
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 setUpModule = support.setUpModule
 

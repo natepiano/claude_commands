@@ -18,10 +18,8 @@ from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("notifier.sh")
 NOW = 1_700_000_123

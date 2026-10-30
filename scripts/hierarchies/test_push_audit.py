@@ -19,6 +19,7 @@ from scripts.hierarchies import push_audit as audit
 from scripts.hierarchies import log_records
 from scripts.hierarchies.test_log_records import phone_overflow_lines, read_report_blocks, summary_lines
 from scripts.production import showrunners
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 JsonRecord = dict[str, object]
@@ -107,7 +108,7 @@ class PushAuditTest(unittest.TestCase):
         result = subprocess.run(
             [sys.executable, str(AUDIT_SCRIPT), "report", "--full", "--since", since, "--until", until],
             cwd=AUDIT_SCRIPT.parents[2], env=environment, capture_output=True, text=True,
-            check=False, timeout=15,
+            check=False, timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         return result.stdout

@@ -30,10 +30,8 @@ import style_ledger
 import style_rules
 import showrunners
 from scripts.direct import test_verify_lint_scope as verify_fixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 class RecordedCall(TypedDict):
     arguments: list[str]
@@ -646,7 +644,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             with (target / "sync.lock").open("a") as lock:
                 real_flock(lock, fcntl.LOCK_EX)
                 locked.set()
-                _ = attempted.wait(30)
+                _ = attempted.wait(TEST_HANG_GUARD_SECS)
 
         holder = threading.Thread(target=first_sync)
         holder.start()
@@ -725,7 +723,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
                 try:
-                    self.assertTrue(wait_until(lambda: pids.exists() or process.poll() is not None, 30))
+                    self.assertTrue(wait_until(lambda: pids.exists() or process.poll() is not None, TEST_HANG_GUARD_SECS))
                     self.addCleanup(kill_group, int(pids.read_text().split()[0]))
                     process.send_signal(signum)
                     _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -738,7 +736,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
                 self.assertEqual(list(self.lint_temp.iterdir()), [])
                 self.assertEqual(self.git("worktree", "list", "--porcelain"), original_worktrees)
                 child, grandchild = (int(pid) for pid in pids.read_text().split())
-                self.assertTrue(wait_until(lambda: not running(child) and not running(grandchild), 5))
+                self.assertTrue(wait_until(lambda: not running(child) and not running(grandchild), TEST_HANG_GUARD_SECS))
 
     def test_a_stop_signal_during_cleanup_raises_after_the_cleanup_ends_and_handlers_are_restored(self) -> None:
         previous = signal.getsignal(signal.SIGTERM)
@@ -883,7 +881,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
                 verifiers.append(child.pid)
                 self.addCleanup(kill_group, child.pid)
                 # verify.sh is running, so only a stop removes its group.
-                self.assertTrue(wait_until(started.exists, 30))
+                self.assertTrue(wait_until(started.exists, TEST_HANG_GUARD_SECS))
                 os.kill(os.getpid(), signal.SIGTERM)
             return child
 
@@ -894,7 +892,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             code = style_sync.main(["lint", "--repo", str(self.repo), "--checkout", str(self.repo), "--tip", self.tip])
         self.assertEqual(code, 128 + signal.SIGTERM, output.getvalue())
         self.assertEqual(len(verifiers), 1)
-        self.assertTrue(wait_until(lambda: not group_running(verifiers[0]), 5))
+        self.assertTrue(wait_until(lambda: not group_running(verifiers[0]), TEST_HANG_GUARD_SECS))
         self.assertEqual(list(self.lint_temp.iterdir()), [])
 
     def test_after_a_sigkill_of_the_owner_the_sweep_keeps_the_dir_until_its_verifier_ends(self) -> None:
@@ -909,7 +907,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
-            self.assertTrue(wait_until(lambda: verifier.exists() or process.poll() is not None, 30))
+            self.assertTrue(wait_until(lambda: verifier.exists() or process.poll() is not None, TEST_HANG_GUARD_SECS))
         finally:
             process.kill()
             _ = process.wait()
@@ -920,7 +918,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             style_sync.sweep_stale_lint_dirs()
         self.assertTrue((directory / "checkout").exists())
         kill_group(group)
-        self.assertTrue(wait_until(lambda: not group_running(group), 5))
+        self.assertTrue(wait_until(lambda: not group_running(group), TEST_HANG_GUARD_SECS))
         with redirect_stdout(io.StringIO()):
             style_sync.sweep_stale_lint_dirs()
         self.assertEqual(list(self.lint_temp.iterdir()), [])

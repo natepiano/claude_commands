@@ -15,13 +15,17 @@ import unittest
 from contextlib import redirect_stderr
 from datetime import datetime
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest.mock import patch
 
 import cli
 import sample
 import store
 from test_index import use_test_log
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 use_test_log()
 
@@ -323,7 +327,7 @@ class SampleTests(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
-            timeout=60,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         files = list(self.root.glob("*/*.jsonl"))

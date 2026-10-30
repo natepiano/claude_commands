@@ -12,9 +12,6 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lib.socket_test_support import short_socket_directory
@@ -27,6 +24,7 @@ from fake_herdr import herdr_listener
 from fake_unit_host import HostedUnit
 from sessions import SessionRecord
 from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("unit_lookup.py")
 

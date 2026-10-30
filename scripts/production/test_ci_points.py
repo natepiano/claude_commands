@@ -16,6 +16,7 @@ import textwrap
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -404,14 +405,14 @@ class CiPointsTests(unittest.TestCase):
         promoted = subprocess.run([sys.executable, str(LIFECYCLE), "promote-main", "--production",
                                    str(self.doc), flag, value, "--smoke-passed", tip],
                                   cwd=self.checkout, env=self.env, capture_output=True,
-                                  text=True, check=False, timeout=300)
+                                  text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(promoted.returncode, 0, promoted.stdout + promoted.stderr)
         self.assertIn("ci: ok", promoted.stdout)
         _ = self.merge(2)
         held = subprocess.run([sys.executable, str(LIFECYCLE), "promote-main", "--production",
                                str(self.doc), flag, value, "--smoke-passed", tip],
                               cwd=self.checkout, env=self.env, capture_output=True,
-                              text=True, check=False, timeout=300)
+                              text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(held.returncode, 2, held.stdout + held.stderr)
         self.assertIn("ci: held", held.stdout)
 
@@ -471,16 +472,16 @@ runpy.run_path(sys.argv[0], run_name='__main__')
                     readable, _, _ = select.select([fd], [], [], 300)
                     self.assertEqual(readable, [fd], "watch never reached the held lock")
                     if os.read(fd, 7) != b"blocked":
-                        stdout, stderr = process.communicate(timeout=300)
+                        stdout, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                         self.fail("watch exited before observing the review lock: " + stdout + stderr)
                 self.assertTrue(all(process.poll() is None for process in processes))
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-                results = [process.communicate(timeout=300) for process in processes]
+                results = [process.communicate(timeout=TEST_HANG_GUARD_SECS) for process in processes]
         finally:
             for process in processes:
                 if process.poll() is None:
                     process.kill()
-                _ = process.communicate(timeout=300)
+                _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             for fd in readiness:
                 os.close(fd)
         self.assertTrue(all(process.returncode == 0 for process in processes), results)

@@ -12,11 +12,12 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 INVOKE = Path(__file__).with_name("invoke.sh")
 OOM_SCORE_ADJ = "/proc/self/oom_score_adj"
@@ -142,7 +143,7 @@ buildlog_sample_anon "$1" "$2" "$$"
 '''
             with near_peak.open() as old_snapshot:
                 result = subprocess.run(["bash", "-c", program, "sampler-test", str(sidecar),
-                                         str(maximum), str(scope)], capture_output=True, text=True, timeout=10)
+                                         str(maximum), str(scope)], capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.splitlines(), [
                     "100:100 1000", "100:100 1000", "100:100 1060", "100:100 1060", "100:100 1121",
@@ -190,7 +191,7 @@ buildlog_sample_anon "$1" "$2" "$$"
 '''
                 result = subprocess.run(["bash", "-c", program, "sampler-test", str(sidecar),
                                          str(maximum), str(scope), str(int(fail_first_peak))],
-                                        capture_output=True, text=True, timeout=10)
+                                        capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected = (["100", "100", "between:200:100 1", "200", "200"] if fail_first_peak
                             else ["100", "200", "200"])
@@ -218,15 +219,15 @@ buildlog_sample_anon "$1" "$2" "$$"
                 assert shell.stdout is not None
                 sampler_pid = int(cast(str, shell.stdout.readline()).strip())
                 os.kill(shell.pid, signal.SIGKILL)
-                _ = shell.wait(timeout=TEST_HANG_GUARD_SECS)
-                deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+                _ = shell.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+                deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
                 while time.monotonic() < deadline and self.process_running(sampler_pid):
                     time.sleep(0.05)
                 self.assertFalse(self.process_running(sampler_pid), "sampler survived its parent shell")
             finally:
                 if shell.poll() is None:
                     shell.kill()
-                    _ = shell.wait(timeout=TEST_HANG_GUARD_SECS)
+                    _ = shell.wait(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 if sampler_pid and self.process_running(sampler_pid):
                     os.kill(sampler_pid, signal.SIGKILL)
                 if shell.stdout is not None:
@@ -298,10 +299,10 @@ class SweepStartupTests(unittest.TestCase):
             )
             os.close(writer)
             try:
-                output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                output, errors = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertEqual(process.returncode, 0, output + errors)
                 events = b""
-                deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+                deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
                 while True:
                     ready, _, _ = select.select([reader], [], [], max(0, deadline - time.monotonic()))
                     self.assertTrue(ready, "sweep stand-in still holds its pipe")
@@ -315,7 +316,7 @@ class SweepStartupTests(unittest.TestCase):
             finally:
                 if process.poll() is None:
                     process.kill()
-                    _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    _ = process.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 os.close(reader)
 
     def test_offload_switch_starts_no_detached_sweep(self) -> None:

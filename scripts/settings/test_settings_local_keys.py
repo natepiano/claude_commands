@@ -6,9 +6,7 @@ import subprocess
 import unittest
 from pathlib import Path
 from typing import cast, final
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 KEYS = Path(__file__).with_name("settings_local_keys.sh")
 BASH = shutil.which("bash") or "/bin/bash"

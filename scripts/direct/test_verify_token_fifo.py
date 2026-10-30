@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import subprocess
 import unittest
-from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD, TEST_HANG_GUARD_SECS
+from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, VERIFY, BOARD
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTokenFifoTests(VerifyTokenWaitFixture):

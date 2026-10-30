@@ -21,9 +21,6 @@ from types import SimpleNamespace
 from typing import BinaryIO, cast, final, override
 from unittest.mock import Mock, call, patch
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -31,6 +28,7 @@ import herdr
 import fake_herdr
 import trust_survey
 from fake_herdr import CommandResponse
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 GIT_BINARY = shutil.which("git") or "git"
 

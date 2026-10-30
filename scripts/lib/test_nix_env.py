@@ -10,12 +10,10 @@ import sys
 from typing import cast
 from unittest.mock import patch
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import nix_env
 from scripts.lib.nix_env_test_support import HELPER, NixFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class EnsureTests(NixFixture):
@@ -148,7 +146,7 @@ class RegisteredWorktreeTests(NixFixture):
     def git(self, directory: Path, *arguments: str) -> str:
         result = subprocess.run(
             ["git", "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
-            cwd=directory, env=self.env, capture_output=True, text=True, timeout=10, check=False)
+            cwd=directory, env=self.env, capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.strip()
 

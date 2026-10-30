@@ -35,9 +35,9 @@ import progress_history
 import tidy_wrapped
 import stall_watch
 from rename_state import RenameRefused
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("transfer_unit.py")
 

@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts.direct import remove_run_scratch, workers
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).parent / "remove_run_scratch.py"
 
@@ -54,7 +55,7 @@ class RemoveRunScratchTests(unittest.TestCase):
         record = records / "verify.json"
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
                                   "mesh_runs.py", "supervise", str(record)], stdin=subprocess.PIPE)
-        self.addCleanup(lambda: child.communicate(timeout=4))
+        self.addCleanup(lambda: child.communicate(timeout=TEST_HANG_GUARD_SECS))
         _ = record.write_text(json.dumps({"status": "running", "pid": child.pid, "worker": "w7", "cwd": str(command_cwd)}))
         with mock.patch.dict(os.environ, {"UNIT_WORKERS_STATE": str(run.parent / "unit-workers")}):
             store = workers.UnitWorkerLedger(workers.ledger_path("demo", "builders"))
@@ -63,14 +64,14 @@ class RemoveRunScratchTests(unittest.TestCase):
                     workers.CodexThread("kept-thread", str(run.parent / "codex")), workers.Paused(),
                     [workers.WorkerEvent("opened", "fixture", str(run), 1_793_188_800.0, {})])
             result = subprocess.run([sys.executable, str(SCRIPT), str(run)], capture_output=True,
-                                    text=True, timeout=10, check=False)
+                                    text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(command_cwd.is_dir(), result.stdout)
             self.assertFalse((run / "scratch" / "export").exists())
             self.assertTrue(record.exists())
             _ = record.write_text(json.dumps({"status": "finished", "pid": os.getpid(), "worker": "w7", "cwd": str(command_cwd)}))
             result = subprocess.run([sys.executable, str(SCRIPT), str(run)], capture_output=True,
-                                    text=True, timeout=10, check=False)
+                                    text=True, timeout=TEST_HANG_GUARD_SECS, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(checkout.exists())
 

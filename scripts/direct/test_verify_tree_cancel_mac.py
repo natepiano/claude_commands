@@ -4,6 +4,7 @@ from __future__ import annotations
 import unittest
 
 from scripts.direct.verify_tree_cancel_test_support import VerifyTreeCancelFixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 class VerifyTreeCancelTests(VerifyTreeCancelFixture):
@@ -12,7 +13,7 @@ class VerifyTreeCancelTests(VerifyTreeCancelFixture):
         self.wait_for_running(self.control / "running", process)
         if not (self.control / "mac-attempt").exists():
             self.end_group(process.pid)
-            output, errors = process.communicate(timeout=30)
+            output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
             self.fail("verify never used the offload runner: " + output + errors)
         self.edit_source()
         self.assert_cancelled(process, "test")

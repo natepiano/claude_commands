@@ -11,11 +11,12 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from typing import override
+from typing import TYPE_CHECKING, override
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPTS = Path(__file__).resolve().parent
 SCOPE_FLAGS = [
@@ -140,7 +141,7 @@ class CargoWrapperTest(unittest.TestCase):
             log.unlink(missing_ok=True)
         return subprocess.run(
             [str(self.front / "cargo"), *args], env=self.env, cwd=self.cwd,
-            input="cargo input\n", capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+            input="cargo input\n", capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             check=False,
         )
 
@@ -317,7 +318,7 @@ class CargoWrapperTest(unittest.TestCase):
         return subprocess.run(
             [str(self.installer)], env={**os.environ, "HOME": str(self.home),
                                        "OSTYPE": self.env["OSTYPE"]},
-            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS, check=False,
+            capture_output=True, text=True, timeout=test_hang_guard.TEST_HANG_GUARD_SECS, check=False,
         )
 
     def test_installer_creates_link_and_accepts_repeat(self) -> None:

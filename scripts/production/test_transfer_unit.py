@@ -19,15 +19,17 @@ from scripts.direct import workers
 from scripts.production import staff, staff_move
 from scripts.production.rename_test_support import legacy_staff_journal, stop_at_staff_write
 from scripts.production.rename_rerun_test_support import final_files, saved_fixture
-from scripts.production.staff_test_support import SOURCES_SCRIPT, PROCESS_TIMEOUT
+from scripts.production.staff_test_support import SOURCES_SCRIPT
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production.transfer_unit_test_support import (
-    UnitTransferFixture, SCRIPT, TEST_HANG_GUARD_SECS,
+    UnitTransferFixture, SCRIPT,
 )
 import transfer_unit
 from rename_state import write_text
 import fake_showrunner
 import fake_unit_host
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS as PROCESS_TIMEOUT
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 @final

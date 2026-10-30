@@ -36,6 +36,7 @@ import stall_watch
 import tidy_wrapped
 import pane_record
 import progress_history
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 if TYPE_CHECKING:
     from scripts.style import style_ledger
@@ -49,7 +50,6 @@ SCRIPT = Path(__file__).with_name("rename_unit.py")
 SLUG = "demo"
 
 # load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 class UnitRenameFixture(StaffTestCase):

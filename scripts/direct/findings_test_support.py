@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.production.cli_fixture import invoke_cli
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 # Only the fsync test calls a function directly; never initialize it from live config.
 with patch.dict(os.environ, {"UNIT_CONFIG": str(Path(__file__).resolve().parents[2] / "config/direct.conf")}):
@@ -23,8 +24,6 @@ with patch.dict(os.environ, {"UNIT_CONFIG": str(Path(__file__).resolve().parents
 SCRIPT = Path(__file__).with_name("findings.py")
 FINDINGS_CODE = compile(SCRIPT.read_text(encoding="utf-8"), str(SCRIPT), "exec")
 
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 
 def invoke_findings(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:

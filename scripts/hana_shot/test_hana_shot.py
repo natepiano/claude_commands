@@ -25,10 +25,8 @@ from unittest import mock
 import zlib
 
 from scripts.hana_shot import hana_shot
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
-
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("hana_shot.py")
 CAMERA_ENTITY = 5
@@ -228,7 +226,7 @@ class Fake:
         if method == "brp_extras/screenshot":
             self.screenshot_started.set()
             if self.screenshot in ("hang", "hold"):
-                _ = self.release.wait(15)
+                _ = self.release.wait(TEST_HANG_GUARD_SECS)
                 return {"result": None}
             if self.screenshot == "busy-always" or (self.screenshot == "busy-once" and screenshots == 1):
                 return {"error": {"code": -32603, "message": "Screenshot already in progress"}}
@@ -368,7 +366,7 @@ class HanaShotTest(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(program), *args],
             cwd=self.scratch, env=self.script_environment(session_variables), capture_output=True, text=True,
-            timeout=60, check=False,
+            timeout=TEST_HANG_GUARD_SECS, check=False,
         )
 
     def run_script(self, *args: str, session_variables: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -1471,7 +1469,7 @@ class ViewsTests(HanaShotTest):
         self.addCleanup(self.stop_script, process)
         self.assertTrue(self.fake.screenshot_started.wait(TEST_HANG_GUARD_SECS), "the second view never reached capture")
         process.send_signal(signal.SIGTERM)
-        _, stderr = process.communicate(timeout=60)
+        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
 
         self.assertEqual(process.returncode, 128 + signal.SIGTERM, stderr)
         [line] = self.timing_lines()
@@ -1938,7 +1936,7 @@ class RemoteTests(HanaShotTest):
         self.addCleanup(self.stop_script, process)
         self.assertTrue(self.fake.screenshot_started.wait(TEST_HANG_GUARD_SECS), "the screenshot call never reached the fake")
         process.send_signal(signal_number)
-        _, stderr = process.communicate(timeout=60)
+        _, stderr = process.communicate(timeout=TEST_HANG_GUARD_SECS)
         return cast(int, process.returncode), stderr
 
     def test_remote_shot_copies_the_png_back_and_removes_it_there(self) -> None:

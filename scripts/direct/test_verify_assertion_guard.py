@@ -9,6 +9,7 @@ from typing import override
 
 from scripts.direct.test_assertion_guard import GitRepositoryFixture, TILE_NEW, TILE_OLD
 from scripts.direct import test_verify_lint_scope as verify_fixture
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
@@ -66,7 +67,7 @@ cargo() { printf '{"workspace_root":"%s"}\n' "$TEST_REPO"; }
         return subprocess.run(
             ["bash", "-c", script, "lint-test", *arguments],
             cwd=self.repo / "src" if member_cwd else self.repo, env=environment,
-            capture_output=True, text=True, check=False, timeout=5,
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
         )
 
     def test_full_verify_entry_point_uses_guard_override_and_stops_before_lint_tools(self) -> None:

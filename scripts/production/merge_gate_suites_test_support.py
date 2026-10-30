@@ -8,7 +8,8 @@ import select
 import sys
 from typing import override
 
-from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE, TEST_HANG_GUARD_SECS
+from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 # Keep the shared fixture unchanged for its other subjects. These jobs still run

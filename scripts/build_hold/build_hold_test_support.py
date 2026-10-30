@@ -20,6 +20,10 @@ import unittest
 from unittest import mock
 
 import build_hold
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 if TYPE_CHECKING:
     from ..lib.socket_test_support import short_socket_directory
@@ -50,9 +54,6 @@ class HoldEventRecord(TypedDict):
     at: str
     until: str
 
-
-# load 136 on natedev, 2026-10-29
-TEST_HANG_GUARD_SECS = 300
 
 SCRIPT = Path(__file__).with_name("build_hold.py")
 MEMORY_GATE = Path(__file__).resolve().parent.parent / "lint" / "memory_gate.sh"
@@ -181,7 +182,7 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         so wait again until a read returns EOF.
         """
         os.close(self.lifetime_writer)
-        deadline = time.monotonic() + TEST_HANG_GUARD_SECS
+        deadline = time.monotonic() + test_hang_guard.TEST_HANG_GUARD_SECS
         try:
             while True:
                 remaining = max(deadline - time.monotonic(), 0)
@@ -199,5 +200,5 @@ class IsolatedBuildHoldTest(unittest.TestCase):
         for thread in threading.enumerate():
             if thread.name == "hold-event-recorder":
                 # A recorder runs a short subprocess; under load it can take far longer than its usual second.
-                thread.join(timeout=TEST_HANG_GUARD_SECS)
+                thread.join(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
                 self.assertFalse(thread.is_alive())

@@ -16,7 +16,7 @@ from contextlib import closing
 from dataclasses import FrozenInstanceError, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import TYPE_CHECKING, TypedDict, cast, override
 from unittest import mock
 
 import disk
@@ -30,6 +30,10 @@ import rust_release
 import sync
 from test_holds import timed_hold_events, write_holder, write_mac_block
 from test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
+if TYPE_CHECKING:
+    from ..lib import test_hang_guard
+else:
+    from scripts.lib import test_hang_guard
 
 
 class CliWork(TypedDict):
@@ -92,7 +96,7 @@ def measure_cli_work(command: str, environment: dict[str, str], row_count: int) 
         [sys.executable, "-c", "import os; environment = dict(os.environ); from test_report import probe_cli; os.environ.update(environment); probe_cli()", command],
         cwd=Path(__file__).resolve().parents[2],
         env={**environment, "PYTHONPATH": str(Path(__file__).resolve().parent), "BUILDLOG_TEST_INSTRUCTION_LIMIT": str(row_count * 500)},
-        capture_output=True, text=True, check=False, timeout=120,
+        capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
     )
     if result.returncode != 0:
         raise AssertionError(f"CLI failed: {result.stderr}\n{result.stdout}")

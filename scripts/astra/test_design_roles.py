@@ -31,6 +31,7 @@ from scripts.astra.design_roles import release_servers as release_design_servers
 from scripts.message import sessions  # noqa: E402
 from scripts.production import production_tree  # noqa: E402
 from scripts.whoami import agent_accounts  # noqa: E402
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 Role = Literal["designer", "reviewer"]
 
@@ -816,7 +817,7 @@ class DurableRolesTests(unittest.TestCase):
         def clean_process() -> None:
             if process.poll() is None:
                 process.kill()
-            _ = process.wait(timeout=5)
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
             if process.stdin is not None:
                 process.stdin.close()
 
@@ -855,7 +856,7 @@ class DurableRolesTests(unittest.TestCase):
             self.assertTrue(server.exists())
             self.assertNotIn("thread/unsubscribe", methods)
             ended = design_roles.end(design_id + "/reviewer")
-            _ = process.wait(timeout=2)
+            _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
         self.assertTrue(all(isinstance(instance.lifecycle, design_roles.RoleEnded) for instance in ended.roles))
         self.assertFalse(server.exists())
         self.assertIn("thread/unsubscribe", methods)

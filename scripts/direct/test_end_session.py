@@ -14,6 +14,7 @@ from typing import override
 from unittest.mock import patch
 
 from scripts.direct import workers
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 END_SESSION = Path(__file__).with_name("end_session.sh")
@@ -203,7 +204,7 @@ class EndSessionTests(unittest.TestCase):
         record = run / "mesh_runs" / "still-running.json"
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
                                   "mesh_runs.py", "supervise", str(record)], stdin=subprocess.PIPE)
-        self.addCleanup(lambda: child.communicate(timeout=4))
+        self.addCleanup(lambda: child.communicate(timeout=TEST_HANG_GUARD_SECS))
         _ = record.write_text(json.dumps({
             "worker": "w7", "status": "running", "pid": child.pid, "cwd": str(command_cwd)}))
         environment = self.environment()
@@ -217,7 +218,7 @@ class EndSessionTests(unittest.TestCase):
                     workers.CodexThread("kept-thread", str(self.root / "codex")), workers.Paused(),
                     [workers.WorkerEvent("opened", "fixture", str(run), 1.0)])
         result = subprocess.run(["bash", str(self.script)], env=environment,
-                                capture_output=True, text=True, check=False, timeout=15)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(command_cwd.is_dir(), result.stdout + result.stderr)
         self.assertFalse(unused.exists(), result.stdout + result.stderr)
