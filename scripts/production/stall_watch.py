@@ -34,6 +34,8 @@ from session_pane import HerdrFailure, agent_status, read_place
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+import context_usage  # noqa: E402
 import push_texts  # noqa: E402
 import rca  # noqa: E402
 import sessions  # noqa: E402
@@ -251,6 +253,22 @@ def latest_transcript_activity(session_id: str) -> float:
             if path.is_file():
                 latest = max(latest, path.stat().st_mtime)
     return latest
+
+
+def context_near_compaction(session_id: str) -> bool:
+    """Wake at the context hook's shared handoff threshold using its bounded tail reading."""
+    try:
+        transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
+        if transcript is None:
+            return False
+        reading = context_usage.latest_reading(transcript)
+    except OSError:
+        return False
+    if reading is None:
+        return False
+    window = context_usage.auto_compact_window(reading["model"])
+    return (window is not None
+            and context_usage.estimate_tokens(reading, 0) >= context_usage.handoff_threshold(window))
 
 
 def lines_from_end(path: Path, block: int = 1 << 20) -> Iterator[bytes]:
@@ -811,7 +829,8 @@ def tick(now: float) -> None:
             # A hold that states when it ends waits like a gate until then; the idle clock starts after it.
             held_until = (stated_hold_end(turn.group(0), now, zone)
                           if turn and turn.group("kind") == HOLDING_KIND else None)
-            if turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now)):
+            if (turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now))
+                    and not context_near_compaction(session_id)):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)
