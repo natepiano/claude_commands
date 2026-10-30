@@ -50,71 +50,48 @@ including the details to make it clear
 
 ### Phase 1 — /build:queue opens a mod pane and says at once why the head waits  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `/build:queue` opens pane `build-queue` (title `Build queue`) at once with no model turn, like `/accounts-board`, and one head line says what holds the first waiting step.
-
-**Spec:**
-- `build_queue.py` gains `--json`: one object with the running rows, the waiting rows, the head line, the totals and the roster problems. Each cell is already formatted in the user's zone, as the text tables show it. The text output keeps its form; text and JSON come from the same row values.
-- Head line, above the Waiting table, in both the text output and the pane. A budget hold names each running step that holds the budget, with its charge and its measured use, for example `widget-enhancements-title nextest: charged 10.8 GiB, using 0.5 GiB`. A free-memory hold gives free memory against the need, and a pressure hold gives the pressure reason. When the head has waited 15 min or more while free memory covers its need, the line starts `Stalled:` in the error tone. The line comes from the decision `memory_admit.py` already makes, read through its existing queue view, never a second copy of its rules.
-- The mod answers `command.run` on `{ command: 'build:queue' }`, as it answers `showrunner:unit_board`, and never calls `next`. Open: store `loading`, run `[~/.claude/scripts/lib/py, ~/.claude/scripts/build_queue/build_queue.py, "--json"]`, reply `Build queue opened.`. Refresh every 10 s while open. `close`, Escape or the close mark closes it (`Build queue closed.`). `bump <selector>` runs `build_queue.py bump <selector>`, replies with its result line and refreshes an open pane. It never parses the text table. A failed run shows `Build queue could not be read.`, never process output.
-- Shared code: the accounts pane lifecycle in `hooks/register.tsx` (open, loading, one run per tick, busy guard, 10 s timer, reload restart from `$.ui.panes()`, close, fixed failure reason) becomes one table-pane helper. `/accounts-board` and `/build:queue` both use it; `/accounts-board` behaves exactly as before.
-- `commands/build/queue.md` keeps its frontmatter; its body still runs the script, so a session without the mod still gets the tables, and names `/reload-plugins` for a session started before the mod change.
-- Assertion-Change: `scripts/build_queue/test_build_queue.py` — `test_budget_reason_names_charged_builds_and_the_limit`, `test_memory_reason_names_free_memory_and_earlyoom_reserve` and `test_unavailable_reading_does_not_claim_zero_free_memory` select only table rows (lines that start with `| `), because the head line now holds the same reason text. Each assertion string stays the same.
-- A bump selector refusal is a type: `memory_admit.bump_waiter` raises `UnmatchedWaiter(ValueError)` (beside `WaiterGone`) for an unknown or ambiguous selector, and `build_queue.py` catches only that and its own ambiguous-name refusal; any other error, a `ValueError` from the locked reread included, stays exit 2.
-- Assertion-Change: `scripts/build_queue/test_build_queue.py` — `test_bump_shared_shown_label_is_ambiguous_even_when_recorded_name_is_unique` and `test_bump_passes_selector_and_caller_and_reports_ambiguous_match` expect exit 3 with the refusal on stdout (was exit 2 on stderr): a selector refusal has its own exit code so the mod forwards only it, never an operational error. Each refusal text check stays. The second one's patched `bump_waiter` side effect becomes `memory_admit.UnmatchedWaiter`, the typed refusal.
+- `build_queue.py --json` prints one `QueueSnapshot` object: running and waiting rows with their headers, the head line `{"text", "tone"}`, the totals and the roster problems. Each cell is formatted once, in the user's zone. The text tables and the JSON come from the same row values.
+- `head_line()` gives one line above the Waiting table, in the text output and in the pane. It reads the decision through `memory_admit`'s queue view and keeps no copy of its rules. A budget hold names each running step that holds budget, with its charge and its measured use. A free-memory hold gives free memory against the step's need. A pressure hold gives the pressure reason. When the head has waited 15 min or more and free memory covers its need, the line starts `Stalled:` with tone `error`; else it starts `Head:` with tone `default`.
+- The unit-board mod answers `command.run` for `build:queue` with no model turn. It opens pane `build-queue` (title `Build queue`), runs `build_queue.py --json`, refreshes every 10 s, and closes on `close`, Escape or the close mark. A failed run shows `Build queue could not be read.`, never process output. `bump <selector>` runs `build_queue.py bump <selector>` and replies with its result line. The pane refresh after a bump is outside the bump's error catch, so a refresh failure never replaces the bump reply.
+- `tablePane()` in `register.tsx` is the one table-pane lifecycle: open, loading, one run per tick, busy guard, 10 s timer, restart on reload, close, fixed failure text. `/accounts-board` and `/build:queue` both use it.
+- A bump selector refusal is a type. `memory_admit.bump_waiter` raises `UnmatchedWaiter(ValueError)` for an unknown or ambiguous selector, and `build_queue.py`'s shown-name match raises the same type for an ambiguous name. `build_queue.py` catches only `UnmatchedWaiter`: it prints `build queue: <text>` on stdout, with control characters escaped, and exits 3. The mod forwards only that exit 3 reply.
+- `commands/build/queue.md` still runs the script, so a session without the mod gets the tables. It names `/reload-plugins` for a session that started before the mod change.
 
 **Files:**
-- `scripts/build_queue/build_queue.py` — `--json`, head line
-- `scripts/lint/memory_admit.py` — `bump_waiter` raises `UnmatchedWaiter(ValueError)` for an unknown or ambiguous selector, nothing else
-- `scripts/build_queue/test_build_queue.py` — JSON equals text cells; head line per hold kind; `Stalled:` at 15 min
-- `mods/unit-board/hooks/register.tsx` — table-pane helper; `build:queue` command
-- `mods/unit-board/hooks/queue.tsx` — new: the build queue pane view
-- `mods/unit-board/types/queue.d.ts` — new: the JSON shape
-- `mods/unit-board/tests/queue.test.ts` — new: pane tests
-- `commands/build/queue.md` — fallback body and `/reload-plugins` line
+- `scripts/build_queue/build_queue.py` — `--json`, `head_line()`, the bump CLI and its exit 3 refusal
+- `scripts/lint/memory_admit.py` — `UnmatchedWaiter(ValueError)`, raised at `bump_waiter`'s match check
+- `mods/unit-board/hooks/register.tsx` — `tablePane()` helper; the `build:queue` command
+- `mods/unit-board/hooks/queue.tsx` — the build queue pane view
+- `mods/unit-board/types/queue.d.ts` — the `QueueSnapshot` JSON shape
+- `commands/build/queue.md` — fallback body and the `/reload-plugins` line
 - `docs/as-built/unit-board.md` — the shared pane and `/build:queue`
+- `scripts/build_queue/test_build_queue.py`, `mods/unit-board/tests/queue.test.ts` — tests
 
-**Workers:** 1 writer + 1 tester.
-- `impl` — `build_queue.py`, `register.tsx`, `queue.tsx`, `queue.d.ts`, `commands/build/queue.md`, `docs/as-built/unit-board.md`
-- `test` — `test_build_queue.py`, `mods/unit-board/tests/queue.test.ts`
+**Binds later work:** the mod pane reads `--json`, so the head line's JSON field keeps the `{"text", "tone"}` shape when build-why takes over its text. A selector refusal is `memory_admit.UnmatchedWaiter`, printed on stdout with exit 3; the mod forwards only that.
 
-**State:** none
+**Gotchas:** only `UnmatchedWaiter` is a refusal. Every other bump error, a `ValueError` from the locked reread included, prints on stderr and exits 2. A refusal found by exit code or text prefix alone lets operational errors through to the pane.
 
-**Depends on:** none
-
-**Constraints from prior phases:** UnitLabels gives separate short Showrunner and Unit names (roster.py `_unit_labels`); keep those columns.
-
-**Acceptance gate:** `python3 -m unittest scripts.build_queue.test_build_queue` green; the mod test suite green with `accounts.test.ts` and `register.test.ts` unchanged; basedpyright 0/0/0 on the changed Python files. Live: after `/reload-plugins`, `/build:queue` opens the pane with no model turn, its rows match `python3 ~/.claude/scripts/build_queue/build_queue.py` run at the same time, and the head line names the step that holds the budget when one does.
+**Ruled out:** a refusal channel by exit code or message prefix without a type — it leaks operational errors.
 
 ### Phase 2 — The index reads old field names and never rewrites a source log  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** a stop at any line of an index update cannot change or lose a build-log record.
-
-**Spec:**
-- Remove `migrate_worker_fields` (`scripts/buildlog/index.py:663-692`) and its call in `read_file`. While indexing a `step` or `call` record, read the old names as the new ones from `FORMER_FIELDS` (`seat`→`worker`, `delegate_session`→`unit_session`); a record with both keeps the new value.
-- The rerun sweep row (`docs/plans/sdlc-rerun-sweep.md` on main 4dfc4dce, `scripts/buildlog/index.py:689`, Q3) is closed by this: no index code writes a `.jsonl` file.
-- Assertion-Change: `scripts/buildlog/test_index.py` `test_first_index_read_migrates_worker_fields_and_preserves_incomplete_appends` becomes `test_first_index_read_maps_worker_fields_and_leaves_source_unchanged`: its two `assertNotIn` checks for `"seat"` and `"delegate_session"` in the source become one `assertEqual` of the source bytes before and after the update. The row, partial-append and second-update checks stay.
+- The build-log index never writes a `.jsonl` source log. `migrate_worker_fields` is gone.
+- `read_file` maps old field names at index time. For a `step` or `call` record, each `FORMER_FIELDS` pair (`seat`→`worker`, `delegate_session`→`unit_session`) fills the new name from the old one; a record with both keeps the new value. An old-name record and a new-name record give the same index row.
+- A stop at any line of an index update leaves every source byte unchanged, and a rerun indexes each record once. This closes the rerun sweep row for `scripts/buildlog/index.py:689`.
 
 **Files:**
-- `scripts/buildlog/index.py` — drop the rewrite; read-side rename
-- `scripts/buildlog/test_index_rerun.py` — new: stop-and-rerun test
-- `scripts/buildlog/test_index.py` — the old rewrite test now checks unchanged source bytes
-- `docs/as-built/buildlog-memory-stalls.md` — one line: the index reads old field names
+- `scripts/buildlog/index.py` — `FORMER_FIELDS` read-side mapping in `read_file`; no source rewrite
+- `scripts/buildlog/test_index_rerun.py` — stop-and-rerun test: source bytes unchanged, new field names, a second rerun adds nothing
+- `scripts/buildlog/test_index.py` — `test_first_index_read_maps_worker_fields_and_leaves_source_unchanged` checks unchanged source bytes
+- `docs/as-built/buildlog-memory-stalls.md` — the index reads old field names
 
-**Workers:** 1 writer + 1 tester.
-- `impl2` — `index.py`, the as-built line
-- `test2` — `test_index_rerun.py`, `test_index.py`
+**Binds later work:** the index never rewrites a source log.
 
-**State:** index rows (`index.sqlite`)
-
-**Depends on:** none
-
-**Constraints from prior phases:** none
-
-**Acceptance gate:** the new test stops the update where the rewrite ran (an exception raised after the first record is indexed), reruns it, and checks that every record is in the index under its new field names, the source bytes are unchanged, and a second rerun adds nothing; an old-name and a new-name record give the same row. `python3 -m unittest discover -s scripts/buildlog -p 'test_*.py' -t .` green from the worktree root (or the module list it runs in the merge gate); basedpyright 0/0/0 on the changed files.
+**Gotchas:** the live logs still hold old-name fields (about 70 at closeout). No code rewrites them; only the index read maps them, so a reader that opens the `.jsonl` files directly must map `FORMER_FIELDS` too.
 
 ### Phase 3 — build-why says at once why the first waiting step waits, from admission's own numbers  · status: todo
 
