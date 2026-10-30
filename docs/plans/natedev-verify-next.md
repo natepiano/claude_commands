@@ -6,15 +6,7 @@
 
 **Today:** the Mac takes one claim per repository (`docs/as-built/mac-test-offload.md`), because two runs of one repository share one mirror and one build folder.
 
-**Needed:** a second cargo-liner claim with its own mirror and build folder, kept inside the Mac free-space floor (`free_floor_gib=100`; cargo-liner build budget default 24 GiB). Hana stays at one. The memory rule "max one hana + one cargo-liner job" changes with it.
-
-## Flaky Mac retry test reads a half-written args file
-
-**Source:** the natedev showrunner, 2026-10-29, from the main tip suite at about 12:30 EDT. Do after Phase 4.
-
-**Today:** `scripts/direct/test_verify_mac_lifecycle.py`, `VerifyMacRetryClockTests.test_lost_mac_run_retries_from_a_later_hold_wait`, raised `JSONDecodeError` at `verify_mac_offload_test_support.py:1057`. It read `runner_state/local-wait-args` while the file was empty: a read before the write finished, or a write that is not atomic. It passed when run again alone.
-
-**Needed:** write the file atomically (write a temporary file, then rename) or have the reader wait on an event that the writer sets. Do not add a sleep. Add a test that fails on a partial file.
+**Needed:** a second cargo-liner claim with its own mirror and build folder, kept inside the Mac free-space floor (`free_floor_gib=100`; cargo-liner build budget default 24 GiB). Hana stays at one. The memory rule "max one hana + one cargo-liner job" changes with it. A second claim must also work with the memory-wait handoff: `mac_test.py claim-wait` takes the claim, and `claim --from-pid` (`adopt_wait_claim`) moves the claim at `claim_path(paths, scope)` to the runner. Both read one claim path per repository scope today.
 
 ## Pair a literal with an imported crate constant
 

@@ -23,14 +23,14 @@ i need changes to verify
 - **Project started:** 2026-10-29T12:55:26.085+00:00
 - **Stack:** bash (`verify.sh`), Python 3.11+ through the `scripts/lib/py` shim, `unittest`, basedpyright.
 - **Layout:**
-  - `scripts/direct/verify.sh` — the verify entry point (3003 lines)
+  - `scripts/direct/verify.sh` — the verify entry point
   - `scripts/direct/final_pass.py`, `step_record.py`, `local_release_wait.py`, `progress_history.py` — helpers `verify.sh` starts
   - `scripts/direct/test_verify_*.py` — verify pipeline tests
   - `scripts/mac_test/` — Mac offload: `mac_test.py`, `offload.py`, `copy_watch.py`, `audit.py` and tests
   - `scripts/buildlog/record.py`, `scripts/buildlog/mac_idle.py`, `scripts/build_targets/build_targets.py` — helpers `verify.sh` starts, owned by other units (read, do not edit without the owner)
   - `scripts/lib/py` — interpreter shim; caches the resolved path, so it adds no Python start of its own on a warm cache
 - **Key files:**
-  - `scripts/direct/verify.sh` — 54 Python starts in the source. Per step: `step_record.py` (lines 248, 253, 1563, 1633, 2683), `final_pass.py` (236, 1002), `record.py call` (1316), `mac_idle.py` (1096, 1645, 1662), `build_targets.py` (1088, 1506, 1522, 2131), `progress_history.py` (2655, 2669), inline `-c` scripts that parse `cargo metadata` separately (`MEMBER_PY` 747, `EXAMPLE_FEATURES_PY` 761, `TEST_TARGETS_PY` 768, `BUILD_TARGETS_PY` 866, `UNTESTED_EXAMPLES_PY` 2077, 2777), `DEV_FEATURES_PY` (1046), `TREE_KEY_PY` (1168), clock reads (`time.monotonic()` at 1070, 1670, 1685, 1759), a hash (2238), `STEP_OWNER_PY` through plain `python3` (2520), and `user_zone.py` (1981)
+  - `scripts/direct/verify.sh` — a `VERIFY_PY_TRACE=<file>` run writes one line per helper start (name, wall ms, CPU ms); every inline helper runs as `VERIFY_PY_HELPER=<NAME> "$PY" …`
   - `docs/as-built/rustdoc-once-and-final-targets.md`, `docs/as-built/mac-test-offload.md`, `docs/as-built/build-targets.md` — how verify, its final pass, the Mac offload and build targets work now
 - **Test lanes:** none (no Rust crate); tests sit beside their modules as `test_*.py`.
 - **Build:** none (scripts).
@@ -324,6 +324,8 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 **Goal:** every wait verify.sh records names who holds what it waits on.
 
+**Starting point:** checkpoint 4fa7a873 on `natedev-verify-holder` (reviewed before Phase 7) holds this work on the older base: `buildlog_memory_poll_hook` in `memory_gate.sh`, the holder lookups in `verify.sh` and 23 tests in `test_verify_wait_holder.py`. It has not landed. Port it to this Spec on the Phase 1 + Phase 7 tree: keep what fits, and change the hook to the form in Spec 5.
+
 **Spec:**
 
 1. `phase_wait_start` passes the holder to `progress_history.py start-wait`: `--holder-resource-kind slot|memory --holder-resource <slot name | memory pool> --holder-session <session id>`, or `--holder-unit <unit>` when only the unit is known. All flags or none; none records `HolderNotNamed`.
@@ -358,3 +360,39 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 - These Phase 7 tests pass unchanged: the first-start `mem_wait_s` build-log assertions (`MemoryQueueIdentityTests` in `test_verify_token_renew.py`) and the claim handoff tests that prove a refused Mac claim leaves the run waiting (`MacWaitClaimTests.test_competing_waiters_cannot_leave_without_a_claim_and_runner_adopts_it` and `scripts/mac_test/test_mac_test.py`).
 - Without `BUILDLOG_MEM_BLOCKER=1`, the memory gate's output and decisions are unchanged (`scripts/lint` tests pass).
 - Merge gate `--tests-only` green on a tree merged with origin/builds; basedpyright 0/0 on changed files and callers. A trial merge of `origin/builds-resources` passes the memory gate tests before the notice.
+
+### Phase 9 — Remove Phase 7's new Python starts  · status: todo
+
+**Depends on:** Phase 1 and Phase 7 (same file: `verify.sh`); both are in this phase's baseline.
+
+**Origin:** Phase 7's architect review; builds showrunner approved it first in the next items (2026-10-30).
+
+#### Work Order
+
+**Goal:** Phase 7's token renewal and lint-result checks start no Python that Phase 1 removed the need for: each verify run gets its code key without Python, its two tree keys from one helper start, and its renewal delay from a Bash `sleep`.
+
+**Spec:**
+
+1. `lint_code_key` hashes its three files with `sha256sum`, or `shasum -a 256` when `sha256sum` is absent, and starts no Python. An absent file still hashes as absent, separated from the next file, so a file that appears or goes away changes the key. `token_waiters_key` and this function share one small hash function; no second copy of the `sha256sum`/`shasum` choice.
+2. One `tree_watch.py` start gives both tree keys. The `--key` mode of `tree_watch.py` also gives the tree-content key (no script files, no assertion-guard scope). One `verify.sh` function sets `VERDICT_KEY` and `VERDICT_TREE_KEY` from that one start; the paired sites (`start_tree_watch` with its `--watch-start`, and the four sites that set both keys after a step) all call it. Each value stays byte-equal to the value from the two separate calls on the same tree. The mismatch check in `cache_record` keeps its lazy `tree_key --tree-content` call, since it runs only when the keys differ.
+3. The token renewer's delay uses `sleep "$TOKEN_RENEW_S"`, in the same background and trap form, so a stop still ends the delay at once. A fractional value still works on Linux and the Mac.
+4. Any inline Python start in `verify.sh` that remains names itself with `VERIFY_PY_HELPER=<NAME>`, so a `VERIFY_PY_TRACE` run has no unnamed row.
+
+**Files:**
+- `scripts/direct/verify.sh`
+- `scripts/direct/tree_watch.py`
+- `scripts/direct/test_verify_python_starts.py` — new
+
+**Workers:** 1 writer (one owner for all three files).
+
+**Constraints from prior phases:**
+- Phase 1: `VERIFY_PY_TRACE=<file>` writes one line per helper start; `verify_metadata.py` reads metadata once per run.
+- Phase 2: `tree_watch.py --key --watch-start <file>` writes the watch key to the file. `tree_key` skips `--assertion-guard` and the script files for `--tree-content`.
+- Phase 7: `renew_token` reads 0 and 2 as renewed. A stop kills the delay process, then the renewer. `LINT_LOADED_CODE_KEY` is read only inside the same run, so its value needs no match with the old Python value.
+
+**Acceptance gate:**
+- A real `verify.sh lint` run with `VERIFY_PY_TRACE` (fake cargo and rustc from the shared fixtures) has no row for the code key and no unnamed row, and has one `tree_watch.py` start where each key pair was two. Compare the row counts with the combined baseline and state both in the checkpoint.
+- The new `tree_watch.py` output equals the two separate calls on the same tree: for lint, and for test.
+- `lint_code_key` changes when each of its three files changes and when one goes away.
+- These tests pass unchanged: `test_running_step_renews_past_its_original_hold_and_stops_on_release` and the rest of `test_verify_token_renew`, `test_verify_final_pass_script`, `test_verify_metadata`, and the `tree_watch` tests.
+- basedpyright 0/0/0 on changed files and their callers; `bash -n` and shellcheck with no new findings; merge gate `--tests-only` green on a tree merged with origin/builds.
