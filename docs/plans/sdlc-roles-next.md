@@ -5,8 +5,8 @@
 - [ ] **A push to the user's phone shows who sent it** (sender in the `production · unit · job` form, for example `sdlc · roles · code reviewer 6`; the user, 2026-10-29)
   - Owner: messaging-unit (showrunner, 2026-10-28)
   - Target: `scripts/notify/pushover.py`, `scripts/message/send.py`
-  - Why needed: `send.py` passes the address as `pushover.py --source`, which also supplies the displayed sender; the push does not receive the R5b shown name
-  - Completion condition: a user push shows the sender's shown name, (`production · unit · job`), in a display field, while silence and dedupe still key on the address; the push texts pass their text review
+  - Why needed: user sends skip sender-roster resolution, and `send.py` passes the raw sender as `pushover.py --source`, which also supplies the displayed sender
+  - Completion condition: resolve the sender's configured roster shown name on the sending machine, carry it through delivery and silence replay, and show it on the phone, while the address still keys identity, silence and dedupe; fixture tests cover a display rename in config and a replay after the config changes; the push texts pass their text review
   - Revealed by: Phase 5
 
 - [ ] **The unit board and cargo-liner show each session's job from the shared names file, and an empty job cell gives its reason**
