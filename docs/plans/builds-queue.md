@@ -12,7 +12,13 @@
 
 add a queue unit - it should own all existing queue scripts and skills - transfer any current work on report unit to queue unit that is queue related - queue can keep it running - and it should task an agent to start the design and the migration plan
 
-2026-10-30 ~11:25 EDT (the showrunner, relaying the user)
+2026-10-30 (the user, to the showrunner; relayed verbatim 11:4x EDT)
+
+why does every build run the queue code - why don't we have a system where there is a queue that guards and releases?
+
+should we use rust or python?
+
+2026-10-30 ~11:25 EDT (the showrunner, relaying the user; its answer to rust or python: Python, for one memory model and no tool build)
 
 The design: the user asked why every build runs the queue code, and wants a queue service that guards and releases. One Python process holds the queue. Each build asks it over a socket and waits. It admits in queue order, frees memory when a build ends, and serves override, priority and the view as commands. It needs a rule for when the service is down. Python, not Rust: one memory model, no tool build. Have an agent write the design and the migration plan from today's polling admission. The user reviews the design before any code.
 
@@ -52,9 +58,9 @@ only I can bump
 
 **Carried over** from report-unit Phase 4g (handover 2026-10-30 11:3x EDT). Report-unit's two workers started Part A at about 11:20 EDT and stopped mid-turn. Their draft edits are in `4g_partA.patch` in queue-unit's handover folder, `/tmp/claude/session/51505394-82db-43d3-a528-136f4ee38d7a/claude-1000/-home-natepiano-worktrees-claude-natedev-builds-queue/dea51c3e-4dad-476a-bad5-e0ac5bbdc965/scratchpad/handover/` (the unit director copies it into the run folder when the run starts) (`git diff --binary` against `builds-report` `e27c243c`; `git apply --3way`): `queue.md`, `queue.tsx`, `register.tsx`, `queue.d.ts`, `build_queue.py`, `head_facts.py`, `roster.py`, new `queue_card.py`, `queue_fixture.py`, `queue_lines.py`, `queue_view.py` and `scripts/message/unit_labels.py`. It is unreviewed and untested: the writer starts from it, reads all of it against the Spec and keeps only what matches. The design notes, mocks, measurements and report-unit's worker prompts are in the same folder.
 
-**Depends on:** report-unit 4d and 4e on `origin/builds` (the draft builds on `head_facts.py` from 4e); merge `origin/builds` first. Part B also depends on resources-unit's ordered-walk checkpoint (resources Phase 30: the queue starts steps in queue order, and every bump is refused until the user's `/showrunner:bump` path lands) on `origin/builds`.
+**Depends on:** Part A1 depends on nothing. Part A2 depends on report-unit 4d and 4e on `origin/builds` (the draft builds on `head_facts.py` from 4e; report sends one hash after its 4c lands, about 13:00 EDT); merge `origin/builds` first. Part B also depends on resources-unit's ordered-walk checkpoint (resources Phase 30: the queue starts steps in queue order, and every bump is refused until the user's `/showrunner:bump` path lands) on `origin/builds`.
 
-**Order of work:** resources-unit's unmerged work (its phase 25, then Phase 30) also changes `memory_admit.py`, `test_memory_admit.py`, `build_why.py`, `test_build_why.py`, `build-memory-admission.md` and `build-targets.md`, and a merge cannot land on uncommitted edits to those files. Part A, before that merge: every other file; `build_queue.py` keeps `locked_queue_read()` and the existing `LineWaiter`, and `queue_lines.py` gets its own cell width. Part B, after the unit director merges `origin/builds`: Spec 1–3, `build_why.py` takes its cell width from `queue_lines.py` (one copy), the switch to `queue_read()`, the docs for those files and the live timing.
+**Order of work:** resources-unit's unmerged work (its phase 25, then Phase 30) also changes `memory_admit.py`, `test_memory_admit.py`, `build_why.py`, `test_build_why.py`, `build-memory-admission.md` and `build-targets.md`, and a merge cannot land on uncommitted edits to those files. Part A, before that merge: every other file, in two steps (showrunner, 2026-10-30: start every item that does not need `head_facts.py` now). A1, now: `queue_lines.py`, the `unit_labels.py` move out of `roster.py`, the pane (`queue.tsx`, the build queue parts of `register.tsx`, `queue.d.ts`, `queue.test.ts`) and `queue.md`. A2, after the unit director merges `origin/builds` with report-unit 4d and 4e: `head_facts.py`, `queue_view.py`, `queue_card.py`, `queue_fixture.py`, `build_queue.py` and the golden files. In Part A `build_queue.py` keeps `locked_queue_read()` and the existing `LineWaiter`, and `queue_lines.py` gets its own cell width. Part B, after the unit director merges `origin/builds`: Spec 1–3, `build_why.py` takes its cell width from `queue_lines.py` (one copy), the switch to `queue_read()`, the docs for those files and the live timing.
 
 **Bridge to the service:** the `queue.json` snapshot (Spec 1) is how the view answers in under 1 s while polling admission stays. The service design says whether the service's view command replaces it; the view, card and renderer (Spec 4–11) read whichever source the design picks.
 
