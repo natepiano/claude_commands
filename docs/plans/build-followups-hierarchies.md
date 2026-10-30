@@ -425,7 +425,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Gotchas:** a test that searches the output for a cell's text must search for words, because a cell can wrap. Read rows with `read_report_blocks`; never write a second parser in a test file.
 
-### Phase 16 — A second merge of the same phase keeps its review row, and the record step reports ok  · status: todo
+### Phase 16 — A second merge of the same phase keeps its review row, and the record step reports ok  · status: done
 **Depends on:** none of the waiting phases. Its files do not overlap Phase 15's or Phase 6's.
 
 #### Work Order
