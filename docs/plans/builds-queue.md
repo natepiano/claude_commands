@@ -287,7 +287,7 @@ No-copies rule (user, 2026-10-30): one place for each thing. A second copy of se
 
 ### Phase 3 — The queue service runs beside today's admission and logs what it would admit  · status: todo
 **Depends on:** Phase 2
-**Blocked by:** the natedev NixOS session has the two user units of Spec 9 in `/etc/nixos/modules/linux/development.nix` on natedev. Queue-unit sends Spec 9 to that session through berth when Phase 2 starts. The service unit has `ConditionPathExists=`, so the units can land before this phase's code is on main.
+**Blocked by:** the natedev NixOS session has the two user units of Spec 9 in `/etc/nixos/modules/linux/development.nix` on natedev. Queue-unit sent Spec 9 and the `OOMScoreAdjust` question to the natedev showrunner on 2026-10-30 (builds showrunner ask). The service unit has `ConditionPathExists=`, so the units can land before this phase's code is on main.
 **Estimate:** about 10 h of worker time.
 
 #### Work Order
@@ -357,22 +357,7 @@ Source: S2 of `docs/plans/builds-queue-service-design.md` (with §2 The service,
 
 No-copies rule (user, 2026-10-30): one place for each thing. A second copy of setup, a fixture, a config writer, a parser or a helper is a defect. A copy exists only with the user's own approval. Fix at the cause, never a patch at each site.
 
-**Pending decision: how the service runs new code after a merge to `~/.claude` main**
-
-Actual problem:
-The service is a process that lives for days and runs main's `admission_service.py`, `admission_protocol.py` and `memory_admit.py`. After a merge changes them, the old process keeps the old code. The design says "the install step restarts the service", but this repository has no install step. Phase 4's cut-over also needs the new code to start after its merge.
-
-What exists now:
-- No step runs after a merge to `~/.claude` main.
-- The unit has `Restart=always` and `RestartSec=1`. The socket keeps new connections in its backlog while the service restarts. Waiters connect again with their `since`, and reservations come back from `state.json` (Spec 4), so a restart costs a waiter about 1 s.
-
-What should change:
-- Option A: the service stats each source file it loaded from `~/.claude/scripts` (from `sys.modules`) once a second. When a file's mtime or inode differs from its start, and no file has changed for 2 s (so a checkout that is still writing is not read half-written), the service writes `state.json`, sends `STOPPING=1` and exits 0. systemd starts the new code 1 s later. No other session acts.
-- Option B: a git `post-merge` and `post-checkout` hook in `~/.claude` runs `systemctl --user restart build-admission.service`. Hooks live in one clone and are not under version control, and a tool that skips hooks leaves the old code running.
-- Option C: the showrunner's merge to main runs the restart as one more step. A merge that skips the step leaves the old code running, and nothing says so.
-
-Recommendation:
-Option A. It needs no step after a merge, it covers every way main changes, and a restart costs a waiter about 1 s. Its cost is a few `os.stat` calls a second. Phase 4's cut-over uses the same rule.
+**Decided (showrunner, 2026-10-30): how the service runs new code after a merge to `~/.claude` main.** Option A. The service stats each source file it loaded from `~/.claude/scripts` (from `sys.modules`) once a second. When a file's mtime or inode differs from its start, and no file has changed for 2 s (so a checkout that is still writing is not read half-written), the service writes `state.json`, sends `STOPPING=1` and exits 0; systemd (`Restart=always`, `RestartSec=1`) starts the new code. No other session acts, and a restart costs a waiter about 1 s. Phase 4's cut-over uses the same rule.
 
 **Files:**
 - `scripts/build_queue/admission_protocol.py` — new: the messages, their encoder and parser, the version check, `admission_socket_path`, the `QueueRead` and `QueueExplanation` serial form
@@ -416,7 +401,7 @@ Option A. It needs no step after a merge, it covers every way main changes, and 
 
 ### Phase 4 — Every build, view and command uses the queue service, and the polling admission goes  · status: todo
 **Depends on:** Phase 3
-**Blocked by:** (1) `admission_service.py report` over at least 24 h of main's shadow prints `adopt` (Phase 3 Spec 7); (2) the place in resources-unit's chain that this phase's Pending decision picks; (3) the natedev NixOS session has `OnFailure=` and the alert unit of Spec 6 in place (the alert unit only calls a command, so it can land first). Tell resources-unit, verify-unit and the natedev showrunner through berth when this phase starts and when it lands.
+**Blocked by:** (1) `admission_service.py report` over at least 24 h of main's shadow prints `adopt` (Phase 3 Spec 7); (2) resources-unit Phase 27 merged on `origin/builds`, and resources 20 not yet started (its Decided block); (3) the natedev NixOS session has `OnFailure=` and the alert unit of Spec 6 in place (the alert unit only calls a command, so it can land first). Tell resources-unit, verify-unit and the natedev showrunner through berth when this phase starts and when it lands.
 **Estimate:** about 21 h of worker time.
 
 #### Work Order
@@ -431,7 +416,7 @@ Source: S3 of `docs/plans/builds-queue-service-design.md` (with §3 Decisions st
 2. **The live service.** `admission_service.py serve` runs the live server with state dir `admission/`. The shadow source, `decisions.jsonl`, the `report` command and `admission/shadow/` go.
    - One import at start, only when `admission/state.json` is absent: each `.reservation` row (through `reservation_lifetime`: live rows keep their charge, ended rows go through `finalize_reservation`), each `.waiting` row's order fields keyed by owner, the queue priority record (`queue_priority.json`), Phase 32's admit-head record and the recovery spacing (`read_recovery`). The service writes `state.json`, then deletes the files it imported. A later start finds `state.json` and imports nothing.
    - Each admission appends one row to `queue_times.jsonl` through Phase 26's one append function: `{"at", "kind": "admitted", "session_id", "step", "pid", "start_time", "call_id", "need", "waited_s"}`. The 24 h check in the gate reads it.
-   - The new code starts through Phase 3's restart rule (its Pending decision).
+   - The new code starts through Phase 3's restart rule (its Decided block).
 3. **Cut-over steps.** The builds showrunner runs them at the merge to main, in a quiet hour. A running bash keeps the `memory_gate.sh` functions it read at its start, so a step that started before the merge would call the deleted `check`.
    1. `/build:hold hold "admission cut-over"` on natedev.
    2. Wait until `/build:hold quiet` reports no running or waiting step.
@@ -456,23 +441,7 @@ Source: S3 of `docs/plans/builds-queue-service-design.md` (with §3 Decisions st
 
 No-copies rule (user, 2026-10-30): one place for each thing. A second copy of setup, a fixture, a config writer, a parser or a helper is a defect. A copy exists only with the user's own approval. Fix at the cause, never a patch at each site.
 
-**Pending decision: where this phase lands in resources-unit's chain**
-
-Actual problem:
-This phase deletes `check`, the locks and the admission files in `memory_admit.py` and `memory_gate.sh`. After Phase 2 of this plan lands (after resources 26, before 15), resources-unit's chain still has eight phases that edit `memory_admit.py`. A resources phase that edits `check`, the files or a caller after the cut-over must be written again against the service.
-
-What exists now:
-- The chain (`docs/plans/builds-resources.md`): 21 → 16 → 25 → 24 → 26 → 15 → 27 → 20 → 11 → 17 → 18 → 19 → 8, with 30, 31 and 32 before 26.
-- By their titles: 15 (a nextest step's charge falls to its test-phase need) changes the charge. 27 (the merge gate holds its whole memory cap in the admission queue) changes `gate_reservation`, a caller this phase moves. 20 (a looser head rule, adopted on a replay) changes a rule. 11, 17, 18 and 19 change estimates and history. 8 (shared build state is written only by the installed copy) changes who writes state files.
-- After the cut-over the rules, estimates and readers stay in `memory_admit.py` (Spec 5), and the service runs them.
-
-What should change:
-- Option A: land after resources 27 and before 20. 15 and 27 land on the polling code, and this phase moves 27's `gate_reservation` with the other callers. 20, 11, 17, 18 and 19 change rules and estimates that the service calls, so they rebase with small conflicts. 8 decides whether the service's `state.json` is shared build state.
-- Option B: land right after this plan's Phase 2, before 15. The cut-over comes first; 15 and 27 write their `check` and `gate_reservation` parts again against the service.
-- Option C: land after the whole chain, after 8. No resources Work Order changes, but the cut-over waits for eight more phases, and each of them edits code this phase deletes, so this phase moves each one.
-
-Recommendation:
-Option A. 27 is the one remaining resources phase that changes a caller this phase moves, so landing after it moves that caller once. The later phases change rules and estimates that stay where they are. Resources-unit confirms this against its own Work Orders, because this reading comes from their titles.
+**Decided (showrunner, 2026-10-30): where this phase lands in resources-unit's chain.** Option A: after resources 27 and before 20 (chain 21 → 16 → 25 → 24 → 26 → 15 → 27 → **this phase** → 20 → 11 → 17 → 18 → 19 → 8). 27 is the one remaining resources phase that changes a caller this phase moves (`gate_reservation`), so landing after it moves that caller once; 20, 11, 17, 18 and 19 change rules and estimates that stay in `memory_admit.py`, which the service runs; 8 decides whether the service's `state.json` is shared build state. queue-unit confirms this place with resources-unit against its Work Orders.
 
 **Files:**
 - `scripts/lint/memory_admit.py` — Spec 5 deletions (owner queue-unit since 2026-10-30; resources-unit reviews the diff)
@@ -490,8 +459,8 @@ Option A. 27 is the one remaining resources phase that changes a caller this pha
 - `scripts/buildlog/mac_idle.py` — `waiting_evidence` (owner verify-unit, per `docs/plans/builds-production.md`)
 - `scripts/production/merge_gate.py` — `gate_reservation` (owner the natedev showrunner)
 - `scripts/shutdown/stop.py` — `_release_build_claims` (owner the natedev showrunner)
-- `scripts/notify/push_catalog.py` — the down push entry (owner natedev messaging-unit, whose run is done)
-- `scripts/accounts/outage_alerts.py` — called for `claim`, `delivered` and `clear`; changed only if a claim with a key that is not a session id needs it (no production doc names an owner)
+- `scripts/notify/push_catalog.py` — the down push entry (natedev messaging-unit's file; the showrunner gave queue-unit the edit, 2026-10-30; also-touches line for natedev, trial-merged against natedev's tip)
+- `scripts/accounts/outage_alerts.py` — called for `claim`, `delivered` and `clear`; changed only if a claim with a key that is not a session id needs it (the showrunner gave queue-unit the edit, 2026-10-30; also-touches line for natedev, trial-merged against natedev's tip)
 - `scripts/direct/test_verify_hold_memory.py`, `scripts/direct/test_verify_token_reservation.py`, `scripts/direct/test_verify_tree_cancel_reacquire.py`, `scripts/direct/test_verify_checks_fail_closed.py`, `scripts/direct/test_verify_lint_guard_key.py`, `scripts/direct/verify_tree_cancel_test_support.py`, `scripts/buildlog/test_mac_idle.py` — per-test socket (owner verify-unit)
 - `scripts/hooks/test_brp_launch_gate.py`, `scripts/build_hold/test_build_hold.py`, `scripts/build_hold/build_hold_test_support.py`, `scripts/build_hold/test_hold_shortcut.py` — per-test socket (owner resources-unit)
 - `scripts/shutdown/test_bounded_stop.py`, `scripts/production/test_merge_gate_suites_admission.py` — per-test socket (owner the natedev showrunner)
@@ -513,7 +482,7 @@ Option A. 27 is the one remaining resources phase that changes a caller this pha
 - Phase 3: `admission_protocol.py`, `admission_service.py` and `admission_client.py` exist; `AdmissionServer(state_dir, clock, readings, proc)`; `admission_test_support.py` is the one in-process server fixture; the client's Python API (`admit`, `launch`, `release`, `width`, `give_back`, `view`, `explain`, `mine`, `priority`, `admit_head`); `reservation_stem`, `step_estimate` and the pure `QueueInputs` builder in `memory_admit.py`; the shadow source and `admission/shadow/`, which this phase deletes; the restart rule its Pending decision picks; the units (socket mode 0600, `Type=notify`, `WatchdogSec=30`, `ConditionPathExists=`).
 - Phase 2: `admission_pass` is the one decision; `blocking_index` and `blocker_identity`; `next_recovery`; `EstimateExpired`.
 - Phase 1: `queue.json` and its writer (deleted here); `queue_read_from` stays; the card and the renderer read `QueueRead`.
-- Resources: the phases that land before this one, by the Pending decision. Their rules and estimates stay in `memory_admit.py`, and the service runs them.
+- Resources: the phases that land before this one: through resources 27 (its Decided block). Their rules and estimates stay in `memory_admit.py`, and the service runs them.
 
 **Acceptance gate:**
 - Before the cut-over, the full merge gate as `docs/plans/builds-production.md` names it, green.
