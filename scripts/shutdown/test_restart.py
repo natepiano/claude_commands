@@ -6684,6 +6684,8 @@ class RestartTests(ShutdownTestCase):
             prior=shutdown_record.SessionStopped(kind="stopped", at=STOPPED),
         )
         self.create([saved])
+        live = self.running_on(saved, self.root / ".claude2")
+        live[0]["procStart"] = saved["session"]["proc_start"]
         stopped = shutdown_record.SessionStopped(kind="stopped", at=RESTARTED)
         timer_enabled = False
         stop_snapshot: list[bool] = []
@@ -6698,7 +6700,8 @@ class RestartTests(ShutdownTestCase):
             elif verb == "stop":
                 timer_enabled = False
 
-        with patch.object(settle, "run_notifier", side_effect=stop_during_timer_restore):
+        with (patch.object(sessions, "live_sessions", return_value=live),
+              patch.object(settle, "run_notifier", side_effect=stop_during_timer_restore)):
             restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         self.assertEqual(self.stored_record()["progress"], stopped)
         self.assertEqual(stop_snapshot, [False])
@@ -6723,6 +6726,258 @@ class RestartTests(ShutdownTestCase):
         with patch.object(settle, "run_notifier", timer):
             restart.confirm_entry(saved, STOPPED, True, observed_at=time.time())
         self.assertEqual(self.stored_record()["progress"], replacement)
+
+    def test_late_timer_completion_keeps_a_newer_completed_restore_enabled(self) -> None:
+        saved = entry(top_level("owner"), state=shutdown_record.SessionRestarting(
+            kind="restarting", at=STOPPED,
+            prior=shutdown_record.SessionStopped(kind="stopped", at=STOPPED),
+        ), timers=[TimerRestore(instance="timer", was_enabled=True)])
+        self.create([saved])
+        enabled = False
+        completed = shutdown_record.SessionRestarted(kind="restarted", at=RESTARTED)
+
+        def notifier(verb: str, _instance: str) -> None:
+            nonlocal enabled
+            if verb == "start":
+                def newer(current: SessionShutdown) -> None:
+                    current["request_id"] = "newer-request"
+                    current["progress"] = completed
+                _ = shutdown_record.update_session(LOGIN, "owner", newer)
+                enabled = True
+            else:
+                enabled = False
+
+        with patch.object(settle, "run_notifier", side_effect=notifier) as timer:
+            restart.confirm_entry(saved, STOPPED, True, observed_at=time.time())
+        self.assertTrue(enabled, "an old restore must not disable the newer restore's timer")
+        timer.assert_called_once_with("start", "timer")
+        self.assertEqual(self.stored_record()["request_id"], "newer-request")
+        self.assertEqual(self.stored_record()["progress"], completed)
+
+    def test_failed_timer_undo_is_reported_when_a_stop_takes_the_claim(self) -> None:
+        saved = entry(top_level("owner"), state=shutdown_record.SessionRestarting(
+            kind="restarting", at=STOPPED,
+            prior=shutdown_record.SessionStopped(kind="stopped", at=STOPPED),
+        ), timers=[TimerRestore(instance="timer", was_enabled=True)])
+        self.create([saved])
+        live = self.running_on(saved, self.root / ".claude2")
+        live[0]["procStart"] = saved["session"]["proc_start"]
+        stopped = shutdown_record.SessionStopped(kind="stopped", at=RESTARTED)
+        enabled = False
+
+        def notifier(verb: str, _instance: str) -> None:
+            nonlocal enabled
+            if verb == "start":
+                _ = shutdown_record.update_session(LOGIN, "owner", lambda current: current.update(progress=stopped))
+                enabled = True
+            else:
+                raise RuntimeError("timer stop refused")
+
+        errors = io.StringIO()
+        with (patch.object(sessions, "live_sessions", return_value=live),
+              patch.object(settle, "run_notifier", side_effect=notifier), redirect_stderr(errors)):
+            restart.confirm_entry(saved, STOPPED, True, observed_at=time.time())
+        self.assertTrue(enabled, "the failed undo left work for the shutdown owner")
+        self.assertEqual(self.stored_record()["progress"], stopped)
+        self.assertIn("timer", errors.getvalue())
+        self.assertIn("owner", errors.getvalue())
+        self.assertIn("timer stop refused", errors.getvalue())
+
+    def assert_overlapping_timer_restore(self, *, manual: bool = False, stop_takes_over: bool = False,
+                                         record_loss: Literal["", "missing", "unreadable"] = "",
+                                         replacement_attempt: bool = False) -> None:
+        saved = entry(top_level("owner"), state=shutdown_record.SessionRestarting(
+            kind="restarting", at=RESTARTED,
+            prior=shutdown_record.SessionStopped(kind="stopped", at=STOPPED),
+        ), timers=[TimerRestore(instance="timer", was_enabled=True)])
+        if manual:
+            saved["progress"] = shutdown_record.SessionNeedsManualRestart(kind="manual restart", command="resume")
+        self.create([saved])
+        live = self.running_on(saved, self.root / ".claude2")
+        live[0]["procStart"] = saved["session"]["proc_start"]
+        entered, release = threading.Event(), threading.Event()
+        enabled = False
+        errors: list[BaseException] = []
+        report = io.StringIO()
+
+        def notifier(verb: str, _instance: str) -> None:
+            nonlocal enabled
+            if verb == "start":
+                if not entered.is_set():
+                    entered.set()
+                    if not release.wait(HANG_GUARD_SECONDS):
+                        raise AssertionError("restart B did not finish its confirmation/archive pass")
+                enabled = True
+            else:
+                enabled = False
+
+        def first_restart() -> None:
+            try:
+                if manual:
+                    _ = restart.clear_running_on_target([saved])
+                else:
+                    restart._confirm_entries([saved])  # pyright: ignore[reportPrivateUsage]
+            except BaseException as error:
+                errors.append(error)
+
+        with (patch.object(sessions, "live_sessions", return_value=live),
+              patch.object(restart, "_prove_move", return_value=True),
+              patch.object(restart, "wait_for_confirmation", return_value=registry_confirmation(frozenset({"owner"}))),
+              patch.object(settle, "run_notifier", side_effect=notifier) as timers, redirect_stderr(report)):
+            owner = threading.Thread(target=first_restart)
+            owner.start()
+            try:
+                self.assertTrue(entered.wait(HANG_GUARD_SECONDS), "restart A did not reach notifier start")
+                if record_loss == "missing":
+                    shutdown_record.archive_session(LOGIN, "owner")
+                elif record_loss == "unreadable":
+                    path = next((self.state_root / LOGIN / "sessions").glob("*.json"))
+                    _ = path.write_text("{not readable")
+                elif replacement_attempt:
+                    _ = shutdown_record.update_session(LOGIN, "owner", lambda current: current.update(
+                        progress=shutdown_record.SessionRestarting(kind="restarting", at=RESTARTED,
+                            prior=shutdown_record.SessionRestartFailed(kind="restart failed", at=RESTARTED,
+                                                                     reason="replacement attempt"))))
+                elif stop_takes_over:
+                    _ = shutdown_record.update_session(LOGIN, "owner", lambda current: current.update(
+                        progress=shutdown_record.SessionStopped(kind="stopped", at=RESTARTED)))
+                else:
+                    _result, launches = self.run_restarts(live=frozenset({"owner"}), confirmed=frozenset({"owner"}))
+                    self.assertEqual(launches, [], "restart B must not launch a second director")
+                    current = shutdown_record.find_session(LOGIN, "owner")
+                    self.assertIsNotNone(current, "the in-flight timer claim must remain persisted")
+                    if current is not None:
+                        self.assertEqual(current["progress"]["kind"], "restarting")
+                    self.assertEqual(list((self.state_root / LOGIN / "history").glob("*.json")), [],
+                                     "restart B must not archive unfinished timer reconciliation")
+            finally:
+                release.set()
+                owner.join(HANG_GUARD_SECONDS)
+            self.assertFalse(owner.is_alive())
+        self.assertEqual(enabled, not stop_takes_over, "archival cannot authorize undo; a covering stop can")
+        self.assertEqual(errors, [])
+        self.assertEqual(timers.call_args_list, [call("start", "timer")] + ([call("stop", "timer")] if stop_takes_over else []))
+        if record_loss:
+            self.assertIn("shutdown: timer timer of owner:", report.getvalue())
+            return
+        self.assertEqual(report.getvalue(), "", "reconciliation must finish without hidden timer failures")
+        if replacement_attempt:
+            progress = self.stored_record()["progress"]
+            self.assertEqual(progress["kind"], "restarting")
+            if progress["kind"] == "restarting":
+                self.assertEqual(progress["prior"]["kind"], "restart failed")
+            self.assertEqual(list((self.state_root / LOGIN / "history").glob("*.json")), [])
+        elif stop_takes_over:
+            self.assertEqual(self.stored_record()["progress"]["kind"], "stopped")
+        else:
+            self.assertEqual(shutdown_record.session_records(LOGIN), [])
+            history = list((self.state_root / LOGIN / "history").glob("*.json"))
+            self.assertEqual(len(history), 1, "completion archives once")
+            self.assertEqual(json.loads(history[0].read_text())["progress"]["kind"], "restarted")
+
+    def test_overlapping_restart_cannot_archive_a_timer_restore_in_progress(self) -> None:
+        self.assert_overlapping_timer_restore()
+
+    def test_manual_recovery_keeps_its_timer_claim_until_archival(self) -> None:
+        self.assert_overlapping_timer_restore(manual=True)
+
+    def test_equal_timestamp_replacement_attempt_keeps_its_timer_claim(self) -> None:
+        self.assert_overlapping_timer_restore(replacement_attempt=True)
+
+    def test_missing_record_reports_reconciliation_failure_without_disabling_timer(self) -> None:
+        self.assert_overlapping_timer_restore(record_loss="missing")
+
+    def test_unreadable_record_reports_reconciliation_failure_without_disabling_timer(self) -> None:
+        self.assert_overlapping_timer_restore(record_loss="unreadable")
+
+    def test_stale_completed_restart_does_not_archive_a_new_stop(self) -> None:
+        saved = entry(top_level("owner"), state=shutdown_record.SessionRestarted(kind="restarted", at=RESTARTED))
+        self.create([saved])
+        stopped = shutdown_record.SessionStopped(kind="stopped", at=RESTARTED)
+        _ = shutdown_record.update_session(LOGIN, "owner", lambda current: current.update(progress=stopped))
+        restart._confirm_entries([saved])  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.stored_record()["progress"], stopped)
+        self.assertEqual(list((self.state_root / LOGIN / "history").glob("*.json")), [])
+
+    def test_covering_stop_still_undoes_a_late_timer_enable(self) -> None:
+        self.assert_overlapping_timer_restore(stop_takes_over=True)
+
+    def assert_move_timer_target_ownership(self, *, old_target: bool,
+                                          manual: bool = False, equal_timestamp: bool = False) -> None:
+        # T0: source failed; T1: an earlier generation was stopped on target;
+        # T2: a different process was manually resumed on that account.
+        saved = entry(top_level("owner"), state=shutdown_record.SessionRestarting(
+            kind="restarting", at=RESTARTED,
+            prior=shutdown_record.SessionStopped(kind="stopped", at=STOPPED),
+        ), timers=[TimerRestore(instance="timer", was_enabled=True)])
+        if manual:
+            saved["progress"] = shutdown_record.SessionRestartFailed(kind="restart failed", at=STOPPED,
+                                                                       reason="old launch failed at T0")
+        saved["target"] = "claude3"
+        self.create([saved])
+        enabled = False
+        target = entry(top_level("owner"))
+        target.update(login="third@example.invalid", label="claude3", request_id="target-stop")
+        target["requested_at"] = RESTARTED if old_target or equal_timestamp else "2026-10-10T01:03:00+00:00"
+        live = self.running_on(saved, self.root / ".claude3")
+        live[0].update(pid=target["session"]["pid"] + 1, procStart="resumed-process")
+        if not old_target:
+            target["session"]["pid"] = live[0]["pid"]
+            target["session"]["proc_start"] = "resumed-process"
+        else:
+            self.assertTrue(shutdown_record.create_session(target))
+
+        def notifier(verb: str, _instance: str) -> None:
+            nonlocal enabled
+            if verb == "start":
+                if not old_target:
+                    self.assertTrue(shutdown_record.create_session(target))
+                enabled = True
+            else:
+                enabled = False
+
+        with (patch.object(restart, "_prove_move", return_value=True),
+              patch.object(sessions, "live_sessions", return_value=live),
+              patch.object(settle, "record_time", return_value="2026-10-10T01:04:00+00:00"),
+              patch.object(settle, "run_notifier", side_effect=notifier) as timer):
+            if manual:
+                result = restart.clear_running_on_target([saved])
+                self.assertEqual(result.remaining, [])
+                self.assertEqual(len(result.finished), 1)
+                self.assertEqual(result.finished[0]["progress"]["kind"], "restarted")
+                self.assertIsNone(shutdown_record.find_session(LOGIN, "owner"))
+            else:
+                restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
+        self.assertEqual(enabled, old_target, "only a stop covering the resumed generation can undo this restore")
+        self.assertEqual(timer.call_args_list, [call("start", "timer")] + ([] if old_target else [call("stop", "timer")]))
+        self.assertEqual(shutdown_record.session_records("third@example.invalid")[0]["progress"], target["progress"])
+
+    def test_move_timer_completion_observes_a_stop_on_the_target_login(self) -> None:
+        self.assert_move_timer_target_ownership(old_target=False)
+
+    def test_old_target_stop_does_not_disable_the_current_move_timer(self) -> None:
+        self.assert_move_timer_target_ownership(old_target=True)
+
+    def test_manual_timer_recovery_ignores_a_target_stop_between_failure_and_resume(self) -> None:
+        self.assert_move_timer_target_ownership(old_target=True, manual=True)
+
+    def test_equal_timestamp_target_stop_covering_resumed_process_owns_timer(self) -> None:
+        self.assert_move_timer_target_ownership(old_target=False, equal_timestamp=True)
+
+    def test_manual_timer_recovery_observes_the_current_target_stop(self) -> None:
+        self.assert_move_timer_target_ownership(old_target=False, manual=True, equal_timestamp=True)
+
+    def test_move_timer_without_a_resumed_generation_is_deferred(self) -> None:
+        saved = entry(top_level("owner"), timers=[TimerRestore(instance="timer", was_enabled=True)])
+        saved["target"] = "claude3"
+        self.create([saved])
+        errors = io.StringIO()
+        with (patch.object(sessions, "live_sessions", return_value=[]),
+              patch.object(settle, "run_notifier") as notifier, redirect_stderr(errors)):
+            pending = restart._restore_timers(saved["timers"], record=saved, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        notifier.assert_not_called()
+        self.assertEqual([timer["instance"] for timer in pending], ["timer"])
+        self.assertIn("resumed process generation unavailable", errors.getvalue())
 
     def test_launcher_does_not_return_a_replacement_claim_for_confirmation(self) -> None:
         saved = entry(top_level("owner", host=inventory.HerdrHost(kind="herdr", herdr_session="owner", pane_id="w1:p1", presentation="detached")))
