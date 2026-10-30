@@ -95,6 +95,7 @@ SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5
 MEMORY_SAMPLE_SECONDS = 0.25
 SETTINGS_BLOB = "b3466859"
+ROLLBACK_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
 # Restore dispositions and the mask in every child, including types. The runner
 # defers cancellation until the child is registered for cleanup.
 SUITE_BOOTSTRAP = """import os, signal, sys
@@ -158,6 +159,7 @@ class GateJobResult:
     killed_for: str = ""
     tripwire_tripped: bool = False
     kind: GateJobKind = GateJobKind.TEST_MODULE
+    cpu_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -190,6 +192,7 @@ class RunningGateJob:
     cpu_slot: SharedCPUSlot | NoSharedCPU = field(default_factory=lambda: NoSharedCPU())
     peak_memory_mib: float = 0.0
     kind: GateJobKind = GateJobKind.TEST_MODULE
+    cpu_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -472,7 +475,7 @@ def interrupted(signum: int, _frame: object) -> None:
 
 @contextmanager
 def rollback_signals() -> Generator[None, None, None]:
-    previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    previous = {sig: signal.signal(sig, interrupted) for sig in ROLLBACK_SIGNALS}
     try:
         yield
     finally:
@@ -657,6 +660,19 @@ def save_measures(path: Path, measures: dict[str, float] | dict[str, list[float]
             temporary.unlink(missing_ok=True)
 
 
+def reap_gate_job(job: RunningGateJob, *, block: bool = False) -> None:
+    """Collect the leader's status and CPU once, including children it waited for."""
+    if job.process.returncode is not None:
+        return
+    # Deliver pending interrupts only after the reaped status and CPU are stored.
+    # The mask covers this thread only; the gate starts no other thread.
+    with defer_cleanup_signals():
+        pid, status, usage = os.wait4(job.process.pid, 0 if block else os.WNOHANG)
+        if pid:
+            job.process.returncode = os.waitstatus_to_exitcode(status)
+            job.cpu_seconds = usage.ru_utime + usage.ru_stime
+
+
 def kill_job_group(job: RunningGateJob) -> None:
     # Also run this after the leader exits: a successful module may have leaked
     # children. SIGKILL prevents a child that ignores TERM from surviving cleanup.
@@ -664,7 +680,7 @@ def kill_job_group(job: RunningGateJob) -> None:
         os.killpg(job.process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    _ = job.process.wait()
+    reap_gate_job(job, block=True)
 
 
 def one_minute_load() -> float:
@@ -789,7 +805,8 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     tripwire_tripped = bool(calls or readings)
     if tripwire_tripped:
         status = 1
-    return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for, tripwire_tripped, job.kind)
+    return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for,
+                         tripwire_tripped, job.kind, job.cpu_seconds)
 
 
 @dataclass(frozen=True)
@@ -995,6 +1012,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     scope_prefix = suite_scope_prefix()
     timings_path = gate_state_dir() / "module_seconds.json"
     timings = read_measures(timings_path)
+    cpu_path = gate_state_dir() / "module_cpu_seconds.json"
+    cpu_measures = read_measures(cpu_path)
+    run_cpu: dict[str, float] = {}
     types_peaks_path = gate_state_dir() / "types_peak_mib.json"
     types_peaks = read_measures(types_peaks_path)
     types_key = " ".join(type_dirs)
@@ -1084,12 +1104,13 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                         _ = suite_started.setdefault(suite, job.started)
                     admission.reserve(job.process.pid, recorded_peaks.reservation_mib(request))
                 for job in running[:]:
-                    status = job.process.poll()
+                    reap_gate_job(job)
+                    status = job.process.returncode
                     if status is None and not job.killed_for and time.monotonic() - job.started >= module_time_limit_s:
                         job.killed_for = f"killed: still running after {module_time_limit_s:g} s, the module time limit"
                         print(f"{job.suite}/{job.module} {job.killed_for}", flush=True)
                         kill_job_group(job)
-                        status = job.process.poll()
+                        status = job.process.returncode
                     if status is None:
                         continue
                     try:
@@ -1099,10 +1120,14 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                             job.cpu_slot.release()
                     running.remove(job)
                     admission.release(job.process.pid)
+                    cpu_key = f"{job.suite}/{result.module}"
+                    run_cpu[cpu_key] = run_cpu.get(cpu_key, 0.0) + result.cpu_seconds
                     if status < 0 and not job.killed_for and not result.tripwire_tripped and not hold.admits():
                         pending.appendleft(requests[(job.kind, job.suite, job.module)])
                         print(f"{job.suite}/{result.module}: stopped during a natedev hold; queued again", flush=True)
                         continue
+                    if not job.killed_for:
+                        cpu_measures[cpu_key] = result.cpu_seconds
                     if not job.killed_for and job.peak_memory_mib:
                         if job.kind is GateJobKind.TYPE_CHECK:
                             types_peaks[types_key] = job.peak_memory_mib
@@ -1147,6 +1172,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     if isinstance(job.cpu_slot, SharedCPUSlot):
                         job.cpu_slot.release()
             save_measures(timings_path, timings)
+            save_measures(cpu_path, cpu_measures)
             save_measures(types_peaks_path, types_peaks)
             save_measures(module_peaks_path, module_peaks)
             save_measures(history_path, history)
@@ -1185,6 +1211,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     print(f"Gate tests: {elapsed:.2f}s; at most {max_running_jobs} modules at once; "
           + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB{full_reason}", flush=True)
     print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled memory); module: {largest_module or '(not sampled)'}", flush=True)
+    most_cpu = sorted(run_cpu, key=lambda key: (-run_cpu[key], key))[:3]
+    cpu_jobs = ", ".join(f"{run_cpu[key]:.2f} s {key}" for key in most_cpu) or "(none)"
+    print(f"Most CPU: {cpu_jobs}; total {sum(run_cpu.values()):.2f} s", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if admission.peak_mib > memory_cap_mib:
         print("RED: sampled memory exceeded the cap", flush=True)
