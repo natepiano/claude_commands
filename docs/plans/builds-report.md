@@ -305,51 +305,30 @@ including the details to make it clear
 
 ### Phase 6 — A cut-short row no longer leaves bad JSON in the build log  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Goal:** after any failed append, the build log's month file holds only whole rows, so every reader parses each line.
-
-**Spec:**
-- Defect (showrunner, from resources' Phase 4 review, 2026-10-30): `store._write_all` writes a row in a loop of `os.write` calls. When one write is short and the next fails (a full disk, for example), part of the row stays in the file with no newline. Since 4b, `locked_append` then writes a `\n` after that part, so the part becomes a line of its own that is not JSON; readers such as `sweep.read_rebuild_steps` (`scripts/lint/sweep.py:2207`, resources-unit's file) fail on it: it calls `json.loads` on each newline-terminated line and does not catch `ValueError`. Resources' uncommitted work renames it `read_rebuild_evidence`, which reads through `sweep.build_log_rows` and behaves the same way.
-- Showrunner's ruling: under the append lock, before it writes, the appender cuts an unfinished tail back to the last newline, then writes the row.
-- In `store.locked_append`, replace the `\n` repair with that cut: read only the last byte when it is `\n` (the usual case); otherwise find the last `\n` by reading back from the end, and `os.ftruncate` the file to just after it, or to 0 when the file has no `\n`. The cut runs under the same `flock`, before the caller's write.
-- `record.step` takes `month_offset` from the same `store` function instead of `st_size` (Constraints).
-- A row counts as written only when its newline lands, so a whole JSON object with no newline after it is cut too. A step row lost this way is published again by 4b's recovery (`record._resume_step_line`), which scans for its id; other rows stay lost, as they were before.
-- No reader changes. Old damage is removed once instead (showrunner, 2026-10-30): count the lines that do not parse in each live month file under `~/.local/state/buildlog/`. In each file a reader still reads that has any, remove those lines once, after a backup copy beside the file named so that no reader's glob matches it. The month-file globs after the phase-start merge are `index.py:844` and `record.py:1007` (`*/*.jsonl`), `ci.py:135` (`ci/*.jsonl`) and `scripts/lint/sweep.py:2209` (`natedev/????-??.jsonl`); a name that continues after `.jsonl` matches none of them. Run `git grep -n 'glob(' -- scripts` again before the run. Rewrite the file in place under its `flock` (truncate, then write the kept lines; same inode): never rename a new file over it, because an appender waiting on the lock holds the old inode. Skip and report a file that a pending 4b step record names (its `month_offset` would move): the records are `record.pending_steps_root()/*.json`, and each names its month file through its row's `host` and `started_at` (`record._step_month_file`). The index reads each rewritten file again through its existing path: `index.update()` calls `read_file` (`index.py:784-795`), which forgets a file and reads it from 0 when the file is smaller than its stored offset or the bytes before that offset (`marks`) changed. Name that path in the output. `sync.py` pulls the Mac's host folders with `rsync -rt` (`sync.py:235-246`), which replaces a changed file by rename, so the next sync brings the Mac's bad lines back. Report each bad file in a Mac host folder and leave it unchanged. This is a one-time live step, not new repository code; save its output (each file, lines removed, backup path) to the phase folder for the notice.
-- Update the module docstring (`store.py` lines 9–10). No as-built doc names the `\n` repair; `docs/as-built/buildlog-memory-stalls.md:46` says `store.append_line` "writes one line under a flock with `O_APPEND`": add there that it first cuts an unfinished tail back to the last newline. Take every name from the code.
-- The checkpoint notice names resources-unit as also-affected: the cut can move the file end below a size offset taken over an unfinished tail. Their uncommitted `TrimTake.log_offset` (`scripts/lint/sweep.py:1081` in their worktree) is such an offset, and `build_log_rows` (line 1133 there) then raises `ValueError` on a row fragment. Offer them the one `store` function from Constraints.
-- The director corrected `docs/as-built/build-targets.md:127` (`rebuild_bin(crates_compiled, warm)`, with `warm` from `warm_step_clause()`), which 4f made wrong; this phase's checkpoint commits it. The phase-start merge of builds at 31eaac9c kept both new step columns (`started_at_us`, `test_build_key`) and set `SCHEMA_VERSION = 25`; that merge commit carries the schema lines in `docs/as-built/build-memory-admission.md:168` and `docs/as-built/buildlog-memory-stalls.md:17`.
+- `store.last_whole_row_end(handle: BinaryIO) -> int` returns the byte after the last `\n`, or 0 when the file has none. When the file ends in `\n`, it reads only that byte. Else it maps the file read-only and uses `rfind(b"\n") + 1`.
+- `store.read_last_whole_row_end(path: Path) -> int` takes `LOCK_SH` and calls it. An absent file gives 0.
+- `store.locked_append` takes `LOCK_EX` and cuts an unfinished tail with `os.ftruncate` to `last_whole_row_end` before the caller writes. A row counts as written only when its newline lands, so a whole JSON object with no newline is cut too. `record._resume_step_line` publishes a step row lost this way again; other rows stay lost. Readers see only whole rows and do not change.
+- `record.step` saves `PendingStep.month_row_end` from `store.read_last_whole_row_end(month_file)`, not from `st_size`. `_resume_step_line` scans from it. `_read_pending_step` gives a record with only the legacy `month_offset` key a boundary of 0, so its rerun scans the month file from 0.
+- On 2026-10-30 the live month files held no line that does not parse (1284 files read). No file changed and no backup exists.
 
 **Files:**
-- `scripts/buildlog/store.py` — the end-of-last-whole-row function, the cut in `locked_append`, the module docstring
-- `scripts/buildlog/record.py` — `month_offset` from that function (line 849)
-- `scripts/buildlog/test_store.py` — the new test and the changed assertion
-- `scripts/buildlog/test_record_rerun.py` — the offset rerun test
-- `docs/as-built/buildlog-memory-stalls.md` — line 46, the cut
-- `docs/as-built/build-memory-admission.md`, `docs/as-built/build-targets.md` — director edits, already in the tree
+- `scripts/buildlog/store.py` — `last_whole_row_end`, `read_last_whole_row_end`, the cut in `locked_append`, the module docstring
+- `scripts/buildlog/record.py` — `PendingStep.month_row_end`, its capture in `record.step`, the legacy `month_offset` read in `_read_pending_step`
+- `scripts/buildlog/test_store.py` — tail cut, short write and short read tests
+- `scripts/buildlog/test_record_rerun.py` — rerun after a tail cut, tail-byte reads, legacy offset
+- `docs/as-built/buildlog-memory-stalls.md` — `store.append_line` cuts an unfinished tail before it writes
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `store.py`, `record.py`'s `month_offset` capture, `docs/as-built/buildlog-memory-stalls.md`, and the one-time live removal after its code passes
-- `test` — `test_store.py`: a test that cuts a write short: `os.write` writes a few bytes of a row, then raises `OSError`; `append_line` raises; the next `append_line` leaves the file as the old rows plus the new row, and every line parses as JSON. Also a file with no newline at all is cut to empty. It must fail on the old code. And `test_record_rerun.py`: the month file ends in an unfinished tail when `record.step` starts; the row write lands, then the save fails (for example `os.fsync` raises); the rerun leaves the row in the file once. It must fail with the cut in place and `month_offset` still from `st_size`.
+**Binds later work:** a reader that keeps a month-file byte offset takes it with `store.read_last_whole_row_end(path)`. An `st_size` offset can sit inside an unfinished tail, and a later cut moves the file end below it. resources-unit's sweep offset (`TrimTake.log_offset`) is such a reader.
 
-**Assertion-Change:** `scripts/buildlog/test_store.py` `test_append_separates_an_interrupted_tail_before_the_next_row` — old: `self.assertEqual(path.read_bytes(), tail + b'\n{"id":"next"}\n')` for both tails; new: the file is `b'{"id":"next"}\n'` for both tails, because the ruling cuts every unfinished tail. Rename the test for the new behavior. `test_append_reads_only_the_tail_byte_and_keeps_the_lock_through_fsync` stays as it is: its file ends in `\n`, so the cut still reads one byte with `os.read(fd, 1)`. The test patches `os.read` and asserts `read_sizes == [1]`.
+**Gotchas:**
+- Every caller of `last_whole_row_end` holds the file's flock: exclusive in `locked_append`, shared in `read_last_whole_row_end`. Without it, a cut can shrink a mapped file.
+- Never use a legacy `month_offset` as a boundary. It can sit inside a tail that a later cut removes.
+- To rewrite a month file, truncate and write it in place under its flock. Never rename a new file over it: an appender that waits on the lock holds the old inode.
+- Fix a bad line in a Mac host folder on the Mac. `sync.py` pulls those folders with `rsync -rt`, which replaces a changed file, so a natedev edit is lost at the next sync.
 
-**Assertion-Change (director ruling after review pass 1, 2026-10-30):** `scripts/buildlog/test_record_rerun.py`:
-- `test_normal_step_appends_without_opening_month_history_for_reading` becomes `test_normal_step_reads_only_tail_bytes_without_scanning_month_history` — old: any read open of the month file raises `AssertionError("a normal step read the monthly history")`; new: the only month-file reads are `os.read` of size 1 at `original_size - 1`, `read_sizes == [1, 1]`, because `record.step` now reads the tail byte to find the row end, and the cut reads it again.
-- `assert_short_append_recovers` (used by `test_fragment_then_normal_step_and_call_recovers_one_physical_row_per_id`, `test_complete_object_without_newline_then_other_writers_recovers_without_duplicate` and the two stop tests) — old: the stop is the `\n` write (`self.assertEqual(bytes(data), b"\n")`), then `self.assertTrue(month.read_bytes().endswith(b"\n"))`, and `self.assertEqual(finished.added, not complete_object)`; new: the stop is the cut (`os.ftruncate`, `self.assertEqual(length, 0)`), then `self.assertEqual(month.read_bytes(), b"")`, and `self.assertTrue(finished.added)`, because a whole object with no newline is cut and its row is published again.
-- `test_stop_after_fragment_repair_newline_recovers_without_losing_later_rows` and `test_stop_after_complete_object_repair_newline_recovers_without_duplicate` become `test_stop_after_fragment_tail_cut_recovers_without_losing_later_rows` and `test_stop_after_complete_object_tail_cut_recovers_without_duplicate`.
-
-**Repair round 1 (director ruling, 2026-10-30):** a short `os.read` could make the row-end search skip bytes, so the cut removed whole rows. `store.last_whole_row_end` now reads the last byte, and when it is not `\n` maps the file read-only and finds the last `\n`, with no block loop. Its caller holds the file's flock, so a cut cannot shrink the mapping: `locked_append` holds the exclusive lock, and `record.step` captures through `store.read_last_whole_row_end`, which takes a shared one. A pending record written before this phase can hold an offset inside an unfinished tail, so the row end is saved under a new key, `month_row_end`, and a record with only `month_offset` scans its month file from 0.
-
-**Assertion-Change (director ruling after repair round 1, 2026-10-30):** `scripts/buildlog/test_record_rerun.py` `test_recovery_starts_at_the_saved_month_offset_and_keeps_other_appends` — old: `self.assertEqual(saved["month_offset"], len(prefix))`; new: `self.assertEqual(saved["month_row_end"], len(prefix))`, the same value under the renamed key.
-
-**State:** the month file's tail: a cut under the exclusive lock, before the write. A pending step's `month_row_end`: the end of the last whole row at record time; a cut never moves below it. A record with only the old `month_offset` key scans from 0. A rerun after a failed append cuts the same tail again and writes once. The one-time removal: a second run finds no bad line and changes nothing, and never overwrites an existing backup.
-
-**Constraints from prior phases:** 4b's recovery scan (`record._resume_step_line`, `record.py:682-697`) seeks to `month_offset` under `locked_append` and skips lines that do not parse. Today `record.step` sets `month_offset` to the month file's `st_size` (`record.py:849`), outside the month file's lock, so it can sit inside an unfinished tail. The cut would then put the next row before `month_offset`, and a rerun after that row landed would miss it and append it again. So `month_offset` must be the end of the last whole row: the byte after the last `\n` at or before the size, or 0. A cut removes only bytes after the last `\n`, so bytes up to that point never change. The capture still takes a shared flock, because the search maps the file (repair round 1). One `store` function finds the end of the last whole row; the cut and the `month_offset` capture both call it. No second backward read in `record.py`, and no copy of `head_facts._backward_lines`' block loop (`scripts/build_queue/head_facts.py:111`).
-
-**Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.buildlog.test_store scripts.buildlog.test_record scripts.buildlog.test_record_rerun scripts.buildlog.test_recorder_health` from the worktree root green, with the new `test_store` tests failing on the old code and the offset test failing on the cut with `st_size` capture; basedpyright on `scripts/buildlog/store.py scripts/buildlog/record.py scripts/buildlog/test_store.py scripts/buildlog/test_record_rerun.py` `0 errors, 0 warnings, 0 notes`; live: the one-time removal above ran, with a backup per changed file, and a second count finds no bad line in any file a reader reads; `python3 scripts/buildlog/cli.py report` from the worktree root runs clean.
+**Ruled out:** reader changes that skip bad lines (the writer keeps each file whole); a `\n` repair after an unfinished tail (the fragment became its own line that is not JSON); a second backward block reader beside `head_facts._backward_lines` (a short `os.read` skipped bytes, so the cut removed whole rows); a repair of the one-time removal script (it rewrote nothing and does not run again).
 
 ### Phase 7 — The build report shows how much memory running builds really hold, hour by hour  · status: todo
 
@@ -362,36 +341,59 @@ including the details to make it clear
 **Spec:**
 - User, 2026-10-30: asked for the average real memory use of running builds per hour. The only answer the log could give summed step peaks, and one hour came to 56 GiB, above the 44 GiB cap of `builds.slice`. The 60 s `memory_snapshot` rows hold only `memory.peak` (the peak since the slice started), so no true reading exists.
 - Accuracy first (user, 2026-10-30: "we keep making mistakes - undercounting, double counting"). In `memory.slice_state` (`scripts/buildlog/memory.py`), store each reading as the kernel gives it, under its own name, and derive nothing at write time:
-  - `current_bytes` from `memory.current`: the slice's whole charge, the same number `memory.max` enforces. It already includes every child cgroup (each step's scope) and file cache and kernel memory. This is the one "held" total; never add child cgroups, `memory.stat` lines or swap to it.
+  - `current_bytes` from `memory.current`: the slice's whole charge, the same number `memory.max` enforces. It already includes every child cgroup (each step's scope, `sccache.service`), file cache and kernel memory. This is the one "held" total; never add child cgroups, `memory.stat` lines or swap to it.
   - `swap_current_bytes` from `memory.swap.current`; kept apart, never added to `current_bytes`.
-  - From `memory.stat`, these lines as named fields in a `stat` record: `anon`, `file`, `kernel`, `shmem`, `file_mapped`, `file_dirty`, `file_writeback`, `active_file`, `inactive_file`, `slab`, `sock`. `shmem` is part of `file`, so never add the two; `inactive_file` is the cache the kernel frees first. A line the kernel does not print is stored as absent, never 0.
+  - From `memory.stat`, these lines as named fields in a `stat` record: `anon`, `file`, `kernel`, `shmem`, `file_mapped`, `file_dirty`, `file_writeback`, `active_file`, `inactive_file`, `slab`, `sock`, `zswap`. `shmem` is part of `file`, so never add the two. A line the kernel does not print is stored as absent, never 0.
   - `max_bytes` at that instant (already read as `max`); `builds` and `ci` slices stay separate, never summed.
   Use the existing typed slice record and its one reader of slice files; add no second reader.
-- In the report's Memory pressure section, add one line from the samples of the last 24 hours: `Build memory held (60 s samples, last 24 h): average <x> GiB (`anon` <y> GiB, `file` <z> GiB, of which `inactive_file` <v> GiB) of the <cap> GiB cap; busiest hour <HH:00> at <w> GiB.` The hour uses the user's zone, as other report times do. With no sample that has `current_bytes`, the line reads `Build memory held: no readings yet.`
-- Add a command that prints the hour-by-hour table on demand, in the existing `cli.py` (columns: hour, average GiB held, processes, file cache, samples). Times in the user's zone.
+- In the report's Memory pressure section, add one line from the samples of the last 24 hours: `Build memory held (60 s samples, last 24 h): average <x> GiB (`anon` <y> GiB, `file` <z> GiB, of which `inactive_file` <v> GiB) of the <cap> GiB cap; busiest hour <HH:00> at <w> GiB.` With no sample that has `current_bytes`, the line reads `Build memory held: no readings yet.` For `report YYYY-MM-DD` the 24 hours end at the end of that local date; with no date they end now.
+- Add the command `usage-hours` to `cli.py` (`hourly` is the hourly job, `cli.py:211`): the hour-by-hour table (columns: hour, average GiB held, processes, file cache, samples), over the same 24 hours. Add its usage line to the `cli.py` docstring.
+- Hours: bucket UTC instants by UTC hour, and label each bucket with its local date, hour and UTC offset, so the two 01:00 hours on 2026-11-01 stay two rows.
 - Averages are the mean of the readings in each hour, with the reading count shown; a missing reading is skipped, never 0. Rows written before this phase have no `current_bytes`; they count as no reading. Step `peak_mem_bytes` is never used for this line.
-- Update `docs/as-built/buildlog-memory-stalls.md` (the snapshot fields, the new line and the command).
+- Update `docs/as-built/buildlog-memory-stalls.md` (the snapshot and sample fields, the new line and the command).
 - CPU and disk, same rules (user, 2026-10-30: record what builds really do, for trends). Store raw kernel counters as read; derive rates only in the report, from the difference of two readings; a missing file is absent, never 0:
-  - per step, at step end, from the step's own scope cgroup (the folder `BUILDLOG_SCOPE_SH` writes to `"$BUILDLOG_PEAK.cgroup"`): `cpu.stat` `usage_usec`, `user_usec`, `system_usec` and `io.stat` `rbytes`, `wbytes` summed over devices (the sum, and the per-device lines kept as read);
-  - per 60 s sample, for the builds slice and the CI slice apart: `cpu.stat` `usage_usec` and `io.stat` `rbytes`, `wbytes`;
-  - per 60 s sample: free and total bytes of the filesystem that holds the build targets (`os.statvfs`); `disk.json` keeps only the latest snapshot, so it gives no trend;
-  - per 60 s sample: free slots in each jobserver pool (`/dev/steve`, 31; `/dev/steve-ci`, 14), read without taking a slot (for example `FIONREAD` on the fifo). If no read is safe, record nothing and say so in the as-built; never take and return a slot to count.
-  - Report: the hourly command shows, per hour, average CPU cores busy for builds (`usage_usec` difference / wall time), disk bytes read and written, lowest free disk and average free slots per pool, each with its reading count.
+  - per step, from the step's own scope cgroup: `cpu.stat` `usage_usec`, `user_usec`, `system_usec` (every cgroup v2 scope has them). Capture in `invoke.sh` after `"$@"` returns and before `buildlog_finish_memory` deletes `"$BUILDLOG_PEAK.cgroup"` (`invoke.sh:262-272`): one call into a buildlog function, a small hunk. The values go into `PendingStep.row` before `_save_pending_step` and stay there until the row is published. Label them "excludes compiles run by sccache.service"; the slice totals count those compiles once.
+  - per-step IO: the same capture reads the step scope's `io.stat` (`rbytes`, `wbytes`, raw lines kept as for the slices) when it is present, and records a typed unavailable value when it is absent. Today `builds.slice/cgroup.subtree_control` is `memory pids` (checked live 2026-10-30), so a step scope has no `io.stat`. Dependency: nixos commit ee6d018 (on nixos main since 2026-10-30, `DefaultIOAccounting=yes` for the user manager; not in this phase). After the user's next rebuild, scopes have `io.stat` and no code change is needed. `IOAccounting` on `builds.slice` alone does not give scopes `io.stat` (tested).
+  - per 60 s sample, for the builds slice and the CI slice apart: `cpu.stat` `usage_usec`, `user_usec`, `system_usec` and `io.stat` `rbytes`, `wbytes`. Keep every raw `io.stat` line with its `major:minor` and device name. Report traffic for one device only: the device behind the filesystem that holds the build targets, found by mapping its `st_dev` `major:minor` through `/sys/dev/block` to the top layer (today `254:0` dm-crypt over NVMe `259:0`). Keep zram swap (`253:0` today) apart. Never sum stacked layers.
+  - per 60 s sample: free, total and used bytes and the filesystem identity of the filesystem that holds the build targets, from `disk.filesystem_usage` extended with total bytes (`f_blocks * f_frsize`; `used + free` is not total when blocks are reserved) and the identity. `disk.json` keeps only the latest snapshot, so it gives no trend.
+  - per 60 s sample: free pool tokens in each jobserver pool (`/dev/steve`, 31; `/dev/steve-ci`, 14), read with `stevie -t` and `stevie -s /dev/steve-ci -t` with a short timeout (read-only: `/etc/nixos/modules/linux/jobserver.nix:53`, `:79`). steve is a CUSE device; `FIONREAD` fails on it. Any failure gives a typed unavailable value. Label the value "free pool tokens", never CPU in use: each client also holds one implicit slot.
+  - Report: `usage-hours` also shows, per hour, average CPU cores busy for builds, disk bytes read and written, lowest free disk and average free pool tokens per pool, each with its reading count.
+- Counter continuity: pair readings by boot id and cgroup identity (the cgroup folder's inode); elapsed time must be above 0. A counter reset or a gap over `report.MAX_SAMPLE_GAP_S` gives unknown, never 0. Split a delta across hour edges by its covered seconds. Average CPU = valid `usage_usec` delta / covered seconds. Extend the pairing in `report.sample_counter_deltas` (`report.py:844`; today it clamps a decrease to 0 and takes a new boot's counter as a delta); add no second pairing loop.
 
 **Files:**
-- `scripts/buildlog/memory.py` — the new slice fields
-- `scripts/buildlog/report.py` — the new line
-- `scripts/buildlog/cli.py` — the hourly command
-- `scripts/buildlog/test_sample.py` — slice field tests
-- `scripts/buildlog/test_report.py` — line tests
+- `scripts/lint/invoke.sh` — one capture call after `"$@"` (also-touches: verify-unit's file)
+- `scripts/buildlog/record.py` — the per-step CPU fields in `PendingStep.row` before the save
+- `scripts/buildlog/memory.py` — the new slice fields, through the shared capture
+- `scripts/buildlog/sample.py` — disk and jobserver fields; slice reads through the shared capture
+- `scripts/buildlog/disk.py` — `filesystem_usage` total bytes and identity
+- `scripts/buildlog/index.py` — new `SAMPLE_COLUMNS`, `SCHEMA_VERSION` 26
+- `scripts/buildlog/report.py` — the new line; counter pairing
+- `scripts/buildlog/cli.py` — `usage-hours`
+- `scripts/lint/test_invoke_scope.py` — tests
+- `scripts/buildlog/test_record.py` — tests
+- `scripts/buildlog/test_record_rerun.py` — tests
+- `scripts/buildlog/test_memory_window.py` — tests
+- `scripts/buildlog/test_sample.py` — tests
+- `scripts/buildlog/test_disk.py` — tests
+- `scripts/buildlog/test_index.py` — tests
+- `scripts/buildlog/test_report.py` — tests
 - `docs/as-built/buildlog-memory-stalls.md` — the fields, line and command
 
+**Ownership:** `scripts/lint/invoke.sh` belongs to verify-unit; the checkpoint notice names it as also-touches.
+
 **Workers:** 1 writer + 1 tester
-- `impl` — `memory.py`, `report.py`, `cli.py`, the as-built doc
-- `test` — `test_sample.py`: the fields come from a fake slice folder; `test_report.py`: the line with readings, with only old rows (`no readings yet`), and an average that never exceeds the cap for a fixture within it
+- `impl` — `invoke.sh`; `record.py`, `memory.py`, `sample.py`, `disk.py`, `index.py`, `report.py`, `cli.py`; the shared capture; the as-built doc
+- `test` — the test modules in Files: capture in terminal and tee runs and in an interrupted recovery; a scope with and without `io.stat`; fake slice folders; an unreadable slice file that keeps the other readings; a dm-crypt-over-NVMe `io.stat` fixture with zram swap; a counter reset, a gap, a boot change and a cgroup change (unknown, never 0); a delta split across an hour edge; the two 01:00 hours on 2026-11-01; `stevie` failure and timeout (unavailable); the line with readings, with only old rows (`no readings yet`), and an average that never exceeds the cap for a fixture within it
 
-**State:** none.
+**State:** each slice, disk and jobserver field is measured or unavailable (typed); an unreadable file makes only its own field unavailable and never drops the valid memory or CI readings. Per-step IO is unavailable while a step scope has no `io.stat` (until nixos ee6d018 is built). A counter interval is valid or unknown, never 0.
 
-**Constraints from prior phases:** samples reach `index.sqlite` table `memory_snapshots` (`slices` JSON); read them from there, through the existing query path.
+**Constraints from prior phases:**
+- Samples reach `index.sqlite`: slice measurements in `memory_snapshots.slices` (JSON); disk and jobserver readings in the `sample` row (`SAMPLE_COLUMNS`, `index.py:252`). Bump `SCHEMA_VERSION` from 25 to 26, which reindexes the source logs once. Read through the existing query path.
+- One shared typed capture of slice files feeds `sample.py` and `memory.slice_state`; today `sample.py:192` builds the slice path again and `sample.anon_bytes` reads `memory.stat` apart from `slice_state`. `slice_state` raises on an unreadable file today, so `cli.py sample` loses the whole snapshot.
+- 4b binds: every new row field is in `PendingStep.row` before `_save_pending_step`; a rerun takes it from the pending record and never reads the scope again.
+- Good engineering first, not after the user notices. Before a worker writes code, ask: is there already one place for this? Use it, or make it, then call it.
+- No copies. A second copy of setup, a fixture, a config writer, a parser or a helper is a defect. Reviews flag it; you send it back. A test helper that each file writes for itself goes into one shared helper.
+- When many things break the same way, the copy is the cause. Name it first in your report, with the one-place fix, before anyone asks.
+- Fix at the cause, never a patch at each site.
 
-**Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.buildlog.test_sample scripts.buildlog.test_report` from the worktree root green; basedpyright on the five Python files `0 errors, 0 warnings, 0 notes`; live cross-check: read `memory.current` and `memory.stat` by hand in the folder `memory.builds_path()` returns at one instant beside one sample run, and show that the stored values equal the files, that `anon + file + kernel` is within 5% of `current_bytes` (report the gap), and that no stored `current_bytes` exceeds `max_bytes`; live: after the installed sampler writes a row with `current_bytes` (or one `python3 scripts/buildlog/cli.py` sample run from the worktree), `python3 scripts/buildlog/cli.py report` prints the new line and the hourly command prints a row per hour with readings.
+**Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.lint.test_invoke_scope scripts.buildlog.test_record scripts.buildlog.test_record_rerun scripts.buildlog.test_memory_window scripts.buildlog.test_sample scripts.buildlog.test_disk scripts.buildlog.test_index scripts.buildlog.test_report` from the worktree root green; basedpyright on every changed Python file `0 errors, 0 warnings, 0 notes`; fixtures prove the rules (no sum of stacked layers, unknown never 0, typed unavailable); live: one capture-only run (not `cli.py sample`, which starts the Mac idle watcher at `cli.py:289`) beside timestamped reads of `memory.current`, `memory.stat` and `io.stat` in the folder `memory.builds_path()` returns, compared within a stated tolerance, with the `anon + file + kernel + sock + zswap` gap to `current_bytes` reported; `python3 scripts/buildlog/cli.py report` prints the new line and `python3 scripts/buildlog/cli.py usage-hours` prints a row per hour with readings. The per-step CPU live check runs after the change lands on main (invoke.sh runs the installed recorder).
