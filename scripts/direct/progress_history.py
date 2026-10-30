@@ -5786,6 +5786,15 @@ def _wait_holder_history(events: list[dict[str, object]]) -> dict[tuple[str, str
     return histories
 
 
+def _counted_uncertain_reasons(waits: Iterable[dict[str, object]]) -> str:
+    counts: dict[str, int] = {}
+    for wait in waits:
+        reason = _string((_object_dict(wait.get("wait_attribution")) or {}).get("reason"))
+        counts[reason] = counts.get(reason, 0) + 1
+    return "; ".join(f"{reason} ({count} times)" if count > 1 else reason
+                     for reason, count in counts.items())
+
+
 def _read_waits(args: argparse.Namespace) -> None:
     since, until = _history_window(args)
     session = _arg_string(args, "session_dir")
@@ -5866,8 +5875,7 @@ def _read_waits(args: argparse.Namespace) -> None:
         if own_uncertain:
             _ = phase.pop("wait_n", None)
             phase.update(state="UncertainCoverage", recorded_wait_n=len(own),
-                         reason="; ".join(_string((_object_dict(wait.get("wait_attribution")) or {}).get("reason"))
-                                          for wait in own_uncertain),
+                         reason=_counted_uncertain_reasons(own_uncertain),
                          candidates=[candidate for wait in own_uncertain for candidate in _attribution_candidates(wait)],
                          attribution_miss_ids=[wait["wait_id"] for wait in own_uncertain])
         if own_without_id:
