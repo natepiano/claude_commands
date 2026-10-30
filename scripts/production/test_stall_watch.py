@@ -1205,7 +1205,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                 stall_watch.Process(21, 1, "build")]
         with (mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier),
               mock.patch.object(stall_watch, "unit_marks", return_value=("old-showrunner", "unit-one")),
-              mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads):
+              mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads):
             self.assertFalse(stall_watch.work_running(10, rows, ("unrelated", "unit-one")))
             self.assertEqual(reads.call_count, 1)
             self.assertTrue(stall_watch.work_running(10, rows, ("showrunner", "unit-one")))
