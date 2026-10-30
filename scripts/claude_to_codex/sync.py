@@ -241,7 +241,7 @@ def main() -> int:
         references_dir = skill_dir / "references"
         skill_file = skill_dir / "SKILL.md"
 
-        if skill_dir.exists():
+        if skill_file.exists():
             if not force:
                 print(f"skip: {skill_dir} already exists", file=sys.stderr)
                 continue
