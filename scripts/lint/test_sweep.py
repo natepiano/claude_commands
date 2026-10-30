@@ -902,6 +902,64 @@ class ReclamationTests(SweepCase):
 
 
 class FloorTests(SweepCase):
+    def test_floor_claims_an_absent_busy_mark_before_unlinking_output(self) -> None:
+        base = self.base()
+        tree, output = cargo_target(base, "copy", APP, time.time() - 3 * DAY)
+        mark = tree.parent / ".claude-busy"
+        reclaim = sweep.reclaim
+        attempts: list[bool] = []
+
+        def late_holder(group: sweep.Group, scan: sweep.Scan, remaining: dict[sweep.InodeKey, int],
+                        dry_run: bool) -> sweep.ReclamationEstimate | sweep.ConfirmedDeletion:
+            with mark.open("a") as holder:
+                try:
+                    fcntl.flock(holder, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    attempts.append(False)
+                else:
+                    attempts.append(True)
+                return reclaim(group, scan, remaining, dry_run)
+
+        self.assertFalse(mark.exists())
+        with mock.patch.object(sweep, "reclaim", late_holder):
+            status, text = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB])
+        self.assertEqual(status, 0, text)
+        self.assertTrue(attempts)
+        self.assertFalse(any(attempts), "a holder started while the floor sweep was unlinking output")
+        self.assertFalse(output.exists())
+
+    def test_floor_keeps_a_shared_busy_copy_or_target_then_reclaims_after_unlock(self) -> None:
+        for location in ("copy", "target"):
+            with self.subTest(location=location):
+                base = self.base()
+                tree, output = cargo_target(base, "copy", APP, time.time() - 3 * DAY)
+                mark = (tree.parent.parent if location == "copy" else tree.parent) / ".claude-busy"
+                with mark.open("a") as holder:
+                    fcntl.flock(holder, fcntl.LOCK_SH)
+                    with mock.patch.object(sweep, "send_floor_alert", return_value=True):
+                        status, text = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB - SIZE])
+                    self.assertEqual(status, 0, text)
+                    self.assertTrue(output.exists())
+                status, text = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB])
+                self.assertEqual(status, 0, text)
+                self.assertFalse(output.exists())
+
+    def test_floor_rechecks_busy_mark_after_its_scan(self) -> None:
+        base = self.base()
+        tree, output = cargo_target(base, "copy", APP, time.time() - 3 * DAY)
+        mark = tree.parent.parent / ".claude-busy"
+        scan = sweep.scan_floor_roots
+        with mark.open("a") as holder:
+            def start_after_scan(roots: list[str], trees: dict[str, list[str]]) -> sweep.Scan:
+                result = scan(roots, trees)
+                fcntl.flock(holder, fcntl.LOCK_SH)
+                return result
+            with (mock.patch.object(sweep, "scan_floor_roots", side_effect=start_after_scan),
+                  mock.patch.object(sweep, "send_floor_alert", return_value=True)):
+                status, text = self.hold(base, 10 * GIB, [10 * GIB - SIZE, 10 * GIB - SIZE])
+            self.assertEqual(status, 0, text)
+            self.assertTrue(output.exists())
+
     def test_outside_link_leaves_floor_exhausted_and_sends_alert(self) -> None:
         base = self.base()
         _, output = cargo_target(base, "old", APP, time.time() - DAY)

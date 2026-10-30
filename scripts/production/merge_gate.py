@@ -60,6 +60,7 @@ from scripts.build_targets import build_targets  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.lib import scratch  # noqa: E402
 
 TEST_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold", "build_queue",
@@ -1373,7 +1374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
     try:
-        with rollback_signals():
+        with rollback_signals(), scratch.copy_lock(Path(args.repo).expanduser().resolve()):
             if args.nightly:
                 return nightly(args)
             if args.tests_only:

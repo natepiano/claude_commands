@@ -66,7 +66,7 @@ RUST_ROOTS_FILE = Path(__file__).resolve().parents[2] / "config" / "rust_roots.t
 RUST_SCRATCH_NAME = "scratch"
 MIN_AGE_SECONDS = 24 * 3600
 REMOVE_AFTER_SECONDS = tmp_sweep.WIDE_IDLE_SECONDS
-KEPT_NAMES = SYSTEM_TEMP_NAMES | {"unit", "delegate", "scratch", "repro", "session"}
+KEPT_NAMES = SYSTEM_TEMP_NAMES | {"unit", "delegate", "scratch", "repro", "session", "copies"}
 KEPT_PREFIXES = SYSTEM_TEMP_PREFIXES
 IDLE_DEPTH = 3
 # A folder with more entries than this inside IDLE_DEPTH is not read to the end, and stays.

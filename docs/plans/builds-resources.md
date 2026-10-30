@@ -648,7 +648,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - If adopted: the memory admission tests pass; `basedpyright` over the changed Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green. Post-merge check, 24 h after the merge reaches main: wait minutes and the heads' start delay against the 24 h before, and how often a step went above its charge. The phase report records when the check is due.
 - Change-Review line: small steps start while a large head cannot fit | on natedev while a large hana nextest head waits, type `/build:queue` in a Claude session | younger clippy rows that fit are running, and the head's Reason names the new window state (text in the as-built).
 
-### Phase 21 — Copies get a root, a busy mark and a lifetime that ends when their work ends  · status: todo
+### Phase 21 — Copies get a root, a busy mark and a lifetime that ends when their work ends  · status: done
 **Depends on:** Phase 14 (`tmp_sweep.py`, `folder_audit.py`). Runs beside Phase 15 (no shared files). Phase 4 follows it on `sweep.py`. Merge `origin/builds` first. It is the resources part of verify-copies Phase 2; verify-unit builds none of it.
 
 **Approved:** showrunner 2026-10-29 23:3x EDT (ETA 06:00 EDT 2026-10-30), from resources' answer to verify (23:05) and verify's four points (verify-copies `9d36907d`).

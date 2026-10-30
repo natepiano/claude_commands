@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import fcntl
 
 import json
 import io
@@ -18,6 +19,34 @@ from scripts.production.merge_gate_test_support import EXPECTED_SUITES, MergeGat
 
 @final
 class MergeGateCheckpointTests(MergeGateFixture):
+    def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
+        copies = self.root / "copies"
+        checkout = copies / "show-maker" / "21-gate"
+        checkout.parent.mkdir(parents=True)
+        _ = self.git(self.checkout, "clone", str(self.checkout), str(checkout))
+        self.environment["SCRATCH_COPIES_ROOT"] = str(copies)
+        observed: list[Path] = []
+
+        def suites(repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
+            self.assertEqual(repo, checkout)
+            with (repo / ".claude-busy").open("a") as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(contender, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            observed.append(repo)
+            raise merge_gate.GateRefused("injected suite stop")
+
+        with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
+            result = self.run_gate("--tests-only", "--checkout", str(checkout))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("injected suite stop", result.stderr)
+        self.assertEqual(observed, [checkout])
+        excludes = (checkout / ".git/info/exclude").read_text().splitlines()
+        self.assertEqual(excludes.count("/.claude-busy"), 1)
+        self.assertEqual(excludes.count("/.scratch.json"), 1)
+        with (checkout / ".claude-busy").open("a") as contender:
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
         checked = merge_gate.checked_git
 

@@ -177,12 +177,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from . import tmp_sweep
+    from ..lib import scratch
     from .config_values import config_values as config_values
     from ..notify.push_texts import RenderedPush
     from ..notify import review
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import tmp_sweep
+    import scratch
     from config_values import config_values as config_values
 
 GIB = 1 << 30
@@ -1275,31 +1277,36 @@ def shrink_floor(
         if root in current_uses:
             busy[root] = current_uses[root]
             continue
-        held, blocked = lock_trees(trees[root])
-        if blocked is not None:
-            busy[root] = LockHeld(blocked)
-            continue
-        try:
-            if target_last_use(root, []) > planned_at:
+        lock = scratch.judgment_lock if dry_run else scratch.removal_lock
+        with lock(Path(root)) as idle:
+            if not idle:
+                busy[root] = LockHeld(os.path.join(root, ".claude-busy"))
                 continue
-            removed_output = False
-            for group in candidates:
-                if left <= budget:
-                    break
-                if not group_unchanged(group):
+            held, blocked = lock_trees(trees[root])
+            if blocked is not None:
+                busy[root] = LockHeld(blocked)
+                continue
+            try:
+                if target_last_use(root, []) > planned_at:
                     continue
-                attempted.append(group)
-                account = reclaim(group, scan, remaining, dry_run)
-                left -= account.bytes
-                failed = account.failures if isinstance(account, ConfirmedDeletion) else 0
-                failures += failed
-                if not failed:
-                    taken.append((group, account.bytes))
-                    removed_output |= group.kind != "orphan"
-            if removed_output and not dry_run:
-                record_sweep_removal(root, "floor take")
-        finally:
-            release(held)
+                removed_output = False
+                for group in candidates:
+                    if left <= budget:
+                        break
+                    if not group_unchanged(group):
+                        continue
+                    attempted.append(group)
+                    account = reclaim(group, scan, remaining, dry_run)
+                    left -= account.bytes
+                    failed = account.failures if isinstance(account, ConfirmedDeletion) else 0
+                    failures += failed
+                    if not failed:
+                        taken.append((group, account.bytes))
+                        removed_output |= group.kind != "orphan"
+                if removed_output and not dry_run:
+                    record_sweep_removal(root, "floor take")
+            finally:
+                release(held)
     verb, result = ("would remove", "would leave") if dry_run else ("removed", "left")
     orphans = [group for group in attempted if group.kind == "orphan"]
     if orphans:
@@ -1822,6 +1829,11 @@ def hold_floor(
         uses = process_uses(targets)
         locked_files = held_cargo_lock_files()
         for root in targets:
+            with scratch.judgment_lock(Path(root)) as idle_copy:
+                if not idle_copy:
+                    busy[root] = LockHeld(os.path.join(root, ".claude-busy"))
+                    print(f"lint sweep: busy .claude-busy lock; {root} left alone")
+                    continue
             if root in hold_targets:
                 reason = hold_targets[root]
                 print(f"lint sweep: {reason.holder} holds natedev builds; {root} left alone")

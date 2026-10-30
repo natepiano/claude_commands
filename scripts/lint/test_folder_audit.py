@@ -97,6 +97,17 @@ class FolderAuditTests(unittest.TestCase):
         self.enterContext(unittest.mock.patch.dict(os.environ, {"FOLDER_SWEEP_STATE_DIR": str(state),
                                                                 "SCRATCH_HOLDS": str(state / "holds.json")}))
 
+    def test_copies_root_keeps_an_old_open_phase_copy(self) -> None:
+        import json
+        copy = folder(self.temp / "copies" / "show-maker" / "21-gate", 30)
+        _ = (copy / scratch.RECORD).write_text(json.dumps({"task": "phase:maker-unit/21"}))
+        age(self.temp / "copies", 30)
+        proc = self.root / "proc"
+        proc.mkdir()
+        _ = folder_audit.audit(self.rust, [self.temp], frozenset[str](), time.time(), files=[],
+                               removing=True, proc=str(proc), sockets=str(self.root / "unix"))
+        self.assertTrue(copy.is_dir())
+
     def test_copied_folder_needs_seven_days_since_its_last_metadata_change(self) -> None:
         now = time.time()
         proc = self.root / "proc"
