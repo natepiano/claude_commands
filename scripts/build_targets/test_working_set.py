@@ -136,8 +136,11 @@ class WorkingSetTests(unittest.TestCase):
         self.assertEqual((total.count, total.pss_kib, total.swap_kib), (6, 4032, 504))
         text = working_set.render(report)
         self.assertIn(script, text)
-        self.assertIn("resources-unit", text)
-        self.assertIn("verify-unit", text)
+        self.assertIn("[resources]", text)
+        self.assertIn("[verify]", text)
+        self.assertNotIn("resources-unit", text)
+        self.assertNotIn("verify-unit", text)
+        self.assertIn("[unassigned]", text)
 
     def test_verify_helpers_have_the_owner_named_in_builds_production(self) -> None:
         scripts = (

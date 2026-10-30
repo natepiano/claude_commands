@@ -28,6 +28,9 @@ from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Concatenate, Literal, TypedDict, cast
 
+from git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
+                         LedgerError as LedgerError, GitExitAnswers, SUCCESS_ONLY, run_git)
+
 import rules as rule_catalog
 import style_footprint
 import declarations
@@ -92,10 +95,6 @@ def _judgment_rule(component: Rule, path: str) -> Rule:
     return replace(component, input_scope="file") if component.tier == "B" and not path.endswith(".rs") else component
 
 
-class LedgerError(ValueError):
-    """A ledger operation cannot represent the requested check."""
-
-
 def protected_ticket_files(files: frozenset[str], crates: tuple[str, ...]) -> frozenset[str]:
     """A ticket's edit paths and the build inputs those paths depend on."""
     protected = {"Cargo.toml", "Cargo.lock", *files}
@@ -130,31 +129,6 @@ class ReadFiles:
             raise LedgerError("--reads requires at least one file")
 
 
-class CheckCouldNotRun(LedgerError):
-    """A git command failed or the ledger schema is newer than this script; the request is not at fault."""
-
-
-class GitReadFailed(CheckCouldNotRun):
-    """A Git read failed; command details stay available without entering a user refusal."""
-
-    def __init__(self, command: tuple[str, ...], status: int, stderr: str) -> None:
-        self.command: tuple[str, ...] = command
-        self.status: int = status
-        self.stderr: str = stderr
-        self.operations: tuple[str, ...] = ()
-        arguments = command[3:] if len(command) > 3 and command[1] == "-C" else command[1:]
-        action = next(iter(arguments), "read")
-        details = " " + repr(arguments[1:]) if len(arguments) > 1 else ""
-        diagnosis = ": not a git repository" if "not a git repository" in stderr else ""
-        super().__init__(f"git {action} failed (exit {status}){details}{diagnosis}")
-
-    @classmethod
-    def from_process(cls, error: subprocess.CalledProcessError) -> GitReadFailed:
-        raw_command = cast(object, error.cmd)
-        command = (raw_command,) if isinstance(raw_command, str) else tuple(cast(Sequence[str], raw_command))
-        raw_stderr = cast(object, error.stderr)
-        stderr = raw_stderr.decode(errors="replace") if isinstance(raw_stderr, bytes) else str(raw_stderr or "")
-        return cls(command, error.returncode, stderr)
 
 
 class ChangedBeforeLock(LedgerError):
@@ -1622,16 +1596,9 @@ class RepositoryTip:
         return next((directory for directory in self.crate_dirs if _under(path, directory)), ".")
 
 
-def _git_bytes(repo: Path, *arguments: str, input: bytes | None = None,
-               success: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[bytes]:
-    command = ("git", "-C", str(repo), *arguments)
-    try:
-        result = subprocess.run(command, input=input, capture_output=True, check=False)
-    except OSError as error:
-        raise GitReadFailed(command, -1, str(error)) from error
-    if result.returncode not in success:
-        raise GitReadFailed(command, result.returncode, result.stderr.decode(errors="replace"))
-    return result
+def _git_bytes(repo: Path, *arguments: str, input: bytes = b"",
+               answers: GitExitAnswers = SUCCESS_ONLY) -> subprocess.CompletedProcess[bytes]:
+    return run_git(("git", "-C", str(repo), *arguments), input=input, answers=answers)
 
 
 def _git(repo: Path, *arguments: str) -> str:
@@ -1727,13 +1694,7 @@ def blob_contents(repo: Path, blobs: Mapping[str, str]) -> Iterator[tuple[str, b
     """Each path of blobs with the bytes of its blob, read by one `git cat-file --batch`."""
     with tempfile.TemporaryFile() as contents:
         command = ("git", "-C", str(repo), "cat-file", "--batch")
-        try:
-            result = subprocess.run(command, input="".join(f"{blob}\n" for blob in blobs.values()).encode(),
-                                    stdout=contents, stderr=subprocess.PIPE, check=False)
-        except OSError as error:
-            raise GitReadFailed(command, -1, str(error)) from error
-        if result.returncode:
-            raise GitReadFailed(command, result.returncode, result.stderr.decode(errors="replace"))
+        _ = run_git(command, input="".join(f"{blob}\n" for blob in blobs.values()).encode(), output=contents)
         _ = contents.seek(0)
         for path, blob in blobs.items():
             header = contents.readline().split()
@@ -2194,10 +2155,7 @@ class Ledger:
             self._git_operation_depth -= 1
 
     def _load_rules(self) -> tuple[Rule, ...]:
-        try:
-            return rule_catalog.load_rules(self.repo)
-        except subprocess.CalledProcessError as error:
-            raise GitReadFailed.from_process(error) from error
+        return rule_catalog.load_rules(self.repo)
 
     def close(self) -> None:
         self._connection.close()
@@ -2254,7 +2212,7 @@ class Ledger:
 
     def _judged_commit_missing(self, commit: str) -> bool:
         """A missing historical judgment cannot judge current inputs; a failed lookup still refuses."""
-        result = _git_bytes(self.repo, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}", success=(0, 1))
+        result = _git_bytes(self.repo, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}", answers=GitExitAnswers(frozenset({0, 1})))
         return result.returncode == 1
 
     def _judgment_inputs_match(self, row: Judgment, tip: RepositoryTip, scope: CellInputScope, path: str, family: Family | None) -> bool:
@@ -2291,7 +2249,7 @@ class Ledger:
     def _is_ancestor(self, commit: str, tip: str) -> bool:
         key = (commit, tip)
         if key not in self._ancestors:
-            result = _git_bytes(self.repo, "merge-base", "--is-ancestor", commit, tip, success=(0, 1))
+            result = _git_bytes(self.repo, "merge-base", "--is-ancestor", commit, tip, answers=GitExitAnswers(frozenset({0, 1})))
             self._ancestors[key] = result.returncode == 0
         return self._ancestors[key]
 
@@ -2836,15 +2794,7 @@ class Ledger:
                     raise LedgerError(f"{id}: {path} is already widened for another reason: {previous[path]}")
             if all(path in previous for path in normalized):
                 return ticket["widened"]
-            try:
-                allowed = approved()
-            except GitReadFailed:
-                raise
-            except subprocess.CalledProcessError as error:
-                raise GitReadFailed.from_process(error) from error
-            except (CheckCouldNotRun, OSError) as error:
-                # unit_files.git currently discards its command/status. Keep that external loss explicit.
-                raise GitReadFailed(("git", "approved-footprint-callback"), -1, str(error)) from error
+            allowed = approved()
             for path in normalized:
                 if path in allowed:
                     raise LedgerError(f"{id}: {path} is already allowed by the approved findings")
@@ -3047,7 +2997,7 @@ class Ledger:
                     _ = _git(self.repo, "check-ref-format", branch)
                 except GitReadFailed:
                     raise
-                except (OSError, LedgerError, subprocess.CalledProcessError) as error:
+                except LedgerError as error:
                     raise LedgerError(f"{id}: cannot assign: invalid branch {branch}") from error
                 active = self.ticket_open(ticket["unit"])
                 if active:
@@ -3055,7 +3005,7 @@ class Ledger:
                         assignment_tip = _git(self.repo, "rev-parse", "--verify", f"{branch}^{{commit}}")
                     except GitReadFailed:
                         raise
-                    except (OSError, LedgerError, subprocess.CalledProcessError) as error:
+                    except LedgerError as error:
                         raise LedgerError(f"{id}: cannot resolve branch {branch}; waiting for merge: "
                                           + f"{active[0]['id']} checkpointed at {active[0]['checkpoint']}; assignment refused") from error
                     if assignment_tip != active[0]["checkpoint"] or not assignment_tip:
@@ -3677,7 +3627,7 @@ class Ledger:
         """The judging ticket's checkpoint, else its start, from its row as read; reads git and not the ledger."""
         for commit in (commit for commit in (judging[0] if judging else ()) if commit):
             if commit not in self._resolved_commits:
-                resolved = _git_bytes(self.repo, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}", success=(0, 1))
+                resolved = _git_bytes(self.repo, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}", answers=GitExitAnswers(frozenset({0, 1})))
                 self._resolved_commits[commit] = NoJudgedCommit() if resolved.returncode else JudgedCommit(resolved.stdout.decode().strip())
             judged = self._resolved_commits[commit]
             if isinstance(judged, JudgedCommit):
@@ -4081,7 +4031,7 @@ class Ledger:
         """The files at tip that match pathspecs and hold name as a whole word, read once for each ledger."""
         key = (tip, name, pathspecs)
         if key not in self._named_files:
-            result = _git_bytes(self.repo, "grep", "-l", "-z", "-w", "-F", "-e", name, tip, "--", *pathspecs, success=(0, 1))
+            result = _git_bytes(self.repo, "grep", "-l", "-z", "-w", "-F", "-e", name, tip, "--", *pathspecs, answers=GitExitAnswers(frozenset({0, 1})))
             self._named_files[key] = tuple(os.fsdecode(entry).removeprefix(f"{tip}:")
                                            for entry in result.stdout.split(b"\0") if entry)
         return self._named_files[key]
@@ -5731,7 +5681,7 @@ class Ledger:
         style_branch = "refs/heads/" + style_branch.removeprefix("refs/heads/")
         with self.git_operation(f"reconcile {style_branch}"):
             branch_tip = pushed_branch_point_tip(self.repo, branch_point)
-            present = _git_bytes(self.repo, "show-ref", "--verify", "--quiet", style_branch, success=(0, 1))
+            present = _git_bytes(self.repo, "show-ref", "--verify", "--quiet", style_branch, answers=GitExitAnswers(frozenset({0, 1})))
             style_tip = branch_tip if present.returncode == 1 else _git(self.repo, "rev-parse", "--verify", f"{style_branch}^{{commit}}")
         changes: list[str] = []
         sync = cast(list[tuple[str, str]], self._connection.execute("SELECT tip,style_branch FROM sync WHERE id=1").fetchall())
@@ -5762,7 +5712,7 @@ class Ledger:
                     changes.append(f"ticket {id}: checkpointed -> merged")
                     changes.extend(not_built_line(self.repo, item) for item in not_built)
                 elif state == "assigned":
-                    result = _git_bytes(self.repo, "show-ref", "--verify", "--quiet", branch, success=(0, 1))
+                    result = _git_bytes(self.repo, "show-ref", "--verify", "--quiet", branch, answers=GitExitAnswers(frozenset({0, 1})))
                     if result.returncode == 1:
                         self.ticket_drop(id)
                         changes.append(f"ticket {id}: assigned -> dropped")

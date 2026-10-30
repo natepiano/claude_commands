@@ -473,7 +473,10 @@ class RankExemptions:
     def source(self, path: str) -> str:
         if path not in self.sources:
             try:
-                self.sources[path] = git(self.ledger.repo, "show", f"{self.tip}:{path}")
+                blob = GitProposalReader(self.ledger).blob(self.tip, path)
+                self.sources[path] = git(self.ledger.repo, "show", blob) if blob else ""
+            except style_ledger.GitReadFailed:
+                raise
             except style_ledger.LedgerError:
                 self.sources[path] = ""
         return self.sources[path]
@@ -535,7 +538,16 @@ class GitProposalReader:
 
     def blob(self, commit: str, path: str) -> str:
         try:
-            return git(self.ledger.repo, "rev-parse", "--verify", f"{commit}:{path}")
+            # A successful tree read distinguishes an absent file from a failed Git read.
+            listing = git(self.ledger.repo, "ls-tree", "-z", "--full-tree", commit, "--", path)
+            for entry in filter(None, listing.split("\0")):
+                metadata, name = entry.split("\t", 1)
+                _mode, kind, blob = metadata.split()
+                if name == path and kind == "blob":
+                    return blob
+            return ""
+        except style_ledger.GitReadFailed:
+            raise
         except style_ledger.LedgerError:
             return ""
 

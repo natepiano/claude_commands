@@ -1454,12 +1454,15 @@ def _refill_cells(ledger: style_ledger.Ledger, cells: tuple[style_ledger.Cell, .
                    and frontmatter(finding.state.proposal).get("status") == ["open"]
                    for finding in findings[key]):
                 try:
-                    previous = git(ledger.repo, "rev-parse", "--verify", f"{held[key]}:{cell.path}")
-                    current = git(ledger.repo, "rev-parse", "--verify", f"{tip}:{cell.path}")
+                    reader = style_proposals.GitProposalReader(ledger)
+                    previous = reader.blob(held[key], cell.path)
+                    current = reader.blob(tip, cell.path)
+                except style_ledger.GitReadFailed:
+                    raise
                 except style_ledger.LedgerError:
                     pass
                 else:
-                    if previous == current:
+                    if previous and previous == current:
                         continue
         result.append(cell)
     own = (cell for cell in result if _unit_tickets(family, cell) and crate_in_scope(scope, cell.crate))

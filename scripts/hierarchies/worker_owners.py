@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+from stat import S_ISREG
 import subprocess
 import sys
 from typing import cast
@@ -166,6 +167,62 @@ class EndResult:
     evidence: tuple[str, ...]
     first_run: bool
     failed: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PendingEndCleanup:
+    name: str
+    thread_id: str
+    run: str
+    classification: WorkerClass
+    started_at: datetime
+
+    def __post_init__(self) -> None:
+        if not all(value.strip() for value in (self.name, self.thread_id, self.run)):
+            raise ValueError("pending end needs name, thread and run")
+        if self.started_at.utcoffset() != timezone.utc.utcoffset(self.started_at):
+            raise ValueError("pending end time must be UTC")
+
+
+@dataclass(frozen=True)
+class EndCleanupFinished:
+    name: str
+
+
+@dataclass(frozen=True)
+class EndCleanupFailed:
+    name: str
+    exit_code: int
+
+
+@dataclass(frozen=True)
+class EndCleanupDropped:
+    name: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class EndCleanupKept:
+    name: str
+    problem: str
+
+
+EndCleanupOutcome = EndCleanupFinished | EndCleanupFailed | EndCleanupDropped | EndCleanupKept
+
+
+@dataclass(frozen=True)
+class RouteEnded:
+    pass
+
+
+@dataclass(frozen=True)
+class RouteGone:
+    reason: str
+
+
+@dataclass(frozen=True)
+class RouteUnreadable:
+    problem: str
 
 
 @dataclass(frozen=True)
@@ -581,8 +638,126 @@ def worker_record(worker: Worker) -> JsonObject:
             "evidence": worker.evidence, "recovery_attempted": worker.recovery_attempted, "status": worker.status.value}
 
 
+def pending_end_record(record: PendingEndCleanup) -> JsonObject:
+    return {"name": record.name, "thread_id": record.thread_id, "run": record.run,
+            "classification": record.classification.value, "started_at": record.started_at.isoformat()}
+
+
+def read_pending_ends(state_dir: Path, problems: list[str]) -> list[PendingEndCleanup]:
+    path = state_dir / "end-cleanup.json"
+    if not path.exists():
+        return []
+    document = read_object(path, problems)
+    if not isinstance(document.get("pending"), list):
+        problems.append(f"{path}: pending must be a list")
+        return []
+    pending: list[PendingEndCleanup] = []
+    for index, raw in enumerate(list_items(document.get("pending"))):
+        try:
+            fields = object_fields(raw)
+            pending.append(PendingEndCleanup(
+                text_field(fields, "name"), text_field(fields, "thread_id"), text_field(fields, "run"),
+                WorkerClass(text_field(fields, "classification")),
+                datetime.fromisoformat(text_field(fields, "started_at"))))
+        except ValueError as error:
+            problems.append(f"{path}: pending[{index}]: {error}")
+    return pending
+
+
+def write_pending_ends(state_dir: Path, pending: Sequence[PendingEndCleanup]) -> None:
+    write_json(state_dir / "end-cleanup.json", {"pending": [pending_end_record(record) for record in pending]})
+
+
+def pending_route_problem(record: PendingEndCleanup) -> RouteEnded | RouteGone | RouteUnreadable:
+    path = Path(record.run) / "mesh_roster.json"
+    try:
+        if not S_ISREG(path.stat().st_mode):
+            return RouteUnreadable(f"{path}: roster is not a regular file")
+    except FileNotFoundError:
+        return RouteGone("mesh route missing")
+    except OSError as error:
+        return RouteUnreadable(f"{path}: {error}")
+    problems: list[str] = []
+    route = object_fields(read_object(path, problems).get(record.name))
+    if problems:
+        try:
+            if not S_ISREG(path.stat().st_mode):
+                return RouteUnreadable(f"{path}: roster is not a regular file")
+        except FileNotFoundError:
+            return RouteGone("mesh route missing")
+        except OSError as error:
+            problems.append(f"{path}: {error}")
+        return RouteUnreadable("; ".join(problems))
+    if not route:
+        return RouteGone("mesh route missing")
+    if route.get("thread_id") != record.thread_id:
+        return RouteGone("mesh thread changed")
+    if route.get("status") != "ended":
+        return RouteGone("mesh route is not ended")
+    return RouteEnded()
+
+
+def mesh_cleanup(record: PendingEndCleanup) -> int:
+    completed = subprocess.run([sys.executable, str(SCRIPTS / "agents/codex_mesh.py"), "end",
+                                "--session-dir", record.run, "--to", record.name,
+                                "--expected-thread-id", record.thread_id, "--cleanup-only"],
+                               check=False, timeout=45, capture_output=True, text=True)
+    return completed.returncode
+
+
+def cleanup_note(outcome: EndCleanupOutcome) -> str:
+    if isinstance(outcome, EndCleanupFinished):
+        return "end cleanup finished"
+    if isinstance(outcome, EndCleanupFailed):
+        return f"end cleanup failed: exit {outcome.exit_code}"
+    if isinstance(outcome, EndCleanupKept):
+        return f"end cleanup kept: roster unreadable: {outcome.problem}"
+    return f"end cleanup dropped: {outcome.reason}"
+
+
+def log_end_outcome(state_dir: Path, record: JsonObject, outcome: str) -> None:
+    with (state_dir / "ends.jsonl").open("a", encoding="utf-8") as log:
+        json.dump({"at": datetime.now(timezone.utc).isoformat(), "worker": record, "outcome": outcome}, log)
+        log.writelines(("\n",))
+
+
+def finish_pending_ends(state_dir: Path, cleanup: Callable[[PendingEndCleanup], int]) -> tuple[EndCleanupOutcome, ...]:
+    """Finish recorded ends; the caller holds end.lock for every journal write."""
+    problems: list[str] = []
+    pending = read_pending_ends(state_dir, problems)
+    outcomes: list[EndCleanupOutcome] = []
+    for record in tuple(pending):
+        route = pending_route_problem(record)
+        outcome: EndCleanupOutcome
+        if isinstance(route, RouteGone):
+            outcome = EndCleanupDropped(record.name, route.reason)
+        elif isinstance(route, RouteUnreadable):
+            outcome = EndCleanupKept(record.name, route.problem)
+        else:
+            try:
+                result = cleanup(record)
+            except subprocess.TimeoutExpired:
+                result = 124
+            except OSError:
+                result = 1
+            route = pending_route_problem(record)
+            if isinstance(route, RouteUnreadable):
+                outcome = EndCleanupKept(record.name, route.problem)
+            elif result == 0 and isinstance(route, RouteEnded):
+                outcome = EndCleanupFinished(record.name)
+            else:
+                outcome = EndCleanupFailed(record.name, result or 3)
+        log_end_outcome(state_dir, pending_end_record(record), cleanup_note(outcome))
+        if isinstance(outcome, (EndCleanupFinished, EndCleanupDropped)):
+            pending.remove(record)
+        write_pending_ends(state_dir, pending)
+        outcomes.append(outcome)
+    return tuple(outcomes)
+
+
 def end_workers(sources: OwnershipSources, selected_class: WorkerClass, state_dir: Path, apply: bool = False,
-                end_worker: Callable[[Worker], int | WorkerKept] = mesh_end) -> EndResult:
+                end_worker: Callable[[Worker], int | WorkerKept] = mesh_end,
+                cleanup: Callable[[PendingEndCleanup], int] = mesh_cleanup) -> EndResult:
     if selected_class not in (WorkerClass.DirectorGone, WorkerClass.OwnerUnknown):
         raise ValueError("only DirectorGone and OwnerUnknown may be selected")
     recovered = recover_sources(sources)
@@ -591,6 +766,8 @@ def end_workers(sources: OwnershipSources, selected_class: WorkerClass, state_di
     failed: list[str] = []
     marker = state_dir / "first-report.json"
     if not apply:
+        for record in read_pending_ends(state_dir, recovered.problems):
+            notes.append(f"{record.name}: would finish end cleanup")
         for worker in recovered.workers:
             decision = end_decision(worker, selected_class, recovered.problems, not marker.exists())
             notes.append(f"{worker.name}: would keep: {decision.reason}" if isinstance(decision, WorkerKept)
@@ -599,6 +776,12 @@ def end_workers(sources: OwnershipSources, selected_class: WorkerClass, state_di
     state_dir.mkdir(parents=True, exist_ok=True)
     with (state_dir / "end.lock").open("a", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        pending = read_pending_ends(state_dir, recovered.problems)
+        cleanup_outcomes = finish_pending_ends(state_dir, cleanup)
+        for record, cleanup_outcome in zip(pending, cleanup_outcomes, strict=True):
+            notes.append(f"{cleanup_outcome.name}: {cleanup_note(cleanup_outcome)}")
+            if isinstance(cleanup_outcome, (EndCleanupFailed, EndCleanupKept)):
+                failed.append(record.thread_id)
         first_run = not marker.exists()
         if first_run:
             write_json(marker, {"at": datetime.now(timezone.utc).isoformat(), "workers": [worker_record(item) for item in recovered.workers]})
@@ -612,6 +795,12 @@ def end_workers(sources: OwnershipSources, selected_class: WorkerClass, state_di
             if isinstance(decision, WorkerKept):
                 outcome = f"kept: {decision.reason}"
             else:
+                pending = read_pending_ends(state_dir, recovered.problems)
+                record = PendingEndCleanup(worker.name, worker.thread_id, worker.run, worker.classification,
+                                           datetime.now(timezone.utc))
+                pending.append(record)
+                write_pending_ends(state_dir, pending)
+                completed_end = False
                 try:
                     result = end_worker(worker)
                     if isinstance(result, WorkerKept):
@@ -619,16 +808,24 @@ def end_workers(sources: OwnershipSources, selected_class: WorkerClass, state_di
                     else:
                         outcome = f"end exit {result}"
                         if result == 0:
+                            completed_end = True
                             ended.append(worker.thread_id)
                         else:
                             failed.append(worker.thread_id)
                 except (OSError, subprocess.TimeoutExpired) as error:
                     outcome = f"end failed: {error}"
                     failed.append(worker.thread_id)
+                route = pending_route_problem(record)
+                if not completed_end and not isinstance(route, RouteGone) and worker.thread_id not in failed:
+                    failed.append(worker.thread_id)
+                if not completed_end and isinstance(route, RouteUnreadable):
+                    outcome = cleanup_note(EndCleanupKept(worker.name, route.problem))
+                if completed_end or isinstance(route, RouteGone):
+                    pending.remove(record)
             notes.append(f"{worker.name}: {outcome}")
-            with (state_dir / "ends.jsonl").open("a", encoding="utf-8") as log:
-                json.dump({"at": datetime.now(timezone.utc).isoformat(), "worker": worker_record(worker), "outcome": outcome}, log)
-                log.writelines(("\n",))
+            log_end_outcome(state_dir, worker_record(worker), outcome)
+            if isinstance(decision, EndEligible):
+                write_pending_ends(state_dir, pending)
     return EndResult(recovered.workers, tuple(ended), tuple(notes), first_run, tuple(failed))
 
 
@@ -675,9 +872,11 @@ def main(arguments: Sequence[str] = ()) -> int:
         sources = replace(sources, workers=result.workers)
         notes = result.evidence
         end_failed = bool(result.failed)
+    pending = read_pending_ends(state_directory(), sources.problems)
     totals = {kind.value: sum(item.classification == kind for item in sources.workers) for kind in WorkerClass}
     if as_json:
         print(json.dumps({"workers": [worker_record(item) for item in sources.workers], "totals": totals,
+                          "end_cleanup_pending": [pending_end_record(record) for record in pending],
                           "problems": sources.problems, "timers": [asdict(item) for item in timers], "notes": notes}, indent=2))
     else:
         for worker in sources.workers:
@@ -698,7 +897,7 @@ def main(arguments: Sequence[str] = ()) -> int:
             missing_requests = sum(not timer.requested_by for timer in timers)
             print(f"Timers: {len(timers)} registered, {missing_requests} with no recorded request (the showrunner checks these; --full lists each)")
         print("Totals: " + ", ".join(f"{kind}={count}" for kind, count in totals.items()) +
-              f", source_problems={len(sources.problems)}")
+              f", source_problems={len(sources.problems)}, end_cleanup_pending={len(pending)}")
     return 1 if command == "end" and (sources.problems or end_failed) else 0
 
 

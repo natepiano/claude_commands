@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager, redirect_stdout
 from dataclasses import replace
+from datetime import datetime, timezone
 import io
 import json
 import os
@@ -93,6 +94,342 @@ class WorkerOwnersTest(unittest.TestCase):
         self.write_json(str(Path(worker.run) / "mesh_roster.json"), {
             worker.name: {"thread_id": thread or worker.thread_id, "status": "paused"},
         })
+
+    def pending_records(self, state: Path) -> list[owners.JsonObject]:
+        path = state / "end-cleanup.json"
+        if not path.exists():
+            return []
+        problems: list[str] = []
+        fields = owners.read_object(path, problems)
+        self.assertEqual(problems, [])
+        return [owners.object_fields(item) for item in owners.list_items(fields.get("pending"))]
+
+    def seed_pending_cleanup(self, worker: owners.Worker) -> Path:
+        state = self.root / "state"
+        self.write_json(str(Path(worker.run) / "mesh_roster.json"), {
+            worker.name: {"thread_id": worker.thread_id, "status": "ended"},
+        })
+        self.write_json(str(state / "end-cleanup.json"), {"pending": [{
+            "name": worker.name, "thread_id": worker.thread_id, "run": worker.run,
+            "classification": worker.classification.value, "started_at": "2026-10-29T20:00:00+00:00",
+        }]})
+        return state
+
+    def test_failed_end_saves_cleanup_before_handler_and_rerun_finishes_same_thread(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        self.mesh_route(worker)
+        sources = owners.OwnershipSources([worker], [], [], [])
+        state = self.root / "state"
+        commands: list[list[str]] = []
+
+        def handler(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            commands.append(command)
+            self.assertEqual(options.get("timeout"), 45)
+            self.assertTrue(options.get("capture_output"))
+            self.assertEqual(command[command.index("--expected-thread-id") + 1], worker.thread_id)
+            self.assertEqual(command[command.index("--session-dir") + 1], worker.run)
+            self.assertEqual(command[command.index("--to") + 1], worker.name)
+            pending = self.pending_records(state)
+            self.assertEqual(len(pending), 1)
+            self.assertEqual({key: pending[0][key] for key in ("name", "thread_id", "run", "classification")},
+                             {"name": worker.name, "thread_id": worker.thread_id, "run": worker.run,
+                              "classification": "DirectorGone"})
+            started = datetime.fromisoformat(owners.text_field(pending[0], "started_at"))
+            self.assertEqual(started.utcoffset(), timezone.utc.utcoffset(started))
+            if "--cleanup-only" in command:
+                self.assertNotIn("--idle-only", command)
+                return subprocess.CompletedProcess(command, 0, "", "")
+            self.assertIn("--idle-only", command)
+            self.write_json(str(Path(worker.run) / "mesh_roster.json"), {
+                worker.name: {"thread_id": worker.thread_id, "status": "ended"},
+            })
+            return subprocess.CompletedProcess(command, 1, "", "cleanup failed")
+
+        with patch.object(owners, "collect_sources", return_value=sources), patch.object(subprocess, "run", side_effect=handler):
+            first = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state, apply=True)
+            failed = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state, apply=True)
+        self.assertTrue(first.first_run)
+        self.assertEqual(failed.failed, (worker.thread_id,))
+        self.assertEqual(failed.ended, ())
+        self.assertEqual(len(self.pending_records(state)), 1)
+        empty = owners.OwnershipSources([], [], [], ["unrelated source cannot be read"])
+        with patch.object(subprocess, "run", side_effect=handler):
+            finished = owners.end_workers(empty, owners.WorkerClass.OwnerUnknown, state, apply=True)
+        self.assertEqual(len(commands), 2)
+        self.assertIn("--cleanup-only", commands[1])
+        self.assertEqual(finished.failed, ())
+        self.assertIn(worker.name + ": end cleanup finished", finished.evidence)
+        self.assertEqual(self.pending_records(state), [])
+        self.assertIn("end cleanup finished", (state / "ends.jsonl").read_text())
+
+    def test_unreadable_pending_roster_keeps_cleanup_until_valid_ended_route_returns(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        state = self.seed_pending_cleanup(worker)
+        pending = self.pending_records(state)
+        route = Path(worker.run) / "mesh_roster.json"
+        self.write_text(str(route), "{invalid JSON")
+        sources = owners.OwnershipSources([], [], [], [])
+
+        with patch.object(subprocess, "run") as handler:
+            kept = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state, apply=True)
+        handler.assert_not_called()
+        self.assertEqual(kept.failed, (worker.thread_id,))
+        self.assertEqual(kept.ended, ())
+        self.assertEqual(self.pending_records(state), pending)
+        note = next(note for note in kept.evidence if "roster unreadable:" in note)
+        self.assertTrue(note.startswith(worker.name + ": end cleanup kept: roster unreadable: "))
+        self.assertIn(str(route), note)
+        self.assertIn(note.removeprefix(worker.name + ": "), (state / "ends.jsonl").read_text())
+
+        self.write_json(str(route), {worker.name: {"thread_id": worker.thread_id, "status": "ended"}})
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as handler:
+            finished = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state, apply=True)
+        self.assertEqual(handler.call_count, 1)
+        command = cast(list[str], handler.call_args.args[0])
+        self.assertIn("--cleanup-only", command)
+        self.assertEqual(command[command.index("--expected-thread-id") + 1], worker.thread_id)
+        self.assertEqual(finished.failed, ())
+        self.assertIn(worker.name + ": end cleanup finished", finished.evidence)
+        self.assertEqual(self.pending_records(state), [])
+
+    def test_failed_first_end_keeps_cleanup_when_roster_becomes_unreadable(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        self.mesh_route(worker)
+        state = self.root / "state"
+        sources = owners.OwnershipSources([worker], [], [], [])
+        route = Path(worker.run) / "mesh_roster.json"
+
+        def failed_end(selected: owners.Worker) -> int:
+            self.assertEqual(selected.thread_id, worker.thread_id)
+            self.assertEqual(len(self.pending_records(state)), 1)
+            self.write_text(str(route), "{incomplete roster")
+            return 1
+
+        first = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state, apply=True)
+        self.assertTrue(first.first_run)
+        with patch.object(owners, "collect_sources", return_value=sources), patch.object(subprocess, "run") as handler:
+            failed = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state,
+                                       apply=True, end_worker=failed_end)
+        handler.assert_not_called()
+        self.assertEqual(failed.failed, (worker.thread_id,))
+        self.assertEqual(failed.ended, ())
+        pending = self.pending_records(state)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["thread_id"], worker.thread_id)
+        note = next(note for note in failed.evidence if "roster unreadable:" in note)
+        self.assertTrue(note.startswith(worker.name + ": end cleanup kept: roster unreadable: "))
+        self.assertIn(str(route), note)
+        self.assertIn(note.removeprefix(worker.name + ": "), (state / "ends.jsonl").read_text())
+
+    def test_finished_cleanup_is_logged_before_pending_journal_rewrite(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        state = self.seed_pending_cleanup(worker)
+        pending = self.pending_records(state)
+        sources = owners.OwnershipSources([], [], [], [])
+
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as handler, \
+                patch.object(owners, "write_pending_ends", side_effect=OSError("journal rewrite interrupted")):
+            with self.assertRaisesRegex(OSError, "journal rewrite interrupted"):
+                _ = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state, apply=True)
+        self.assertEqual(handler.call_count, 1)
+        self.assertEqual(self.pending_records(state), pending)
+        outcomes = [owners.object_fields(cast(object, json.loads(line)))
+                    for line in (state / "ends.jsonl").read_text().splitlines()]
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0]["outcome"], "end cleanup finished")
+        self.assertEqual(owners.object_fields(outcomes[0]["worker"])["thread_id"], worker.thread_id)
+
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as handler:
+            finished = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state, apply=True)
+        self.assertEqual(handler.call_count, 1)
+        self.assertEqual(finished.failed, ())
+        self.assertEqual(self.pending_records(state), [])
+        self.assertEqual((state / "ends.jsonl").read_text().count('"outcome": "end cleanup finished"'), 2)
+
+    def test_interrupted_end_leaves_cleanup_record_that_next_run_finishes(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        self.mesh_route(worker)
+        sources = owners.OwnershipSources([worker], [], [], [])
+        state = self.root / "state"
+
+        def interrupted(selected: owners.Worker) -> int:
+            self.assertEqual(len(self.pending_records(state)), 1)
+            self.write_json(str(Path(selected.run) / "mesh_roster.json"), {
+                selected.name: {"thread_id": selected.thread_id, "status": "ended"},
+            })
+            raise KeyboardInterrupt
+
+        first = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state, apply=True, end_worker=interrupted)
+        self.assertTrue(first.first_run)
+        with self.assertRaises(KeyboardInterrupt):
+            _ = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state, apply=True, end_worker=interrupted)
+        self.assertEqual(len(self.pending_records(state)), 1)
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as handler:
+            result = owners.end_workers(owners.OwnershipSources([], [], [], []), owners.WorkerClass.DirectorGone,
+                                        state, apply=True)
+        self.assertEqual(handler.call_count, 1)
+        self.assertIn(worker.name + ": end cleanup finished", result.evidence)
+        self.assertEqual(self.pending_records(state), [])
+
+    def test_pending_cleanup_drops_reopened_replaced_or_missing_routes_without_handler(self) -> None:
+        for change in ("reopened", "replaced", "missing-entry", "missing-run"):
+            with self.subTest(change=change):
+                worker = self.worker(name=change, run="unit/" + change, classification="DirectorGone")
+                state = self.seed_pending_cleanup(worker)
+                route = Path(worker.run) / "mesh_roster.json"
+                if change == "missing-run":
+                    route.unlink()
+                    route.parent.rmdir()
+                else:
+                    entry = {"thread_id": worker.thread_id, "status": "ended"}
+                    if change == "reopened":
+                        entry["status"] = "running"
+                    elif change == "replaced":
+                        entry["thread_id"] = "new-thread"
+                    self.write_json(str(route), {} if change == "missing-entry" else {worker.name: entry})
+                before = route.read_bytes() if route.exists() else b""
+                with patch.object(subprocess, "run") as handler:
+                    result = owners.end_workers(owners.OwnershipSources([], [], [], []), owners.WorkerClass.DirectorGone,
+                                                state, apply=True)
+                handler.assert_not_called()
+                self.assertEqual(result.failed, ())
+                self.assertTrue(any(note.startswith(worker.name + ": end cleanup dropped: ") for note in result.evidence))
+                self.assertEqual(self.pending_records(state), [])
+                self.assertEqual(route.read_bytes() if route.exists() else b"", before)
+                self.assertIn("end cleanup dropped:", (state / "ends.jsonl").read_text())
+
+    def test_unsupported_cleanup_handler_keeps_record_and_cli_returns_failure(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        state = self.seed_pending_cleanup(worker)
+        output = io.StringIO()
+        with patch.object(owners, "collect_sources", return_value=owners.OwnershipSources([], [], [], [])), \
+                patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 2, "", "unknown flag")) as handler, \
+                redirect_stdout(output):
+            result = owners.main(["end", "--class", "DirectorGone", "--apply"])
+        self.assertEqual(result, 1)
+        command = cast(list[str], handler.call_args.args[0])
+        self.assertIn("--cleanup-only", command)
+        self.assertEqual(command[command.index("--expected-thread-id") + 1], worker.thread_id)
+        self.assertEqual(handler.call_count, 1)
+        self.assertEqual(len(self.pending_records(state)), 1)
+        self.assertIn(worker.name + ": end cleanup failed: exit 2", output.getvalue())
+        self.assertIn("end cleanup failed: exit 2", (state / "ends.jsonl").read_text())
+
+    def test_pending_cleanup_dry_run_previews_without_writing(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        state = self.seed_pending_cleanup(worker)
+        before = {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        output = io.StringIO()
+        with patch.object(owners, "collect_sources", return_value=owners.OwnershipSources([], [], [], [])), \
+                patch.object(subprocess, "run") as handler, redirect_stdout(output):
+            result = owners.main(["end", "--class", "DirectorGone", "--dry-run"])
+        self.assertEqual(result, 0)
+        handler.assert_not_called()
+        self.assertIn(worker.name + ": would finish end cleanup", output.getvalue())
+        self.assertEqual({str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+        self.assertEqual(len(self.pending_records(state)), 1)
+
+    def test_unsuccessful_end_keeps_cleanup_only_after_same_thread_was_ended(self) -> None:
+        for failure in ("exit", "kept", "os-error", "timeout"):
+            for saved_end in (False, True):
+                with self.subTest(failure=failure, saved_end=saved_end):
+                    worker = self.worker(name=failure + str(saved_end), run="unit/" + failure + str(saved_end),
+                                         classification="DirectorGone")
+                    self.mesh_route(worker)
+                    state = self.root / (failure + str(saved_end))
+                    sources = owners.OwnershipSources([worker], [], [], [])
+
+                    def unsuccessful(selected: owners.Worker) -> int | owners.WorkerKept:
+                        self.assertEqual(len(self.pending_records(state)), 1)
+                        if saved_end:
+                            self.write_json(str(Path(selected.run) / "mesh_roster.json"), {
+                                selected.name: {"thread_id": selected.thread_id, "status": "ended"},
+                            })
+                        if failure == "kept":
+                            return owners.WorkerKept("handler refused after validation")
+                        if failure == "os-error":
+                            raise OSError("cleanup connection closed")
+                        if failure == "timeout":
+                            raise subprocess.TimeoutExpired(["fixture-end"], 45)
+                        return 1
+
+                    first = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state,
+                                                apply=True, end_worker=unsuccessful)
+                    self.assertTrue(first.first_run)
+                    result = owners.end_workers(sources, owners.WorkerClass.DirectorGone, state,
+                                                 apply=True, end_worker=unsuccessful)
+                    self.assertEqual(result.ended, ())
+                    self.assertEqual(len(self.pending_records(state)), int(saved_end))
+                    if saved_end:
+                        self.assertIn(worker.thread_id, result.failed)
+
+    def test_cleanup_success_with_replaced_thread_keeps_failure_until_next_route_check(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        state = self.seed_pending_cleanup(worker)
+
+        def replaced_during_cleanup(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[command.index("--expected-thread-id") + 1], worker.thread_id)
+            self.assertEqual(options.get("timeout"), 45)
+            self.write_json(str(Path(worker.run) / "mesh_roster.json"), {
+                worker.name: {"thread_id": "replacement", "status": "running"},
+            })
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with patch.object(subprocess, "run", side_effect=replaced_during_cleanup):
+            result = owners.end_workers(owners.OwnershipSources([], [], [], []), owners.WorkerClass.DirectorGone,
+                                        state, apply=True)
+        self.assertEqual(result.failed, (worker.thread_id,))
+        self.assertTrue(any("end cleanup failed:" in note for note in result.evidence))
+        self.assertEqual(len(self.pending_records(state)), 1)
+        with patch.object(subprocess, "run") as handler:
+            dropped = owners.end_workers(owners.OwnershipSources([], [], [], []), owners.WorkerClass.DirectorGone,
+                                         state, apply=True)
+        handler.assert_not_called()
+        self.assertTrue(any("end cleanup dropped:" in note for note in dropped.evidence))
+        self.assertEqual(self.pending_records(state), [])
+
+    def test_report_rejects_bad_pending_entry_without_losing_valid_cleanup(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        state = self.seed_pending_cleanup(worker)
+        valid = self.pending_records(state)
+        self.write_json(str(state / "end-cleanup.json"), {"pending": [
+            {**valid[0], "thread_id": 42}, valid[0],
+        ]})
+        before = {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        output = io.StringIO()
+        with patch.object(owners, "collect_sources", return_value=owners.OwnershipSources([], [], [], [])), \
+                patch.object(subprocess, "run") as handler, redirect_stdout(output):
+            self.assertEqual(owners.main(["report", "--json"]), 0)
+        handler.assert_not_called()
+        report = owners.object_fields(cast(object, json.loads(output.getvalue())))
+        self.assertEqual(report["end_cleanup_pending"], valid)
+        problems = owners.list_items(report["problems"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn(str(state / "end-cleanup.json"), str(problems[0]))
+        self.assertEqual({str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+
+    def test_report_reads_pending_cleanup_and_never_creates_or_changes_state(self) -> None:
+        worker = self.worker(classification="DirectorGone")
+        empty = owners.OwnershipSources([], [], [], [])
+        output = io.StringIO()
+        with patch.object(owners, "collect_sources", return_value=empty), redirect_stdout(output):
+            self.assertEqual(owners.main(["report"]), 0)
+        self.assertTrue(output.getvalue().splitlines()[-1].endswith("end_cleanup_pending=0"))
+        self.assertFalse((self.root / "state").exists())
+        state = self.seed_pending_cleanup(worker)
+        before = {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        with patch.object(owners, "collect_sources", return_value=empty), patch.object(subprocess, "run") as handler:
+            for arguments in (["report"], ["report", "--json"]):
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(owners.main(arguments), 0)
+                if "--json" in arguments:
+                    report = owners.object_fields(cast(object, json.loads(output.getvalue())))
+                    self.assertEqual(report["end_cleanup_pending"], self.pending_records(state))
+                else:
+                    self.assertTrue(output.getvalue().splitlines()[-1].endswith("end_cleanup_pending=1"))
+        handler.assert_not_called()
+        self.assertEqual({str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
 
     def test_raw_rosters_include_paused_and_finished_workers_but_skip_ended_routes(self) -> None:
         self.write_text("unit/run-one/director", "director-one\n")
@@ -279,7 +616,8 @@ class WorkerOwnersTest(unittest.TestCase):
         self.assertIn("request provenance not recorded", outputs["--full"])
         self.assertEqual(full_lines[-1], outputs[""].splitlines()[-1])
         report = cast(dict[str, object], json.loads(outputs["--json"]))
-        self.assertEqual(set(report), {"workers", "totals", "problems", "timers", "notes"})
+        self.assertEqual(set(report), {"workers", "totals", "problems", "timers", "notes", "end_cleanup_pending"})
+        self.assertEqual(report["end_cleanup_pending"], [])
         timers = cast(list[dict[str, object]], report["timers"])
         self.assertEqual({timer["name"]: timer["requested_by"] for timer in timers},
                          {"asked": "user", "approved": "user", "unasked": ""})
