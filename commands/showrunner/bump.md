@@ -28,21 +28,21 @@ it changes, and say so in one line.
    notice that waits.
    - When the production has a merge unit (hana: `merge-gate`), tell it in one
      line to merge this checkpoint next, before its queue.
-   - Otherwise run <MergeCheckpoint/> (`/showrunner:produce`) for it yourself
-     now.
+   - Otherwise run <MergeCheckpoint/> (`/showrunner:produce`) with `--bump`
+     for it yourself now.
 
    After the merge and push, start the demo build: the Mac run of
    <CIPoint/> on the pushed sha, or the build the production's rules name. If
    natedev's free memory is too short for it, first take `/build:hold
    bump: demo build of <unit>`, and release it when the build ends.
-4. **Full suite after.** Run the full suite on the pushed tip in the
-   background: the merge unit's full run, or `merge_gate.py --tests-only` on
-   an export of the tip for the `~/.claude` repo. A red test goes to the owning
-   unit as a follow-up checkpoint, and it stays the top priority until the
-   tip is green.
+4. **Full suite after.** `--bump` starts the checkpoint gate on the pushed
+   tip in the background, in a detached clone. Red goes to the owning unit
+   and the showrunner with the failed step, tip and log; green goes to the
+   showrunner. With a merge unit, use its full run. Keep the work top priority
+   until the tip is green; red fixes come as follow-up checkpoints.
 5. **Tell the user.** When the demo build is installed, tell the user what to
    run and where, in one line, and send a `note` (<Notify/>). Then log
-   `bump done: <unit>`, and the production goes back to its normal order.
+   `bump done: <unit>` once the tip is green, and return to the normal order.
 
 ## Rules
 

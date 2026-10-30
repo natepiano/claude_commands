@@ -604,7 +604,11 @@ notice to the unit director before any merge command runs:
    `--as-built`; with either, omit `--review-trial`, `--parallel` and `--delivers`. Add
    `--cancel-prior` only with `Push: validate_and_push` when this push supersedes
    an older queued or running CI run on the merge branch and no CI point is
-   watching its result or diagnosing a red run. The script checks ancestry,
+   watching its result or diagnosing a red run. Add `--bump` only for a user's
+   bump: merge and push the code checkpoint first, then gate the pushed tip
+   in a detached clone in the background; red goes to the unit and the
+   showrunner, green to the showrunner. It refuses `--shrink`, `--as-built`
+   and `--from-child`. The script checks ancestry,
    origin, scope and conflicts, reports overlaps with other units, merges,
    tests, reruns red packages, pushes, promotes, and records the result. Its
    first `held` or `failed` line stops the run. Send its final `send <unit>:`

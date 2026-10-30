@@ -81,7 +81,7 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
 
 **Ruled out:** A support module that passes the guard name on: each file imports it directly. `LifecycleTestClock` as the shared clock: it lives only in `scripts/agents/test_codex_mesh.py` and retires with the mesh.
 
-### Phase 2b — A user's bump merges first and gates the pushed tip  · status: todo
+### Phase 2b — A user's bump merges first and gates the pushed tip  · status: done
 **Depends on:** none
 
 #### Work Order

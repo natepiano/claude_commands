@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import json
 import os
 import re
 import shlex
@@ -20,10 +21,10 @@ import sys
 import tempfile
 import tomllib
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
-from typing import NamedTuple, cast
+from typing import Literal, NamedTuple, TypedDict, cast
 
 import change_review
 import scratch  # on the path once change_review has put scripts/lib there
@@ -35,6 +36,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import progress_history  # noqa: E402
 from scripts.production import production_doc  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
+from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
+import sessions  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
@@ -183,6 +186,7 @@ class MergeRequest(NamedTuple):
     holds: int
     merge_defects: int
     excluded: str
+    bump: bool = False
 
 
 class Stop(Exception):
@@ -301,7 +305,16 @@ def parse_merge_tests(lines: list[str], checkout: Path) -> tuple[tuple[str, ...]
     return tuple(commands)
 
 
+def user_bump(args: argparse.Namespace) -> bool:
+    bump = cast(bool, getattr(args, "bump", False))
+    if bump and any((cast(bool, args.shrink), cast(bool, args.as_built),
+                     cast(str | None, getattr(args, "from_child", None)))):
+        raise Refusal("--bump applies only to a code checkpoint requested by the user")
+    return bump
+
+
 def request_from(args: argparse.Namespace) -> MergeRequest:
+    bump = user_bump(args)
     production = read_production(Path(cast(str, args.production)))
     lines = production.doc.read_text(encoding="utf-8").splitlines()
     units = parse_units(lines)
@@ -349,7 +362,7 @@ def request_from(args: argparse.Namespace) -> MergeRequest:
                         tuple(cast(list[str], args.trailer)), review_trial, delivers or "",
                         cast(bool, args.cancel_prior), cast(str, args.started),
                         cast(str, args.regime), cast(int, args.holds), cast(int, args.merge_defects),
-                        cast(str | None, args.excluded) or "")
+                        cast(str | None, args.excluded) or "", bump)
 
 
 def merge_branch_history(checkout: Path, merge_branch: str) -> MergeBranchHistory:
@@ -773,11 +786,25 @@ def stop_cancelled_test(name: str, result: subprocess.CompletedProcess[str], log
 def checkpoint_tests(production: Production, paths: tuple[str, ...], checkpoint: str,
                      merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str], scratch: Path,
                      merge_head: str, flaky_tests: frozenset[str]) -> str:
-    steps = test_steps(production, paths, merge_tests)
     scratch.mkdir(parents=True, exist_ok=True)
     log = scratch / f"merge_{checkpoint[:7]}_test.log"
+    _ = log.write_text("", encoding="utf-8")
+    try:
+        return run_checkpoint_test_steps(production, paths, merge_tests, flakes, flaky_tests, log)
+    except Stop as error:
+        if error.step == "red" and error.state == "failed":
+            undo_unpushed_merge(production, merge_head)
+        raise
+
+
+def run_checkpoint_test_steps(production: Production, paths: tuple[str, ...],
+                              merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str],
+                              flaky_tests: frozenset[str], log: Path) -> str:
+    """Run checkpoint commands and their retries; the caller owns merge rollback."""
+    steps = test_steps(production, paths, merge_tests)
+    log.parent.mkdir(parents=True, exist_ok=True)
     failed: list[tuple[str, list[str], frozenset[str]]] = []
-    with log.open("w", encoding="utf-8") as output:
+    with log.open("a", encoding="utf-8") as output:
         for name, command in steps:
             result = run_test_command(command, production.checkout)
             _ = output.write(result.stdout + result.stderr)
@@ -803,10 +830,10 @@ def checkpoint_tests(production: Production, paths: tuple[str, ...], checkpoint:
             with production.log.open("a", encoding="utf-8") as ledger:
                 _ = ledger.write(f"- {datetime.now(production.zone):%H:%M %Z}: {note}\n")
         else:
-            unresolved.append(name)
+            names = tests | failed_tests(result.stdout + result.stderr)
+            unresolved.append(name + (f" ({', '.join(sorted(names))})" if names else ""))
     report("test", "ok", f"{len(steps)} commands ran; {len(failed)} red; log {log}")
     if unresolved:
-        undo_unpushed_merge(production, merge_head)
         raise Stop("red", "failed", f"{', '.join(unresolved)} failed; log {log}",
                    f"repair {', '.join(unresolved)} and send a new checkpoint; test log: {log}")
     report("red", "ok", "all commands green or known flakes green alone")
@@ -1030,7 +1057,8 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
     with request.production.log.open("a", encoding="utf-8") as log:
         suffix = "; promoted" if isinstance(request.promotion, production_doc.PromoteTo) else ""
         _ = log.write(f"- {datetime.now(request.production.zone):%H:%M %Z}: {request.unit.name} phase {request.phase} "
-                      + f"({request.commit}) merged as {merge_head}; {tests_green} green; pushed{suffix}\n")
+                      + f"({request.commit}) merged as {merge_head}; "
+                      + ("gate after push" if request.bump else f"{tests_green} green") + f"; pushed{suffix}\n")
     report("record", "ok", detail)
 
 
@@ -1131,6 +1159,183 @@ def record_pushed_merges(production: Production, merge_head: str, source_checkpo
         )
 
 
+class BumpGateRecord(TypedDict):
+    """The gate plan and its process or completed result, owned by one merge."""
+
+    tip: str
+    checkpoint: str
+    production_doc: str
+    slug: str
+    merge_branch: str
+    checkout: str
+    production_log: str
+    zone: str
+    unit: str
+    delivered_to: list[Literal["unit", "showrunner"]]
+    paths: list[str]
+    merge_tests: list[list[str]]
+    flakes: list[str]
+    flaky_tests: list[str]
+    started: str
+    pid: int
+    proc_start: str
+    result: Literal["pending", "green", "red"]
+    detail: str
+    log: str
+
+
+@contextmanager
+def record_lock(path: Path) -> Generator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name(path.name + ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def read_record(path: Path) -> BumpGateRecord:
+    raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    if not isinstance(raw, dict):
+        raise ValueError(f"invalid bump gate record: {path}")
+    return cast(BumpGateRecord, cast(object, raw))
+
+
+def save_record(path: Path, record: BumpGateRecord) -> None:
+    write_text_atomic(path, json.dumps(record, indent=2) + "\n")
+
+
+def same_gate_runner(first: BumpGateRecord, second: BumpGateRecord) -> bool:
+    return (first["tip"], first["pid"], first["proc_start"]) == (second["tip"], second["pid"], second["proc_start"])
+
+
+def send_result(path: Path, record: BumpGateRecord) -> None:
+    """Deliver only unsent notices, resolve current recipients, and save each success."""
+    with record_lock(path):
+        current = read_record(path)
+        if not same_gate_runner(current, record) or current["result"] == "pending":
+            print("bump gate delivery superseded; no notice sent", flush=True)
+            return
+        red = current["result"] == "red"
+        text = (f"Bump gate {'red' if red else 'green'}: {current['unit']}; tip {current['tip']}; "
+                + f"{current['detail']}; log {current['log']}")
+        script = tool("send.py", Path(__file__).resolve().parents[1] / "message/send.py", "MERGE_CHECKPOINT_SEND")
+        recipients: tuple[Literal["unit", "showrunner"], ...] = ("unit", "showrunner") if red else ("showrunner",)
+        delivered = current.get("delivered_to", [])
+        current["delivered_to"] = delivered
+        for recipient in recipients:
+            if recipient in delivered:
+                continue
+            for attempt in (1, 2):
+                try:
+                    unit_address, showrunner_address = bump_gate_addresses(current["slug"], current["unit"])
+                    address = unit_address if recipient == "unit" else showrunner_address
+                    if not address:
+                        raise ValueError(f"no current {recipient} address for {current['slug']}/{current['unit']}")
+                    result = subprocess.run(
+                        [sys.executable, script, "--to", address, "--from", current["slug"], "--text", text],
+                        capture_output=True, text=True, check=False,
+                    )
+                    if result.returncode:
+                        raise ValueError(result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
+                    delivered.append(recipient)
+                    save_record(path, current)
+                    break
+                except (OSError, ValueError) as error:
+                    print(f"bump gate send {recipient} attempt {attempt} failed: {error}", flush=True)
+
+
+def complete_gate(path: Path, record: BumpGateRecord, result: Literal["green", "red"], detail: str) -> None:
+    with record_lock(path):
+        current = read_record(path)
+        if not same_gate_runner(current, record):
+            print("bump gate completion superseded; no result saved or notice sent", flush=True)
+            return
+        current["result"] = result
+        current["detail"] = " ".join(detail.splitlines())
+        save_record(path, current)
+    send_result(path, current)
+
+
+def start_gate(request: MergeRequest, paths: tuple[str, ...], merge_head: str, tip: str) -> None:
+    """Start at most one gate for this pushed tip, then let promotion continue."""
+    path = checkpoint_step_record(request.production.checkout, merge_head, "bump-gate")
+    resume_delivery = False
+    launch_failure = ""
+    log = path.with_name("bump-gate.log")
+    record: BumpGateRecord = {
+        "tip": tip, "checkpoint": request.commit,
+        "production_doc": str(request.production.doc), "slug": request.production.slug,
+        "merge_branch": request.production.merge_branch, "checkout": str(request.production.checkout),
+        "production_log": str(request.production.log.relative_to(request.production.checkout)),
+        "zone": str(request.production.zone), "unit": request.unit.name,
+        "delivered_to": [],
+        "paths": list(paths), "merge_tests": [list(command) for command in request.merge_tests],
+        "flakes": sorted(request.flakes), "flaky_tests": sorted(request.flaky_tests),
+        "started": datetime.now(request.production.zone).isoformat(), "pid": 0, "proc_start": "",
+        "result": "pending", "detail": "", "log": str(log),
+    }
+    with record_lock(path):
+        if path.exists():
+            previous = read_record(path)
+            if previous["tip"] == tip:
+                if previous["result"] != "pending":
+                    record = previous
+                    resume_delivery = True
+                else:
+                    live = sessions.process_liveness(previous["pid"], previous["proc_start"])
+                    if isinstance(live, sessions.LiveSessionProcess):
+                        report("bump gate", "ok", f"tip {tip} gate still runs as pid {previous['pid']}")
+                        return
+                    if isinstance(live, sessions.SessionLivenessUnknown):
+                        report("bump gate", "held", live.reason)
+                        return
+        if not resume_delivery:
+            save_record(path, record)
+            with log.open("a", encoding="utf-8") as output:
+                try:
+                    process = subprocess.Popen(
+                        [sys.executable, str(Path(__file__).with_name("bump_gate.py").resolve()), "--record", str(path)],
+                        cwd=request.production.checkout, stdin=subprocess.DEVNULL,
+                        stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
+                    )
+                    record["pid"] = process.pid
+                    record["proc_start"] = sessions.process_start(process.pid) or ""
+                    save_record(path, record)
+                except OSError as error:
+                    launch_failure = f"start failed: {error}"
+    # Completion and delivery take the same lock, after the launch lock is released.
+    if resume_delivery or launch_failure:
+        with Path(record["log"]).open("a", encoding="utf-8") as output, redirect_stdout(output):
+            if launch_failure:
+                print(launch_failure, flush=True)
+                complete_gate(path, record, "red", launch_failure)
+            else:
+                send_result(path, record)
+        report("bump gate", "failed" if launch_failure else "ok",
+               f"{launch_failure or 'tip ' + tip + ' already ' + record['result']}; log {record['log']}")
+        return
+    report("bump gate", "ok", f"started pid {record['pid']} on pushed tip {tip}; log {record['log']}")
+
+
+def bump_gate_addresses(slug: str, unit: str) -> tuple[str, str]:
+    """Resolve recipients through the production's current unit and showrunner lookup."""
+    import showrunners
+    import unit_lookup
+
+    unit_address = ""
+    showrunner_address = ""
+    try:
+        found = unit_lookup.marked_unit(slug, unit)
+        if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
+            unit_address = f"session:{found.claude.session_id}"
+    except OSError as error:
+        report("bump gate notice", "failed", str(error))
+    try:
+        showrunner_address = showrunners.current_address(slug)
+    except (OSError, ValueError) as error:
+        report("bump gate notice", "failed", str(error))
+    return unit_address, showrunner_address
+
+
 def run(request: MergeRequest) -> int:
     try:
         checkpoint = git(request.unit.worktree, "rev-parse", "--verify", f"{request.commit}^{{commit}}")
@@ -1139,7 +1344,8 @@ def run(request: MergeRequest) -> int:
                        "push the checkpoint and send its hash again")
         request = request._replace(commit=checkpoint.stdout.strip())
         already = ancestry(request)
-        tests_green = "merge tests" if isinstance(request.kind, CodeCheckpoint) else "no tests"
+        tests_green = ("gate after push" if request.bump else
+                       "merge tests" if isinstance(request.kind, CodeCheckpoint) else "no tests")
         pushed = pushed_state(request.production, request.commit) if already else NotYetPushed()
         commits = [] if already else change_review_commits(request)
         if not already:
@@ -1155,12 +1361,14 @@ def run(request: MergeRequest) -> int:
             commits = change_review.merge_commits(request.production.checkout, merge_head)
             # A run killed between its merge and its push left a merge nothing has tested.
             steps = ("scope", "conflicts", "other units", "merge")
-            if isinstance(pushed, PushedTip):
+            if isinstance(pushed, PushedTip) and not request.bump:
                 steps += ("test", "red")
             for step in steps:
                 report(step, "ok", "checkpoint already merged; resuming promotion")
             paths = changed_paths(request, f"{merge_head}^1")
-        if isinstance(pushed, NotYetPushed):
+        if request.bump:
+            report("test", "ok", "user bump: the gate runs on the pushed tip in the background")
+        elif isinstance(pushed, NotYetPushed):
             try:
                 if isinstance(request.kind, CodeCheckpoint):
                     with merge_gate_wait(request.unit.worktree, request.phase, request.unit.name, request.commit):
@@ -1187,6 +1395,8 @@ def run(request: MergeRequest) -> int:
         record_changes(request, commits, merge_head)
         into(request.production.checkout, request.production.merge_branch,
              "the merge branch collects every unit's checkpoints", gate_names(request, first_code_merge))
+        if request.bump:
+            start_gate(request, paths, merge_head, tip)
         promote(request, tip)
         record(request, merge_head, tests_green)
         end_phase_scratch(request)
@@ -1460,6 +1670,8 @@ def main() -> int:
     _ = parser.add_argument("--parallel")
     _ = parser.add_argument("--delivers")
     _ = parser.add_argument("--cancel-prior", action="store_true")
+    _ = parser.add_argument("--bump", action="store_true",
+                            help="only a user's bump: push a code checkpoint before its background gate")
     _ = parser.add_argument("--started", required=True)
     _ = parser.add_argument("--regime", choices=("after", "trial"), default="after")
     _ = parser.add_argument("--holds", type=int, default=0)
@@ -1469,10 +1681,11 @@ def main() -> int:
     args = parser.parse_args()
     if cast(str | None, args.from_child):
         try:
+            _ = user_bump(args)
             if not cast(str | None, args.checkpoint):
                 raise Refusal("--from-child requires --checkpoint")
             if any((cast(str | None, args.unit), cast(str | None, args.phase), cast(str | None, args.hash),
-                    cast(bool, args.shrink), cast(bool, args.as_built), cast(str | None, args.review_trial),
+                    cast(bool, args.shrink), cast(bool, args.as_built), cast(bool, args.bump), cast(str | None, args.review_trial),
                     cast(str | None, args.parallel), cast(str | None, args.delivers), cast(bool, args.cancel_prior),
                     cast(list[str], args.also), cast(list[str], args.trailer),
                     cast(str, args.regime) != "after", cast(int, args.holds), cast(int, args.merge_defects),
