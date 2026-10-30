@@ -22,6 +22,12 @@ from urllib.parse import quote
 PORT = 8765
 
 
+def private_name(name: str) -> bool:
+    """Identify publisher metadata and unfinished writes in any letter case."""
+    folded = name.casefold()
+    return folded in (".index.json", ".index.lock") or folded.startswith(".review-link-")
+
+
 def review_root() -> Path:
     return Path(os.environ.get("REVIEW_LINKS_ROOT") or Path.home() / ".local/share/review-links").expanduser()
 
@@ -120,7 +126,7 @@ def snapshot(files: list[Path], name: str = "review", *, new: bool = False) -> l
             outputs[destination] = render_markdown(outputs[file.name].decode("utf-8"), file.name).encode("utf-8")
         for output, content in outputs.items():
             folded = output.casefold()
-            if folded in (".index.json", ".index.lock") or folded.startswith(".review-link-"):
+            if private_name(output):
                 raise ValueError(f"reserved snapshot filename: {output} ({file})")
             if folded in output_sources:
                 raise ValueError(f"snapshot filename collision: {output_sources[folded]} and {file} ({output})")
