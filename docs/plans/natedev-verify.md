@@ -363,36 +363,57 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 ### Phase 9 — Remove Phase 7's new Python starts  · status: done
 
-**Depends on:** Phase 1 and Phase 7 (same file: `verify.sh`); both are in this phase's baseline.
+#### As-built
 
-**Origin:** Phase 7's architect review; builds showrunner approved it first in the next items (2026-10-30).
+- `verify.sh` `hash_stream` reads stdin and prints its sha256 with `sha256sum`, or `shasum -a 256` when `sha256sum` is absent; it returns 1 when the hash program fails. `lint_code_key` and `token_waiters_key` both use it.
+- `lint_code_key` hashes `verify.sh`, `lint/invoke.sh` and the lint config (`LINT_CONFIG_FILE`, else `config/lint.conf`), each framed as `present\0<bytes>\0` or `absent\0\0`, under `set -o pipefail` in its own substitution. An unreadable input gives an empty key and exit 0, so the lint-result cache misses and never matches a wrong tree.
+- One `tree_watch.py --key` start gives both `VERDICT_KEY` and `VERDICT_TREE_KEY`, byte-equal to the two separate calls; `cache_record` keeps its lazy `tree_key --tree-content` call for the mismatch case.
+- The token renewer's delay is a background Bash `sleep "$TOKEN_RENEW_S"` that a stop ends at once.
+- Helper Python starts per `verify.sh lint` run: 47 → 41 (`tree_watch.py` 14 → 10, inline Python 2 → 0).
+
+**Files:**
+- `scripts/direct/verify.sh` — `hash_stream`, `lint_code_key`, the paired key function, the Bash renew delay
+- `scripts/direct/tree_watch.py` — `--key` mode also prints the tree-content key
+- `scripts/direct/test_verify_python_starts.py` — trace count, key-pair equality, code-key change on edit or removal, unreadable input
+
+**Binds later work:** `verify.sh` starts no new Python; any inline Python names itself with `VERIFY_PY_HELPER=<NAME>`.
+
+**Gotchas:** an empty lint code key means a cache miss, never a hit.
+
+### Phase 10 — A stopped verify run ends all of its processes  · status: todo
+
+**Depends on:** Phase 9 (same file: `verify.sh`); it is this phase's baseline.
+
+**Origin:** builds showrunner defect report, ruled a wrong result and current (2026-10-30): `kill -TERM` on the process group of a lint run marked its record finished with exit 141, but two `verify.sh` processes lived on and held a memory-queue place for 58 minutes.
 
 #### Work Order
 
-**Goal:** Phase 7's token renewal and lint-result checks start no Python that Phase 1 removed the need for: each verify run gets its code key without Python, its two tree keys from one helper start, and its renewal delay from a Bash `sleep`.
+**Goal:** A TERM, INT or HUP sent to a verify run's process group ends every process the run started, frees its memory-queue place at once, and records the signal's exit status (143 for TERM), never 141.
 
 **Spec:**
 
-1. `lint_code_key` hashes its three files with `sha256sum`, or `shasum -a 256` when `sha256sum` is absent, and starts no Python. An absent file still hashes as absent, separated from the next file, so a file that appears or goes away changes the key. `token_waiters_key` and this function share one small hash function; no second copy of the `sha256sum`/`shasum` choice.
-2. One `tree_watch.py` start gives both tree keys. The `--key` mode of `tree_watch.py` also gives the tree-content key (no script files, no assertion-guard scope). One `verify.sh` function sets `VERDICT_KEY` and `VERDICT_TREE_KEY` from that one start; the paired sites (`start_tree_watch` with its `--watch-start`, and the four sites that set both keys after a step) all call it. Each value stays byte-equal to the value from the two separate calls on the same tree. The mismatch check in `cache_record` keeps its lazy `tree_key --tree-content` call, since it runs only when the keys differ.
-3. The token renewer's delay uses `sleep "$TOKEN_RENEW_S"`, in the same background and trap form, so a stop still ends the delay at once. A fractional value still works on Linux and the Mac.
-4. Any inline Python start in `verify.sh` that remains names itself with `VERIFY_PY_HELPER=<NAME>`, so a `VERIFY_PY_TRACE` run has no unnamed row.
+1. Reproduce first, before any edit. Start a real `verify.sh lint` run (fake cargo and rustc from the shared fixtures) in its own process group, the way `mesh_runs.py` starts it, with a memory checker that always waits, so the step sits in the memory queue. Send `kill -TERM -<pgid>`. Record which processes outlive the signal, their process groups, and the run's exit status. Put the measured cause in the worker summary.
+2. Lead to confirm or refute, not a given: the output tees from `exec > >(tee -a "${RUN_LOG}") 2> >(tee …)` (verify.sh, run-log setup) share the run's group, so the group signal ends them; `verify.sh`'s next write to its stdout then takes SIGPIPE and the shell dies with 141 before `verify_interrupted` sends the signal to the step group. The step subshell runs in its own group (`set -m` before it starts), which the run's group signal does not reach, and it waits silently in the memory queue.
+3. Fix it at the cause in `verify.sh`, so the run's own interrupt path always ends the step group and releases what it holds. No sweep that cleans up afterward, and no second cancel path beside `verify_interrupted`.
+4. If the memory-queue place can only be freed by `memory_admit`, that change is resources-unit's file: make it, and the director names it in the notice's also-touches line.
 
 **Files:**
 - `scripts/direct/verify.sh`
-- `scripts/direct/tree_watch.py`
-- `scripts/direct/test_verify_python_starts.py` — new
+- `scripts/direct/test_verify_hold_signals.py`
+- `scripts/direct/verify_hold_wait_test_support.py`
 
 **Workers:** 1 writer (one owner for all three files).
 
+**State:** none — the fix changes how a run ends, not what it stores.
+
 **Constraints from prior phases:**
-- Phase 1: `VERIFY_PY_TRACE=<file>` writes one line per helper start; `verify_metadata.py` reads metadata once per run.
-- Phase 2: `tree_watch.py --key --watch-start <file>` writes the watch key to the file. `tree_key` skips `--assertion-guard` and the script files for `--tree-content`.
-- Phase 7: `renew_token` reads 0 and 2 as renewed. A stop kills the delay process, then the renewer. `LINT_LOADED_CODE_KEY` is read only inside the same run, so its value needs no match with the old Python value.
+- Phase 7: a stop kills the token renewer's delay process, then the renewer; `renew_token` reads 0 and 2 as renewed.
+- Phase 8 (other branch, natedev-verify-holder): the wait-holder hook and `phase_wait_finish` change in `verify.sh`; it also edits `verify_hold_wait_test_support.py`; add new fixture parts beside the old ones and keep this change apart from those functions, so the two merge cleanly.
+- Phase 9: no new Python start in `verify.sh`; any inline Python names itself with `VERIFY_PY_HELPER=<NAME>`.
+- `test_verify_hold_signals.py` already sends signals to a real verify run through `VerifyHoldWaitFixture` (`verify_hold_wait_test_support.py`, which starts it with `start_new_session=True`); add the new tests there and extend that fixture for a memory checker that always waits, never a second harness.
 
 **Acceptance gate:**
-- A real `verify.sh lint` run with `VERIFY_PY_TRACE` (fake cargo and rustc from the shared fixtures) has no row for the code key and no unnamed row, and has one `tree_watch.py` start where each key pair was two. Compare the row counts with the combined baseline and state both in the checkpoint.
-- The new `tree_watch.py` output equals the two separate calls on the same tree: for lint, and for test.
-- `lint_code_key` changes when each of its three files changes and when one goes away.
-- These tests pass unchanged: `test_running_step_renews_past_its_original_hold_and_stops_on_release` and the rest of `test_verify_token_renew`, `test_verify_final_pass_script`, `test_verify_metadata`, and the `tree_watch` tests.
-- basedpyright 0/0/0 on changed files and their callers; `bash -n` and shellcheck with no new findings; merge gate `--tests-only` green on a tree merged with origin/builds.
+- A new test in `test_verify_hold_signals.py` runs the real verify CLI in its own group, waits until the step is in the memory queue, sends TERM to the group, and requires: no process of the run or its step group alive within 5 s, the queue no longer lists the run, and exit status 143. It fails on the Phase 9 tree.
+- The same test for INT (130).
+- These pass unchanged: `test_verify_wait_holder`, `test_verify_token_renew`, `test_verify_final_pass_script`, `test_verify_python_starts`.
+- basedpyright 0/0/0 on the new test; `bash -n` and shellcheck with no new findings; merge gate `--tests-only` green on a tree merged with origin/builds.
