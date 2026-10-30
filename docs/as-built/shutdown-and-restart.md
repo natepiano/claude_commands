@@ -39,6 +39,8 @@ An account-wide request holds the account against new launches and scheduled wor
 
 `stop_resume.move_sessions` stops all selected sessions concurrently, then resumes them concurrently on the target account. Every stop finishes before any resume starts. A failed member does not prevent other members from returning. A single move uses the same batch path. An optional warning is limited to fifteen seconds. The move writes no shutdown record and does not stop workers.
 
+A session in the selection cannot coordinate its own move, because its stop would end the coordinator. When `CLAUDE_CODE_SESSION_ID` names a selected session, `move_sessions` hands the whole batch to a detached `stop_resume.py batch` process (`systemd-run --user` on Linux, a new session on the Mac) and returns `MoveHandedOff`, printed as `moving now`. Each member's result is one JSON line in `logs/move-<id>.log` under the shutdown state folder. A stop returns `Stopped` only when the process is gone; a process that outlives `SIGKILL` by 5 s returns `StopFailed` and gets no resume. A tab has no label during its session's first turn, so a move in that turn reports no tab.
+
 The shared `resume_message` says why the session stopped and resumed, names an account change, and gives instructions for its existing Codex threads. `resume_arguments` also serves pane restoration and record-driven restart. Record-driven snapshot, timer, manual and attach recovery remain until Phase 8.
 
 `accounts.py move <session> <claudeN>` uses `stop_resume.move`: stop the session, then resume it on the target account. Group moves select their members through the staff and account APIs and send the complete selection to `stop_resume.move_sessions`. A preview changes nothing.

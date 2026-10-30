@@ -305,6 +305,15 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(shutdown_record.all_session_records(), [])
 
+    def test_handed_off_self_move_is_success_and_prints_moving_now(self) -> None:
+        with patch.object(stop_resume, "move_sessions", return_value=[stop_resume.MoveHandedOff("move-id")]):
+            result, output, error = self.cli()
+        self.assertEqual(result, 0)
+        self.assertEqual(error, "")
+        self.assertIn("move-id: moving now\n", output)
+        self.assertNotIn("not moved", output)
+        self.assertEqual(shutdown_record.all_session_records(), [])
+
     def test_move_ignores_an_old_open_record_and_leaves_it_unchanged(self) -> None:
         saved = entry(self.owner)
         saved["login"], saved["label"] = "current@example.invalid", "claude1"
