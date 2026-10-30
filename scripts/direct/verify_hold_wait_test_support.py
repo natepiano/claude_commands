@@ -22,7 +22,9 @@ from unittest import mock
 
 from scripts.build_hold import build_hold
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.direct.verify_mac_offload_test_support import VerifyMacOffloadFixture, CallRecord, CARGO_STUB
+from scripts.direct.verify_mac_offload_test_support import (
+    VerifyMacOffloadFixture, CallRecord, CARGO_STUB, replace_library_launcher,
+)
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
 
 
@@ -163,13 +165,7 @@ class VerifyHoldTools(VerifyMacOffloadFixture):
         # Version discovery is the lib/py suite's boundary. Preserve every
         # requested script and its real process, without a probe before each.
         library = builder.home / ".claude/scripts/lib"
-        source = library.resolve()
-        library.unlink()
-        library.mkdir()
-        for entry in source.iterdir():
-            if entry.name != "py":
-                (library / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
-        builder.write_executable(library / "py", '#!/bin/sh\nexec "${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}" "$@"\n')
+        replace_library_launcher(library, '#!/bin/sh\nexec "${CLAUDE_PYTHON:-$TEST_REAL_PYTHON}" "$@"\n')
         cls.fixture_environment = {
             **builder.environment,
             "IN_NIX_SHELL": "pure",

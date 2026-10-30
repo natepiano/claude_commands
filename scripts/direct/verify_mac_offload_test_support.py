@@ -35,6 +35,19 @@ TEST_HANG_GUARD_SECS = 300
 HANG_GUARD_S = TEST_HANG_GUARD_SECS
 
 
+def replace_library_launcher(home_library: Path, shim: str) -> None:
+    """Keep the linked library's entries and replace only its launcher."""
+    source = home_library.resolve()
+    home_library.unlink()
+    home_library.mkdir()
+    for entry in source.iterdir():
+        if entry.name != "py":
+            (home_library / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+    launcher = home_library / "py"
+    _ = launcher.write_text(shim, encoding="utf-8")
+    launcher.chmod(0o755)
+
+
 def invoke_mac_claim(arguments: list[str], environment: dict[str, str], cwd: Path) -> subprocess.CompletedProcess[str]:
     """Run the real claim CLI; its copy signals still cross the process boundary."""
     with mock.patch.object(sys, "path", [str(VERIFY.parent.parent / "mac_test"), *sys.path]):
@@ -945,9 +958,9 @@ class VerifyMacOffloadFixture(unittest.TestCase):
         clock = self.runner_state / "routing-clock"
         _ = clock.write_text("100")
         library = self.home / ".claude" / "scripts" / "lib"
-        library.unlink()
-        library.mkdir()
-        self.write_executable(library / "py", ROUTING_CLOCK_SHIM)
+        replace_library_launcher(library, ROUTING_CLOCK_SHIM)
+        self.assertTrue((library / "process_start.py").exists(),
+                        "the routing clock must keep the real library modules available")
         self.environment["TEST_ROUTING_CLOCK"] = str(clock)
         return clock
 
