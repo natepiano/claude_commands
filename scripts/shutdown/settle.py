@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -38,6 +38,7 @@ import launch_permission
 import shutdown_record as store
 from shutdown_record import CheckoutMove, SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
+from scripts.production import staff_sources
 import showrunners
 import sessions
 import stop as stop_work
@@ -201,6 +202,11 @@ class MessageUnconfirmed(TypedDict):
 MessageDelivery = MessageSent | MessageQueued
 MessageSendOutcome = (MessageDelivery | MessageAcknowledged | MessageWindowSkipped
                       | MessageKept | MessageReplaced | MessageUnconfirmed)
+
+
+def message_was_delivered(outcome: Mapping[str, object]) -> bool:
+    """Accept only a delivered send or the recipient's acknowledgement."""
+    return outcome["kind"] in {"sent", "acknowledged"}
 
 
 @dataclass(frozen=True)
@@ -377,7 +383,7 @@ def send_message(
     key: str = "",
     repeat_minutes: int = 0,
 ) -> MessageSendOutcome:
-    """Send to a session; a repeat window requires the observed send outcome."""
+    """Send to a session and return the observed send outcome."""
     if recipient == "user":
         raise ValueError("user messages require alert_user")
     command = [
@@ -395,11 +401,7 @@ def send_message(
             command.extend(("--repeat-minutes", str(repeat_minutes)))
     if machine:
         command.extend(("--machine", machine))
-    outcome = _deliver_message(command, recipient, text)
-    # Calls without a repeat window retain their existing acceptance rule.
-    if not repeat_minutes and outcome["kind"] not in {"sent", "queued"}:
-        return MessageSent(kind="sent")
-    return outcome
+    return _deliver_message(command, recipient, text)
 
 
 def stopped_sessions_text(count: int) -> str:
@@ -411,7 +413,8 @@ def alert_user(push: RenderedPush, *, machine: str = "") -> bool:
     """Send a registry action through the shutdown alert path."""
     command = [*_send_command(), *user_send_argv(push, machine=machine)[2:]]
     try:
-        return _deliver_message(command, "user", "")["kind"] != "queued"
+        outcome = _deliver_message(command, "user", "")
+        return message_was_delivered(outcome) or outcome["kind"] in {"kept", "replaced"}
     except (OSError, RuntimeError) as error:
         print(f"shutdown: user alert failed: {error}", file=sys.stderr)
         return False
@@ -1044,7 +1047,7 @@ def _down_all(started: float) -> int:
     for report in reports:
         _ = store.release_finished_account_hold(report["login"])
     return 0 if not refused and len(stopped) == len(selected) - len(deferred) and all(
-        saved["progress"]["kind"] == "stopped" and not saved["stop_issues"] for saved in stopped
+        saved["progress"]["kind"] == "stopped" and not store.stop_incomplete(saved) for saved in stopped
     ) else 1
 
 
@@ -1244,15 +1247,16 @@ def _send_settle_message(saved: SessionShutdown) -> None:
     text = _settle_text(saved, session)
     delivery = send_message(f"session:{session['session_id']}", text.split("\n", 1)[0], text,
         key=f"shutdown-{saved['login']}-{session['session_id']}")
+    delivered = message_was_delivered(delivery)
     at = record_time()
     def save(current: SessionShutdown) -> None:
         if current["request_id"] != saved["request_id"] or current["progress"]["kind"] != "waiting":
             return
-        if current["settle_message"]["kind"] == "sent":
+        if delivered and current["settle_message"]["kind"] == "sent":
             current["reasked_at"] = at
             return
-        current["settle_message"] = ({"kind": "queued", "at": at, "reason": delivery["reason"]}
-                                    if delivery["kind"] == "queued" else {"kind": "sent", "at": at})
+        current["settle_message"] = ({"kind": "sent", "at": at} if delivered else
+                                    {"kind": "queued", "at": at, "reason": delivery.get("reason", "send not delivered")})
     _ = store.update_session(saved["login"], session["session_id"], save)
 
 
@@ -1503,10 +1507,10 @@ def _now(account: Account, here: bool, only: Iterable[str], *, started: float) -
                 print(f"{saved['session']['name']}: stopping now", flush=True)
         stopped = stop_work.bounded_stop(active, started=started, grace_seconds=0)
         refused = refused or len(stopped) != sum(not stop_work.keep_infrastructure(saved["session"]) for saved in active) or any(
-            saved["progress"]["kind"] != "stopped" or saved["stop_issues"] for saved in stopped
+            saved["progress"]["kind"] != "stopped" or store.stop_incomplete(saved) for saved in stopped
         )
         restart_pending = any(saved["then"] == "restart" and saved["progress"]["kind"] == "stopped"
-                              and not saved["stop_issues"] for saved in stopped)
+                              and not store.stop_incomplete(saved) for saved in stopped)
         _ = store.release_finished_account_hold(account.login)
         changed = True
     missing = unrecorded_local_sessions(account.login, ids, records)
@@ -1605,8 +1609,7 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
          origin: accounts.MoveOrigin = HAND_ORIGIN, move_id: str = "",
          checkout_move: CheckoutMove | None = None) -> int:
     """Start local work immediately and ask the peer to conduct its own owners."""
-    from scripts.accounts import accounts
-    origin_arguments = accounts.move_origin_arguments(origin)
+    del origin
     ids = tuple(only)
     # A move never waits on cold keys: the session keeps its commits on the same machine.
     if not target and not _warm():
@@ -1669,19 +1672,6 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
             for saved in added:
                 _ = store.withdraw_session(account.login, saved["session"]["session_id"], _restore_record)
         raise
-    if target:
-        from scripts.accounts import moves
-        for saved in added:
-            session = saved["session"]
-            request: moves.RequestedMove = {"kind": "requested", "at": saved["requested_at"],
-                "tool": "claude", "subject": session["session_id"] + ": " + session["name"],
-                "move_id": saved.get("move_id", saved["request_id"]), "request_id": saved["request_id"], "from": saved.get("source_label", account.label),
-                "to": target, "why": saved.get("why", why), "window": "unknown"}
-            fields = accounts.move_origin_fields(origin)
-            request["cause"], request["window"] = fields["cause"], fields["window"]
-            if "reset" in fields:
-                request["reset"] = fields["reset"]
-            moves.append_move(request)
     peer_ids = [session_id for session_id in ids if session_id not in local_ids]
     if not here and (not ids or peer_ids):
         arguments = ["down", account.login, "--here", "--request-id", identity]
@@ -1691,10 +1681,6 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
             arguments.extend(("--only", ",".join(peer_ids)))
         if then == "restart":
             arguments.append("--restart")
-        if target:
-            arguments.extend(("--to", target, "--why", why or f"{account.label} is out of usage", *origin_arguments))
-            if move_id:
-                arguments.extend(("--move-id", move_id))
         if alerts == "none":
             arguments.append("--no-alert")
         status, output = run_remote(arguments)
@@ -1880,7 +1866,7 @@ def _unit_showrunner(saved: SessionShutdown) -> str:
     if session["kind"] != "unit" or host["kind"] != "unit":
         return ""
     try:
-        return showrunners.current_name(showrunners.production_slug(host["doc"]))
+        return showrunners.current_name(staff_sources.unit_parent(host["unit"], session["session_id"]).slug)
     except (OSError, ValueError):
         return ""
 
@@ -1940,7 +1926,7 @@ def send_showrunner_line(saved: SessionShutdown, told: str, showrunner: str, sum
                                saved["session"]["session_id"], *line_identity], ensure_ascii=True)
         key = "shutdown-unit-" + hashlib.sha256(identity.encode()).hexdigest()
         outcome = send_message(showrunner, offered["summary"], offered["text"], key=key, repeat_minutes=5_256_000)
-        if outcome["kind"] in {"sent", "acknowledged"}:
+        if message_was_delivered(outcome):
             return _complete_showrunner_send(current, store.ShowrunnerLineDelivered(
                 kind="delivered", line=told, text=offered["text"]))
         if outcome["kind"] == "queued":
@@ -2102,7 +2088,7 @@ def _holdout_host(saved: SessionShutdown) -> str:
     if host["kind"] == "legacy tmux" or host["kind"] == "legacy tmux unit":
         return f"legacy host {host['session_name']}"
     if host["kind"] == "unit":
-        return f"unit {host['production']}/{host['unit']}"
+        return f"unit {host['unit']}"
     if host["kind"] == "ghostty" or host["kind"] == "zed":
         desktop = host["desktop"]
         window = "Ghostty window" if host["kind"] == "ghostty" else "Zed window"

@@ -123,14 +123,45 @@ class BoundedShutdownTests(ShutdownTestCase):
             _ = self.processes.pop(pid, None)
         return 0
 
-    def run_stop(self, records: list[shutdown_record.SessionShutdown], grace: float = 60, *,
+    def run_stop(self, records: list[shutdown_record.SessionShutdown], grace: float = 60, *, started: float = 0,
                  request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
         with redirect_stdout(self.output):
-            return stop.bounded_stop(records, started=0, grace_seconds=grace, request_exit=request_exit,
+            return stop.bounded_stop(records, started=started, grace_seconds=grace, request_exit=request_exit,
                 monotonic=lambda: self.elapsed, sleep=self.advance,
                 clock=lambda: NOW_UTC + timedelta(seconds=self.elapsed),
                 observe=self.observe, identity=self.probe,
                 kill=self.kill, codex_mesh=lambda arguments, _budget: self.pause_workers(arguments))
+
+    def test_late_bounded_attempt_gets_its_full_budget_after_the_original_request_deadline(self) -> None:
+        saved = self.save(top_level("owner", 101))
+        def ready(current: shutdown_record.SessionShutdown) -> None:
+            current["stop_deadline"] = (NOW_UTC - timedelta(seconds=60)).isoformat()
+            current["progress"] = {"kind": "ready", "at": NOW_UTC.isoformat()}
+        saved = shutdown_record.update_session(saved["login"], "owner", ready)
+        self.stubborn.add(101)
+        with patch.object(self, "observe", wraps=self.observe) as observations:
+            result = self.run_stop([saved], started=-120)
+        self.assertTrue(observations.called, "an old request deadline prevented the new attempt's first capture")
+        self.assertEqual(observations.call_args_list[0].args, (66,))
+        self.assertEqual(result[0]["progress"]["kind"], "stopped")
+        self.assertEqual(self.signals, [(0, 101, signal.SIGTERM), (5, 101, signal.SIGKILL)])
+        self.assertLess(self.elapsed, 6)
+
+    def test_gone_claude_completes_even_when_its_worker_pause_is_unconfirmed(self) -> None:
+        run = self.root / "unconfirmed-pause"
+        run.mkdir()
+        saved = self.save(top_level("owner", 101, run_dirs=[str(run)]))
+        _ = self.processes.pop(101)
+        with patch.object(self, "pause_workers", return_value=1):
+            result = self.run_stop([saved])
+        self.assertEqual(result[0]["progress"]["kind"], "stopped")
+        self.assertEqual([(issue["kind"], issue.get("cause")) for issue in result[0]["stop_issues"]],
+                         [("codex server left running", "stop not confirmed")])
+        self.assertEqual(shutdown_record.find_session(saved["login"], "owner"), result[0])
+        self.assertNotIn("worker pause not confirmed", self.output.getvalue())
+        self.assertIn("all 1 stopped", self.output.getvalue())
+        self.assertEqual(self.signals, [])
+        self.assertLess(self.elapsed, 1)
 
     def linux_table(self, groups: dict[int, str], unread: set[int]) -> inventory.ProcessObservation:
         proc = self.root / "linux-proc"
@@ -253,7 +284,8 @@ class BoundedShutdownTests(ShutdownTestCase):
                         (200, 6323, requester_scope, ("zsh",), ""),
                         (201, 200, requester_scope, ("claude",), ""),
                         (202, 201, requester_scope, ("zsh", "-c", "tool"), "requester"),
-                        (260, 202, requester_scope, ("python3", "shutdown.py"), marker)]
+                        (260, 202, requester_scope, ("python3", "shutdown.py"), marker),
+                        (250, 260, requester_scope, ("python3", "codex_mesh.py", "stop", "--pause", "--session-dir", run), "requester")]
                 for pid, parent, scope, arguments, session_id in rows:
                     self.processes[pid] = inventory.ShutdownProcess(pid, parent, f"start-{pid}",
                         arguments, session_id, cgroups=frozenset({scope}))
@@ -269,9 +301,6 @@ class BoundedShutdownTests(ShutdownTestCase):
                     return shown
                 def pause(arguments: list[str], _budget: float) -> int:
                     self.assertEqual(arguments, ["stop", "--pause", "--session-dir", run])
-                    self.processes[250] = inventory.ShutdownProcess(250, 260, "start-250",
-                        ("python3", "codex_mesh.py", *arguments), "requester",
-                        cgroups=frozenset({requester_scope}))
                     return 0
                 with (patch.object(os, "getpid", return_value=260), redirect_stdout(self.output)):
                     result = stop.bounded_stop([saved], started=0, machine_wide=machine_wide,
@@ -1414,7 +1443,7 @@ class BoundedShutdownTests(ShutdownTestCase):
         result = self.evidence_stop(saved, observation_cost=2, identity_cost=0.5, pause_cost=30)
         self.assertLessEqual(self.elapsed, 66)
         self.assertEqual(result[0]["progress"]["kind"], "stop failed")
-        self.assertIn("pause", str(result[0]["progress"]))
+        self.assertIn("deadline", str(result[0]["progress"]))
         self.assertNotIn("stopped  owner", self.output.getvalue())
 
     def test_continuous_owned_spawning_never_extends_the_deadline(self) -> None:
@@ -1558,16 +1587,17 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.assertEqual([sig for _, pid, sig in self.signals if pid == 301], [signal.SIGTERM])
         self.assertEqual(result[0]["progress"]["kind"], "stopped")
 
-    def test_failed_pause_never_writes_a_stopped_record(self) -> None:
+    def test_failed_pause_is_advisory_after_the_claude_exits(self) -> None:
         run = self.root / "pause-run"
         run.mkdir()
         saved = self.save(top_level("owner", 101, run_dirs=[str(run)]))
         self.natural_exits[101] = 3
         with patch.object(self, "pause_workers", return_value=1), patch.object(stop, "now_utc", return_value=NOW_UTC):
             result = self.run_stop([saved])
-        self.assertEqual(result[0]["progress"]["kind"], "stop failed")
-        self.assertIn("pause", str(result[0]["progress"]))
-        self.assertNotIn("stopped  owner", self.output.getvalue())
+        self.assertEqual(result[0]["progress"]["kind"], "stopped")
+        self.assertEqual([(issue["kind"], issue.get("cause")) for issue in result[0]["stop_issues"]],
+                         [("codex server left running", "stop not confirmed")])
+        self.assertIn("stopped  owner", self.output.getvalue())
 
     def test_force_note_reports_inaccessible_git_search_and_shutdown_continues(self) -> None:
         saved = self.save(top_level("owner", 101))
@@ -1670,8 +1700,7 @@ class BoundedShutdownTests(ShutdownTestCase):
                             request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             _ = machine_wide, keep, request_exit
             del started
-            with (patch.object(restart, "_prove_move", return_value=True),
-                  patch.object(restart, "_clear_live_outage"),
+            with (patch.object(restart, "_clear_live_outage"),
                   patch.object(restart, "_send_worker_resume"),
                   patch.object(restart, "_restore_timers", return_value=[]),
                   patch.object(restart, "_tell_source_fallback")):
@@ -2360,7 +2389,7 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.assertEqual(seen[0]["session"]["pid"], 202)
         self.assertNotIn("nothing to stop", self.output.getvalue())
 
-    def test_now_returns_failure_when_the_bounded_stop_or_worker_pause_fails(self) -> None:
+    def test_now_returns_failure_for_a_failed_stop_but_keeps_worker_pause_advisory(self) -> None:
         saved = self.save(top_level("owner", 101))
         for failed in (True, False):
             with self.subTest(stop_failed=failed):
@@ -2376,7 +2405,7 @@ class BoundedShutdownTests(ShutdownTestCase):
                     return records
                 with (patch.object(settle, "run_inventory", return_value=machine_inventory([saved["session"]])),
                       patch.object(stop, "bounded_stop", side_effect=stop_now), redirect_stdout(self.output)):
-                    self.assertEqual(settle.now(Account("claude", saved["login"], saved["label"]), True, ["owner"]), 1)
+                    self.assertEqual(settle.now(Account("claude", saved["login"], saved["label"]), True, ["owner"]), 1 if failed else 0)
 
     def test_down_all_revokes_launch_admitted_before_its_inventory_and_closes_only_its_new_pane(self) -> None:
         first = self.save(top_level("seed", 101))

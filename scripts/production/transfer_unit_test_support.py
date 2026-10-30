@@ -141,7 +141,8 @@ class UnitTransferFixture(StaffTestCase):
         for path in (self.giving, self.root / "home/.claude", self.root / "state/sessions"):
             path.mkdir(parents=True)
         self.write(self.root / "herdr-responses.json",
-                   json.dumps({"default": {"stdout": '{"sessions": []}', "code": 0}}))
+                   json.dumps({"default": {"stdout": '{"sessions": []}', "code": 0},
+                               "--session agents pane list": {"stdout": '{"result": {"panes": []}}', "code": 0}}))
         self.write(self.root / "fake_send.py",
                    "import json, os, sys\nfrom pathlib import Path\n"
                    + f"sys.path.insert(0, {str(SCRIPT.parents[2])!r})\n"
@@ -398,7 +399,7 @@ class UnitTransferFixture(StaffTestCase):
         replies = {
             "workspace list": {"workspaces": [{"workspace_id": "w1", "label": "demo"},
                                                 {"workspace_id": "w2", "label": "other"}]},
-            "pane list": {"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"}]},
+            "pane list": {"panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "alpha"}]},
             "pane move w1:p1 --new-tab --workspace w2": {
                 "move_result": {"created_tab": {"tab_id": "w2:t1"}, "pane": {"pane_id": "w1:p1"}}},
             "tab rename w2:t1 alpha": {},
@@ -408,7 +409,7 @@ class UnitTransferFixture(StaffTestCase):
         for command, result in replies.items():
             responses[f"--session agents {command}"] = {"stdout": json.dumps({"result": result}), "code": 0}
         after = {**responses, "--session agents pane list": {"stdout": json.dumps({"result": {
-            "panes": [{"pane_id": "w1:p1", "workspace_id": "w2", "tab_id": "w2:t1"}],
+            "panes": [{"pane_id": "w1:p1", "workspace_id": "w2", "tab_id": "w2:t1", "label": "alpha"}],
         }}), "code": 0}}
         move = cast(dict[str, object], responses["--session agents pane move w1:p1 --new-tab --workspace w2"])
         move["write_files"] = {str(path): json.dumps(after)}

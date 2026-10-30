@@ -11,8 +11,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.production import staff, staff_sources  # noqa: E402
-import unit_lookup  # noqa: E402
-import unit_move  # noqa: E402
 import herdr  # noqa: E402
 
 
@@ -56,19 +54,15 @@ _LOCATE_UNIT = LocateUnit()
 
 
 def _place_tab(slug: str, unit: str, row: staff.StaffRow, workspace: str) -> TabMoved | TabAlreadyPlaced | NoLiveTab:
-    marked = unit_lookup.marked_unit(slug, unit)
-    pane = unit_move.unit_pane(marked, slug)
-    if pane is not None:
-        place = pane.place
-    elif marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
-        # The close-oriented resolver omits an exec-launched director, which still moves live.
-        place = marked.place
-    else:
+    client = herdr.Herdr(herdr.shared_session())
+    found = client.lookup(row.name)
+    if isinstance(found, herdr.NoPane):
         return NoLiveTab(workspace)
-    client = herdr.Herdr(place.session)
+    if isinstance(found, herdr.SeveralPanes):
+        raise herdr.HerdrFailure(f"{slug}/{unit}: several panes ({found.count}) for label {row.name!r}")
     panes = [herdr.json_object(item, "herdr pane") for item in herdr.json_items(
         client.result("pane", "list").get("panes"), "herdr pane list")]
-    current = next((item for item in panes if item.get("pane_id") == place.pane), None)
+    current = next((item for item in panes if item.get("pane_id") == found.pane_id), None)
     if current is None:
         return NoLiveTab(workspace)
     spaces = [herdr.json_object(item, "herdr workspace") for item in herdr.json_items(
@@ -83,7 +77,7 @@ def _place_tab(slug: str, unit: str, row: staff.StaffRow, workspace: str) -> Tab
         if not any(item.get("tab_id") == tab and item.get("label") == row.name for item in tabs):
             _ = client.run("tab", "rename", tab, row.name)
         return TabAlreadyPlaced(workspace)
-    _ = client.move_pane_to_workspace(place.pane, workspace, row.name)
+    _ = client.move_pane_to_workspace(found.pane_id, workspace, row.name)
     return TabMoved(workspace)
 
 

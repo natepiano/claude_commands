@@ -7,6 +7,7 @@ import re
 import unittest
 from typing import cast, final
 
+from scripts.production import staff_sources
 from scripts.production import rename_test_support as support
 from scripts.production.rename_test_support import INTERRUPT_UNIT_GIT, NEW, OLD
 
@@ -29,8 +30,11 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertEqual(session["cwd"], f"{new}/sub")
         self.assertEqual(cast(list[dict[str, object]], saved["workers"])[0]["cwd"], f"{new}/worker")
         self.assertEqual(cast(dict[str, object], host["plan"])["path"], f"{new}/docs/plans/alpha-unit.md")
-        self.assertEqual((host["session_name"], host["production"], host["doc"]),
-                         ("new-alpha-unit", NEW, str(self.new_doc)))
+        self.assertEqual(host["session_name"], "new-alpha-unit")
+        self.assertNotIn("production", host)
+        self.assertNotIn("doc", host)
+        self.assertEqual(staff_sources.unit_parent("alpha-unit", "sid-alpha"),
+                         staff_sources.UnitProduction(NEW, str(self.new_doc)))
         worker = cast(list[dict[str, object]], saved["codex_seats"])[0]
         self.assertEqual(worker["launcher_command"],
                          ["bash", "/scripts/direct/implement.sh", str(new), f"{new}/prompt.md"])

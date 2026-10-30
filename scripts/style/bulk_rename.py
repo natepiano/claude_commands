@@ -1321,8 +1321,13 @@ def file_edits_preserved(file: FileRenames, after: str) -> bool:
             == style_footprint.comment_gaps(after, after_spans, lambda text: text))
 
 
+def unreserved_files(_paths: tuple[str, ...]) -> None:
+    """Callers without file reservations rely on their own final write guard."""
+
+
 def rename_file(server: RenameServer, path: Path, relative: str, source: str,
-                findings: tuple[RenameFinding, ...], docs: tuple[str, ...] = ()) -> FileRenames:
+                findings: tuple[RenameFinding, ...], docs: tuple[str, ...] = (), *,
+                check_files: Callable[[tuple[str, ...]], None] = unreserved_files) -> FileRenames:
     refused: list[Refusal] = []
     located: list[tuple[RenameFinding, RenameDeclaration]] = []
     for finding in findings:
@@ -1371,6 +1376,9 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
             if not any(document.path == path and any(edit.start <= offset < edit.end for edit in document.edits)
                        for document in documents):
                 raise BulkRenameError("WorkspaceEdit does not rename the finding's declaration")
+            # This finding's edit set is still separate. Refuse before any proposed
+            # overlay can become evidence for a later finding's resolution proof.
+            check_files(tuple(document.path.relative_to(root).as_posix() for document in documents))
             # Validate every document before changing any server document.
             replacements = [(document, apply_edits(document.source, document.edits)) for document in documents]
             verify_rename_references(server, path, offset, rename, replacements)

@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from production_units import read_production  # noqa: E402
 import production_units  # noqa: E402
 import showrunners  # noqa: E402
+import showrunner_tree
 import stall_watch  # noqa: E402
 import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
@@ -385,8 +386,8 @@ def _describe(plan: RenamePlan) -> list[str]:
     def moves(move: PathMove) -> str:
         return f"{move.source} -> {move.destination}"
 
-    parents = [path for path in sorted(plan.state[-1].source.parent.glob("*/parent"))
-               if path.read_text(encoding="utf-8").strip() == plan.old]
+    parents = [plan.state[-1].source.parent / child / "parent"
+               for child in showrunner_tree.stored_children(plan.old)]
     headers = [f"2. Production header {path}: {plan.old} -> {plan.new}" for path in plan.plans]
     stretches = [f"5. stall-watch {unit}: {moves(move)}"
                  for unit, move in zip(plan.units, plan.stall, strict=True)]
@@ -514,9 +515,8 @@ def _rename_showrunner_state(plan: RenamePlan) -> None:
                 destination = directory.destination / "rename-history" / f"{plan.old}.json"
             unit_move.move(PathMove(path, destination))
         directory.source.rmdir()
-    for path in sorted(directory.destination.parent.glob("*/parent")):
-        if path.read_text(encoding="utf-8").strip() == plan.old:
-            write_text(path, plan.new + "\n")
+    for child in showrunner_tree.stored_children(plan.new):
+        write_text(directory.destination.parent / child / "parent", plan.new + "\n")
     _move_held_roles(design_roles.ShowrunnerHolder(plan.old), design_roles.ShowrunnerHolder(plan.new))
     rename_outside.apply(plan.old, plan.new, plan.old_doc, plan.new_doc)
 
@@ -710,7 +710,7 @@ def _saved_restore(record: dict[str, object]) -> UnitRestore:
                               session_id=_string(restore, "session_id"))
 
 
-def _repoint_unit_restore(plan: RenamePlan, name: str, record: dict[str, object],
+def _repoint_unit_restore(_plan: RenamePlan, name: str, record: dict[str, object],
                           restore: StoppedUnitRestore) -> None:
     import herdr
 
@@ -723,12 +723,9 @@ def _repoint_unit_restore(plan: RenamePlan, name: str, record: dict[str, object]
 
     def change(saved: SessionShutdown) -> None:
         host = saved["session"]["host"]
-        if host["kind"] != "unit" or host["unit"] != name or host["production"] not in (plan.old, plan.new):
+        if host["kind"] != "unit" or host["unit"] != name:
             raise RenameRefused(f"shutdown record {restore['session_id']} is not {name}'s")
         rename_unit.repoint_shutdown_worktree(saved, old, new, host_names, note)
-        host["production"] = plan.new
-        if host["doc"] == str(plan.old_doc):
-            host["doc"] = str(plan.new_doc)
 
     try:
         _ = shutdown_record.update_session(restore["login"], restore["session_id"], change)
