@@ -391,7 +391,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Acceptance gate:** `python3 -m unittest scripts.production.test_merge_checkpoint scripts.production.test_change_review` green; `basedpyright` on both files ends `0 errors, 0 warnings, 0 notes`. No unit merge gate: the showrunner's merge test is its gate. **Change-Review:** none — merge tooling only; the showrunner sees it on the next held merge.
 
-### Phase 14 — The change review list and the open-question list survive a stopped write, and a rerun of verdict or answer finishes its work  · status: todo
+### Phase 14 — The change review list and the open-question list survive a stopped write, and a rerun of verdict or answer finishes its work  · status: done
 **Depends on:** Phases 9 and 11 (done). Its files do not overlap Phase 13's, so the two can run in either order.
 
 #### Work Order
@@ -418,7 +418,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 *Answer rerun (row `update_registration.py:613`):*
 - Today `answer` removes the item and then prints the relay line; a stop between them leaves no record of who asked, and a rerun refuses (`0 open items match`).
-- New record file `outstanding/<slug>.answered.jsonl`, beside the list: one `AnsweredItem` TypedDict per line, `time` (ISO with the production's zone), `slug`, `text`, `asked_by: NotRequired[str]`. It keeps 48 hours, like the question history, and is written whole through `replace_text`; a new record for the same text replaces the older one.
+- New record file `outstanding/<slug>.answered.jsonl`, beside the list: one `AnsweredItem` TypedDict per line, `time` (ISO with the production's zone), `slug`, `text`, `question: NotRequired[str]` (the open item's question, so a rerun matches words in either), `asked_by: NotRequired[str]`. It keeps 48 hours, like the question history, and is written whole through `replace_text`; a new record for the same text replaces the older one.
 - `answer`, under the list's lock: (1) write the answered record; (2) rewrite the list without the item; then, after the lock, (3) print the relay line. Read `asked_by` at the JSON boundary into `UnitAsker(unit) | ShowrunnerAsker() | AskerNotRecorded(reason)`, never an empty string; one function `relay_line(production, slug, asker: <that union>) -> str` makes the line for both paths, and a legacy answered record with no `asked_by` replays as `AskerNotRecorded`.
 - When no open item matches, `answer` reads the answered records of the same lists (`showrunners.user_facing(production.slug, below=True)`) with the same exact-then-partial rule. One match prints `already answered <time as %a %b %d %H:%M>` and then that item's relay line, `report("answer", "ok", ...)`, exit 0. None or several: today's refusal.
 - A stop after (1) and before (2): the item is still open; the rerun removes it and writes its record again.
@@ -435,6 +435,10 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `scripts/production/test_update_registration_answers.py` — tests
 - `scripts/production/test_update_registration_questions.py` — tests
 - `scripts/production/test_tidy_wrapped.py` — tests
+- `scripts/lib/scratch.py` — `remove` keeps a removal record beside the folder until the folder is gone, so verdict cleanup finds a folder whose removal stopped (repair)
+- `scripts/lib/test_scratch.py` — tests (repair)
+- `scripts/production/rename_state.py` — `rename_outstanding` takes the list path from `tidy_wrapped.outstanding_path` (repair)
+- `scripts/production/test_rename_state.py` — tests (repair)
 
 **Workers:** `1 writer + 1 tester`
 - `impl2` (opens as impl) — `atomic_file.py`, `change_review.py`, `update_registration.py`, `tidy_wrapped.py`, `commands/change_review.md`; no hub file

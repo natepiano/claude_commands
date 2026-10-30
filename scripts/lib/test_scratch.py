@@ -7,6 +7,8 @@ import os
 import subprocess
 import tempfile
 import unittest
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
@@ -94,6 +96,71 @@ class ScratchTests(unittest.TestCase):
             self.assertFalse(path.exists())
         self.assertTrue(other.is_dir())
         self.assertTrue(loose.is_dir())
+
+    def test_stopped_removal_keeps_its_task_record_until_the_rerun_finishes(self) -> None:
+        path = scratch.new(ROW, "stopped", visible=True)
+        first, second = path / "a", path / "b"
+        _ = first.write_text("first child")
+        _ = second.write_text("second child")
+        record = (path / scratch.RECORD).read_bytes()
+        other = scratch.new(RUN, "kept")
+        real_unlink = os.unlink
+        real_scandir = os.scandir
+
+        @contextmanager
+        def record_first(directory: int | str | os.PathLike[str]) -> Generator[Iterator[os.DirEntry[str]]]:
+            with real_scandir(directory) as entries:
+                yield iter(sorted(entries, key=lambda entry: (entry.name != scratch.RECORD, entry.name)))
+
+        def stop_after_child(child: str | os.PathLike[str], *, dir_fd: int | None = None) -> None:
+            real_unlink(child, dir_fd=dir_fd)
+            if Path(child).name == first.name:
+                raise KeyboardInterrupt
+
+        with (mock.patch.object(os, "scandir", side_effect=record_first),
+              mock.patch.object(os, "unlink", side_effect=stop_after_child),
+              self.assertRaises(KeyboardInterrupt)):
+            _ = scratch.end(ROW)
+        self.assertFalse(first.exists())
+        self.assertTrue(second.is_file())
+        self.assertEqual((path / scratch.RECORD).read_bytes(), record)
+        self.assertIn(path, [folder.path for folder in scratch.folders() if folder.task == ROW])
+        self.assertEqual(scratch.end(ROW), [path])
+        self.assertFalse(path.exists())
+        self.assertTrue(other.is_dir())
+
+    def test_removal_rerun_finds_the_task_after_its_record_or_folder_is_deleted(self) -> None:
+        for index, boundary in enumerate(("record removed", "before rmdir", "after rmdir")):
+            with self.subTest(boundary=boundary):
+                path = scratch.new(ROW, f"final-stop-{index}", visible=True)
+                other = scratch.new(RUN, "kept")
+                real_unlink = os.unlink
+                real_rmdir = Path.rmdir
+
+                def stop_after_record(child: str | os.PathLike[str], *, dir_fd: int | None = None) -> None:
+                    real_unlink(child, dir_fd=dir_fd)
+                    if boundary == "record removed" and Path(child).name == scratch.RECORD:
+                        raise KeyboardInterrupt
+
+                def stop_at_folder(folder: Path) -> None:
+                    if folder == path and boundary == "before rmdir":
+                        raise KeyboardInterrupt
+                    real_rmdir(folder)
+                    if folder == path and boundary == "after rmdir":
+                        raise KeyboardInterrupt
+
+                with (mock.patch.object(os, "unlink", side_effect=stop_after_record),
+                      mock.patch.object(Path, "rmdir", autospec=True, side_effect=stop_at_folder),
+                      self.assertRaises(KeyboardInterrupt)):
+                    _ = scratch.end(ROW)
+                self.assertFalse((path / scratch.RECORD).exists())
+                self.assertEqual(path.exists(), boundary != "after rmdir")
+                self.assertIn(path, [folder.path for folder in scratch.folders() if folder.task == ROW])
+                self.assertEqual(scratch.end(ROW), [path])
+                self.assertFalse(path.exists())
+                self.assertNotIn(path, [folder.path for folder in scratch.folders()])
+                self.assertTrue(other.is_dir())
+                self.assertEqual(list(path.parent.iterdir()), [])
 
     def test_end_keep_predicate_preserves_folders_and_holds_until_the_command_finishes(self) -> None:
         kept = scratch.new(RUN, "live")
