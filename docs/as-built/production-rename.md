@@ -235,11 +235,17 @@ names, completed apply step names and `done`. It does not store the current
 checkout, production doc paths, timer, state, stall-watch or review-pool paths.
 On resume these are resolved from the current update timer and configured
 state roots. Until `_rename_timer` is recorded complete, the old slug's timer
-is required; afterwards the new slug's timer is required. The old timer may
+is required, except while that step is pending and its source instance has
+already moved: recovery validates the new timer and retries the timer step
+before recording it complete. Afterwards the new slug's timer is required. The old timer may
 already name the new doc: `_rename_doc` points CHECK there before moving the
 doc, and `_rename_timer` moves the instance later. A missing or unreadable
-expected timer refuses with both slugs and the next step, even if the other
-slug's timer resolves. Recovery never guesses a checkout from a journal path.
+expected timer refuses with both slugs and the next step outside that move
+recovery window. An unreadable source instance is never bypassed. Recovery
+never guesses a checkout from a journal path. A kept merge branch can already
+hold the rename commit when its push fails or progress was not saved; the
+recorded base, commit parent and subject identify it, and apply retries its
+push without making a second commit. Other tip changes still refuse.
 
 Older journals with absolute paths and counted progress still load. Their
 stored location fields are ignored; absolute plan entries are replaced by
