@@ -386,52 +386,21 @@ Yes. Area passes the user's rule (at most 10% wrong on tune; held-out checked on
 
 ### Phase 7 — the TypeSafe guide for other sessions  · status: done
 
-**Depends on:** Phase 6
+#### As-built
 
-#### Work Order
-
-**Goal:** `docs/typesafe.md` lets any session use TypeSafe here without this unit, and the area table has its final two-column form.
-
-**Spec:** in STE, under 150 lines:
-- that live calls run as `with-typesafe <cmd>`, that the key is never read or printed, and the data rule (what may be sent);
-- how to reuse `scripts/issue_score/client.py`;
-- the `questions.py` pattern (all wording in one module, model pinned, payloads logged);
-- the skill's core rules, with links to the live docs;
-- the measured lessons from Phases 3, 4 and 6 (`lessons.md`), the area merge reruns included (116 -> 64 failed tune at every threshold; 62 areas met the rule at 0.95);
-- how `/issue` uses `score_issues.py propose`: a single-valued first line, unsure choices on an `Alternatives:` line, exit 2 when the agent must propose every field;
-- project names: the vault base files are the one source (`vault.load_project_names()`). A new base file adds a shorthand with no code change; a new canonical project also needs a `PROJECT_ABOUT` entry;
-- the reassess workflow: which artifact the operator reads (`<run>-reassess.md`), fills (`<run>-agent-proposals.json`, the approvals file) and keeps (`<run>-reassess.json`, the snapshot approvals are checked against); and each `apply_labels.py` refusal (stderr, exit 2) with its recovery: content or area definitions changed (rescore), a reviewed field changed since review, a duplicate approval, and an interrupted batch (run the same approvals again; written fields count as done);
-- the cost of a pass;
-- the instruction to ask `typesafe-unit` for anything not covered.
-
-Finish the area table, after the guide is written:
-- Remove the shorthand allowlist from `commands/issue.md`: it names the vault base files as the source and stops refusing a shorthand that has a base file.
-- First prove that the reassess phase's checkpoint is on origin/main: `git merge-base --is-ancestor bef8ccf4 origin/main` (merged as 6835f4f2 on 2026-10-30). If it is not, leave the table and the loader as they are, and post blocked. A two-column table read by a three-column-only loader makes every `/issue` call fall back.
-- Rewrite `~/rust/hanadocs/conf/issue-areas.md` as a two-column `area | definition` table. Keep each area and its definition text unchanged. The intro sentence that names the issues column points only at `[[issue areas.base]]` for counts. Commit and push with `git -C ~/rust/hanadocs`; never `cd` into the vault. Order matters: main's loader (since 6835f4f2) reads both forms, so the two-column table goes first. The table is pushed, and present in the vault on natedev and the Mac, before this phase's checkpoint brings the two-column-only loader to main. The checkpoint notice names the hanadocs commit.
-- Remove the three-column form from `vault.load_area_definitions()`: a three-column header then gives the no-definitions `ValueError` that names the path. Delete the one three-column case in `test_vault.py`, and add a case that the three-column header is refused. This removal is planned, not weakening a test.
+- `docs/typesafe.md` (149 lines, STE) lets any session use TypeSafe without `typesafe-unit`: live calls as `with-typesafe <cmd>` and the data rule, client and `questions.py` reuse, question rules (the area `unfiled` fallback included), `/issue` and `score_issues.py propose`, score/compare/reassess with each `apply_labels.py` refusal and its recovery, spend and stale reservations, and the measured lessons. It sends anything it does not cover to `typesafe-unit`.
+- The vault area table is a two-column `area | definition` table (hanadocs 8cfc18f4), with each area and definition text unchanged.
+- `vault.load_area_definitions()` reads only the two-column form. Any other header gives a `ValueError` that names the path and the required header.
+- `/issue` has no shorthand allowlist; a shorthand is valid when its base file exists.
 
 **Files:**
 - `docs/typesafe.md` — the TypeSafe guide for other sessions
-- `~/rust/hanadocs/conf/issue-areas.md` — the two-column area table (vault file)
-- `scripts/issue_score/vault.py` — the loader reads only the two-column form
-- `scripts/issue_score/test_vault.py` — the three-column case becomes a refusal case
+- `~/rust/hanadocs/conf/issue-areas.md` — the two-column area table (vault file; `conf/` is the current place, not a permanent one)
+- `scripts/issue_score/vault.py` — `load_area_definitions()` reads the two-column form only
+- `scripts/issue_score/test_vault.py` — the three-column header is refused with the path and the required header
+- `scripts/issue_score/test_apply_labels.py` — a duplicate approval is refused before any write
+- `commands/issue.md` — names the vault base files as the only shorthand source
 
-Assertion-Change: `scripts/issue_score/test_vault.py::test_legacy_three_column_area_definitions_ignore_only_the_issues_cell` becomes `test_three_column_area_definition_header_is_refused_with_the_path_and_required_header` and expects a `ValueError` naming the path, because the loader drops the three-column form by plan.
+**Binds later work:** The guide names `THRESHOLDS` and `JEV_FIELDS` in `questions.py` and copies no values, so "area threshold from the user's answer; run the reassess" changes them with no guide edit. The area table has two columns, and the loader refuses a three-column header. Project shorthands come only from the vault base files (`vault.load_project_names()`); `commands/issue.md` holds no copy. A new canonical project also needs a `PROJECT_ABOUT` entry in `questions.py`.
 
-- `commands/issue.md` — no shorthand allowlist; the base files are the source
-- `scripts/issue_score/test_apply_labels.py` — a duplicate-approval case
-
-**Workers:** `1 writer + 1 tester`
-- `impl` — `docs/typesafe.md`, `vault.py`, the vault table, `commands/issue.md`
-- `test` — `test_vault.py` (the two-column form reads; the three-column header is refused with a `ValueError` that names the path); `test_apply_labels.py` (a duplicate approval is refused); a walkthrough of the guide's reassess steps on the reassess and `apply_labels` fixtures
-
-**Constraints from prior phases:**
-- The area table lives at `vault.AREA_DEFINITIONS_PATH` (`~/rust/hanadocs/conf/issue-areas.md`). The user said `conf/` is "fine for now but not allowed" long term, so the guide names it as the current place, not a permanent one. Counts per area live in `~/rust/hanadocs/home-base/issue areas.base`.
-- The reassess phase leaves the loader reading both table forms, every test fixture in the two-column form, and one three-column case in `test_vault.py`.
-- `propose`'s single-valued first line exists for `scripts/production/proposals_table.py`, which counts every star on a `Proposed ranking:` line (unit-board-unit's file).
-- Every prompt for this phase carries, verbatim: "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why."
-- Explain partial runs: a failed line holds `{"issue_path","error"}`, and `score` exits 1.
-- Explain spend: `spend.jsonl` holds recorded spend; `spend.pending.json` holds reservations, which stay after a killed process (fail closed). `BudgetExceeded` can come while recorded spend is below $20; give the steps to tell reserved from recorded spend and to clear a stale reservation. Acceptance checks that an interrupted-run scenario gives the operator these steps.
-- Name the shared modules: `records.py` (run shapes, `STATE_DIR`), `questions.py`, `decide.py`, `evaluate.py`; explain that a complete scoring run and a complete comparison cohort are different checks (`compare --baseline`).
-
-**Acceptance gate:** the doc exists, and every path it names exists. The guide's reassess steps and refusal recoveries match a walkthrough on the fixtures, and a duplicate approval is refused in a test. `commands/issue.md` has no shorthand allowlist. The vault table has two columns, and `vault.load_area_definitions()` reads it with the same definitions as before. basedpyright is clean on `scripts/issue_score`, and the merge gate is green.
+**Gotchas:** The Mac vault is far behind origin. Its `conf/issue-areas.md` is an untracked copy of the published table, not a pulled file; a later pull can conflict with it. The guide's sure rule has one exception: below `EVIDENCE_ABSENT`, area becomes `unfiled` with confidence `1 - fits`, sure only when that passes the area threshold.
