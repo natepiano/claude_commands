@@ -113,6 +113,62 @@ class PushAuditTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         return result.stdout
 
+    def test_coverage_claims_subtract_gaps_and_stop_at_the_command_time(self) -> None:
+        path = self.home / "coverage.toml"
+        _ = path.write_text(
+            '["notification history"]\nsince="2026-10-12T21:24:00Z"\nevidence="abc123 start logging"\n'
+            + '[["notification history".gaps]]\nfrom="2026-10-14T21:24:00Z"\n'
+            + 'to="2026-10-16T21:24:00Z"\nreason="writer stopped"\n'
+            + '[["notification history".gaps]]\nfrom="2026-10-15T21:24:00Z"\n'
+            + 'to="2026-10-17T21:24:00Z"\nreason="overlapping outage"\n'
+            + '[["notification history".gaps]]\nfrom="2026-10-19T21:24:00Z"\n'
+            + 'to="2026-10-25T21:24:00Z"\nreason="outage continues after this command"\n'
+        )
+        original = path.read_bytes()
+        problems: list[log_records.SourceProblem] = []
+        claims = audit.read_coverage(path, log_records.required_time(UNTIL), problems)
+        self.assertEqual(problems, [])
+        self.assertEqual(set(claims), {"notification history"})
+        claim = claims["notification history"]
+        self.assertEqual(claim.evidence, "abc123 start logging")
+        self.assertEqual([(interval.since, interval.until) for interval in claim.intervals], [
+            (log_records.required_time("2026-10-12T21:24:00Z"), log_records.required_time("2026-10-14T21:24:00Z")),
+            (log_records.required_time("2026-10-17T21:24:00Z"), log_records.required_time("2026-10-19T21:24:00Z")),
+        ])
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_bad_coverage_entries_name_the_file_and_key_without_losing_good_claims(self) -> None:
+        path = self.home / "coverage.toml"
+        valid = '["notification history"]\nsince="2026-10-13T21:24:00Z"\nevidence="abc123 start logging"\n'
+        for invalid in (
+            'since="2026-10-13T21:24:00"\nevidence="offset missing"\n',
+            'since="bad time"\nevidence="bad stamp"\n',
+            'since="2026-10-13T21:24:00Z"\nevidence=" "\n',
+            'since="2026-10-13T21:24:00Z"\nevidence="ok"\nextra="invalid field"\n',
+            'since="2026-10-13T21:24:00Z"\nevidence="ok"\n'
+            + '[["merge history".gaps]]\nfrom="2026-10-17T00:00:00Z"\n'
+            + 'to="2026-10-16T00:00:00Z"\nreason="backward gap"\n',
+            'since="2026-10-13T21:24:00Z"\nevidence="ok"\n'
+            + '[["merge history".gaps]]\nfrom="2026-10-14T00:00:00Z"\n'
+            + 'to="2026-10-16T00:00:00Z"\nreason=" "\n',
+        ):
+            with self.subTest(entry=invalid):
+                _ = path.write_text(valid + '["merge history"]\n' + invalid)
+                problems: list[log_records.SourceProblem] = []
+                claims = audit.read_coverage(path, log_records.required_time(UNTIL), problems)
+                self.assertEqual(set(claims), {"notification history"})
+                self.assertEqual(claims["notification history"].intervals, (log_records.Window(
+                    log_records.required_time("2026-10-13T21:24:00Z"), log_records.required_time(UNTIL)),))
+                self.assertEqual(len(problems), 1)
+                self.assertEqual(problems[0].source, str(path))
+                self.assertIn("merge history", problems[0].reason)
+        _ = path.write_text("[")
+        problems = []
+        self.assertEqual(audit.read_coverage(path, log_records.required_time(UNTIL), problems), {})
+        self.assertEqual(len(problems), 1)
+        self.assertEqual(problems[0].source, str(path))
+        self.assertIn("coverage config", problems[0].reason)
+
     def test_full_cli_omits_the_hint_and_summary_only_keeps_it(self) -> None:
         self.save(self.pushes, [self.push("Delivered fixture")])
         self.reviews.unlink()
@@ -128,6 +184,47 @@ class PushAuditTest(unittest.TestCase):
         self.assertEqual(full_summary[:-1], summary[:-1])
         self.assertNotIn("Use --full", full)
         self.assertIn("Totals per showrunner", full)
+
+    def test_two_window_audits_keep_earlier_reviews_silence_and_rewrites_available(self) -> None:
+        boundary = "2026-10-20T00:00:00Z"
+        before = log_records.Window(log_records.required_time("2026-10-13T00:00:00Z"),
+                                    log_records.required_time(boundary))
+        after = log_records.Window(before.until, log_records.required_time("2026-11-17T00:00:00Z"))
+        kept = {**self.push("Delayed across boundary", at="2026-10-19T12:00:00Z"),
+                "outcome": "kept: silence until tomorrow"}
+        delayed = {**self.push("Delayed across boundary", at="2026-10-21T12:00:00Z"),
+                   "outcome": "sent, kept during silence"}
+        rewritten: JsonRecord = {
+            **self.failed_review("Rewritten", at="2026-10-19T23:59:59Z"),
+            "verdict": "rewrite", "sent": {"title": "Rewritten", "body": "Corrected body"},
+        }
+        self.save(self.pushes, [
+            self.push("Before", at="2026-10-19T12:00:00Z"), kept,
+            self.push("Reviewed before boundary", at=boundary), delayed,
+            self.push("Rewritten", at=boundary, body="Corrected body"),
+            self.push("Later excluded", at=after.until.isoformat()),
+        ])
+        self.save(self.reviews, [
+            self.failed_review("Before", at="2026-10-19T12:00:00Z"),
+            self.failed_review("Reviewed before boundary", at="2026-10-19T23:59:59Z"),
+            self.failed_review("Delayed across boundary", at="2026-10-19T12:00:00Z"),
+            rewritten,
+            {**self.failed_review("Held agent", at=boundary, text_id="nate.adhoc"), "sent": None},
+        ])
+        original = {path: path.read_bytes() for path in (self.pushes, self.reviews)}
+        with patch.object(audit, "read_owners", return_value=audit.ProductionOwnership({}, {})):
+            sources = audit.load_sources(self.logs)
+        first, second = audit.audit(sources, before), audit.audit(sources, after)
+        self.assertEqual([push.title for push in first.delivered_pushes], ["Before"])
+        self.assertEqual([entry.title for entry in first.entries], ["Before"])
+        self.assertEqual([push.title for push in second.delivered_pushes],
+                         ["Reviewed before boundary", "Delayed across boundary", "Rewritten"])
+        self.assertEqual([entry.title for entry in second.entries],
+                         ["Reviewed before boundary", "Delayed across boundary"])
+        self.assertEqual([entry.evidence for entry in second.entries], [audit.FailedCheckEvidence.FAILED_RULES] * 2)
+        self.assertEqual(sum(second.pushes_by_showrunner.values()), 3)
+        self.assertEqual(audit.audit(sources, before), first)
+        self.assertEqual({path: path.read_bytes() for path in original}, original)
 
     def test_agent_text_exception_ends_at_the_delivery_boundary(self) -> None:
         for at, approved in (("2026-10-29T03:05:58Z", True),
