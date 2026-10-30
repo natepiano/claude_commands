@@ -5714,6 +5714,7 @@ def command_end(args: argparse.Namespace) -> int:
     Drain queued submissions before interrupting: each queued message can open
     another turn. End never starts a server, and retrying an ended worker
     retries cleanup that may have exhausted its budget.
+    Cleanup-only refuses any status other than ended before changing worker state.
     """
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
@@ -5734,6 +5735,9 @@ def command_end(args: argparse.Namespace) -> int:
                 print(f"codex_mesh: {target}: worker was adopted; nothing ended", file=sys.stderr)
                 return 2
             status = _as_str(record.get("status")) or "unknown"
+            if _attr(args, "cleanup_only") and status != "ended":
+                print(f"codex_mesh: {target}: worker is {status}, not ended; nothing cleaned", file=sys.stderr)
+                return 2
             deadline = time.time() + END_OPERATION_TIMEOUT_SECS
             if _attr(args, "idle_only"):
                 history = record.get("giving_runs")
@@ -8630,7 +8634,10 @@ def main(argv: list[str] | None = None) -> int:
     _ = end.add_argument("--session-dir", required=True)
     _ = end.add_argument("--to", required=True)
     _ = end.add_argument("--expected-thread-id", default="", help="refuse if this worker now names another thread")
-    _ = end.add_argument("--idle-only", action="store_true", help="refuse a running worker without changing it")
+    end_filter = end.add_mutually_exclusive_group()
+    _ = end_filter.add_argument("--idle-only", action="store_true", help="refuse a running worker without changing it")
+    _ = end_filter.add_argument("--cleanup-only", action="store_true",
+                               help="only retry server cleanup for a worker already ended; refuse any other status without changing it")
     end.set_defaults(handler=command_end)
 
     stop = subparsers.add_parser("stop", help="stop the session app-server")
