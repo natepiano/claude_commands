@@ -12,8 +12,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
-import usage_store  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.whoami import usage_store  # noqa: E402
 
 @dataclass(frozen=True)
 class KnownReset:

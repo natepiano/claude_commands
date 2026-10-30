@@ -33,7 +33,7 @@ sys.path.insert(0, str(SCRIPTS.parent))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 sys.path.insert(0, str(SCRIPTS / "production"))
-import account  # noqa: E402
+from scripts.whoami import account  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.production.unit_lookup import LiveClaude

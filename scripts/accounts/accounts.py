@@ -38,13 +38,13 @@ _ = sys.modules.setdefault("scripts.accounts.accounts", sys.modules[__name__])
 sys.path.insert(0, str(REPOSITORY_ROOT))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
 
-import account  # noqa: E402
-from account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
+from scripts.whoami import account  # noqa: E402
+from scripts.whoami.account import ResolvedHistoryLabel as ResolvedHistoryLabel, HistoricalAccountUnresolved as HistoricalAccountUnresolved  # noqa: E402
 from scripts.lib import atomic_file, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
-import agent_accounts  # noqa: E402
-import note_file  # noqa: E402
-import usage_store  # noqa: E402
+from scripts.whoami import agent_accounts  # noqa: E402
+from scripts.whoami import note_file  # noqa: E402
+from scripts.whoami import usage_store  # noqa: E402
 from scripts.accounts import refusals  # noqa: E402
 from scripts.accounts import moves, worker_names, role_map  # noqa: E402
 from scripts.accounts.refusals import (  # noqa: E402
