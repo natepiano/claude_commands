@@ -182,6 +182,22 @@ except BlockingIOError:
   return 2
 }
 
+# A momentary board operation must not look like lost ownership. Bound each
+# guard wait; status 2 is inconclusive, distinct from an ownership refusal.
+wait_lock_guard() {
+  local attempt status
+  for ((attempt=0; attempt<200; attempt++)); do
+    if lock_guard "$1"; then
+      return 0
+    else
+      status=$?
+    fi
+    (( status == 1 )) || return "$status"
+    sleep 0.05
+  done
+  return 2
+}
+
 # Read a lock's metadata. Absent metadata means the directory was created a
 # moment ago and its holder has not written itself in yet; treat that as a live
 # lock held by an unknown agent rather than as a free one, so a race never
@@ -423,18 +439,9 @@ cmd_release() {
   fi
   local dir; dir="$(lock_dir "$session_dir" "$resource")"
   local guard="${session_dir}/locks/${resource}.guard"
-  local attempt lock_status guarded=0
+  local guarded=0
   if [[ -d "$dir" ]]; then
-    for ((attempt=0; attempt<200; attempt++)); do
-      if lock_guard "$guard"; then
-        guarded=1
-        break
-      else
-        lock_status=$?
-      fi
-      (( lock_status == 1 )) || break
-      sleep 0.05
-    done
+    if wait_lock_guard "$guard"; then guarded=1; fi
   fi
   if [[ ! -d "$dir" ]]; then
     (( guarded == 0 )) || exec 9>&-
@@ -519,7 +526,7 @@ cmd_renew() {
   [[ "$hold" =~ ^[0-9]+$ ]] && (( hold > 0 )) || die "--hold must be a positive integer"
   local dir; dir="$(lock_dir "$session_dir" "$resource")"
   mkdir -p "${session_dir}/locks"
-  lock_guard "${session_dir}/locks/${resource}.guard" || return 1
+  wait_lock_guard "${session_dir}/locks/${resource}.guard" || return 2
   [[ -d "$dir" ]] || { exec 9>&-; printf 'board.sh: %s is not held\n' "$resource" >&2; return 1; }
   local holder; holder="$(lock_holder "$dir")"
   [[ "$holder" == "$agent" ]] || {

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -9,21 +10,29 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from threading import Event
+import time
 import unittest
 from unittest import mock
 from typing import cast
 
 from scripts.direct import verify_lint_scope_test_support as lint_support
-from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture, BOARD, VERIFY
+from scripts.direct.shell_function_test_support import shell_functions
+from scripts.direct.verify_examples_test_support import rust_tool_path
+from scripts.direct.verify_token_wait_test_support import TEST_HANG_GUARD_SECS, VerifyTokenWaitFixture, BOARD, VERIFY
 from scripts.direct.wait_for_test_state import wait_until
 
 SCRIPTS = VERIFY.parent.parent
 
 
-def shell_function(path: Path, name: str) -> str:
-    source = path.read_text()
-    start = source.index(name + "() {")
-    return source[start:source.index("\n}\n", start) + 3]
+def token_renewal_functions() -> str:
+    return shell_functions(VERIFY, "start_token_renewer", "stop_token_renewer", "with_token_renewal")
+
+
+def token_admission_functions() -> str:
+    return shell_functions(VERIFY,
+        "record_token_wait", "remember_tree_reservation", "note_memory_admission", "admit_with_token",
+        "buildlog_wait_for_memory")
 
 
 class LongStepOwnershipTests(VerifyTokenWaitFixture):
@@ -79,8 +88,9 @@ class LongStepOwnershipTests(VerifyTokenWaitFixture):
 
     def test_every_step_renews_before_launching_its_command(self) -> None:
         harness = self.root / "two-steps.sh"
-        _ = harness.write_text("set -eu\n" + shell_function(VERIFY, "renew_token")
-                               + shell_function(VERIFY, "buildlog_exec") + r'''
+        _ = harness.write_text("set -eu\n" + shell_functions(VERIFY, "renew_token")
+                               + token_renewal_functions()
+                               + shell_functions(VERIFY, "buildlog_exec") + r'''
 BOARD_HELPER=$1 BOARD_DIR=$2 BOARD_SLOT=holder TOKEN_HOLD_S=30 TOKEN_RENEW_S=60
 TOKEN_HELD=1 PY=$3 STEP_OWNER_PY=""
 bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$ --hold 30
@@ -98,6 +108,227 @@ bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
                                 env=self.environment, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.count("command started after renewal"), 2)
+
+    def memory_wait_process(self, *, lose_at_launch: bool = False, scoped_attempt: bool = False,
+                            board_helper: Path = BOARD) -> subprocess.Popen[str]:
+        # Exercise the real second admission wrapper, board leases and command
+        # ownership guard. Only admission and the contention boundary are fixed.
+        source = VERIFY.read_text()
+        owner_start = source.index("STEP_OWNER_PY='\n")
+        owner_end = source.index("\nrelease_token() {", owner_start)
+        harness = self.root / "held-memory.sh"
+        _ = harness.write_text('set -eu\nsource "$4"\n'
+                               + source[owner_start:owner_end]
+                               + shell_functions(VERIFY, "release_token")
+                               + token_admission_functions() + r'''
+BOARD_HELPER=$1 BOARD_DIR=$2 BOARD_SLOT=first TOKEN_HOLD_S=2 TOKEN_RENEW_S=0.1
+TOKEN_USED=1 TOKEN_HELD=0 TOKEN_WAIT_FILE="$TEST_ROOT/token-waits" TOKEN_WAITED=0 PY=$3
+BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=Granted passes=0
+HOLD_WAIT_DIR="$TEST_ROOT/hold"
+mkdir -p "$HOLD_WAIT_DIR"
+eval "$(declare -f buildlog_exec_unowned | sed '1s/buildlog_exec_unowned/buildlog_exec_actual/')"
+buildlog_exec_unowned() {
+    if [[ "$TEST_LOSE_AT_LAUNCH" == 1 && ! -f "$TEST_ROOT/lost-at-launch" ]]; then
+        : > "$TEST_ROOT/lost-at-launch"
+        bash "$BOARD_HELPER" release "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$
+    fi
+    buildlog_exec_actual "$@"
+}
+step_state() { :; }
+build_hold_wait_local() { :; }
+build_hold_check_local() { :; }
+buildlog_begin() {
+    BUILDLOG_START="" BUILDLOG_PEAK=""
+    if [[ "$TEST_SCOPED_ATTEMPT" == 1 ]]; then
+        BUILDLOG_PEAK="$TEST_ROOT/attempt.$RANDOM.peak"
+    fi
+}
+buildlog_end() {
+    printf '%s\n' "$1" >> "$TEST_ROOT/recorded-statuses"
+    [[ -z "$BUILDLOG_PEAK" ]] || rm -f "$BUILDLOG_PEAK"
+}
+# Run the real scope shell without requiring a user systemd manager.
+systemd-run() {
+    while [[ "$1" != -- ]]; do shift; done
+    shift
+    printf '%s\n' "$BUILDLOG_PEAK" >> "$TEST_ROOT/scoped-attempts"
+    "$@"
+}
+sweep_after_step() { :; }
+buildlog_release_memory() {
+    rm -f "$TEST_ROOT/reservation"
+    BUILDLOG_MEM_RESERVATION=""
+}
+# Force the admission-after-queue path, using the real board for ownership.
+try_token_now() { return 1; }
+acquire_token() {
+    TOKEN_WAITED=0
+    [[ "$TOKEN_HELD" == 0 ]] || return 0
+    : > "$TEST_ROOT/token-wait"
+    bash "$BOARD_HELPER" acquire "$BOARD_DIR" "$BOARD_SLOT" cargo --pid $$ --hold "$TOKEN_HOLD_S" --wait 30
+    TOKEN_HELD=1
+    if [[ -f "$TEST_ROOT/acquisitions" ]]; then TOKEN_WAITED=7; fi
+    printf 'acquired\n' >> "$TEST_ROOT/acquisitions"
+    rm -f "$TEST_ROOT/token-wait"
+}
+buildlog_wait_for_memory_only() {
+    passes=$(( passes + 1 ))
+    if (( passes == 2 )); then
+        cp "$BOARD_DIR/locks/cargo.d/expires" "$TEST_ROOT/original-expiry"
+        : > "$TEST_ROOT/memory-wait"
+        "$PY" "$TEST_WAIT_HELPER" "$TEST_RELEASE"
+    fi
+    BUILDLOG_MEM_RESERVATION="$TEST_ROOT/reservation"
+    : > "$BUILDLOG_MEM_RESERVATION"
+    printf '%s\n' "$TOKEN_HELD" >> "$TEST_ROOT/admission-holders"
+}
+trap 'stop_token_renewer; release_token; buildlog_release_memory; rm -rf "$HOLD_WAIT_DIR"' EXIT
+run_once cargo check
+release_token
+''')
+        # The fake cargo still runs through the real invocation and ownership
+        # guard, and gives the test an unambiguous command-start marker.
+        environment = {**self.environment, "TEST_ROOT": str(self.root),
+                       "TEST_LOSE_AT_LAUNCH": "1" if lose_at_launch else "0",
+                       "TEST_SCOPED_ATTEMPT": "1" if scoped_attempt else "0",
+                       "TEST_REAL_BOARD": str(BOARD),
+                       "TEST_BLOCK": "1", "TEST_RUNNING": str(self.root / "command-ran")}
+        process = subprocess.Popen(["bash", str(harness), str(board_helper), str(self.root / "board"), sys.executable,
+                                    str(SCRIPTS / "lint" / "invoke.sh")],
+                                   cwd=self.root, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        self.started_groups.add(process.pid)
+        self.addCleanup(self.finish_memory_wait, process)
+        return process
+
+    def finish_memory_wait(self, process: subprocess.Popen[str]) -> None:
+        (self.root / "release").touch()
+        if process.poll() is None:
+            self.end_group(process.pid)
+        _ = process.communicate(timeout=300)
+
+    def test_memory_wait_renews_the_held_token_until_the_step_runs(self) -> None:
+        process = self.memory_wait_process()
+        lock = self.root / "board" / "locks" / "cargo.d"
+        self.wait_for_running(self.root / "memory-wait", process)
+        original_expiry = int((self.root / "original-expiry").read_text())
+        # The rival tries after the initial lease would have expired, while
+        # admission is still blocked and no command owns a process group yet.
+        _ = Event().wait(max(0, original_expiry + 2 - time.time()))
+        rival = self.board(self.root / "board", "acquire", "second", "cargo", "--pid", str(os.getpid()))
+        try:
+            self.assertNotEqual(rival.returncode, 0, rival.stdout + rival.stderr)
+            self.assertGreater(int((lock / "expires").read_text()), original_expiry)
+            self.assertFalse((self.root / "command-ran").exists())
+        finally:
+            if rival.returncode == 0:
+                _ = self.board(self.root / "board", "release", "second", "cargo", "--pid", str(os.getpid()))
+            (self.root / "release").touch()
+        output, errors = process.communicate(timeout=300)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertTrue((self.root / "command-ran").exists())
+        self.assertFalse(lock.exists())
+        self.assertEqual(self.live_group_processes(process.pid), [])
+
+    def test_busy_board_guard_does_not_stop_memory_wait_renewal(self) -> None:
+        helper = self.root / "traced-board.sh"
+        _ = helper.write_text('exec 8>>"$TEST_ROOT/board.trace"\n'
+                              + 'export BASH_XTRACEFD=8\n'
+                              + 'exec bash -x "$TEST_REAL_BOARD" "$@"\n')
+        process = self.memory_wait_process(board_helper=helper)
+        self.wait_for_running(self.root / "memory-wait", process)
+        board = self.root / "board"
+        lock = board / "locks" / "cargo.d"
+        original_expiry = int((self.root / "original-expiry").read_text())
+        trace = self.root / "board.trace"
+        with (board / "locks" / "cargo.guard").open("a") as guard:
+            fcntl.flock(guard, fcntl.LOCK_EX)
+            # A real failed flock, rather than a delay alone, proves that the
+            # heartbeat met contention. Both old and repaired boards reach it.
+            wait_until(lambda: "+ status=75" in trace.read_text(), trace, processes=(process,))
+            _ = Event().wait(0.3)
+        # Scheduling under load can carry the guard collision past the initial
+        # expiry. Observe the next heartbeat before letting the rival compete;
+        # a heartbeat stopped by that collision must time out here.
+        wait_until(lambda: int((lock / "expires").read_text() or "0") > original_expiry,
+                   lock, timeout=TEST_HANG_GUARD_SECS, processes=(process,))
+        # Let the initial lease expire: a heartbeat stopped by the busy guard
+        # would now let a rival take this token before any step has launched.
+        _ = Event().wait(max(0, original_expiry + 3 - time.time()))
+        rival = self.board(board, "acquire", "second", "cargo", "--pid", str(os.getpid()))
+        try:
+            self.assertNotEqual(rival.returncode, 0, rival.stdout + rival.stderr)
+            self.assertGreater(int((lock / "expires").read_text()), original_expiry)
+            self.assertFalse((self.root / "command-ran").exists())
+        finally:
+            if rival.returncode == 0:
+                _ = self.board(board, "release", "second", "cargo", "--pid", str(os.getpid()))
+            (self.root / "release").touch()
+        output, errors = process.communicate(timeout=300)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertTrue((self.root / "command-ran").exists())
+        self.assertFalse(lock.exists())
+        self.assertEqual(self.live_group_processes(process.pid), [])
+
+    def test_token_lost_during_memory_wait_is_reacquired_before_the_step(self) -> None:
+        process = self.memory_wait_process()
+        self.wait_for_running(self.root / "memory-wait", process)
+        # Simulate an administrative release during admission. The shell's
+        # local TOKEN_HELD is deliberately stale until the prelaunch check.
+        released = self.board(self.root / "board", "release", "first", "cargo", "--pid", str(process.pid))
+        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+        (self.root / "release").touch()
+        output, errors = process.communicate(timeout=300)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertTrue((self.root / "command-ran").exists())
+        self.assertEqual((self.root / "acquisitions").read_text().splitlines(), ["acquired", "acquired"])
+        self.assertEqual((self.root / "token-waits").read_text().splitlines(), ["7"])
+        self.assertFalse((self.root / "board" / "locks" / "cargo.d").exists())
+        self.assertEqual(self.live_group_processes(process.pid), [])
+
+    def test_lost_token_releases_memory_before_waiting_to_reacquire(self) -> None:
+        process = self.memory_wait_process()
+        board = self.root / "board"
+        self.wait_for_running(self.root / "memory-wait", process)
+        released = self.board(board, "release", "first", "cargo", "--pid", str(process.pid))
+        self.assertEqual(released.returncode, 0, released.stdout + released.stderr)
+        rival = self.board(board, "acquire", "second", "cargo", "--pid", str(os.getpid()))
+        self.assertEqual(rival.returncode, 0, rival.stdout + rival.stderr)
+        try:
+            (self.root / "release").touch()
+            self.wait_for_running(self.root / "token-wait", process)
+            self.assertFalse((self.root / "reservation").exists(),
+                             "token queue kept memory needed by its current holder")
+            self.assertFalse((self.root / "command-ran").exists())
+        finally:
+            _ = self.board(board, "release", "second", "cargo", "--pid", str(os.getpid()))
+        output, errors = process.communicate(timeout=300)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertTrue((self.root / "command-ran").exists())
+        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["0", "1", "1"])
+        self.assertEqual((self.root / "recorded-statuses").read_text().splitlines(), ["0"])
+        self.assertEqual((self.root / "token-waits").read_text().splitlines(), ["7"])
+        self.assertFalse((self.root / "reservation").exists())
+        self.assertFalse((self.root / "hold").exists())
+        self.assertEqual(self.live_group_processes(process.pid), [])
+
+    def test_ownership_guard_refusal_readmits_before_running_and_records_only_the_step(self) -> None:
+        process = self.memory_wait_process(lose_at_launch=True, scoped_attempt=True)
+        self.wait_for_running(self.root / "memory-wait", process)
+        (self.root / "release").touch()
+        output, errors = process.communicate(timeout=300)
+        self.assertEqual(process.returncode, 0, output + errors)
+        self.assertTrue((self.root / "command-ran").exists())
+        self.assertEqual((self.root / "acquisitions").read_text().splitlines(), ["acquired", "acquired"])
+        self.assertEqual((self.root / "admission-holders").read_text().splitlines(), ["0", "1", "1"])
+        self.assertEqual((self.root / "recorded-statuses").read_text().splitlines(), ["0"])
+        self.assertEqual((self.root / "token-waits").read_text().splitlines(), ["7"])
+        self.assertFalse((self.root / "reservation").exists())
+        self.assertFalse((self.root / "hold").exists())
+        self.assertEqual(len((self.root / "scoped-attempts").read_text().splitlines()), 2)
+        self.assertEqual(list(self.root.glob("attempt.*.peak")), [], "discarded scope kept its peak file")
+        self.assertEqual(list(self.root.glob("attempt.*.peak.cgroup")), [])
+        self.assertEqual(self.live_group_processes(process.pid), [])
 
     def test_renew_requires_the_matching_holder_pid(self) -> None:
         board = self.root / "board"
@@ -207,14 +438,15 @@ class MemoryQueueIdentityTests(unittest.TestCase):
             harness = root / "recheck-wait.sh"
             _ = harness.write_text('set -eu\nsource "$1"\n'
                                    + 'eval "$(declare -f buildlog_wait_for_memory | sed \'1s/buildlog_wait_for_memory/buildlog_wait_for_memory_only/\')"\n'
-                                   + shell_function(VERIFY, "remember_tree_reservation")
-                                   + shell_function(VERIFY, "buildlog_wait_for_memory") + r'''
+                                   + token_renewal_functions()
+                                   + token_admission_functions() + r'''
 unset EPOCHSECONDS SECONDS
 EPOCHSECONDS=100 SECONDS=0
 BUILDLOG_MEM_WAIT_SINCE="" BUILDLOG_MEM_WAIT_FIRST_FILE="$TMPDIR/first-wait"
 TOKEN_USED=1 TOKEN_HELD=0 TOKEN_WAIT_FILE="" acquisitions=0 hold_checks=0 hold_waits=0
 step_state() { :; }
 release_token() { :; }
+renew_token() { :; }
 try_token_now() { return 1; }
 acquire_token() {
     acquisitions=$(( acquisitions + 1 ))
@@ -252,7 +484,8 @@ run_once cargo nextest run
 printf '%s\n' "$(( EPOCHSECONDS - 100 ))" > "$TMPDIR/elapsed"
 printf '%s\n' "$acquisitions:$hold_checks" > "$TMPDIR/rechecks"
 ''')
-            environment = {**os.environ, "HOME": str(home), "TMPDIR": str(root), "BUILDLOG_OFF": "0",
+            environment = {**os.environ, "PATH": rust_tool_path(root / "bin"),
+                           "HOME": str(home), "TMPDIR": str(root), "BUILDLOG_OFF": "0",
                            "BUILDLOG_DIR": str(root / "buildlog"), "BUILDLOG_MEMINFO": str(root / "meminfo"),
                            "BUILD_HOLD_DIR": str(root / "no-hold"), "UNIT_ACTIVE_DIR": str(root / "active"),
                            "XDG_STATE_HOME": str(root / "state"), "XDG_CACHE_HOME": str(root / "cache"),
@@ -275,7 +508,7 @@ printf '%s\n' "$acquisitions:$hold_checks" > "$TMPDIR/rechecks"
             root = Path(temporary)
             _ = (root / "meminfo").write_text("MemAvailable: 1 kB\n")
             harness = root / "retry.sh"
-            _ = harness.write_text('set -eu\nsource "$1"\n' + shell_function(VERIFY, "run_local_test") + r'''
+            _ = harness.write_text('set -eu\nsource "$1"\n' + shell_functions(VERIFY, "run_local_test") + r'''
 # A valid checker reply, still held; no fake admission or reservation.
 buildlog_memory_python() { printf 'hold|100|100|fallback|0|0|0|0|fixture||repo|nextest|1|held|tree\n'; }
 buildlog_memory_line() { :; }
@@ -317,7 +550,7 @@ run_local_test
             (home / ".claude").symlink_to(SCRIPTS.parent, target_is_directory=True)
             _ = (root / "meminfo").write_text("MemAvailable: 1 kB\n")
             harness = root / "record-wait.sh"
-            _ = harness.write_text('set -eu\nsource "$1"\n' + shell_function(VERIFY, "run_local_test") + r'''
+            _ = harness.write_text('set -eu\nsource "$1"\n' + shell_functions(VERIFY, "run_local_test") + r'''
 unset EPOCHSECONDS SECONDS
 EPOCHSECONDS=100 SECONDS=0
 HOLD_WAIT_DIR=$2 MAC_LEAVE_SETTINGS=settings MAC_RETRY_AFTER=0 MAC_LEAVE_REASON=busy
@@ -358,7 +591,8 @@ run_nextest() {
 BUILDLOG_SYNC=1 BUILDLOG_CALLER=verify BUILDLOG_CALL_ID=first-wait
 run_local_test
 ''')
-            environment = {**os.environ, "HOME": str(home), "BUILDLOG_OFF": "0",
+            environment = {**os.environ, "PATH": rust_tool_path(root / "bin"),
+                           "HOME": str(home), "BUILDLOG_OFF": "0",
                            "BUILDLOG_DIR": str(root / "buildlog"),
                            "BUILDLOG_MEMINFO": str(root / "meminfo"),
                            "BUILD_HOLD_DIR": str(root / "no-hold"),

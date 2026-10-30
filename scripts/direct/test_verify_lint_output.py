@@ -4,24 +4,19 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import re
 import subprocess
 import tempfile
 from typing import final
 import unittest
 
 from scripts.direct.verify_lint_scope_test_support import SCRIPTS, TEST_HANG_GUARD_SECS, VERIFY
+from scripts.direct.shell_function_test_support import shell_functions
+
+INVOKE = SCRIPTS / "lint" / "invoke.sh"
 
 
 @final
 class InvokeOutputTests(unittest.TestCase):
-    def function_body(self, name: str) -> str:
-        source = (SCRIPTS / "lint" / "invoke.sh").read_text(encoding="utf-8")
-        match = re.search(rf"^{name}\(\) [{{(]\n.*?^[}})]$", source, re.MULTILINE | re.DOTALL)
-        self.assertIsNotNone(match, name)
-        assert match is not None
-        return match.group()
-
     def shell(self, script: str, root: Path) -> subprocess.CompletedProcess[str]:
         environment = dict(os.environ, HOME=str(root), TMPDIR=str(root))
         return subprocess.run(
@@ -56,7 +51,8 @@ sweep_after_step() { :; }
             tee.chmod(0o755)
             for status in (0, 47):
                 with self.subTest(status=status):
-                    script = self.command_stubs() + self.function_body("run_once")
+                    script = self.command_stubs() + shell_functions(
+                        INVOKE, "nextest_share_end", "buildlog_retry_unstarted_step", "run_step_attempt", "run_once")
                     script += f'\nexport PATH="$PWD/bin:$PATH"\nif run_once bash -c "exit {status}"; then result=0; else result=$?; fi\nexit "$result"\n'
                     result = self.shell(script, root)
                     self.assertEqual(result.returncode, status, result.stdout + result.stderr)
@@ -65,8 +61,7 @@ sweep_after_step() { :; }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script = "set -euo pipefail\n"
-            script += self.function_body("invoke_clippy") + "\n"
-            script += self.function_body("invoke_clippy_fix") + r'''
+            script += shell_functions(INVOKE, "invoke_clippy", "invoke_clippy_fix") + r'''
 lint_config_enabled() { return 0; }
 run() { printf '%s\n' "$@"; return 47; }
 invoke_clippy_fix -p sample --lib -- -A clippy::type_complexity
@@ -82,8 +77,7 @@ invoke_clippy_fix -p sample --lib -- -A clippy::type_complexity
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             script = "set -euo pipefail\n"
-            script += self.function_body("invoke_clippy") + "\n"
-            script += self.function_body("invoke_clippy_fix") + r'''
+            script += shell_functions(INVOKE, "invoke_clippy", "invoke_clippy_fix") + r'''
 lint_config_enabled() { return 1; }
 lint_config_skip_notice() { printf 'SKIPPED: %s\n' "$2"; }
 run() { printf 'unexpected run\n'; return 99; }

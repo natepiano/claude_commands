@@ -279,7 +279,13 @@ buildlog_finish_memory() {
 # neither cargo nor nextest exits with it.
 LINT_LEFT_QUEUE_STATUS=75
 
-run_once() {
+# verify overrides this only for an ownership guard that launched no command.
+# It runs after memory cleanup, before an unrun attempt can leave a step record.
+buildlog_retry_unstarted_step() {
+    BUILDLOG_RETRY_STEP=0
+}
+
+run_step_attempt() {
     if [[ -n "${BUILDLOG_CHECK_FAILED_FILE:-}" && -f "$BUILDLOG_CHECK_FAILED_FILE" ]]; then
         build_check_stop 2 'a prior admission or hold check failed'
         return 2
@@ -352,29 +358,34 @@ run_once() {
     # mend see a pipe, not a tty, and drop their ANSI. It buys only the sandbox
     # detection underneath, which can fire only inside Claude Code, where
     # stdout is never a tty.
+    local log="" tty=0
     if [[ -t 1 ]]; then
-        local tty_status=0
+        tty=1
         set +e
         buildlog_exec "$@" 9>&-
-        tty_status=$?
-        set -e
-        nextest_share_end
-        buildlog_finish_memory "$tty_status" "$sampler_pid"
-        buildlog_end "$tty_status" "" 1 "$@" || true
-        sweep_after_step "$@" || true
-        return $tty_status
+        status=$?
+    else
+        # $RANDOM too: a background sweep's run() shares this shell's $$.
+        log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
+        # Keep output streaming for heartbeat_watch.sh and the watching worker.
+        set +e
+        buildlog_exec "$@" 9>&- 2>&1 | tee "$log"
+        status=${PIPESTATUS[0]}
     fi
-    # $RANDOM too: a background sweep's run() shares this shell's $$.
-    local log="${TMPDIR:-/tmp}/lint_invoke.$$.$RANDOM.log"
-    # tee keeps output streaming: heartbeat_watch.sh digests the agent log to
-    # prove a worker is alive, so buffering a long build looks like a hang.
-    set +e
-    buildlog_exec "$@" 9>&- 2>&1 | tee "$log"
-    status=${PIPESTATUS[0]}
     set -e
     nextest_share_end
     buildlog_finish_memory "$status" "$sampler_pid"
-    if [[ $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
+    buildlog_retry_unstarted_step || {
+        status=$?
+        [[ -z "$log" ]] || rm -f "$log"
+        return "$status"
+    }
+    if [[ "$BUILDLOG_RETRY_STEP" == 1 ]]; then
+        [[ -z "${BUILDLOG_PEAK:-}" ]] || rm -f "$BUILDLOG_PEAK"
+        [[ -z "$log" ]] || rm -f "$log"
+        return 0
+    fi
+    if [[ -n "$log" && $status -ne 0 ]] && grep -q "$SANDBOX_SIGNATURE" "$log"; then
         buildlog_end "$status" "$log" 0 "$@" || true
         rm -f "$log"
         cat >&2 <<'EOF'
@@ -394,10 +405,21 @@ unsandboxed run needs approval, not whether it runs unsandboxed.
 EOF
         exit 3
     fi
-    buildlog_end "$status" "$log" 0 "$@" || true
-    rm -f "$log"
+    buildlog_end "$status" "$log" "$tty" "$@" || true
+    [[ -z "$log" ]] || rm -f "$log"
     sweep_after_step "$@" || true
     return $status
+}
+
+run_once() {
+    local BUILDLOG_RETRY_STEP=0 status=0
+    while :; do
+        run_step_attempt "$@" || status=$?
+        if (( status != 0 )) || [[ "$BUILDLOG_RETRY_STEP" != 1 ]]; then
+            return "$status"
+        fi
+        BUILDLOG_RETRY_STEP=0
+    done
 }
 
 run() {

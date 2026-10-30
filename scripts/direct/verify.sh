@@ -2607,8 +2607,9 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
     except OSError:
         recorded = ""
     if recorded != holder:
-        print("verify.sh: this run lost the cargo token before its step started; run it again.",
-              file=sys.stderr)
+        lost_file = os.environ.get("VERIFY_TOKEN_LOST_FILE")
+        if lost_file:
+            Path(lost_file).write_text("lost")
         sys.exit(125)
     record = lock / f"owned.{os.getpid()}.tmp"
     record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid())}))
@@ -2622,42 +2623,99 @@ sys.exit(shell_status(subprocess.call(command)))
 # fallback), changing only the command it launches while this token is held.
 eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
 renew_token() {
+    local status=0
     bash "${BOARD_HELPER}" renew "${BOARD_DIR}" "${BOARD_SLOT}" cargo \
-        --pid $$ --hold "$TOKEN_HOLD_S" >/dev/null 2>&1
+        --pid $$ --hold "$TOKEN_HOLD_S" >/dev/null 2>&1 || status=$?
+    # An exhausted bounded guard wait is inconclusive. Keep the heartbeat;
+    # only the board's ownership refusal means the hold is truly lost.
+    (( status == 0 || status == 2 ))
+}
+
+# Each span owns its renewer. Nested spans borrow the outer heartbeat; release
+# stops it before handing ownership away. Keep one loop for commands and waits.
+start_token_renewer() {
+    [[ "${TOKEN_HELD:-0}" -eq 1 ]] || return 0
+    renew_token || return 1
+    local renew_parent=${BASHPID:-$$}
+    (
+        delay_pid=""
+        trap 'if [[ -n "$delay_pid" ]]; then
+            kill "$delay_pid" 2>/dev/null || true
+            wait "$delay_pid" 2>/dev/null || true
+        fi; exit 0' INT TERM HUP
+        while kill -0 "$$" 2>/dev/null && kill -0 "$renew_parent" 2>/dev/null; do
+            "$PY" -c 'import sys, time; time.sleep(float(sys.argv[1]))' "$TOKEN_RENEW_S" &
+            delay_pid=$!
+            wait "$delay_pid" || break
+            delay_pid=""
+            renew_token || break
+        done
+    ) &
+    TOKEN_RENEWER_PID=$!
+}
+
+stop_token_renewer() {
+    [[ -n "${TOKEN_RENEWER_PID:-}" ]] || return 0
+    kill "$TOKEN_RENEWER_PID" 2>/dev/null || true
+    wait "$TOKEN_RENEWER_PID" 2>/dev/null || true
+    TOKEN_RENEWER_PID=""
+}
+
+with_token_renewal() {
+    # A nested call must not stop its caller's renewer.
+    if [[ -n "${TOKEN_RENEWER_PID:-}" ]] && kill -0 "$TOKEN_RENEWER_PID" 2>/dev/null; then
+        "$@"
+        return $?
+    fi
+    local TOKEN_RENEWER_PID="" status=0
+    # True ownership loss must still reach admission's release/requeue check
+    # (or the command's ownership guard), rather than abort an unstarted step.
+    start_token_renewer || true
+    "$@" || status=$?
+    stop_token_renewer
+    return "$status"
+}
+
+# Routing can retain the local token while waiting for a Mac claim, a held
+# target's release, or an offloaded result. Local hold waits below release it.
+eval "$(declare -f route_test | sed '1s/route_test/route_test_without_renewal/')"
+route_test() {
+    with_token_renewal route_test_without_renewal "$@"
 }
 
 buildlog_exec() {
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-        if ! renew_token; then
-            echo 'verify.sh: this run lost the cargo token before its step started; run it again.' >&2
+        local TOKEN_RENEWER_PID="" step_status=0
+        if ! start_token_renewer; then
+            printf lost > "${HOLD_WAIT_DIR:?}/token-lost"
             return 125
         fi
-        (
-            delay_pid=""
-            trap 'if [[ -n "$delay_pid" ]]; then
-                kill "$delay_pid" 2>/dev/null || true
-                wait "$delay_pid" 2>/dev/null || true
-            fi; exit 0' INT TERM HUP
-            while kill -0 "$$" 2>/dev/null; do
-                "$PY" -c 'import sys, time; time.sleep(float(sys.argv[1]))' "$TOKEN_RENEW_S" &
-                delay_pid=$!
-                wait "$delay_pid" || break
-                delay_pid=""
-                renew_token || break
-            done
-        ) &
-        local renewer=$! step_status=0
-        buildlog_exec_unowned "$PY" -c "$STEP_OWNER_PY" \
-            "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
-        kill "$renewer" 2>/dev/null || true
-        wait "$renewer" 2>/dev/null || true
+        VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \
+            buildlog_exec_unowned "$PY" -c "$STEP_OWNER_PY" \
+                "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
+        stop_token_renewer
         return "$step_status"
     else
         buildlog_exec_unowned "$@"
     fi
 }
 
+# run_once calls this after releasing its reservation and sampler. The guard's
+# private refusal is not a step result: take the token before admitting again.
+# The marker lives in the run's hold folder, removed on every exit path.
+buildlog_retry_unstarted_step() {
+    BUILDLOG_RETRY_STEP=0
+    [[ -s "$HOLD_WAIT_DIR/token-lost" ]] || return 0
+    rm -f "$HOLD_WAIT_DIR/token-lost"
+    BUILDLOG_RETRY_STEP=1
+    TOKEN_HELD=0
+    # The attempt runner discards its peak before the next admission acquires
+    # the token. No scratch file stays behind while that acquisition waits.
+    TOKEN_RETRY_ADMISSION=1
+}
+
 release_token() {
+    stop_token_renewer
     # A step that gave the token back and left for the Mac did so in run()'s
     # subshell; its mark tells this shell the token is no longer held. A step
     # killed as its acquire returned may hold it all the same, so free that.
@@ -2689,6 +2747,13 @@ try_token_now() {
     TOKEN_HELD=1
 }
 
+record_token_wait() {
+    [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
+    if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
+        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+    fi
+}
+
 # The token is for natedev cargo only. A step gives it back while it waits for
 # memory, and takes it again once the gate admits it; a step that leaves the
 # wait for the Mac does not. A token that is not free at once means a wait,
@@ -2706,6 +2771,34 @@ remember_tree_reservation() {
     fi
 }
 
+note_memory_admission() {
+    # Publish only actual memory waits, including subsecond waits identified by
+    # the first-wait file. A hold-only wait must still record zero memory wait.
+    if [[ -n "${BUILDLOG_MEM_WAIT_SINCE:-}" || -s "${BUILDLOG_MEM_WAIT_FIRST_FILE:-}" ]] \
+            || (( BUILDLOG_MEM_WAIT_S > 0 )); then
+        BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM
+    fi
+    remember_tree_reservation
+}
+
+admit_with_token() {
+    local waited=0
+    while :; do
+        acquire_token || return $?
+        waited=$(( waited + TOKEN_WAITED ))
+        # The Mac claim hook and every poll share this admission's heartbeat.
+        with_token_renewal buildlog_wait_for_memory_only "$@" || return $?
+        note_memory_admission
+        [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || break
+        if [[ "${TOKEN_USED}" -eq 0 ]] || renew_token; then break; fi
+        # Ownership was lost before any command ran. Never wait for the token
+        # with a memory promise that could prevent its new holder from running.
+        buildlog_release_memory 0
+        TOKEN_HELD=0
+    done
+    TOKEN_WAITED=$waited
+}
+
 buildlog_wait_for_memory() {
     local stat fields=()
     if [[ -n "${TREE_WATCH_DIR:-}" && -r "/proc/${BASHPID:-$$}/stat" ]]; then
@@ -2715,41 +2808,29 @@ buildlog_wait_for_memory() {
             "${BASHPID:-$$}" "${fields[19]}" >> "$TREE_WATCH_DIR/waiters"
     fi
     step_state waiting_hold
-    if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
-        : > "${TOKEN_WAIT_FILE}.given_back"
-    fi
-    buildlog_wait_for_memory_only "$@" || return $?
-    # Publish an actual memory wait to run_once as well as later admission
-    # passes. An immediate grant must not turn a later build hold into memory
-    # wait; the call file also identifies waits shorter than one second.
-    if [[ -n "${BUILDLOG_MEM_WAIT_SINCE:-}" || -s "${BUILDLOG_MEM_WAIT_FIRST_FILE:-}" ]] \
-            || (( BUILDLOG_MEM_WAIT_S > 0 )); then
-        BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM
-    fi
-    remember_tree_reservation
-    [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
     TOKEN_WAITED=0
-    if ! try_token_now; then
-        buildlog_release_memory 0
-        acquire_token || return $?
-        # The second pass reports the whole wait from its first start.
+    if [[ "${TOKEN_RETRY_ADMISSION:-0}" -eq 1 ]]; then
+        TOKEN_RETRY_ADMISSION=0
+        admit_with_token "$@" || return $?
+    else
+        if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
+            : > "${TOKEN_WAIT_FILE}.given_back"
+        fi
         buildlog_wait_for_memory_only "$@" || return $?
-        if [[ -n "${BUILDLOG_MEM_WAIT_SINCE:-}" || -s "${BUILDLOG_MEM_WAIT_FIRST_FILE:-}" ]] \
-                || (( BUILDLOG_MEM_WAIT_S > 0 )); then
-            BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM
-        fi
-        remember_tree_reservation
-        if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
-            if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
-                : > "${TOKEN_WAIT_FILE}.given_back"
-            fi
-            return 0
+        note_memory_admission
+        [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
+        if ! try_token_now; then
+            buildlog_release_memory 0
+            admit_with_token "$@" || return $?
         fi
     fi
-    [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
-    if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
-        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
+    if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then
+        if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
+            : > "${TOKEN_WAIT_FILE}.given_back"
+        fi
+        return 0
     fi
+    record_token_wait
     step_state on_natedev
 }
 
@@ -2795,14 +2876,11 @@ build_hold_wait_local() {
     if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then
         : > "${TOKEN_WAIT_FILE}.given_back"
     fi
-    build_hold_wait_local_only "$@" || status=$?
+    with_token_renewal build_hold_wait_local_only "$@" || status=$?
     phase_wait_finish hold
     [[ "$status" == 0 ]] || return "$status"
     acquire_token || return $?
-    [[ -z "${TOKEN_WAIT_FILE:-}" ]] || rm -f "${TOKEN_WAIT_FILE}.given_back"
-    if (( TOKEN_WAITED > 0 )) && [[ -n "${TOKEN_WAIT_FILE:-}" ]]; then
-        printf '%s\n' "$TOKEN_WAITED" >> "$TOKEN_WAIT_FILE"
-    fi
+    record_token_wait
     if [[ "$TEST_BUILD_INPUTS_READY" == 1 ]]; then refresh_test_build_inputs; fi
     return "$status"
 }
