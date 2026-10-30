@@ -65,7 +65,8 @@ TEST_SUITES = (
     "mac_test", "usage", "bevy_upgrade", "bevy_migration_plan", "production", "direct", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
     "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "issue_score",
-    "hierarchies",
+    "hierarchies", "release", "claude_to_codex", "new_rust_project", "validate_and_push",
+    "exclude", "prioritize",
 )
 DEFAULT_MEMORY_CAP_MIB = 4096
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
@@ -169,6 +170,11 @@ class RunningGateJob:
     log: Path
     # Set when the runner kills the job for its memory or time limit.
     killed_for: str = ""
+    module: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.module:
+            self.module = self.path.name
 
 
 @dataclass
@@ -462,10 +468,16 @@ def one_minute_load() -> float:
     return float(Path("/proc/loadavg").read_text().split()[0])
 
 
-def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float]) -> list[tuple[str, Path]]:
+def test_module_name(repo: Path, suite: str, path: Path) -> str:
+    root = repo / "scripts" / suite
+    return str(path.relative_to(root)) if path.is_relative_to(root) else path.name
+
+
+def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
+                 repo: Path) -> list[tuple[str, Path]]:
     """`modules` in start order: modules with no recorded time first, then the slowest recorded first."""
-    return sorted(modules, key=lambda item: (f"{item[0]}/{item[1].name}" in timings,
-                                             -timings.get(f"{item[0]}/{item[1].name}", 0)))
+    return sorted(modules, key=lambda item: (f"{item[0]}/{test_module_name(repo, *item)}" in timings,
+                                             -timings.get(f"{item[0]}/{test_module_name(repo, *item)}", 0)))
 
 
 def in_builds_slice() -> bool:
@@ -508,7 +520,8 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     except BaseException:
         output.close()
         raise
-    return RunningGateJob(suite, path, process, started, output, log)
+    module = test_module_name(repo, suite, path)
+    return RunningGateJob(suite, path, process, started, output, log, module=module)
 
 
 def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str, str]:
@@ -542,7 +555,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     marker = job.log.parent / "build-tool-calls.jsonl"
     calls = [cast(list[str], json.loads(line)) for line in marker.read_text().splitlines()] if marker.exists() else []
     for call in calls:
-        captured += f"\n{job.path.name}: a test started real {Path(call[0]).name}: {shlex.join(call[1:])}\n"
+        captured += f"\n{job.module}: a test started real {Path(call[0]).name}: {shlex.join(call[1:])}\n"
     memory_marker = job.log.parent / "live-memory-reads.jsonl"
     readings = memory_marker.read_text(errors="replace").splitlines() if memory_marker.exists() else []
     for line in readings:
@@ -558,7 +571,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
             detail = f"{path}: {shlex.join(cast(list[str], argv))}"
         except ValueError:
             detail = f"(unreadable record): {line}"
-        captured += f"\n{job.path.name}: a test read live memory {detail}\n"
+        captured += f"\n{job.module}: a test read live memory {detail}\n"
     shutil.rmtree(job.log.parent)
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"
@@ -570,7 +583,7 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     tripwire_tripped = bool(calls or readings)
     if tripwire_tripped:
         status = 1
-    return GateJobResult(job.suite, job.path.name, status, seconds, captured, job.killed_for, tripwire_tripped)
+    return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for, tripwire_tripped)
 
 
 @dataclass(frozen=True)
@@ -718,6 +731,12 @@ def report_selection(selection: AffectedSelection | FullSuite, total: int) -> No
     print(f"Tree-scanning modules: {len(selection.tree_scanners)} (always affected)", flush=True)
 
 
+def discover_test_modules(repo: Path) -> list[tuple[str, Path]]:
+    """Find every suite module, including tests in nested directories."""
+    return [(suite, path) for suite in TEST_SUITES
+            for path in sorted((repo / "scripts" / suite).rglob("test_*.py"))]
+
+
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -731,8 +750,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
-    modules = [(suite, path) for suite in TEST_SUITES
-               for path in sorted((repo / "scripts" / suite).glob("test_*.py"))]
+    modules = discover_test_modules(repo)
     missing = [suite for suite in TEST_SUITES if not any(name == suite for name, _ in modules)]
     if missing:
         raise GateRefused(f"suites have no test modules: {', '.join(missing)}")
@@ -771,7 +789,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     slow_modules: list[str] = []
     history_path = gate_state_dir() / "module_history.json"
     history = read_history(history_path)
-    pending = deque(module_order(modules, timings) if not reused else [])
+    pending = deque(module_order(modules, timings, repo) if not reused else [])
     running: list[RunningGateJob] = []
     results: list[GateJobResult] = []
     first_runs: dict[tuple[str, str], GateJobResult] = {}
@@ -806,13 +824,13 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                             types_peak_mib = max(types_peak_mib, measured)
                         elif measured > largest_module_peak_mib:
                             largest_module_peak_mib = measured
-                            largest_module = f"{job.suite}/{job.path.name}"
+                            largest_module = f"{job.suite}/{job.module}"
                         if measured > memory_cap_mib and not job.killed_for:
                             # Admission cannot stop a job that grows after it starts; on 2026-10-18 one
                             # module grew to 28 GiB in 56 minutes and filled natedev's swap.
                             job.killed_for = (f"killed: sampled memory {measured / 1024:.3f} GiB is over the "
                                               + f"{memory_cap_mib / 1024:.3f} GiB cap")
-                            print(f"{job.suite}/{job.path.name} {job.killed_for}", flush=True)
+                            print(f"{job.suite}/{job.module} {job.killed_for}", flush=True)
                             kill_job_group(job)
                 while (pending and len(running) < max_running_jobs
                        and admission.admits(bool(running)) and (not rerunning or not running)):
@@ -841,7 +859,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     status = job.process.poll()
                     if status is None and not job.killed_for and time.monotonic() - job.started >= module_time_limit_s:
                         job.killed_for = f"killed: still running after {module_time_limit_s:g} s, the module time limit"
-                        print(f"{job.suite}/{job.path.name} {job.killed_for}", flush=True)
+                        print(f"{job.suite}/{job.module} {job.killed_for}", flush=True)
                         kill_job_group(job)
                         status = job.process.poll()
                     if status is None:
@@ -851,13 +869,13 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     admission.release(job.process.pid)
                     if status < 0 and not job.killed_for and not result.tripwire_tripped and not hold.admits():
                         pending.appendleft((job.suite, job.path))
-                        print(f"{job.suite}/{job.path.name}: stopped during a natedev hold; queued again", flush=True)
+                        print(f"{job.suite}/{job.module}: stopped during a natedev hold; queued again", flush=True)
                         continue
                     if job.suite == "types":
                         if not job.killed_for and types_peak_mib:
                             types_peaks[types_key] = types_peak_mib
                     elif not rerunning:
-                        key, seconds = f"{job.suite}/{job.path.name}", result.seconds
+                        key, seconds = f"{job.suite}/{job.module}", result.seconds
                         past = history.get(key) or ([timings[key]] if key in timings else [])
                         if past and slower_than_recorded(seconds, statistics.median(past)):
                             slow_modules.append(f"{key} {seconds:.0f} s, median of the last {len(past)} runs "
