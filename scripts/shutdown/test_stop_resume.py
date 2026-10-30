@@ -4,6 +4,8 @@ import io
 import os
 import shlex
 import signal
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -39,6 +41,7 @@ class StopResumeTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "", "SHUTDOWN_STATE_DIR": str(self.root / "shutdown")})))
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="agents"))
         _ = self.enterContext(patch.object(herdr, "Herdr", return_value=self.client))
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
@@ -57,11 +60,28 @@ class StopResumeTests(unittest.TestCase):
         """What the pane's shell parses from the one line herdr types."""
         return (*arguments[:3], *shlex.split(arguments[3]))
 
+    def add_beta(self) -> None:
+        second = pane_record.launch("w1:p4", "sid-beta", str(self.root),
+            {"CLAUDE_CONFIG_DIR": self.entry["config_dir"]}, ["claude", "-n", "beta", "--model", "opus"])
+        self.client.rows.append({"pane_id": "w1:p4", "label": "beta", "workspace_id": "w1",
+                                 "agent_session": {"kind": "id", "value": "sid-beta"}})
+        pane_record.write("agents", second)
+
     def test_a_stopped_tab_resumes_by_id_or_label_from_its_launch_entry(self) -> None:
         self.client.rows[0]["agent_session"] = None
         for session in ("sid-alpha", "alpha"):
             self.assertEqual(stop_resume.resume(session, why="maintenance"), stop_resume.Resumed("sid-alpha", "w1:p2", "claude3"))
         self.assertEqual(stop_resume.resume("sid-other", why="maintenance"), stop_resume.SessionNotFound("sid-other"))
+
+    def test_a_new_session_herdr_has_no_id_for_is_found_through_the_launches_read_first(self) -> None:
+        self.client.rows[0]["agent_session"] = None
+        pane_record.record_path("agents").unlink()
+        def seed(_session: str) -> int:
+            pane_record.write("agents", self.entry)
+            return 0
+        self.seed.side_effect = seed
+        self.assertEqual(stop_resume.move_sessions(["alpha"], "claude4", why="limit"),
+                         [stop_resume.Resumed("sid-alpha", "w1:p2", "claude4")])
 
     def test_launches_are_read_while_claude_runs_before_any_stop(self) -> None:
         order: list[str] = []
@@ -80,6 +100,10 @@ class StopResumeTests(unittest.TestCase):
 
     def test_stop_sends_term_then_kill_to_the_same_claude_and_writes_nothing(self) -> None:
         self.live.return_value = sessions.LiveSessionProcess(123)
+        def signal_delivered(_pid: int, sig: int) -> None:
+            if sig == signal.SIGKILL:
+                self.live.return_value = sessions.SessionNotLive()
+        self.kill.side_effect = signal_delivered
         before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
         self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("sid-alpha", 123))
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
@@ -94,6 +118,70 @@ class StopResumeTests(unittest.TestCase):
                 self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123), final]
                 self.assertEqual(stop_resume.stop("sid-alpha"), stop_resume.Stopped("sid-alpha", 123))
                 self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
+
+    def test_stop_confirms_exit_after_kill(self) -> None:
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        self.process.side_effect = [sessions.LiveSessionProcess(123)] * 3 + [sessions.SessionNotLive()]
+        self.assertEqual(stop_resume.stop("alpha"), stop_resume.Stopped("sid-alpha", 123))
+        self.assertEqual(self.process.call_count, 4)
+        self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
+
+    def test_a_process_still_alive_after_kill_fails_and_never_resumes(self) -> None:
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        with patch.object(stop_resume, "monotonic", side_effect=[10.0, 10.0, 15.0]):
+            result = stop_resume.move("alpha", "claude4", why="limit")
+        self.assertIsInstance(result, stop_resume.StopFailed)
+        assert isinstance(result, stop_resume.StopFailed)
+        self.assertIn("123", result.reason)
+        self.assertIn("SIGKILL", result.reason)
+        self.start.assert_not_called()
+
+    def test_self_move_hands_off_the_whole_batch_without_signalling(self) -> None:
+        self.add_beta()
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform), patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-alpha"}), patch.object(sys, "platform", platform), patch.object(subprocess, "run", return_value=subprocess.CompletedProcess[str]([], 0, "", "")) as run, patch.object(subprocess, "Popen") as popen:
+                self.client.rows[0]["agent_session"] = None
+                result = stop_resume.move_sessions(["beta", "alpha"], "claude4", why="limit", warn_seconds=3)
+                self.assertEqual(result, [stop_resume.MoveHandedOff("sid-beta"), stop_resume.MoveHandedOff("sid-alpha")])
+                invocation = run.call_args if platform == "linux" else popen.call_args
+                self.assertIsNotNone(invocation)
+                assert invocation is not None
+                argv = cast(list[str], invocation.args[0])
+                if platform == "linux":
+                    self.assertEqual(argv[:5], ["systemd-run", "--user", "--collect", "--quiet", "--no-block"])
+                    self.assertIn("CLAUDE_CODE_SESSION_ID", argv)
+                else:
+                    self.assertTrue(cast(bool, invocation.kwargs["start_new_session"]))
+                self.assertNotIn("CLAUDE_CODE_SESSION_ID", cast(dict[str, str], invocation.kwargs["env"]))
+                self.assertEqual(cast(object, invocation.kwargs["stdin"]), subprocess.DEVNULL)
+                self.assertIn("batch", argv)
+                self.assertEqual(argv[argv.index("--target") + 1], "claude4")
+                self.assertEqual(argv[-2:], ["beta", "alpha"])
+        self.kill.assert_not_called()
+        self.start.assert_not_called()
+
+    def test_detached_batch_uses_the_same_moves_and_logs_each_member(self) -> None:
+        log = self.root / "batch.log"
+        self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123),
+                                 sessions.SessionNotLive(), sessions.SessionNotLive()]
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-alpha"}), patch.object(subprocess, "run") as run, patch.object(subprocess, "Popen") as popen:
+            result = stop_resume.main(["batch", "--target", "claude4", "--why", "limit", "--log", str(log), "alpha", "missing"])
+        self.assertEqual(result, 1)
+        self.assertEqual(len(log.read_text().splitlines()), 2)
+        self.assertIn('"result": "Resumed"', log.read_text())
+        self.assertIn('"result": "SessionNotFound"', log.read_text())
+        self.start.assert_called_once()
+        self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
+        self.seed.assert_called_once()
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_failed_handoff_reports_failure_without_signalling(self) -> None:
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-alpha"}), patch.object(sys, "platform", "linux"), patch.object(subprocess, "run", side_effect=OSError("service manager unavailable")):
+            result = stop_resume.move_sessions(["alpha"], "claude4", why="limit")
+        self.assertEqual(result, [stop_resume.StopFailed("alpha", "cannot hand off move: service manager unavailable")])
+        self.kill.assert_not_called()
+        self.start.assert_not_called()
 
     def test_reused_pid_generation_is_checked_before_each_signal(self) -> None:
         for changed_before_term in (True, False):
@@ -183,11 +271,7 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.client.closed, [])
 
     def test_batch_stops_all_before_any_resume_and_uses_each_own_pane(self) -> None:
-        second = pane_record.launch("w1:p4", "sid-beta", str(self.root),
-            {"CLAUDE_CONFIG_DIR": self.entry["config_dir"]}, ["claude", "-n", "beta", "--model", "opus"])
-        self.client.rows.append({"pane_id": "w1:p4", "label": "beta", "workspace_id": "w1",
-                                 "agent_session": {"kind": "id", "value": "sid-beta"}})
-        pane_record.write("agents", second)
+        self.add_beta()
         both_stopping = Barrier(2, timeout=3)
         both_resuming = Barrier(2, timeout=3)
         stopped: list[str] = []

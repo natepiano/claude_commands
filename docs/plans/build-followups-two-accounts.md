@@ -58,7 +58,7 @@ Everything else is a symlink into `~/.claude`: `settings.json`, `CLAUDE.md`, `co
 
 **Calls I made (each a one-line revert):**
 
-- Showrunners, top-level sessions, the fix pipeline and the `send.py` relay stay on `~/.claude`'s login. The nightly review ran there too until 2026-10-11, when it moved to the unit role's account (Phase 7). Only units get a role account, because they spend about 70% and they are the sessions that can be stopped safely and resumed.
+- Showrunners, top-level sessions and the `send.py` relay stay on `~/.claude`'s login. The nightly review ran there too until 2026-10-11, when it moved to the unit role's account (Phase 7). Only units get a role account, because they spend about 70% and they are the sessions that can be stopped safely and resumed.
 - A swap reuses `/shutdown`'s safe stop and resume instead of moving each unit at its next checkpoint.
 - The Mac is out of scope: units launch only on natedev (`add_unit.py` used `systemd-run` and tmux then; it now starts each unit in its own herdr session). Mac sessions stay on `~/.claude`.
 - A long-lived `CLAUDE_CODE_OAUTH_TOKEN` per launch is ruled out: such a token "can't establish Remote Control sessions", and every unit runs with `--remote-control`.
