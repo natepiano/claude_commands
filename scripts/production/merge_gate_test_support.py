@@ -17,6 +17,8 @@ import time
 from typing import ClassVar, ParamSpec, TypedDict, cast, override
 import unittest
 from unittest import mock
+from scripts.lint import memory_admit
+from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.production import merge_gate
 from scripts.production.cli_fixture import invoke_cli
 from scripts.direct.wait_for_test_state import wait_until
@@ -239,6 +241,15 @@ def wait_for_file(path: Path) -> None:
     wait_until(path.exists, path.parent, timeout=TEST_HANG_GUARD_SECS)
 
 
+def observe_result[**Parameters, Result](function: Callable[Parameters, Result],
+                                       observe: Callable[[Result], None]) -> Callable[Parameters, Result]:
+    def observed(*args: Parameters.args, **kwargs: Parameters.kwargs) -> Result:
+        result = function(*args, **kwargs)
+        observe(result)
+        return result
+    return observed
+
+
 @dataclass(frozen=True)
 class GateFixtureSeed:
     snapshot: Path
@@ -344,6 +355,78 @@ class MergeGateFixture(unittest.TestCase):
             "NOTIFIER_STATE_DIR": str(home / "notifier"), "CLAUDE_CODE_SESSION_ID": "fixture-showrunner",
         }
         self.environment["MERGE_GATE_TEST_PYTHONPATH"] = self.environment.get("PYTHONPATH", "")
+        readings = root / "memory"
+        readings.mkdir(exist_ok=True)
+        self.environment.update(fake_memory_readings(readings))
+        self.environment.update({
+            "BUILDLOG_DIR": str(root / "buildlog"), "BUILDLOG_BUILD_BUDGET_GIB": "21",
+            "BUILDLOG_JOBSERVER_FIFO": str(root / "jobserver"),
+            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "merge-gate",
+            "NOTIFIER_SESSIONS_DIR": str(home / "sessions"),
+        })
+        # The seed is copied with copytree; create the FIFO only in restored cases.
+        if self.origin.exists():
+            os.mkfifo(self.environment["BUILDLOG_JOBSERVER_FIFO"])
+            descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
+            self.addCleanup(os.close, descriptor)
+            _ = os.write(descriptor, b"+" * 31)
+
+    def jobserver_tokens(self) -> bytes:
+        """Read the private pool without changing the available slots."""
+        descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
+        try:
+            try:
+                tokens = os.read(descriptor, 4096)
+            except BlockingIOError:
+                tokens = b""
+            if tokens:
+                self.assertEqual(os.write(descriptor, tokens), len(tokens))
+            return tokens
+        finally:
+            os.close(descriptor)
+
+    def supply_jobserver(self, tokens: bytes) -> None:
+        descriptor = os.open(self.environment["BUILDLOG_JOBSERVER_FIFO"], os.O_RDWR | os.O_NONBLOCK)
+        try:
+            try:
+                _ = os.read(descriptor, 4096)
+            except BlockingIOError:
+                pass
+            if tokens:
+                self.assertEqual(os.write(descriptor, tokens), len(tokens))
+        finally:
+            os.close(descriptor)
+
+    @property
+    def admission_directory(self) -> Path:
+        return Path(self.environment["BUILDLOG_DIR"]) / "admission"
+
+    def gate_history(self) -> list[dict[str, object]]:
+        path = self.admission_directory / "anon_peaks.jsonl"
+        return [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def occupy_memory_queue(self) -> Path:
+        self.admission_directory.mkdir(parents=True, exist_ok=True)
+        with mock.patch.dict(os.environ, self.environment):
+            start = memory_admit.process_start_time(os.getpid())
+        self.assertIsNotNone(start)
+        row: memory_admit.Reservation = {
+            "pid": os.getpid(), "start_time": start or "", "need": 21 * memory_admit.GIB,
+            "repo": "busy", "step": "nextest", "worktree": "busy", "sidecar": "",
+            "admitted_at": memory_admit.store.utc_iso(time.time()), "test_threads": None, "call_id": None,
+        }
+        path = self.admission_directory / "busy.reservation"
+        self.write(path, json.dumps(row))
+        return path
+
+    def assert_gate_released(self) -> None:
+        for suffix in ("reservation", "waiting", "max", "wave"):
+            self.assertEqual(list(self.admission_directory.glob("*." + suffix)), [], suffix)
+
+    @contextlib.contextmanager
+    def observing_admission(self, observe: Callable[[memory_admit.CheckResult], None]) -> Generator[None]:
+        with mock.patch.object(memory_admit, "check", side_effect=observe_result(memory_admit.check, observe)):
+            yield
 
     def build_fixture(self, root: Path) -> None:
         self.bind_fixture(root)
