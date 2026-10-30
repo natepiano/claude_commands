@@ -13,7 +13,6 @@ from unittest import mock
 
 from scripts.production import staff, staff_move, staff_sources
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase
-import herdr
 import unit_lookup
 
 
@@ -64,14 +63,9 @@ class StaffMoveTests(StaffTestCase):
         self.reply(["workspace", "list"], {"workspaces": [
             {"workspace_id": "w1", "label": "tools"}, {"workspace_id": "w2", "label": "new-tools"},
         ]})
-        self.responses["--session agents pane list"] = [
-            {"code": 0, "stdout": json.dumps({"result": {"panes": [
-                {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1"},
-            ]}})},
-            {"code": 0, "stdout": json.dumps({"result": {"panes": [
-                {"pane_id": "w1:p1", "workspace_id": "w2", "tab_id": "w2:t2"},
-            ]}})},
-        ]
+        self.reply(["pane", "list"], {"panes": [
+            {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "panes"},
+        ]})
         self.reply(["pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"], {
             "move_result": {"created_tab": {"tab_id": "w2:t2"}, "pane": {"pane_id": "w1:p1"}},
         })
@@ -83,14 +77,25 @@ class StaffMoveTests(StaffTestCase):
             {"tab_id": "w1:t0", "workspace_id": "w1", "label": "tools"},
             {"tab_id": "w2:t2", "workspace_id": "w2", "label": "panes"},
         ]})
-        marked = unit_lookup.MarkedUnit("models-unit", unit_lookup.LiveClaude("panes", "director-session", "", 101),
-                                        herdr.HerdrPlace("agents", "w1:p1"))
-        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", return_value=marked))
 
-    def reply(self, arguments: list[str], result: dict[str, object]) -> None:
+    def reply(self, arguments: list[str], result: dict[str, object], *, code: int = 0, stderr: str = "") -> None:
+        if self.responses_path.exists():
+            self.responses = cast(dict[str, object], json.loads(self.responses_path.read_text()))
         self.responses[" ".join(["--session", "agents", *arguments])] = {
-            "stdout": json.dumps({"result": result}), "code": 0,
+            "stdout": json.dumps({"result": result}), "code": code, "stderr": stderr,
         }
+        move = self.responses.get("--session agents pane move w1:p1 --new-tab --workspace w2")
+        if isinstance(move, dict):
+            move = cast(dict[str, object], move)
+            after = {**self.responses, "--session agents pane list": {"code": 0, "stdout": json.dumps({"result": {
+                "panes": [{"pane_id": "w1:p1", "workspace_id": "w2", "tab_id": "w2:t2", "label": self.unit.name}],
+            }})}}
+            moved = {key: value for key, value in move.items() if key != "write_files"}
+            after["--session agents pane move w1:p1 --new-tab --workspace w2"] = moved
+            if move["code"] == 0:
+                move["write_files"] = {str(self.responses_path): json.dumps(after)}
+            else:
+                _ = move.pop("write_files", None)
         self.write_json(self.responses_path, self.responses)
 
     def commands(self) -> list[list[str]]:
@@ -107,7 +112,7 @@ class StaffMoveTests(StaffTestCase):
         self.assertEqual(staff.snapshot(), replace(before, rows=tuple(
             result.row if row.id == self.unit.id else row for row in before.rows)))
         self.assertEqual(self.commands(), [["--session", "agents", *arguments] for arguments in (
-            ["pane", "process-info", "--pane", "w1:p1"], ["pane", "list"], ["workspace", "list"],
+            ["pane", "list"], ["pane", "list"], ["workspace", "list"],
             ["workspace", "list"],
             ["pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"], ["tab", "rename", "w2:t2", "panes"],
             ["workspace", "list"], ["tab", "list", "--workspace", "w2"], ["workspace", "list"], ["tab", "list"],
@@ -127,6 +132,7 @@ class StaffMoveTests(StaffTestCase):
         self.assertEqual(sum(command[2:4] == ["pane", "move"] for command in self.commands()), 1)
 
     def test_no_live_pane_keeps_parent_change_and_reports_the_unmoved_tab_once(self) -> None:
+        self.reply(["pane", "list"], {"panes": []})
         with mock.patch.object(unit_lookup, "marked_unit", return_value=None):
             with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
                 code = staff.main(["move", "sdlc/models-unit", "target"])
@@ -134,7 +140,50 @@ class StaffMoveTests(StaffTestCase):
         self.assertEqual(staff.by_id(self.unit.id), replace(self.unit, parent=self.destination.id))
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertIn("tab was not moved", output.getvalue())
-        self.assertEqual(self.commands(), [])
+        self.assertEqual(self.commands(), [["--session", "agents", "pane", "list"]])
+
+    def test_pane_exiting_after_lookup_keeps_parent_change_and_reports_no_live_tab(self) -> None:
+        command = "--session agents pane list"
+        self.responses[command] = [self.responses[command], {
+            "code": 0, "stdout": json.dumps({"result": {"panes": []}}),
+        }]
+        self.write_json(self.responses_path, self.responses)
+        with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            code = staff.main(["move", "sdlc/models-unit", "target"])
+        self.assertEqual(code, 0, errors.getvalue())
+        self.assertEqual(staff.by_id(self.unit.id), replace(self.unit, parent=self.destination.id))
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertIn("tab was not moved (no live pane)", output.getvalue())
+        self.assertEqual(self.commands(), [["--session", "agents", "pane", "list"]] * 2)
+
+    def test_hand_resumed_unmarked_director_moves_by_its_pane_label(self) -> None:
+        self.reply(["pane", "list"], {"panes": [
+            {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "panes"},
+        ]})
+        with mock.patch.object(unit_lookup, "marked_unit", return_value=None) as marks:
+            result = staff_move.move_unit("sdlc", "models-unit", "target")
+        marks.assert_not_called()
+        self.assertIsInstance(result.tab, staff_move.TabMoved)
+        self.assertEqual(result.row.parent, self.destination.id)
+        self.assertIn(["--session", "agents", "pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"],
+                      self.commands())
+        self.assertFalse(any(command[2:4] in (["pane", "process-info"], ["pane", "close"], ["agent", "start"])
+                             for command in self.commands()))
+
+    def test_hand_resumed_tab_moves_on_retry_after_parent_already_changed(self) -> None:
+        _ = staff.move(self.unit.id, self.destination.id)
+        before = self.staff_file.read_bytes()
+        self.reply(["pane", "list"], {"panes": [
+            {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "panes"},
+        ]})
+        with mock.patch.object(unit_lookup, "marked_unit", return_value=None) as marks:
+            result = staff_move.move_unit("sdlc", "models-unit", "target")
+        marks.assert_not_called()
+        self.assertFalse(result.membership_changed)
+        self.assertIsInstance(result.tab, staff_move.TabMoved)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertIn(["--session", "agents", "pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"],
+                      self.commands())
 
     def test_exec_launched_director_moves_while_its_process_stays_running(self) -> None:
         self.reply(["pane", "process-info", "--pane", "w1:p1"], {"process_info": {"shell_pid": 101}})
@@ -152,6 +201,9 @@ class StaffMoveTests(StaffTestCase):
             "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
         })
         self.members["unit"] = staff.rename(self.unit.id, "models")
+        self.reply(["pane", "list"], {"panes": [
+            {"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "label": "models"},
+        ]})
         self.reply(["tab", "rename", "w2:t2", "models"], {})
         self.reply(["tab", "list", "--workspace", "w2"], {"tabs": [
             {"tab_id": "w2:t2", "label": "models"},
@@ -250,36 +302,27 @@ class StaffMoveTests(StaffTestCase):
         self.assertEqual(self.commands(), [])
 
     def test_retry_finishes_tab_title_after_move_already_succeeded(self) -> None:
-        command = "--session agents tab rename w2:t2 panes"
-        successful = self.responses[command]
-        self.responses[command] = {"stdout": "", "stderr": "rename refused", "code": 1}
+        self.reply(["tab", "rename", "w2:t2", "panes"], {}, code=1, stderr="rename refused")
         self.reply(["tab", "list", "--workspace", "w2"], {"tabs": [
             {"tab_id": "w2:t2", "label": "untitled"},
         ]})
         with self.assertRaisesRegex(staff.StaffUnreadable, "rename refused"):
             _ = staff_move.move_unit("sdlc", "models-unit", "target")
         before = self.staff_file.read_bytes()
-        self.responses[command] = successful
-        self.write_json(self.responses_path, self.responses)
+        self.reply(["tab", "rename", "w2:t2", "panes"], {})
         _ = staff_move.move_unit("sdlc", "models-unit", "target")
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertEqual(sum(item[2:4] == ["pane", "move"] for item in self.commands()), 1)
         self.assertEqual(self.commands()[-1], ["--session", "agents", "tab", "rename", "w2:t2", "panes"])
 
     def test_retry_after_tab_failure_reconciles_tab_without_repeating_staff_change(self) -> None:
-        command = "--session agents pane move w1:p1 --new-tab --workspace w2"
-        successful = self.responses[command]
-        self.responses[command] = {"stdout": "", "stderr": "move refused", "code": 1}
-        panes = self.responses["--session agents pane list"]
-        assert isinstance(panes, list)
-        # The failed command did not move the pane; keep discovery in the original workspace.
-        self.responses["--session agents pane list"] = panes[0]
-        self.write_json(self.responses_path, self.responses)
+        self.reply(["pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"], {}, code=1, stderr="move refused")
         with self.assertRaisesRegex(staff.StaffUnreadable, "tab was not moved"):
             _ = staff_move.move_unit("sdlc", "models-unit", "target")
         before = self.staff_file.read_bytes()
-        self.responses[command] = successful
-        self.write_json(self.responses_path, self.responses)
+        self.reply(["pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"], {
+            "move_result": {"created_tab": {"tab_id": "w2:t2"}, "pane": {"pane_id": "w1:p1"}},
+        })
         result = staff_move.move_unit("sdlc", "models-unit", "target")
         self.assertFalse(result.membership_changed)
         self.assertIsInstance(result.tab, staff_move.TabMoved)
@@ -291,7 +334,7 @@ class StaffMoveTests(StaffTestCase):
         result = staff_move.move_unit("sdlc", "models-unit", "target")
         self.assertIsInstance(result.tab, staff_move.TabAlreadyPlaced)
         self.assertEqual(self.commands()[previous_commands:], [["--session", "agents", *arguments] for arguments in (
-            ["pane", "process-info", "--pane", "w1:p1"], ["pane", "list"], ["workspace", "list"],
+            ["pane", "list"], ["pane", "list"], ["workspace", "list"],
             ["tab", "list", "--workspace", "w2"],
         )])
 
