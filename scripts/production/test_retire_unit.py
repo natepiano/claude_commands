@@ -44,6 +44,9 @@ else:
     import sessions
     from sessions import SessionRecord
 
+from scripts.production.staff_test_support import StaffTestCase
+from scripts.production import staff
+
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
 # The fixture replaces the lookup; a test of the lookup itself puts it back.
 CLAUDE_SESSIONS = retire_unit.claude_sessions
@@ -66,6 +69,7 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
 
 @final
 class RetireUnitTests(unittest.TestCase):
+    staff: StaffTestCase = StaffTestCase()
     root: Path = Path()
     checkout: Path = Path()
     worktree: Path = Path()
@@ -80,6 +84,9 @@ class RetireUnitTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        self.staff = StaffTestCase()
+        self.staff.setUp()
+        self.addCleanup(self.staff.doCleanups)
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         origin = self.root / "origin.git"
         _ = subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
@@ -269,6 +276,45 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_live_director_in_pane_shell_stops_closes_and_retires(self) -> None:
         self.pane_shell_completes(live=True)
+
+    def staff_unit(self) -> tuple[staff.StaffRow, staff.StaffRow]:
+        runner = staff.ensure("showrunner", name="tools")
+        unit = staff.ensure("unit", name="panes", parent=runner.id)
+        self.staff.pane("w1:p1", session_id=DIRECTOR, environment={
+            "STAFF_ID": unit.id, "SHOWRUNNER_UNIT": "alpha", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+        return runner, unit
+
+    def test_retire_unit_keeps_staff_workers_and_reports_each_one(self) -> None:
+        runner, unit = self.staff_unit()
+        worker = staff.ensure("worker", name="impl1", parent=unit.id)
+        code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn(worker.id, output)
+        self.assertIn(worker.name, output)
+        self.assertEqual(staff.by_id(unit.id), unit)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        self.assertEqual(staff.by_id(runner.id), runner)
+        self.assertFalse(self.worktree.exists())
+
+    def test_retire_unit_rerun(self) -> None:
+        runner, unit = self.staff_unit()
+        original = staff.retire
+        for after in (False, True):
+            def interrupted(staff_id: staff.StaffId) -> staff.StaffRow | None:
+                if after:
+                    _ = original(staff_id)
+                raise RuntimeError("stopped at staff retirement")
+            with mock.patch.object(staff, "retire", side_effect=interrupted):
+                with self.assertRaisesRegex(RuntimeError, "stopped at staff retirement"):
+                    _ = self.retire()
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertIsNone(staff.by_id(unit.id))
+        self.assertEqual(staff.by_id(runner.id), runner)
+        data, document = self.staff.staff_file.read_bytes(), self.doc.read_bytes()
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (data, document))
 
     def test_exited_directors_pane_shell_closes_and_retires(self) -> None:
         self.pane_shell_completes(live=False)

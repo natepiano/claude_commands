@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import io
 from contextlib import redirect_stdout
+from dataclasses import FrozenInstanceError
 import os
 import re
 import shlex
@@ -28,6 +29,9 @@ import showrunners
 from sessions import SessionRecord
 from fake_unit_host import HostedUnit
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase
+from scripts.production.rename_test_support import bind_staff_fixture
 
 
 SCRIPT = Path(__file__).with_name("showrunners.py")
@@ -39,7 +43,7 @@ def setUpModule() -> None:
     unittest.enterModuleContext(mock.patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
-class ShowrunnerRegistryTests(unittest.TestCase):
+class ShowrunnerRegistryTests(StaffTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -56,7 +60,7 @@ class ShowrunnerRegistryTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        super().setUp()
         self.config = self.root / "config" / "showrunners.json"
         self.config.parent.mkdir()
         self.notifier = self.root / "notifier"
@@ -90,6 +94,7 @@ for record in records:
         raise SystemExit(0)
 raise SystemExit(1)
 """)
+        bind_staff_fixture(self, self.environment(), {})
 
     def test_adoption_retries_a_partial_file_or_directory_copy(self) -> None:
         for name, directory in (("unit_status", True), ("showrunner_state.json", False)):
@@ -192,7 +197,9 @@ raise SystemExit(1)
                 "TEST_SENT": str(self.sent), "CLAUDE_CODE_SESSION_ID": caller,
                 **fake_unit_host.environment(self.root), "HERDR_PANE_ID": pane}
 
-    def cli(self, *args: str, pane: str = "", caller: str = "") -> subprocess.CompletedProcess[str]:
+    @override
+    def cli(self, *args: str, pane: str = "", caller: str = "", code: int = 0) -> subprocess.CompletedProcess[str]:
+        del code
         return subprocess.run([sys.executable, str(SCRIPT), *args], env=self.environment(pane, caller),
                               capture_output=True, text=True, check=False)
 
@@ -201,9 +208,9 @@ raise SystemExit(1)
         self.assertEqual(result.returncode, 0, (args, result.stdout, result.stderr))
         return result.stdout
 
-    def refused(self, *args: str, caller: str = "") -> str:
+    def refused(self, *args: str, caller: str = "", code: int = 1) -> str:
         result = self.cli(*args, caller=caller)
-        self.assertEqual(result.returncode, 1, (args, result.stdout, result.stderr))
+        self.assertEqual(result.returncode, code, (args, result.stdout, result.stderr))
         self.assertEqual(result.stdout, "")
         return result.stderr
 
@@ -217,6 +224,7 @@ raise SystemExit(1)
                                encoding="utf-8")
         if running:
             _ = self.record(name or slug, f"{slug}-id")
+        _ = staff.ensure("showrunner", name=slug)
 
     def messages(self) -> list[tuple[str, str]]:
         """Each message sent, as the socket it went to and its text."""
@@ -545,11 +553,11 @@ raise SystemExit(1)
         # A child two levels down is told the top of the whole tree, not its own parent.
         self.assertIn("leaf now reports to mid. The root is top:", self.messages()[2][1])
         self.assertIn("mid already reports to top; detach it first", self.refused("attach", "mid", "leaf"))
-        self.assertIn("leaf already reports to top, directly or through others", self.refused("attach", "top", "leaf"))
+        self.assertIn("leaf already reports to top, directly or through others", self.refused("attach", "top", "leaf", code=2))
         self.assertEqual(sorted(path.parent.name for path in self.state.glob("*/parent")), ["leaf", "mid"])
         self.assertEqual(len(self.messages()), 4)
 
-    def test_detach_removes_the_edge_tells_both_and_refuses_a_child_with_none(self) -> None:
+    def test_detach_removes_the_edge_tells_both_and_accepts_a_child_with_none(self) -> None:
         self.showrunner("top")
         self.showrunner("mid")
         _ = self.successful("attach", "mid", "top")
@@ -558,7 +566,7 @@ raise SystemExit(1)
         self.assertFalse((self.state / "mid" / "parent").exists())
         self.assertEqual(self.successful("root", "mid"), "mid\n")
         self.assertIn("mid is a root again", self.messages()[-1][1])
-        self.assertIn("mid reports to no one", self.refused("detach", "mid"))
+        self.assertIn("mid reports to no one", self.successful("detach", "mid"))
 
     def test_a_message_that_could_not_be_sent_is_said_and_the_edge_stands(self) -> None:
         self.showrunner("top")
@@ -570,6 +578,22 @@ raise SystemExit(1)
         self.assertEqual(result.stdout.splitlines(), ["mid now reports to top", "could not tell mid: send.py exited 3",
                                                       "could not tell top: send.py exited 3"])
         self.assertEqual(self.successful("parent", "mid"), "top\n")
+
+    def test_delivery_result_tracks_failed_targets_and_preserves_output_lines(self) -> None:
+        def address(slug: str) -> str:
+            return "session:" + slug
+
+        with mock.patch.object(showrunners, "own_slug", return_value="self"), \
+                mock.patch.object(showrunners, "current_address", side_effect=address), \
+                mock.patch.object(subprocess, "run", side_effect=[
+                    subprocess.CompletedProcess([], 0, "", ""), subprocess.CompletedProcess([], 3, "", "offline")]):
+            delivery = showrunners.tell_others({"self": "skip", "top": "hello", "mid": "hello"}, "notice")
+        self.assertEqual(list(delivery.lines), ["told top", "could not tell mid: offline"])
+        self.assertEqual(delivery.failed, ("mid",))
+        with self.assertRaises(FrozenInstanceError):
+            setattr(delivery, "lines", ())
+        with self.assertRaises(FrozenInstanceError):
+            setattr(delivery, "failed", ())
 
     def test_an_edge_to_a_production_with_no_timer_counts_for_nothing(self) -> None:
         self.showrunner("top")

@@ -276,7 +276,7 @@ class IncompleteShutdownStillLive:
     """The owner is running, so its unfinished shutdown remains unchanged."""
 
 
-INCOMPLETE_PROGRESS = frozenset({"waiting", "ready", "held by usage limit", "reaping", "stopping"})
+INCOMPLETE_PROGRESS = frozenset({"waiting", "ready", "held by usage limit", "reaping", "stopping", "stop failed"})
 
 
 def _recover_incomplete_shutdown(
@@ -291,15 +291,23 @@ def _recover_incomplete_shutdown(
             return IncompleteShutdownRefused(reason)
         case SessionNotLive():
             pass
+    # The session's Claude process is gone, so its stop is done. An unconfirmed
+    # worker pause or cleanup never holds the restart: every thread can resume.
+    gone: SessionProgress = {"kind": "already gone", "at": settle.record_time()}
     if dry_run:
-        return {**saved, "progress": {"kind": "already gone", "at": settle.record_time()}}
-    # The stop path proves worker and host cleanup too, and owns its stopping claim.
-    cleaned = stop_work.stop_session(saved)
-    if cleaned["request_id"] != saved["request_id"]:
+        return {**saved, "progress": gone}
+
+    def mark_gone(current: SessionShutdown) -> None:
+        if current["request_id"] == saved["request_id"] and current["progress"]["kind"] in INCOMPLETE_PROGRESS:
+            current["progress"] = gone
+
+    try:
+        marked = update_session(saved["login"], saved["session"]["session_id"], mark_gone)
+    except NoLiveRecord:
         return IncompleteShutdownRefused("shutdown request changed during recovery")
-    if cleaned["progress"]["kind"] not in RESTARTABLE_PROGRESS or _unfinished_cleanup(cleaned):
-        return IncompleteShutdownRefused("owner cleanup not confirmed: " + cleaned["progress"]["kind"])
-    return cleaned
+    if marked["request_id"] != saved["request_id"] or marked["progress"]["kind"] not in RESTARTABLE_PROGRESS:
+        return IncompleteShutdownRefused("shutdown request changed during recovery")
+    return marked
 
 
 @dataclass(frozen=True)

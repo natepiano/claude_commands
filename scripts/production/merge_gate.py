@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Merge a checkpoint, run the complete gate, then push (and optionally promote).
 
-The default sampled memory cap is 6144 MiB: full-tree basedpyright peaked at 4065 MiB
-on 2026-10-30, so its 4878 MiB reservation did not fit a 4096 MiB cap. A 163-module run with an empty timing
-cache took 102.80 s, peaked at 2.027 GiB, and had a largest module peak of
-0.494 GiB (one-minute load 7.79-16.32). A sample is resident plus swapped memory.
-Each running job keeps a reservation: admission counts max(job memory, largest job peak seen so far, initially 96 MiB)
-plus the runner itself. Startup samples never discard reservations.
+The default sampled memory cap is 6144 MiB. Full-tree basedpyright peaked at
+4065 MiB on 2026-10-30; its reservation is 4878 MiB. A sample is resident plus swapped memory.
+Each job reserves its last recorded peak times 1.2, using records from before this run.
+An unrecorded module reserves the largest recorded module peak times 1.2, or 640 MiB
+without module records. An unrecorded types job reserves 3072 MiB. Admission counts
+the latest aggregate sample, remaining running reservations and the next job's reservation.
 Samples are at least 0.25 seconds apart. One job is always allowed to progress;
 an observed overshoot makes the run red. This is admission on samples, not an
 OS allocation limit; growth between samples can still exceed the cap. A job whose
@@ -62,17 +62,12 @@ from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 
-TEST_SUITES = (
-    "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold", "build_queue",
-    "mac_test", "usage", "bevy_upgrade", "bevy_migration_plan", "production", "direct", "buildlog",
-    "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
-    "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "issue_score",
-    "hierarchies", "release", "claude_to_codex", "new_rust_project", "validate_and_push",
-    "exclude", "prioritize",
-)
+# Full-tree basedpyright peaked at 4065 MiB on 2026-10-30: its 4878 MiB reservation
+# leaves room for modules beside it under this cap.
 DEFAULT_MEMORY_CAP_MIB = 6144
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
-MODULE_MEMORY_MIB = 48
+# The largest measured module was 0.52 GiB; this includes the 1.2 growth margin.
+UNRECORDED_MODULE_RESERVATION_MIB = 640
 # A module still running this long is killed and the run is red: a hung module holds every gate
 # behind it. The slowest measured module took 387 s at load 152 (direct/test_verify_mac_offload.py,
 # 2026-10-18); the limit is about 4.6 times that.
@@ -83,11 +78,9 @@ RELEASE_LOCK_WAIT_S = 60
 # type-check-only venv, so the full tree reports 0/0. The stub date matches the 2026-08-23 sweep;
 # later dates report new diagnostics in bake_textures.py.
 TYPECHECK_REQUIREMENTS = ("pillow==13.0.0", "fake-bpy-module==20260822")
-# basedpyright is one large job, not a module: the full tree peaked at 2.64 GiB (77 s, 2026-10-19)
-# and scripts/production at 0.79 GiB. Admission reserves its last sampled peak for the same dirs,
-# times TYPES_PEAK_MARGIN for growth between samples, or this when none is recorded.
+# An unrecorded type job keeps its own fallback; recorded jobs all use one margin.
 TYPES_MEMORY_MIB = 3072
-TYPES_PEAK_MARGIN = 1.2
+MEMORY_PEAK_MARGIN = 1.2
 # A module this many times slower than the median of its last MODULE_HISTORY_RUNS times, and at least
 # the floor slower, is named in the report. On 2026-10-19 agents/test_codex_mesh.py went from 49 s to
 # 1264 s (four tests each waited a 300 s call timeout) and no line said so. Load alone moved modules
@@ -135,6 +128,20 @@ class GateArguments(argparse.Namespace):
     nightly: bool = False
 
 
+class GateJobKind(Enum):
+    TEST_MODULE = auto()
+    TYPE_CHECK = auto()
+
+
+@dataclass(frozen=True)
+class GateJobRequest:
+    """A job to start, with its original path retained for holds and retries."""
+    suite: str
+    path: Path
+    module: str
+    kind: GateJobKind = GateJobKind.TEST_MODULE
+
+
 @dataclass(frozen=True)
 class GateJobResult:
     suite: str
@@ -144,6 +151,7 @@ class GateJobResult:
     output: str
     killed_for: str = ""
     tripwire_tripped: bool = False
+    kind: GateJobKind = GateJobKind.TEST_MODULE
 
 
 @dataclass(frozen=True)
@@ -170,25 +178,35 @@ class RunningGateJob:
     started: float
     output: TextIO
     log: Path
+    module: str
     # Set when the runner kills the job for its memory or time limit.
     killed_for: str = ""
-    module: str = ""
+    peak_memory_mib: float = 0.0
+    kind: GateJobKind = GateJobKind.TEST_MODULE
 
-    def __post_init__(self) -> None:
-        if not self.module:
-            self.module = self.path.name
+
+@dataclass(frozen=True)
+class RecordedJobPeaks:
+    """Peaks from before this run, used to size every job's reservation."""
+    modules_mib: dict[str, float]
+    types_mib: dict[str, float]
+    types_key: str
+
+    def reservation_mib(self, job: GateJobRequest) -> float:
+        if job.kind is GateJobKind.TYPE_CHECK:
+            peaks, key, fallback_mib = self.types_mib, self.types_key, float(TYPES_MEMORY_MIB)
+        else:
+            peaks, key = self.modules_mib, f"{job.suite}/{job.module}"
+            fallback_mib = max(peaks.values()) * MEMORY_PEAK_MARGIN if peaks else float(UNRECORDED_MODULE_RESERVATION_MIB)
+        return peaks[key] * MEMORY_PEAK_MARGIN if key in peaks else fallback_mib
 
 
 @dataclass
 class SampledRSSAdmission:
     cap_mib: int
     latest_mib: float = 0.0
-    # Start conservatively while children are still execing and their RSS is
-    # growing; subsequently retain the largest measured module/subprocess peak.
-    headroom_mib: float = float(MODULE_MEMORY_MIB * 2)
     job_memory_mib: dict[int, float] = field(default_factory=dict)
-    # Jobs reserved at a known size; their samples never raise the per-module headroom.
-    fixed_mib: dict[int, float] = field(default_factory=dict)
+    reservations_mib: dict[int, float] = field(default_factory=dict)
     peak_mib: float = 0.0
     next_sample_at: float = 0.0
 
@@ -198,30 +216,27 @@ class SampledRSSAdmission:
     @property
     def reserved_mib(self) -> float:
         # A small startup sample does not release a running job's reservation.
-        return sum(max(0.0, self.fixed_mib.get(pid, self.headroom_mib) - measured)
-                   for pid, measured in self.job_memory_mib.items())
+        return sum(max(0.0, expected - self.job_memory_mib.get(pid, 0.0))
+                   for pid, expected in self.reservations_mib.items())
 
     def observe(self, now: float, aggregate_mib: float, job_memory_mib: dict[int, float]) -> None:
         self.latest_mib = aggregate_mib
         self.peak_mib = max(self.peak_mib, aggregate_mib)
-        self.headroom_mib = max([self.headroom_mib, *(measured for pid, measured in job_memory_mib.items()
-                                                      if pid not in self.fixed_mib)])
         self.job_memory_mib = job_memory_mib.copy()
         self.next_sample_at = now + MEMORY_SAMPLE_SECONDS
 
-    def admits(self, jobs_running: bool) -> bool:
-        return not jobs_running or self.latest_mib + self.reserved_mib + self.headroom_mib <= self.cap_mib
+    def admits(self, expected_mib: float) -> bool:
+        return not self.reservations_mib or self.latest_mib + self.reserved_mib + expected_mib <= self.cap_mib
 
-    def reserve(self, pid: int, expected_mib: float = 0.0) -> None:
+    def reserve(self, pid: int, expected_mib: float) -> None:
         self.job_memory_mib[pid] = 0.0
-        if expected_mib:
-            self.fixed_mib[pid] = expected_mib
+        self.reservations_mib[pid] = expected_mib
 
     def release(self, pid: int) -> None:
         # Keep the last aggregate sample until the next scan; it may still
         # include this finished job, which conservatively delays admission.
         _ = self.job_memory_mib.pop(pid, 0.0)
-        _ = self.fixed_mib.pop(pid, 0.0)
+        _ = self.reservations_mib.pop(pid, 0.0)
 
 
 class GateRefused(Exception):
@@ -473,8 +488,9 @@ def one_minute_load() -> float:
 
 
 def test_module_name(repo: Path, suite: str, path: Path) -> str:
+    """Name a module by its path within its suite; standalone jobs keep their file name."""
     root = repo / "scripts" / suite
-    return str(path.relative_to(root)) if path.is_relative_to(root) else path.name
+    return path.relative_to(root).as_posix() if path.is_relative_to(root) else path.name
 
 
 def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
@@ -514,7 +530,8 @@ def suite_scope_prefix() -> list[str]:
 
 
 def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
-                   environment: dict[str, str], log: Path) -> RunningGateJob:
+                   environment: dict[str, str], log: Path, *,
+                   kind: GateJobKind = GateJobKind.TEST_MODULE) -> RunningGateJob:
     output = log.open("w+")
     started = time.monotonic()
     try:
@@ -525,7 +542,7 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
         output.close()
         raise
     module = test_module_name(repo, suite, path)
-    return RunningGateJob(suite, path, process, started, output, log, module=module)
+    return RunningGateJob(suite, path, process, started, output, log, module, kind=kind)
 
 
 def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str, str]:
@@ -582,12 +599,12 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     # Python 3.13 returns 5 for empty helper modules; import errors still return 1.
     if status == 5 and re.search(r"^Ran 0 tests in", captured, re.MULTILINE) and "NO TESTS RAN" in captured:
         status = 0
-    if job.suite == "types":
+    if job.kind is GateJobKind.TYPE_CHECK:
         status = 0 if status in (0, 3) and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
     tripwire_tripped = bool(calls or readings)
     if tripwire_tripped:
         status = 1
-    return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for, tripwire_tripped)
+    return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for, tripwire_tripped, job.kind)
 
 
 @dataclass(frozen=True)
@@ -612,6 +629,7 @@ class PassedTreeLedger:
     repo: Path
     source: Literal["tests-only", "checkpoint"]
     tree: CleanTestTree | UnrecordableTestTree
+    suites: list[str]
     unavailable: bool = False
 
     @property
@@ -658,7 +676,7 @@ class PassedTreeLedger:
             for record in reversed(self.records()):
                 if (record.get("kind", "full") == "full"
                         and record["tree"] == self.tree.tree and record["host"] == host_name()
-                        and record["suites"] == sorted(TEST_SUITES)):
+                        and record["suites"] == self.suites):
                     at = datetime.fromisoformat(cast(str, record["at"]))
                     when = at.astimezone(user_zone()).strftime("%Y-%m-%d %H:%M:%S %Z")
                     print(f"tests reused from {self.tree.tree[:12]} ({when}, {record['source']}, {record['checkout']})", flush=True)
@@ -674,7 +692,7 @@ class PassedTreeLedger:
             records = sorted(self.records(), key=lambda record: datetime.fromisoformat(cast(str, record["at"])), reverse=True)
             for record in records:
                 if (record.get("kind", "full") != "full" or record["host"] != host_name()
-                        or record["suites"] != sorted(TEST_SUITES)):
+                        or record["suites"] != self.suites):
                     continue
                 commit = cast(str, record["commit"])
                 if not git(self.repo, "merge-base", "--is-ancestor", commit, "HEAD").returncode:
@@ -694,7 +712,7 @@ class PassedTreeLedger:
                 return
             record = {"tree": self.tree.tree, "commit": self.tree.commit,
                       "at": datetime.now(UTC).isoformat(), "host": host_name(),
-                      "checkout": str(self.repo.resolve()), "suites": sorted(TEST_SUITES), "source": self.source,
+                      "checkout": str(self.repo.resolve()), "suites": self.suites, "source": self.source,
                       "kind": "full" if isinstance(selection, FullSuite) else "affected"}
             if isinstance(selection, FullSuite):
                 record["reason"] = selection.reason
@@ -736,9 +754,17 @@ def report_selection(selection: AffectedSelection | FullSuite, total: int) -> No
 
 
 def discover_test_modules(repo: Path) -> list[tuple[str, Path]]:
-    """Find every suite module, including tests in nested directories."""
-    return [(suite, path) for suite in TEST_SUITES
-            for path in sorted((repo / "scripts" / suite).rglob("test_*.py"))]
+    """Find modules in path order; each suite is the first folder under scripts."""
+    scripts = repo / "scripts"
+    modules: list[tuple[str, Path]] = []
+    for path in sorted(scripts.rglob("test_*.py")):
+        relative = path.relative_to(scripts)
+        if not path.is_file() or "__pycache__" in relative.parts:
+            continue
+        if len(relative.parts) == 1:
+            raise GateRefused(f"test module must be in a suite folder under scripts/: {relative}")
+        modules.append((relative.parts[0], path))
+    return modules
 
 
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
@@ -755,9 +781,6 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
     modules = discover_test_modules(repo)
-    missing = [suite for suite in TEST_SUITES if not any(name == suite for name, _ in modules)]
-    if missing:
-        raise GateRefused(f"suites have no test modules: {', '.join(missing)}")
     if not modules:
         raise GateRefused("the test list is empty")
     tmpfs = Path("/dev/shm")
@@ -771,7 +794,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     except (GateRefused, OSError) as error:
         tested_tree = UnrecordableTestTree(str(error))
         print(f"Test tree unavailable; tests cannot be reused or recorded: {str(error).replace(chr(10), '; ')}", flush=True)
-    ledger = PassedTreeLedger(repo, source, tested_tree)
+    suites = sorted({suite for suite, _ in modules})
+    ledger = PassedTreeLedger(repo, source, tested_tree, suites)
     required = full_required()
     reused = not full and not isinstance(required, FullSuite) and ledger.reuse()
     selection: AffectedSelection | FullSuite = FullSuite("passed tree reused")
@@ -789,20 +813,24 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     types_peaks_path = gate_state_dir() / "types_peak_mib.json"
     types_peaks = read_measures(types_peaks_path)
     types_key = " ".join(type_dirs)
-    types_peak_mib = 0.0
+    module_peaks_path = gate_state_dir() / "module_peak_mib.json"
+    module_peaks = read_measures(module_peaks_path)
+    recorded_peaks = RecordedJobPeaks(module_peaks.copy(), types_peaks.copy(), types_key)
     slow_modules: list[str] = []
     history_path = gate_state_dir() / "module_history.json"
     history = read_history(history_path)
-    pending = deque(module_order(modules, timings, repo) if not reused else [])
+    pending = deque(GateJobRequest(suite, path, test_module_name(repo, suite, path))
+                    for suite, path in (module_order(modules, timings, repo) if not reused else []))
     running: list[RunningGateJob] = []
     results: list[GateJobResult] = []
     first_runs: dict[tuple[str, str], GateJobResult] = {}
     rerunning = False
     types_python = typecheck_python() if type_dirs else ""
     if isinstance(types_python, Path):
-        pending.appendleft(("types", repo / "basedpyright"))
+        pending.appendleft(GateJobRequest("types", repo / "basedpyright", "basedpyright", GateJobKind.TYPE_CHECK))
     elif types_python:
-        results.append(GateJobResult("types", "basedpyright", 1, 0.0, types_python))
+        results.append(GateJobResult("types", "basedpyright", 1, 0.0, types_python, kind=GateJobKind.TYPE_CHECK))
+    requests = {(job.kind, job.suite, job.module): job for job in pending}
     suite_started: dict[str, float] = {}
     suite_finished: dict[str, float] = {}
     admission = SampledRSSAdmission(memory_cap_mib)
@@ -824,9 +852,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                                       {job.process.pid: sample.get(job.process.pid, 0.0) for job in running})
                     for job in running:
                         measured = sample.get(job.process.pid, 0.0)
-                        if job.suite == "types":
-                            types_peak_mib = max(types_peak_mib, measured)
-                        elif measured > largest_module_peak_mib:
+                        job.peak_memory_mib = max(job.peak_memory_mib, measured)
+                        if job.kind is GateJobKind.TEST_MODULE and measured > largest_module_peak_mib:
                             largest_module_peak_mib = measured
                             largest_module = f"{job.suite}/{job.module}"
                         if measured > memory_cap_mib and not job.killed_for:
@@ -837,28 +864,32 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                             print(f"{job.suite}/{job.module} {job.killed_for}", flush=True)
                             kill_job_group(job)
                 while (pending and len(running) < max_running_jobs
-                       and admission.admits(bool(running)) and (not rerunning or not running)):
+                       and admission.admits(recorded_peaks.reservation_mib(pending[0]))
+                       and (not rerunning or not running)):
                     if not hold.admits():
                         if not running:
                             hold.wait_until_free()
                         break
-                    suite, path = pending.popleft()
+                    request = pending.popleft()
+                    suite, path = request.suite, request.path
                     root = Path(tempfile.mkdtemp(prefix=f"{suite}-{path.stem}-", dir=temporary))
                     log = root / "output.log"
-                    job_environment = ({**environment, "TMPDIR": str(root)} if suite == "types"
+                    job_environment = ({**environment, "TMPDIR": str(root)} if request.kind is GateJobKind.TYPE_CHECK
                                        else test_module_environment(root, environment))
-                    if suite == "types":
+                    if request.kind is GateJobKind.TYPE_CHECK:
                         _ = job_environment.pop("BUILDLOG_LIVE_MEMORY_TRIPWIRE", None)
                     argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
                              *type_dirs]
-                            if suite == "types" else
+                            if request.kind is GateJobKind.TYPE_CHECK else
                             [*scope_prefix, python, "-c", SUITE_BOOTSTRAP, "-m", "unittest", "discover", "-s", str(path.parent), "-p", path.name])
-                    job = start_gate_job(suite, path, argv, repo, job_environment, log)
+                    if request.kind is GateJobKind.TYPE_CHECK:
+                        job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
+                    else:
+                        job = start_gate_job(suite, path, argv, repo, job_environment, log)
                     running.append(job)
-                    _ = suite_started.setdefault(suite, job.started)
-                    admission.reserve(job.process.pid, (types_peaks[types_key] * TYPES_PEAK_MARGIN
-                                                    if types_key in types_peaks else TYPES_MEMORY_MIB)
-                                      if suite == "types" else 0.0)
+                    if job.kind is GateJobKind.TEST_MODULE:
+                        _ = suite_started.setdefault(suite, job.started)
+                    admission.reserve(job.process.pid, recorded_peaks.reservation_mib(request))
                 for job in running[:]:
                     status = job.process.poll()
                     if status is None and not job.killed_for and time.monotonic() - job.started >= module_time_limit_s:
@@ -872,14 +903,16 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     running.remove(job)
                     admission.release(job.process.pid)
                     if status < 0 and not job.killed_for and not result.tripwire_tripped and not hold.admits():
-                        pending.appendleft((job.suite, job.path))
-                        print(f"{job.suite}/{job.module}: stopped during a natedev hold; queued again", flush=True)
+                        pending.appendleft(requests[(job.kind, job.suite, job.module)])
+                        print(f"{job.suite}/{result.module}: stopped during a natedev hold; queued again", flush=True)
                         continue
-                    if job.suite == "types":
-                        if not job.killed_for and types_peak_mib:
-                            types_peaks[types_key] = types_peak_mib
-                    elif not rerunning:
-                        key, seconds = f"{job.suite}/{job.module}", result.seconds
+                    if not job.killed_for and job.peak_memory_mib:
+                        if job.kind is GateJobKind.TYPE_CHECK:
+                            types_peaks[types_key] = job.peak_memory_mib
+                        else:
+                            module_peaks[f"{job.suite}/{result.module}"] = job.peak_memory_mib
+                    if job.kind is GateJobKind.TEST_MODULE and not rerunning:
+                        key, seconds = f"{job.suite}/{result.module}", result.seconds
                         past = history.get(key) or ([timings[key]] if key in timings else [])
                         if past and slower_than_recorded(seconds, statistics.median(past)):
                             slow_modules.append(f"{key} {seconds:.0f} s, median of the last {len(past)} runs "
@@ -894,17 +927,18 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                                   + f"(first run exit {first.returncode}, {first.seconds:.2f} s)", flush=True)
                     else:
                         results.append(result)
-                    suite_finished[job.suite] = job.started + result.seconds
+                    if job.kind is GateJobKind.TEST_MODULE:
+                        suite_finished[job.suite] = job.started + result.seconds
                 if not pending and not running and not rerunning:
                     failed = [result for result in results
-                              if result.suite != "types" and result.returncode and not result.killed_for
+                              if result.kind is GateJobKind.TEST_MODULE and result.returncode and not result.killed_for
                               and not result.tripwire_tripped]
                     rerunning = True
                     if len(failed) > RERUN_LIMIT:
                         print(f"{len(failed)} modules failed; this is a real breakage, not load; no reruns", flush=True)
                     else:
                         first_runs = {(result.suite, result.module): result for result in failed}
-                        pending.extend((result.suite, repo / "scripts" / result.suite / result.module) for result in failed)
+                        pending.extend(requests[(result.kind, result.suite, result.module)] for result in failed)
                 if running or pending:
                     time.sleep(0.05)
         finally:
@@ -914,20 +948,23 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                 job.output.close()
             save_measures(timings_path, timings)
             save_measures(types_peaks_path, types_peaks)
+            save_measures(module_peaks_path, module_peaks)
             save_measures(history_path, history)
     elapsed = time.monotonic() - began - (hold.seconds - initial_hold_seconds)
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)
-    for suite in TEST_SUITES:
+    for suite in suites:
         if reused:
             print(f"{suite}: OK reused", flush=True)
             continue
         if suite not in suite_started:
             print(f"{suite}: skipped (not affected)", flush=True)
             continue
-        failed = [module for module in results if module.suite == suite and module.returncode]
+        suite_results = [result for result in results
+                         if result.kind is GateJobKind.TEST_MODULE and result.suite == suite]
+        failed = [module for module in suite_results if module.returncode]
         print(f"{suite}: {'RED' if failed else 'OK'} {suite_finished[suite] - suite_started[suite]:.2f}s", flush=True)
-        for module in (result for result in results if result.suite == suite):
+        for module in suite_results:
             key = (suite, module.module)
             if key in first_runs:
                 first = first_runs[key]
@@ -937,7 +974,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                 label = "rerun alone " if key in first_runs else ""
                 print(f"--- {suite}/{module.module} {label}exit={module.returncode} ---\n{module.output}", flush=True)
     for result in results:
-        if result.suite == "types":
+        if result.kind is GateJobKind.TYPE_CHECK:
             print(f"basedpyright: {'RED' if result.returncode else 'OK'}\n{result.output}", flush=True)
     for slow in slow_modules:
         print(f"Slow module: {slow} ({SLOW_MODULE_FACTOR:g}x or more)", flush=True)
@@ -1291,7 +1328,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--mac-repo", default="~/.claude")
     _ = parser.add_argument("--settings-blob", default=SETTINGS_BLOB)
     _ = parser.add_argument("--memory-cap-mib", type=int, default=DEFAULT_MEMORY_CAP_MIB,
-                            help="sampled memory admission cap in MiB (default: 6144); measured 163-module run: 102.80 s, 2.027 GiB peak, 0.494 GiB largest module")
+                            help="sampled memory admission cap in MiB (default: 6144); full-tree basedpyright peaked at 4065 MiB on 2026-10-30, reserving 4878 MiB")
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--tests-only", action="store_true")

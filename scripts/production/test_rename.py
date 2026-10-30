@@ -12,6 +12,7 @@ from unittest import mock
 
 from scripts.direct import workers
 from scripts.production import rename_test_support as support
+from scripts.production import staff
 import rename
 from unit_move import PathMove
 from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT_MOVE_INDEX, FAIL_PLAN_REWRITE, NEW, OLD, UNITS
@@ -19,6 +20,35 @@ from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
+    def test_rename_finds_the_workspace_member_and_keeps_its_id(self) -> None:
+        row = staff.snapshot().find(kind="showrunner")[0]
+        _ = staff.rename(row.id, "tools")
+        self.write(self.doc, self.doc.read_text().replace("## Production Context\n", "## Production Context\n\n- **Showrunner session:** `tools`\n"))
+        _ = self.git("add", str(self.doc))
+        _ = self.git("commit", "-m", "Record workspace name")
+        self.assert_success(self.run_rename("apply"))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "showrunner", "new", None))
+        self.assertEqual(self.journal()["staff_id"], row.id)
+        self.assertIn("- **Showrunner session:** `new`", self.new_doc.read_text())
+
+    def test_taken_staff_name_refuses_before_sources_change(self) -> None:
+        _ = staff.ensure("showrunner", name=NEW)
+        before = self.snapshot()
+        failed = self.run_rename("apply")
+        self.assertEqual(failed.returncode, 2, failed.stderr)
+        self.assertIn("StaffRefused", failed.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_missing_staff_member_refuses_before_sources_change(self) -> None:
+        row = staff.snapshot().find(kind="showrunner")[0]
+        for unit in staff.snapshot().find(kind="unit", parent=row.id):
+            _ = staff.retire(unit.id)
+        _ = staff.retire(row.id)
+        before = self.snapshot()
+        failed = self.run_rename("apply")
+        self.assertEqual(failed.returncode, 2, failed.stderr)
+        self.assertEqual(self.snapshot(), before)
+
     def interrupt_apply(self, count: int) -> rename.RenamePlan:
         save = cast(Callable[[rename.RenamePlan, tuple[str, ...]], None], getattr(rename, "_save"))
         stopped: list[rename.RenamePlan] = []

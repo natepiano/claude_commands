@@ -9,13 +9,58 @@ from typing import cast, final
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scripts.production.rename_test_support import ProductionRenameFixture
+from scripts.production.rename_test_support import ProductionRenameFixture, legacy_staff_journal, stop_at_staff_write
 from scripts.production.rename_rerun_test_support import final_files, saved_fixture
 import unit_move
 
 
 @final
 class ProductionRenameRerunTests(ProductionRenameFixture):
+    def test_legacy_journal_resumes_after_the_timer_and_staff_names_changed(self) -> None:
+        move = unit_move.move
+
+        def interrupted(path_move: unit_move.PathMove) -> None:
+            move(path_move)
+            if path_move.source == self.notifier / "showrunner-old":
+                raise OSError("stopped after timer move")
+
+        with mock.patch.object(unit_move, "move", side_effect=interrupted):
+            failed = self.run_rename("apply")
+        self.assertNotEqual(failed.returncode, 0)
+        legacy_staff_journal(self.root / "state/showrunner/new/rename.json")
+        self.assert_success(self.run_rename("apply"))
+        self.assert_applied()
+        self.assertTrue(self.journal()["staff_id"])
+
+    def test_completed_legacy_journal_migrates_once_and_reports_done(self) -> None:
+        self.assert_success(self.run_rename("apply"))
+        expected = self.outcome()
+        legacy_staff_journal(self.root / "state/showrunner/new/rename.json")
+        finished = self.run_rename("apply")
+        self.assert_success(finished)
+        self.assertIn("done", finished.stdout)
+        self.assertEqual(self.outcome(), expected)
+
+    def test_rename_rerun(self) -> None:
+        self.env.update(GIT_AUTHOR_DATE="2026-10-29T12:00:00Z", GIT_COMMITTER_DATE="2026-10-29T12:00:00Z")
+        with saved_fixture(self.root) as restore:
+            self.assert_success(self.run_rename("apply"))
+            expected = self.outcome()
+            for after in (False, True):
+                with self.subTest(after=after):
+                    restore()
+
+                    with stop_at_staff_write("rename", after=after):
+                        failed = self.run_rename("apply")
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertIn("stopped at staff step", failed.stderr)
+                    self.assert_success(self.run_rename("apply"))
+                    self.assertEqual(self.outcome(), expected)
+                    finished = self.run_rename("apply")
+                    self.assert_success(finished)
+                    self.assertIn("done", finished.stdout)
+                    self.assertEqual(self.outcome(), expected)
+
     def outcome(self) -> tuple[dict[str, bytes], str, str, str]:
         return (final_files(self.root), self.git("show-ref"), self.git("status", "--porcelain"),
                 self.git("--git-dir", str(self.origin), "show-ref"))

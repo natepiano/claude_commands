@@ -284,6 +284,67 @@ class FindingSitesTests(unittest.TestCase):
     def test_generic_and_closure_commas_do_not_start_statements(self) -> None:
         self.assert_continuation_carries("let f = |a: A, mut b: B| { consume(a, &mut b); }; let x = Map::<A, dyn Trait>::new();")
 
+    def assert_function_pointer_owner(self, source: str, line: int,
+                                      chain: tuple[tuple[str, ...], ...] = (("fn work",),)) -> None:
+        old = finding_sites.SourceSites(source)
+        new = finding_sites.SourceSites("// heading\n" + source)
+        try:
+            self.assertEqual(old.owner_chain(line), chain)
+            self.assertTrue(old.same_owner(line, new, line + 1))
+        except finding_sites.UnreadableSourceItems as error:
+            self.fail(f"function-pointer type refused its owner: {error}")
+
+    def test_function_pointer_let_reads_owner(self) -> None:
+        self.assert_function_pointer_owner(
+            'fn work() {\n    let callback: unsafe extern "C" fn() = target;\n}\n', 2)
+
+    def test_function_pointer_parameter_reads_owner(self) -> None:
+        self.assert_function_pointer_owner('fn work(cb: extern "C" fn(u8) -> u8) {}\n', 1)
+
+    def test_function_pointer_field_reads_owner(self) -> None:
+        self.assert_function_pointer_owner(
+            'fn work() {\n    struct Callbacks {\n        cb: unsafe fn(),\n    }\n}\n',
+            3, (("fn work",), ("fn work", "struct Callbacks")))
+
+    def test_function_pointer_return_reads_owner(self) -> None:
+        self.assert_function_pointer_owner('fn work() -> unsafe extern "system" fn() { target }\n', 1)
+
+    def test_function_pointer_type_contexts_read_owner(self) -> None:
+        for declaration in (
+            'let callback: Option<unsafe extern "C" fn()> = None;',
+            'let callback = target as unsafe extern "C" fn();',
+            'let callback: &dyn Fn(unsafe extern "C" fn()) = target;',
+            'let callback: extern fn() -> unsafe extern "C" fn() = target;',
+        ):
+            with self.subTest(declaration=declaration):
+                self.assert_function_pointer_owner("fn work() {\n    " + declaration + "\n}\n", 2)
+
+    def test_function_pointer_impl_bound_reads_owner(self) -> None:
+        self.assert_function_pointer_owner('fn work(cb: impl Fn(unsafe extern "C" fn())) {}\n', 1)
+        self.assert_function_pointer_owner('fn work() -> impl Fn(unsafe extern "C" fn()) { target }\n', 1)
+
+    def test_function_pointer_extern_field_reads_owner(self) -> None:
+        self.assert_function_pointer_owner(
+            'fn work() {\n    struct Callbacks {\n        cb: unsafe extern "C" fn(),\n    }\n}\n',
+            3, (("fn work",), ("fn work", "struct Callbacks")))
+
+    def test_function_pointer_impl_bound_cannot_hide_item_body(self) -> None:
+        for bound in ("impl Trait", "impl Trait<A, B>"):
+            with self.subTest(bound=bound):
+                self.assert_unproved_owner('fn work(cb: ' + bound + ' { fn hidden() {} }) {}')
+
+    def test_function_pointer_arguments_still_refuse_items(self) -> None:
+        for item in ('extern crate hidden;', 'extern "C" { fn hidden(); }',
+                     'extern "C" fn hidden() {}', 'extern fn hidden() {}'):
+            with self.subTest(item=item):
+                # Type syntax cannot let an unknown prefix conceal an item owner.
+                self.assert_unproved_owner('fn work() { let cb: extern "C" fn() = target; unknown ' + item + ' }')
+                self.assert_unproved_owner('fn work() { let cb: extern "C" fn(' + item + ') = target; }')
+
+    def test_function_pointer_does_not_skip_following_item(self) -> None:
+        source = 'fn container() { let cb: unsafe extern "C" fn() = target; fn work() {} }'
+        self.assertIn(("fn container", "fn work"), tuple(item.identity for item in finding_sites.SourceSites(source).items))
+
     def test_unreadable_sibling_owner_does_not_poison_known_owner(self) -> None:
         source = ("fn unreadable() {\n    unknown::<T> fn hidden() {}\n}\n"
                   "fn work() {\n    let old = 791;\n}\n")

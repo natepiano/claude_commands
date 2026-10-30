@@ -96,7 +96,10 @@ def configure_test_zone() -> None:
     unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
 
 
+from scripts.production.staff_test_support import StaffTestCase
+
 class AddUnitTestCase(ShutdownTestCase):
+    staff: StaffTestCase = StaffTestCase()
     seed: ClassVar[ImmutableGitSeed]
 
     @classmethod
@@ -133,6 +136,9 @@ class AddUnitTestCase(ShutdownTestCase):
 
     @override
     def setUp(self) -> None:
+        self.staff = StaffTestCase()
+        self.staff.setUp()
+        self.addCleanup(self.staff.doCleanups)
         super().setUp()
         _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         # These CLI fixtures prove launcher plumbing; transcript proof is exercised
@@ -203,6 +209,8 @@ class AddUnitTestCase(ShutdownTestCase):
                     "CODEX_CONFIG_FILE": str(codex_config),
                     "CODEX_MODELS_CACHE_FILE": str(codex_cache),
                     "CODEX_CATALOG_SYNC_STATE_FILE": str(sync_state)}
+        self.env["STAFF_FILE"] = str(self.staff.staff_file)
+        self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
         self.herdr_overrides = {}
         fake_path = self.bin / "fake-herdr"
         source = (SCRIPT.parents[1] / "herdr/fake_herdr.py").read_text()

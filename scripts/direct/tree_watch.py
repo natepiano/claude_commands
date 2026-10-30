@@ -14,11 +14,13 @@ import json
 import math
 import os
 from pathlib import Path
+import runpy
 import signal
 import subprocess
 import sys
 import time
-from typing import TypedDict, cast
+from types import SimpleNamespace
+from typing import NotRequired, Protocol, TypedDict, cast
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -40,6 +42,17 @@ class Metadata(TypedDict):
     workspace_root: str
     packages: list[Package]
     workspace_members: list[str]
+    target_directory: NotRequired[str]
+
+
+class AssertionGuard(Protocol):
+    """The configured guard defines its own base and ruling inputs."""
+
+    GuardError: type[Exception]
+
+    def default_base(self, repo: Path, explicit_base: str = "") -> str: ...
+    def git(self, repo: Path, *arguments: str) -> str: ...
+    def read_rulings(self, sources: list[str], messages: str) -> dict[tuple[str, str], str]: ...
 
 
 def run(*args: str | bytes) -> bytes:
@@ -75,6 +88,13 @@ class TreeInputs:
         split = args.index("--")
         self.files: list[str] = args[:split]
         self.words: list[str] = args[split + 1:]
+        self.guard_files: list[str] = self.files[1:2] if self.files[:1] == ["--assertion-guard"] else []
+        self.rulings_folders: list[str] = []
+        if self.guard_files:
+            self.files = self.files[2:]
+            while self.files[:1] == ["--rulings"]:
+                self.rulings_folders.append(self.files[1])
+                self.files = self.files[2:]
         self.package: str = self.files[1] if self.files[:1] == ["--package"] else ""
         if self.package:
             self.files = self.files[2:]
@@ -87,8 +107,10 @@ class TreeInputs:
             ) if not folder.startswith(b"..") and folder != b"."
         )
         self.workspace_root: bytes = b""
+        self.test_target_directory: str = ""
         try:
             meta: Metadata = cast(Metadata, json.loads(metadata)) if metadata.strip() else {"workspace_root": "", "packages": [], "workspace_members": []}
+            self.test_target_directory = meta.get("target_directory", "")
             workspace_root = meta.get("workspace_root", "")
             if workspace_root:
                 self.workspace_root = os.fsencode(os.path.realpath(workspace_root))
@@ -168,14 +190,51 @@ class TreeInputs:
             key = hashlib.sha256(self.top + b"\0" + run("git", "--no-optional-locks", "-C", self.top, "rev-parse", "HEAD^{tree}"))
             for path in changed:
                 key.update(path + b"\0" + content(os.path.join(self.top, path)))
+        if self.guard_files:
+            # Use the invoked guard's own readers, including completed merge
+            # parents. An unresolved base leaves no reusable cache key.
+            assertion_guard = cast(AssertionGuard, cast(object, SimpleNamespace(
+                **runpy.run_path(self.guard_files[0]))))
+            repo = Path(os.fsdecode(self.top))
+            explicit = os.environ.get("VERIFY_ASSERTION_BASE", "")
+            try:
+                bases = [assertion_guard.default_base(repo, explicit)]
+                if not explicit:
+                    bases.extend(assertion_guard.git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()[2:])
+                for base in dict.fromkeys(bases):
+                    key.update(b"\0guard-base=" + base.encode())
+                    key.update(assertion_guard.git(repo, "log", "--format=%B", base + "..HEAD", "--").encode())
+                key.update(assertion_guard.git(repo, "rev-parse", "HEAD").encode())
+                rulings = assertion_guard.read_rulings(self.rulings_folders, "")
+            except assertion_guard.GuardError:
+                raise SystemExit(1)
+            for name in self.guard_files:
+                key.update(content(os.fsencode(name)))
+            key.update(json.dumps(sorted(rulings.items()), separators=(",", ":")).encode())
         key.update(run("rustc", "-vV"))
         for name in self.files:
             key.update(content(os.fsencode(name)))
+        build_key = key.copy()
+        words = iter(self.words)
+        for word in words:
+            if word == "--filter":
+                _ = next(words, None)
+            else:
+                build_key.update(b"\0" + word.encode())
         for word in self.words:
             key.update(b"\0" + word.encode())
         for name, value in sorted(os.environ.items()):
             if name.startswith(("RUST", "CARGO_", "NEXTEST_")) and name != "CARGO_MAKEFLAGS":
                 key.update(("\0" + name + "=" + value).encode())
+                if not name.startswith("NEXTEST_") or name == "NEXTEST_CARGO_PROFILE":
+                    build_key.update(("\0" + name + "=" + value).encode())
+        if self.package and os.environ.get("VERIFY_COMPUTE_TEST_BUILD") == "1":
+            # Cargo resolves config, environment and workspace target paths.
+            # An unknown destination proves no fresh build.
+            output = os.environ.get("VERIFY_TEST_BUILD_INPUTS_FILE", "")
+            if output and os.path.isabs(self.test_target_directory):
+                build_key.update(b"\0target=" + os.fsencode(self.test_target_directory))
+                _ = Path(output).write_text(build_key.hexdigest() + "\n" + self.test_target_directory + "\n")
         return key.hexdigest(), watch_key
 
 

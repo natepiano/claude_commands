@@ -40,6 +40,24 @@ def setUpModule() -> None:
 
 @final
 class AddUnitResumeTests(AddUnitTestCase):
+    def test_unreadable_staff_refuses_resume_before_closing_its_stopped_pane(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        self.staff.staff_file.parent.mkdir(parents=True, exist_ok=True)
+        _ = self.staff.staff_file.write_text("broken record", encoding="utf-8")
+        before = (self.doc.read_bytes(), self.git("rev-parse", "HEAD"), self.staff.staff_file.read_bytes())
+        stopped = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(),
+                                        HerdrPlace("old-host", "w2:p3"))
+        with (patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(stopped)),
+              patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+              patch.object(herdr, "close_agent") as closed):
+            result = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("StaffUnreadable", result.stderr)
+        closed.assert_not_called()
+        self.assertEqual((self.doc.read_bytes(), self.git("rev-parse", "HEAD"), self.staff.staff_file.read_bytes()), before)
+        self.assertFalse(any(row[2:4] == ["agent", "start"] for row in self.herdr_calls()))
+
     def test_new_row_resume_closes_the_stopped_marked_tab_then_launches(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()

@@ -12,11 +12,11 @@ import unittest
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal, cast, final
+from unittest import mock
 
 from scripts.lib import process_start as process_identity
 from scripts.lib.process_start_test_support import write_stat
-from typing import TYPE_CHECKING, Literal, cast, final
-from unittest import mock
 
 if TYPE_CHECKING:
     import herdr
@@ -29,11 +29,6 @@ from fake_herdr import CommandResponse, herdr_listener
 
 PANE_RESULT = herdr.Herdr.result
 TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
-PaneOccupantMembership = Literal["descendant", "session", "terminal", "scope",
-                                "nested candidate scope", "nested shell scope", "nested scopes"]
-PANE_OCCUPANT_MEMBERSHIPS: tuple[PaneOccupantMembership, ...] = (
-    "descendant", "session", "terminal", "scope",
-    "nested candidate scope", "nested shell scope", "nested scopes")
 
 
 @dataclass(frozen=True)
@@ -63,7 +58,7 @@ def environment(root: Path) -> dict[str, str]:
 
 
 def process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], marks: Mapping[str, str], *, started: str = "1",
-            session: int | None = None, cwd: Path | None = None, scope: str = "") -> None:
+            session: int | None = None, cwd: Path | None = None) -> None:
     directory = Path(env["HERDR_PROC"]) / str(pid)
     _ = write_stat(directory.parent, pid, ppid=parent, pgrp=pid, session=session or pid,
                    tty_nr=session or pid, tpgid=0, start_ticks=int(started), command="fixture")
@@ -72,7 +67,7 @@ def process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], 
     link = directory / "cwd"
     link.unlink(missing_ok=True)
     link.symlink_to(cwd or directory.parent.parent)
-    _ = (directory / "cgroup").write_text(f"0::{scope}\n" if scope else "")
+    _ = (directory / "cgroup").write_text("")
 
 
 def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
@@ -161,7 +156,7 @@ def live_pid(test: unittest.TestCase) -> int:
 
 @final
 class PaneShellFixture:
-    """One session-qualified pane host for lifecycle operations and private process proofs."""
+    """One session-qualified pane host for lifecycle operations."""
 
     def __init__(self, case: unittest.TestCase, worktree: Path, process_root: Path, *,
                  live: bool, slug: str = "demo", unit: str = "alpha-unit",
@@ -249,26 +244,6 @@ class PaneShellFixture:
             parent, os_session = server, pid
         process(self.environment, pid, parent, ["visitor"], marks,
                 session=os_session, cwd=self.worktree)
-
-    def unmarked_occupant_scenario(self, pid: int, membership: PaneOccupantMembership) -> None:
-        """Reset call history and isolate one blocker relation, including nested pane cgroups."""
-        _ = Path(self.environment["FAKE_HERDR_LOG"]).write_text("")
-        scope = f"/user.slice/{herdr.PANE_SLICE}/pane.scope" if "scope" in membership else ""
-        shell_scope = scope + "/shell" if membership in ("nested shell scope", "nested scopes") else scope
-        job_scope = scope + "/job" if membership in ("nested candidate scope", "nested scopes") else scope
-        process(self.environment, self.shell, 991000, ["shell"], self.marks(),
-                session=self.shell, cwd=self.worktree, scope=shell_scope)
-        process(self.environment, pid, self.shell if membership == "descendant" else 1,
-                ["foreign-uid-job"], {}, session=self.shell if membership == "session" else pid,
-                cwd=self.worktree, scope=job_scope)
-        if membership == "terminal" or scope:
-            # A detached job has no controlling terminal; only the pane scope relates it.
-            root = Path(self.environment["HERDR_PROC"])
-            stat = process_identity.read_stat(pid, root)
-            assert not isinstance(stat, process_identity.ProcessGone)
-            _ = write_stat(root, pid, ppid=stat.ppid, pgrp=stat.pgrp, session=stat.session,
-                           tty_nr=self.shell if membership == "terminal" else 0,
-                           tpgid=stat.tpgid, start_ticks=stat.start.ticks, command="fixture")
 
 
 def stopped_record(root: Path, worktree: Path, *, name: str = "alpha", cwd: Path | None = None,
