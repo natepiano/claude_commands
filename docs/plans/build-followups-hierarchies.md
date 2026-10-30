@@ -198,6 +198,42 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Ruled out:** dropping `--cleanup-only` from `worker_owners.py` (a reopened worker can be ended again).
 
+### Phase 6b — The full baseline measure prints each repeated wait row once, and a table names its window and source once  · status: done
+**Depends on:** Phase 15's checkpoint (`blocks`). Showrunner, 2026-10-30: change rows C535 and C566 failed its check and go in this unit's next checkpoint.
+
+#### Work Order
+
+**Goal:** `measure.py baseline --full` is readable on a phone on live data: one row for each repeated wait cause, and each table names its common window and source once.
+
+**Hana link:** indirect. The Phase 6 review reads this output; a report nobody can read cannot judge a Hana step.
+
+**Spec:**
+- Live defects, measured 2026-10-30 18:05 EDT on natedev from this branch:
+  - `baseline --full` prints 11826 lines. 26 `Hana wait coverage / UncertainCoverage` blocks carry the same value, and 165 `Hana wait attribution / Unresolved` blocks repeat a few values. Each such row is one phase or one wait, and its source is that one id.
+  - The value lists six candidates, each followed by `(26 times)`, and each ends `cwd=` with no text.
+  - `baseline --full --since 2026-10-22 --until 2026-10-29` prints 7521 lines (the showrunner measured 8475). `blocks` prints `Window:` and `Source:` in the heading only when every row shares them. The Capacity table mixes snapshot rows and window rows, so each of its rows prints its own window and source lines.
+- `log_records.blocks`: the heading prints the window that most rows share, and the source that most rows share, once. A tie takes the first row's value. A row prints `window:` or `source:` only when its value differs from the heading. When no two rows share a window, the heading has no `Window:` line and every row prints its own; the same holds for source. The fields keep their order: value, n, window, source.
+- `measure.hana_wait_rows` (`UncertainCoverage`, `attribution_misses`, `unresolved_origins`, `problems`): rows with the same measure and the same value collapse into one row. Its n is the number of phases or waits it covers. Its source is the shared source text, then `; phases: ` or `; waits: ` and the ids. `HistoryNotRecorded` already groups this way and stays as is.
+- In text output an id list longer than 3 prints the first 3 ids, then `+<N> more`. `--json` keeps every id.
+- `candidate_summary` lists each distinct candidate once, in first-seen order, with no `(N times)`. Find why one phase holds each candidate 26 times. When the parse makes the copies, fix the parse; when the record holds them, the dedupe is the fix, and name the record's producer in the handoff.
+- A candidate with no working directory prints `cwd=not recorded`, never `cwd=` and no text.
+- No value, n, window or source changes meaning: collapsing only merges rows that print the same measure and value.
+
+**Files:**
+- `scripts/hierarchies/log_records.py`, `scripts/hierarchies/test_log_records.py` — the `blocks` heading rule and the id-list cap.
+- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — row collapse, candidate dedupe, `cwd=not recorded`.
+- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — only where the `blocks` heading change moves its printed output.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `log_records.py`, `measure.py`, `push_audit.py`
+- `test` — `test_log_records.py`, `test_measure.py`, `test_push_audit.py`: the mixed-window heading (snapshot rows beside window rows), a tie, no shared value, a collapsed UncertainCoverage row from 26 phases with repeated candidates, a collapsed attribution row from 3 waits, the id cap at 3 and 4 ids, the full id list in `--json`, and an empty working directory. Each test reads rendered output through `read_report_blocks`.
+
+**State:** none.
+
+**Constraints from prior phases:** as Phase 15's As-built: `PHONE_WIDTH` and the wrap helper are the one place for width; tests read blocks with `read_report_blocks` and never add a second parser. As Phase 6a's As-built: `compare` prints through `blocks`, so its output takes the same heading rule. `--json` does not change shape.
+
+**Acceptance gate:** on live data both commands above print no two blocks in one table with the same measure and value, no row whose window or source repeats its table heading, no `(N times)` in a candidate list and no empty `cwd=`; the unit director records both line counts. Unit tests pass, per-slot `basedpyright` reads `0 errors, 0 warnings, 0 notes`, and the merge gate is green.
+
 ### Phase 6 — The four-week review: which waits slow Hana, which links helped, and which trial steps stay  · status: todo
 **Depends on:** Phase 6a's checkpoint (`compare`), and the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), Phase 15's checkpoint (`compare` prints through its `blocks`), and four weeks from the experiment start in design doc Step 2: the first day on which each holder producer (builds' `verify.sh`, models-unit's `codex_mesh.py`) has recorded a `NamedHolder`, read live from `progress_history.py waits`. At Phase 10's checkpoint (bece20e1) neither had, and Step 2 says `start not set`; the unit director sets the start and the review date when both have. Also models-unit's checkpoint that adds `codex_mesh.py end --cleanup-only` (routed from Phase 6a), merged into sdlc, and one `worker_owners.py end` run after that merge: until then every cleanup retry exits 2, so `end_cleanup_pending` counts the missing flag, not a held worker. The phase starts on the latest of these dates, never before.
 
