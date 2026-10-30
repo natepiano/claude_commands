@@ -169,7 +169,6 @@ class SyncNotNeeded:
 class MainChanges:
     pushed_tip: str
     paths: frozenset[str] = frozenset()
-    crates: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -221,8 +220,7 @@ def main_changes(ledger: style_ledger.Ledger, branch_point: str, tip: str) -> Ma
             index += 2
         if fields[-1]:
             return UnknownMainChanges("unterminated git name-status output")
-        crates = tuple(member.directory for member in coverage_report.workspace(ledger, tip)) if paths else ()
-        return MainChanges(main, frozenset(paths), tuple(sorted(crates, key=len, reverse=True)))
+        return MainChanges(main, frozenset(paths))
     except (OSError, ValueError, style_ledger.LedgerError, subprocess.CalledProcessError) as error:
         return UnknownMainChanges(str(error))
 
@@ -230,16 +228,7 @@ def main_changes(ledger: style_ledger.Ledger, branch_point: str, tip: str) -> Ma
 def ticket_sync_check(changes: MainChanges | UnknownMainChanges, files: tuple[str, ...]) -> SyncNeeded | SyncNotNeeded:
     if isinstance(changes, UnknownMainChanges):
         return SyncNeeded(f"touched set unknown: {changes.reason}")
-    if not changes.paths:
-        return SyncNotNeeded()
-    protected = {"Cargo.toml", "Cargo.lock", *files}
-    for path in files:
-        crate = next((crate for crate in changes.crates
-                      if crate == "." or path == crate or path.startswith(crate + "/")), "")
-        if not crate:
-            return SyncNeeded(f"touched set unknown: unknown crate for {path}")
-        protected.update(str(PurePosixPath(crate) / name) for name in ("Cargo.toml", "build.rs"))
-    touched = sorted(protected & changes.paths)
+    touched = sorted(changes.paths.intersection(files))
     if not touched:
         return SyncNotNeeded()
     paths = ", ".join(touched[:3])
