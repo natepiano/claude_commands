@@ -12,6 +12,7 @@ from typing import cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import merge_checkpoint
+import showrunners
 from scripts.production import production_doc
 from merge_checkpoint import check_parallel
 
@@ -27,6 +28,31 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def test_same_checkpoint_rerun_skips_another_productions_reviewed_commits(self) -> None:
+        import change_review
+
+        self.write(self.other, "crates/alpha/imported.txt", "other production\n")
+        _ = self.git("add", "crates/alpha/imported.txt", cwd=self.other)
+        _ = self.git("commit", "-m", "checkpoint(other): already on another production", cwd=self.other)
+        foreign = self.git("rev-parse", "HEAD", cwd=self.other)
+        _ = self.git("push", "origin", "HEAD:refs/heads/other-production", cwd=self.other)
+        _ = self.git("fetch", "origin", cwd=self.unit)
+        _ = self.git("merge", "--no-ff", "-m", "merge other production", "origin/other-production", cwd=self.unit)
+        sha = self.checkpoint(subject="checkpoint(alpha): own work\n\nChange-Review: none — internal check")
+        other_doc = self.root / "other-production.md"
+        _ = other_doc.write_text(f"- **Repository:** `{self.checkout}`\n"
+                                 + "- **Merge branch:** `other-production`\n"
+                                 + f"- **Change review:** `{self.root / 'other-review.md'}`\n")
+        with mock.patch.object(showrunners, "timer_docs", return_value={}):
+            held = self.run_checkpoint(sha)
+        self.assert_stopped_before_merge(held, "held", "change review: held")
+        self.assertIn(foreign[:change_review.SHORT], held.process.stdout)
+        with mock.patch.object(showrunners, "timer_docs", return_value={"other": other_doc}):
+            accepted = self.run_checkpoint(sha)
+        self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
+        self.assertIn("change review: ok — 1 unit commit(s)", accepted.process.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
+
     def test_missing_hash_and_unpushed_checkpoint_stop_at_ancestry(self) -> None:
         missing = self.run_checkpoint("0" * 40)
         self.assert_stopped_before_merge(missing, "failed", "commit")
