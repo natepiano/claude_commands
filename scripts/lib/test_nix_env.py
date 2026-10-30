@@ -112,11 +112,13 @@ class EnsureTests(NixFixture):
 
     def test_cli_ensure_json_and_refusal_exit(self) -> None:
         _ = self.envrc(self.work)
+        self.env["NIX_ENV_ENVRC"] = "caller provenance remains unchanged by ensure"
         allowed = self.cli("ensure", str(self.work))
         self.assertEqual(allowed.returncode, 0, allowed.stderr)
         value = cast(dict[str, str], json.loads(allowed.stdout))
         self.assertEqual(value["IN_NIX_SHELL"], "impure")
         self.assertEqual(value["KEEP"], "caller")
+        self.assertEqual(value["NIX_ENV_ENVRC"], self.env["NIX_ENV_ENVRC"])
         refused = self.cli("ensure", str(self.work), extra={"DIRENV_DIFF": "{}"})
         self.assertEqual(refused.returncode, 1)
         self.assertEqual(refused.stdout, "")
@@ -142,6 +144,44 @@ class EnsureTests(NixFixture):
         result = self.cli("exec", str(program), "argument with spaces")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), ["impure", ["argument with spaces"], str(self.work)])
+
+    def test_cli_exec_names_the_resolved_loaded_envrc(self) -> None:
+        target = self.envrc(self.home / "rust/source")
+        (self.work / ".envrc").symlink_to(target)
+        self.env["NIX_ENV_ENVRC"] = "/stale/.envrc"
+        self.env["DIRENV_DIFF"] = json.dumps({"IN_NIX_SHELL": "pure", "NIX_ENV_ENVRC": "/exported/.envrc"})
+        program = self.bin / "provenance"
+        self.script(program, 'import os\nprint(os.environ["NIX_ENV_ENVRC"])\n')
+        result = self.cli("exec", str(program))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, str(target.resolve()) + "\n")
+        self.assertEqual(sum(call["args"] == ["export", "json"] for call in self.direnv_calls()), 1)
+
+    def test_cli_exec_clears_inherited_envrc_when_none_applies(self) -> None:
+        self.env["NIX_ENV_ENVRC"] = "/previous/worktree/.envrc"
+        program = self.bin / "environment"
+        self.script(program, 'import json, os\nprint(json.dumps(dict(os.environ)))\n')
+        result = self.cli("exec", str(program))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environment = cast(dict[str, str], json.loads(result.stdout))
+        self.assertNotIn("NIX_ENV_ENVRC", environment)
+        self.assertEqual(environment["KEEP"], "caller")
+        self.assertEqual(environment["REMOVE"], "old")
+        self.assertEqual(self.direnv_calls(), [])
+
+    def test_no_envrc_cli_import_budget(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-S", "-X", "importtime", str(HELPER), "ensure", str(self.work)],
+            cwd=self.work, env=self.env, capture_output=True, text=True, check=False,
+            timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environment = cast(dict[str, str], json.loads(result.stdout))
+        self.assertEqual({key: environment[key] for key in self.env}, self.env)
+        imports = {line.rpartition("|")[2].strip() for line in result.stderr.splitlines()
+                   if line.startswith("import time:")}
+        self.assertTrue(imports, result.stderr)
+        self.assertEqual(imports.intersection({"dataclasses", "inspect", "subprocess", "shlex"}), set())
+        self.assertEqual(self.direnv_calls(), [])
 
 
 class RegisteredWorktreeTests(NixFixture):

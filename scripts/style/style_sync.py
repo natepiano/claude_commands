@@ -328,10 +328,10 @@ def sweep_stale_lint_dirs() -> None:
 
 
 def lint_target(common_dir: Path) -> Path:
-    """One Cargo target per main repo, held until its standing style production wraps."""
-    target = common_dir / "style-sync-target"
-    target.mkdir(exist_ok=True)
-    _ = scratch.hold(target, f"run:{common_dir.parent.name}-style", "standing style production sync lint target")
+    """One Cargo target per main repo, retained across style production tasks."""
+    target = common_dir / scratch.STYLE_TARGET_NAME
+    scratch.mark_cargo_cache(target)
+    _ = scratch.release(target)
     return target
 
 
@@ -339,7 +339,7 @@ def lint_target(common_dir: Path) -> Path:
 def locked_lint_target(common_dir: Path) -> Generator[Path]:
     """Serialize checkout creation through cleanup, so source times postdate prior fingerprints."""
     target = lint_target(common_dir)
-    with (target / "sync.lock").open("a") as lock:
+    with (target / scratch.STYLE_LOCK_NAME).open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         yield target
 

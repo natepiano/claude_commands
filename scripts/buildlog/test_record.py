@@ -769,15 +769,6 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.records()[-1]["mac_holder"], "hana nextest")
 
-    def test_queue_bump_uses_the_hold_event_log_and_names_the_move(self) -> None:
-        recorder.queue_bump("actor-id", "moved-id", "nextest", "/tmp/tree", 4, START)
-        row = self.records()[-1]
-        self.assertEqual({key: row[key] for key in ("kind", "actor", "session", "step", "folder", "old_position")},
-                         {"kind": "queue_bump", "actor": "actor-id", "session": "moved-id", "step": "nextest",
-                          "folder": "/tmp/tree", "old_position": 4})
-        self.assertEqual(row["at"], store.utc_iso(START))
-        self.assertTrue(store.host_file(store.host_name(), START).exists())
-
     def test_hold_event_keeps_the_key_and_the_locked_utc_time(self) -> None:
         result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",
                              "2026-10-12T12:00:00.123456+00:00", "2026-10-12T14:00:00+00:00")

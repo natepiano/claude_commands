@@ -135,6 +135,13 @@ class UnitOperationPaneTests(unittest.TestCase):
             unit_move.close_unit_pane(pane, self.saved)
         self.assertEqual(self.pane.close_calls(), [['--session', 'agents', 'pane', 'close', 'w1:p1']])
 
+    def test_a_pane_already_gone_counts_as_closed(self) -> None:
+        pane = unit_move.unit_pane(self.pane.found, 'demo')
+        gone = herdr.HerdrFailure('herdr pane close: pane_not_found: pane w1:p1 not found', 'pane_not_found')
+        with mock.patch.object(herdr.Herdr, 'run', side_effect=gone) as close:
+            unit_move.close_unit_pane(pane, self.saved)
+        close.assert_called_once_with('pane', 'close', 'w1:p1')
+
     def test_herdr_close_error_is_reported_for_the_units_exact_place(self) -> None:
         pane = unit_move.unit_pane(self.pane.found, 'demo')
         failure = herdr.HerdrFailure('fixture close failed')

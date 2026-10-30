@@ -44,12 +44,6 @@ from typing import Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-# Sibling scripts and package callers must share the same account identity classes.
-if __name__ == "agent_accounts":
-    _ = sys.modules.setdefault("scripts.whoami.agent_accounts", sys.modules[__name__])
-elif __name__ == "scripts.whoami.agent_accounts":
-    _ = sys.modules.setdefault("agent_accounts", sys.modules[__name__])
-
 from scripts.lib.user_zone import user_zone as setting_zone  # noqa: E402
 
 

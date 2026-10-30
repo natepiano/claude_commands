@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.accounts import accounts, new_account
-import agent_accounts
-import note_file
+from scripts.whoami import agent_accounts
+from scripts.whoami import note_file
 
 
 def shipped_color_expectations(text: str) -> tuple[str, str, bytes]:
