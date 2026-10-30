@@ -683,7 +683,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - Every changed test module passes; `basedpyright` over every changed Python file reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
 - Change-Review line: a busy copy survives every sweep | on natedev in a terminal, make a folder under `/tmp/claude/copies/try/a`, hold `flock -s /tmp/claude/copies/try/a/.claude-busy sleep 600`, then run `~/.claude/scripts/lib/py ~/.claude/scripts/lint/tmp_sweep.py --dry-run` | the copy is listed as kept, busy.
 
-### Phase 22 — A stopped hold release finishes when it runs again  · status: todo
+### Phase 22 — A stopped hold release finishes when it runs again  · status: done
 **Depends on:** none in this plan (own file, `scripts/build_hold/build_hold.py`). Runs beside Phases 15 and 21. Code may be written during the 02:00–05:00 EDT hold; no test runs and nothing merges before the hold ends (verify releases that hold at 05:00 with the installed copy). Merge `origin/builds` first.
 
 **Approved:** builds showrunner 2026-10-30 01:0x EDT, a row of the rerun sweep the user approved 2026-10-29 (row `scripts/build_hold/build_hold.py:1173`, `~/.claude/docs/plans/sdlc-rerun-sweep.md`).
