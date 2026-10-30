@@ -2721,7 +2721,8 @@ def relaunch_session(
 
 def _unfinished_cleanup(record: SessionShutdown) -> bool:
     return bool(recovery_store.legacy_tmux_leftovers(record)) or any(
-        (issue["kind"] == "codex server left running" or issue["kind"] == "unit session left running")
+        recovery_store.stop_issue_blocks_completion(issue)
+        and (issue["kind"] == "codex server left running" or issue["kind"] == "unit session left running")
         and issue["cause"] == "stop not confirmed"
         for issue in record["stop_issues"]
     )

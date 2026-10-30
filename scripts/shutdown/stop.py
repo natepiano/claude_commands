@@ -1209,12 +1209,20 @@ def _owner_observation(owner: BoundedOwner, observation: ProcessObservation) -> 
         observation.uncertain, observation.terminated, observation.observed_identities)
 
 
+def _worker_pause_blocks_stop(owner: BoundedOwner, pending: list[tuple[int, str]]) -> bool:
+    """An unconfirmed resumable worker pause cannot hold a proven-gone Claude."""
+    session = owner.record["session"]
+    return ((session["pid"], session["proc_start"]) in pending
+        and (not owner.pause_observed or not owner.pause_done.is_set()
+             or any(record_store.stop_issue_blocks_completion(issue) for issue in owner.pause_issues)))
+
+
 def stop_succeeded(owner: BoundedOwner, observation: ProcessObservation, *, request_current: bool,
                    generation: int, begun: float, pending: list[tuple[int, str]],
                    errors: list[str], now: float, deadline: StopDeadline) -> bool:
     """The sole completion rule, shared by persistence, output and the caller."""
-    return (request_current and owner.pause_observed and owner.pause_done.is_set()
-        and not owner.pause_issues and owner.claims_released and not observation.errors and not errors and not pending
+    return (request_current and not _worker_pause_blocks_stop(owner, pending)
+        and owner.claims_released and not observation.errors and not errors and not pending
         and generation >= owner.required_observation
         and begun >= max(owner.last_signal_at, owner.pause_finished_at) and now <= deadline.expires)
 
@@ -1226,7 +1234,7 @@ def stop_failure_reason(owner: BoundedOwner, errors: list[str], *, request_curre
         reasons.append("shutdown record disappeared or was replaced")
     if pending:
         reasons.append("unresolved pids: " + ", ".join(f"{pid}/{start}" for pid, start in pending))
-    if not owner.pause_observed or not owner.pause_done.is_set() or owner.pause_issues:
+    if _worker_pause_blocks_stop(owner, pending):
         reasons.append("worker pause not confirmed successful")
     if generation < owner.required_observation:
         reasons.append("no complete observation after latest signal/pause")
@@ -1563,6 +1571,7 @@ def bounded_stop(
     codex_mesh: Callable[[list[str], float], int | None] = _bounded_mesh,
 ) -> list[SessionShutdown]:
     """Prove completion from fresh evidence, including bounded record persistence."""
+    started = monotonic()
     deadline = StopDeadline(started + grace_seconds + TERM_GRACE_SECONDS + 1, monotonic)
     results: list[SessionShutdown] = []
     try:
@@ -1959,7 +1968,7 @@ def _bounded_stop(
                     line(f"stopped build  {label} ({session['name']})")
                     owner.reported_builds.add(pid)
             if (not owner.claims_released and not pending and not errors and request_current
-                    and owner.pause_observed and owner.pause_done.is_set() and not owner.pause_issues):
+                    and not _worker_pause_blocks_stop(owner, pending)):
                 def cleanup(budget: float) -> str:
                     if not admitted(owner):
                         return ""

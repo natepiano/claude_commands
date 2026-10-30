@@ -842,7 +842,7 @@ def follow(login: str, request_id: str) -> int:
                 if identity in history.taken_out:
                     continue
                 kind = saved["progress"]["kind"]
-                if kind in {"process identity lost", "stop failed", "restart failed", "manual restart", "timers pending"} or (kind == "waiting" and "alerted_at" in saved) or (kind in {"stopped", "already gone"} and saved["stop_issues"]):
+                if kind in {"process identity lost", "stop failed", "restart failed", "manual restart", "timers pending"} or (kind == "waiting" and "alerted_at" in saved) or (kind in {"stopped", "already gone"} and recovery_store.stop_incomplete(saved)):
                     if kind == "stop failed":
                         print(stop_work.stop_summary(list(known.values())), flush=True)
                     print(_follow_action(saved), flush=True)

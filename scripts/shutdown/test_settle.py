@@ -4042,7 +4042,8 @@ class SettleTests(ShutdownTestCase):
 
     def test_now_only_stopped_owner_with_leftover_cleanup_is_retried_by_conductor(self) -> None:
         saved = session_shutdown(top_level("partial", "Partial"), progress={"kind": "stopped", "at": NOW})
-        saved["stop_issues"] = [shutdown_record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir="/tmp/run", cause="stop not confirmed")]
+        saved["stop_issues"] = [shutdown_record.UnitSessionLeftRunning(kind="unit session left running",
+            at=NOW, host="herdr", session_name="unit", cause="stop not confirmed")]
         self.save(saved)
         with patch.object(settle, "_launch_conductor") as conductor, patch.object(stop_work, "stop_session") as stop, redirect_stdout(io.StringIO()):
             self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True, only=["partial"]), 0)

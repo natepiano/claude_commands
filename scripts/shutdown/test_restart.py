@@ -2605,6 +2605,23 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(stored["leftover"]["stop_issues"], leftover["stop_issues"])
         self.assertTrue(restart._unfinished_cleanup(stored["leftover"]))  # pyright: ignore[reportPrivateUsage]
 
+    def test_restart_keeps_an_unconfirmed_codex_pause_issue_without_retrying_cleanup(self) -> None:
+        saved = entry(top_level("advisory-pause", cwd=str(self.root)))
+        issue = shutdown_record.CodexServerLeftRunning(kind="codex server left running",
+            at=STOPPED, run_dir=str(self.root / "run"), cause="stop not confirmed")
+        saved["stop_issues"] = [issue]
+        self.create([saved])
+        with (patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(stop_work, "stop_session", return_value=saved) as cleanup,
+              patch.object(restart, "_launch_entry_safely", return_value=restart.EntrySettled()) as launch,
+              redirect_stdout(io.StringIO()) as output):
+            _ = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
+        cleanup.assert_not_called()
+        launch.assert_called_once()
+        self.assertEqual(self.stored_record()["progress"]["kind"], "restarting")
+        self.assertEqual(self.stored_record()["stop_issues"], [issue])
+        self.assertNotIn("owner cleanup not confirmed", output.getvalue())
+
     def test_manual_resume_selects_the_current_group_account(self) -> None:
         self.configure_groups(units="claude3")
         owner = unit("old-unit")

@@ -898,6 +898,16 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         assert current is not None
         self.assertEqual(current["progress"], {"kind": "waiting"})
 
+    def test_follow_finishes_a_stopped_request_with_an_advisory_codex_pause_issue(self) -> None:
+        saved = session_shutdown(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER))
+        saved["then"] = "stop"
+        saved["stop_issues"] = [shutdown_store.CodexServerLeftRunning(kind="codex server left running",
+            at=OCTOBER, run_dir="/owned/run", cause="stop not confirmed")]
+        self.assertTrue(shutdown_store.create_session(saved))
+        status, text = self.follow_request()
+        self.assertEqual(status, 0, text)
+        self.assertEqual(shutdown_store.find_session(LOGIN, "session-123"), saved)
+
     def test_follow_prints_each_new_step_once_and_waits_for_pending_restart(self) -> None:
         saved = session_shutdown(shutdown_store.SessionWaiting(kind="waiting"))
         saved["session"]["name"] = "Alpha"
