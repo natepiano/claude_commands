@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh
 from scripts.direct import workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
-from scripts.guilds import roles as guild_roles
+from scripts.astra import design_roles
 from scripts.lib import unit_runs
 from scripts.usage.agents_log import LENSES
 
@@ -377,11 +377,11 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 else:
                     refuse(f"{dispatch.worker} is already implementing")
             _ = status_path.write_text("error\n")
-        if record.get("transferring_role") or record.get("role_redirect") or guild_roles.transfer_route(
+        if record.get("transferring_role") or record.get("role_redirect") or design_roles.transfer_route(
                 text(record.get("thread_id")), text(record.get("held_design_id"))):
             refuse(f"{dispatch.worker}: TransferringRole; use its destination holder")
         if record.get("held_design_id"):
-            refuse(f"{dispatch.worker}: held roles resume through roles.py")
+            refuse(f"{dispatch.worker}: held roles resume through design_roles.py")
         config = Path(os.environ.get("UNIT_CONFIG", str(Path.home() / ".claude/config/direct.conf")))
         match = re.search(r"^UNIT_COMPACT_ABOVE_TOKENS=(\d+)", config.read_text(), re.M) if config.is_file() else None
         threshold = int(match.group(1)) if match else 0

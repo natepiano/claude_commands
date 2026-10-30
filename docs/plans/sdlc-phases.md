@@ -517,7 +517,7 @@ The user approved this work through the showrunner (2026-10-29, ranked before Ph
 
 **Acceptance gate:** `rerun_lens.py arm` gives `armed` on a fixture diff that writes a state file, moves a record, takes a lock, and adds `set -e` over an account loop, each hit named with path:line; it gives `armed` on a Rust fixture diff that writes a reservation file with `std::fs::write`, renames it with `fs::rename` and takes an `fd-lock`; it gives `not armed` on a docs-only diff, a pure-computation diff and a diff whose only writes are in tests. On today's shutdown fix diffs (when present on main) it gives `armed`. `review.sh --lens rerun` passes its launch check; `findings.py open --lens rerun` records the lens; `assign.py --lens rerun` is accepted. The `review.sh`, `assign`, `findings`, `agents_log`, `review_pool_report`, `progress_history` and `rounds` suites stay green; basedpyright 0/0/0. `berth.work_order validate` passes this plan's todo phases.
 
-### Phase 16 — One rerun sweep of the scripts names each fault and its owner  · status: todo
+### Phase 16 — One rerun sweep of the scripts names each fault and its owner  · status: done
 **Depends on:** Phase 15
 
 #### Work Order
@@ -528,16 +528,26 @@ The user approved this work through the showrunner (2026-10-29, ranked before Ph
 - Run the `rerun` lens's five questions over the scripts in `~/.claude/scripts` at the sdlc merge-branch tip, in this order: shutdown, herdr, claims, holds, leases and review-pool scripts first, then the rest that `rerun_lens.py arm` marks armed when run on the whole file.
 - Each fault is one row: `path:line`, question number, what happens on a rerun (the stop line and the result), and the owner unit (from the file's last checkpoint subject, or the production doc's owner map). A fault already fixed on the tip is not a row.
 - The unit director checks each row against the file before it is sent; a row that does not hold is dropped.
-- Send the list to the showrunner as one message. This phase fixes nothing; the showrunner routes each row to its owner.
+- Send the list to the showrunner as one message. The sweep fixes nothing; the showrunner routes each row to its owner.
+- Holder evidence stays visible when it is malformed (showrunner, 2026-10-29, from the hierarchies phase 10 review; a wrong result, due at this checkpoint). `progress_history.py waits` reads each wait's holder record. Today a present but malformed `holder` (such as `[]`) becomes `HolderNotNamed("recorded before holders")`, and unknown holder fields are dropped before any reader sees them, so a malformed record reaches the measure as valid evidence. A new named state, `MalformedHolder`, carries the raw value and the reason. Only an absent `holder` key means recorded before holders. A record with a field outside its state's schema is malformed. Every reader of the `holders` output that counts holder evidence treats `MalformedHolder` as not valid evidence and shows it.
+- A phase's `production` in `progress_history.py waits` is a production name, never a path (showrunner, 2026-10-29, from the C473 vet). A plan header such as `> **Production:** docs/hana/tool-based-ui-production.md — unit …` names the production doc; `_phase_plan_names` reports that path as the production today. When the header value is a path to a production doc, read the name from that doc's `# Production — <name>` heading; a stored `phase_started` value that is a path reads the same way. A doc that cannot be read or has no heading gives `PhaseMetadataNotRecorded` with the reason, never the path.
+- One heading reader, with no import cycle (merge gate, 2026-10-29: basedpyright `reportImportCycles` on `progress_history.py` -> `production_lifecycle.py` -> `merge_checkpoint.py`). `scripts/production/production_doc.py`, which imports only the standard library, gains `production_name(lines)` returning `ProductionName(value)` or `ProductionNameNotRecorded(reason)`. `production_lifecycle.production_name` keeps its callers and its `LifecycleStop`, and reads through it. `progress_history.py` imports `production_doc` at module level, with no `sys.path` change and no import inside a function.
 
 **Files:**
 - `docs/plans/sdlc-rerun-sweep.md` — new: the list, with the tip hash and the time
+- `scripts/direct/progress_history.py` — the `MalformedHolder` state and the production name from a header path
+- `scripts/direct/test_progress_history.py` — tests for a malformed holder and unknown fields
+- `scripts/production/production_doc.py` — the shared production name reader
+- `scripts/production/production_lifecycle.py` — reads the name through `production_doc`
+- `scripts/production/test_production_lifecycle.py` — tests for the shared reader
+- `scripts/direct/review_launcher_test_support.py` — its copied scripts tree gains `production_doc.py`
+- `scripts/direct/implement_launcher_test_support.py` — its copied scripts tree gains `production_doc.py`
 
-**Workers:** `2 writers` — `fix3` reads shutdown, herdr and claims scripts; `design` reads holds, leases, review-pool and the rest. Each writes only its own section of the report.
+**Workers:** `2 writers` — `fix3` reads shutdown, herdr and claims scripts; `design` reads holds, leases, review-pool and the rest. Each writes only its own section of the report. `fix2` writes the holder fix.
 
-**State:** none — read only; writes one report.
+**State:** none — the sweep reads only and writes one report; the holder fix changes how stored holder records are read, not what is written.
 
-**Acceptance gate:** every row names path:line, a question 1-5, the rerun result and an owner; the unit director has checked each row against the tip; the list is sent.
+**Acceptance gate:** every row names path:line, a question 1-5, the rerun result and an owner; the unit director has checked each row against the tip; the list is sent. A wait whose holder is `[]`, or a named holder with an unknown field, comes back from `waits` (its output is JSON) as `MalformedHolder` with the raw value, and an absent holder key still reads as recorded before holders; a phase whose plan header names a production doc path reports that doc's production name; basedpyright over the whole `scripts/` tree reports no import cycle; the `progress_history` suite stays green; basedpyright 0/0/0.
 
 ### Phase 14 — A plan's Depends line counts only this plan's own phases  · status: todo
 **Depends on:** Phase 15 (order only: the showrunner ranks the rerun lens first)
