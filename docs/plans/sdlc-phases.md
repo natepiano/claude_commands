@@ -135,9 +135,9 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Ruled out:** a retrospective before sample — the design's Steps need a prospective one; start-time selection inside `phase_boundaries` — it breaks `daily_read.py`; deploy time as exposure — it does not prove which contract a phase read.
 
 ### Phase 4 — `direct.md` becomes a short route, and each step reads only its own rule file  · status: todo
-**Depends on:** Phase 3, Phase 6, Phase 7, Phase 8, Phase 9, Phase 11, Phase 12, Phase 13
+**Depends on:** Phase 3, Phase 6, Phase 7, Phase 8, Phase 9, Phase 11, Phase 12, Phase 13, Phase 17, Phase 20
 
-**Waits for:** Phases 3, 6, 7, 8, 9, 11, 12 and 13 on main, and postmaster-unit's write-once reply records on main (the showrunner names each hash and time); then at least twenty eligible `BeforeChange` phases (`--before-at` main HEAD) from at least two units after the latest of those times, so both samples run with the same recorder, wait records, launchers and `phase_process.py`. fix-rounds-unit's `<FixDispatch/>` edits to `commands/unit/direct.md` are on the sdlc merge branch since c79e5d12.
+**Waits for:** Phases 3, 6, 7, 8, 9, 11, 12, 13, 17 and 20 on main (17 and 20 change the launcher and wait records the comparison holds fixed), and postmaster-unit's write-once reply records on main (the showrunner names each hash and time); then at least twenty eligible `BeforeChange` phases (`--before-at` main HEAD) from at least two units after the latest of those times, so both samples run with the same recorder, wait records, launchers and `phase_process.py`. fix-rounds-unit's `<FixDispatch/>` edits to `commands/unit/direct.md` are on the sdlc merge branch since c79e5d12.
 
 #### Work Order
 
@@ -145,7 +145,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Spec:**
 - First, before any edit to a contract file, freeze the before sample. Fix both bounds: `--since` is the latest of the main times named in **Waits for**, and `--until` is the freeze time, written as UTC stamps in the Step log. Run one invocation per unit: `phase_process.py baseline --exposure before --before-at <~/.claude main HEAD at the freeze> --units <one unit> --since <the latest main time> --until <the freeze time>`. `render_trial` pools the primary measures across all selected units, so a run with several units gives no per-unit result. Run each unit again with `--detail trial` to list its eligible rows. Record in the design doc's **Step log** the `phase_process.py` commit, the before anchor, the filter, each unit, the window, n for each measure, each excluded state with n, median and p90 phase time per unit over the trial's eligible phases (the trial section's phase-time line), and the selected phase instances.
-- Phase instances and matching metadata: the detail table prints only run and display phase id. For each detail row, read its phase start event in `~/.local/state/plan-delegate/runs/<run>.jsonl` (read-only) and record the run id, display phase id, `phase_instance_id`, start time, mode, scope class, worker model and gates. When one display id has more than one instance in the run, the start time inside the window selects the instance; when that does not select exactly one, the Step log names the row ambiguous. A field that the run file does not hold is `NotRecorded` for that row, never a blank. Phase 5 matches on these recorded values.
+- Phase instances and matching metadata: the detail table prints only run and display phase id. For each detail row, read its phase start event in `~/.local/state/plan-delegate/runs/<run>.jsonl` (read-only) and record the run id, display phase id, `phase_instance_id`, start time, mode, scope class, worker model and gates. When one display id has more than one instance in the run, the start time inside the window selects the instance; when that does not select exactly one, the Step log names the row ambiguous. The phase start event does not hold mode, scope class, worker model or gates today: before the freeze, find each field's source (the run start event, the phase's `pass_started` records, its retained prompts or check artifacts) and name it in the Step log. Scope class is the number of paths in the phase's Work Order **Files** list: 1–5 small, 6–20 medium, more than 20 large. A field that no source holds is `NotRecorded` for that row, never a blank. Phase 5 matches on these recorded values.
 - Merge the sdlc merge branch. Build every move on its text (fix-rounds-unit's phase 5 and roles-unit's renames).
 - The route: `direct.md` keeps the tags that can apply at any step after a compaction — state, `<TagReferenceContract>`, `<LongLivedWorkers>`, `<CoreContract>`, `<ProductionUnit>`, `<TurnEndGate>`, `<ToolingContract>`, `<DispatchContract>`, `<WorkerRuns>`, `<PauseForMove>`, `<CompactionContract>`, `<UserFacingText>`, `<ProgressContract>`, `<AuthorizationContract>`, `<DecisionRouting>`, `<Guild>`, `<GuildHeadStanding>`, `<HeldAstraRoles>` and the `**Standing:**` startup line — and one table row per moved tag: tag, file, the moment to read it. Moved tags go to files under `docs/direct/` beside `phase_end.md` and `run_phase_review.md`, grouped by step. Each step file starts with the list of contracts it depends on. A rule body moves byte-for-byte; only the route rows and each step file's header are new text.
 - `tag_inventory.py` passes before and after the move, and lists the same tags.
@@ -176,7 +176,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Spec:**
 - Fix both bounds before the run: `--since` is the time the route reached main, and `--until` is the collection time, written as UTC stamps in the Step log. Never use the script's moving fourteen-day default. Run one invocation per unit, because `render_trial` pools the primary measures across all selected units: `phase_process.py baseline --exposure after --route-revision <Phase 4's route commit> --units <one unit of the before sample> --since <the route main time> --until <the collection time>`, at the Step log's measurement version. Record the after phase instances and their matching metadata the same way Phase 4's freeze did (`--detail trial` per unit, then each row's phase start event). Add the after numbers to the Step log with n for each: weighted director tokens over the phase plus its following gap (the primary measure), compactions per phase and context size after each reload (reported, no target). Show each unit's results apart, and each excluded state (`ExposureNotRecorded`, `NoFollowingPhase`, `SharedDirector`, mixed) with n.
-- Matching: the same units in both windows, with matched mode, scope class, worker model and gates. If they do not match, the result is `inconclusive`, with what did not match; it is never read as a pass or a failure.
+- Matching: the same units in both windows, with matched mode, scope class, worker model and gates. If they do not match, the result is `inconclusive`, with what did not match; it is never read as a pass or a failure. Two `NotRecorded` values never match: a control that is `NotRecorded` in either window makes the result `inconclusive`.
 - Counts: the n a step names counts usable primary observations (weighted tokens known). `Unweighted`, `NotRecorded`, `NoCompaction` and `NoReload` are reported with n; they are never 0 and never a failed saving.
 - Quality held: median and p90 phase time per unit, over the trial's eligible phases (the trial section's phase-time line), do not rise against the Step log's before sample. A rise is reported with the step's result.
 - If the window holds no eligible observation (n 0, or below the n the step names), the result is `not yet measurable`: the Step log names the missing evidence and the condition for the next collection, and the phase waits on it; this is never read as a failed step.
@@ -192,7 +192,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `impl` — `docs/plans/sdlc-phases-design.md`
 - `test` — opens as test — independently re-runs the frozen measure, recomputes the percentage from the exact observations (values near 1.5% included), and checks the Step log; it writes no doc text
 
-**Constraints from prior phases:** Deployed revisions: Phase 3 is merged as b5187294, and ~/.claude main has been bc9e8ad9 since 05:29 EDT 2026-10-29. Phase 6, Phase 7, Phase 8 and Phase 4's route are pending: the showrunner names hash and time for each, and the Step log records them. The Step log before measure (version, filter, units, n, fixed window, phase instances with matching metadata), the deploy hash and time from the showrunner, and the change Phase 3 shipped. Step 1's target: weighted director tokens 3–7% lower per phase plus gap; gap 0–3 s. Exposure comes from the `direct.md` hash the recorder records at each phase start and finish (Phase 3), never from a deploy time; Phase 4 froze the before sample before the route. The next step is chosen from B, full A, G and I (design doc, Recommendation); C waits until dispatch time comes first. Phases 6, 7, 8, 9, 11, 12 and 13 and postmaster-unit's write-once reply records are on main before the before sample starts, so both samples use the same recorder, wait records, launchers and `phase_process.py`. A change to the recorder, a launcher or `phase_process.py` that reaches main between Phase 4's freeze and this collection makes the result `inconclusive`, naming the change, unless a new before sample is frozen after it. `test_phase_process.py` holds three tests that read the design doc's Recommendation, Comparison and Steps; every Step log or Recommendation edit keeps them green.
+**Constraints from prior phases:** Deployed revisions: Phase 3 is merged as b5187294, and ~/.claude main has been bc9e8ad9 since 05:29 EDT 2026-10-29. Phase 6, Phase 7, Phase 8 and Phase 4's route are pending: the showrunner names hash and time for each, and the Step log records them. The Step log before measure (version, filter, units, n, fixed window, phase instances with matching metadata), the deploy hash and time from the showrunner, and the change Phase 3 shipped. Step 1's target: weighted director tokens 3–7% lower per phase plus gap; gap 0–3 s. Exposure comes from the `direct.md` hash the recorder records at each phase start and finish (Phase 3), never from a deploy time; Phase 4 froze the before sample before the route. The next step is chosen from B, full A, G and I (design doc, Recommendation); C waits until dispatch time comes first. Phases 6, 7, 8, 9, 11, 12, 13, 17 and 20 and postmaster-unit's write-once reply records are on main before the before sample starts, so both samples use the same recorder, wait records, launchers and `phase_process.py`. A change to the recorder, a launcher or `phase_process.py` that reaches main between Phase 4's freeze and this collection makes the result `inconclusive`, naming the change, unless a new before sample is frozen after it. `test_phase_process.py` holds three tests that read the design doc's Recommendation, Comparison and Steps; every Step log or Recommendation edit keeps them green.
 
 **Acceptance gate:** the Step log has before and after numbers with n and window, the matching result and the phase-time check; `python3 -m unittest discover -s scripts/direct -p 'test_phase_process.py'` passes, its design-doc tests included; the question is sent.
 
@@ -428,112 +428,32 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `scripts/direct/test_plan_history.py`, `scripts/direct/test_progress_history.py` — dependency-parse tests
 
 ### Phase 17 — Five rerun faults in the unit scripts clear on a rerun  · status: done
-**Depends on:** Phase 16 (the sweep list) and Phase 14 (order only)
 
-The showrunner routed five rows of the rerun sweep (`docs/plans/sdlc-rerun-sweep.md`, checked at sdlc 097b1a0d) to phases-unit on 2026-10-29: the four rows in its phases-unit section and `scripts/direct/end_session.sh:87` from the fix-rounds section (fix-rounds-unit is stopped). Each row is a step that, if stopped at the named line, leaves a state that a rerun cannot get past or reads wrong. Line numbers are from 097b1a0d; find each by the code the row names.
+#### As-built
 
-#### Work Order
-
-**Goal:** after a stop at each named line, the next run of the same command finishes the work and reports the true state.
-
-**Spec:**
-- `scripts/direct/assign.py` (claim check, row line 363): a launcher claim records the launcher's process start time beside its pid. A claim is live only when a process with that pid exists and has the same start time; a reused pid reads as a stale claim, and the rerun takes the worker. A claim with no start time (written before this change) keeps today's pid-only check.
-- `scripts/direct/findings.py` (`landed`, row line 1218): a stop after the state write and before the `finding_batch_landed` event no longer leaves history without the event. A rerun of `landed` for that round writes the missing event once and says so; a round whose event exists stays "no repair round in flight".
-- `scripts/direct/verify.sh` (lint pass cache, row line 2065): a recorded failure on a tree is never hidden by an older recorded pass for the same tree. A forced lint that fails deletes the old pass record before it publishes its failure record, so a stop between the two steps leaves no record and the next call runs lint again.
-- `scripts/direct/verify.sh` (resource wait close, row line 1157): when closing a recorded resource wait fails, cleanup keeps the wait's id where the next run finds it (or keeps the folder), and the next run closes that earlier wait before it opens its own.
-- `scripts/direct/end_session.sh` (row line 87): one run whose `roles.py unbind-run` fails no longer stops the cleanup of the other runs in the list. Each run is unbound and cleaned on its own; the script exits nonzero at the end and names each run that failed, so a rerun retries only those.
+- A stop at each of five named steps no longer blocks a rerun. Each fault has a stop-and-rerun test that fails on the tree before its fix.
+- `assign.py`: a launcher claim records the launcher's process start time beside its pid. A claim is live only when that pid exists with the same start time. A reused pid reads as stale, and the rerun takes the worker. A claim with no start time keeps the pid-only check.
+- `findings.py` `landed`: a rerun after a stop between the state write and the `finding_batch_landed` event writes the missing event once and says so. A round whose event exists stays "no repair round in flight".
+- `verify.sh`: a failed forced lint deletes the old pass record before it publishes its failure record, so an older pass never hides a failure on the same tree. When a resource wait close fails, cleanup keeps the wait id (or the folder), and the next run closes that wait before it opens its own. The wait file is published by a staged write.
+- `end_session.sh`: each run is unbound and cleaned on its own. A failed `roles.py unbind-run` does not stop the other runs. The script exits nonzero at the end and names each failed run, so a rerun retries only those.
+- `scripts/lib/process_start.py` is the one process start and /proc stat reader under `scripts/`. `check_owner` and `check_group_leader` return `OwnerCheck` (ALIVE, GONE, REPLACED, UNKNOWN), computed per call and never stored. Each caller maps it to keep, reclaim or signal. Every per-script copy of a start reader is deleted.
 
 **Files:**
-- `scripts/direct/assign.py`
-- `scripts/direct/test_assign_launcher.py`
-- `scripts/direct/findings.py`
-- `scripts/direct/test_findings.py`
-- `scripts/direct/verify.sh`
-- `scripts/direct/test_verify_hold_lint.py`
-- `scripts/direct/test_verify_hold_wait.py`
-- `scripts/direct/end_session.sh`
-- `scripts/direct/test_end_session.py`
-- `scripts/agents/codex_mesh.py` — the follow-claim release and launcher liveness checks (models-unit's file)
-- `scripts/agents/test_codex_mesh.py`
-- `scripts/lib/process_start.py` — new: the one process start reader (showrunner ruling 2026-10-30)
-- `scripts/lib/test_process_start.py`
-- `scripts/direct/step_record.py` — calls the shared reader; its own copy is deleted
-- `scripts/direct/test_step_record.py`
-- `scripts/direct/tree_watch.py` — calls the shared reader; its own copy is deleted
-- `scripts/direct/test_tree_watch.py`
-- `scripts/lib/process_start_test_support.py` — the shared fake stat writer for tests
-- `scripts/production/retire_unit.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/production/test_retire_unit.py`
-- `scripts/production/merge_gate.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/production/merge_gate_test_support.py`
-- `scripts/production/merge_gate_suites_test_support.py`
-- `scripts/herdr/herdr.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/herdr/test_herdr.py`
-- `scripts/herdr/test_herdr_sessions.py`
-- `scripts/message/sessions.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/message/test_sessions.py`
-- `scripts/message/test_rca.py`
-- `scripts/message/test_roster.py`
-- `scripts/message/test_top_level.py`
-- `scripts/shutdown/remote_control.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/shutdown/stop.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/shutdown/inventory.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/shutdown/pane_record.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/shutdown/test_inventory.py`
-- `scripts/shutdown/test_remote_control.py`
-- `scripts/shutdown/test_restart.py`
-- `scripts/shutdown/test_settle.py`
-- `scripts/shutdown/test_stop.py`
-- `scripts/nix_env/heal.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/nix_env/test_heal.py`
-- `scripts/direct/test_workers.py`
-- `scripts/production/fake_unit_host.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/production/add_unit_test_support.py`
-- `scripts/production/test_unit_lookup.py`
-- `scripts/production/test_session_pane.py`
-- `scripts/production/test_live_units.py`
-- `scripts/production/test_add_showrunner.py`
-- `scripts/production/test_add_unit_restore.py`
-- `scripts/production/test_add_unit_resume.py`
-- `scripts/mac_test/mac_test.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/mac_test/copy_watch.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/mac_test/offload_test_support.py`
-- `scripts/mac_test/test_mac_test.py`
-- `scripts/mac_test/test_copy_watch.py`
-- `scripts/build_targets/build_targets.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/build_targets/test_targets.py`
-- `scripts/build_targets/test_build_targets.py`
-- `scripts/build_hold/build_hold.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/build_hold/hold_enforcer.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/build_hold/test_build_hold.py`
-- `scripts/build_hold/test_hold_enforcer.py`
-- `scripts/hooks/test_build_hold_guard.py`
-- `scripts/build_queue/test_build_queue.py`
-- `scripts/lint/memory_admit.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/lint/tmp_sweep.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/lint/test_memory_admit.py`
-- `scripts/lint/test_tmp_sweep.py`
-- `scripts/lint/test_invoke_scope.py`
-- `scripts/buildlog/mac_idle.py` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/buildlog/test_mac_idle.py`
-- `scripts/direct/test_verify_mac_arguments.py`
-- `scripts/direct/board.sh` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/direct/test_board_reclaim.py`
-- `scripts/direct/implement.sh` — calls the shared reader; its own copy is deleted (showrunner ruling 2026-10-30)
-- `scripts/direct/implement_launcher_claims_test_support.py`
-- `scripts/direct/test_implement_launcher_claims.py`
-- `scripts/direct/verify_token_ownership_test_support.py`
-- `scripts/direct/test_verify_step_routes_restart.py`
-- `scripts/production/unit_status_test_support.py`
-- `scripts/direct/implement_launcher_test_support.py`
-- `scripts/direct/review_launcher_test_support.py`
-- `scripts/direct/test_verify_step_owner.py`
-- `scripts/production/rename_unit.py`
-- `scripts/production/test_rename_unit_processes.py`
+- `scripts/lib/process_start.py` — the shared reader and `OwnerCheck`; `scripts/lib/test_process_start.py`.
+- `scripts/lib/process_start_test_support.py` — the one fake stat helper for tests (`write_stat`, `process_start_probe`, `stored_start_probe`).
+- `scripts/direct/assign.py`, `findings.py`, `verify.sh`, `end_session.sh` — the five rerun fixes; tests in `test_assign_launcher.py`, `test_findings.py`, `test_verify_hold_lint.py`, `test_verify_hold_wait.py`, `test_end_session.py`.
+- Callers of the shared reader (own copy deleted): `scripts/direct/` (`step_record.py`, `tree_watch.py`, `board.sh`, `implement.sh`), `scripts/agents/codex_mesh.py`, `scripts/production/` (`retire_unit.py`, `merge_gate.py`, `fake_unit_host.py`, `rename_unit.py`), `scripts/herdr/herdr.py`, `scripts/message/sessions.py`, `scripts/shutdown/` (`remote_control.py`, `stop.py`, `inventory.py`, `pane_record.py`), `scripts/nix_env/heal.py`, `scripts/mac_test/` (`mac_test.py`, `copy_watch.py`), `scripts/build_targets/build_targets.py`, `scripts/build_hold/` (`build_hold.py`, `hold_enforcer.py`), `scripts/lint/` (`memory_admit.py`, `tmp_sweep.py`), `scripts/buildlog/mac_idle.py`. Their tests and test support modules use the shared fake stat helper.
 
-**Workers:** `2 impl` (one for `assign.py`, `findings.py`, `end_session.sh` and their tests; one for `verify.sh` and its two test modules).
+**Binds later work:**
+- Any code that reads a process start or decides a process is stale calls `scripts.lib.process_start` (`check_owner`, `check_group_leader`). Only GONE and REPLACED reclaim. Only ALIVE signals. UNKNOWN keeps the record.
+- Tests fake process state through `scripts/lib/process_start_test_support.py`, never a local stat writer.
+- "A stopped verify.sh wait is found and closed on a rerun" uses the staged wait-file publication in `verify.sh` and the shared reader for its owner check.
 
-**Acceptance gate:** for each of the five rows, one test stops the command at the named line (a fault injected at that step), reruns the same command, and asserts the rerun's result: a reused pid takes the worker; `landed` restores `finding_batch_landed` exactly once; a failed forced lint after a saved pass reports the failure on the next ordinary call; a failed wait close is closed by the next run; a failed unbind still cleans the other runs and the rerun retries only the failed one. Each test fails on the tree before its fix. The `scripts.direct.test_assign_launcher`, `scripts.direct.test_findings`, `scripts.direct.test_end_session`, `scripts.direct.test_verify_hold_lint` and `scripts.direct.test_verify_hold_wait` suites stay green.
+**Gotchas:**
+- A Mac start time is `ps -o lstart=` text, read with `LC_ALL=C` and `TZ=UTC`. A host without /proc gives UNKNOWN on a date mismatch, never REPLACED.
+- A test that patches a per-script start reader breaks, because those readers are gone. Patch `scripts.lib.process_start`.
+- A stop inside `phase_wait_start` still leaves an open wait with no wait file. "A stopped verify.sh wait is found and closed on a rerun" closes it.
+- A mesh inbox race in `codex_mesh.py` stays open; models-unit owns that file.
 
 ### Phase 18 — The Stop hook lets a full-context stop through only when something live will wake the session  · status: done
 **Depends on:** none (showrunner fix, 2026-10-29: ahead of other work)
@@ -569,20 +489,28 @@ Phase 17's closure work found this fault (Astra review of F008, 2026-10-30): `ph
 
 #### Work Order
 
-**Goal:** after a stop at any point in `phase_wait_start`, the next `verify.sh` run in that session closes the earlier wait, and history holds no open wait without a file that names it.
+**Goal:** after a stop at any point while a wait starts, the next run in that session closes the earlier wait, and history holds no open wait without a file that names it. Every wait publisher uses one recorder-owned operation for this.
 
 **Spec:**
-- `scripts/direct/verify.sh` makes the wait id before it calls the recorder and saves it in the wait file first, with the same staged publication Phase 17 uses for other wait files. It then calls `start-wait --wait-id <id>`.
-- `scripts/direct/progress_history.py` `start-wait` takes an optional `--wait-id`. A repeat call with an id that already has a `wait_started` event writes nothing more and prints the same id. Without `--wait-id` it makes an id as it does now.
-- `finish-wait` on an id that was never started exits with its own status and message ("never started"), not the "was not recorded" error. The shell removes a wait file on success or on that status, and keeps the file on any other failure.
-- No second wait-file writer and no second id format: the shell and the recorder use one id, made in one place.
+- One operation owns wait identity and publication. `scripts/direct/progress_history.py` makes the wait id, writes the wait file first (the staged publication Phase 17 uses for wait files), then appends the `wait_started` event, all in one place. `verify.sh` `phase_wait_start` and `progress_history.py` `record_turn_wait` (~5672, which writes its marker after `_record_wait` returns) both call it. No second wait-file writer and no second id format.
+- `codex_mesh.py` (~3306) has the same event-before-marker order. codex_mesh is models-unit's: this phase does not edit it; the checkpoint notice names the shared operation and asks models-unit to move that caller to it, with its own interruption test.
+- `start-wait` takes an optional `--wait-id`. A repeat call with an id that is already recorded writes nothing more and prints the same id. This holds for every recorded state of that id: `wait_started`, `wait_not_recorded`, finished, and closed as unclosed. A repeat keeps the original attribution and terminal state. Without `--wait-id` it makes an id as it does now.
+- History reads give a typed answer, not an empty list: `RecordedWait`, `NeverStartedWait` (the history was read in full and holds no event for the id) and `WaitHistoryUnavailable` (unreadable or malformed history). `_run_events` (~2436) returns `[]` on a read failure and skips malformed records today, so an empty list never proves absence.
+- `finish-wait` on a `NeverStartedWait` id exits with its own status and message ("never started"), not the "was not recorded" error. The shell removes a wait file on success or on that status. On `WaitHistoryUnavailable` or any other failure it keeps the file and prints a diagnostic.
+- Abandonment is terminal. A "never started" close records the abandoned id under the recorder lock (~6497), and a later `start-wait` for that id, from a recorder child that outlived its killed shell, writes nothing and exits with the abandoned status.
+- `waits` (~5798) shows one closure per recovered wait, keeps each terminal state, makes no interval for a never-started id, and keeps the recovery evidence when a close fails.
 
 **Files:**
 - `scripts/direct/verify.sh`
 - `scripts/direct/progress_history.py`
 - `scripts/direct/test_progress_history.py`
 - `scripts/direct/test_verify_hold_wait.py`
+- `scripts/direct/verify_hold_wait_test_support.py`
 
-**Workers:** `1 impl`.
+**Workers:** `1 writer + 1 tester`
+- `impl` — `scripts/direct/verify.sh`, `scripts/direct/progress_history.py`: the shared wait-publication operation and its callers
+- `test` — `scripts/direct/test_progress_history.py`, `scripts/direct/test_verify_hold_wait.py`, `scripts/direct/verify_hold_wait_test_support.py`: new interruption controls extend the shared fixture in `verify_hold_wait_test_support.py` (~144), never a second fixture
 
-**Acceptance gate:** a test stops `phase_wait_start` after the wait file is written and before `start-wait` runs; the next run closes it and history holds no open wait. A second test stops after `start-wait` writes its event; the next run closes that wait once. A third runs `start-wait --wait-id` twice with one id and finds one `wait_started` event. Each test fails on the tree before the fix. The `scripts.direct.test_verify_hold_wait` and `scripts.direct.test_progress_history` suites stay green.
+**Constraints from prior phases:** Phase 17: import the shared reader only as `from scripts.lib import process_start`; fake stat lines use `scripts/lib/process_start_test_support.py` (`write_stat`, `process_start_probe`); only GONE and REPLACED reclaim, only ALIVE signals, UNKNOWN keeps the owner. A rerun recovers waits only for the same session and physical worktree (`verify.sh` ~2260); keep that boundary. Keep Phase 17's live-owner protection, UNKNOWN retention, staged publication, probe suppression and failed-close recovery, and keep its stop-and-rerun tests green.
+
+**Acceptance gate:** a test stops `phase_wait_start` after the wait file is written and before the event; the next run closes it and history holds no open wait. A second test stops after the event; the next run closes that wait once. A third runs `start-wait --wait-id` twice with one id, for a started, a not-recorded, a finished and an unclosed wait, and finds one record each with its first attribution. A fourth makes history unreadable and finds the wait file kept with a diagnostic. A fifth pauses a recorder child before its append, kills only its shell, runs recovery, then resumes the child, and finds no reopened wait. A sixth stops `record_turn_wait` between its event and its marker and finds the wait closed on the next turn. `waits` shows one closure per recovered wait and no interval for a never-started id. Each test fails on the tree before the fix. The `scripts.direct.test_verify_hold_wait` and `scripts.direct.test_progress_history` suites stay green.
