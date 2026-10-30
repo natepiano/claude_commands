@@ -144,6 +144,142 @@ class BoundedShutdownTests(ShutdownTestCase):
               patch.object(inventory, "_snapshot_environment", environment)):
             return inventory.shutdown_processes()
 
+    def test_down_all_reaps_a_detached_build_with_a_saved_worker_marker(self) -> None:
+        director = top_level("owner", 101)
+        director["proc_start"] = "100"
+        worker = worker_session("worker", 201, owner="owner")
+        worker["proc_start"] = "105"
+        self.process(101, started="100")
+        self.process(201, started="105")
+        self.process(301, 900, started="110", session_id="worker", arguments=("bash", "verify.sh"))
+        scope = "/user/app.slice/app-agents.slice/run-owner.scope"
+        self.processes = self.linux_table({101: scope, 201: scope, 301: scope}, set()).processes.copy()
+        self.natural_exits.update({101: 3, 201: 3})
+        report = machine_inventory([director, worker])
+        original = stop.bounded_stop
+        def bounded(records: list[record.SessionShutdown], *, started: float,
+                    machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
+                    request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+            del started
+            self.assertEqual(records[0]["workers"], [worker])
+            return original(records, started=0, machine_wide=machine_wide, keep=keep, request_exit=request_exit,
+                monotonic=lambda: self.elapsed, sleep=self.advance, clock=lambda: NOW_UTC,
+                observe=self.observe, identity=self.probe, kill=self.kill)
+        with (patch.object(inventory, "all_live_accounts", return_value=[report]),
+              patch.object(settle, "_send_settle_message"), patch.object(stop, "bounded_stop", side_effect=bounded),
+              patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}), redirect_stdout(self.output)):
+            result = settle.down_all()
+        self.assertEqual(result, 0)
+        self.assertEqual(self.processes, {})
+        self.assertEqual({pid for _, pid, _ in self.signals}, {301})
+        self.assertIn("all 1 stopped", self.output.getvalue())
+
+    def test_saved_worker_marker_owns_a_build_without_scope_evidence(self) -> None:
+        saved = self.save(top_level("owner", 101))
+        worker = worker_session("worker", 201, owner="owner")
+        def workers(current: record.SessionShutdown) -> None:
+            current["workers"] = [worker]
+        saved = record.update_session(saved["login"], "owner", workers)
+        self.process(201, started=worker["proc_start"])
+        self.process(301, 900, session_id="worker", arguments=("bash", "verify.sh"))
+        self.natural_exits.update({101: 3, 201: 3})
+        result = self.run_stop([saved])
+        self.assertEqual(result[0]["progress"]["kind"], "stopped")
+        self.assertEqual(self.processes, {})
+        self.assertEqual({pid for _, pid, _ in self.signals}, {301})
+
+    def test_retained_owner_scope_owns_a_build_with_a_foreign_marker(self) -> None:
+        for survives in (False, True):
+            with self.subTest(survives=survives):
+                self.setUp()
+                director = top_level("owner", 101)
+                director["proc_start"] = "100"
+                saved = self.save(director)
+                self.process(301, 900, started="110", session_id="other")
+                scope = "/user/app.slice/app-agents.slice/run-owner.scope"
+                self.processes = self.linux_table({101: scope, 301: scope}, set()).processes.copy()
+                self.natural_exits[101] = 3
+                def kill(pid: int, signum: int) -> None:
+                    if survives:
+                        self.signals.append((self.elapsed, pid, signum))
+                    else:
+                        self.kill(pid, signum)
+                with redirect_stdout(self.output):
+                    result = stop.bounded_stop([saved], started=0, monotonic=lambda: self.elapsed,
+                        sleep=self.advance, clock=lambda: NOW_UTC, observe=self.observe,
+                        identity=self.probe, kill=kill)
+                self.assertEqual(result[0]["progress"]["kind"], "stop failed" if survives else "stopped")
+                self.assertEqual({pid for _, pid, _ in self.signals}, {301})
+                self.assertEqual(301 in self.processes, survives)
+
+    def test_uncertain_saved_worker_marker_keeps_its_observation_error(self) -> None:
+        director = top_level("owner", 101)
+        director["proc_start"] = "Thu Oct 29 19:00:00 2026"
+        saved = self.save(director)
+        def workers(current: record.SessionShutdown) -> None:
+            worker = worker_session("worker", 201, owner="owner")
+            worker["proc_start"] = "Thu Oct 29 19:00:01 2026"
+            current["workers"] = [worker]
+        saved = record.update_session(saved["login"], "owner", workers)
+        self.processes = {}
+        shown = self.darwin_tables("301 900 301 S Thu Oct 29 18:00:00 2026 build\n",
+            "301 900 301 S Thu Oct 29 18:00:00 2026 changed CLAUDE_CODE_SESSION_ID=worker\n")
+        with patch.object(sys, "platform", "darwin"), redirect_stdout(self.output):
+            result = stop.bounded_stop([saved], started=0, monotonic=lambda: self.elapsed,
+                sleep=self.advance, clock=lambda: NOW_UTC, observe=lambda _budget: shown, kill=self.kill)
+        self.assertEqual(result[0]["progress"]["kind"], "stop failed")
+        self.assertIn("301", str(result[0]["progress"]))
+        self.assertEqual(self.signals, [])
+
+    def requester_pause_preserves_its_pane(self, *, machine_wide: bool) -> None:
+        for marker in ("requester", "owner"):
+            with self.subTest(marker=marker):
+                self.setUp()
+                run = str(self.root / "owner-run")
+                director = top_level("owner", 101, run_dirs=[run])
+                saved = self.save(director)
+                owner_scope = "/user/app.slice/app-agents.slice/run-owner.scope"
+                requester_scope = "/user/app.slice/app-agents.slice/run-requester.scope"
+                rows = [(101, 100, owner_scope, ("claude",), ""),
+                        (200, 6323, requester_scope, ("zsh",), ""),
+                        (201, 200, requester_scope, ("claude",), ""),
+                        (202, 201, requester_scope, ("zsh", "-c", "tool"), "requester"),
+                        (260, 202, requester_scope, ("python3", "shutdown.py"), marker)]
+                for pid, parent, scope, arguments, session_id in rows:
+                    self.processes[pid] = inventory.ShutdownProcess(pid, parent, f"start-{pid}",
+                        arguments, session_id, cgroups=frozenset({scope}))
+                self.processes[101] = inventory.ShutdownProcess(101, 100, director["proc_start"],
+                    ("claude",), cgroups=frozenset({owner_scope}))
+                self.natural_exits[101] = 3
+                requester = top_level("requester", 201)
+                requester["proc_start"] = "start-201"
+                captures: list[bool] = []
+                def observe(budget: float) -> inventory.ProcessObservation:
+                    shown = self.observe(budget)
+                    captures.append(250 in shown.processes)
+                    return shown
+                def pause(arguments: list[str], _budget: float) -> int:
+                    self.assertEqual(arguments, ["stop", "--pause", "--session-dir", run])
+                    self.processes[250] = inventory.ShutdownProcess(250, 260, "start-250",
+                        ("python3", "codex_mesh.py", *arguments), "requester",
+                        cgroups=frozenset({requester_scope}))
+                    return 0
+                with (patch.object(os, "getpid", return_value=260), redirect_stdout(self.output)):
+                    result = stop.bounded_stop([saved], started=0, machine_wide=machine_wide,
+                        keep=(requester,) if machine_wide else (), monotonic=lambda: self.elapsed,
+                        sleep=self.advance, clock=lambda: NOW_UTC, observe=observe,
+                        identity=self.probe, kill=self.kill, codex_mesh=pause)
+                self.assertEqual(result[0]["progress"]["kind"], "stopped")
+                self.assertTrue(any(captures), "the pause subprocess must be observed")
+                self.assertEqual(self.signals, [])
+                self.assertEqual(set(self.processes), {200, 201, 202, 250, 260})
+
+    def test_down_all_pause_command_never_claims_the_requester_pane(self) -> None:
+        self.requester_pause_preserves_its_pane(machine_wide=True)
+
+    def test_single_stop_pause_command_never_claims_the_requester_pane(self) -> None:
+        self.requester_pause_preserves_its_pane(machine_wide=False)
+
     def test_initial_scopes_are_captured_before_exit_requests(self) -> None:
         director = top_level("owner", 101)
         director["proc_start"] = "100"
@@ -1800,7 +1936,7 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.assertTrue(arguments[1].endswith("/mac_test/mac_test.py"))
         self.assertTrue(block.exists(), "only the unblock protocol may delete a block and its saved CI state")
 
-    def test_detached_verify_with_an_exact_run_argument_stops_without_process_environment(self) -> None:
+    def test_detached_verify_run_argument_alone_grants_no_ownership(self) -> None:
         directory = self.root / "run"
         directory.mkdir()
         saved = self.save(top_level("director", 101, run_dirs=[str(directory)]))
@@ -1809,9 +1945,9 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.process(302, 301, arguments=("test-binary",))
         self.process(901, arguments=("bash", "verify.sh", "--session-dir", str(directory) + "-other", "test", "package"))
         _ = self.run_stop([saved])
-        self.assertEqual({pid for _, pid, _ in self.signals}, {301, 302})
-        self.assertEqual(set(self.processes), {901})
-        self.assertIn("stopped build", self.output.getvalue())
+        self.assertEqual(self.signals, [])
+        self.assertEqual(set(self.processes), {301, 302, 901})
+        self.assertNotIn("stopped build", self.output.getvalue())
 
     def assert_late_detached_build_stops(self, *, mesh: bool) -> None:
         run = self.root / "late-run"
@@ -1836,7 +1972,7 @@ class BoundedShutdownTests(ShutdownTestCase):
                     _ = path.write_text(json.dumps({"status": "running", "pid": 301, "label": "late build"}))
                     self.process(301, arguments=("python3", "mesh_runs.py", "supervise", str(path)))
                 else:
-                    self.process(301, arguments=("bash", "verify.sh", "--session-dir", str(run)))
+                    self.process(301, arguments=("bash", "verify.sh", "--session-dir", str(run)), run_dir=str(run))
                 self.process(302, 301)
                 _ = claim.write_text(json.dumps({"pid": 301, "proc_start": "start-301"}))
 

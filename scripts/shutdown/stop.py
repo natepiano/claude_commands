@@ -974,11 +974,16 @@ def _predates_owners(owner: BoundedOwner, started: str) -> bool:
     return candidate is not None and bool(earliest) and candidate < min(earliest)
 
 
+def _owner_session_ids(saved: SessionShutdown) -> frozenset[str]:
+    """Markers inherited from any recorded director or worker belong to this stop."""
+    return frozenset(entry["session_id"] for entry in (saved["session"], *saved["workers"]))
+
+
 def _cgroup_relation(owner: BoundedOwner, process: ShutdownProcess) -> Literal["owned", "unrelated", "unknown"]:
     """Readable Linux membership scopes unreadable environment evidence."""
-    if (process.session_id and process.session_id != owner.record["session"]["session_id"]
+    if (process.session_id in _owner_session_ids(owner.record)
             and not process.ownership_unreadable and process.pid not in owner.environment_unread):
-        return "unrelated"
+        return "owned"
     if process.ownership_unreadable or process.pid in owner.cgroup_unread:
         return "unknown"
     if not process.cgroups:
@@ -990,6 +995,9 @@ def _cgroup_relation(owner: BoundedOwner, process: ShutdownProcess) -> Literal["
             return "owned"
         if path.name != shared_server and group in owner.cgroups and "app-agents.slice" in path.parts:
             return "owned"
+    if (process.session_id and process.session_id not in _owner_session_ids(owner.record)
+            and process.pid not in owner.environment_unread):
+        return "unrelated"
     # Shared membership proves neither server identity nor pane ownership.
     if any(Path(group).name == shared_server for group in process.cgroups):
         return "unknown"
@@ -1028,7 +1036,8 @@ def _owner_observation(owner: BoundedOwner, observation: ProcessObservation) -> 
                           if (match := re.match(r"pid (\d+): environment unread", error)) is not None}
     cgroup_unread = {int(match[1]) for error in observation.errors
                      if (match := re.match(r"pid (\d+): cgroup unread", error)) is not None}
-    markers = {f"CLAUDE_CODE_SESSION_ID={session['session_id']}",
+    session_ids = _owner_session_ids(owner.record)
+    markers = {*(f"CLAUDE_CODE_SESSION_ID={identity}" for identity in session_ids),
                *(f"{key}={run}" for run in runs for key in ("UNIT_RUN_DIR", "UNIT_SESSION_DIR"))}
     ambiguous: set[int] = set()
     missing_parents = {pid for pid, _start in owner.targets if pid not in observation.processes
@@ -1038,10 +1047,11 @@ def _owner_observation(owner: BoundedOwner, observation: ProcessObservation) -> 
         uncertain_markers = (pid in observation.uncertain and any(
             re.search(r"(?:^|\s)" + re.escape(marker) + r"(?=\s|$)",
                       process.unreconciled_ownership_text) is not None for marker in markers))
-        if (process.session_id == session["session_id"] or process.run_dir in runs
+        if (process.session_id in session_ids or process.run_dir in runs
                 or uncertain_markers or process.build_unit and process.build_unit in units):
             related.add(pid)
-        if pid not in related and (process.observed_parents | {process.parent}) & missing_parents:
+        if (pid not in related and (pid, process.started) not in owner.permanent_keeps
+                and (process.observed_parents | {process.parent}) & missing_parents):
             ambiguous.add(pid)
             extra_errors.append(f"pid {pid}: parent identity not observed; ownership unknown")
     while True:
@@ -1132,6 +1142,8 @@ def _recorded_builds(session: Session, observed: dict[int, ShutdownProcess], rep
 
 
 def _owned_processes(saved: SessionShutdown, observed: dict[int, ShutdownProcess], report: Callable[[str], None] = _ignore_read_error) -> BoundedOwner:
+    command_tree = _descendants({os.getpid()}, observed)
+    observed = {pid: process for pid, process in observed.items() if pid not in command_tree}
     owner = saved["session"]
     runs = set(_run_directories(owner))
     owner_process = observed.get(owner["pid"])
@@ -1153,11 +1165,10 @@ def _owned_processes(saved: SessionShutdown, observed: dict[int, ShutdownProcess
     # Detached supervisors own a separate POSIX session, including already-reparented children.
     roots.update(pid for pid, process in observed.items() if process.process_session in builds
                  and observed[process.process_session].process_session == process.process_session)
-    # Detached verify calls retain the director/run environment, even after reparenting.
+    # Detached verify calls retain director/worker markers, even after reparenting.
+    session_ids = _owner_session_ids(saved)
     for pid, process in observed.items():
-        named_run = any(word in {"--session-dir", "--director-dir"} and following in runs
-                        for word, following in zip(process.arguments, process.arguments[1:]))
-        if process.session_id == owner["session_id"] or (process.run_dir and process.run_dir in runs) or named_run:
+        if process.session_id in session_ids or (process.run_dir and process.run_dir in runs):
             roots.add(pid)
             if any(Path(word).name in {"verify.sh", "merge_gate.py"} for word in process.arguments):
                 builds[pid] = " ".join(process.arguments)
@@ -1491,6 +1502,15 @@ def bounded_stop(
                 ownership_errors.extend(owner.ownership_errors)
                 ownership_errors.append(f"ownership observation: {error}")
                 return BoundedOwner(saved, {}, {}, set())
+            def keeps_unread(error: str) -> set[int]:
+                ownership_errors.append(f"keep observation: {error}")
+                return set()
+            kept_roots = {session["pid"] for session in keep if session["pid"] in fresh
+                          and fresh[session["pid"]].started == session["proc_start"]}
+            permanent = deadline.call(lambda _budget: _protected_processes(saved, fresh, ownership_errors.append),
+                                      keeps_unread, verification=True) | _descendants({os.getpid()} | kept_roots, fresh)
+            owner.permanent_keeps.update((pid, fresh[pid].started) for pid in permanent if pid in fresh)
+            owner.permanent_keeps.update(server_identities)
             discovered = deadline.call(lambda _budget: _owned_processes(saved,
                 {pid: process for pid, process in fresh.items() if pid not in observation.uncertain}, ownership_errors.append),
                                        ownership_unread, verification=True)
@@ -1501,10 +1521,14 @@ def bounded_stop(
             roots.update(discovered.processes)
             roots = _descendants(roots, fresh)
             roots.update(pid for pid, process in fresh.items() if process.build_unit and process.build_unit in owner.units)
+            roots.difference_update(pid for pid, start in owner.permanent_keeps
+                                    if pid in fresh and fresh[pid].started == start)
             owner.cgroups.update(group for pid in roots for group in fresh[pid].cgroups)
             roots.update(pid for pid, process in fresh.items() if pid not in observation.uncertain
                 and _cgroup_relation(owner, process) == "owned")
             roots = _descendants(roots, fresh)
+            roots.difference_update(pid for pid, start in owner.permanent_keeps
+                                    if pid in fresh and fresh[pid].started == start)
             for pid in roots:
                 process = fresh[pid]
                 identity_key = (pid, process.started)
@@ -1518,15 +1542,6 @@ def bounded_stop(
             for pid in roots:
                 if any(Path(word).name in {"verify.sh", "merge_gate.py"} for word in fresh[pid].arguments):
                     owner.builds[pid] = " ".join(fresh[pid].arguments)
-            def keeps_unread(error: str) -> set[int]:
-                ownership_errors.append(f"keep observation: {error}")
-                return set()
-            kept_roots = {session["pid"] for session in keep if session["pid"] in fresh
-                          and fresh[session["pid"]].started == session["proc_start"]}
-            permanent = deadline.call(lambda _budget: _protected_processes(saved, fresh, ownership_errors.append),
-                                      keeps_unread, verification=True) | _descendants({os.getpid()} | kept_roots, fresh)
-            owner.permanent_keeps.update((pid, fresh[pid].started) for pid in permanent if pid in fresh)
-            owner.permanent_keeps.update(server_identities)
             worker_roots = deadline.call(lambda _budget: _mesh_server_roots(session, fresh, ownership_errors.append),
                                          keeps_unread, verification=True)
             owner.ownership_errors = list(dict.fromkeys(ownership_errors))

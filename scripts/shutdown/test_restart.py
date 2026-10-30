@@ -5627,6 +5627,8 @@ class RestartTests(ShutdownTestCase):
                 self.create(saved)
                 unrelated_confirming = threading.Event()
                 requester_confirmed = threading.Event()
+                dependency_committed = threading.Event()
+                requester_launched = threading.Event()
                 observations: list[bool] = []
                 progress_line = restart.progress_line
 
@@ -5639,17 +5641,32 @@ class RestartTests(ShutdownTestCase):
                 def launch(_saved: SessionShutdown, _note: str, _state: restart.DesktopLaunchState,
                            *, dry_run: bool) -> restart.SessionLaunched:
                     del dry_run
-                    if _saved["session"]["session_id"] == "requester" and dependency_account != "none":
-                        self.assertIsNone(record.find_session(dependency_login, "dependency"))
+                    name = _saved["session"]["session_id"]
+                    if name == "unrelated" and dependency_account != "none":
+                        self.assertTrue(dependency_committed.wait(HANG_GUARD_SECONDS))
+                    if name == "requester" and dependency_account != "none":
+                        try:
+                            self.assertTrue(dependency_committed.is_set())
+                            dependency_record = record.find_session(dependency_login, "dependency")
+                            self.assertTrue(dependency_record is None or dependency_record["progress"]["kind"] == "restarted")
+                        finally:
+                            requester_launched.set()
                     return restart.SessionLaunched(SUBMITTED_PROMPT)
+
+                def resume_workers(current: SessionShutdown) -> None:
+                    if current["session"]["session_id"] == "dependency":
+                        # Confirmation is committed; keep archival pending until the
+                        # requester observes that valid settled state.
+                        dependency_committed.set()
+                        self.assertTrue(requester_launched.wait(HANG_GUARD_SECONDS))
 
                 def confirm(ids: frozenset[str], _timeout: float) -> restart.RegistryConfirmation:
                     if "unrelated" in ids:
                         unrelated_confirming.set()
                         # A finite guard releases the old scheduler without hanging the suite.
-                        observations.append(requester_confirmed.wait(5))
+                        observations.append(requester_confirmed.wait(HANG_GUARD_SECONDS))
                     elif "requester" in ids:
-                        self.assertTrue(unrelated_confirming.wait(5))
+                        self.assertTrue(unrelated_confirming.wait(HANG_GUARD_SECONDS))
                     return registry_confirmation(ids)
 
                 with (patch.object(restart, "_retire"),
@@ -5657,6 +5674,7 @@ class RestartTests(ShutdownTestCase):
                       patch.object(restart, "_launch_recovery_record", side_effect=launch),
                       patch.object(restart, "wait_for_confirmation", side_effect=confirm),
                       patch.object(restart, "progress_line", side_effect=progress),
+                      patch.object(restart, "_send_worker_resume", side_effect=resume_workers),
                       redirect_stdout(io.StringIO()) as output):
                     result = restart._up("", False, all_accounts=True)  # pyright: ignore[reportPrivateUsage]
                     self.assertEqual(result.exit_status, 0, output.getvalue())
