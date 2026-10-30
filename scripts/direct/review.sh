@@ -230,7 +230,7 @@ fi
 
 if [[ -z "${FOLLOW_TO}" && -z "${NEW_SLOT}" && ( -n "${POOL_TYPE}" || -n "${POOL_LEASE}" ) ]]; then
   RESOLVE_ERROR_FILE="${ARTIFACT_DIR}/review_resolve${SUFFIX}.$$.txt"
-  if FOLLOW_TO="$("$PY" "${SCRIPT_DIR}/workers.py" resolve --session-dir "${SESSION_DIR}" --role review --owner-pid "$$" 2>"${RESOLVE_ERROR_FILE}")"; then
+  if FOLLOW_TO="$("$PY" "${SCRIPT_DIR}/workers.py" resolve --session-dir "${SESSION_DIR}" --working-dir "${WORKING_DIR}" --role review --owner-pid "$$" 2>"${RESOLVE_ERROR_FILE}")"; then
     rm -f "${RESOLVE_ERROR_FILE}"
   else
     RESOLVE_CAUSE="$(tr '\n' ' ' < "${RESOLVE_ERROR_FILE}")"
