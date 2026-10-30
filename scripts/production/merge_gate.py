@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Merge a checkpoint, run the complete gate, then push (and optionally promote).
 
-The default sampled memory cap is 4096 MiB. A 163-module run with an empty timing
+The default sampled memory cap is 6144 MiB: full-tree basedpyright peaked at 4065 MiB
+on 2026-10-30, so its 4878 MiB reservation did not fit a 4096 MiB cap. A 163-module run with an empty timing
 cache took 102.80 s, peaked at 2.027 GiB, and had a largest module peak of
 0.494 GiB (one-minute load 7.79-16.32). A sample is resident plus swapped memory.
 Each running job keeps a reservation: admission counts max(job memory, largest job peak seen so far, initially 96 MiB)
@@ -67,7 +68,7 @@ TEST_SUITES = (
     "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "issue_score",
     "hierarchies",
 )
-DEFAULT_MEMORY_CAP_MIB = 4096
+DEFAULT_MEMORY_CAP_MIB = 6144
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
 MODULE_MEMORY_MIB = 48
 # A module still running this long is killed and the run is red: a hung module holds every gate
@@ -1269,7 +1270,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--mac-repo", default="~/.claude")
     _ = parser.add_argument("--settings-blob", default=SETTINGS_BLOB)
     _ = parser.add_argument("--memory-cap-mib", type=int, default=DEFAULT_MEMORY_CAP_MIB,
-                            help="sampled memory admission cap in MiB (default: 4096); measured 163-module run: 102.80 s, 2.027 GiB peak, 0.494 GiB largest module")
+                            help="sampled memory admission cap in MiB (default: 6144); measured 163-module run: 102.80 s, 2.027 GiB peak, 0.494 GiB largest module")
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--tests-only", action="store_true")
