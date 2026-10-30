@@ -409,37 +409,50 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Ruled out:** answer replay across a rename in this plan — rare, and the refusal is safe; it is a next item.
 
 ### Phase 15 — The push audit report and the full baseline measure read on a phone  · status: done
-**Depends on:** Phase 13 (done; it changed `measure.py`). Its files do not overlap Phase 14's, so the two can run in either order. It runs before Phase 6, which prints `compare` in the same form.
+
+#### As-built
+
+- `log_records.py` holds `PHONE_WIDTH = 50`, the one place the width is set, and `blocks(title: str, rows: Sequence[MeasureRow]) -> str`. `table` is gone. Output: the wrapped title; then `Window: …` and `Source: …` once when every row shares that field; then one block per row, a blank line between blocks: the measure name, then `  value: …`, `  n: …`, `  window: …`, `  source: …` for the fields that differ. No rows prints the title and `none`.
+- One wrap helper wraps every line at spaces to `PHONE_WIDTH`. A continued line is indented four spaces under its field. A word that fits the width but not beside the indent prints alone without the indent; a word longer than the width is never split and stands alone.
+- `measure.flow_table` is gone; the flow rows print through `blocks`. The summary lines of both commands and the note line in `push_audit.render` wrap the same way. `--json` does not change; there is no `--wide`.
+- Live on 2026-10-30: `push_audit.py report --full` and `measure.py baseline --full` print 0 lines over 50 characters that hold more than one word.
+
+**Files:**
+- `scripts/hierarchies/log_records.py` — `PHONE_WIDTH`, `blocks`, the wrap helper.
+- `scripts/hierarchies/measure.py`, `scripts/hierarchies/push_audit.py` — `render` and the summaries call `blocks` and the wrap helper.
+- `scripts/hierarchies/test_log_records.py` (new) — the one shared test parser: `read_report_blocks`, `displayed_fields`, `summary_lines(output, prefixes)`, `phone_overflow_lines`; tests for `blocks`, word lengths 46 to 50 beside the indent included.
+- `scripts/hierarchies/test_measure.py`, `scripts/hierarchies/test_push_audit.py` — 24 tests read blocks instead of padded columns and keep the same values, counts, windows and sources (24 `Assertion-Change:` lines in ff9c92a5).
+
+**Gotchas:** a test that searches the output for a cell's text must search for words, because a cell can wrap. Read rows with `read_report_blocks`; never write a second parser in a test file.
+
+### Phase 16 — A second merge of the same phase keeps its review row, and the record step reports ok  · status: todo
+**Depends on:** none of the waiting phases. Its files do not overlap Phase 15's or Phase 6's.
 
 #### Work Order
 
-**Goal:** `push_audit.py report --full` and `measure.py baseline --full` print no line wider than a phone screen; every cell value stays in the output.
+**Goal:** when a unit merges a phase a second time (a repair after the phase merged), `merge_checkpoint.py`'s record step reports `ok`, keeps the one review-ledger row from the first merge, and writes the production log line. A rerun of `review_regime.py add` for a unit, plan and phase that already has a row exits 0 and changes nothing.
 
-**Hana link:** indirect. The user reads these reports on the phone to judge the trial steps that Phase 6 keeps or drops for Hana.
+**Hana link:** indirect. A stopped record step holds every unit's repair merge until the showrunner repairs the ledger by hand, so Hana work waits behind it.
 
 **Spec:**
-- Today `log_records.table` pads five columns (Measure, Value, n, Window, Source) to the widest cell, so lines run 250 to 1131 characters (`push_audit.py report --full` printed 403 on 2026-10-29). `measure.flow_table` wraps only the Value cell at 60 and keeps the other columns.
-- `log_records.py`: `PHONE_WIDTH = 50`, the one place the width is set. `table(title, rows)` is replaced by `blocks(title: str, rows: Sequence[MeasureRow]) -> str`. Output: the title, wrapped; then one line per field whose value is the same in every row (`Window: <label>`, `Source: <text>`), printed once under the title and left out of the blocks; then one block per row, a blank line between blocks. A block is the measure name, then one indented line per remaining field: `  value: …`, `  n: …`, `  window: …`, `  source: …`. Each line wraps at spaces to `PHONE_WIDTH`, and a continued line is indented four spaces under its field. A single word longer than the width (a path, a hash) is never split; it stands alone on its line.
-- A table with no rows prints the title and `none`.
-- `measure.flow_table` is removed; the flow rows print through `blocks` with the flow title.
-- The summary lines that both commands print before the tables (`baseline_summary`, `report_summary`) wrap to `PHONE_WIDTH` too. The note line in `push_audit.render` ("Neither notification log records a key…") wraps the same way.
-- `--json` output does not change. No `--wide` option: the block form is the one form.
-- `worker_owners.py` does not use `log_records.table` and is not in this phase.
+- Today `review_regime.add` raises `SystemExit("review_regime: <unit> phase <N> of <plan> already has a row")` when a row with the same `(unit, plan, phase)` exists (`review_regime.py:156-157`). `merge_checkpoint.record` runs `add` on every code merge and stops with `record: failed` on a non-zero exit (`merge_checkpoint.py:1008-1026`). Seen 2026-10-30: cargo-liner-style's repair of its phase 69 (f3fb76f4, merged as 7a2f2fdd) stopped there.
+- `review_regime.add`: when a row with the same `(unit, plan, phase)` exists, write nothing, print one line `kept <unit> phase <N> of <plan>: a row exists from the merge at <existing merged>; nothing added`, and return normally (exit 0). The first row is the one the regime trial counts, so a phase never counts twice. All other checks before it (UTC offsets, `--merged` before `--started`) keep their refusals.
+- A row with no plan (written before plans were recorded) still never matches a row that has a plan, as today.
+- `merge_checkpoint.record`: when `add` exits 0, the record step's ok detail carries `add`'s stdout line before the existing text, for example `record: ok — kept alpha-unit phase 3 of docs/plans/x.md: a row exists from the merge at …; nothing added; review ledger and production log updated`. When `add` printed an `added …` line, the detail keeps today's text. A non-zero exit still stops with `record: failed`, as today.
+- The production log line is written for the second merge as for any merge; the existing "checkpoint already recorded" check (same unit, phase, commit and merge head) does not change.
 
 **Files:**
-- `scripts/hierarchies/log_records.py` — `PHONE_WIDTH`, `blocks`, a wrap helper; `table` removed
-- `scripts/hierarchies/measure.py` — `render` and `baseline_summary` call `blocks`; `flow_table` removed
-- `scripts/hierarchies/push_audit.py` — `render` and `report_summary` call `blocks`
-- `scripts/hierarchies/test_log_records.py` — tests for `blocks` (new)
-- `scripts/hierarchies/test_measure.py` — tests; the calls to `log_records.table` change to `blocks`
-- `scripts/hierarchies/test_push_audit.py` — tests
+- `scripts/production/review_regime.py` — `add` keeps the existing row and exits 0
+- `scripts/production/merge_checkpoint.py` — `record` shows `add`'s line in its ok detail
+- `scripts/production/test_review_regime.py` — tests
+- `scripts/production/test_merge_checkpoint.py` — tests (or `test_merge_checkpoint_history.py` when the second-merge case fits there)
 
 **Workers:** `1 writer + 1 tester`
-- `impl2` — `log_records.py`, `measure.py`, `push_audit.py`; `log_records.py` is the hub file and stays with it
-- `test` — the three test files. `blocks`: every line is at most `PHONE_WIDTH` characters except a line that holds one word longer than the width; the words of each cell, joined, equal the cell's words; a field shared by every row prints once under the title and in no block; a field that differs prints in each block; no rows prints `none`. `measure.py baseline --full` and `push_audit.py report --full` on the existing fixtures: every line obeys the width rule, and each row's measure name and value words are present. Structural assertions change: `test_measure.py` `test_full_cli_coverage_counts_are_separate_and_values_fit_a_phone` (asserts five columns) and `test_push_audit.py` `total_cells` (parses padded columns) move to a block parser in the test files that reads each block's fields back; they keep the exact row values, counts and coverage equality, and each changed test gets an `Assertion-Change:` line. Other existing assertions that search the output for a cell's text keep passing when the text is now on wrapped lines only if they search for words; an assertion that changes needs the Assertion-Change line below.
+- `impl2` — `review_regime.py`, `merge_checkpoint.py`
+- `test` — the test files. `test_review_regime.py`: `test_the_same_unit_plan_and_phase_is_refused` becomes a test that a second `add` for the same unit, plan and phase returns, prints the `kept` line, and leaves the ledger with the first row only, byte for byte (an `Assertion-Change:` line names it); a second plan's phase 1 still adds its own row; a planless old row still blocks nothing. Merge checkpoint: one unit's phase merged, then a repair commit of the same phase merged with the review step running the real `review_regime.py` against a ledger in the test's home (set `MERGE_CHECKPOINT_REVIEW_REGIME`); the second run exits 0, prints `record: ok` with the `kept` line, the ledger holds one row, and the production log holds two merge lines. A failing `add` still stops the record step.
 
-**State:** none; output form only.
+**State:** `~/.claude/data/review_regime.jsonl` (append only; this phase removes the refusal that stopped a second append, and writes nothing new). The production log as today.
 
-**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. From Phase 8: both commands print a short summary by default and the tables only under `--full`. From Phase 13: the UncertainCoverage and attribution cells list each candidate once with `(N times)`; that text wraps like any other value. Tests: `python3 -m unittest scripts.hierarchies.test_log_records scripts.hierarchies.test_measure scripts.hierarchies.test_push_audit`.
+**Constraints from prior phases:** From Phase 13b: the scope filter and the record step stay as they are apart from the ok detail. Tests: `python3 -m unittest scripts.production.test_review_regime scripts.production.test_merge_checkpoint scripts.production.test_merge_checkpoint_history`. Callers to type-check and test: `ci_points.py` and `dailies_input` only run `report` and `watch`, which do not change.
 
-**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; the live `--full` output of both commands has no line over 50 characters except single long words. An assertion changed only because the text now wraps carries an `Assertion-Change:` line in the checkpoint. **Change-Review row:** one per command, run from `~/.claude`: `~/.claude/scripts/lib/py ~/.claude/scripts/hierarchies/push_audit.py report --full` and `~/.claude/scripts/lib/py ~/.claude/scripts/hierarchies/measure.py baseline --full`; what you see: each row is a short block that fits a phone screen, and the shared window prints once at the top of each table.
+**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green. **Change-Review row:** what changed: a repair merge of a phase that merged before no longer stops at the record step | how to try it: on natedev from `~/.claude`, `~/.claude/scripts/lib/py ~/.claude/scripts/production/review_regime.py add` with the unit, plan and phase of a row already in the ledger (see `review_regime.py report`), using a scratch `HOME` | what you see: one `kept … nothing added` line, exit 0, and the ledger unchanged.
