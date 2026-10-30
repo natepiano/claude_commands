@@ -129,6 +129,9 @@ class RetireUnitTests(unittest.TestCase):
         self.records = []
         self.claude = [session(DIRECTOR, "alpha", 4101), session(SEAT, "alpha-seat", 4102)]
         self.pool_lines = "code-1\tcode\talpha-unit:1\tidle\t3\ncode-2\tcode\tbeta-unit:1\tidle\t1\n"
+        self.staff.register_production("alpha", self.doc)
+        parent = staff.ensure("showrunner", name="alpha")
+        _ = staff.ensure("unit", name="alpha", parent=parent.id)
         production = read_production(self.doc)
 
         def production_of(_slug: str) -> Production:
@@ -225,7 +228,6 @@ class RetireUnitTests(unittest.TestCase):
         saved["session"]["session_id"] = DIRECTOR
         host = saved["session"]["host"]
         assert host["kind"] == "unit"
-        host["production"], host["doc"] = "alpha", str(self.doc)
         self.records = []
         self.claude = [session(DIRECTOR,"alpha",pane.director)] if live else []
         self.enterContext(mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown")}))

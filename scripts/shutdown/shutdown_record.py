@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import ctypes
 import fcntl
 import json
 import os
@@ -497,6 +498,34 @@ class OwnerPaneScope(TypedDict):
     cgroups: list[str]
 
 
+class ShowrunnerLinePending(TypedDict):
+    """This line is claimed and has no send result yet."""
+    kind: Literal["pending"]
+    line: str
+    summary: str
+    text: str
+
+
+class ShowrunnerLineQueued(TypedDict):
+    """send.py keeps this line for delivery; no receipt is known."""
+    kind: Literal["queued"]
+    line: str
+    summary: str
+    text: str
+    reason: str
+    at: str
+
+
+class ShowrunnerLineDelivered(TypedDict):
+    """Delivery of this exact line has succeeded."""
+    kind: Literal["delivered"]
+    line: str
+    text: str
+
+
+ShowrunnerLine = ShowrunnerLinePending | ShowrunnerLineQueued | ShowrunnerLineDelivered
+
+
 class SessionShutdown(TypedDict):
     # A machine-wide bounded stop owns this request instead of the account conductor.
     stop_deadline: NotRequired[str]
@@ -532,8 +561,9 @@ class SessionShutdown(TypedDict):
     reasked_at: NotRequired[str]
     # The not-back failure last pushed to the user, so an unchanged one is not pushed again.
     restore_alerted: NotRequired[str]
-    # The last line a unit's showrunner was sent about this stop: "stopping", "back", or the not-back failure.
+    # Records written before per-line delivery state used this last-sent marker.
     showrunner_told: NotRequired[str]
+    showrunner_lines: NotRequired[list[ShowrunnerLine]]
     # Absent means resume on session.config_dir, never on a changed role.
     target: NotRequired[str]
     source_label: NotRequired[str]
@@ -544,6 +574,12 @@ class SessionShutdown(TypedDict):
     cut_off: NotRequired[str]
     # Set by `rename.py checkout` for a stopped showrunner: the launch moves its checkout first (restart.move_checkout).
     checkout_move: NotRequired[CheckoutMove]
+
+
+class RegistrationOwner(TypedDict):
+    """The process that is adding a request's session records."""
+    pid: int
+    proc_start: str
 
 
 class AccountHold(TypedDict):
@@ -562,14 +598,20 @@ class AccountHold(TypedDict):
     registering_request_ids: NotRequired[list[str]]
     # Bounded registrations may be abandoned before their owner loop finishes.
     registration_deadlines: NotRequired[dict[str, str]]
+    registration_owners: NotRequired[dict[str, RegistrationOwner]]
+
+
+def stop_issue_blocks_completion(issue: SessionStopIssue) -> bool:
+    """An unconfirmed resumable Codex pause is advisory, including on restart."""
+    return not (issue["kind"] == "codex server left running" and issue["cause"] == "stop not confirmed")
 
 
 def stop_incomplete(saved: SessionShutdown) -> bool:
     """Report a failed stop or owner resources left after a terminal stop."""
     progress = saved["progress"]["kind"]
-    return progress == "stop failed" or bool(saved["stop_issues"] and progress in {
-        "stopped", "already gone", "process identity lost",
-    })
+    return progress == "stop failed" or bool(saved["stop_issues"] and (
+        progress == "process identity lost" or progress in {"stopped", "already gone"}
+        and any(stop_issue_blocks_completion(issue) for issue in saved["stop_issues"])))
 
 
 # Progress after which a session's shutdown takes no further step by itself.
@@ -1339,6 +1381,21 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
     for field in ("restore_alerted", "showrunner_told", "force_stop_note"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
+    if "showrunner_lines" in values:
+        for index, value in enumerate(_items(values["showrunner_lines"], f"{place}.showrunner_lines")):
+            where = f"{place}.showrunner_lines[{index}]"
+            line = _mapping(value, where)
+            if line.get("kind") == "sent":
+                line["kind"] = "delivered"
+            if line.get("kind") not in {"pending", "queued", "delivered"}:
+                raise InvalidRecord(f"{where}.kind must be pending, queued or delivered")
+            _ = _string(_required(line, "line", where), f"{where}.line")
+            _ = _string(_required(line, "text", where), f"{where}.text")
+            if line["kind"] in {"pending", "queued"}:
+                _ = _string(_required(line, "summary", where), f"{where}.summary")
+            if line["kind"] == "queued":
+                _ = _string(_required(line, "reason", where), f"{where}.reason")
+                _ = _utc_time(_required(line, "at", where), f"{where}.at")
     return cast(SessionShutdown, cast(object, values))
 
 
@@ -1362,6 +1419,17 @@ def _account_hold(value: object, place: str) -> AccountHold:
             if request_id not in request_ids:
                 raise InvalidRecord(f"{place}.registration_deadlines must name covered requests")
             _ = _utc_time(expires, f"{place}.registration_deadlines.{request_id}")
+    if "registration_owners" in values:
+        for request_id, value in _mapping(values["registration_owners"], f"{place}.registration_owners").items():
+            where = f"{place}.registration_owners.{request_id}"
+            if request_id not in request_ids:
+                raise InvalidRecord(f"{where} must name a covered request")
+            owner = _mapping(value, where)
+            pid = _required(owner, "pid", where)
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                raise InvalidRecord(f"{where}.pid must be a positive integer")
+            if not _string(_required(owner, "proc_start", where), f"{where}.proc_start"):
+                raise InvalidRecord(f"{where}.proc_start must not be empty")
     return cast(AccountHold, cast(object, values))
 
 
@@ -1611,6 +1679,16 @@ def request_matches_process(saved: SessionShutdown, live: Session) -> bool:
             and stored["proc_start"] == live["proc_start"])
 
 
+@dataclass(frozen=True)
+class PersistSessionThenAct:
+    """Write the change before its action, with cancellation excluded until both finish."""
+    change: Callable[[SessionShutdown], None]
+    act: Callable[[SessionShutdown], None]
+
+    def __call__(self, saved: SessionShutdown) -> None:
+        self.change(saved)
+
+
 def update_session(
     login: str, session_id: str, change: Callable[[SessionShutdown], None]
 ) -> SessionShutdown:
@@ -1639,7 +1717,48 @@ def update_session(
         if (checked["login"], checked["machine"], checked["session"]["session_id"]) != identity:
             raise ValueError("a session record update cannot change its login, machine or session id")
         _write_record(path, checked)
+        if isinstance(change, PersistSessionThenAct):
+            change.act(checked)
         return checked
+
+
+@contextmanager
+def showrunner_line_lock(saved: SessionShutdown) -> Generator[None, None, None]:
+    """Serialize sends without holding the session store during delivery."""
+    directory = _account_directory(saved["login"])
+    _ = _record_directory(directory)
+    path = directory / (_session_filename(saved["session"]["session_id"]) + ".showrunner.lock")
+    _ = _regular_record(path)
+    with path.open("a+", encoding="utf-8") as lock:
+        _record_deadline.get().acquire(lock.fileno())
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def update_showrunner_line(saved: SessionShutdown, change: Callable[[SessionShutdown], None]) -> bool:
+    """Keep delivery evidence with the matching request, including after archive."""
+    if _existing_account_directory(saved["login"]) is None:
+        return False
+    with _session_store_lock(saved["login"], write=True) as directory:
+        name = _session_filename(saved["session"]["session_id"])
+        paths = [directory / "sessions" / name]
+        history = directory / "history"
+        if _record_directory(history):
+            paths.extend(path for path in history.iterdir() if path.name.endswith("-" + name))
+        for path in paths:
+            if not _regular_record(path):
+                continue
+            current = _session_shutdown(_read_json(path), str(path))
+            _check_account(saved["login"], current["login"], path)
+            if (current["request_id"] != saved["request_id"] or current["requested_at"] != saved["requested_at"]
+                    or current["session"]["session_id"] != saved["session"]["session_id"]):
+                continue
+            change(current)
+            _write_record(path, _session_shutdown(current, str(path)))
+            return True
+    return False
 
 
 def claim_restore_alert(saved: SessionShutdown, detail: str) -> bool:
@@ -1847,10 +1966,36 @@ def _registering_request_ids(hold: AccountHold) -> set[str]:
             or datetime.fromisoformat(deadlines[request]) > now}
 
 
+def registration_process_start(pid: int) -> str:
+    """Read registration identity from the host, independent of a modeled platform."""
+    if os.uname().sysname == "Darwin":
+        # PROC_PIDTBSDINFO ends with the process start seconds and microseconds.
+        buffer = ctypes.create_string_buffer(136)
+        proc_pidinfo = cast(Callable[[int, int, int, object, int], int],
+                            ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidinfo)
+        if proc_pidinfo(pid, 3, 0, buffer, ctypes.sizeof(buffer)) != ctypes.sizeof(buffer):
+            raise OSError(ctypes.get_errno(), "cannot read the shutdown registration process")
+        seconds = int.from_bytes(buffer.raw[120:128], sys.byteorder)
+        micros = int.from_bytes(buffer.raw[128:136], sys.byteorder)
+        return f"darwin:{seconds}:{micros}"
+    _, separator, fields = Path(f"/proc/{pid}/stat").read_bytes().rpartition(b")")
+    if not separator:
+        raise OSError("cannot identify the shutdown registration process")
+    try:
+        started = fields.split()[19].decode("ascii")
+    except (IndexError, UnicodeDecodeError) as error:
+        raise OSError("cannot identify the shutdown registration process") from error
+    if not started.isdigit():
+        raise OSError("cannot identify the shutdown registration process")
+    return started
+
+
 def register_account_hold_request(hold: AccountHold, *, account_wide: bool, expires_at: str = "") -> None:
     """Join an existing hold, or create an account-wide hold, before adding records."""
     checked = _account_hold(copy.deepcopy(hold), "hold")
     login, request_id = checked["login"], checked["request_id"]
+    pid = os.getpid()
+    started = registration_process_start(pid)
     with launch_barrier():
         with _session_store_lock(login, create=True) as directory:
             path = directory / "hold.json"
@@ -1866,6 +2011,7 @@ def register_account_hold_request(hold: AccountHold, *, account_wide: bool, expi
             pending.add(request_id)
             checked["request_ids"] = sorted(requests)
             checked["registering_request_ids"] = sorted(pending)
+            checked.setdefault("registration_owners", {})[request_id] = RegistrationOwner(pid=pid, proc_start=started)
             if expires_at:
                 checked.setdefault("registration_deadlines", {})[request_id] = expires_at
             _write_record(path, checked)
@@ -1885,8 +2031,54 @@ def complete_account_hold_registration(login: str, request_id: str) -> None:
         if request_id in pending:
             pending.remove(request_id)
             held["registering_request_ids"] = sorted(pending)
+            _ = held.get("registration_owners", {}).pop(request_id, None)
             if held["request_id"] == request_id and "registration" in held:
                 held["registration"] = "complete"
+            _write_record(path, held)
+
+
+def registration_owner_running(owner: RegistrationOwner) -> bool:
+    """A reused pid does not own an earlier registration."""
+    try:
+        return registration_process_start(owner["pid"]) == owner["proc_start"]
+    except ProcessLookupError:
+        return False
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # Unreadable identity is not proof that an overlapping registration ended.
+        return True
+
+
+def _finish_abandoned_registrations(held: AccountHold, records: list[SessionShutdown]) -> bool:
+    """Retire only dead owners, or ownerless requests with no unfinished record."""
+    pending = _registering_request_ids(held)
+    active_requests = {saved["request_id"] for saved in records if not shutdown_finished(saved)}
+    owners = held.get("registration_owners", {})
+    abandoned = {request_id for request_id in pending
+                 if (not registration_owner_running(owners[request_id]) if request_id in owners
+                     else request_id not in active_requests)}
+    if not abandoned:
+        return False
+    held["registering_request_ids"] = sorted(pending - abandoned)
+    if held["request_id"] in abandoned and "registration" in held:
+        held["registration"] = "complete"
+    for request_id in abandoned:
+        _ = owners.pop(request_id, None)
+    return True
+
+
+def repair_abandoned_hold_registrations(login: str) -> None:
+    """Finish registrations whose owner is gone; retain a live process still adding records."""
+    if _existing_account_directory(login) is None:
+        return
+    with _session_store_lock(login, write=True) as directory:
+        path = directory / "hold.json"
+        if not _regular_record(path):
+            return
+        held = _account_hold(_read_json(path), str(path))
+        _check_account(login, held["login"], path)
+        if _finish_abandoned_registrations(held, _session_records_in_directory(directory, login)):
             _write_record(path, held)
 
 
@@ -2211,10 +2403,13 @@ def release_finished_account_hold(login: str, *, conducting: bool = False) -> Ho
             return AccountOpen() if legacy is None else HoldInUse(legacy)
         held = _account_hold(_read_json(path), str(path))
         _check_account(login, held["login"], path)
+        records = _session_records_in_directory(directory, login)
+        if _finish_abandoned_registrations(held, records):
+            _write_record(path, held)
         if _registering_request_ids(held):
             return HoldInUse(held)
         covered = _hold_request_ids(held)
-        records = [saved for saved in _session_records_in_directory(directory, login) if saved["request_id"] in covered]
+        records = [saved for saved in records if saved["request_id"] in covered]
         if conducting:
             finished = all(shutdown_finished(saved) for saved in records)
         else:
