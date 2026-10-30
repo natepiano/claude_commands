@@ -2943,7 +2943,7 @@ class RefusalWatchTests(unittest.TestCase):
         output = accounts.status_report()
         for group in ("units", "showrunners"):
             self.assertEqual(output.splitlines().count(
-                f"accounts: {group} has no account; run accounts.py move {group} <claudeN>"), 1)
+                f"{group}: not configured; the role map selects no account; run accounts.py move {group} <claudeN>"), 1)
         rows = [line for line in output.splitlines() if line.startswith("|")][2:]
         self.assertTrue(rows)
         for row in rows:
