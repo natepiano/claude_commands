@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.whoami.note_file import note_name
 
 from unit_staff_test_support import legacy_unit_host
 import io
 import json
 import os
-import sys
 import tempfile
 import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
-from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
@@ -22,7 +25,7 @@ import settle
 import inventory
 from scripts.accounts import accounts
 import shutdown_record as record_store
-from account import UnreadableAccount
+from scripts.whoami.account import UnreadableAccount
 from inventory import Inventory
 from shutdown_record import SessionShutdown
 from test_shutdown_record import LegacyRecordFixture, write_old, move_old

@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import unit_staff_test_support
+from unit_staff_test_support import unit_host
+from scripts.production import staff_sources
 import copy
 import ctypes
 import io
@@ -12,7 +20,6 @@ import shutil
 import signal
 import subprocess
 import tempfile
-import sys
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait as wait_futures
@@ -21,19 +28,14 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from collections.abc import Callable, Generator, Sequence
 from datetime import datetime, timedelta, timezone
 from functools import partial
-from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final, override
 from unittest.mock import Mock, call, patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lib import process_start as process_identity
 from scripts.lib.process_start_test_support import write_stat
-from scripts.production import staff_sources
-import unit_staff_test_support
-from unit_staff_test_support import unit_host
 
 from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCase, empty_session_registry
 from launch_permission import NewWorkLaunchPurpose
@@ -58,9 +60,9 @@ import stop as stop_work
 # The module settle imports by its own path entry: a separate object from the package import below.
 import showrunners as settle_showrunners
 from scripts.accounts import accounts, moves, outage_alerts
-import usage_store
+from scripts.whoami import usage_store
 from scripts.production import showrunners
-from account import Account
+from scripts.whoami.account import Account
 
 
 # Hang guard: natedev reached load 136 on 2026-10-29; scheduling delays are not failures.

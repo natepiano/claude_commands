@@ -118,3 +118,17 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 **Acceptance:** the touched test modules and their callers' suites pass; basedpyright clean on changed Python files.
 
 **Residual (review, minor follow-up):** if `shutdown.py down` itself stops after `settle.begin()` writes the shutdown record and before its conductor starts, the heal stop keeps `stop_request_sent: false` with a record present, and a rerun of `down` skips the existing record (`settle.py:819`, an accounts-unit row of the same sweep). The repair belongs in settle's rerun of an unfinished record, not in heal.
+
+### Phase 11 — verify.sh loads the nix environment with one helper start, and both helpers import less  · status: done
+
+**Source:** showrunner of natedev, 2026-10-30 (measured by builds' verify unit): verify.sh starts `scripts/lib/nix_env.py` (96 ms CPU per start) and `scripts/lib/user_zone.py` (37 ms) on every verify step, on both machines. Give each a cheap entry path with fewer imports, keep one implementation of each (no copy), measure before and after at the parent commit.
+
+**Baseline (natedev, 2026-10-30, parent 8c53e312, child CPU user+sys, mean of 30 runs):** `python3 -c pass` 14.2 ms, `python3 -S -c pass` 9.2 ms; `lib/py nix_env.py ensure <dir with no .envrc>` 49 ms; `lib/py nix_env.py ensure ~/rust/cargo-liner` 126 ms, of which `direnv export json` is 75 ms and `direnv allow` 2 ms; `python3 user_zone.py` 26.5 ms. Outside a nix shell, verify.sh runs `nix_env.py ensure`, then a second Python only to read `IN_NIX_SHELL` from its JSON, then `nix_env.py exec`, which runs direnv export again: about 270 ms in a repo with an `.envrc`, 67 ms without. Own imports (`-X importtime`): nix_env.py — dataclasses 10.5 ms (inspect 9.2), subprocess 5.0, json 4.5, pathlib 2.4, typing 2.4; user_zone.py — pathlib 6.8 ms, zoneinfo 3.6.
+
+#### As-built
+
+Outside a nix shell, `scripts/direct/verify.sh` makes one `nix_env.py exec` of itself under `lib/py -S`: one Python start and one direnv export, down from three and two. `nix_env.py exec` sets `NIX_ENV_ENVRC` to the resolved envrc for `Loaded` and removes it for `NoEnvrc`. On the re-run verify.sh prints the notice when `IN_NIX_SHELL` is set, refuses with one line when it is empty and `NIX_ENV_ENVRC` is set, and goes on silently when both are empty.
+
+`nix_env.py` results are `NamedTuple`s; `subprocess`, `shlex` and `json` import only where used, and `Mapping` is a type-checking import. `user_zone.CONF` is a `str` and `user_zone.stored_zone(path)` is the one zone reader; `zone.py` `stored` calls it. `user_clock` runs `python3 -S`. `docs/as-built/nix-shell-launch.md` describes the flow.
+
+**Result (natedev, 2026-10-30, child CPU user+sys, mean of 30 runs, parent 8c53e312 → this phase):** `verify.sh` with an unknown verb outside a nix shell: repo with an `.envrc` 649.3 → 468.0 ms, repo without 446.1 → 383.8 ms. `user_zone.py` in `user_clock`'s call form: 26.0 → 16.8 ms. The `verify.sh` numbers include its later `build_targets.py` start, which this phase does not change.
