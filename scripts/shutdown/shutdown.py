@@ -40,7 +40,7 @@ from inventory import (
     parse_inventory,
 )
 import inventory as inventory_work
-import record as recovery_store
+import shutdown_record as recovery_store
 from launch_permission import (
     RELEASED_HOLD_PREFIX,
     LaunchPurpose,
@@ -48,7 +48,7 @@ from launch_permission import (
     RecordedSessionRestoreLaunchPurpose,
     shutdown_state_root,
 )
-from record import (
+from shutdown_record import (
     CheckoutMove,
     InvalidRecord,
     SessionShutdown,

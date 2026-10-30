@@ -57,7 +57,7 @@ from inventory import (  # noqa: E402
     herdr_presentation,
     live_supervisor,
 )
-from record import (  # noqa: E402
+from shutdown_record import (  # noqa: E402
     CLAIM_STALE_SECONDS,
     AccountHold,
     InvalidRecord,
@@ -91,7 +91,7 @@ from record import (  # noqa: E402
     acknowledge_snapshot,
     materialize_snapshot,
 )
-import record as recovery_store  # noqa: E402
+import shutdown_record as recovery_store  # noqa: E402
 import launch_permission as restore_permission  # noqa: E402
 from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402

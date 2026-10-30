@@ -33,12 +33,12 @@ send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPri
 deliver_notice_jobs = quota_alert.deliver_and_record
 
 if TYPE_CHECKING:
-    from scripts.shutdown import inventory, launch_permission, record, restart, settle
+    from scripts.shutdown import inventory, launch_permission, shutdown_record, restart, settle
     from scripts.message import sessions
 else:
     launch_permission = import_module("launch_permission")
     inventory = import_module("inventory")
-    record = import_module("record")
+    shutdown_record = import_module("shutdown_record")
     restart = import_module("restart")
     settle = import_module("settle")
     sessions = import_module("sessions")
@@ -245,15 +245,15 @@ class RefusalWatchTests(unittest.TestCase):
             owner = next(owner for owner in self.owners if owner["session_id"] == identity)
             source = self.process_account(owner["pid"], home_state=account.home_account_state())
             assert source is not None
-            saved = record.SessionShutdown(login=source.login, label=source.label, machine="natedev",
+            saved = shutdown_record.SessionShutdown(login=source.login, label=source.label, machine="natedev",
                 requested_at=WatchTime.at.isoformat(), request_id=f"batch-{len(self.commands)}",
-                requested_by=record.FromTerminal(kind="terminal"), hold="session", then="restart",
+                requested_by=shutdown_record.FromTerminal(kind="terminal"), hold="session", then="restart",
                 force="wait for ready", alerts="none" if "--no-alert" in command else "user", probe=False,
                 session=owner, workers=[], timers=[],
-                settle_message=record.SettleMessageNotSent(kind="not sent"), where=record.WhereNotSaid(kind="not said"),
-                progress=record.SessionWaiting(kind="waiting"), trail=[], stop_issues=[], target=target,
+                settle_message=shutdown_record.SettleMessageNotSent(kind="not sent"), where=shutdown_record.WhereNotSaid(kind="not said"),
+                progress=shutdown_record.SessionWaiting(kind="waiting"), trail=[], stop_issues=[], target=target,
                 source_label=source.label, why=why, move_id=command[command.index("--move-id") + 1])
-            self.assertTrue(record.create_session(saved))
+            self.assertTrue(shutdown_record.create_session(saved))
         return subprocess.CompletedProcess(command, 0, "added\n", "")
 
     def groups(self, units: str = "claude1", showrunners: str = "claude3") -> Path:
@@ -1353,7 +1353,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("moving-unit", host="unit")
         _ = accounts.move_sessions(("moving-unit",), "claude2", why="fixture existing shutdown",
                                    origin=accounts.HAND_ORIGIN)
-        self.assertEqual(len(record.all_session_records()), 1)
+        self.assertEqual(len(shutdown_record.all_session_records()), 1)
         self.commands.clear()
         entry = self.low_rule(target="claude3")
         self.next_entries(entry)
@@ -2068,17 +2068,17 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.down(["/fake/shutdown.py", "--only", "old-unit", "--to", "claude3",
                        "--why", "older stop", "--move-id", "older-transition"],
                       env={"REFUSAL_WATCH_INVENTORY": "read existing"})
-        saved = record.all_session_records()[0]
-        def finish(current: record.SessionShutdown) -> None:
+        saved = shutdown_record.all_session_records()[0]
+        def finish(current: shutdown_record.SessionShutdown) -> None:
             current["then"] = "stop"
-            current["progress"] = record.SessionStopped(kind="stopped", at=NOW.isoformat())
-        saved = record.update_session(saved["login"], "old-unit", finish)
+            current["progress"] = shutdown_record.SessionStopped(kind="stopped", at=NOW.isoformat())
+        saved = shutdown_record.update_session(saved["login"], "old-unit", finish)
         self.owners.clear()
         self.commands.clear()
         code, _, error = self.cli()
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(stored_group_labels(path)["units"], "claude2")
-        self.assertEqual(record.all_session_records(), [saved])
+        self.assertEqual(shutdown_record.all_session_records(), [saved])
         self.assertEqual(self.commands, [])
 
     def test_automatic_completion_retry_preserves_the_rule_reason_and_transition_in_the_journal(self) -> None:
@@ -2089,7 +2089,7 @@ class RefusalWatchTests(unittest.TestCase):
                 accounts.SessionMoveRefused("unit", "synthetic delivery refusal"),)):
             _ = self.cli()
         self.assertEqual(stored_group_labels(path)["units"], "claude2")
-        self.assertEqual(record.all_session_records(), [])
+        self.assertEqual(shutdown_record.all_session_records(), [])
         history = accounts.roles_history_file().read_bytes()
         transition = cast(dict[str, object], json.loads(path.read_text())["units"])
         decoded = accounts.group_transition("units")
@@ -2228,7 +2228,7 @@ class RefusalWatchTests(unittest.TestCase):
         path = self.groups()
         _ = self.owner("unit", host="unit")
         _ = accounts.move_group("units", "claude3", why="pending hand move")
-        self.assertEqual(len(record.all_session_records()), 1)
+        self.assertEqual(len(shutdown_record.all_session_records()), 1)
         history = accounts.roles_history_file().read_bytes()
         self.next_entries(self.low_rule())
         _ = self.cli()
@@ -2242,14 +2242,14 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("unit", host="unit")
         self.next_entries(self.low_rule())
         _ = self.cli()
-        saved = record.all_session_records()
+        saved = shutdown_record.all_session_records()
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]["alerts"], "none")
         with (patch.object(import_module("showrunners"), "current_name", return_value="fixture-showrunner"),
               patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery,
               patch.object(settle, "alert_user") as phone):
             settle.tell_showrunner_stopping(saved[0])
-            settle.tell_showrunner_stopping(record.all_session_records()[0])
+            settle.tell_showrunner_stopping(shutdown_record.all_session_records()[0])
         delivery.assert_called_once()
         self.assertEqual(delivery.call_args.args[0], "fixture-showrunner")
         self.assertIn("auto: units-low", cast(str, delivery.call_args.args[1]))
@@ -2511,14 +2511,14 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual({command[command.index("--to") + 1] for command in self.commands}, {"claude2"})
         self.assertEqual({identity for command in self.commands for identity in command[command.index("--only") + 1].split(",")},
                          {"probe-one", "probe-two"})
-        self.assertEqual({saved["session"]["session_id"] for saved in record.all_session_records()}, {"probe-one", "probe-two"})
+        self.assertEqual({saved["session"]["session_id"] for saved in shutdown_record.all_session_records()}, {"probe-one", "probe-two"})
         self.assertEqual(groups.read_bytes(), before)
         self.assertFalse(accounts.roles_history_file().exists())
         requested = [entry for entry in moves.read_moves() if entry["kind"] == "requested"]
         self.assertEqual(len(requested), 2)
         self.assertEqual(len({entry["move_id"] for entry in requested}), 1)
         with patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery:
-            for saved in record.all_session_records():
+            for saved in shutdown_record.all_session_records():
                 settle._send_settle_message(saved)  # pyright: ignore[reportPrivateUsage]
         self.assertEqual({call.args[0] for call in delivery.call_args_list}, {"session:probe-one", "session:probe-two"})
         self.assertEqual(delivery.call_count, 2)
@@ -2542,8 +2542,8 @@ class RefusalWatchTests(unittest.TestCase):
                 self.owners = []
                 self.live = []
                 self.commands = []
-                for saved in record.all_session_records():
-                    record.archive_session(saved["login"], saved["session"]["session_id"])
+                for saved in shutdown_record.all_session_records():
+                    shutdown_record.archive_session(saved["login"], saved["session"]["session_id"])
                 accounts.roles_history_file().unlink(missing_ok=True)
                 moves.store_file().unlink(missing_ok=True)
                 (self.home / ".local/state/accounts/refusal_watch.json").unlink(missing_ok=True)
@@ -2562,7 +2562,7 @@ class RefusalWatchTests(unittest.TestCase):
                 rows = [cast(dict[str, object], json.loads(line)) for line in accounts.roles_history_file().read_text().splitlines()]
                 self.assertEqual(len(rows), 1)
                 self.assertEqual((rows[0]["move_id"], rows[0]["cause"]), (selection["move_id"], expected))
-                record.archive_session(SOURCE_LOGIN, first["session_id"])
+                shutdown_record.archive_session(SOURCE_LOGIN, first["session_id"])
                 first["config_dir"] = str(accounts.account_dir("claude3"))
                 late = self.owner("late-" + str(refused), host="unit")
                 # Every run reopens groups.json and refusal_watch.json; no
@@ -2607,7 +2607,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertIsInstance(outcome, accounts.SessionMoveRequested)
         assert isinstance(outcome, accounts.SessionMoveRequested)
         self.assertEqual((outcome.request_id, outcome.move_id), ("fast-attempt", "group-transition"))
-        self.assertEqual(record.all_session_records(), [])
+        self.assertEqual(shutdown_record.all_session_records(), [])
 
     def test_units_group_preview_lists_exactly_off_target_members_without_writes(self) -> None:
         off = self.owner("off-target", host="unit")
@@ -2625,7 +2625,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertFalse(accounts.groups_file().exists())
         self.assertFalse(accounts.roles_history_file().exists())
         self.assertEqual(moves.read_moves(), [])
-        self.assertEqual(record.all_session_records(), [])
+        self.assertEqual(shutdown_record.all_session_records(), [])
         self.assertEqual(self.commands, [])
 
     def test_units_group_preview_on_current_account_prints_no_live_session_moves(self) -> None:
@@ -2699,7 +2699,7 @@ class RefusalWatchTests(unittest.TestCase):
         command = self.commands[0]
         self.assertEqual(command[command.index("--only") + 1], "runner")
         self.assertEqual(command[command.index("--to") + 1], "claude1")
-        record.archive_session(TARGET_LOGIN, "runner")
+        shutdown_record.archive_session(TARGET_LOGIN, "runner")
         runner["config_dir"] = str(accounts.account_dir("claude1"))
         _ = self.transcript("unit")
         _ = self.cli()
@@ -2807,7 +2807,7 @@ class RefusalWatchTests(unittest.TestCase):
         with patch.object(subprocess, "run", side_effect=partial):
             _ = self.cli()
         self.assertEqual(stored_group_labels(path)["units"], "claude3")
-        self.assertEqual(len(record.all_session_records()), 1)
+        self.assertEqual(len(shutdown_record.all_session_records()), 1)
         WatchTime.at = NOW + timedelta(minutes=2)
         _ = self.cli()
         self.assertEqual(len(self.commands), 2)
@@ -2834,7 +2834,7 @@ class RefusalWatchTests(unittest.TestCase):
         with patch.object(subprocess, "run", side_effect=healthy_only):
             _ = self.cli()
         self.assertEqual(stored_group_labels(path)["units"], "claude3")
-        self.assertEqual({saved["session"]["session_id"] for saved in record.all_session_records()},
+        self.assertEqual({saved["session"]["session_id"] for saved in shutdown_record.all_session_records()},
             {healthy["session_id"]})
         first = moves.read_moves()
         self.assertTrue(any(entry["kind"] == "failed" and entry["subject"].startswith("refused-unit: ") for entry in first))
@@ -2893,7 +2893,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(error, "")
         self.assertIn("no claude account has room", output)
         self.assertEqual(self.commands, [])
-        self.assertEqual(record.all_session_records(), [])
+        self.assertEqual(shutdown_record.all_session_records(), [])
         self.assertEqual(path.read_bytes(), before)
 
     def test_partial_group_reconciliation_skips_unresolved_target_refusal_without_new_transcript(self) -> None:
@@ -2905,7 +2905,7 @@ class RefusalWatchTests(unittest.TestCase):
         before = path.read_bytes()
         _ = self.cli()
         self.assertEqual(self.commands, [])
-        self.assertEqual(record.all_session_records(), [])
+        self.assertEqual(shutdown_record.all_session_records(), [])
         self.assertEqual(path.read_bytes(), before)
 
     def test_unconfigured_group_does_not_adopt_live_default_login_aliases(self) -> None:
@@ -2964,7 +2964,7 @@ class RefusalWatchTests(unittest.TestCase):
                     self.assertIn(f"accounts.py move {group} <claudeN>", output)
                 self.assertFalse(accounts.groups_file().exists())
                 self.assertEqual(self.commands, [])
-                self.assertEqual(record.all_session_records(), [])
+                self.assertEqual(shutdown_record.all_session_records(), [])
 
     def test_refusal_dry_run_keeps_missing_group_file_absent(self) -> None:
         _ = self.owner("refused", host="unit")
@@ -3202,7 +3202,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("refused")
         _ = self.transcript("refused")
         _ = self.cli()
-        record.archive_session(SOURCE_LOGIN, "refused")
+        shutdown_record.archive_session(SOURCE_LOGIN, "refused")
         before = self.snapshot()
         WatchTime.at = NOW + timedelta(minutes=2)
         _ = self.cli()
@@ -3214,7 +3214,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("refused")
         _ = self.transcript("refused")
         _ = self.cli()
-        record.archive_session(SOURCE_LOGIN, "refused")
+        shutdown_record.archive_session(SOURCE_LOGIN, "refused")
         WatchTime.at = NOW + timedelta(minutes=2)
         _ = self.transcript("refused", at=WatchTime.at, entry_id="refusal-two")
         _ = self.cli()
@@ -3506,7 +3506,7 @@ class RefusalWatchTests(unittest.TestCase):
             WatchTime.at = NOW + timedelta(minutes=2)
             _ = self.cli()
         self.assertEqual(down.call_count, 2)
-        self.assertEqual(record.all_session_records(), [])
+        self.assertEqual(shutdown_record.all_session_records(), [])
         entries = moves.read_moves()
         self.assertEqual([entry["kind"] for entry in entries], ["failed", "failed"])
         for entry in entries:
@@ -3523,7 +3523,7 @@ class RefusalWatchTests(unittest.TestCase):
         failed = entries[0]
         assert failed["kind"] == "failed"
         self.assertIn("conductor", failed["reason"])
-        self.assertEqual(record.all_session_records(), [])
+        self.assertEqual(shutdown_record.all_session_records(), [])
 
     def test_conductor_failure_with_created_records_withdraws_all_owners_and_records_only_failures(self) -> None:
         for identity in ("first", "second"):
@@ -3531,7 +3531,7 @@ class RefusalWatchTests(unittest.TestCase):
             _ = self.transcript(identity)
         report = self.inventory_for(SOURCE_LOGIN, refresh_desktops=False)
         def fail_conductor(_login: str, _label: str) -> None:
-            self.assertEqual({saved["session"]["session_id"] for saved in record.all_session_records()}, {"first", "second"})
+            self.assertEqual({saved["session"]["session_id"] for saved in shutdown_record.all_session_records()}, {"first", "second"})
             raise RuntimeError("conductor could not start after records were created")
         def run_down(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
             try:
@@ -3549,11 +3549,11 @@ class RefusalWatchTests(unittest.TestCase):
               patch.object(settle, "_retire_shutdown_messages"),
               patch.object(settle, "_carry_trust"),
               patch.object(settle, "_launch_conductor", side_effect=fail_conductor) as conductor,
-              patch.object(record, "create_session", wraps=record.create_session) as created):
+              patch.object(shutdown_record, "create_session", wraps=shutdown_record.create_session) as created):
             _ = self.cli()
         conductor.assert_called_once()
         self.assertEqual(created.call_count, 2)
-        self.assertEqual(record.all_session_records(), [])
+        self.assertEqual(shutdown_record.all_session_records(), [])
         entries = moves.read_moves()
         self.assertEqual([entry["kind"] for entry in entries], ["failed", "failed"])
         for entry in entries:
@@ -3576,7 +3576,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.transcript("refused")
         _ = self.cli()
         refusal_watch.cancelled("refused")
-        record.archive_session(SOURCE_LOGIN, "refused")
+        shutdown_record.archive_session(SOURCE_LOGIN, "refused")
         WatchTime.at = NOW + timedelta(minutes=2)
         _ = self.cli()
         self.assertEqual(len(self.commands), 1)
@@ -3598,16 +3598,16 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(len(self.commands), 1)
         self.assertEqual([entry["kind"] for entry in moves.read_moves()], ["requested"])
 
-    def save_failed_restart(self, identity: str) -> record.SessionShutdown:
+    def save_failed_restart(self, identity: str) -> shutdown_record.SessionShutdown:
         _ = self.down(["/fake/shutdown.py", "--only", identity, "--to", "claude3",
                        "--why", "older stop", "--move-id", "older-transition"],
                       env={"REFUSAL_WATCH_INVENTORY": "read existing"})
 
-        def fail(current: record.SessionShutdown) -> None:
-            current["progress"] = record.SessionRestartFailed(
+        def fail(current: shutdown_record.SessionShutdown) -> None:
+            current["progress"] = shutdown_record.SessionRestartFailed(
                 kind="restart failed", at=NOW.isoformat(), reason="prompt unconfirmed")
 
-        saved = record.update_session(SOURCE_LOGIN, identity, fail)
+        saved = shutdown_record.update_session(SOURCE_LOGIN, identity, fail)
         self.commands.clear()
         return saved
 
@@ -3626,7 +3626,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(move.call_args.args[0], ("running-refused",))
         self.assertEqual(len(self.commands), 1)
         self.assertEqual(self.commands[0][self.commands[0].index("--only") + 1], "running-refused")
-        current = record.find_session(SOURCE_LOGIN, "running-refused")
+        current = shutdown_record.find_session(SOURCE_LOGIN, "running-refused")
         assert current is not None
         self.assertEqual(current["progress"]["kind"], "waiting")
         history = self.home / "shutdown" / SOURCE_LOGIN / "history"
@@ -3647,7 +3647,7 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(move.call_args.args[0], ("running-unit",))
         self.assertEqual(stored_group_labels(path)["units"], "claude2")
         self.assertEqual(len(self.commands), 1)
-        current = record.find_session(SOURCE_LOGIN, "running-unit")
+        current = shutdown_record.find_session(SOURCE_LOGIN, "running-unit")
         assert current is not None
         self.assertEqual(current["progress"]["kind"], "waiting")
         self.assertEqual(current.get("target"), "claude2")
@@ -3714,7 +3714,7 @@ class RefusalWatchTests(unittest.TestCase):
         command = self.commands[0]
         self.assertEqual(command[command.index("--to") + 1], "claude3")
         self.assertNotEqual(command[command.index("--to") + 1], "claude2")
-        saved = record.all_session_records()
+        saved = shutdown_record.all_session_records()
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0]["login"], "main@example.invalid")
 

@@ -145,7 +145,7 @@ def load_pass() -> NotesPass:
         import_module("scripts.accounts.moves"), import_module("scripts.accounts.next_moves"),
         import_module("scripts.accounts.refusals"), import_module("scripts.production.showrunners"),
         import_module("run_out"), import_module("scripts.accounts.outage_alerts"),
-        import_module("record"), import_module("launch_permission"))
+        import_module("shutdown_record"), import_module("launch_permission"))
 
 
 def result(owner: ModuleType, name: str, *args: object) -> object:

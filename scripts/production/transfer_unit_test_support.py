@@ -212,8 +212,8 @@ class UnitTransferFixture(unittest.TestCase):
             "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
             "progress": {"kind": "stopped", "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": [],
             "codex_seats": []}
-        script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import record; "
-                  + "assert record.create_session(json.loads(sys.stdin.read()))")
+        script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import shutdown_record; "
+                  + "assert shutdown_record.create_session(json.loads(sys.stdin.read()))")
         created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],
                                  input=json.dumps(saved), env=self.env, capture_output=True, text=True,
                                  check=False, timeout=TEST_HANG_GUARD_SECS)
