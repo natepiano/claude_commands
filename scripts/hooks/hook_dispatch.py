@@ -87,11 +87,11 @@ PRE_TOOL_USE = (
     HookSpec("pre-tool-use-scratch-guard.py", "Bash|Write|NotebookEdit", 10),
 )
 POST_TOOL_USE = (
-    HookSpec("post-tool-use-push-delivered.py", "PushNotification"),
     HookSpec("post-tool-use-basedpyright.py", "Edit|MultiEdit|Write"),
     HookSpec("post-tool-use-fn-length.py", "Edit|MultiEdit|Write"),
     HookSpec("post-tool-use-context-usage.py", None),
     HookSpec("post-tool-use-banned-words.py", None),
+    HookSpec("post-tool-use-push-delivered.py", "PushNotification"),
 )
 STOP = (
     HookSpec("stop-direct-continue.py", None),
