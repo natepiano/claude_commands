@@ -384,7 +384,7 @@ Yes. Area passes the user's rule (at most 10% wrong on tune; held-out checked on
 **Acceptance gate:** `THRESHOLDS["area"]` and `JEV_FIELDS` match the user's answer (pinned); the merge gate is green; basedpyright clean on `scripts/issue_score`. A full reassess run on version 5 is within budget. The user has the review file, and the values the user approved are written.
 
 
-### Phase 7 — the TypeSafe guide for other sessions  · status: todo
+### Phase 7 — the TypeSafe guide for other sessions  · status: done
 
 **Depends on:** Phase 6
 
@@ -415,6 +415,9 @@ Finish the area table, after the guide is written:
 - `~/rust/hanadocs/conf/issue-areas.md` — the two-column area table (vault file)
 - `scripts/issue_score/vault.py` — the loader reads only the two-column form
 - `scripts/issue_score/test_vault.py` — the three-column case becomes a refusal case
+
+Assertion-Change: `scripts/issue_score/test_vault.py::test_legacy_three_column_area_definitions_ignore_only_the_issues_cell` becomes `test_three_column_area_definition_header_is_refused_with_the_path_and_required_header` and expects a `ValueError` naming the path, because the loader drops the three-column form by plan.
+
 - `commands/issue.md` — no shorthand allowlist; the base files are the source
 - `scripts/issue_score/test_apply_labels.py` — a duplicate-approval case
 

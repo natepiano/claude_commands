@@ -62,16 +62,20 @@ class VaultTests(unittest.TestCase):
         self.assertIn("not found", str(raised.exception))
         self.assertFalse(path.parent.exists())
 
-    def test_legacy_three_column_area_definitions_ignore_only_the_issues_cell(self) -> None:
+    def test_three_column_area_definition_header_is_refused_with_the_path_and_required_header(self) -> None:
         path = self.root / "issue-areas.md"
-        _ = path.write_text(
-            "| area | definition | issues |\n| --- | --- | --- |\n"
-            + "| rendering | Drawing scenes. | Not a live count |\n"
-            + "| tooling | Building projects. | 999 |\n"
-            + "| invalid | Missing third cell. |\n", encoding="utf-8")
-        self.assertEqual(vault.load_area_definitions(path), {
-            "rendering": "Drawing scenes.", "tooling": "Building projects.",
-        })
+        for outer_pipes in (True, False):
+            with self.subTest(outer_pipes=outer_pipes):
+                rows = ("area | definition | issues", "--- | --- | ---",
+                        "rendering | Drawing scenes. | Not a live count",
+                        "tooling | Building projects. | 999")
+                content = "\n".join("| " + row + " |" if outer_pipes else row for row in rows) + "\n"
+                _ = path.write_text(content, encoding="utf-8")
+                with self.assertRaises(ValueError) as caught:
+                    _ = vault.load_area_definitions(path)
+                self.assertEqual(str(caught.exception),
+                                 f"{path}: no area definitions found in area | definition table")
+                self.assertEqual(path.read_text(encoding="utf-8"), content)
 
     def test_area_definition_rows_must_match_the_header_column_count(self) -> None:
         path = self.root / "issue-areas.md"
