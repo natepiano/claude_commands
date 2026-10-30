@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami.agent_accounts import KnownCodexAccount
 from agent_accounts import Report, observe_workers_home
+from scripts.whoami import account
 from quota_alert import (PROTOCOL, load_config, recipients, relay, showrunners_now,
                          CodexAlertPassReadings, ReadCurrentCodexReadings, READ_CURRENT_CODEX_READINGS,
                          codex_alert_pass, selected_codex_report, codex_swap_line)
@@ -200,6 +201,13 @@ def watch(reports: list[Report], *,
             identity = hashlib.sha256(f"{selected.home}\0{selected.login.casefold()}".encode()).hexdigest()[:24]
             key += "-" + identity
             cancel_outgoing_notices(key, recipients(load_config()))
+        elif report.tool.lower() == "claude":
+            if not report.email:
+                continue
+            identity = hashlib.sha256(report.email.casefold().encode()).hexdigest()[:24]
+            key += "-" + identity
+            label = account.label_for("claude", report.email)
+            name = "Claude" if label == report.email else label
         old_hold_closed = escalate.close(key)
         marker = notice_path(key)
         if report.problem:

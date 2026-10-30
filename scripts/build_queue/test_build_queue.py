@@ -19,7 +19,9 @@ from unittest import mock
 from typing import Protocol, cast, override
 from zoneinfo import ZoneInfo
 
-from scripts.build_queue import build_queue
+from scripts.build_queue import build_queue, head_facts
+from scripts.build_queue.test_head_facts import bump_line, head_reading, queue_read_fixture, queue_time_line, token_gap_line, write_bumps, write_token_gaps
+from scripts.buildlog import store
 from scripts.lint import memory_admit
 from scripts.message import roster
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -28,45 +30,6 @@ GIB = memory_admit.GIB
 NOW = 1793214000.0
 NO_SHOWRUNNER = roster.NoShowrunner()
 NO_DIRECTOR = roster.NoDirector()
-
-
-def queue_read_fixture(view: memory_admit.QueueView) -> memory_admit.QueueRead:
-    """Pair legacy rendering fixtures with explicit, already-decided explanation fields."""
-    running = tuple(memory_admit.ExplainedRunningStep(step, memory_admit.AdmissionTimeNotRecorded(),
-        step.promise, step.measured.bytes if isinstance(step.measured, memory_admit.MeasuredMemory) else 0,
-        memory_admit.build_charge(step.measured), memory_admit.charge_basis(step.measured)) for step in view.running)
-    first: memory_admit.HeadExplanation | memory_admit.NoWaiter = memory_admit.NoWaiter()
-    host: memory_admit.HostAvailable | memory_admit.ReadingUnavailable = memory_admit.HostAvailable(
-        view.available, memory_admit.UnknownHostTotal(), view.reserve, 21 * GIB, memory_admit.NoPressureHold())
-    if view.waiting:
-        step = view.waiting[0]
-        reason = step.reason
-        row: memory_admit.Waiter = {"pid": step.pid, "start_time": "", "need": step.need, "since": step.since}
-        order = memory_admit.head_window(row, view.now)
-        decision = memory_admit.AdmissionDecision("admit", step.need + view.reserve, view.promised, view.reserve, 0)
-        if isinstance(reason, memory_admit.HeadAdmissionStatus):
-            decision, order = reason.decision, reason.backfill
-        elif isinstance(reason, memory_admit.NeedsBuildBudget):
-            decision = memory_admit.AdmissionDecision("hold", step.need + view.reserve, view.promised, view.reserve,
-                0, charged=reason.charged, budget=reason.budget, budget_passes=False)
-        elif isinstance(reason, memory_admit.NeedsMemory):
-            decision = memory_admit.AdmissionDecision("hold", reason.threshold, reason.growth, reason.reserve,
-                0, free_passes=False, head_need=reason.head_need)
-        elif isinstance(reason, memory_admit.MemoryPressure):
-            decision = memory_admit.AdmissionDecision("hold", step.need + view.reserve, view.promised,
-                                                      view.reserve, 0, pressure=reason)
-        elif isinstance(reason, memory_admit.ReadingUnavailable):
-            host = reason
-        first = memory_admit.HeadExplanation(step, memory_admit.NeedSourceNotRecorded(), decision,
-            memory_admit.BudgetCheck(decision.charged, step.need, decision.head_need, decision.budget,
-                decision.budget - step.need - decision.head_need, decision.budget_passes),
-            memory_admit.FreeCheck(view.available, step.need, decision.reserve, decision.promised,
-                decision.head_need, decision.threshold, decision.free_passes),
-            order, False, memory_admit.NoBump())
-    explanation = memory_admit.QueueExplanation(view.now, host, running,
-        memory_admit.QueueMemoryTotals(sum(step.charged for step in running), sum(step.measured for step in running), view.promised),
-        first, memory_admit.WaitingLine((), 0, 0, 0, 0, view.now))
-    return memory_admit.QueueRead(view, explanation, [])
 
 
 class RosterReadMock(Protocol):
@@ -135,13 +98,14 @@ class QueueTests(unittest.TestCase):
         reading = memory_admit.locked_queue_read()
         labels = roster.unit_labels_for([row.step.session_id for row in reading.explanation.running]
                                        + [reading.view.waiting[0].session_id], os.environ)
-        why = "\n".join(build_why.render_explanation(reading.explanation, ZoneInfo("America/New_York"), labels))
+        facts = head_facts.read_head_facts(reading)
+        why = "\n".join(build_why.render_explanation(reading.explanation, ZoneInfo("America/New_York"), labels, facts))
         # Disagreeing legacy fields cannot override the explanation or trigger another decision.
         legacy_head = replace(reading.view.waiting[0], reason=memory_admit.ReadyForAdmission(), need=GIB)
         reading = replace(reading, view=replace(reading.view, available=0, waiting=(legacy_head,)))
         with mock.patch.object(memory_admit, "decide", side_effect=AssertionError("no second decision")), \
              mock.patch.object(memory_admit, "build_charge", side_effect=AssertionError("use recorded charges")):
-            head = build_queue.head_line(reading.explanation, labels, ZoneInfo("America/New_York"))
+            head = build_queue.head_line(reading.explanation, labels, ZoneInfo("America/New_York"), facts)
         for value in ("18.1", "11.8", "16.3", "9.2"):
             self.assertIn(value, head["text"])
             self.assertIn(value, why)
@@ -174,6 +138,106 @@ class QueueTests(unittest.TestCase):
             numeric = {"#", "Promised", "Using", "Delta", "Waiting since", "Needs", "Free"}
             self.assertEqual(markers, ["---:" if heading in numeric else "---" for heading in headings])
         self.assertEqual(tables, 2)
+
+    def test_head_line_short_forms_share_the_recorded_head_and_bump_facts(self) -> None:
+        reading = head_reading(since=NOW - 158 * 60, now=NOW,
+                               fields={"head_since": NOW - 125, "priority_since": NOW - 3600})
+        write_bumps(NOW, [bump_line(NOW - 5, folder="/tmp/alpha"),
+                          bump_line(NOW - 4, folder="/tmp/beta", step="clippy"),
+                          bump_line(NOW - 3, folder="/tmp/alpha")])
+        snapshot = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))
+        self.assertIn("head for 2 min", snapshot["head"]["text"])
+        self.assertIn("3 bumps since it joined, most: alpha check (2)", snapshot["head"]["text"])
+        self.assertIn("no head priority: younger steps that fit may start", snapshot["head"]["text"])
+        self.assertNotIn("head for 158 min", snapshot["head"]["text"])
+
+    def test_missing_head_time_and_empty_bump_history_have_distinct_short_forms(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW, fields={"priority_since": NOW - 60})
+        snapshot = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))
+        self.assertIn("head for: unknown", snapshot["head"]["text"])
+        self.assertIn("no bumps since it joined", snapshot["head"]["text"])
+        self.assertNotIn("head for 10 min", snapshot["head"]["text"])
+
+    def test_no_strict_window_without_admissions_head_priority(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW)
+        head = reading.explanation.head
+        if not isinstance(head, memory_admit.HeadExplanation):
+            self.fail("fixture needs a head")
+        reading = replace(reading, explanation=replace(reading.explanation,
+            head=replace(head, order=memory_admit.StrictUntil(NOW + 123), has_priority=False)))
+        text = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))["head"]["text"]
+        self.assertIn("no head priority: younger steps that fit may start", text)
+        self.assertNotIn("strict", text)
+        self.assertNotIn("until", text)
+        self.assertNotIn("younger steps wait", text)
+
+    def test_bump_read_failure_is_unknown_and_snapshot_keys_stay_unchanged(self) -> None:
+        write_bumps(NOW, [])
+        path = store.host_file(store.host_name(), NOW)
+        path.unlink()
+        path.mkdir()
+        snapshot = build_queue.queue_snapshot(head_reading(since=NOW - 600, now=NOW), ZoneInfo("UTC"))
+        self.assertIn("bumps: unknown", snapshot["head"]["text"])
+        self.assertNotIn("no bumps since it joined", snapshot["head"]["text"])
+        self.assertEqual(set(snapshot), {"running_header", "running", "waiting_header", "waiting",
+                                         "head", "totals", "problems"})
+        self.assertEqual(set(snapshot["head"]), {"text", "tone"})
+        self.assertEqual(set(snapshot["totals"]), {"promised", "measured", "free", "reserve"})
+
+    def test_missing_token_return_never_adds_a_current_token_wait_row(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW, fields={"token_left_at": NOW - 60})
+        follower = replace(reading.view.waiting[0], pid=124, session_id="follower", session_name="follower")
+        reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, follower)))
+        write_token_gaps([queue_time_line(NOW - 60, kind="token_gap", session_id="head-session",
+                                         step="nextest", pid=123, start_time="123", token_left_at=NOW - 60)])
+        snapshot = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))
+        self.assertEqual([row[0] for row in snapshot["waiting"]], ["1", "2"])
+        self.assertFalse(any("waiting for the cargo token" in row[-1] for row in snapshot["waiting"]))
+
+    def test_a_returned_token_record_does_not_add_a_current_token_wait_row(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW)
+        write_token_gaps([token_gap_line(NOW - 200, NOW - 46)])
+        snapshot = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))
+        self.assertEqual([row[0] for row in snapshot["waiting"]], ["1"])
+
+    def test_head_line_shows_a_recorded_cargo_token_wait(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW)
+        write_token_gaps([token_gap_line(NOW - 200, NOW - 46)])
+        snapshot = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))
+        self.assertTrue(snapshot["head"]["text"].endswith("; cargo token waited 154 s"))
+        self.assertEqual(set(snapshot["head"]), {"text", "tone"})
+        self.assertEqual(set(snapshot), {"running_header", "running", "waiting_header", "waiting",
+                                         "head", "totals", "problems"})
+
+    def test_head_line_cargo_token_sum_excludes_other_waiting_steps(self) -> None:
+        reading = head_reading(since=NOW - 1000, now=NOW)
+        follower = replace(reading.view.waiting[0], pid=456, session_id="follower", step="clippy",
+                           since=NOW - 800)
+        reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, follower)))
+        write_token_gaps([
+            token_gap_line(NOW - 900, NOW - 800),
+            token_gap_line(NOW - 700, NOW - 400, session="follower", step="clippy", pid=456),
+            token_gap_line(NOW - 200, NOW - 46),
+        ])
+        text = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))["head"]["text"]
+        self.assertTrue(text.endswith("; cargo token waited 254 s"))
+        self.assertNotIn("cargo token waited 554 s", text)
+
+    def test_head_line_distinguishes_missing_history_from_no_head_token_wait(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW)
+        missing = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))["head"]["text"]
+        self.assertTrue(missing.endswith("; cargo token: unknown"))
+        write_token_gaps([token_gap_line(NOW - 200, NOW - 46, session="unrelated", pid=999)])
+        recorded = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))["head"]["text"]
+        self.assertTrue(recorded.endswith("; no cargo token wait"))
+
+    def test_head_line_partial_token_history_does_not_claim_a_complete_sum(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW)
+        write_token_gaps([token_gap_line(NOW - 200, NOW - 46)],
+                         tail=token_gap_line(NOW - 40, NOW - 20).rstrip(b"\n"))
+        text = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))["head"]["text"]
+        self.assertTrue(text.endswith("; cargo token: unknown"))
+        self.assertNotIn("cargo token waited", text)
 
     def test_json_cli_matches_text_cells_and_preserves_all_roster_problems(self) -> None:
         self.roster_read.return_value = roster.Roster([
@@ -249,8 +313,9 @@ class QueueTests(unittest.TestCase):
         head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], need,
                                        memory_admit.head_wait_reason(decision, need, available, row, NOW))
         view = memory_admit.QueueView((head,), (), available, 0, 3 * GIB, NOW)
+        reading = queue_read_fixture(view)
         with mock.patch.object(memory_admit, "decide", side_effect=AssertionError("Do not decide again")):
-            line = build_queue.head_line(queue_read_fixture(view).explanation, {}, ZoneInfo("UTC"))
+            line = build_queue.head_line(reading.explanation, {}, ZoneInfo("UTC"), head_facts.read_head_facts(reading))
         self.assertIn("needs 11.0 GiB free: this step 8.0, earlyoom 3.0", line["text"])
         self.assertIn("free 7.0 GiB, step needs 8.0 GiB", line["text"])
         self.assertEqual(line["tone"], "default")
@@ -266,8 +331,8 @@ class QueueTests(unittest.TestCase):
                                        memory_admit.head_wait_reason(decision, need, available, row, NOW))
         running = memory_admit.RunningStep("other", "other", "doc", "/tmp/other", 19 * GIB,
                                           memory_admit.MeasuredMemory(19 * GIB))
-        line = build_queue.head_line(queue_read_fixture(memory_admit.QueueView((head,), (running,), available, 0, 3 * GIB, NOW)).explanation,
-                                     {}, ZoneInfo("UTC"))
+        reading = queue_read_fixture(memory_admit.QueueView((head,), (running,), available, 0, 3 * GIB, NOW))
+        line = build_queue.head_line(reading.explanation, {}, ZoneInfo("UTC"), head_facts.read_head_facts(reading))
         self.assertIn("memory pressure: full avg10 23.4", line["text"])
         self.assertNotIn("charged", line["text"])
         self.assertNotIn("budget", line["text"])
@@ -286,7 +351,8 @@ class QueueTests(unittest.TestCase):
     def test_unavailable_head_never_claims_a_stall_even_after_fifteen_minutes(self) -> None:
         head = memory_admit.WaitingStep(10, "head", "worker", "check", "/tmp/head", NOW - 1800,
                                        0, memory_admit.ReadingUnavailable())
-        line = build_queue.head_line(queue_read_fixture(memory_admit.QueueView((head,), (), 0, 0, 0, NOW)).explanation, {}, ZoneInfo("UTC"))
+        reading = queue_read_fixture(memory_admit.QueueView((head,), (), 0, 0, 0, NOW))
+        line = build_queue.head_line(reading.explanation, {}, ZoneInfo("UTC"), head_facts.read_head_facts(reading))
         self.assertIn("memory reading unavailable", line["text"])
         self.assertNotIn("Stalled:", line["text"])
         self.assertNotIn("free 0.0", line["text"])
@@ -440,7 +506,7 @@ class QueueTests(unittest.TestCase):
         line = next(line for line in build_queue.render_queue(queue_read_fixture(view), ZoneInfo("UTC")) if "head:" in line)
         self.assertTrue(line.endswith(
             "10.9 GiB | 12.0 GiB | head: builds use 16.1 of the 21.0 GiB budget "
-            + "(starts when build use falls to 10.1 GiB); needs 13.9 GiB free: this step 10.9, earlyoom 3.0; younger steps wait until 19:10 |"))
+            + "(starts when build use falls to 10.1 GiB); needs 13.9 GiB free: this step 10.9, earlyoom 3.0; no head priority: younger steps that fit may start |"))
 
     def test_bump_by_unique_shown_label_moves_and_logs_the_actual_waiter(self) -> None:
         _ = self.write_waiter(100, "head-id", "head")
@@ -620,7 +686,7 @@ class QueueTests(unittest.TestCase):
         output = "\n".join(lines)
         self.assertIn("| 1 | — | — | clone88ci | check | clone88 | 14:20 (40 min) | 10.9 GiB | 23.1 GiB | "
                       + "head: builds use 15.0 of the 21.0 GiB budget "
-                      + "(starts when build use falls to 10.1 GiB); younger steps wait until 15:10 |", output)
+                      + "(starts when build use falls to 10.1 GiB); no head priority: younger steps that fit may start |", output)
         self.assertIn("| 2 | — | — | tree | doc | tree | 14:55 (5 min) | 11.6 GiB | 23.1 GiB | "
                       + "behind clone88ci (waiting 40 min) |", output)
         self.assertNotIn("head-id", output)
@@ -688,7 +754,7 @@ class QueueTests(unittest.TestCase):
         line = next(line for line in build_queue.render_queue(queue_read_fixture(view), ZoneInfo("UTC")) if "head:" in line)
         self.assertTrue(line.endswith(
             "head: needs 10.0 GiB free: this step 3.0, running steps may grow 4.0, earlyoom 3.0; "
-            + "younger steps wait until 19:10 |"), line)
+            + "no head priority: younger steps that fit may start |"), line)
 
     def test_budget_reason_names_charged_builds_and_the_limit(self) -> None:
         waiting = memory_admit.WaitingStep(
@@ -712,7 +778,7 @@ class QueueTests(unittest.TestCase):
         view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
         line = next(line for line in build_queue.render_queue(queue_read_fixture(view), ZoneInfo("UTC")) if "head:" in line)
         self.assertTrue(line.endswith("head: builds use 13.2 of the 20.0 GiB budget "
-                                      + "(starts when build use falls to 4.9 GiB); younger steps wait until 19:10 |"))
+                                      + "(starts when build use falls to 4.9 GiB); no head priority: younger steps that fit may start |"))
 
     def test_head_reason_names_only_free_memory_when_budget_passes(self) -> None:
         need, available = int(15.1 * GIB), 18 * GIB
@@ -724,14 +790,16 @@ class QueueTests(unittest.TestCase):
         )
         view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
         line = next(line for line in build_queue.render_queue(queue_read_fixture(view), ZoneInfo("UTC")) if "head:" in line)
-        self.assertTrue(line.endswith("head: needs 18.1 GiB free: this step 15.1, earlyoom 3.0; younger steps wait until 19:10 |"))
+        self.assertTrue(line.endswith("head: needs 18.1 GiB free: this step 15.1, earlyoom 3.0; no head priority: younger steps that fit may start |"))
 
     def test_head_backfill_label_uses_the_since_zone_and_becomes_strict_at_ten_minutes(self) -> None:
         need, available = int(15.1 * GIB), 18 * GIB
         decision = memory_admit.decide(available, 60 * GIB, need, [memory_admit.MeasuredMemory(GIB)])
-        for waited, bump, suffix in ((540, 0, "younger steps may start until 15:01"),
-                                      (600, 0, "younger steps wait until 15:10"),
-                                      (60, -1, "younger steps wait until 15:10")):
+        for waited, bump, suffix in (
+            (540, 0, "backfill until 15:01:00 (1 min 0 s left): younger steps that fit may start"),
+            (600, 0, "strict until 15:10:00 (10 min 0 s left): younger steps wait"),
+            (60, -1, "strict until 15:10:00 (10 min 0 s left): younger steps wait"),
+        ):
             with self.subTest(waited=waited, bump=bump):
                 row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need,
                                            "since": NOW - waited, "bump_order": bump}
@@ -739,7 +807,13 @@ class QueueTests(unittest.TestCase):
                     10, "waiting-id", "unit", "nextest", "/tmp/tree", row["since"], need,
                     memory_admit.head_wait_reason(decision, need, available, row, NOW))
                 view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
-                line = next(line for line in build_queue.render_queue(queue_read_fixture(view), ZoneInfo("America/New_York")) if "head:" in line)
+                reading = queue_read_fixture(view)
+                head = reading.explanation.head
+                if not isinstance(head, memory_admit.HeadExplanation):
+                    self.fail("fixture needs a head")
+                reading = replace(reading, explanation=replace(reading.explanation,
+                    head=replace(head, has_priority=True)))
+                line = next(line for line in build_queue.render_queue(reading, ZoneInfo("America/New_York")) if "head:" in line)
                 self.assertTrue(line.endswith("head: needs 18.1 GiB free: this step 15.1, earlyoom 3.0; " + suffix + " |"))
 
     def test_live_queue_pressure_reason_reaches_the_cli(self) -> None:

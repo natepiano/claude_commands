@@ -20,6 +20,8 @@ import next_item
 from production_units import Production
 import proposals_folder
 import showrunners
+import showrunner_tree
+from scripts.production import staff
 from change_review import Visible
 from next_item import NextError, Queue
 
@@ -217,12 +219,13 @@ class NextItemTests(unittest.TestCase):
         def root_of(slug: str) -> str:
             return "top" if slug in tree["top"] else slug
 
-        def descendants_of(slug: str) -> list[str]:
+        def descendants_of(slug: str, *, record: staff.StaffSnapshot | None = None) -> list[str]:
+            del record
             return tree[slug][1:]
 
         with mock.patch.object(proposals_folder, "owner_docs", owner_docs), \
-                mock.patch.object(showrunners, "root_of", root_of), \
-                mock.patch.object(showrunners, "descendants_of", descendants_of), \
+                mock.patch.object(showrunner_tree, "root_of", root_of), \
+                mock.patch.object(showrunner_tree, "descendants_of", descendants_of), \
                 mock.patch.object(showrunners, "timer_docs", return_value=docs), \
                 mock.patch.object(change_review, "production_list", the_list), \
                 mock.patch.object(next_item, "read_production", production), \
@@ -255,7 +258,7 @@ class NextItemTests(unittest.TestCase):
             return path
 
         with mock.patch.object(change_review, "production_list", the_list), \
-                mock.patch.object(showrunners, "root_of", return_value="top"), \
+                mock.patch.object(showrunner_tree, "root_of", return_value="top"), \
                 mock.patch.object(showrunners, "timer_docs", return_value={"top": top, "kid": kid}), \
                 mock.patch.object(proposals_folder, "owner_docs", return_value=[kid]):
             self.assertEqual([entry.item.splitlines()[0] for entry in next_item.change_queue(kid).entries],
@@ -280,12 +283,13 @@ class NextItemTests(unittest.TestCase):
             "| C1 | Earlier grandchild change | 2026-10-04 | Try earlier grandchild | | |\n")
         tree = {"top": ["kid", "grand"], "kid": ["grand"], "grand": []}
 
-        def descendants(slug: str) -> list[str]:
+        def descendants(slug: str, *, record: staff.StaffSnapshot | None = None) -> list[str]:
+            del record
             return tree[slug]
 
-        _ = self.enterContext(mock.patch.object(showrunners, "root_of", return_value="top"))
+        _ = self.enterContext(mock.patch.object(showrunner_tree, "root_of", return_value="top"))
         _ = self.enterContext(mock.patch.object(showrunners, "timer_docs", return_value=docs))
-        _ = self.enterContext(mock.patch.object(showrunners, "descendants_of", descendants))
+        _ = self.enterContext(mock.patch.object(showrunner_tree, "descendants_of", descendants))
         _ = self.enterContext(mock.patch.object(change_review, "production_list",
                                                return_value=folder / "change-review - top.md"))
         return docs

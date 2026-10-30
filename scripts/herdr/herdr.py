@@ -33,7 +33,7 @@ from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator, Sequence, Set
-from typing import NamedTuple, NotRequired, TypedDict, cast, override
+from typing import NamedTuple, NotRequired, TypedDict, TypeVar, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
@@ -660,6 +660,29 @@ class SeveralPanes:
 
 
 @dataclass(frozen=True)
+class TabSession:
+    """A labelled pane and its last known conversation, including after the agent exits."""
+
+    pane_id: str
+    label: str
+    workspace: str
+    session_id: str | None
+
+
+_LabelledPane = TypeVar("_LabelledPane")
+
+
+def _match_label(label: str, panes: Sequence[_LabelledPane],
+                 label_of: Callable[[_LabelledPane], str | None]) -> _LabelledPane | NoPane | SeveralPanes:
+    matches = [pane for pane in panes if label_of(pane) == label]
+    if not matches:
+        return NoPane(label)
+    if len(matches) > 1:
+        return SeveralPanes(label, len(matches))
+    return matches[0]
+
+
+@dataclass(frozen=True)
 class PaneAtShell:
     """The pane's foreground process group is its original shell."""
 
@@ -718,6 +741,8 @@ class SessionListResult(TypedDict):
 class PaneIdentity(TypedDict):
     pane_id: str
     label: NotRequired[str | None]
+    workspace_id: str
+    session_id: str | None
 
 
 class PaneListResult(TypedDict):
@@ -1041,6 +1066,10 @@ class Herdr:
         require_success(result, context)
         return result.stdout
 
+    def run_in_pane(self, pane: str, command: list[str]) -> None:
+        """Run an argv command in an existing pane; herdr types its text into the shell."""
+        _ = self.run("pane", "run", pane, shlex.join(command))
+
     def result(self, *arguments: str) -> dict[str, object]:
         reply = decode_object(self.run(*arguments), "herdr response")
         return json_object(reply.get("result"), "herdr result")
@@ -1053,16 +1082,35 @@ class Herdr:
             label = pane.get("label")
             if label is not None and not isinstance(label, str):
                 raise HerdrFailure("herdr pane label: expected text or null")
-            panes.append({"pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label})
+            agent_session = pane.get("agent_session")
+            session_id = (json_object(agent_session, "herdr pane agent session").get("value")
+                          if agent_session is not None else None)
+            if session_id is not None and not isinstance(session_id, str):
+                raise HerdrFailure("herdr pane agent session value: expected text or null")
+            panes.append({"pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label,
+                          "workspace_id": json_text(pane.get("workspace_id"), "herdr pane workspace id"),
+                          "session_id": session_id})
         return panes
 
     def lookup(self, label: str) -> PaneFound | NoPane | SeveralPanes:
-        matches = [pane["pane_id"] for pane in self.panes() if pane.get("label") == label]
-        if not matches:
-            return NoPane(label)
-        if len(matches) > 1:
-            return SeveralPanes(label, len(matches))
-        return PaneFound(matches[0])
+        found = _match_label(label, self.panes(), lambda pane: pane.get("label"))
+        return found if isinstance(found, (NoPane, SeveralPanes)) else PaneFound(found["pane_id"])
+
+    def tab_sessions(self) -> list[TabSession]:
+        """Read labelled panes with workspace names and their last known conversation ids."""
+        panes = self.panes()
+        spaces: dict[str, str] = {}
+        for item in json_items(self.result("workspace", "list").get("workspaces"), "herdr workspace list"):
+            workspace = json_object(item, "herdr workspace")
+            ident = json_text(workspace.get("workspace_id"), "herdr workspace id")
+            label = workspace.get("label")
+            spaces[ident] = "" if label is None else json_text(label, "herdr workspace label")
+        return [TabSession(pane["pane_id"], label, spaces.get(pane["workspace_id"], ""), pane["session_id"])
+                for pane in panes if (label := pane.get("label")) is not None]
+
+    def session_of(self, label: str) -> TabSession | NoPane | SeveralPanes:
+        """Find exactly one labelled tab, whether its agent is running or has exited."""
+        return _match_label(label, self.tab_sessions(), lambda tab: tab.label)
 
     def pane_activity(self, pane: str) -> PaneAtShell | PaneRunning:
         """Describe whether the pane is at its shell or running foreground work."""

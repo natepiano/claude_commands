@@ -601,12 +601,17 @@ class AccountHold(TypedDict):
     registration_owners: NotRequired[dict[str, RegistrationOwner]]
 
 
+def stop_issue_blocks_completion(issue: SessionStopIssue) -> bool:
+    """An unconfirmed resumable Codex pause is advisory, including on restart."""
+    return not (issue["kind"] == "codex server left running" and issue["cause"] == "stop not confirmed")
+
+
 def stop_incomplete(saved: SessionShutdown) -> bool:
     """Report a failed stop or owner resources left after a terminal stop."""
     progress = saved["progress"]["kind"]
-    return progress == "stop failed" or bool(saved["stop_issues"] and progress in {
-        "stopped", "already gone", "process identity lost",
-    })
+    return progress == "stop failed" or bool(saved["stop_issues"] and (
+        progress == "process identity lost" or progress in {"stopped", "already gone"}
+        and any(stop_issue_blocks_completion(issue) for issue in saved["stop_issues"])))
 
 
 # Progress after which a session's shutdown takes no further step by itself.

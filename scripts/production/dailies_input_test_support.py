@@ -25,6 +25,9 @@ from dailies_input import (Activity, Block, ClaudeNotRunning, Decision, FormWait
                            StillWaiting, TicksFailing, UnitRow, status_blocks)
 from unit_lookup import UnitState
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+from scripts.production.staff_test_support import (
+    fixture_showrunner_name, isolated_staff_file, showrunner_launch, showrunner_relationship,
+)
 
 
 SCRIPT = Path(__file__).with_name("dailies_input.py")
@@ -149,7 +152,10 @@ class DailiesInputFixture(unittest.TestCase):
         builder = cls()
         builder.root = cls.fixture_root
         builder.root.mkdir()
-        builder.build_fixture()
+        try:
+            builder.build_fixture()
+        finally:
+            builder.doCleanups()
         cls.fixture_attributes = {name: cast(Path, getattr(builder, name)) for name in (
             "root", "home", "origin", "checkout", "doc", "status", "judgment", "state", "holders",
             "output", "notifier", "events", "notifier_failure", "phase_table", "phase_table_json",
@@ -188,6 +194,7 @@ class DailiesInputFixture(unittest.TestCase):
         for name, value in self.fixture_attributes.items():
             setattr(self, name, value)
         self.env = self.fixture_env.copy()
+        _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
         self.patch_commands()
 
     def build_fixture(self) -> None:
@@ -235,9 +242,12 @@ class DailiesInputFixture(unittest.TestCase):
                     "STYLE_LEDGER_STATE_DIR": str(self.root / "style-state"),
                     "STYLE_HISTORY_NATE_STYLE_DIR": str(self.root / "nate_style"),
                     **fake_unit_host.environment(self.root),
-                    "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")}
+                    "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
+                    "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"), "HERDR_SESSION": "agents"}
+        _ = self.enterContext(isolated_staff_file(self.root / "staff/staff.json", self.env))
         (self.root / "sessions").mkdir()
         self.production_doc()
+        _ = showrunner_relationship(fixture_showrunner_name("example", self.doc))
         self.status_lines(f"== {ALPHA}", "● Checking panel labels", "ETA 23:40")
         self.judgment_file()
 
@@ -516,14 +526,14 @@ class DailiesInputFixture(unittest.TestCase):
         instance.mkdir(parents=True)
         _ = (instance / "conf").write_text(
             f"TARGET=session:{slug}-session\nCHECK=zsh /x/production_check.sh {self.doc}\n", encoding="utf-8")
+        row = showrunner_relationship(fixture_showrunner_name(slug, self.doc))
+        showrunner_launch(row, f"{slug}-session", self.env)
 
     def attach(self, child: str, parent: str) -> None:
         for slug in (child, parent):
             if not (self.root / "notifier-state" / f"showrunner-{slug}").exists():
                 self.timer(slug)
-        edge = self.showrunner_state / child / "parent"
-        edge.parent.mkdir(parents=True, exist_ok=True)
-        _ = edge.write_text(parent + "\n", encoding="utf-8")
+        _ = showrunner_relationship(fixture_showrunner_name(child, self.doc), fixture_showrunner_name(parent, self.doc))
 
     def saved_report(self, slug: str) -> Path:
         return self.showrunner_state / slug / "dailies_last.json"

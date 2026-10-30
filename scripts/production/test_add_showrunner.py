@@ -14,7 +14,7 @@ from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import cast, override
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -23,6 +23,7 @@ from scripts.accounts import accounts
 from scripts.production import add_showrunner
 import production_units
 import showrunners
+import showrunner_tree
 import usage_store
 import herdr as runtime
 from scripts.herdr import herdr
@@ -38,6 +39,25 @@ from scripts.message import sessions
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 class AddShowrunnerTests(AddShowrunnerFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = staff.ensure("showrunner", name="top")
+
+    def test_existing_staff_parent_survives_a_stale_saved_parent_during_ensure(self) -> None:
+        self.timer("kid", "kid-session")
+        parent = staff.ensure("showrunner", name="other")
+        child = staff.ensure("showrunner", name="kid", parent=parent.id)
+        path = self.root / "showrunner/kid/parent"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(path, "top\n")
+        before = self.staff.staff_file.read_bytes(), path.read_bytes()
+        with (patch.dict(os.environ, self.env),
+              patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier")):
+            ensured = add_showrunner.ensure_staff_showrunner(production_units.read_production(self.doc("kid")), "top")
+        self.assertEqual(ensured, child)
+        self.assertEqual((self.staff.staff_file.read_bytes(), path.read_bytes()), before)
+
     def assert_dead_launch_recovers(self, *, transcript_exists: bool) -> None:
         self.starts("kid-session", registers="kid")
         with patch.object(add_showrunner, "launch", side_effect=RuntimeError("stopped after saving launch")):
@@ -440,7 +460,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         child = production_units.read_production(self.doc("kid"))
         with patch.dict(os.environ, self.env, clear=True), \
                 patch.object(add_showrunner, "running", return_value=False), \
-                patch.object(showrunners, "descendants_of", return_value=[]), \
+                patch.object(showrunner_tree, "descendants_of", return_value=[]), \
                 patch.object(add_showrunner, "herdr_tab_open", return_value=False) as destination:
             result = add_showrunner.checked(child, "top", config_dir=Path(self.env["HOME"]) / ".claude2")
         self.assertIsNone(result)
@@ -557,6 +577,8 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         edge = self.root / "showrunner" / "kid" / "parent"
         edge.parent.mkdir(parents=True)
         _ = edge.write_text("top\n", encoding="utf-8")
+        top = staff.ensure("showrunner", name="top")
+        _ = staff.ensure("showrunner", name="kid", parent=top.id)
         self.starts("abc-123")
         result = self.run_command("kid", "--resume", "abc-123", "--cwd", str(self.root), "--account", "claude2")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -648,6 +670,10 @@ class AddShowrunnerTests(AddShowrunnerFixture):
     def test_a_production_above_the_caller_is_refused(self) -> None:
         self.timer("middle", "middle-session")
         self.timer("grand", "grand-session")
+        grand = staff.ensure("showrunner", name="grand")
+        middle = staff.ensure("showrunner", name="middle", parent=grand.id)
+        top = next(row for row in staff.find(kind="showrunner") if row.name == "top")
+        _ = staff.move(top.id, middle.id)
         for child, parent in (("top", "middle"), ("middle", "grand")):
             edge = self.root / "showrunner" / child / "parent"
             edge.parent.mkdir(parents=True)

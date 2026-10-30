@@ -16,7 +16,7 @@ from contextlib import ExitStack
 
 from scripts.astra import design_roles
 from scripts.direct import workers
-from scripts.production import staff, staff_move
+from scripts.production import staff, staff_sources, staff_move
 from scripts.production.rename_test_support import legacy_staff_journal, stop_at_staff_write
 from scripts.production.rename_rerun_test_support import final_files, saved_fixture
 from scripts.production.staff_test_support import SOURCES_SCRIPT
@@ -379,6 +379,31 @@ class UnitTransferTests(UnitTransferFixture):
         note = notice[notice.index("--text") + 1]
         self.assertIn(f"Your production doc is now {receiving}", note)
         self.assertIn(f"Your worktree {self.unit}, your branch demo-alpha and its commits stay.", note)
+
+    def test_a_stopped_unit_relaunches_using_its_receiving_staff_parent(self) -> None:
+        from scripts.accounts import accounts
+        from account import Account
+        import restart
+        import shutdown_record
+
+        _ = self.seed_record()
+        self.assert_ok(self.transfer("apply"))
+        path = self.root / "home/.local/state/shutdown/owner@example.com/sessions/sid-alpha.json"
+        saved = shutdown_record.parse_session_records(f"[{path.read_text()}]")[0]
+        host = saved["session"]["host"]
+        assert host["kind"] == "unit"
+        self.assertEqual((host["unit"], host["session_name"]), ("alpha-unit", "demo-alpha"))
+        self.assertNotIn("production", host)
+        self.assertNotIn("doc", host)
+        receiving = self.receiving / "docs/plans/other-production.md"
+        self.assertEqual(staff_sources.unit_parent("alpha-unit", "sid-alpha"),
+                         staff_sources.UnitProduction("other", str(receiving)))
+        with (mock.patch.object(restart, "_note_path", return_value=self.root / "restart-note"),
+              mock.patch.object(accounts, "account_for_group_launch",
+                                return_value=Account("claude", "owner@example.com", "claude2"))):
+            argv = restart._unit_argv(saved)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(argv[argv.index("--production") + 1], str(receiving))
+        self.assertEqual(argv[argv.index("--resume") + 1], "sid-alpha")
 
     def test_plan_lists_the_steps_and_changes_nothing(self) -> None:
         before = self.git("rev-parse", "demo", "other", "demo-alpha")

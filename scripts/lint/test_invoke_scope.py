@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import select
@@ -12,6 +13,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
@@ -21,6 +23,27 @@ else:
 
 INVOKE = Path(__file__).with_name("invoke.sh")
 OOM_SCORE_ADJ = "/proc/self/oom_score_adj"
+
+
+@dataclass(frozen=True)
+class SamplerFiles:
+    scope: Path
+    scope_path: Path
+    maximum: Path
+
+
+def sampler_files(root: Path) -> SamplerFiles:
+    scope = root / "scope"
+    scope.mkdir()
+    scope_path = root / "scope-path"
+    _ = scope_path.write_text(str(scope) + "\n")
+    return SamplerFiles(scope, scope_path, root / "step.max")
+
+
+def sampler_command() -> str:
+    """Read the actual sampler body once for deterministic shell fixtures."""
+    body = INVOKE.read_text().split("buildlog_sample_anon() {", 1)[1].split("\n}\n", 1)[0]
+    return "buildlog_sample_anon() {" + body + "\n}\n"
 
 
 def scope_command() -> str:
@@ -115,16 +138,11 @@ class BuildScopeTests(unittest.TestCase):
     def test_sampler_records_near_peak_use_with_rate_limit_and_atomic_replace(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            scope = root / "scope"
-            scope.mkdir()
-            sidecar = root / "scope-path"
-            _ = sidecar.write_text(str(scope) + "\n")
-            maximum = root / "step.max"
+            files = sampler_files(root)
+            scope, sidecar, maximum = files.scope, files.scope_path, files.maximum
             near_peak = root / "step.wave"
             _ = near_peak.write_text("900\n")
-            program = INVOKE.read_text().split("buildlog_sample_anon() {", 1)[1].split("\n}\n", 1)[0]
-            program = "buildlog_sample_anon() {" + program + '''
-}
+            program = sampler_command() + '''
 times=(1000 1059 1060 1120 1121 1122 1182 1183)
 values=(100 50 50 49 50 200 99 100)
 index=0
@@ -154,16 +172,11 @@ buildlog_sample_anon "$1" "$2" "$$"
         for fail_first_peak in (False, True):
             with self.subTest(fail_first_peak=fail_first_peak), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                scope = root / "scope"
-                scope.mkdir()
-                sidecar = root / "scope-path"
-                _ = sidecar.write_text(str(scope) + "\n")
-                maximum = root / "step.max"
+                files = sampler_files(root)
+                scope, sidecar, maximum = files.scope, files.scope_path, files.maximum
                 _ = maximum.write_text("100\n")
                 _ = maximum.with_suffix(".wave").write_text("100 1\n")
-                program = INVOKE.read_text().split("buildlog_sample_anon() {", 1)[1].split("\n}\n", 1)[0]
-                program = "set -e\nbuildlog_sample_anon() {" + program + r'''
-}
+                program = "set -e\n" + sampler_command() + r'''
 values=(100 200 200 0)
 index=0
 date() { if (( index == 0 )); then printf '1\n'; else printf '3000\n'; fi; }
@@ -331,13 +344,13 @@ class SweepStartupTests(unittest.TestCase):
 
 class BuildAdmissionTests(unittest.TestCase):
     def run_invoke(
-        self, root: Path, shell: str, arguments: list[str]
+        self, root: Path, shell: str, arguments: list[str], *,
+        environment: dict[str, str] | None = None, cwd: Path | None = None,
+        terminal: bool = False,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["bash", "-c", 'set -euo pipefail; source "$1"; shift; ' + shell,
-             "admission-test", str(INVOKE), *arguments],
-            capture_output=True, text=True, check=False,
-            env={**os.environ,
+        command = ["bash", "-c", 'set -euo pipefail; source "$1"; shift; ' + shell,
+                   "admission-test", str(INVOKE), *arguments]
+        isolated = {**os.environ,
                  "HOME": str(root), "TMPDIR": str(root),
                  "BUILDLOG_DIR": str(root / "buildlog"),
                  "BUILD_HOLD_DIR": str(root / "holders"),
@@ -346,8 +359,34 @@ class BuildAdmissionTests(unittest.TestCase):
                  "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
                  "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
                  "MAC_TEST_STATE_DIR": str(root / "mac-state"),
-                 "LINT_CONFIG_READER": str(root / "missing-config")},
-        )
+                 "LINT_CONFIG_READER": str(root / "missing-config")}
+        isolated.update(environment or {})
+        if not terminal:
+            return subprocess.run(command, capture_output=True, text=True, check=False,
+                                  env=isolated, cwd=cwd, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+        reader, writer = os.openpty()
+        try:
+            try:
+                result = subprocess.run(command, stdout=writer, stderr=subprocess.PIPE,
+                                        text=True, check=False, env=isolated, cwd=cwd,
+                                        timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
+            finally:
+                os.close(writer)
+            chunks: list[bytes] = []
+            while True:
+                try:
+                    chunk = os.read(reader, 4096)
+                except OSError as error:
+                    if error.errno == errno.EIO:
+                        break
+                    raise
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return subprocess.CompletedProcess(command, result.returncode,
+                                               b"".join(chunks).decode(), result.stderr)
+        finally:
+            os.close(reader)
 
     def test_taplo_does_not_compile_and_existing_command_classification_is_preserved(self) -> None:
         cases = [

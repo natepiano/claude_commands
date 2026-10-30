@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, final, override
 from unittest import mock
 from scripts.direct import workers
+from scripts.production import staff_sources
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -26,8 +27,10 @@ import unit_runs
 from rename_state import RenameRefused
 
 if TYPE_CHECKING:
+    from scripts.shutdown.unit_staff_test_support import PARENTS, isolated_parents
     from scripts.shutdown import shutdown_record
 else:
+    from unit_staff_test_support import PARENTS, isolated_parents
     # rename_unit puts the shutdown folder on the path.
     import shutdown_record
 
@@ -88,6 +91,8 @@ class RunProcessTests(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(isolated_parents())
+        PARENTS["alpha-unit"] = staff_sources.UnitProduction(SLUG, "/fixture/demo-production.md")
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.worktree = self.root / "claude-demo-alpha"
         other = self.root / "claude-demo-beta"

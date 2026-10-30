@@ -2,7 +2,7 @@
 
 Each machine appends only under its own <root>/<host>/, so the two never write
 the same file. This pushes this host's folder and ci/ (only natedev polls CI)
-to the peer, then pulls every other host's folder back. rsync never deletes,
+to the peer, then pulls the other hosts in record.SYNC_HOSTS. rsync never deletes,
 and replaces a changed file by rename, which index.py expects.
 
 The peer is `mac`; BUILDLOG_PEER overrides it. A peer that does not answer --
@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TypedDict, cast
 
+import health
+import record
 import store
 
 import sys
@@ -203,7 +205,10 @@ def _sync_locked() -> int:
     root = store.root()
     host = store.host_name()
     root.mkdir(parents=True, exist_ok=True)
-    reach = run(["ssh", *SSH_OPTIONS, peer, "mkdir -p " + REMOTE_ROOT + '; echo "rc=$?"'], REACH_TIMEOUT_S)
+    _ = health.write_snapshot()
+    remote_refresh = ("mkdir -p " + REMOTE_ROOT + '; echo "rc=$?"; '
+                      + "~/.claude/scripts/lib/py ~/.claude/scripts/buildlog/health.py")
+    reach = run(["ssh", *SSH_OPTIONS, peer, remote_refresh], REACH_TIMEOUT_S)
     if reach is None or reach.returncode == 255:
         # ssh's own 255: no connection. One mkdir stands in for a separate
         # `ssh true` reachability probe and saves a connection each hour.
@@ -218,23 +223,25 @@ def _sync_locked() -> int:
         write_status(peer, False)
         return 1
     shell = "ssh " + " ".join(SSH_OPTIONS)
-    sources = [str(root / name) for name in (host, store.CI_DIR) if (root / name).is_dir()]
+    push_folders = (host, store.CI_DIR) if host == "natedev" else (host,)
+    sources = [str(root / name) for name in push_folders if (root / name).is_dir()]
     if sources and failed(
         "push", run(["rsync", "-rt", "-e", shell, *sources, f"{peer}:{REMOTE_ROOT}"], RSYNC_TIMEOUT_S)
     ):
         write_status(peer, False)
         return 1
-    # Top-level folders only, minus this host's and ci/: the peer's own
-    # folders. Its index, status and error files stay where they are.
+    # Pull only the allow-listed host subtrees, minus this host. Admission and
+    # pending state stay local at every depth; ci/ is pushed by natedev only.
     pull = [
         "rsync",
         "-rt",
         "-e",
         shell,
-        f"--exclude=/{host}/",
-        f"--exclude=/{store.CI_DIR}/",
-        "--include=/*/",
-        "--exclude=/*",
+        "--exclude=admission/",
+        "--exclude=pending-steps/",
+        "--exclude=pending-launches/",
+        *(f"--include=/{name}/***" for name in record.SYNC_HOSTS if name != host),
+        "--exclude=*",
         f"{peer}:{REMOTE_ROOT}",
         f"{root}/",
     ]

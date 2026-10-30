@@ -249,7 +249,7 @@ class HerdrLaunchTests(NixFixture):
                                    ["claude", "-n", "worker"])
         invoke = cast(Callable[..., object], getattr(pane_restore, "_resume"))
         with patch.object(pane_restore, "named_account_environment", return_value={}):
-            self.refusal(lambda: invoke("host", client, pane_restore.RestoredPane("pane", "worker", "space", "sid"), entry))
+            self.refusal(lambda: invoke("host", client, herdr.TabSession("pane", "worker", "space", "sid"), entry))
         cast(Mock, client.close_tab_of).assert_not_called()
 
     def test_herdr_sessions_refusal_prints_one_line_and_opens_nothing(self) -> None:
