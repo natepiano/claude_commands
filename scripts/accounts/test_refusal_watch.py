@@ -93,7 +93,11 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.home / "pace.jsonl"))
         (self.home / ".claude").mkdir()
         (self.home / "notifier").mkdir()
-        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifier"))
+        # Production scripts import the registry under both spellings, each with paths fixed at import.
+        for registry in (showrunners, import_module("showrunners")):
+            for field, value in (("NOTIFIER_STATE_DIR", self.home / "notifier"), ("SESSIONS_DIR", self.home / "sessions"),
+                                 ("SHOWRUNNER_STATE_DIR", self.home / "showrunner")):
+                _ = self.enterContext(patch.object(registry, field, value))
         _ = (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
         for label, login in (("claude1", SOURCE_LOGIN), ("claude2", "main@example.invalid"), ("claude3", TARGET_LOGIN)):
             self.assertEqual(accounts.setup(label), [])
