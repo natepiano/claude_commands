@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
 import unittest
 from scripts.lib.test_agents_registry import write_registry
 from scripts.direct.implement_launcher_claims_test_support import CompletedWorkerFixture
 from scripts.direct.implement_launcher_test_support import AGENTS_REGISTRY as AGENTS_REGISTRY
-from scripts.direct.implement_launcher_test_support import TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS
 from typing import cast
 import json
 import subprocess
