@@ -109,6 +109,22 @@ class PushAuditTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         return result.stdout
 
+    def test_full_cli_omits_the_hint_and_summary_only_keeps_it(self) -> None:
+        self.save(self.pushes, [self.push("Delivered fixture")])
+        self.reviews.unlink()
+        with patch.object(audit, "STATE_DIR", self.logs), \
+                patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifiers"), \
+                redirect_stdout(io.StringIO()) as captured:
+            self.assertEqual(audit.main(["report", "--since", SINCE, "--until", UNTIL]), 0)
+        summary = captured.getvalue().splitlines()
+        full = self.report()
+        full_summary = full.split("\n\n", 1)[0].splitlines()
+        self.assertEqual(summary[-1], "Source problems: 1. Use --full to print the tables.")
+        self.assertEqual(full_summary[-1], "Source problems: 1.")
+        self.assertEqual(full_summary[:-1], summary[:-1])
+        self.assertNotIn("Use --full", full)
+        self.assertIn("Totals per showrunner", full)
+
     def test_priority_two_send_names_its_exception(self) -> None:
         self.save(self.pushes, [self.push("Emergency fixture", priority="2",
                                         outcome="sent, receipt fixture, sent despite failed review: context")])
@@ -139,7 +155,8 @@ class PushAuditTest(unittest.TestCase):
         self.assertEqual(result, 0)
         summary = output.getvalue()
         full = self.report()
-        self.assertEqual(full.split("\n\n", 1)[0] + "\n", summary)
+        self.assertEqual(full.split("\n\n", 1)[0] + "\n",
+                         summary.replace(" Use --full to print the tables.", ""))
         self.assertEqual(len(summary.splitlines()), 4)
         self.assertIn("Window: 2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded).", summary)
         self.assertIn("Pushes: 4 delivered; 3 after a failed text check.", summary)
