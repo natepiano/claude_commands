@@ -577,7 +577,7 @@ launcher's own `landed` and `abandon` reach that phase's ledger.
 
 | Command | Purpose |
 | --- | --- |
-| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <worker\|main\|both> [--lens <adversary\|contract\|craft\|ux>[,…]] [--detail <d>]` | create an id; `--lens` names every lens that raised it, comma-separated; legacy `both` means `adversary,contract` |
+| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <worker\|main\|both> [--lens <adversary\|contract\|craft\|ux\|rerun>[,…]] [--detail <d>]` | create an id; `--lens` names every lens that raised it, comma-separated; legacy `both` means `adversary,contract` |
 | `status` | read the ledger for closure review |
 | `gate` | get `converged` or `dispatch`, plus batch and any advisory |
 | `dispatch --covers F001,F002,... --accepted-checks "<checks or none: reason>" [--keep F001=<regression\|broken\|gate\|ruling>:<evidence>]` | record the complete kept batch; repeat `--keep` per id from repair round 4 (the user, 2026-10-28) |

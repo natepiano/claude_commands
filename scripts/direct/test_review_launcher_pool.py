@@ -139,6 +139,16 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual(self.turn_records(session)[0]["thread_id"], "thread-fixture")
         self.assertEqual((session / "review_status_contract").read_text(), "reviewed\n")
 
+    def test_code_pool_runs_rerun_lens_and_records_its_findings(self) -> None:
+        session = self.start_implementation("pool-rerun")
+        self.finish_implementation(session)
+        result = subprocess.run(self.pool_command(session, lens="rerun"), env=self.pool_fixture(),
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record, = self.turn_records(session)
+        self.assertEqual((record["lens"], record["kind"], record["status"]), ("rerun", "broad", "reviewed"))
+        self.assertTrue((session / "review_findings_1_rerun.txt").is_file())
+
     def test_ignored_code_flags_use_own_claim_compaction_and_records(self) -> None:
         session = self.start_implementation("pool-routing")
         self.finish_implementation(session)
