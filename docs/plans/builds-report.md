@@ -189,40 +189,25 @@ including the details to make it clear
 
 ### Phase 4c — Each scoped test step records its test-phase memory peak  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** every scoped nextest step from `verify`, `cargo-port` and `validate_ci` (full and filtered, terminal and tee) records `test_phase_peak_bytes`: the step scope's largest `memory.stat` `anon`, in bytes, over its test phase.
-
-**Spec:**
-- Why (showrunner order 2026-10-30, for resources' parked test-phase charge, its Phase 15): today's 60 s machine samples cannot show a test peak per step.
-- Spec source: line 20 of `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/15/impl_summary_impl.txt`.
-- Sample once per second, from the first Cargo-profile `deps/` test binary seen in the scope until the scope ends. Count all parallel test processes in the scope.
-- Put the sampling in the existing per-step sampler `buildlog_sample_anon` (`scripts/lint/invoke.sh` near line 172), which already writes admission's `.max` and `.wave` files from the scope's `memory.stat` `anon`. One loop writes both those files and the test-phase window; keep its atomic publication (temp + `mv`) and its exit when the parent ends. Start no second sampler.
-- Admission release deletes its reservation and measurement files (`memory_admit.py` `release`, near line 2055), and both invoke.sh paths release before they call the recorder (near line 307). So invoke.sh writes the test-phase fields into the step's own sidecar before release, and copies admission's assigned charge there from admission's record, computing nothing; `record.py step` reads that sidecar. Admission's release API does not change (showrunner OK, 2026-10-30).
-- On release, persist these with the call/step identity: `test_phase_peak_bytes`, `test_phase_started_at` (epoch seconds), the actual `test_threads`, the repository and the filter family. A step with no test-phase mark records unknown, never 0.
-- Also persist the charge admission assigned at test-phase entry, with its history cutoff, form and contributing widths. Read it from admission's own record; never compute it. If admission has no such field, record unknown and tell the showrunner; resources adds the field in its follow-up.
-- Measure the sampler's CPU cost per step; the checkpoint notice names it.
+- The one admission sampler `buildlog_sample_anon` in `scripts/lint/invoke.sh` also opens a test-phase window on the first tick when a running executable in the step's scope has a direct parent folder named `deps` (`/deps/[^/]+$`). This works under any target folder name, with or without a target-triple level. Build scripts run from `<profile>/build/<pkg>-<hash>/` and do not open it. One `readlink` per tick covers all scope processes. The peak is the scope's `memory.stat` `anon`, so it counts all parallel tests.
+- The sampler writes the window's anon peak and start time (epoch seconds) to the sidecar `$BUILDLOG_PEAK.test-phase.json` (temp + `mv`). It also writes the context from `record.py test-phase-context RESERVATION ARGV...`, read once before the loop. The same loop still writes admission's `.max` and `.wave` files.
+- `record.py step` reads `BUILDLOG_TEST_PHASE_FILE` and validates the sidecar into `PendingStep.test_phase` (`TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord`) before the save. An absent sidecar records unknown (null). An unreadable one keeps the sources and the pending record (`test_phase_read_error`) for a retry and writes one `pending record <path>` line to `errors.log`. Only `_finish_step` and the invalid-argument cleanup delete the sidecar.
+- Row fields: `test_phase_peak_bytes`, `test_phase_started_at`, and the typed `TestPhaseContext` (`repo_identity`, `test_scope`, `package`, `filters`, `call_id`, `test_threads`). `test_threads` comes from the nextest flag first, then `NEXTEST_TEST_THREADS`, through admission's one parser `memory_admit.test_threads`. `test_phase_charge` records null: admission has no test-phase entry-charge field yet.
+- Sampler CPU cost: about +0.36 CPU-s per accelerated 60-tick fixture step.
 
 **Files:**
-- `scripts/lint/invoke.sh` — the scope script samples the test phase (owner verify-unit; trial-merge against `origin/natedev-verify-token` and name verify-unit with that tip in the notice's also-touches line)
-- `scripts/buildlog/record.py` — persist the fields on release
-- `scripts/buildlog/test_test_phase_peak.py` — first test binary starts the window, peak over parallel processes, no mark gives unknown, admission field absent gives unknown, terminal and tee steps record after admission's files are gone; a stop after the row is saved and a stop before the sidecar is deleted both recover through `launches.collect()` after admission's files are gone, from a different environment, with the original fields and one row; a requested width of 32 that the share claim narrows to 8 records 8 for terminal and tee steps, with the original repository and filter family
+- `scripts/lint/invoke.sh` — the shared sampler opens and writes the test-phase window; `buildlog_end` passes `BUILDLOG_TEST_PHASE_FILE` to the recorder
+- `scripts/buildlog/record.py` — `test-phase-context` command, the test-phase record types, the sidecar in `PendingStep` and its cleanup
+- `scripts/buildlog/test_test_phase_peak.py` — window start, parallel peak, unknown cases, custom target folders, build-script negative, recovery after stops, width narrowed from 32 to 8
 - `scripts/lint/test_invoke_scope.py` — the shared sampler still writes `.max` and `.wave`
 
-**Workers:** 1 writer + 1 tester.
-- `impl2` — `invoke.sh`, `record.py`
-- `test2` — `test_test_phase_peak.py` (with its sidecar recovery fixtures) and the affected cases in `scripts/lint/test_invoke_scope.py`
+**Binds later work:** an unreadable test-phase sidecar is a third cause of a held pending step and uses the same `pending record <path>` error line. `record.py` imports `memory_admit` once at module load, so every module that imports `record` loads it too. `test_test_phase_peak.py` composes the `RecordRerunTests` fixtures. `test_phase_charge` stays null until admission records a test-phase entry charge.
 
-**State:** step records (new fields), the scope's peak/sample files
+**Gotchas:** only a sidecar that does not exist is absent; a read or validation error holds the step pending. `memory_admit` imports `record` back through `importlib` and must not use `record` attributes while it loads. invoke.sh runs the installed `~/.claude/scripts/buildlog/record.py`, so the live check (one filtered `verify.sh test` step gets `test_phase_peak_bytes`) runs only after the change lands on main; it is still open.
 
-**Depends on:** Phase 4b (both edit `scripts/buildlog/record.py`).
-
-**Constraints from prior phases:**
-- Phase 2: the index never rewrites a source log.
-- Phase 4b: a step row reaches the log only through `record.py`'s `PendingStep` record (`pending-steps/<row_key>.json`, the host's monthly file, `month_offset`, the `.done` replay proof, `store.append_line`). Put every new field and where it came from into `PendingStep` before the save starts, so a failed save keeps them and a rerun publishes the same row. The step sidecar is a named source like the held log and the peak file: only `_finish_step` deletes it, after the row is durable. An absent sidecar maps to a named absence type that records unknown, never 0.
-- `nextest_share_claim` (`scripts/lint/invoke.sh` near line 474) can narrow the width after admission through `memory_admit.set_width`, and the sampler starts after it. Record the width the tests ran with, never the requested width.
-
-**Acceptance gate:** the buildlog and `scripts/lint/test_invoke_scope.py` tests green; basedpyright 0/0/0. Live: one filtered `verify.sh test` step gets a `test_phase_peak_bytes` value, and the notice states the sampler's CPU cost per step.
+**Ruled out:** a matcher that needs a folder literally named `target` (misses `CARGO_TARGET_DIR`); a match on any `/deps/` ancestor (a build script under such a path opened the window); reading the sidecar at finish time (a transient read error published null); a second sampler or a change to admission's release API.
 
 ### Phase 4d — Recorder health covers both hosts  · status: todo
 
@@ -251,12 +236,16 @@ including the details to make it clear
 
 **Workers:** 1 writer + 1 tester.
 - `impl2` — `health.py`, `launches.py`, `report.py`, `sync.py`, `cli.py`
-- `test2` — `test_recorder_health.py`, `test_sync.py`, the affected health fixtures in `test_record_rerun.py`
+- `test2` — `test_recorder_health.py`, `test_sync.py`, the affected health fixtures in `test_record_rerun.py`; owns the shared buildlog gate lane (impl2 type-checks only its own files and hands the gate to test2)
 
 **State:** the per-machine health snapshot
 
 **Depends on:** Phase 4b (health line, sync allow-list).
 
-**Constraints from prior phases:** Phase 4b: sync pulls only the host folders `record.py` names, minus this host; `ci/` is pushed by natedev only. `.done` stays internal, a bounded replay proof. Cleanup of admission files already pulled from the Mac belongs to resources.
+**Constraints from prior phases:**
+- Phase 4b: sync pulls only the host folders `record.py` names, minus this host; `ci/` is pushed by natedev only. `.done` stays internal, a bounded replay proof. Cleanup of admission files already pulled from the Mac belongs to resources.
+- Phase 4c: an unreadable test-phase sidecar now also holds a step before its save. Its `pending-steps/<row_key>.json` carries `test_phase_read_error`, and each failed retry writes the same `pending record <path>` line to `errors.log`. The health model counts it like every other pending record, with no case of its own, and never reads the sidecar.
+- Phase 4c: `record.py` imports `scripts/lint/memory_admit.py` when it loads, so every module that imports `record` (`health.py`, and the Mac's snapshot write inside the ssh call) loads it too.
+- Phase 4c: `test_test_phase_peak.py` composes `test_record_rerun.RecordRerunTests` and its fixtures. A change to those health fixtures keeps that file green.
 
-**Acceptance gate:** the buildlog tests green; basedpyright 0/0/0. Live: after one `buildlog hourly` on natedev, with no report run on the Mac, natedev's report shows a Mac line for a recorder error written on the Mac for the test.
+**Acceptance gate:** the buildlog tests green; basedpyright 0/0/0. Live: after one `buildlog hourly` on natedev, with no report run on the Mac, natedev's report shows a Mac line for a recorder error written on the Mac for the test. The ssh call runs the Mac's installed `~/.claude` scripts, so the live check runs after the change lands on main and the Mac's `~/.claude` holds it.
