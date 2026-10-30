@@ -22,7 +22,7 @@ The showrunner's answer to the second question: Python, for one memory model and
 - 2026-10-30 11:31 EDT (load 61–80, 19 waiters): 3.5 check processes per second, at least 0.48 of a core.
 - A step can start up to 5 s plus one lock wait after memory frees.
 
-**What it costs.** About 37 h of worker time over 3 phases. One systemd user unit and socket on natedev. The Mac is not affected: it runs no memory admission.
+**What it costs.** About 37 h of worker time over 3 phases. One systemd system service (run as the user) and socket on natedev. The Mac is not affected: it runs no memory admission.
 
 **Down rule.** No build starts without an "admitted" answer from the service. The kernel holds the socket (socket activation), so a service restart is a short wait for the build, not an error. If the service cannot start, steps keep waiting, print why, and the user gets one alert. There is no second admission path.
 
@@ -69,7 +69,7 @@ The showrunner's answer to the second question: Python, for one memory model and
 
 **Persisted.** One file, `~/.local/state/buildlog/admission/state.json`. It is written with a temporary file and `os.replace` after each change to reservations, bump state or recovery. Waiters persist only their order fields (`since`, `bump_order`, `holds_younger`, `priority_since`), keyed by owner. A restarting waiter gets its place back. `anon_peaks.jsonl` and the build log rows do not change.
 
-**Start and restart.** A systemd user socket unit (`build-admission.socket`, `ListenStream=%t/build-admission.sock`) and its service (`build-admission.service`, `Restart=always`, `RestartSec=1`, `WatchdogSec=30`). The service sends `WATCHDOG=1` from its loop to `$NOTIFY_SOCKET`. It runs outside `builds.slice` with `OOMScoreAdjust=-900` and `CPUWeight=1000`, so earlyoom does not kill it and it answers under load.
+**Start and restart.** A systemd system socket unit (`build-admission.socket`, `ListenStream=/run/build-admission/build-admission.sock`; system units so `OOMScoreAdjust=-900` works, natedev 2026-10-30) and its service (`build-admission.service`, `Restart=always`, `RestartSec=1`, `WatchdogSec=30`). The service sends `WATCHDOG=1` from its loop to `$NOTIFY_SOCKET`. It runs outside `builds.slice` with `OOMScoreAdjust=-900` and `CPUWeight=1000`, so earlyoom does not kill it and it answers under load.
 - *Restart with running builds.* The new process reads `state.json`. For each reservation it checks the owner (pid and start time) and the scope (`cgroup.procs`), as `reservation_lifetime` does on resources-unit's branch today. Live rows keep their charge, and ended rows are finalized.
 - *Restart with waiting builds.* Their connections close. The client reconnects at once and sends its first request again with its original `since`. The service restores the waiter's order fields from `state.json`. Its place does not change.
 
