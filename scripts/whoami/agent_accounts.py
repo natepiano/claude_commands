@@ -366,8 +366,8 @@ UsageStoreWarning = UsageClaimFailed | UsageSaveFailed
 
 def usage_store_warning_line(warning: UsageStoreWarning) -> str:
     if isinstance(warning, UsageClaimFailed):
-        return "usage store: could not claim the read; read without a hold"
-    return "usage store: could not save the read; keep the live report"
+        return f"usage store: could not claim the read; {warning.reason}; read without a hold"
+    return f"usage store: could not save the read; {warning.reason}; keep the live report"
 
 
 @dataclass

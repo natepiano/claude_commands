@@ -270,6 +270,16 @@ raise SystemExit(1)
         sockets.assert_not_called()
         names.assert_not_called()
 
+    def test_an_unreadable_timer_conf_refuses_registry_discovery_beside_a_good_timer(self) -> None:
+        self.instance("showrunner-a-good", target="session:good-id", doc=self.doc)
+        self.instance("showrunner-z-bad", target="session:bad-id", doc=self.root / "bad-production.md")
+        conf = self.notifier / "showrunner-z-bad" / "conf"
+        conf.unlink()
+        conf.mkdir()
+        with self.assertRaises(IsADirectoryError) as raised:
+            _ = showrunners.registered_showrunners(self.notifier, known_sessions={})
+        self.assertIn(str(conf), str(raised.exception))
+
     def test_checked_doc_refuses_missing_check_line(self) -> None:
         directory = self.notifier / "showrunner-check"
         directory.mkdir()
