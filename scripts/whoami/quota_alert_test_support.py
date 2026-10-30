@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import registry_text, write_registry
+
 from scripts.whoami.note_file import note_name
 
 import io
@@ -43,36 +45,7 @@ from user_action import ActionRequired, UserAction, parse_user_action
 
 Notes = list[quota_alert.AgentNote]
 
-REGISTRY = """\
-[assignments]
-direct=codex
-cli=claude
-module_review=codex   # a trailing comment
-ask_a_friend=caller
-
-[direct.codex]
-impl=gpt-6-sol:high
-[direct.claude]
-impl=opus:high
-[cli.codex]
-commit_prep=gpt-6-sol:high
-[cli.claude]
-commit_prep=sonnet:high
-[module_review.codex]
-review=gpt-6-sol:xhigh
-[module_review.claude]
-review=opus:max
-[ask_a_friend.codex]
-consultation=gpt-6-sol:max
-[ask_a_friend.claude]
-consultation=opus:max
-
-[codex.agents]
-gpt-6-sol=low,medium,high,xhigh,max
-[claude.agents]
-opus=low,medium,high,xhigh,max
-sonnet=low,medium,high
-"""
+REGISTRY = registry_text({'assignments': {'direct': 'codex', 'cli': 'claude', 'module_review': 'codex   # a trailing comment', 'ask_a_friend': 'caller'}, 'direct.codex': {'impl': 'gpt-6-sol:high'}, 'direct.claude': {'impl': 'opus:high'}, 'cli.codex': {'commit_prep': 'gpt-6-sol:high'}, 'cli.claude': {'commit_prep': 'sonnet:high'}, 'module_review.codex': {'review': 'gpt-6-sol:xhigh'}, 'module_review.claude': {'review': 'opus:max'}, 'ask_a_friend.codex': {'consultation': 'gpt-6-sol:max'}, 'ask_a_friend.claude': {'consultation': 'opus:max'}, 'codex.agents': {'gpt-6-sol': 'low,medium,high,xhigh,max'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max', 'sonnet': 'low,medium,high'}})
 
 REAL_RECIPIENTS = quota_alert.recipients
 REAL_TELL_USER = quota_alert.tell_user
@@ -157,7 +130,7 @@ class QuotaReminderFixture(unittest.TestCase):
         _ = (self.root / "showrunners.json").write_text(json.dumps({
             "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": 5,
             "faults_to": "natedev", "always": ["natedev"]}))
-        _ = (self.root / "agents.conf").write_text(REGISTRY)
+        _ = write_registry((self.root / "agents.conf"), base_text=REGISTRY)
         (self.root / "catalog synced").touch()
 
     @staticmethod
@@ -383,7 +356,7 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
             "stall_minutes": 5, "faults_to": "director", "always": ["director"]}))
         registry = self.root / "agents.conf"
-        _ = registry.write_text(REGISTRY)
+        _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(mock.patch.object(quota_alert, "CONFIG", config))
         _ = self.enterContext(mock.patch.object(quota_alert, "REGISTRY", registry))
         _ = self.enterContext(mock.patch.object(quota_alert, "STATE", self.root / "alerts.json"))
