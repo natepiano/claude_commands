@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -204,6 +204,11 @@ MessageSendOutcome = (MessageDelivery | MessageAcknowledged | MessageWindowSkipp
                       | MessageKept | MessageReplaced | MessageUnconfirmed)
 
 
+def message_was_delivered(outcome: Mapping[str, object]) -> bool:
+    """Accept only a delivered send or the recipient's acknowledgement."""
+    return outcome["kind"] in {"sent", "acknowledged"}
+
+
 @dataclass(frozen=True)
 class SendSettleMessage:
     """The owner needs the shutdown request delivered."""
@@ -378,7 +383,7 @@ def send_message(
     key: str = "",
     repeat_minutes: int = 0,
 ) -> MessageSendOutcome:
-    """Send to a session; a repeat window requires the observed send outcome."""
+    """Send to a session and return the observed send outcome."""
     if recipient == "user":
         raise ValueError("user messages require alert_user")
     command = [
@@ -396,11 +401,7 @@ def send_message(
             command.extend(("--repeat-minutes", str(repeat_minutes)))
     if machine:
         command.extend(("--machine", machine))
-    outcome = _deliver_message(command, recipient, text)
-    # Calls without a repeat window retain their existing acceptance rule.
-    if not repeat_minutes and outcome["kind"] not in {"sent", "queued"}:
-        return MessageSent(kind="sent")
-    return outcome
+    return _deliver_message(command, recipient, text)
 
 
 def stopped_sessions_text(count: int) -> str:
@@ -412,7 +413,8 @@ def alert_user(push: RenderedPush, *, machine: str = "") -> bool:
     """Send a registry action through the shutdown alert path."""
     command = [*_send_command(), *user_send_argv(push, machine=machine)[2:]]
     try:
-        return _deliver_message(command, "user", "")["kind"] != "queued"
+        outcome = _deliver_message(command, "user", "")
+        return message_was_delivered(outcome) or outcome["kind"] in {"kept", "replaced"}
     except (OSError, RuntimeError) as error:
         print(f"shutdown: user alert failed: {error}", file=sys.stderr)
         return False
@@ -1245,15 +1247,16 @@ def _send_settle_message(saved: SessionShutdown) -> None:
     text = _settle_text(saved, session)
     delivery = send_message(f"session:{session['session_id']}", text.split("\n", 1)[0], text,
         key=f"shutdown-{saved['login']}-{session['session_id']}")
+    delivered = message_was_delivered(delivery)
     at = record_time()
     def save(current: SessionShutdown) -> None:
         if current["request_id"] != saved["request_id"] or current["progress"]["kind"] != "waiting":
             return
-        if current["settle_message"]["kind"] == "sent":
+        if delivered and current["settle_message"]["kind"] == "sent":
             current["reasked_at"] = at
             return
-        current["settle_message"] = ({"kind": "queued", "at": at, "reason": delivery["reason"]}
-                                    if delivery["kind"] == "queued" else {"kind": "sent", "at": at})
+        current["settle_message"] = ({"kind": "sent", "at": at} if delivered else
+                                    {"kind": "queued", "at": at, "reason": delivery.get("reason", "send not delivered")})
     _ = store.update_session(saved["login"], session["session_id"], save)
 
 
@@ -1941,7 +1944,7 @@ def send_showrunner_line(saved: SessionShutdown, told: str, showrunner: str, sum
                                saved["session"]["session_id"], *line_identity], ensure_ascii=True)
         key = "shutdown-unit-" + hashlib.sha256(identity.encode()).hexdigest()
         outcome = send_message(showrunner, offered["summary"], offered["text"], key=key, repeat_minutes=5_256_000)
-        if outcome["kind"] in {"sent", "acknowledged"}:
+        if message_was_delivered(outcome):
             return _complete_showrunner_send(current, store.ShowrunnerLineDelivered(
                 kind="delivered", line=told, text=offered["text"]))
         if outcome["kind"] == "queued":

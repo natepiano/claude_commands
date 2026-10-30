@@ -24,6 +24,7 @@ from unittest.mock import call, patch
 
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.production import showrunners
+from scripts.message import send as message_send
 from scripts.whoami import run_out
 import account
 import agent_accounts
@@ -96,7 +97,11 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.home / "pace.jsonl"))
         (self.home / ".claude").mkdir()
         (self.home / "notifier").mkdir()
-        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.home / "notifier"))
+        # Production scripts import the registry under both spellings, each with paths fixed at import.
+        for registry in (showrunners, import_module("showrunners")):
+            for field, value in (("NOTIFIER_STATE_DIR", self.home / "notifier"), ("SESSIONS_DIR", self.home / "sessions"),
+                                 ("SHOWRUNNER_STATE_DIR", self.home / "showrunner")):
+                _ = self.enterContext(patch.object(registry, field, value))
         _ = (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
         for label, login in (("claude1", SOURCE_LOGIN), ("claude2", "main@example.invalid"), ("claude3", TARGET_LOGIN)):
             self.assertEqual(accounts.setup(label), [])
@@ -3262,6 +3267,203 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(refusals.load()[refusals.key("claude", SOURCE_LOGIN)].window, refusals.UnknownWindow())
         self.assertEqual(len(self.commands), 1)
 
+    def test_wait_rerun_restores_its_journaled_move_and_continues_without_moving(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        _ = self.owner("interrupted-wait", host="ghostty")
+        _ = self.transcript("interrupted-wait", "You've hit your session limit")
+        reset = NOW + timedelta(minutes=19)
+        self.reading(SOURCE_LOGIN, 80, five=0, five_reset=reset)
+        set_transition = refusal_watch._set_transition  # pyright: ignore[reportPrivateUsage]
+
+        def stop_after_wait(state: refusal_watch.WatchState, session_id: str, entry_id: str,
+                            transition: refusal_watch.WatchTransition, move_id: str) -> None:
+            if transition == "waited":
+                raise Killed
+            set_transition(state, session_id, entry_id, transition, move_id)
+
+        with patch.object(refusal_watch, "_set_transition", side_effect=stop_after_wait):
+            with self.assertRaises(Killed):
+                _ = self.cli()
+        waited, = moves.read_moves()
+        self.assertEqual(waited["kind"], "waited")
+        self.assertEqual(self.commands, [])
+
+        code, _, error = self.cli()
+
+        self.assertEqual((code, error), (0, ""))
+        saved = refusal_watch._load_state()["sessions"]["interrupted-wait"]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((saved["entry_id"], saved["state"], saved["move_id"]),
+                         ("refusal-one", "waited", waited["move_id"]))
+        self.assertEqual(moves.read_moves(), [waited])
+        WatchTime.at = reset
+        with (patch.object(accounts, "pick", side_effect=AssertionError("waited session chose another account")),
+              patch.object(accounts, "move_sessions", side_effect=AssertionError("waited session moved")),
+              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery):
+            _, output, _ = self.cli()
+            _ = self.cli()
+        self.assertIn("continued on its current account", output)
+        delivery.assert_called_once_with("session:interrupted-wait", "Quota wait ended", "Continue where you stopped.",
+            key="quota-continue-interrupted-wait-refusal-one")
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["waited", "wait ended"])
+        self.assertEqual(entries[1]["move_id"], waited["move_id"])
+        self.assertEqual(self.commands, [])
+
+    def test_grouped_wait_rerun_continues_after_reset_without_preparing_a_refused_destination(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        path = self.groups()
+        _ = self.owner("interrupted-unit-wait", host="unit")
+        _ = self.transcript("interrupted-unit-wait", "You've hit your session limit")
+        reset = NOW + timedelta(minutes=19)
+        self.reading(SOURCE_LOGIN, 80, five=0, five_reset=reset)
+        set_transition = refusal_watch._set_transition  # pyright: ignore[reportPrivateUsage]
+
+        def stop_after_wait(state: refusal_watch.WatchState, session_id: str, entry_id: str,
+                            transition: refusal_watch.WatchTransition, move_id: str) -> None:
+            if transition == "waited":
+                raise Killed
+            set_transition(state, session_id, entry_id, transition, move_id)
+
+        with patch.object(refusal_watch, "_set_transition", side_effect=stop_after_wait):
+            with self.assertRaises(Killed):
+                _ = self.cli()
+        waited, = moves.read_moves()
+        self.assertEqual(waited["kind"], "waited")
+        saved = refusal_watch._load_state()["sessions"]["interrupted-unit-wait"]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((saved["entry_id"], saved["state"]), ("refusal-one", "retry"))
+
+        WatchTime.at = reset
+        with (patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused("fixture destination refused")) as prepared,
+              patch.object(accounts, "placement", wraps=accounts.placement) as placement,
+              patch.object(accounts, "pick", wraps=accounts.pick) as pick,
+              patch.object(accounts, "move_sessions", side_effect=AssertionError("wait moved")),
+              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery):
+            code, output, error = self.cli()
+            _ = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines(), ["owner interrupted-unit-wait: continued on its current account"])
+        delivery.assert_called_once_with("session:interrupted-unit-wait", "Quota wait ended", "Continue where you stopped.",
+            key="quota-continue-interrupted-unit-wait-refusal-one")
+        prepared.assert_not_called()
+        placement.assert_not_called()
+        pick.assert_not_called()
+        saved = refusal_watch._load_state()["sessions"]["interrupted-unit-wait"]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((saved["entry_id"], saved["state"], saved["move_id"]),
+                         ("refusal-one", "continued", waited["move_id"]))
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["waited", "wait ended"])
+        self.assertEqual(entries[1]["move_id"], waited["move_id"])
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertEqual(self.commands, [])
+
+    def test_grouped_no_room_wait_rerun_reuses_its_journal_and_continues_without_a_destination(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        path = self.groups()
+        _ = self.owner("no-room-wait", host="unit")
+        _ = self.transcript("no-room-wait", "You've hit your session limit")
+        reset = NOW + timedelta(minutes=30)
+        self.reading(SOURCE_LOGIN, 80, five=0, five_reset=reset)
+        for label in ("claude2", "claude3"):
+            identity = accounts.account_identity(accounts.account_dir(label))
+            assert isinstance(identity, agent_accounts.NumberedAccount)
+            refusals.write_refusal(refusals.AccountRefusal("claude", identity.login,
+                refusals.KnownWindow("weekly"), refusals.KnownReset(WEEKLY_RESET), NOW))
+        code, _, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        saved = refusal_watch._load_state()["sessions"]["no-room-wait"]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((saved["entry_id"], saved["state"]), ("refusal-one", "no room"))
+        no_room, = moves.read_moves()
+        self.assertEqual(no_room["kind"], "no room")
+        self.assertEqual(self.commands, [])
+
+        WatchTime.at = NOW + timedelta(minutes=11)
+        self.reading(SOURCE_LOGIN, 80, five=0, at=WatchTime.at, five_reset=reset)
+        set_transition = refusal_watch._set_transition  # pyright: ignore[reportPrivateUsage]
+
+        def stop_after_wait(state: refusal_watch.WatchState, session_id: str, entry_id: str,
+                            transition: refusal_watch.WatchTransition, move_id: str) -> None:
+            if transition == "waited":
+                raise Killed
+            set_transition(state, session_id, entry_id, transition, move_id)
+
+        with patch.object(refusal_watch, "_set_transition", side_effect=stop_after_wait):
+            with self.assertRaises(Killed):
+                _ = self.cli()
+        _, waited = moves.read_moves()
+        self.assertEqual(waited["kind"], "waited")
+        saved = refusal_watch._load_state()["sessions"]["no-room-wait"]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((saved["entry_id"], saved["state"]), ("refusal-one", "no room"))
+
+        with (patch.object(accounts, "prepared_account", return_value=accounts.AccountRefused("fixture destination refused")) as prepared,
+              patch.object(accounts, "placement", wraps=accounts.placement) as placement,
+              patch.object(accounts, "pick", wraps=accounts.pick) as pick,
+              patch.object(accounts, "move_sessions", side_effect=AssertionError("wait moved")),
+              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery):
+            code, _, error = self.cli()
+            self.assertEqual((code, error), (0, ""))
+            self.assertEqual(moves.read_moves(), [no_room, waited])
+            saved = refusal_watch._load_state()["sessions"]["no-room-wait"]  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual((saved["entry_id"], saved["state"], saved["move_id"]),
+                             ("refusal-one", "waited", waited["move_id"]))
+            delivery.assert_not_called()
+
+            WatchTime.at = reset
+            code, output, error = self.cli()
+            _ = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(output.splitlines(), ["owner no-room-wait: continued on its current account"])
+        delivery.assert_called_once_with("session:no-room-wait", "Quota wait ended", "Continue where you stopped.",
+            key="quota-continue-no-room-wait-refusal-one")
+        prepared.assert_not_called()
+        placement.assert_not_called()
+        pick.assert_not_called()
+        saved = refusal_watch._load_state()["sessions"]["no-room-wait"]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((saved["entry_id"], saved["state"], saved["move_id"]),
+                         ("refusal-one", "continued", waited["move_id"]))
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["no room", "waited", "wait ended"])
+        self.assertEqual(entries[-1]["move_id"], waited["move_id"])
+        self.assertEqual(stored_group_labels(path)["units"], "claude1")
+        self.assertEqual(self.commands, [])
+
+    def test_new_refusal_with_the_previous_wait_reset_moves_instead_of_continuing(self) -> None:
+        _ = self.owner("same-reset", host="ghostty")
+        _ = self.transcript("same-reset", "You've hit your session limit")
+        reset = NOW + timedelta(minutes=19)
+        self.reading(SOURCE_LOGIN, 80, five=0, five_reset=reset)
+        _ = self.cli()
+        waited, = moves.read_moves()
+        self.assertEqual(waited["kind"], "waited")
+        WatchTime.at = reset
+        with patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as first_delivery:
+            _ = self.cli()
+        first_delivery.assert_called_once_with("session:same-reset", "Quota wait ended", "Continue where you stopped.",
+            key="quota-continue-same-reset-refusal-one")
+
+        WatchTime.at = reset + timedelta(seconds=1)
+        self.reading(SOURCE_LOGIN, 80, five=0, at=WatchTime.at, five_reset=reset)
+        _ = self.transcript("same-reset", "You've hit your session limit", at=WatchTime.at, entry_id="refusal-two")
+        with (patch.object(accounts, "pick", wraps=accounts.pick) as pick,
+              patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as delivery):
+            code, output, error = self.cli()
+        self.assertEqual((code, error), (0, ""))
+        delivery.assert_not_called()
+        pick.assert_called_once()
+        self.assertNotIn("continued on its current account", output)
+        self.assertEqual(len(self.commands), 1)
+        saved = refusal_watch._load_state()["sessions"]["same-reset"]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((saved["entry_id"], saved["state"]), ("refusal-two", "requested"))
+        self.assertNotEqual(saved["move_id"], waited["move_id"])
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["waited", "wait ended", "requested"])
+        self.assertEqual(entries[-1]["move_id"], saved["move_id"])
+
     def test_waited_reset_continues_once_on_its_own_account_and_new_refusal_is_decided_fresh(self) -> None:
         _ = self.owner("refused", host="ghostty")
         _ = self.transcript("refused", "You've hit your session limit · resets 11:30pm (America/New_York)")
@@ -3290,6 +3492,35 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.transcript("refused", "weekly limit", at=reset, entry_id="later-refusal")
         _ = self.cli()
         self.assertEqual(len(self.commands), 1)
+
+    def test_expired_wait_retries_a_window_skip_until_the_continuation_is_acknowledged(self) -> None:
+        _ = self.owner("refused", host="ghostty")
+        _ = self.transcript("refused", "You've hit your session limit")
+        reset = NOW + timedelta(minutes=19)
+        self.reading(SOURCE_LOGIN, 80, five=0, five_reset=reset)
+        _ = self.cli()
+        waited = moves.read_moves()[0]
+        WatchTime.at = reset
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, "SKIPPED: inside the key window\n", "")) as first:
+            _, output, _ = self.cli()
+        self.assertEqual(output.splitlines(), ["owner refused: continuation not delivered: inside the key window"])
+        saved = refusal_watch._load_state()["sessions"]["refused"]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((saved["state"], saved["move_id"]), ("waited", waited["move_id"]))
+        acknowledged = message_send.acknowledged_skip_reason("quota-continue-refused-refusal-one", reset.isoformat())
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, f"SKIPPED: {acknowledged}\n", "")) as retry:
+            _, output, _ = self.cli()
+            _ = self.cli()
+        self.assertEqual(output.splitlines(), ["owner refused: continued on its current account"])
+        saved = refusal_watch._load_state()["sessions"]["refused"]  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((saved["state"], saved["move_id"]), ("continued", waited["move_id"]))
+        self.assertEqual((first.call_count, retry.call_count), (1, 1))
+        self.assertEqual(first.call_args.args, retry.call_args.args)
+        self.assertEqual(self.commands, [])
+        entries = moves.read_moves()
+        self.assertEqual([entry["kind"] for entry in entries], ["waited", "wait ended"])
+        self.assertEqual([entry["move_id"] for entry in entries], [waited["move_id"], waited["move_id"]])
 
     def test_expired_wait_retries_failed_continuation_without_moving_or_repeating_wait_end(self) -> None:
         _ = self.owner("refused", host="ghostty")
