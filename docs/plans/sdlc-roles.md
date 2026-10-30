@@ -326,6 +326,15 @@ For active process redesigns, as we are currently undergoing with promotions and
 **Files:**
 - `scripts/production/roles_audit.py`, `scripts/message/roster.py` and their tests
 
+### Phase 10d — The tab labels are back as they were  · status: done
+
+**Why:** Phase 6 changed herdr tab titles to `production · unit · job` (e.g. `sdlc · roles · unit director`). The user never approved a tab-name change. The first tab is the showrunner and every other tab is a unit director, so a tab needs no role word and no production (user, 2026-10-29).
+
+**Spec:**
+- Each herdr tab title is the session name again, exactly as at `~/.claude` main before 5adb23e8 (`5adb23e8^1`): the launchers (`add_unit.py`, `restart.py`) and the Stop hook (`herdr_tab_title.py`) give the tab the session name. `herdr.session_title` and its production/job join are gone.
+- A test pins the tab title of a showrunner, a unit director and a plain session to its session name.
+- `docs/as-built/herdr-adoption.md` says what is true after the revert.
+
 ### Phase 11 — The review pool and the transfer code are gone  · status: todo
 **Depends on:** Phase 10 merged to main (the showrunner says when), and Phase 12 (it renames the held design role names in the same files).
 
