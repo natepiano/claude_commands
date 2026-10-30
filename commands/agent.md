@@ -22,6 +22,8 @@ No arguments prints every function's active family and resolved rows (one `task=
 
 `/agent skills` prints the unique list of configured skills (one per line, no usage block) — relay it as-is.
 
+Family resolution and catalog sync read the cache through `scripts/lib/codex_models_cache.py`. Missing, empty or malformed files retry for two seconds, then report `the models cache could not be read` with the path. `no Codex model` means a complete cache lacks the requested model.
+
 ## Functions assigned `caller`
 
 `ask_a_friend` is assigned `caller` rather than a family: it runs on the family of the agent asking, because only a like-to-like pair can talk both ways. `/agent ask_a_friend` shows both row sets with `active=yes` on the family this session runs as, and its comment line reads `# current family: caller — the calling agent's family (claude here)`; render it as plain text like any other `#` line. `/agent ask_a_friend <family>` is rejected — there is no switch — and the error names the row edit to use instead; `/agent <family>` leaves it alone. Row edits work as for any function, and the `# updated …` line reads `— live whenever a <family> session runs ask_a_friend`.
