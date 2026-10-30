@@ -73,13 +73,43 @@ def record_path(session: str) -> Path:
     return RECORD_DIR / f"{session}.json"
 
 
+def _read_entries(session: str) -> dict[str, object]:
+    path = record_path(session)
+    try:
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return {}
+    except ValueError as error:
+        raise ValueError(f"{path}: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: pane records must be an object")
+    return cast(dict[str, object], value)
+
+
+def read_strict(session: str) -> dict[str, PaneLaunch]:
+    """Read validated launch evidence; only an absent file means there are no entries."""
+    entries = _read_entries(session)
+    for pane_id, value in entries.items():
+        location = f"{record_path(session)}: pane {pane_id}"
+        if not isinstance(value, dict):
+            raise ValueError(f"{location}: launch must be an object")
+        launch = cast(dict[str, object], value)
+        environment = launch.get("environment")
+        if (not isinstance(launch.get("session_id"), str)
+                or not isinstance(launch.get("written_at"), str)
+                or not isinstance(environment, dict)
+                or not all(isinstance(name, str) and isinstance(setting, str)
+                           for name, setting in cast(dict[object, object], environment).items())):
+            raise ValueError(f"{location}: expected session_id and written_at strings and a string environment")
+    return cast(dict[str, PaneLaunch], entries)
+
+
 def read(session: str) -> dict[str, PaneLaunch]:
     """The session's entries by pane id; an absent or unreadable file reads as none."""
     try:
-        value = cast(object, json.loads(record_path(session).read_text(encoding="utf-8")))
+        return cast(dict[str, PaneLaunch], _read_entries(session))
     except (OSError, ValueError):
         return {}
-    return cast(dict[str, PaneLaunch], value) if isinstance(value, dict) else {}
 
 
 @contextmanager
@@ -149,14 +179,26 @@ def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
     return list(parts.arguments), parts.environment
 
 
+def _process_stat(process: Path) -> list[str]:
+    return (process / "stat").read_text().rsplit(")", 1)[1].split()
+
+
 def process_parent(pid: int) -> int:
     """Read the OS parent; callers decide how unavailable evidence is handled."""
     if (os.environ.get("HERDR_PLATFORM") or sys.platform) == "darwin":
         result = subprocess.run([os.environ.get("HERDR_PS", "ps"), "-o", "ppid=", "-p", str(pid)],
                                 capture_output=True, text=True, check=True, timeout=5)
         return int(result.stdout)
-    stat = (Path(os.environ.get("HERDR_PROC") or PROC) / str(pid) / "stat").read_text()
-    return int(stat.rsplit(")", 1)[1].split()[1])
+    return int(_process_stat(Path(os.environ.get("HERDR_PROC") or PROC) / str(pid))[1])
+
+
+def pane_shell_pid(place: herdr.HerdrPlace) -> int:
+    info = herdr.json_object(herdr.Herdr(place.session).result(
+        "pane", "process-info", "--pane", place.pane).get("process_info"), "pane process info")
+    shell = info.get("shell_pid")
+    if isinstance(shell, bool) or not isinstance(shell, int) or shell <= 0:
+        raise ValueError("pane process info: expected a positive shell_pid")
+    return shell
 
 
 def _arguments(pid: int) -> list[str]:

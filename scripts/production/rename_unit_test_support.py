@@ -13,20 +13,23 @@ import subprocess
 import sys
 import tempfile
 import time
-import unittest
 from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, cast, override
+from typing import TYPE_CHECKING, ClassVar, Literal, cast, override
 from unittest import mock
 from scripts.herdr import fake_herdr
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production.rename_test_support import bind_staff_fixture
+from scripts.production.staff_test_support import StaffTestCase
+from scripts.production import staff
+from scripts.lib.atomic_file import write_text_atomic
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_showrunner
-import fake_unit_host
+from scripts.production import fake_unit_host
 import rename_unit
 import retire_unit
 import stall_watch
@@ -49,7 +52,7 @@ SLUG = "demo"
 TEST_HANG_GUARD_SECS = 300
 
 
-class UnitRenameFixture(unittest.TestCase):
+class UnitRenameFixture(StaffTestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -80,11 +83,13 @@ class UnitRenameFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         # Git worktrees and production docs embed absolute paths. Each independent
         # copy returns to the seed's original path, with its own refs and origin.
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
+        bind_staff_fixture(self, self.env, {SLUG: ("alpha-unit", "mul_add-unit")})
         # These modules also bind paths at import time; environment changes alone
         # do not isolate their journals, locks, or stall-watch state.
         for module, name, value in (
@@ -213,7 +218,7 @@ class UnitRenameFixture(unittest.TestCase):
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(content, encoding="utf-8")
+        write_text_atomic(path, content)
 
     def git(self, *arguments: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *arguments], cwd=cwd or self.checkout, env=self.env,
@@ -346,6 +351,8 @@ class UnitRenameFixture(unittest.TestCase):
             f"| alpha-unit | docs/plans/alpha.md | `{self.rust / 'claude-demo-alpha'}` | demo-alpha |",
             f"| names-unit | `{plan}` | `{worktree}` | demo-names |")
         self.write(self.doc, text)
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == SLUG)
+        _ = staff.ensure("unit", name="names", parent=parent.id)
         for directory in (self.checkout, worktree):
             self.write(directory / plan, "# Names\n\n> **Production:** demo (names-unit)\n"
                        + "> **Standing:** style_plan.py\n\nnames-unit history stays.\n")
@@ -367,34 +374,20 @@ class UnitRenameFixture(unittest.TestCase):
             )
         return worktree, plan, database
 
-    def seed_record(self, progress: str = "stopped", name: str = "alpha", host_session: str = "demo-alpha", *,
+    def seed_record(self, progress: Literal["waiting", "ready", "stopped"] = "stopped", name: str = "alpha", host_session: str = "demo-alpha", *,
                     unit: str = "alpha-unit", slug: str = SLUG) -> Path:
         """A stopped unit's shutdown record, as `shutdown.py down` leaves it."""
         old = self.rust / "claude-demo-alpha"
-        session: dict[str, object] = {
-            "session_id": "sid-alpha", "config_dir": str(self.home / ".claude"), "pid": 4242, "proc_start": "1",
-            "name": name, "cwd": f"{old}/sub", "status": "idle", "updated_at": 0, "probe": False,
-            "model": {"kind": "no reply yet"},
-            "checkout": {"kind": "git", "path": str(old), "head": {"kind": "branch", "name": "demo-alpha"},
-                         "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []},
-            "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
-            "host": {"kind": "unit", "production": slug, "unit": unit, "doc": str(self.doc),
-                     "session_name": host_session, "session_host": "herdr",
-                     "plan": {"kind": "plan", "path": f"{old}/docs/plans/alpha.md"}}}
-        saved: dict[str, object] = {
-            "login": "owner@example.com", "label": "claude2", "machine": "natedev",
-            "requested_at": "2026-10-09T21:49:10+00:00", "request_id": "request",
-            "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
-            "alerts": "none", "probe": False, "session": session, "workers": [], "timers": [],
-            "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
-            "progress": {"kind": progress, "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": [],
-            "codex_seats": [{"run_dir": str(self.root / "runs/r1"), "seat": "impl", "role": "impl",
-                             "thread_id": "thread-impl", "turn_live": True, "launcher_command": [
-                                 "bash", "/scripts/direct/implement.sh", "--to", "impl", str(self.root / "runs/r1"),
-                                 str(old), "/runs/r1/prompt.md", "impl", "task", "impl", "working", "0", "impl"]}]}
+        saved = fake_unit_host.stopped_record(self.home / ".claude", old,
+            name=name, cwd=old / "sub", production=slug, unit=unit, doc=self.doc,
+            host_session=host_session, branch="demo-alpha", plan=old / "docs/plans/alpha.md", progress=progress)
+        saved["codex_seats"] = [{"run_dir": str(self.root / "runs/r1"), "seat": "impl", "role": "impl",
+                                 "thread_id": "thread-impl", "turn_live": True, "launcher_command": [
+                                     "bash", "/scripts/direct/implement.sh", "--to", "impl", str(self.root / "runs/r1"),
+                                     str(old), "/runs/r1/prompt.md", "impl", "task", "impl", "working", "0", "impl"]}]
         self.write(self.root / "runs/r1/impl.resume-prompt.md", "Continue the task you were on.\n")
         with mock.patch.dict(os.environ, self.env):
-            self.assertTrue(shutdown_record.create_session(cast(shutdown_record.SessionShutdown, cast(object, saved))))
+            self.assertTrue(shutdown_record.create_session(saved))
         log = self.root / "shutdown-calls.jsonl"
         stub = self.root / "fake_shutdown.py"
         self.write(stub, "import json, os, sys\nwith open(os.environ['RENAME_UNIT_SHUTDOWN_LOG'], 'a') as log:\n"
@@ -417,7 +410,7 @@ class UnitRenameFixture(unittest.TestCase):
         self.addCleanup(held.close)
         fake_unit_host.write(self.env, [fake_unit_host.HostedUnit(
             f"demo-{unit}", "w1:p1", {"SHOWRUNNER_UNIT": SLUG, "SHOWRUNNER_UNIT_ID": unit}, label=name)])
-        fake_unit_host.place_process(self.env, os.getpid(), "w1:p1")
+        fake_unit_host.place_process(self.env, os.getpid(), "w1:p1", exec_shell=True)
 
         def end() -> None:
             held.close()

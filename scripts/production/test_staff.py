@@ -1,41 +1,29 @@
 """Exercise the staff contract with isolated state and an actual fake SSH process."""
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import multiprocessing
 import os
-import shlex
 import stat
 import subprocess
 import sys
-import tempfile
 import unittest
 from collections.abc import Callable
-from contextlib import AbstractContextManager, redirect_stderr
+from contextlib import redirect_stderr
 from dataclasses import FrozenInstanceError, replace
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Barrier
-from pathlib import Path
-from typing import cast, override
+from typing import cast
 from unittest import mock
 
 from scripts.production import staff
+from scripts.production.staff_test_support import CHECKOUT, PROCESS_TIMEOUT, STAFF_SCRIPT, StaffTestCase
 
 
-CHECKOUT = Path(__file__).resolve().parents[2]
-STAFF_SCRIPT = Path(__file__).with_name("staff.py")
 MISSING_ID = staff.StaffId("s00000000000")
-PROCESS_TIMEOUT = 30
-
-# subprocesses must exercise owner behavior even when this suite runs on the Mac.
-OWNER_CLI = """import os, runpy, sys
-sys.platform = os.environ.get('STAFF_TEST_PLATFORM', 'linux')
-script = sys.argv.pop(1)
-sys.argv[0] = script
-runpy.run_path(script, run_name='__main__')
-"""
 
 KILLED_WRITER = """import os, sys
 sys.platform = 'linux'
@@ -44,33 +32,6 @@ os.replace = lambda *args, **kwargs: os._exit(73)
 staff.ensure('showrunner', name='interrupted')
 """
 
-# Execute the real CLI against a different temp file: this is the owner, not a
-# canned response, so remote reads, writes, and error mapping must all agree.
-FAKE_SSH = """import json, os, runpy, shlex, sys
-from pathlib import Path
-arguments = sys.argv[1:]
-with open(os.environ['STAFF_TEST_SSH_LOG'], 'a') as log:
-    log.write(json.dumps(arguments) + '\\n')
-if os.environ.get('STAFF_TEST_SSH_FAIL'):
-    reason = os.environ.get('STAFF_TEST_SSH_REASON', 'ssh: connection refused')
-    if reason:
-        print(reason, file=sys.stderr)
-    raise SystemExit(int(os.environ.get('STAFF_TEST_SSH_EXIT', '255')))
-if len(arguments) < 6 or arguments[:5] != ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'natedev']:
-    raise SystemExit('unexpected SSH target or options')
-command = arguments[5:]
-if len(command) == 1:
-    command = shlex.split(command[0])
-if command[:2] != ['~/.claude/scripts/lib/py', '~/.claude/scripts/production/staff.py']:
-    raise SystemExit('unexpected remote Python or staff script')
-if '--json' not in command[2:]:
-    raise SystemExit('remote staff call requires --json')
-os.environ['STAFF_FILE'] = os.environ['STAFF_TEST_OWNER_FILE']
-sys.platform = 'linux'
-sys.path.insert(0, os.environ['STAFF_TEST_CHECKOUT'])
-sys.argv = [os.environ['STAFF_TEST_SCRIPT'], *command[2:]]
-runpy.run_path(sys.argv[0], run_name='__main__')
-"""
 
 
 def concurrent_ensure(
@@ -90,57 +51,7 @@ def concurrent_ensure(
             result.send((False, repr(error)))
 
 
-class StaffTests(unittest.TestCase):
-    root: Path = Path()
-    staff_file: Path = Path()
-    ssh_log: Path = Path()
-
-    @override
-    def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.staff_file = self.root / "owner" / "staff.json"
-        self.ssh_log = self.root / "ssh.jsonl"
-        binaries = self.root / "bin"
-        binaries.mkdir()
-        ssh = binaries / "ssh"
-        _ = ssh.write_text(f"#!{sys.executable}\n{FAKE_SSH}", encoding="utf-8")
-        ssh.chmod(0o755)
-        _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
-            "STAFF_FILE": str(self.staff_file),
-            "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
-            "STAFF_TEST_SSH_LOG": str(self.ssh_log),
-            "STAFF_TEST_OWNER_FILE": str(self.staff_file),
-            "STAFF_TEST_CHECKOUT": str(CHECKOUT),
-            "STAFF_TEST_SCRIPT": str(STAFF_SCRIPT),
-            "STAFF_TEST_SSH_FAIL": "",
-            "STAFF_TEST_SSH_EXIT": "255",
-            "STAFF_TEST_SSH_REASON": "ssh: connection refused",
-            "STAFF_TEST_PLATFORM": "linux",
-            "PYTHONDONTWRITEBYTECODE": "1",
-        })))
-        _ = self.enterContext(mock.patch("scripts.production.staff.remote.other_machine", return_value="mac"))
-
-    def tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow]:
-        showrunner = staff.ensure("showrunner", name="sdlc")
-        unit = staff.ensure("unit", name="models", parent=showrunner.id)
-        worker = staff.ensure("worker", name="impl1", parent=unit.id)
-        return showrunner, unit, worker
-
-    def cli(self, *arguments: str, code: int = 0) -> subprocess.CompletedProcess[str]:
-        completed = subprocess.run(
-            [sys.executable, "-c", OWNER_CLI, str(STAFF_SCRIPT), *arguments],
-            cwd=CHECKOUT, capture_output=True, text=True, check=False,
-            timeout=PROCESS_TIMEOUT,
-        )
-        self.assertEqual(completed.returncode, code, completed.stderr)
-        return completed
-
-    def write_document(self, document: object) -> bytes:
-        self.staff_file.parent.mkdir(parents=True, exist_ok=True)
-        content = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
-        _ = self.staff_file.write_bytes(content)
-        return content
-
+class StaffTests(StaffTestCase):
     def assert_refused(self, action: Callable[[], object]) -> None:
         before = self.staff_file.read_bytes()
         with self.assertRaises(staff.StaffRefused):
@@ -195,17 +106,6 @@ class StaffTests(unittest.TestCase):
                 process.close()
             for result in results:
                 result.close()
-
-    def ssh_commands(self) -> list[list[str]]:
-        commands: list[list[str]] = []
-        for line in self.ssh_log.read_text().splitlines():
-            arguments = cast(list[str], json.loads(line))
-            self.assertEqual(arguments[:5], ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "natedev"])
-            command = shlex.split(arguments[5]) if len(arguments) == 6 else arguments[5:]
-            self.assertEqual(command[:2], ["~/.claude/scripts/lib/py", "~/.claude/scripts/production/staff.py"])
-            self.assertIn("--json", command[2:])
-            commands.append(command[2:])
-        return commands
 
     def test_worker_names_preserve_role_and_positive_number(self) -> None:
         for role in ("impl", "test", "fix", "review", "designer", "reviewer"):
@@ -585,9 +485,8 @@ class StaffTests(unittest.TestCase):
         )
         owner_results = [read() for read in reads]
         self.assertCountEqual(staff.find(), [staff.StaffRow.from_json(row) for row in cast(list[object], json.loads(owner_show.stdout))])
-        local_file = self.root / "mac" / "staff.json"
-        with mock.patch.dict(os.environ, {"STAFF_FILE": str(local_file), "STAFF_TEST_PLATFORM": "darwin"}), \
-                mock.patch("scripts.production.staff.remote.other_machine", return_value="natedev"):
+        local_file = self.mac_file
+        with self.machine("mac"):
             for read, expected in zip(reads, owner_results):
                 with self.subTest(read=read):
                     self.assertEqual(read(), expected)
@@ -601,14 +500,14 @@ class StaffTests(unittest.TestCase):
         self.assertFalse(local_file.parent.exists())
         self.assertEqual(staff.by_path("sdlc/registry/impl1"), worker)
         commands = self.ssh_commands()
-        self.assertEqual(commands[:len(reads) + 1], [["show", "--json"]] * (len(reads) + 1))
+        self.assertEqual(commands[:len(reads) + 1],
+                         [["show", "--snapshot", "--json"]] * len(reads) + [["show", "--json"]])
         self.assertEqual([command[0] for command in commands[len(reads) + 1:]], ["ensure", "rename", "move", "retire", "show"])
 
     def test_mac_preserves_names_that_begin_with_a_dash(self) -> None:
         expected = staff.ensure("showrunner", name="-scratch")
-        local_file = self.root / "mac" / "staff.json"
-        with mock.patch.dict(os.environ, {"STAFF_FILE": str(local_file)}), \
-                mock.patch("scripts.production.staff.remote.other_machine", return_value="natedev"):
+        local_file = self.mac_file
+        with self.machine("mac"):
             self.assertEqual(staff.ensure("showrunner", name="-scratch"), expected)
             renamed = staff.rename(expected.id, "-renamed")
         self.assertEqual(renamed, staff.rename(expected.id, "-renamed"))
@@ -619,17 +518,16 @@ class StaffTests(unittest.TestCase):
 
     def test_owner_selection_uses_the_shared_remote_module(self) -> None:
         showrunner, _, _ = self.tree()
-        local_file = self.root / "mac" / "staff.json"
-        with mock.patch.dict(os.environ, {"STAFF_FILE": str(local_file)}), \
-                mock.patch("scripts.shutdown.remote.other_machine", return_value="natedev"):
+        local_file = self.mac_file
+        with self.machine("mac"):
             self.assertEqual(staff.by_id(showrunner.id), showrunner)
         self.assertFalse(local_file.parent.exists())
-        self.assertEqual(self.ssh_commands(), [["show", "--json"]])
+        self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"]])
 
     def test_remote_errors_keep_application_reasons_and_identify_ssh_failures(self) -> None:
         _ = self.tree()
         before = self.staff_file.read_bytes()
-        local_file = self.root / "mac" / "staff.json"
+        local_file = self.mac_file
         cases = (
             (2, "usage: staff.py: invalid option", "usage: staff.py: invalid option"),
             (1, "remote interpreter failed", "remote interpreter failed"),
@@ -637,7 +535,7 @@ class StaffTests(unittest.TestCase):
             (255, "ssh: connection refused", "natedev not reached"),
             (2, "", "natedev not reached"),
         )
-        with mock.patch("scripts.production.staff.remote.other_machine", return_value="natedev"):
+        with self.machine("mac"):
             for code, reason, expected in cases:
                 with self.subTest(code=code, reason=reason), mock.patch.dict(os.environ, {
                     "STAFF_FILE": str(local_file), "STAFF_TEST_SSH_FAIL": "1",
@@ -652,9 +550,8 @@ class StaffTests(unittest.TestCase):
     def test_unreachable_owner_raises_unreadable_and_writes_nothing_locally(self) -> None:
         _ = self.tree()
         before = self.staff_file.read_bytes()
-        local_file = self.root / "mac" / "staff.json"
-        with mock.patch.dict(os.environ, {"STAFF_FILE": str(local_file), "STAFF_TEST_SSH_FAIL": "1"}), \
-                mock.patch("scripts.production.staff.remote.other_machine", return_value="natedev"):
+        local_file = self.mac_file
+        with self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}):
             actions: tuple[Callable[[], object], ...] = (
                 lambda: staff.by_id(MISSING_ID), lambda: staff.by_path("sdlc"), staff.find,
                 lambda: staff.ensure("showrunner", name="blocked"),
@@ -665,6 +562,192 @@ class StaffTests(unittest.TestCase):
         self.assertFalse(local_file.parent.exists())
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertEqual([command[0] for command in self.ssh_commands()], ["show", "show", "show", "ensure"])
+
+    def test_mac_snapshot_reads_once_and_all_lookups_use_its_rows(self) -> None:
+        showrunner, unit, worker = self.tree()
+        expected = (staff.by_id(worker.id), staff.by_path("sdlc/models/impl1"), staff.find(kind="unit", parent=showrunner.id))
+        with self.machine("mac"):
+            record = staff.snapshot()
+            self.assertEqual(record.by_id(worker.id), expected[0])
+            self.assertEqual(record.by_path("sdlc/models/impl1"), expected[1])
+            self.assertEqual(record.find(kind="unit", parent=showrunner.id), expected[2])
+            self.assertIsNone(record.by_id(MISSING_ID))
+            self.assertIsNone(record.by_path("sdlc/missing"))
+            self.assertEqual(record.find(kind="worker", parent=unit.id), [worker])
+            self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"]])
+            self.assertFalse(self.mac_file.exists())
+        _ = staff.rename(unit.id, "panes")
+        self.assertEqual(record.by_path("sdlc/models"), unit)
+        self.assertIsNone(record.by_path("sdlc/panes"))
+        self.assertIsNotNone(staff.snapshot().by_path("sdlc/panes"))
+        with self.assertRaises(FrozenInstanceError):
+            setattr(record, "rows", ())
+
+    def test_mac_snapshot_refuses_an_unreachable_owner(self) -> None:
+        _ = self.tree()
+        before = self.staff_file.read_bytes()
+        with self.machine("mac"), mock.patch.dict(os.environ, {"STAFF_TEST_SSH_FAIL": "1"}):
+            with self.assertRaisesRegex(staff.StaffUnreadable, "^natedev not reached$"):
+                _ = staff.snapshot()
+        self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"]])
+        self.assertFalse(self.mac_file.exists())
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_get_renders_the_same_complete_path_and_columns_as_show(self) -> None:
+        showrunner, unit, worker = self.tree()
+        attached = staff.ensure("showrunner", name="style", parent=showrunner.id)
+        lines = {line.split()[0]: line for line in self.cli("show").stdout.splitlines()}
+        for row, path in ((unit, "sdlc/models"), (worker, "sdlc/models/impl1"), (attached, "style")):
+            with self.subTest(path=path):
+                self.assertEqual(self.cli("get", path).stdout.rstrip("\n"), lines[row.id])
+                self.assertEqual(lines[row.id].split()[2], path)
+
+    def test_mac_write_waits_for_owner_operation_lock(self) -> None:
+        _, unit, _ = self.tree()
+        destination = staff.ensure("showrunner", name="other")
+        lock = self.staff_file.parent / "operation.lock"
+        with self.lock_notice(lock) as listener:
+            with staff.operation():
+                with self.machine("mac"):
+                    pending = self.start_script(STAFF_SCRIPT, "move", unit.id, f"--parent={destination.id}", "--json")
+                    self.assert_operation_blocks(pending, listener)
+                self.assertEqual(staff.by_id(unit.id), unit)
+            output, errors = pending.communicate(timeout=PROCESS_TIMEOUT)
+        self.assertEqual(pending.returncode, 0, errors)
+        self.assertEqual(cast(object, json.loads(output)), replace(unit, parent=destination.id).to_json())
+        self.assertEqual(staff.by_id(unit.id), replace(unit, parent=destination.id))
+        self.assertFalse(self.mac_file.exists())
+
+    def test_operation_preserves_body_errors_and_releases_the_lock(self) -> None:
+        failure = OSError("source update failed")
+        with self.assertRaises(OSError) as raised:
+            with staff.operation():
+                raise failure
+        self.assertIs(raised.exception, failure)
+        with staff.operation():
+            row = staff.ensure("showrunner", name="after-failure")
+        self.assertEqual(staff.by_id(row.id), row)
+
+    def test_operation_lock_errors_have_the_staff_unreadable_type(self) -> None:
+        with mock.patch.object(fcntl, "flock", side_effect=OSError("lock failed")):
+            with self.assertRaisesRegex(staff.StaffUnreadable, "staff operation: lock failed"):
+                with staff.operation():
+                    self.fail("entered an operation without acquiring its lock")
+
+    def test_absent_records_have_the_same_typed_signal_on_owner_and_mac(self) -> None:
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine), self.machine(machine):
+                with self.assertRaises(staff.StaffAbsent):
+                    _ = staff.snapshot()
+        self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"]])
+        self.assertFalse(self.staff_file.exists())
+        self.assertFalse(self.mac_file.exists())
+
+    def test_operation_joins_inherited_descriptor_and_keeps_the_outer_lock(self) -> None:
+        with staff.operation():
+            with staff.operation():
+                _ = staff.ensure("showrunner", name="outer")
+            child = subprocess.run([sys.executable, "-c",
+                "from scripts.production import staff; " +
+                "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='child')\")"],
+                cwd=CHECKOUT, pass_fds=staff.operation_fds(), capture_output=True,
+                text=True, timeout=PROCESS_TIMEOUT, check=False)
+            self.assertEqual(child.returncode, 0, child.stderr)
+            with self.lock_notice(self.staff_file.parent / "operation.lock") as listener:
+                seed = self.start_script(STAFF_SCRIPT, "ensure", "showrunner", "--name=after")
+                self.assert_operation_blocks(seed, listener)
+        output, errors = seed.communicate(timeout=PROCESS_TIMEOUT)
+        self.assertEqual(seed.returncode, 0, output + errors)
+        self.assertEqual({row.name for row in staff.snapshot().rows}, {"outer", "child", "after"})
+
+    def test_operation_joins_a_valid_inherited_lock_after_its_owner_exits(self) -> None:
+        path = self.staff_file.parent / "operation.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as inherited:
+            exited = subprocess.Popen([sys.executable, "-c",
+                "import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)", str(inherited.fileno())],
+                pass_fds=(inherited.fileno(),))
+            self.assertEqual(exited.wait(timeout=PROCESS_TIMEOUT), 0)
+            environment = {**os.environ, "STAFF_OPERATION_FD": str(inherited.fileno())}
+            child = subprocess.run([sys.executable, "-c",
+                "from scripts.production import staff; " +
+                "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='orphan')\")"],
+                cwd=CHECKOUT, env=environment, pass_fds=(inherited.fileno(),), capture_output=True,
+                text=True, timeout=3, check=False)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual([row.name for row in staff.find()], ["orphan"])
+
+    def test_seed_result_preserves_pending_retirement_on_owner_and_mac(self) -> None:
+        runner, unit, _worker = self.tree()
+        staff.defer_retire((runner.id, unit.id))
+        before = self.staff_file.read_bytes()
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine), self.machine(machine):
+                result = staff.apply_seed(staff.SeedInput(()))
+                self.assertEqual(result.pending_retire, tuple(sorted((runner.id, unit.id))))
+                self.assertEqual(result, staff.snapshot())
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def assert_invalid_operation_descriptor_blocks(self, wrong_file: bool) -> None:
+        with staff.operation():
+            path = self.root / "wrong-lock" if wrong_file else self.staff_file.parent / "operation.lock"
+            with path.open("a") as unlocked, self.lock_notice(self.staff_file.parent / "operation.lock") as listener:
+                environment = {**os.environ, "STAFF_OPERATION_FD": str(unlocked.fileno())}
+                program = (
+                    "from scripts.production.staff_test_support import observe_operation_lock; "
+                    "observe_operation_lock(); from scripts.production import staff; "
+                    "exec(\"with staff.operation():\\n staff.ensure('showrunner', name='fallback')\")")
+                child = subprocess.Popen([sys.executable, "-c", program], cwd=CHECKOUT,
+                    env=environment, pass_fds=(unlocked.fileno(),), stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True)
+                self.assert_operation_blocks(child, listener)
+        output, errors = child.communicate(timeout=PROCESS_TIMEOUT)
+        self.assertEqual(child.returncode, 0, output + errors)
+        self.assertEqual(len(staff.find(kind="showrunner")), 1)
+
+    def test_operation_rejects_an_inherited_descriptor_for_another_file(self) -> None:
+        self.assert_invalid_operation_descriptor_blocks(True)
+
+    def test_operation_rejects_an_unlocked_inherited_descriptor(self) -> None:
+        self.assert_invalid_operation_descriptor_blocks(False)
+
+    def test_pending_retirement_waits_for_workers_then_retires_units_before_showrunners(self) -> None:
+        runner, unit, worker = self.tree()
+        child = staff.ensure("showrunner", name="child", parent=runner.id)
+        staff.defer_retire((runner.id, unit.id))
+        original = self.staff_file.read_bytes()
+        staff.defer_retire((unit.id, runner.id))
+        self.assertEqual(self.staff_file.read_bytes(), original)
+        self.assertEqual(staff.retire_pending(), tuple(sorted((runner.id, unit.id))))
+        self.assertEqual(self.staff_file.read_bytes(), original)
+        _ = staff.rename(unit.id, "panes")
+        self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, unit.id))))
+        _ = staff.retire(worker.id)
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertIsNone(staff.by_id(unit.id))
+        self.assertIsNone(staff.by_id(runner.id))
+        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        completed = self.staff_file.read_bytes()
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertEqual(self.staff_file.read_bytes(), completed)
+
+    def test_pending_retirement_round_trips_over_mac_transport(self) -> None:
+        runner, unit, worker = self.tree()
+        with self.machine("mac"):
+            staff.defer_retire((runner.id, unit.id))
+            self.assertEqual(staff.snapshot().pending_retire, tuple(sorted((runner.id, unit.id))))
+            self.assertEqual(staff.retire_pending(), tuple(sorted((runner.id, unit.id))))
+            _ = staff.retire(worker.id)
+            self.assertEqual(staff.retire_pending(), ())
+        self.assertFalse(self.mac_file.exists())
+        self.assertEqual(staff.snapshot().rows, ())
+
+    def test_pending_retirement_drops_ids_already_retired(self) -> None:
+        runner = staff.ensure("showrunner", name="gone")
+        staff.defer_retire((runner.id,))
+        _ = staff.retire(runner.id)
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertEqual(staff.snapshot().pending_retire, ())
 
 
 if __name__ == "__main__":

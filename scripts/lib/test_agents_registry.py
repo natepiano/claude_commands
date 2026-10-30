@@ -61,9 +61,9 @@ def registry_text(overrides: RegistryOverrides = NO_OVERRIDES, *,
 def write_registry(path: Path, overrides: RegistryOverrides = NO_OVERRIDES, *,
                    replace_sections: Sequence[str] = (), update: bool = False, base_text: str = "",
                    bare_rows: Sequence[str] = ()) -> Path:
-    """Write a fixture registry, refusing the user's real registry or overlay."""
+    """Write a fixture registry, refusing the user's real agents.conf."""
     real_config = (Path(pwd.getpwuid(os.getuid()).pw_dir) / ".claude/config").resolve()
-    if path.resolve() in (real_config / "agents.conf", real_config / "agents.local.conf"):
+    if path.resolve() == real_config / "agents.conf":
         raise AssertionError(f"test registry must be temporary: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     base_text = path.read_text(encoding="utf-8") if update and path.exists() else base_text
