@@ -195,8 +195,8 @@ def main_changes(ledger: style_ledger.Ledger, branch_point: str, tip: str) -> Ma
         else:
             return UnknownMainChanges("synced tip is not an ancestor of main")
         changes = subprocess.run(
-            ["git", "-C", str(repo), "-c", "diff.renameLimit=0", "log", "--format=", "--name-status", "-z",
-             "--no-ext-diff", "--no-textconv", "--no-relative", "-M", "-C", "--find-copies-harder",
+            ["git", "-C", str(repo), "log", "--format=", "--name-status", "-z",
+             "--no-ext-diff", "--no-textconv", "--no-relative", "--no-renames",
              "--diff-merges=first-parent", f"{tip}..{main}", "--"],
             capture_output=True, check=False,
         )
