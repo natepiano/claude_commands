@@ -38,6 +38,7 @@ from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
+TREE_CHANGED_STATUS = 77
 
 
 class ValidateAndPush(NamedTuple):
@@ -714,6 +715,12 @@ def only_tests(command: list[str], names: frozenset[str]) -> list[str]:
     return [*command, *(word for name in sorted(names) for word in ("-E", f"test(={name})"))]
 
 
+def stop_cancelled_test(name: str, result: subprocess.CompletedProcess[str], log: Path) -> None:
+    if result.returncode == TREE_CHANGED_STATUS:
+        raise Stop("test", "cancelled", f"{name} cancelled because the tree changed; log {log}",
+                   f"resubmit this checkpoint after your edits are done; test log: {log}")
+
+
 def checkpoint_tests(production: Production, paths: tuple[str, ...], checkpoint: str,
                      merge_tests: tuple[tuple[str, ...], ...], flakes: frozenset[str], scratch: Path,
                      merge_head: str, flaky_tests: frozenset[str]) -> str:
@@ -727,9 +734,9 @@ def checkpoint_tests(production: Production, paths: tuple[str, ...], checkpoint:
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{name.replace(' ', '_')}_EXIT={result.returncode}\n")
             output.flush()
+            stop_cancelled_test(name, result, log)
             if not test_passed(command, result):
                 failed.append((name, command, failed_tests(result.stdout + result.stderr)))
-    report("test", "ok", f"{len(steps)} commands ran; {len(failed)} red; log {log}")
     unresolved: list[str] = []
     for name, command, tests in failed:
         # Only known flaky tests failed: rerun those alone, not the whole command.
@@ -738,6 +745,7 @@ def checkpoint_tests(production: Production, paths: tuple[str, ...], checkpoint:
             result = run_test_command(only_tests(command, tests) if alone else command, production.checkout)
             _ = output.write(result.stdout + result.stderr)
             _ = output.write(f"{name.replace(' ', '_')}_RERUN_EXIT={result.returncode}\n")
+        stop_cancelled_test(name, result, log)
         package = name.removeprefix("package ")
         if test_passed(command, result) and (alone or package in flakes):
             note = (f"known flaky tests {', '.join(sorted(tests))}: red in {name}, green alone" if alone
@@ -747,6 +755,7 @@ def checkpoint_tests(production: Production, paths: tuple[str, ...], checkpoint:
                 _ = ledger.write(f"- {datetime.now(production.zone):%H:%M %Z}: {note}\n")
         else:
             unresolved.append(name)
+    report("test", "ok", f"{len(steps)} commands ran; {len(failed)} red; log {log}")
     if unresolved:
         undo_unpushed_merge(production, merge_head)
         raise Stop("red", "failed", f"{', '.join(unresolved)} failed; log {log}",
@@ -1132,7 +1141,7 @@ def run(request: MergeRequest) -> int:
     except Stop as error:
         report(error.step, error.state, error.detail.replace("\n", "; "))
         print(f"send {request.unit.name}: {error.message}")
-        return 1
+        return TREE_CHANGED_STATUS if error.state == "cancelled" else 1
     except (OSError, ValueError) as error:
         report("run", "failed", str(error).replace("\n", "; "))
         print(f"send {request.unit.name}: the showrunner will inspect the failed command")
@@ -1293,6 +1302,12 @@ def finish_handoff(request: ChildHandoffRequest, merge_head: str) -> None:
         acknowledge_handoff(request, merge_head)
 
 
+def handoff_tests_pending_path(checkout: Path, checkpoint: str) -> Path:
+    """Keep untested handoffs across cancelled runs, scratch cleanup, and new sessions."""
+    path = good(git(checkout, "rev-parse", "--git-path", f"checkpoint-tests-pending/{checkpoint}"), "test")
+    return checkout / path
+
+
 def run_handoff(request: ChildHandoffRequest) -> int:
     checkout, branch, checkpoint = request.production.checkout, request.production.merge_branch, request.checkpoint
     delivery = request.delivery
@@ -1310,12 +1325,21 @@ def run_handoff(request: ChildHandoffRequest) -> int:
     staged = good(git(checkout, "diff", "--cached", "--name-only"), "merge")
     if staged:
         raise Refusal(f"staged paths in merge checkout: {staged.replace(chr(10), ', ')}")
+    pending_tests = handoff_tests_pending_path(checkout, checkpoint)
+    paths: tuple[str, ...] = ()
     if isinstance(delivery, NotMerged):
         paths = merge_paths(checkout, branch, checkpoint)
         _ = good(git(checkout, "merge-tree", "--write-tree", branch, checkpoint), "conflicts")
         subject = f"Merge {request.child.slug} hand-off ({checkpoint[:7]}) into {branch}"
+        pending_tests.parent.mkdir(parents=True, exist_ok=True)
+        pending_tests.touch()
         _ = good(git(checkout, "merge", "--no-ff", "-m", subject, checkpoint), "merge")
         merge_head = good(git(checkout, "rev-parse", "HEAD"), "merge")
+    else:
+        merge_head = delivery.merge_head
+        if pending_tests.exists():
+            paths = merge_paths(checkout, f"{merge_head}^1", checkpoint)
+    if isinstance(delivery, NotMerged) or pending_tests.exists():
         try:
             with child_handoff_wait(request.child.slug, checkpoint):
                 _ = checkpoint_tests(request.production, paths, checkpoint, request.merge_tests,
@@ -1323,8 +1347,7 @@ def run_handoff(request: ChildHandoffRequest) -> int:
         except (OSError, ValueError) as error:
             undo_unpushed_merge(request.production, merge_head)
             raise Stop("red", "failed", str(error), "repair the test logging failure and send a new checkpoint") from error
-    else:
-        merge_head = delivery.merge_head
+        pending_tests.unlink()
     if isinstance(request.push, GitPush):
         tip = push_git(request.production, isinstance(delivery, NotMerged))
     else:
@@ -1382,7 +1405,14 @@ def main() -> int:
             handoff = child_request(args)
             with merge_lock(handoff.production.checkout, handoff.production.slug):
                 return run_handoff(handoff)
-        except (Refusal, Stop, OSError, ValueError, subprocess.TimeoutExpired) as error:
+        except Stop as error:
+            if error.state == "cancelled":
+                report(error.step, error.state, error.detail.replace("\n", "; "))
+                print(error.message, flush=True)
+                return TREE_CHANGED_STATUS
+            print("merge_checkpoint: " + " ".join(str(error).splitlines()), flush=True)
+            return 1
+        except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
             print("merge_checkpoint: " + " ".join(str(error).splitlines()), flush=True)
             return 1
     if cast(bool, args.root_self) or cast(str | None, args.checkpoint):
