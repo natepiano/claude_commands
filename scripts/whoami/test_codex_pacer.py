@@ -1,5 +1,6 @@
 """The pacer's plan, its measurements, and the rollout reader feeding them."""
 
+import sys
 import json
 import tempfile
 import unittest
@@ -9,8 +10,10 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import codex_pacer as pacer
-import note_file
+from scripts.whoami import note_file
 
 
 class FakeNote:

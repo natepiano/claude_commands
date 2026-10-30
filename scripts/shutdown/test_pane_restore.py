@@ -23,16 +23,18 @@ SETTINGS = '{"disableAgentView": true}'
 
 
 @final
-class FakeClient:
+class FakeClient(herdr.Herdr):
     """The herdr calls a restore makes, on a layout the test sets."""
 
     def __init__(self, rows: list[dict[str, object]]) -> None:
+        with mock.patch.object(herdr, "herdr_binary", return_value="fixture-herdr"):
+            super().__init__("agents")
         self.rows = rows
         self.started: list[tuple[str, str, list[str]]] = []
         self.closed: list[str] = []
         self.start_error: herdr.HerdrFailure | None = None
-        self.session = "agents"
 
+    @override
     def result(self, *arguments: str) -> dict[str, object]:
         if arguments[:2] == ("workspace", "list"):
             return {"workspaces": [{"workspace_id": "w1", "label": "demo"}]}
@@ -43,21 +45,21 @@ class FakeClient:
                 {"argv": ["claude", "-n", "alpha", "--model", "opus"], "pid": 4242, "cwd": "/work/alpha"}]}}
         raise AssertionError(arguments)
 
-    def panes(self) -> list[herdr.PaneIdentity]:
-        return [{"pane_id": str(row["pane_id"]), "label": cast(str | None, row.get("label"))} for row in self.rows]
-
+    @override
     def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
         _ = pane
         return herdr.PaneAtShell()
 
+    @override
     def start_agent(self, name: str, pane: str, kind: str, agent_arguments: list[str],
-                    opening: herdr.NoOpeningPrompt, timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
+                    opening: herdr.OpeningPrompt | herdr.NoOpeningPrompt, timeout_ms: int) -> herdr.PromptSubmissionNotRequired:
         _ = (kind, opening, timeout_ms)
         if self.start_error is not None:
             raise self.start_error
         self.started.append((name, pane, agent_arguments))
         return herdr.PromptSubmissionNotRequired()
 
+    @override
     def close_tab_of(self, pane: str) -> None:
         self.closed.append(pane)
 
@@ -177,7 +179,7 @@ class PaneRestoreTests(unittest.TestCase):
             f"CLAUDE_CONFIG_DIR={self.config}\0SHOWRUNNER_UNIT=demo\0CLAUDE_CODE_OAUTH_TOKEN=secret\0".encode())
         (self.config / "sessions").mkdir()
         _ = (self.config / "sessions/4242.json").write_text(json.dumps({"pid": 4242, "sessionId": "sid-alpha"}))
-        client = FakeClient([{"pane_id": "w1:p2", "label": "alpha"}])
+        client = FakeClient([{"pane_id": "w1:p2", "label": "alpha", "workspace_id": "w1"}])
         with mock.patch.object(herdr, "Herdr", return_value=client), redirect_stdout(io.StringIO()):
             self.assertEqual(pane_record.seed("agents"), 0)
         entry = pane_record.read("agents")["w1:p2"]

@@ -21,7 +21,9 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "production", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
-from account import (
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.whoami.account import (
     Account,
     UnknownAccountName,
     UnreadableAccount,
@@ -73,8 +75,9 @@ from remote import other_machine, run_remote
 import settle
 import stop as stop_work
 import restart as restart_work
+from scripts.shutdown import stop_resume
 import remote_control
-import note_file
+from scripts.whoami import note_file
 from user_zone import user_zone
 
 
@@ -95,12 +98,7 @@ class CommandLine(argparse.Namespace):
     no_alert: bool = False
     restart_of: str | None = None
     restart: bool = False
-    target: str = ""
     why: str = ""
-    move_id: str = ""
-    refused: str = ""
-    auto: bool = False
-    reset: datetime | None = None
     session_id: str = ""
     pid: int = 0
     proc_start: str = ""
@@ -108,6 +106,7 @@ class CommandLine(argparse.Namespace):
     session: str = ""
     then: ShutdownContinuation = "stop"
     forget_name: str = ""
+    resume_to: str | None = None
 
 
 class UnreachableMachine(TypedDict):
@@ -927,12 +926,18 @@ def main(arguments: list[str] | None = None) -> int:
         epilog="Run in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py <verb> <account> [--only ID[,ID...]].\nFollow in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py follow <account> --request <request-id>.\nInternal fixer in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py remote-control <session-id> --pid <pid> --proc-start <start> --who <name> --session <session-name>.",
     )
     # Commands without these flags still read them.
-    parser.set_defaults(also="", target="")
+    parser.set_defaults(also="")
     commands = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{down,status,follow,now,cancel,restart,snapshot,forget,remote-control,launch-blocked}",
+        metavar="{stop,resume,down,status,follow,now,cancel,restart,snapshot,forget,remote-control,launch-blocked}",
     )
+    stop_command = commands.add_parser("stop", help="end one local tab's Claude; leave its workers alone")
+    _ = stop_command.add_argument("session")
+    resume_command = commands.add_parser("resume", help="resume a local session in its own tab")
+    _ = resume_command.add_argument("session")
+    _ = resume_command.add_argument("--why", required=True)
+    _ = resume_command.add_argument("--to", dest="resume_to")
     _ = commands.add_parser("snapshot", help="save a read-only local recovery observation")
     forget = commands.add_parser("forget", help="forget one local recovery entry or stopped session's restore")
     _ = forget.add_argument("forget_name", metavar="NAME_OR_ID")
@@ -946,43 +951,8 @@ def main(arguments: list[str] | None = None) -> int:
                           help="also stop the account on the other machine; a stop covers only this machine by default")
     _ = down.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
     _ = down.add_argument("--restart", action="store_true")
-    from typing import override
-
-    class NumberedClaudeTarget(argparse.Action):
-        @override
-        def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
-                     values: object, option_string: str | None = None) -> None:
-            from scripts.accounts import accounts
-
-            assert isinstance(values, str)
-            try:
-                namespace.target = accounts.numbered_account_label(values, "claude").label
-            except accounts.AccountsError as error:
-                raise argparse.ArgumentError(self, str(error)) from error
-
-    _ = down.add_argument("--to", dest="target", action=NumberedClaudeTarget, default="", help="resume on claudeN")
-
-    class AwareReset(argparse.Action):
-        @override
-        def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace,
-                     values: object, option_string: str | None = None) -> None:
-            assert isinstance(values, str)
-            try:
-                reset = datetime.fromisoformat(values)
-                if reset.tzinfo is None:
-                    raise ValueError("reset needs a timezone offset")
-            except ValueError as error:
-                raise argparse.ArgumentError(self, "--reset requires an aware ISO time") from error
-            namespace.reset = reset
-
-    origin = down.add_mutually_exclusive_group()
-    _ = origin.add_argument("--refused", choices=("weekly", "five_hour", "unknown"), default="")
-    _ = origin.add_argument("--auto", action="store_true", help="move requested by an automatic account rule")
-    _ = down.add_argument("--reset", action=AwareReset)
-    _ = down.add_argument("--move-id", default="", help=argparse.SUPPRESS)
     # rename.py checkout: the conductor moves the showrunner's checkout between its stop and its launch.
     _ = down.add_argument("--checkout-move", nargs=2, metavar=("OLD", "NEW"), help=argparse.SUPPRESS)
-    _ = down.add_argument("--why", default="", help="reason for the account move")
     _ = down.add_argument("--requested-by", help=argparse.SUPPRESS)
     _ = down.add_argument("--request-id", default="", help=argparse.SUPPRESS)
     _ = down.add_argument("--no-alert", action="store_true", help=argparse.SUPPRESS)
@@ -1049,8 +1019,6 @@ def main(arguments: list[str] | None = None) -> int:
     _ = ownership.add_argument("--here", action="store_true")
     _ = commands.add_parser("held-sessions")
     options = cast(CommandLine, parser.parse_args(arguments))
-    if options.command == "down" and options.reset is not None and not options.refused:
-        parser.error("--reset requires --refused")
     if options.command == "remote-control" and (options.pid <= 0 or not options.proc_start):
         parser.error("remote-control requires a positive pid and nonempty process start")
     if options.command == "restart":
@@ -1238,15 +1206,31 @@ def _stop_here(options: CommandLine, ids: tuple[str, ...]) -> bool:
     """Whether a stop stays on this machine.
 
     Stopping a whole account covers only this machine unless --also names the other one.
-    Named sessions are stopped where they run, and a move keeps both machines in scope.
+    Named sessions are stopped where they run, and account moves use stop_resume.move.
     """
-    return options.here or not (options.also or ids or options.target)
+    return options.here or not (options.also or ids)
 
 
 def _dispatch(options: CommandLine) -> int:
+    if options.command in {"stop", "resume"}:
+        result = (stop_resume.stop(options.session) if options.command == "stop"
+                  else stop_resume.resume(options.session, why=options.why, to=options.resume_to))
+        if isinstance(result, stop_resume.SessionNotFound):
+            print(f"{result.name}: no tab on this machine")
+            return 2
+        if isinstance(result, (stop_resume.StopFailed, stop_resume.ResumeFailed)):
+            print(f"{result.session_id}: {options.command} failed: {next(iter(result.reason.splitlines()), 'unknown error')}")
+            return 1
+        if isinstance(result, stop_resume.Resumed):
+            print(f"{result.session_id}: resumed in {result.pane_id} on {result.account}")
+        elif isinstance(result, stop_resume.Stopped):
+            print(f"{result.session_id}: stopped pid {result.pid}")
+        else:
+            print(f"{result.session_id}: not running")
+        return 0
     if options.command == "down" and getattr(options, "down_all", False):
-        if options.account or options.only or options.also or options.target or options.restart:
-            print("shutdown: down --all is local and cannot join an account, --only, --also, --to or --restart", file=sys.stderr)
+        if options.account or options.only or options.also or options.restart:
+            print("shutdown: down --all is local and cannot join an account, --only, --also or --restart", file=sys.stderr)
             return 2
         return settle.down_all()
     if options.command in {"snapshot", "forget"}:
@@ -1404,27 +1388,20 @@ def _dispatch(options: CommandLine) -> int:
         if options.command == "down":
             checkout_move: CheckoutMove | None = None
             if moved := cast(list[str] | None, options.checkout_move):
-                if not (options.here and options.restart and len(ids) == 1 and not options.target):
-                    print("shutdown: --checkout-move needs --here, --restart and one --only session, without --to", file=sys.stderr)
+                if not (options.here and options.restart and len(ids) == 1):
+                    print("shutdown: --checkout-move needs --here, --restart and one --only session", file=sys.stderr)
                     return 2
                 checkout_move = {"old": moved[0], "new": moved[1]}
             if isinstance(down_report, settle.InventoryNeeded):
                 down_report = inventory(selected.login)
             from scripts.accounts import accounts
-            from scripts.accounts.refusals import KnownReset, NoResetKnown
-            move_origin: accounts.MoveOrigin = accounts.HandOrigin()
-            if options.auto:
-                move_origin = accounts.AutoOrigin()
-            elif options.refused:
-                move_origin = accounts.RefusalOrigin(cast(Literal["weekly", "five_hour", "unknown"], options.refused),
-                    KnownReset(options.reset) if options.reset is not None else NoResetKnown())
             return settle.down(
                 selected, _stop_here(options, ids), ids,
                 then="restart" if options.restart else "stop",
                 alerts="none" if options.no_alert else "user",
                 requested_by=options.requested_by, request_id=options.request_id,
-                target=options.target, why=options.why, report=down_report,
-                origin=move_origin, move_id=options.move_id,
+                target="", why="", report=down_report,
+                origin=accounts.HandOrigin(), move_id="",
                 checkout_move=checkout_move,
             )
         if options.command == "now":

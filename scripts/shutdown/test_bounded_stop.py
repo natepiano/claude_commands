@@ -19,12 +19,15 @@ from collections.abc import Callable
 from contextlib import redirect_stdout
 from datetime import timedelta
 from pathlib import Path
-from typing import cast, override
+from types import SimpleNamespace
+from typing import cast, final, override
 from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from test_support import ShutdownTestCase, linux_process_fixture, empty_session_registry
 from test_stop import NOW_UTC, entry, machine_inventory, top_level, unit, showrunner, worker_session
-from account import Account
+from scripts.whoami.account import Account
 import inventory
 import herdr
 import launch_permission
@@ -48,6 +51,19 @@ class FlushedOutput(io.StringIO):
     def flush(self) -> None:
         self.flushed.append(self.getvalue())
         super().flush()
+
+
+@final
+class InlineThread:
+    """A thread that runs its target at start, so only the fake clock orders the stop's steps."""
+
+    def __init__(self, target: Callable[..., object], args: tuple[object, ...] = (), daemon: bool = False) -> None:
+        del daemon
+        self._target = target
+        self._args = args
+
+    def start(self) -> None:
+        _ = self._target(*self._args)
 
 
 class BoundedShutdownTests(ShutdownTestCase):
@@ -80,6 +96,9 @@ class BoundedShutdownTests(ShutdownTestCase):
             shown = subprocess.run(arguments, capture_output=True, text=True, check=True, timeout=timeout)
             return shown.stdout, -1
         _ = self.enterContext(patch.object(inventory, "_collect_process_table", collect, create=True))
+        # A real thread finishes at a time the machine's load sets, while the fake clock
+        # moves only when the stop sleeps; under load the two orders differed.
+        _ = self.enterContext(patch.object(stop, "threading", SimpleNamespace(Thread=InlineThread, Event=threading.Event)))
 
     def process(self, pid: int, parent: int = 1, *, started: str = "", arguments: tuple[str, ...] = (),
                 session_id: str = "", run_dir: str = "", build_unit: str = "") -> None:
@@ -1700,8 +1719,7 @@ class BoundedShutdownTests(ShutdownTestCase):
                             request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             _ = machine_wide, keep, request_exit
             del started
-            with (patch.object(restart, "_prove_move", return_value=True),
-                  patch.object(restart, "_clear_live_outage"),
+            with (patch.object(restart, "_clear_live_outage"),
                   patch.object(restart, "_send_worker_resume"),
                   patch.object(restart, "_restore_timers", return_value=[]),
                   patch.object(restart, "_tell_source_fallback")):

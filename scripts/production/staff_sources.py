@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Match production members and seed staff from this machine's existing sources."""
+"""Match production members and import missing staff once; remove this importer on 2026-11-13."""
 
 from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -77,6 +77,14 @@ class _MemberSources:
             row = record.by_path(f"{parent.row.name}/{unit_names.name(selector.unit)}")
         return MemberFound(row) if row is not None else NoSuchMember(selector)
 
+    def showrunner_members(self, record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
+        found: dict[str, staff.StaffRow] = {}
+        for slug in self.productions:
+            selected = self.member(ShowrunnerMember(slug), record)
+            if isinstance(selected, MemberFound):
+                found[slug] = selected.row
+        return found
+
 
 def _member_sources() -> _MemberSources:
     session = herdr.shared_session()
@@ -93,6 +101,11 @@ def _member_sources() -> _MemberSources:
 def member(selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
     """Resolve the newest launch identity first, converting missing rows at the boundary."""
     return _member_sources().member(selector, record)
+
+
+def showrunner_members(record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
+    """Resolve local production slugs to rows with the same launch-first matching rule."""
+    return _member_sources().showrunner_members(record)
 
 
 @dataclass(frozen=True)
@@ -124,12 +137,11 @@ def unit_parent(unit: str, session_id: str = "") -> UnitProduction:
     """Resolve the current staff edge; old launch marks supply identity only."""
     record, sources = staff.snapshot(), _member_sources()
     parent = _unit_member(unit, session_id, record, sources).parent
-    parents = [source for slug, source in sources.productions.items()
-               if isinstance(found := sources.member(ShowrunnerMember(slug), record), MemberFound)
-               and found.row.id == parent]
+    parents = [slug for slug, row in sources.showrunner_members(record).items() if row.id == parent]
     if len(parents) != 1:
         raise staff.StaffUnreadable(f"{unit}: staff parent has no unique production document")
-    return UnitProduction(parents[0].timer.slug, str(parents[0].timer.doc))
+    slug = parents[0]
+    return UnitProduction(slug, str(sources.productions[slug].timer.doc))
 
 
 def _showrunner_key(slug: str) -> str:
@@ -143,128 +155,59 @@ def _seed_member(key: str, kind: Literal["showrunner", "unit"], name: str, found
 
 
 def _collect(record: staff.StaffSnapshot, sources: _MemberSources) -> staff.SeedInput:
-    members: dict[str, staff.SeedMember] = {}
-    parent_slugs: dict[str, str] = {}
-    present: set[staff.StaffId] = set()
-    protected: set[staff.StaffId] = set()
-    retire: set[staff.StaffId] = set()
-    read_showrunners: set[staff.StaffId] = set()
+    members: list[staff.SeedMember] = []
+    imported_unit_names = {row.name for row in record.find(kind="unit")}
     for slug, source in sources.productions.items():
-        doc = source.timer.doc
         try:
             cells = production_units.unit_table(source.document.splitlines())
-            parent_slug = showrunners.stored_parent(slug)
             found = sources.member(ShowrunnerMember(slug), record)
             production_members = [_seed_member(_showrunner_key(slug), "showrunner",
                                                showrunners.space_from_text(slug, source.document), found,
                                                staff.KeepSeedParent())]
-            listed: set[staff.StaffId] = set()
-            kept: set[staff.StaffId] = set()
-            retired: set[staff.StaffId] = set()
-            all_active_matched = True
             marks = production_units.SessionMarks(slug)
             for unit_cells in cells:
                 unit = production_units.cell_value(unit_cells.get("Unit", ""))
                 name = unit_names.name(unit)
                 selected = sources.member(UnitMember(slug, unit), record)
-                path_text = production_units.cell_value(unit_cells.get("Worktree", ""))
-                local = bool(path_text) and Path(path_text).expanduser().is_dir()
-                is_retired = production_units.unit_is_retired(unit_cells, marks)
-                explicit_retirement = production_units.plan_cell_is_retired(unit_cells.get("Plan", ""))
-                retirement_evidence = is_retired and (local or explicit_retirement)
                 if isinstance(selected, MemberFound):
-                    listed.add(selected.row.id)
-                    if retirement_evidence:
-                        retired.add(selected.row.id)
-                    else:
-                        # An absent local worktree alone says nothing about the other host.
-                        kept.add(selected.row.id)
-                elif not retirement_evidence:
-                    all_active_matched = False
-                if is_retired or not local:
+                    production_members.append(_seed_member(f"unit:{slug}/{unit}", "unit", name, selected,
+                                                           staff.KeepSeedParent()))
+                    continue
+                # A moved unit can remain in its old Units table. Import never recreates it there.
+                if name in imported_unit_names:
+                    continue
+                path_text = production_units.cell_value(unit_cells.get("Worktree", ""))
+                if (not path_text or not Path(path_text).expanduser().is_dir()
+                        or production_units.unit_is_retired(unit_cells, marks)):
                     continue
                 production_members.append(_seed_member(f"unit:{slug}/{unit}", "unit", name, selected,
                                                        staff.SeedParent(_showrunner_key(slug))))
         except (OSError, UnicodeError, production_units.Refusal, unit_names.BadName) as error:
-            print(f"seed: {slug} ({doc}): {error}", file=sys.stderr)
+            print(f"seed: {slug} ({source.timer.doc}): {error}", file=sys.stderr)
             continue
-        for entry in production_members:
-            if entry.key in members:
-                raise staff.StaffRefused(f"duplicate source member: {entry.key}")
-            members[entry.key] = entry
-        parent_slugs[slug] = parent_slug
-        if isinstance(found, MemberFound) and all_active_matched:
-            read_showrunners.add(found.row.id)
-        present.update(listed)
-        protected.update(kept)
-        retire.update(retired)
-    edges = showrunners.parent_edges(parent_slugs)
-    for slug, parent_slug in parent_slugs.items():
-        entry = members[_showrunner_key(slug)]
-        if parent_slug and parent_slug not in parent_slugs:
-            desired: staff.SeedParent | staff.KeepSeedParent | staff.RootSeedParent = staff.KeepSeedParent()
-        elif slug not in edges:
-            desired = staff.RootSeedParent()
-        else:
-            key = _showrunner_key(parent_slug)
-            if key not in members:
-                found = sources.member(ShowrunnerMember(parent_slug), record)
-                if isinstance(found, MemberFound):
-                    members[key] = _seed_member(key, "showrunner", found.row.name, found,
-                                                staff.KeepSeedParent())
-            desired = staff.SeedParent(key) if key in members else staff.KeepSeedParent()
-        members[entry.key] = replace(entry, parent=desired)
-    for row in record.find(kind="unit"):
-        if row.parent in read_showrunners and row.id not in present:
-            retire.add(row.id)
-    retirements: list[staff.SeedRetirement] = []
-    for staff_id in sorted(retire - protected):
-        row = record.by_id(staff_id)
-        assert row is not None and row.parent is not None
-        retirements.append(staff.SeedRetirement(staff_id, row.parent))
-    return staff.SeedInput(tuple(members.values()), tuple(retirements))
+        members.extend(production_members)
+    return staff.SeedInput(tuple(members), ())
 
 
-def _print_plan(seed_input: staff.SeedInput, record: staff.StaffSnapshot, *, dry_run: bool) -> bool:
+def _print_plan(seed_input: staff.SeedInput) -> bool:
     changed = False
-    entries = {entry.key: entry for entry in seed_input.members}
     for entry in seed_input.members:
         if isinstance(entry.match, staff.NewSeedMember):
             action, identity = "add", entry.key
-        else:
-            row = record.by_id(entry.match)
-            assert row is not None
-            identity = row.id
-            action = "keep"
-            if isinstance(entry.parent, staff.RootSeedParent) and row.parent is not None:
-                action = "move"
-            elif isinstance(entry.parent, staff.SeedParent):
-                parent = entries[entry.parent.key]
-                if isinstance(parent.match, staff.NewSeedMember) or parent.match != row.parent:
-                    action = "move"
-        changed = changed or action != "keep"
-        print(f"{action} {identity} {entry.kind} {entry.name}")
-    for retirement in seed_input.retire:
-        staff_id = retirement.staff_id
-        row = record.by_id(staff_id)
-        assert row is not None
-        if record.find(kind="worker", parent=staff_id):
-            print(f"keep {row.id} unit {row.name}")
-            if dry_run:
-                print(f"seed: keeping unit {row.name}: worker rows remain", file=sys.stderr)
-        else:
             changed = True
-            print(f"retire {row.id} unit {row.name}")
+        else:
+            action, identity = "keep", entry.match
+        print(f"{action} {identity} {entry.kind} {entry.name}")
     return changed
 
 
 def seed(*, dry_run: bool = False) -> None:
-    """Read local evidence under the operation lock and apply it in one owner write."""
+    """Import missing local members without moving or deleting any recorded member."""
     with staff.operation():
         record = staff.initial_snapshot()
         sources = _member_sources()
         seed_input = _collect(record, sources)
-        changed = _print_plan(seed_input, record, dry_run=dry_run)
+        changed = _print_plan(seed_input)
         if dry_run:
             if not changed:
                 print("unchanged", file=sys.stderr)
