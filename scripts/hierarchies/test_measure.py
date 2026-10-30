@@ -874,6 +874,27 @@ class WaitRecordsTest(unittest.TestCase):
         self.assertTrue(all(isinstance(phase.state, m.UncertainWaitCoverage) for phase in history.phases))
         self.assertNotIn("wait_n=0", output)
 
+    def test_candidate_cells_count_distinct_notes_in_first_seen_order(self) -> None:
+        first: log_records.JsonObject = {"run_id": "hana-run", "phase_id": "4", "phase_instance_id": "hana-phase"}
+        second: log_records.JsonObject = {"run_id": "hana-run", "phase_id": "5", "phase_instance_id": "hana-next"}
+        first_label = "run=hana-run; phase=4; instance=hana-phase; cwd="
+        second_label = "run=hana-run; phase=5; instance=hana-next; cwd="
+        for candidates, expected in (([first] * 6, first_label + " (6 times)"),
+                                     ([first, second, first], first_label + " (2 times) | " + second_label)):
+            with self.subTest(expected=expected):
+                phase = wait_phase_fixture("UncertainCoverage")
+                phase.update(reason="ambiguous coverage", candidates=candidates, recorded_wait_n=0)
+                missing = wait_fixture("ambiguous-candidates", "WaitingForUser", self.start)
+                missing["wait_attribution"] = {"state": "UnresolvedAttribution", "reason": "ambiguous attribution",
+                                                "candidates": candidates}
+                history = m.parse_wait_report(wait_report_fixture(self.window, [missing], [phase]))
+                rows = m.hana_wait_rows(history, self.window, ())
+                for label, reason in (("Hana wait coverage / UncertainCoverage", "ambiguous coverage"),
+                                      ("Hana wait attribution / Unresolved", "ambiguous attribution")):
+                    cells = [row for row in rows if row.measure == label]
+                    self.assertEqual([(row.value, row.n) for row in cells],
+                                     [(reason + "; candidates: " + expected, 1)])
+
     def test_completed_wait_with_unresolved_supplier_adds_no_hana_minutes(self) -> None:
         reason = "supplier address is not recorded"
         unresolved = wait_fixture("unknown-supplier", "WaitingForSupplier", self.start, 90)
@@ -1148,6 +1169,64 @@ class HolderHistoryTest(unittest.TestCase):
             self.assertEqual(m.main(["baseline", "--full", "--since", self.start.isoformat(),
                                      "--until", self.window.until.isoformat()]), 0)
         return captured.getvalue()
+
+    def test_named_then_malformed_holder_keeps_partial_holder_coverage_and_phase_minutes(self) -> None:
+        wait = wait_fixture("holder-became-malformed", "WaitingForMemoryOrSlot", self.start, 10)
+        wait["holders"] = [holder_observation(self.start, named_holder_fixture()), holder_observation(
+            self.start + timedelta(minutes=4), {"state": "MalformedHolder", "reason": "holder schema changed",
+                                               "raw_value": {"private-resource": "never-print-this"}})]
+        history = m.parse_wait_report(wait_report_fixture(self.window, [wait], [wait_phase_fixture(wait_n=1)]))
+        self.assertEqual(history.problems, ())
+        self.assertEqual(m.holder_coverage(history.waits[0]), m.HolderCoverage.PART)
+        event = m.PhaseCompletion("holder-phase-finished", self.start + timedelta(minutes=10), True, 600,
+                                  phase=m.WaitPhaseInstance("hana-run", "hana-phase"), started=self.start)
+        rows = m.phase_flow([event], self.window, history)
+        by_name = {row.measure: row for row in rows}
+        for label, expected in (("Hana wait / WaitingForMemoryOrSlot", "10.0 min"),
+                                ("Hana wait holders / WaitingForMemoryOrSlot / part of wait", "10.0 min"),
+                                ("Hana wait / share of phase time with a recorded kind", "100.0%")):
+            self.assertEqual((by_name[label].value, by_name[label].n), (expected, 1))
+        details = [row for row in rows if row.measure == "Hana wait holder / holder-became-malformed"]
+        self.assertEqual(len(details), 2)
+        self.assertIn("MalformedHolder: holder schema changed", details[1].value)
+        self.assertIn("6.0 min", details[1].value)
+        self.assertFalse(any("coverage / source_problem_n" in row.measure for row in rows))
+        output = m.flow_table(rows)
+        for raw in ("private-resource", "never-print-this", "raw_value"):
+            self.assertNotIn(raw, output)
+
+    def test_legacy_invalid_holder_reason_becomes_malformed_without_a_source_problem(self) -> None:
+        wait = wait_fixture("legacy-holder", "WaitingForUser", self.start, 3)
+        wait["holders"] = [holder_observation(
+            self.start, {"state": "HolderNotNamed", "reason": "invalid holder record: x"})]
+        history = m.parse_wait_report(wait_report_fixture(self.window, [wait], [wait_phase_fixture(wait_n=1)]))
+        self.assertEqual(history.problems, ())
+        self.assertEqual(history.waits[0].holders.observations[0].holder, m.MalformedHolder("invalid holder record: x"))
+        rows = {row.measure: row for row in m.holder_rows(history, self.window, ())}
+        row = rows["Hana wait holders unnamed / WaitingForUser / MalformedHolder: invalid holder record: x"]
+        self.assertEqual((row.value, row.n), ("3.0 min", 1))
+
+    def test_malformed_holder_invalid_metadata_rejects_only_its_wait(self) -> None:
+        invalid_records: tuple[log_records.JsonObject, ...] = (
+            {"state": "MalformedHolder", "reason": "invalid holder", "unknown": "never-print-this"},
+            {"state": "MalformedHolder", "reason": "   ", "raw_value": "never-print-this"},
+        )
+        for fields in invalid_records:
+            with self.subTest(fields=fields):
+                valid = wait_fixture("valid", "WaitingForUser", self.start, 2)
+                broken = wait_fixture("bad-malformed-holder", "WaitingForUser", self.start, 90)
+                broken["holders"] = [holder_observation(self.start, fields)]
+                history = m.parse_wait_report(wait_report_fixture(self.window, [valid, broken], [wait_phase_fixture(wait_n=2)]))
+                self.assertEqual([wait.identity for wait in history.waits], ["valid"])
+                self.assertEqual(len(history.problems), 1)
+                rows = {row.measure: row for row in m.hana_wait_rows(history, self.window, ())}
+                self.assertEqual((rows["Hana wait / WaitingForUser"].value, rows["Hana wait / WaitingForUser"].n),
+                                 ("2.0 min (partial)", 1))
+                self.assertEqual((rows["Hana wait / coverage / source_problem_n"].value,
+                                  rows["Hana wait / coverage / source_problem_n"].n), ("1", 1))
+                output = m.flow_table(list(rows.values()))
+                self.assertIn("bad-malformed-holder", output)
+                self.assertNotIn("never-print-this", output)
 
     def test_full_cli_coverage_counts_are_separate_and_values_fit_a_phone(self) -> None:
         named = wait_fixture("named", "WaitingForMemoryOrSlot", self.start, 4)
@@ -1476,33 +1555,54 @@ class HolderHistoryTest(unittest.TestCase):
                 self.assertIn("bad-origin" if defect == "origin" else "bad-holder", output)
 
     def test_real_supplier_invalid_holder_is_named_without_losing_other_waits(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runs = root / "runs"
-            runs.mkdir()
-            good = wait_fixture("valid", "WaitingForUser", self.start, 2)
-            bad = wait_fixture("bad-holder", "WaitingForMemoryOrSlot", self.start, 90)
-            opened = {**bad, "event_type": "wait_started", "event_id": "bad-holder-start",
-                      "timestamp": self.start.isoformat(), "timestamp_epoch": self.start.timestamp(),
-                      "holder": {"state": "NamedHolder", "resource_kind": "disk", "resource": "disk-1",
-                                 "holder": {"state": "SessionHolder", "session_id": "other"}}}
-            path = runs / "hana-run.jsonl"
-            self.assertGreater(path.write_text("\n".join(json.dumps(event) for event in (
-                WaitRecordsTest().phase_started(), good, opened, bad)) + "\n"), 0)
-            before = path.read_bytes()
-            problems: list[log_records.SourceProblem] = []
-            history = m.read_wait_history(root, self.window, problems, (), ())
-            self.assertIsInstance(history, m.HanaWaitHistory)
-            if isinstance(history, m.HanaWaitHistory):
-                self.assertEqual([wait.identity for wait in history.waits], ["valid"])
-            self.assertTrue(problems)
-            output = log_records.table("Waits", m.hana_wait_rows(history, self.window, ()))
-            self.assertIn("source problem", output)
-            self.assertIn("bad-holder", output)
-            rows = {row.measure: row for row in m.hana_wait_rows(history, self.window, ())}
-            self.assertEqual((rows["Hana wait / WaitingForUser"].value,
-                              rows["Hana wait / WaitingForUser"].n), ("2.0 min (partial)", 1))
-            self.assertEqual(path.read_bytes(), before)
+        invalid_object: log_records.JsonObject = {
+            "state": "NamedHolder", "resource_kind": "disk", "resource": "disk-1",
+            "holder": {"state": "SessionHolder", "session_id": "other"},
+        }
+        for holder in (invalid_object, "slot-7"):
+            with self.subTest(holder=holder), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                runs = root / "runs"
+                runs.mkdir()
+                good = wait_fixture("valid", "WaitingForUser", self.start, 2)
+                bad = wait_fixture("bad-holder", "WaitingForMemoryOrSlot", self.start, 90)
+                opened: log_records.JsonObject = {
+                    **bad, "event_type": "wait_started", "event_id": "bad-holder-start",
+                    "timestamp": self.start.isoformat(), "timestamp_epoch": self.start.timestamp(), "holder": holder,
+                }
+                path = runs / "hana-run.jsonl"
+                self.assertGreater(path.write_text("\n".join(json.dumps(event) for event in (
+                    WaitRecordsTest().phase_started(), good, opened, bad)) + "\n"), 0)
+                before = path.read_bytes()
+                problems: list[log_records.SourceProblem] = []
+                history = m.read_wait_history(root, self.window, problems, (), ())
+                self.assertIsInstance(history, m.HanaWaitHistory)
+                if isinstance(history, m.HanaWaitHistory):
+                    self.assertEqual({wait.identity for wait in history.waits}, {"valid", "bad-holder"})
+                    malformed = next(wait for wait in history.waits if wait.identity == "bad-holder")
+                    self.assertIsInstance(malformed.holders.observations[0].holder, m.MalformedHolder)
+                    self.assertEqual(history.problems, ())
+                self.assertEqual(problems, [])
+                rows = m.phase_flow([], self.window, history)
+                by_name = {row.measure: row for row in rows}
+                for label, minutes in (("Hana wait / WaitingForUser", "2.0 min"),
+                                       ("Hana wait / WaitingForMemoryOrSlot", "90.0 min"),
+                                       ("Hana wait holders / WaitingForMemoryOrSlot / HolderNotNamed", "90.0 min")):
+                    self.assertEqual((by_name[label].value, by_name[label].n), (minutes, 1))
+                groups = [row for row in rows if row.measure.startswith(
+                    "Hana wait holders unnamed / WaitingForMemoryOrSlot / MalformedHolder: ")]
+                self.assertEqual(len(groups), 1)
+                self.assertEqual((groups[0].value, groups[0].n), ("90.0 min", 1))
+                if isinstance(holder, str):
+                    self.assertEqual(groups[0].measure,
+                                     "Hana wait holders unnamed / WaitingForMemoryOrSlot / MalformedHolder: holder must be an object")
+                else:
+                    self.assertIn("invalid holder record:", groups[0].measure)
+                output = m.flow_table(rows)
+                self.assertNotIn("source problem", output)
+                for raw in ("disk-1", "other", "slot-7", "raw_value"):
+                    self.assertNotIn(raw, output)
+                self.assertEqual(path.read_bytes(), before)
 
     def test_missing_id_count_is_a_problem_beside_valid_waits(self) -> None:
         wait = wait_fixture("valid", "WaitingForUser", self.start, 2)

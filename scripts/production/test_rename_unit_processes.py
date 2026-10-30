@@ -26,10 +26,10 @@ import unit_runs
 from rename_state import RenameRefused
 
 if TYPE_CHECKING:
-    from scripts.shutdown import record as shutdown_record
+    from scripts.shutdown import shutdown_record
 else:
     # rename_unit puts the shutdown folder on the path.
-    import record as shutdown_record
+    import shutdown_record
 
 from scripts.production.rename_unit_test_support import SLUG, TEST_HANG_GUARD_SECS, UnitRenameFixture
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import registry_text, write_registry
+
 import json
 import os
 import shutil
@@ -12,7 +14,7 @@ import unittest
 from pathlib import Path
 from typing import TypedDict, ClassVar, cast, override
 
-from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.direct.recorder_fixture import STUB_ATOMIC_JSON_WRITER, communicate_launcher, invoke_recorder
 
 
 TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
@@ -48,7 +50,7 @@ printf 'stub agent log\\n' > "$6"
 if [[ -n "${TEST_WORKER_STARTED:-}" ]]; then : > "$TEST_WORKER_STARTED"; fi
 """
 
-STUB_MESH = """#!/usr/bin/env python3
+STUB_MESH = "#!/usr/bin/env python3\n" + STUB_ATOMIC_JSON_WRITER + """
 import fcntl
 import json
 import os
@@ -80,7 +82,7 @@ def save_entry():
         fcntl.flock(lock, fcntl.LOCK_EX)
         current = json.loads(roster_path.read_text()) if roster_path.exists() else {}
         current[name] = entry
-        roster_path.write_text(json.dumps(current))
+        write_json(roster_path, current)
 
 if verb == 'start':
     entry = {
@@ -186,7 +188,7 @@ if verb == 'follow' and os.environ.get('STUB_REVIEW_DONE_FILE'):
 """
 
 
-STUB_WORKERS = r'''#!/usr/bin/env python3
+STUB_WORKERS = "#!/usr/bin/env python3\n" + STUB_ATOMIC_JSON_WRITER + r'''
 import fcntl
 import json
 import os
@@ -225,7 +227,7 @@ with (run / "fixture_workers.lock").open("a+") as lock:
     entry.update({"previous_status": entry.get("previous_status", entry["status"]),
                   "previous_role": entry.get("role", "review"),
                   "status": "starting", "launcher_pid": owner_pid})
-    path.write_text(json.dumps(records))
+    write_json(path, records)
     print(name)
 '''
 
@@ -276,20 +278,7 @@ class OpenPass(TypedDict):
 ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
-AGENTS_REGISTRY = """[assignments]
-direct=codex
-
-[direct.codex]
-implementation=gpt-called:xhigh
-review=gpt-blind:max
-
-[codex.agents]
-gpt-called=low,medium,high,xhigh,max
-gpt-blind=low,medium,high,xhigh,max
-
-[direct.options]
-codex_mesh=1
-"""
+AGENTS_REGISTRY = registry_text({'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-called:xhigh', 'review': 'gpt-blind:max'}, 'codex.agents': {'gpt-called': 'low,medium,high,xhigh,max', 'gpt-blind': 'low,medium,high,xhigh,max'}, 'direct.options': {'codex_mesh': '1'}})
 
 
 class ReviewLauncherFixture(unittest.TestCase):
@@ -358,7 +347,7 @@ class ReviewLauncherFixture(unittest.TestCase):
         )
         registry = self.root / ".claude" / "config" / "agents.conf"
         registry.parent.mkdir(parents=True)
-        _ = registry.write_text(AGENTS_REGISTRY, encoding="utf-8")
+        _ = write_registry(registry, base_text=AGENTS_REGISTRY)
         self.prompt_file = self.root / "review_prompt.md"
         _ = self.prompt_file.write_text("Review the diff.\n", encoding="utf-8")
         reviewed = self.working_dir / "reviewed.txt"
@@ -512,7 +501,7 @@ class ReviewLauncherFixture(unittest.TestCase):
         self.recorder(
             "start-pass", "--session-dir", str(session_dir), "--phase-id", "3",
             "--pass-kind", "impl", "--activity", "writing the retry path",
-            "--called-task", "direct.implementation", "--called-family", "codex",
+            "--called-task", "direct.impl", "--called-family", "codex",
             "--called-model", "gpt-called", "--called-effort", "xhigh",
         )
         return session_dir

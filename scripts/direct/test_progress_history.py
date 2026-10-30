@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import argparse
 import hashlib
 import io
@@ -93,7 +95,7 @@ class ProgressHistoryTests(unittest.TestCase):
         # the test wrote instead of reading an empty one beside it.
         self.team_slot = ""
         self.agents_config_file = self.root / ".claude" / "config" / "agents.conf"
-        self.agents_config_file.parent.mkdir(parents=True, exist_ok=True)
+        _ = write_registry(self.agents_config_file)
         _ = subprocess.run(
             ["git", "init", "-b", "feature/rubric"],
             cwd=self.working_dir,
@@ -2093,6 +2095,28 @@ print('two homes isolated; recorder lock retained; caller restored')
             self.assertTrue(attribution["reason"])
             self.assertTrue(attribution["candidates"])
 
+    def test_uncertain_coverage_counts_repeated_reasons_in_first_seen_order(self) -> None:
+        session = self.covered_wait_phase("repeated-uncertainty")
+        _ = (session / "mesh_roster.json").write_text(json.dumps({
+            "unit-impl": {"thread_id": "impl-thread"},
+            "unit-test": {"thread_id": "test-thread"},
+        }))
+        wait_ids = [self.run_command(
+            "start-wait", "--session-dir", str(session), "--worker-thread-id", thread,
+            "--owner-session", thread, "--kind", "WaitingForMemoryOrSlot", at=1020 + index,
+        ) for index, thread in enumerate(("impl-thread", "test-thread", *("impl-thread",) * 4))]
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1030)))
+        phase, = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual(phase["state"], "UncertainCoverage")
+        self.assertEqual(phase["reason"], "worker unit-impl has 0 active pass matches (5 times); "
+                         + "worker unit-test has 0 active pass matches")
+        self.assertEqual(phase["attribution_miss_ids"], wait_ids)
+        missing = cast(list[dict[str, object]], report["missing"])
+        expected_candidates = [candidate for wait in missing
+                               for candidate in cast(list[object], cast(dict[str, object], wait["wait_attribution"])["candidates"])]
+        self.assertEqual(len(expected_candidates), 6)
+        self.assertEqual(phase["candidates"], expected_candidates)
+
     def test_checkpoint_identity_survives_reopening_runs_and_active_later_instances(self) -> None:
         for across_runs in (False, True):
             for active_later in (False, True):
@@ -3333,9 +3357,7 @@ with patch.object(fcntl, "flock", admission):
         ]
 
     def test_a_pass_records_a_digest_of_the_configuration_it_ran_under(self) -> None:
-        _ = self.agents_config_file.write_text(
-            "[direct.implementation.codex]\nagent = gpt-called\n", encoding="utf-8"
-        )
+        _ = write_registry(self.agents_config_file, {"direct.codex": {"impl": "gpt-called:xhigh"}})
         session_dir = self.start_run("digest", 20_000)
         self.start_phase_and_pass(session_dir, 20_010)
         expected = hashlib.sha256(
@@ -3394,6 +3416,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(started[0].get("team_slot"), "")
 
     def test_an_unreadable_conf_leaves_the_digest_empty_and_records_the_pass(self) -> None:
+        self.agents_config_file.unlink()
         session_dir = self.start_run("no-registry", 21_000)
         self.start_phase_and_pass(session_dir, 21_010)
         started = self.pass_events("no-registry", "pass_started")
@@ -5285,24 +5308,10 @@ with patch.object(fcntl, "flock", admission):
     def write_agents_registry(self) -> None:
         """A registry under the temporary home, so arm-review resolves the same
         agent review.sh would without reading this machine's real assignments."""
-        _ = self.agents_config_file.write_text(
-            "\n".join(
-                (
-                    "[assignments]",
-                    "direct=codex",
-                    "",
-                    "[direct.codex]",
-                    "implementation=gpt-called:xhigh",
-                    "review=gpt-blind:max",
-                    "",
-                    "[codex.agents]",
-                    "gpt-called=low,medium,high,xhigh,max",
-                    "gpt-blind=low,medium,high,xhigh,max",
-                    "",
-                )
-            ),
-            encoding="utf-8",
-        )
+        _ = write_registry(self.agents_config_file, {
+            "direct.codex": {"impl": "gpt-called:xhigh", "review": "gpt-blind:max"},
+            "codex.agents": {"gpt-called": "low,medium,high,xhigh,max", "gpt-blind": "low,medium,high,xhigh,max"},
+        })
 
     def arm_early_review(self, session_dir: Path, at: int) -> str:
         return self.run_command(
