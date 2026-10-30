@@ -942,6 +942,19 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         self.assertNotIn("unrelated", output)
         self.assertTrue(output.rstrip().endswith("all 1 back on claude3"), output)
 
+    def test_follow_failed_stops_reports_the_total_and_each_failed_owner_reason(self) -> None:
+        for identity, reason in (("first", "deadline exhausted"), ("second", "worker pause refused")):
+            saved = session_shutdown(shutdown_store.SessionStopFailed(kind="stop failed", at=OCTOBER, reason=reason), identity)
+            saved["session"]["name"] = identity + "-name"
+            saved["then"] = "stop"
+            self.assertTrue(shutdown_store.create_session(saved))
+        status, output = self.follow_request()
+        self.assertEqual(status, 1)
+        self.assertIn("0 of 2 stopped", output)
+        self.assertIn("first-name: deadline exhausted", output)
+        self.assertIn("second-name: worker pause refused", output)
+        self.assertNotIn("all 0 stopped", output)
+
     def test_follow_waits_for_every_session_and_reports_total_back_on_target(self) -> None:
         first = session_shutdown(shutdown_store.SessionRestarted(kind="restarted", at=OCTOBER), "first")
         second = session_shutdown(shutdown_store.SessionWaiting(kind="waiting"), "second")
@@ -982,7 +995,8 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                     status, output = self.follow_request()
                 self.assertEqual(status, 0)
                 self.assertIn(f"alpha: {kind}", output)
-                self.assertIn("all 1 back on" if kind == "restarted" else "all 1 stopped", output)
+                total = "all 1 back on" if kind == "restarted" else "0 of 1 stopped" if kind == "already gone" else "all 1 stopped"
+                self.assertIn(total, output)
 
     def test_follow_keeps_trail_when_record_is_archived_between_polls(self) -> None:
         saved = session_shutdown(shutdown_store.SessionWaiting(kind="waiting"))
@@ -2404,7 +2418,8 @@ class OnlySessionCliTests(ShutdownTestCase):
                 if state.exists():
                     shutil.rmtree(state)
                 before = self.save_three(progress)
-                with patch.object(restart_work, "_launch_session") as launch:
+                with (patch.object(restart_work, "_owner_liveness", return_value=restart_work.SessionLive()),
+                      patch.object(restart_work, "_launch_session") as launch):
                     status, output, error = self.action("restart", "Beta", "--no-alert")
                 self.assertEqual((status, error), (1, ""))
                 self.assertIn(f"Beta is {progress['kind']}, not stopped; nothing to restart\n", output)

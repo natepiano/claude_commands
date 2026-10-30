@@ -2714,35 +2714,25 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 94b (order only)
 
-#### Work Order
+#### As-built
 
-**Goal:** A unit watchdog pass never loses a finished recovery's result before it knows whether the unit is live. The Phase 94b closure review found: on the recovery-result path (`scripts/accounts/unit_watchdog.py`, the `job = outage.get("job")` branch), `_recovery_result` deletes the result file and the job is removed before `_live_account` reads; when that read is unreadable and raises, the result and the job are gone and the next pass cannot report the restart. The order is the same at `ed98b7dc` (before Phase 94b). Phase 94b fixed the same order on the observed-live branch.
-
-**Spec:**
-- On the recovery-result path, read the result without deleting it, confirm liveness fresh with `_live_account`, then delete the result and remove the job. A confirmed live unit: success cleanup and the `restarted on` line. An absent unit: delete the result and remove the job, then the existing retry line and recovery handling. An unreadable read: keep the result file, the job and the outage; no `restarted on` or retry line. The existing error path still writes its `watchdog: <production>: <error>` line.
-- The held or blocked branch between the result read and `_live_account` (`(source.blocked and not owns_claim) or _held(source, dry_run=False)`, which drops the outage with `del retained[key]`) relies today on `_recovery_result` having deleted the file. After the reorder it deletes the result file itself, so no file stays in `unit-watchdog-results`.
-- `scripts/whoami/test_profile_notes_pass.py` `test_child_launch_options_cannot_substitute_executable_or_run_hooks`: use an argv form the policy permits, for example `("ps", "-eo", "pid=,ppid=,comm=,args=")`, and add a positive control: the same argv with no launch option starts once. Then the test fails only when the launch-option check is missing (today `ps -c 'touch …'` fails `ps_read`, so argument rejection alone makes it pass). Assertion-Change: `scripts/whoami/test_profile_notes_pass.py::test_child_launch_options_cannot_substitute_executable_or_run_hooks` — the rejected-call input is the ps listing form, so the test pins the launch-option check; a successful-launch control is added.
-- No other behavior changes.
+- `RecoveryFinished(failure, result_path)` in `scripts/accounts/unit_watchdog.py` is a finished recovery result that is read but not yet deleted. `_recovery_result` does not delete the result file; each branch of `run()` that uses up the result deletes it.
+- Recovery-result branch: the result is deleted and the job is popped only after a fresh `_live_account` read answers. A live unit gets `restarted on <account>`. An absent unit gets the retry line and the recovery. An unreadable read (`OSError`) keeps the result file, the job and the outage, and the error path writes `watchdog: <production>: <error>`; the next pass reports the restart or the retry.
+- Held or blocked branch (`(source.blocked and not owns_claim) or _held(source, dry_run=False)`): deletes the result file, then `del retained[key]`. No file stays in `unit-watchdog-results`.
+- No-recovery-source branch: deletes the result, then sets `dropped`, then pops the job. A failed delete keeps the job and writes no `dropped`, so a later pass retries cleanup and recovery when a source returns.
+- `test_child_launch_options_cannot_substitute_executable_or_run_hooks` rejects the ps listing form `("ps", "-eo", "pid=,ppid=,comm=,args=")` with a launch option, and a positive control starts the same argv once with no launch option. The test fails only when the launch-option check is missing.
+- Checkpoint `182c9f80`. Its commit body holds the Assertion-Change line for `scripts/whoami/test_profile_notes_pass.py::test_child_launch_options_cannot_substitute_executable_or_run_hooks`.
 
 **Files:**
-- `scripts/accounts/unit_watchdog.py` — the recovery-result order; the held or blocked branch deletes the result.
-- `scripts/accounts/test_unit_watchdog.py` — live, absent and unreadable after a finished result; the file and job stay for unreadable; the held or blocked branch leaves no result file.
-- `scripts/whoami/test_profile_notes_pass.py` — the launch-options test.
+- `scripts/accounts/unit_watchdog.py` — `RecoveryFinished.result_path`, `_recovery_result`, the three branches of `run()` that use up a finished result.
+- `scripts/accounts/test_unit_watchdog.py` — seven tests: the unreadable second fresh read, live and absent confirmation, held, blocked, no recovery source, and the failed-cleanup retry (`test_failed_result_cleanup_retries_when_a_recovery_source_returns`).
+- `scripts/whoami/test_profile_notes_pass.py` — the launch-options test and its positive control.
 
-**Workers:** 1 writer, no split.
-- `impl` — all files.
+**Gotchas:**
+- Each branch that uses up a finished result deletes the result file before it writes a final mark (`dropped`, `del retained[key]`, the job pop). A failed delete is a third outcome next to live and absent: it must leave the job retryable. A saved `dropped` together with a job makes every later pass skip cleanup and recovery.
 
-**Constraints from prior phases:** Phase 94b's one-scan idle pass and fresh reads before acts stay. Tests use a scratch `HOME` and state dirs; they never touch live dirs, `~/.local/state`, ssh or real sessions.
-- `_live_account(doc, unit) -> str` is wrapped in `@herdr.process_action()`: each call scans processes fresh and retires the pass's shared snapshot. It returns the account name, `""` for an absent unit, and raises `OSError` when liveness or the account is unreadable.
-- Phase 94b already reordered the observed-live branch (`if outage is not None and "job" in outage and not dry_run: restored = _live_account(doc, unit)`, before `outage_alerts.clear` and the result delete). When that read finds the unit absent, `claude` becomes `ClaudeNotRunning()` and the pass falls through to the recovery-result branch, which reads `_live_account` a second time.
-- The failing sequence the tests must cover: the report sees the unit live, the observed-live branch's fresh read finds it absent, a finished result file exists, and the recovery-result branch's fresh read raises. Do not patch `_recovery_result` in these tests; 94b's `test_live_report_without_fresh_confirmation_keeps_recovery_evidence` patches it to `RecoveryStillRunning` and so never reaches this path.
-- Fixture helpers in `test_unit_watchdog.py`: `add_unit`, `die`, `revive`, `marked`, `pass_at`, `finish_jobs` (set `False` to keep a job unfinished), `notices` and `pending`. 94b's `test_unreadable_fresh_confirmation_preserves_recovery_result_and_job` shows the pattern (write the result, revive, patch `_live_account` with `OSError`).
-- The profile test's setUp puts fake `ps`, `git`, `herdr`, `lsof`, `ssh` and `security` scripts on `PATH` (`self.bin`); `child_policy` pins only programs that `shutil.which` finds. `readonly_launch_options` refuses more than two positional arguments.
-- Type Design Contract: a finished result that is read but not yet deleted needs a name that says so (for example, `RecoveryFinished` carrying its result path), not a flag.
-- `_recovery_result` has two callers: the no-recovery-record branch (`job = outage.get("job")` near line 393, which records `dropped`) and the recovery-result branch (line 448). When it stops deleting, the first caller deletes the result after it records `dropped`.
-- Merge timing: no checkpoint merge during the natedev build hold, 00:05–03:05 EDT (showrunner, 2026-10-29). While any natedev build hold is in force, run no tests, gates or type checks unless this unit holds it; check `build_hold.py status` first.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` and the same for `scripts/whoami` pass; `basedpyright` on the changed files reads `0 errors, 0 warnings, 0 notes`.
+**Ruled out:**
+- Delete the result after `dropped` is recorded in the no-recovery-source branch: a failed delete then stops recovery for good.
 
 ### Phase 94e — Each derived account problem names the cause it comes from  · status: todo
 
@@ -2767,6 +2757,19 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/whoami/agent_accounts.py` — claim and save warnings keep their reason.
 - `scripts/accounts/role_map.py` — read: `observed_map_provenance`, `cached_map_warning` (the raw counterpart of the cached-map problem); change only if its delivery needs a mark.
 - `scripts/accounts/test_accounts.py`, `scripts/accounts/test_role_map.py` — the pairing tests.
+- `scripts/whoami/test_agent_accounts.py` — the claim and finish store-error tests expect `warning.reason` (repair round 1).
+
+**Assertion-Change** (accepted at review pass 1; each follows the Spec):
+- `scripts/whoami/test_agent_accounts.py::SharedUsageReadTests::test_a_claim_store_error_still_returns_the_live_read` and `::test_a_finish_store_error_keeps_the_good_live_report` — the expected warning text gains its `warning.reason`.
+- `scripts/accounts/test_accounts.py::AccountsTests::test_exec_refuses_wrong_login_and_status_keeps_the_actual_identity` — the line form drops the `* ` prefix (94c line form).
+- `scripts/accounts/test_accounts.py` `assert_mcp_status_streams` (`test_piped_status_keeps_mcp_problem_in_table_and_json`, `test_piped_status_suppresses_nested_account_notes`, `test_terminal_status_keeps_nested_account_notes`), `test_status_detail_shows_unclassified_entries_and_mcp_difference`, `StatusProblemCauseTests::test_independent_configuration_problems_each_keep_their_repair` — the MCP baseline is the file Claude reads for `~/.claude`, and the step names it.
+- `scripts/accounts/test_accounts.py::AccountsTests::test_status_explains_empty_account_rows_in_the_table_and_json_without_login_addresses` — `check()` no longer carries the state source, so the test clears readiness problems instead; its assertions stay.
+- `scripts/accounts/test_accounts.py::PickerTests::test_unnoted_claude_home_is_displayed_but_never_selected_or_a_destination` and `::test_legacy_group_for_an_unnoted_home_is_display_only_and_cannot_launch` — the unnoted-home cause names its note path and the setup step.
+- `scripts/accounts/test_accounts.py::StatusProblemCauseTests::test_reserved_login_reports_the_test_file_and_write_time_without_account_steps` and `::test_unnoted_legacy_login_merges_read_failure_and_keeps_both_repairs` — an independent usage failure stays its own line.
+- `scripts/accounts/test_role_map.py::RoleMapTests::test_status_refuses_an_unavailable_remote_map_unless_stored` and `::test_stored_status_uses_cached_group_assignments_and_workers_instead_of_local_selections` — role availability binds to the account-state cause; observed account problems print before the final error.
+- Rejected: `StatusProblemCauseTests::test_duplicate_identity_keeps_independent_rate_limit_and_its_times` must still assert which accounts the one duplicate-login line names.
+- `scripts/accounts/test_accounts.py::StatusProblemCauseTests::test_account_state_merge_uses_the_cause_after_wording_changes` — its summary input carries an explicit source observed by readiness, since an unlinked summary no longer merges (repair round 1).
+- Rejected: `test_test_signin_with_malformed_or_unreadable_note_has_only_delete_advice` keeps a check that the real producer's diagnostic is an `UnreadableAccountNote`.
 
 **Workers:** 1 writer, no split.
 - `impl` — all files.
@@ -2817,7 +2820,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` passes with a scratch HOME set before import; `basedpyright` on the changed Python files reads `0 errors, 0 warnings, 0 notes`; each of the three stop-and-rerun tests fails on the code before the change.
 
-### Phase 97 — A stopped Codex fallback switch is finished by its rerun  · status: todo
+### Phase 97 — A stopped Codex fallback switch is finished by its rerun  · status: done
 
 **Depends on:** Phase 95 (order only)
 
@@ -2834,6 +2837,10 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Files:**
 - `scripts/whoami/quota_alert.py` — the pending switch, the kept failed keys, the consumption check.
 - `scripts/whoami/test_quota_alert.py` — one stop-and-rerun test per row; `scripts/whoami/quota_alert_test_support.py` holds the shared fixtures.
+- `scripts/whoami/test_codex_alert_accounts.py` — the failed-restore test expects the retry (repair round 1).
+- `scripts/whoami/test_quota_zero_episode.py` — each subcase of the uncertain-switch test starts from its own state, so a pending switch from one subcase is not recovered in the next; no assertion changes (repair round 1).
+
+**Assertion-Change** (accepted at review pass 1): `scripts/whoami/test_codex_alert_accounts.py::CodexAccountAlertTests::test_failed_restoration_is_attempted_and_reported_once` — a failed restore key is kept and retried by the next pass, so the attempt count follows the retry; the failure is still reported once.
 
 **Workers:** 1 writer + 1 tester.
 - `impl` — `quota_alert.py`.
@@ -2868,6 +2875,10 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/whoami/five_hour.py` — the claim and sent marker; the kept cancel file.
 - `scripts/production/codex_winddown.py` — the quiet claim; the owed at-zero state.
 - `scripts/whoami/test_five_hour.py`, `scripts/production/test_codex_winddown.py` — one stop-and-rerun test per row, and one failed-send test per send.
+
+**Assertion-Change** (accepted at review pass 1): `scripts/whoami/test_five_hour.py::WatchTests::test_a_low_window_tells_the_alert_list_once_without_a_phone_hold`, renamed `test_a_low_window_retries_failed_relays_without_a_phone_hold` — after a failed relay no sent marker exists and the next pass relays again; the retry relays only to the recipient that failed, so the send count is 3, not 4; the sent marker and the empty later pass are asserted after the successful retry. `WatchTests::test_no_reading_changes_nothing` — the relay succeeds, so the unchanged marker assertion is about a sent warning.
+
+**Repair round 1:** a retry relays only to the recipients that did not get the warning; a recipient that already got it gets no second copy.
 
 **Workers:** 2 writers, split by file (no file in both).
 - `impl` — `scripts/whoami/five_hour.py`, `scripts/whoami/test_five_hour.py`.
