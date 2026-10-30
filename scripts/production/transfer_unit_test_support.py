@@ -19,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fake_showrunner
-import fake_unit_host
+from scripts.production import fake_unit_host
 
 from scripts.herdr import fake_herdr
 from scripts.direct import review_pool
@@ -228,24 +228,9 @@ class UnitTransferFixture(StaffTestCase):
     def seed_record(self) -> Path:
         """A stopped unit's shutdown record, as `shutdown.py down` leaves it, and a shutdown stub that logs calls."""
         home = self.root / "home"
-        session: dict[str, object] = {
-            "session_id": "sid-alpha", "config_dir": str(home / ".claude"), "pid": 4242, "proc_start": "1",
-            "name": "alpha", "cwd": str(self.unit), "status": "idle", "updated_at": 0, "probe": False,
-            "model": {"kind": "no reply yet"},
-            "checkout": {"kind": "git", "path": str(self.unit), "head": {"kind": "branch", "name": "demo-alpha"},
-                         "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []},
-            "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
-            "host": {"kind": "unit", "production": "demo", "unit": "alpha-unit",
-                     "doc": str(self.giving / "docs/plans/demo-production.md"), "session_name": "demo-alpha",
-                     "session_host": "herdr", "plan": {"kind": "plan", "path": f"{self.unit}/docs/plans/alpha.md"}}}
-        saved: dict[str, object] = {
-            "login": "owner@example.com", "label": "claude2", "machine": "natedev",
-            "requested_at": "2026-10-09T21:49:10+00:00", "request_id": "request",
-            "requested_by": {"kind": "terminal"}, "hold": "session", "then": "stop", "force": "wait for ready",
-            "alerts": "none", "probe": False, "session": session, "workers": [], "timers": [],
-            "settle_message": {"kind": "not sent"}, "where": {"kind": "not said"},
-            "progress": {"kind": "stopped", "at": "2026-10-09T21:50:00+00:00"}, "stop_issues": [], "trail": [],
-            "codex_seats": []}
+        saved = fake_unit_host.stopped_record(home / ".claude", self.unit,
+            doc=self.giving / "docs/plans/demo-production.md", host_session="demo-alpha",
+            branch="demo-alpha", plan=self.unit / "docs/plans/alpha.md")
         script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import shutdown_record; "
                   + "assert shutdown_record.create_session(json.loads(sys.stdin.read()))")
         created = subprocess.run([sys.executable, "-c", script, str(SCRIPT.parents[1] / "shutdown")],

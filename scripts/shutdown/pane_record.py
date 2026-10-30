@@ -179,14 +179,26 @@ def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
     return list(parts.arguments), parts.environment
 
 
+def _process_stat(process: Path) -> list[str]:
+    return (process / "stat").read_text().rsplit(")", 1)[1].split()
+
+
 def process_parent(pid: int) -> int:
     """Read the OS parent; callers decide how unavailable evidence is handled."""
     if (os.environ.get("HERDR_PLATFORM") or sys.platform) == "darwin":
         result = subprocess.run([os.environ.get("HERDR_PS", "ps"), "-o", "ppid=", "-p", str(pid)],
                                 capture_output=True, text=True, check=True, timeout=5)
         return int(result.stdout)
-    stat = (Path(os.environ.get("HERDR_PROC") or PROC) / str(pid) / "stat").read_text()
-    return int(stat.rsplit(")", 1)[1].split()[1])
+    return int(_process_stat(Path(os.environ.get("HERDR_PROC") or PROC) / str(pid))[1])
+
+
+def pane_shell_pid(place: herdr.HerdrPlace) -> int:
+    info = herdr.json_object(herdr.Herdr(place.session).result(
+        "pane", "process-info", "--pane", place.pane).get("process_info"), "pane process info")
+    shell = info.get("shell_pid")
+    if isinstance(shell, bool) or not isinstance(shell, int) or shell <= 0:
+        raise ValueError("pane process info: expected a positive shell_pid")
+    return shell
 
 
 def _arguments(pid: int) -> list[str]:

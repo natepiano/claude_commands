@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import pickle
-import re
 import subprocess
 import sys
 import tempfile
@@ -21,11 +20,11 @@ from scripts.shot_report.episodes import (
 )
 from scripts.shot_report.transcripts import (
     AttemptCountInferredFromImages, AvailableTimingSource, ExactAttemptCountFromOrderedCaptures, ExactOrderedCaptureAttempts,
-    FailedCapture, HanaShotDurationUnavailable, MeasuredHanaShotDuration, NamedCaptureView, PersistentScanCache,
-    RememberedScript, SelectedCaptureTarget, SuccessfulCapture, ToolCall, TranscriptScan, TranscriptToolEvent,
+    FailedCapture, HanaShotDurationUnavailable, MeasuredHanaShotDuration, NamedCaptureView, NO_SCAN_CACHE, PersistentScanCache,
+    ProjectAttribution, RememberedScript, SelectedCaptureTarget, SuccessfulCapture, ToolCall, TranscriptScan, TranscriptToolEvent,
     parsed_tool_event_category, scan_calls,
 )
-from scripts.shot_report.transcripts import _classify, _remember  # pyright: ignore[reportPrivateUsage]
+from scripts.shot_report.transcripts import _classify, _claude_encoded, _remember  # pyright: ignore[reportPrivateUsage]
 from scripts.shot_report.transcripts import CachedScanEvidence
 
 
@@ -66,10 +65,10 @@ def _claude_case(path: Path, calls: list[tuple[str, str, object]], cwd: str = "/
     _ = path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
-def _codex_case(path: Path, commands: list[str], packed: bool = False) -> None:
+def _codex_case(path: Path, commands: list[str], packed: bool = False, *, cwd: str = "/fictional/studio") -> None:
     rows: list[dict[str, object]] = [{
         "timestamp": START.isoformat(), "type": "session_meta",
-        "payload": {"id": path.stem, "cwd": "/fictional/studio"},
+        "payload": {"id": path.stem, "cwd": cwd},
     }]
     for number, command in enumerate(commands):
         stamp = START + timedelta(seconds=number * 30)
@@ -85,6 +84,13 @@ def _codex_case(path: Path, commands: list[str], packed: bool = False) -> None:
         ))
     path.parent.mkdir(parents=True, exist_ok=True)
     _ = path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def _project_cases(root: Path, cwd: Path) -> None:
+    _claude_case(root / "claude" / "project.jsonl", [
+        ("mcp__brp__brp_extras_screenshot", "", "saved /tmp/view.png"),
+    ], str(cwd))
+    _codex_case(root / "codex" / "project.jsonl", ["python3 hana_shot.py shot --view front"], cwd=str(cwd))
 
 
 def _claude_tools(path: Path, tools: list[tuple[str, dict[str, object], bool]], cwd: str) -> None:
@@ -118,6 +124,20 @@ def _codex_part(seconds: int, part: dict[str, object]) -> dict[str, object]:
 
 
 class TranscriptTest(unittest.TestCase):
+    def _assert_cwd_attribution(self, root: Path, cwd: Path, scratchpad_roots: tuple[Path, ...],
+                                project: str, attribution: ProjectAttribution) -> None:
+        _project_cases(root, cwd)
+        persistent = PersistentScanCache(root / "scan.pickle")
+        for mode, cache in (("full", NO_SCAN_CACHE), ("cold", persistent), ("warm", persistent)):
+            with self.subTest(mode=mode):
+                calls = scan_calls(root / "claude", root / "codex", cache=cache, scratchpad_roots=scratchpad_roots)
+                self.assertEqual(sorted((call.agent, call.project, call.project_attribution, call.cwd) for call in calls), [
+                    ("Claude", project, attribution, str(cwd)),
+                    ("Codex", project, attribution, str(cwd)),
+                ])
+                if mode == "warm":
+                    self.assertEqual(calls.bytes_read, 0)
+
     def test_split_episodes_scales_by_transcript_instead_of_all_tool_events(self) -> None:
         calls: list[ToolCall] = []
         events: list[TranscriptToolEvent] = []
@@ -389,7 +409,7 @@ class TranscriptTest(unittest.TestCase):
             repo = root / "widget"
             repo.mkdir()
             _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            encoded = re.sub(r"[^A-Za-z0-9]", "-", str(repo))
+            encoded = _claude_encoded(repo)
             scratchpad = str(root / "claude-live" / encoded / "scratchpad")
             claude_rows = [
                 {"timestamp": START.isoformat(), "type": "system", "cwd": str(repo), "sessionId": "claude-main",
@@ -433,8 +453,9 @@ class TranscriptTest(unittest.TestCase):
                         with path.open("a") as target:
                             _ = target.write("".join(lines[previous:cut]))
                         previous = cut
-                        cached = scan_calls(scan_root / "claude", scan_root / "codex", cache=cache)
-                        complete = scan_calls(scan_root / "claude", scan_root / "codex")
+                        cached = scan_calls(scan_root / "claude", scan_root / "codex", cache=cache,
+                                            scratchpad_roots=(root,))
+                        complete = scan_calls(scan_root / "claude", scan_root / "codex", scratchpad_roots=(root,))
                         cached_fields = [(call.project, call.project_attribution, call.cwd,
                                           call.session_id, call.kind, call.image_paths) for call in cached]
                         complete_fields = [(call.project, call.project_attribution, call.cwd,
@@ -444,7 +465,8 @@ class TranscriptTest(unittest.TestCase):
                         self.assertEqual(cached.candidate_file_count, int(stage >= 2))
                         if stage == 2:
                             self.assertEqual(cached.bytes_read, path.stat().st_size)
-                    final_cached = scan_calls(scan_root / "claude", scan_root / "codex", cache=cache)
+                    final_cached = scan_calls(scan_root / "claude", scan_root / "codex", cache=cache,
+                                              scratchpad_roots=(root,))
                     self.assertEqual((len(final_cached), final_cached.bytes_read), (1, 0))
                     self.assertEqual((final_cached[0].project, final_cached[0].image_paths),
                                      ("widget", ("/tmp/front.png",)))
@@ -480,6 +502,53 @@ class TranscriptTest(unittest.TestCase):
             _ = cache.path.write_bytes(b"\x80\x04invalid")
             repaired = scan_calls(root / "claude", root / "codex", cache=cache)
             self.assertEqual((len(repaired), repaired.bytes_read), (1, transcript.stat().st_size))
+
+    def test_warm_cache_rebuilds_attribution_when_scratchpad_roots_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "widget"
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            cwd = root / "claude-cache" / _claude_encoded(repo) / "session" / "scratchpad" / "probe"
+            _project_cases(root, cwd)
+            cache = PersistentScanCache(root / "scan.pickle")
+            first = scan_calls(root / "claude", root / "codex", cache=cache, scratchpad_roots=(root,))
+            self.assertEqual(sorted((call.agent, call.project, call.project_attribution) for call in first), [
+                ("Claude", "widget", "scratchpad"), ("Codex", "widget", "scratchpad"),
+            ])
+            self.assertGreater(first.bytes_read, 0)
+            self.assertEqual(scan_calls(root / "claude", root / "codex", cache=cache,
+                                        scratchpad_roots=(root,)).bytes_read, 0)
+
+            other_root = root / "other-temp-parent"
+            other_root.mkdir()
+            changed = scan_calls(root / "claude", root / "codex", cache=cache, scratchpad_roots=(other_root,))
+            fresh = scan_calls(root / "claude", root / "codex", scratchpad_roots=(other_root,))
+            self.assertEqual(sorted((call.agent, call.project, call.project_attribution) for call in changed), [
+                ("Claude", "probe", "last_path"), ("Codex", "probe", "last_path"),
+            ])
+            self.assertEqual(changed, fresh)
+            self.assertEqual(changed.bytes_read, first.bytes_read)
+            self.assertEqual(scan_calls(root / "claude", root / "codex", cache=cache,
+                                        scratchpad_roots=(other_root,)).bytes_read, 0)
+
+    def test_saved_cache_without_scratchpad_roots_reuses_default_attribution_without_rereading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _project_cases(root, Path("/fictional/studio"))
+            cache = PersistentScanCache(root / "scan.pickle")
+            first = scan_calls(root / "claude", root / "codex", cache=cache)
+            self.assertEqual(sorted((call.agent, call.project, call.project_attribution) for call in first), [
+                ("Claude", "studio", "last_path"), ("Codex", "studio", "last_path"),
+            ])
+            self.assertGreater(first.bytes_read, 0)
+            state = cast(CachedScanEvidence, pickle.loads(cache.path.read_bytes()))
+            _ = cast(dict[str, object], vars(state)).pop("scratchpad_roots", None)
+            _ = cache.path.write_bytes(pickle.dumps(state))
+
+            reused = scan_calls(root / "claude", root / "codex", cache=cache)
+
+            self.assertEqual(reused, first)
+            self.assertEqual(reused.bytes_read, 0)
 
     def test_previous_cache_version_reparses_hana_source_searches(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -778,8 +847,8 @@ class TranscriptTest(unittest.TestCase):
             repo.mkdir()
             _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
             missing = root / "hana_catalyst-feature"
-            encoded_live = "-" + "-".join(repo.parts[1:]).replace("_", "-")
-            encoded_missing = "-" + "-".join(missing.parts[1:]).replace("_", "-")
+            encoded_live = _claude_encoded(repo)
+            encoded_missing = _claude_encoded(missing)
             for label, encoded in (("live", encoded_live), ("missing", encoded_missing)):
                 _claude_case(root / "claude" / f"{label}.jsonl", [
                     ("mcp__brp__brp_extras_screenshot", "", "saved x.png"),
@@ -787,7 +856,7 @@ class TranscriptTest(unittest.TestCase):
             _claude_case(root / "claude" / "main.jsonl", [
                 ("mcp__brp__brp_extras_screenshot", "", "saved y.png"),
             ], str(repo))
-            calls = scan_calls(root / "claude", root / "codex")
+            calls = scan_calls(root / "claude", root / "codex", scratchpad_roots=(root,))
         by_name = {Path(call.transcript_path).stem: call for call in calls}
         self.assertEqual(by_name["live"].project, "hana_catalyst")
         self.assertEqual(by_name["live"].project_attribution, "scratchpad")
@@ -810,11 +879,11 @@ class TranscriptTest(unittest.TestCase):
                 ], str(repo))
             for name in ("hana_catalyst-feature", "render.engine-feature", "absent-project-feature"):
                 target = worktrees / name
-                encoded = re.sub(r"[^A-Za-z0-9]", "-", str(target))
+                encoded = _claude_encoded(target)
                 _claude_case(root / "claude" / f"missing-{name}.jsonl", [
                     ("mcp__brp__brp_extras_screenshot", "", "saved b.png"),
                 ], f"{root}/claude-1/{encoded}/session/scratchpad")
-            calls = scan_calls(root / "claude", root / "codex")
+            calls = scan_calls(root / "claude", root / "codex", scratchpad_roots=(root,))
         by_name = {Path(call.transcript_path).stem: call for call in calls}
         self.assertEqual((by_name["missing-hana_catalyst-feature"].project,
                           by_name["missing-hana_catalyst-feature"].project_attribution),
@@ -825,6 +894,27 @@ class TranscriptTest(unittest.TestCase):
         self.assertEqual((by_name["missing-absent-project-feature"].project,
                           by_name["missing-absent-project-feature"].project_attribution),
                          ("absent-project-feature", "scratchpad_target_missing"))
+
+    def test_repository_under_scratchpad_shape_outside_configured_root_keeps_repository_attribution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "claude-9" / _claude_encoded(Path("/x/y")) / "s" / "scratchpad" / "repo"
+            repo.mkdir(parents=True)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            other_root = root / "other-temp-parent"
+            other_root.mkdir()
+            self._assert_cwd_attribution(root, repo, (other_root,), "repo", "repository")
+
+    def test_scratchpad_decodes_nested_repository_without_decoding_outer_project(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            outer = root / "outer"
+            _ = subprocess.run(["git", "init", "-q", str(outer)], check=True)
+            repo = root / "claude-9" / _claude_encoded(outer) / "s" / "scratchpad" / "repo"
+            repo.mkdir(parents=True)
+            _ = subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            cwd = root / "claude-1" / _claude_encoded(repo) / "session" / "scratchpad"
+            self._assert_cwd_attribution(root, cwd, (root,), "repo", "scratchpad")
 
     def test_python_wrapper_runs_remembered_shell_shot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -959,7 +1049,7 @@ class TranscriptTest(unittest.TestCase):
                 _claude_case(root / "claude" / f"{name}.jsonl", [
                     ("mcp__brp__brp_extras_screenshot", "", "saved x.png"),
                 ], str(cwd))
-            calls = scan_calls(root / "claude", root / "codex")
+            calls = scan_calls(root / "claude", root / "codex", scratchpad_roots=(root,))
         notes_call = next(call for call in calls if Path(call.transcript_path).stem == "notes")
         self.assertEqual((notes_call.project, notes_call.project_attribution), ("hana-notes", "last_path"))
 
@@ -1058,12 +1148,12 @@ class TranscriptTest(unittest.TestCase):
             _ = subprocess.run([
                 "git", "-C", str(repo), "worktree", "add", "-q", "-b", "enhancements", str(worktree),
             ], check=True)
-            encoded = re.sub(r"[^A-Za-z0-9]", "-", str(worktree))
-            cwd = f"/tmp/claude-1000/{encoded}/session/scratchpad/run"
+            encoded = _claude_encoded(worktree)
+            cwd = str(root / "claude-1000" / encoded / "session" / "scratchpad" / "run")
             _claude_case(root / "claude" / "scratchpad.jsonl", [
                 ("mcp__brp__brp_extras_screenshot", "", "saved /tmp/pad.png"),
             ], cwd)
-            calls = scan_calls(root / "claude", root / "codex")
+            calls = scan_calls(root / "claude", root / "codex", scratchpad_roots=(root,))
         self.assertEqual([call.project for call in calls], ["widget"])
         self.assertEqual([call.project_attribution for call in calls], ["scratchpad"])
 
@@ -1259,7 +1349,7 @@ class TranscriptTest(unittest.TestCase):
             _claude_case(root / "claude" / "live.jsonl", [
                 ("mcp__brp__brp_extras_screenshot", "", "saved /tmp/b.png"),
             ], str(repo))
-            calls = scan_calls(root / "claude", root / "codex")
+            calls = scan_calls(root / "claude", root / "codex", scratchpad_roots=(root,))
             self.assertEqual({call.project for call in calls}, {"studio"})
             live = next(call for call in calls if Path(call.transcript_path).stem == "live")
             self.assertEqual(live.project_attribution, "repository")
@@ -1277,7 +1367,7 @@ class TranscriptTest(unittest.TestCase):
             _claude_case(root / "claude" / "missing.jsonl", [
                 ("mcp__brp__brp_extras_screenshot", "", "saved /tmp/b.png"),
             ], str(root / "studio-feature-old"))
-            calls = scan_calls(root / "claude", root / "codex")
+            calls = scan_calls(root / "claude", root / "codex", scratchpad_roots=(root,))
             missing = next(call for call in calls if Path(call.transcript_path).stem == "missing")
             self.assertEqual(missing.project, "studio-feature")
 

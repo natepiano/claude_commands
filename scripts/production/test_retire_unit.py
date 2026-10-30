@@ -29,7 +29,7 @@ import unit_lookup
 import unit_move
 from herdr import HerdrPlace
 from production_units import Production, read_production
-from scripts.production.unit_operation_test_support import PaneShellFixture, assert_pane_shell_refused
+from scripts.production.fake_unit_host import PaneShellFixture, stopped_record
 
 if TYPE_CHECKING:
     from scripts.message import sessions
@@ -217,18 +217,41 @@ class RetireUnitTests(unittest.TestCase):
     def stops(self) -> list[list[str]]:
         return [call for call in self.calls if call[:2] != ["review_pool.py", "status"]]
 
-    def pane_shell_refused(self, *, live: bool) -> None:
-        pane = PaneShellFixture(self, self.worktree, self.root / "pane-proc", live=live, slug="alpha")
-
-        def invoke() -> subprocess.CompletedProcess[str]:
+    def pane_shell_completes(self, *, live: bool) -> None:
+        pane = PaneShellFixture(self, self.worktree, self.root / "proc", live=live, slug="alpha")
+        pane.found = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude(
+            "alpha", DIRECTOR, "socket", pane.director) if live else unit_lookup.ClaudeNotRunning(), pane.place)
+        saved = stopped_record(self.root, self.worktree)
+        saved["session"]["session_id"] = DIRECTOR
+        host = saved["session"]["host"]
+        assert host["kind"] == "unit"
+        host["production"], host["doc"] = "alpha", str(self.doc)
+        self.records = []
+        self.claude = [session(DIRECTOR,"alpha",pane.director)] if live else []
+        self.enterContext(mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown")}))
+        def clean_stop() -> None:
+            pane.stopped()
+            self.claude = []
+            self.assertTrue(shutdown_record.create_session(saved))
+            self.records = [saved]
+        original = self.fake_run
+        def run(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            result = original(argv,cwd)
+            if str(retire_unit.SHUTDOWN) in argv and "down" in argv:
+                clean_stop()
+            return result
+        if not live:
+            clean_stop()
+        with mock.patch.object(retire_unit, "run", side_effect=run):
             code, output = self.retire("--wait-minutes", "0")
-            return subprocess.CompletedProcess(["retire"], code, output, "")
+        self.assertEqual(code, 0, output)
+        self.assertEqual(pane.close_calls(), [["--session","agents","pane","close","w1:p1"]])
+        self.assertFalse(self.worktree.exists())
+        self.assertIn("retired", self.doc.read_text())
+        self.assertEqual(sum(call[:2] == ["shutdown.py","down"] for call in self.calls), int(live))
 
-        before = self.doc.read_bytes()
-        assert_pane_shell_refused(self, pane, invoke)
-        self.assertEqual(self.calls, [], "preflight must not run any shutdown or cleanup command")
-        self.assertEqual(self.doc.read_bytes(), before)
-        self.assertTrue(self.worktree.is_dir())
+    def test_live_director_in_pane_shell_stops_closes_and_retires(self) -> None:
+        self.pane_shell_completes(live=True)
 
     def staff_unit(self) -> tuple[staff.StaffRow, staff.StaffRow]:
         runner = staff.ensure("showrunner", name="tools")
@@ -269,11 +292,52 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (data, document))
 
-    def test_live_director_in_pane_shell_refuses_before_stop(self) -> None:
-        self.pane_shell_refused(live=True)
+    def test_exited_directors_pane_shell_closes_and_retires(self) -> None:
+        self.pane_shell_completes(live=False)
 
-    def test_exited_directors_pane_shell_refuses_before_stop(self) -> None:
-        self.pane_shell_refused(live=False)
+    def test_unowned_cwd_visitor_or_other_units_shell_blocks_without_signals(self) -> None:
+        for marked_pane in (False,True):
+            for visitor_unit in ("", "beta-unit"):
+                with self.subTest(marked_pane=marked_pane, visitor_unit=visitor_unit):
+                    self.claude = []
+                    self.marked = None
+                    unit = retire_unit.find_unit("alpha", "alpha")
+                    self.records = []
+                    pane = PaneShellFixture(self, self.worktree, self.root / "visitor-proc", live=False, slug="alpha")
+                    pane.add_occupant(991551, unit=visitor_unit, marked=bool(visitor_unit))
+                    if not marked_pane:
+                        pane.found = None
+                    before = self.doc.read_bytes()
+                    with (mock.patch.object(retire_unit, "terminate", return_value=[]) as signals,
+                          mock.patch.object(retire_unit, "_alive", return_value=True)):
+                        remaining = retire_unit.gather(unit)
+                        left = retire_unit.stop_rest(unit, remaining)
+                    self.assertTrue(any("991551" in line for line in left), left)
+                    self.assertFalse(any(991551 in call.args[0] for call in signals.call_args_list), "cwd is no stop authority")
+                    self.assertEqual(self.doc.read_bytes(), before)
+                    self.assertTrue(self.worktree.is_dir())
+                    self.assertEqual(pane.close_calls(), [])
+                    with mock.patch.object(retire_unit, "terminate", return_value=[]) as signals:
+                        code, output = self.retire("--wait-minutes", "0")
+                    self.assertEqual(code, 1, output)
+                    self.assertFalse(any(991551 in call.args[0] for call in signals.call_args_list))
+                    self.assertEqual(self.doc.read_bytes(), before)
+                    self.assertTrue(self.worktree.is_dir())
+                    self.assertEqual(pane.close_calls(), [])
+
+    def test_registered_claude_in_the_checkout_is_not_owned_by_cwd(self) -> None:
+        visitor = session("33333333-3333-3333-3333-333333333333", "visitor", 991551)
+        with (mock.patch.object(sessions, "live_sessions", return_value=[visitor]),
+              mock.patch.object(unit_move, "processes_inside", return_value=[991551])):
+            self.assertEqual(CLAUDE_SESSIONS(self.worktree, frozenset()), ())
+
+    def test_process_gone_after_owned_cleanup_does_not_remain_a_cwd_blocker(self) -> None:
+        unit = retire_unit.find_unit("alpha", "alpha")
+        found = retire_unit.Found((), (), (), (), (), (), (991551,))
+        with (mock.patch.object(unit_move, "processes_inside", return_value=[]),
+              mock.patch.object(retire_unit, "terminate", return_value=[]) as signals):
+            self.assertEqual(retire_unit.stop_rest(unit, found), [])
+        self.assertFalse(any(991551 in call.args[0] for call in signals.call_args_list))
 
     def test_refuses_uncommitted_work_and_an_unmerged_checkpoint_and_changes_nothing(self) -> None:
         _ = (self.worktree / "late.txt").write_text("late\n", encoding="utf-8")

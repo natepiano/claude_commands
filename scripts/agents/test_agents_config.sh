@@ -8,20 +8,17 @@ TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agents-config.XXXXXX")"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
 AGENTS_CONFIG_FILE="$TEST_DIR/agents.conf"
-AGENTS_LOCAL_CONFIG_FILE="$TEST_DIR/agents.local.conf"
+AGENTS_CONFIG_PUBLISH=0
 CODEX_CONFIG_FILE="$TEST_DIR/codex.toml"
 CODEX_MODELS_CACHE_FILE="$TEST_DIR/models.json"
 CODEX_CATALOG_SYNC_STATE_FILE="$TEST_DIR/last_success"
-export AGENTS_CONFIG_FILE AGENTS_LOCAL_CONFIG_FILE CODEX_CONFIG_FILE
+export AGENTS_CONFIG_FILE AGENTS_CONFIG_PUBLISH CODEX_CONFIG_FILE
 export CODEX_MODELS_CACHE_FILE CODEX_CATALOG_SYNC_STATE_FILE
 
 touch "$CODEX_CATALOG_SYNC_STATE_FILE"
 
 write_fixture() {
-    # Model editable machine rows above immutable, empty defaults. Deleting a
-    # local override is different from trying to delete a committed default.
-    : > "$AGENTS_CONFIG_FILE"
-    cp "$1" "$AGENTS_LOCAL_CONFIG_FILE"
+    cp "$1" "$AGENTS_CONFIG_FILE"
 }
 
 write_test_registry "$TEST_DIR/base.conf" --replace-provided-sections --replace-section claude.families \
@@ -117,9 +114,7 @@ assert_fails() {
     fi
 }
 
-# Overlay writers preserve rows, while section order and comments belong to
-# the committed defaults. Compare the effective records, including every row,
-# so an unexpected change outside the requested edit still fails the test.
+# Compare every semantic row so edits outside the requested target fail.
 assert_registry_matches() {
     diff -u <(registry_records < "$1") <(agents_registry_text | registry_records)
 }
@@ -128,7 +123,6 @@ test_model_families() (
     # Keep these fixtures separate from the legacy mutation cases below. A
     # generated family row may lag the cache until the next catalog sync.
     AGENTS_CONFIG_FILE="$TEST_DIR/families.conf"
-    AGENTS_LOCAL_CONFIG_FILE="$TEST_DIR/families.local.conf"
     # /agent sources the resolver in a child; keep the freshness gate closed
     # so these effort-less cache fixtures exercise resolution alone.
     AGENTS_CONFIG_TIER_ONLY=1
@@ -184,14 +178,16 @@ EOF
     [[ "$family_display" == *" word=sol"* && "$family_display" == *" agent=gpt-6.10-sol "* ]] \
         || fail "/agent did not display both the family word and its current slug"
 
-    # Missing, malformed and hidden-only caches must never fall back to the
+    # Unreadable and hidden-only caches must never fall back to the
     # previously generated family row. Explicit slugs remain usable offline.
     no_model_message="no Codex model for 'sol' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug"
-    for cache_state in other-family hidden-only missing malformed unreadable; do
+    for cache_state in other-family hidden-only missing empty malformed unreadable; do
+        expected_error="the models cache could not be read: $CODEX_MODELS_CACHE_FILE"
         case "$cache_state" in
-            other-family) printf '%s\n' '{"models":[{"slug":"gpt-6-astra","visibility":"list"}]}' > "$CODEX_MODELS_CACHE_FILE" ;;
-            hidden-only) printf '%s\n' '{"models":[{"slug":"gpt-9-sol","visibility":"hide"}]}' > "$CODEX_MODELS_CACHE_FILE" ;;
+            other-family) printf '%s\n' '{"models":[{"slug":"gpt-6-astra","visibility":"list"}]}' > "$CODEX_MODELS_CACHE_FILE"; expected_error="$no_model_message" ;;
+            hidden-only) printf '%s\n' '{"models":[{"slug":"gpt-9-sol","visibility":"hide"}]}' > "$CODEX_MODELS_CACHE_FILE"; expected_error="$no_model_message" ;;
             missing) rm -f "$CODEX_MODELS_CACHE_FILE" ;;
+            empty) : > "$CODEX_MODELS_CACHE_FILE" ;;
             malformed) printf '%s\n' '{invalid' > "$CODEX_MODELS_CACHE_FILE" ;;
             unreadable)
                 printf '%s\n' '{"models":[{"slug":"gpt-6.10-sol","visibility":"list"}]}' > "$CODEX_MODELS_CACHE_FILE"
@@ -205,8 +201,11 @@ EOF
         fi
         resolve_status=0
         stderr_out="$(agents_resolve launch.work 2>&1 >/dev/null)" || resolve_status=$?
-        [[ "$resolve_status" -eq 1 && "$stderr_out" == *"$no_model_message"* ]] \
+        [[ "$resolve_status" -eq 1 && "$stderr_out" == *"$expected_error"* ]] \
             || fail "$cache_state cache did not refuse sol with the named recovery message: $stderr_out"
+        if [[ "$expected_error" != "$no_model_message" && "$stderr_out" == *"no Codex model"* ]]; then
+            fail "$cache_state cache was mistaken for a missing model"
+        fi
         agents_resolve launch.pinned || fail "full slug required a usable cache ($cache_state)"
         [[ "$AGENT_MODEL" == gpt-6.9-sol && "$AGENT_EFFORT" == high ]] \
             || fail "offline full slug resolved incorrectly ($cache_state)"
@@ -223,12 +222,10 @@ test_model_families
 
 test_family_repairs() (
     AGENTS_CONFIG_FILE="$TEST_DIR/family-repairs.conf"
-    AGENTS_LOCAL_CONFIG_FILE="$TEST_DIR/family-repairs.local.conf"
     CODEX_MODELS_CACHE_FILE="$TEST_DIR/family-repairs.json"
     AGENTS_CONFIG_TIER_ONLY=1
     export AGENTS_CONFIG_TIER_ONLY
-    : > "$AGENTS_CONFIG_FILE"
-    write_test_registry "$AGENTS_LOCAL_CONFIG_FILE" --replace-provided-sections \
+    write_test_registry "$AGENTS_CONFIG_FILE" --replace-provided-sections \
         assignments/direct=codex \
         assignments/probe=codex \
         assignments/dormant=claude \
@@ -292,11 +289,11 @@ EOF
 
     agents_set_assignment dormant claude
     rm "$CODEX_MODELS_CACHE_FILE"
-    no_model_message="no Codex model for 'sol' in ~/.codex/models_cache.json; run codex once to refresh the cache, or name the full slug"
+    no_model_message="the models cache could not be read: $CODEX_MODELS_CACHE_FILE"
     admin_output="$(bash "$SCRIPT_DIR/agent_admin.sh" dormant)" \
         || fail "missing cache blocked status for a function running on Claude"
     dormant_display="$(printf '%s\n' "$admin_output" | awk '/^task=dormant.work family=codex /')"
-    [[ "$dormant_display" == *"sol (unresolved: $no_model_message)"* && "$dormant_display" == *"active=no"* ]] \
+    [[ "$dormant_display" == *"sol (unresolved: $no_model_message"* && "$dormant_display" == *"active=no"* ]] \
         || fail "status omitted the unresolved dormant family and its recovery reason: $admin_output"
     [[ "$admin_output" == *"task=dormant.work family=claude agent=haiku effort=high active=yes"* \
         && "$admin_output" == *"# current family: claude"* ]] \
@@ -305,7 +302,7 @@ EOF
     [[ "$AGENT_MODEL" == haiku ]] || fail "Claude launch used the dormant family"
     admin_output="$(bash "$SCRIPT_DIR/agent_admin.sh" probe)" \
         || fail "missing cache blocked status for an active family row"
-    [[ "$admin_output" == *"sol (unresolved: $no_model_message)"* ]] \
+    [[ "$admin_output" == *"sol (unresolved: $no_model_message"* ]] \
         || fail "active family status did not show its resolution failure"
     resolve_status=0
     stderr_out="$(agents_resolve probe.work 2>&1 >/dev/null)" || resolve_status=$?
@@ -348,13 +345,13 @@ stderr_out="$(agents_resolve bare_catalog_effort.work 2>&1 >/dev/null || true)"
 [[ "$stderr_out" != *"is not allowed for family"* ]] || fail "empty-effort catalog agent with effort failed as an unknown-agent error"
 
 before="$TEST_DIR/before.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "invalid assignment set" agents_set_assignment switchable claude
 assert_registry_matches "$before" || fail "rejected assignment changed the registry"
 
 before="$TEST_DIR/assignable-before.conf"
 expected="$TEST_DIR/assignable-expected.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 sed 's/^assignable=codex$/assignable=claude/' "$before" > "$expected"
 agents_set_assignment assignable claude
 assert_registry_matches "$expected" || fail "successful assignment changed rows other than its assignment"
@@ -364,13 +361,13 @@ agents_resolve assignable.work
 
 before="$TEST_DIR/editable-before.conf"
 expected="$TEST_DIR/editable-expected.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "invalid row agent" agents_set_row editable.work nosuch:high
 assert_registry_matches "$before" || fail "rejected row agent changed the registry"
 assert_fails "invalid row effort" agents_set_row editable.work gpt-test:max
 assert_registry_matches "$before" || fail "rejected row effort changed the registry"
 awk '/^\[/ { editing = ($0 == "[editable.codex]") }
-     editing { sub(/^work=gpt-test:high$/, "work=gpt-bare") }
+     editing { sub(/^work=gpt-test:high([[:space:]]*#.*)?$/, "work=gpt-bare") }
      { print }' "$before" > "$expected"
 agents_set_row editable.work gpt-bare
 assert_registry_matches "$expected" || fail "successful row edit changed rows other than its target"
@@ -379,7 +376,7 @@ agents_resolve editable.work
 agents_set_row editable.work gpt-test:high
 assert_registry_matches "$before" || fail "row edit reversal changed registry rows"
 awk '/^\[/ { editing = ($0 == "[editable.codex]") }
-     editing && $0 == "work=gpt-test:high" { print "work=gpt\\bs:low"; next }
+     editing && /^work=gpt-test:high([[:space:]]*#.*)?$/ { print "work=gpt\\bs:low"; next }
      { print }' "$before" > "$expected"
 agents_set_row editable.work 'gpt\bs:low'
 assert_registry_matches "$expected" || fail "row edit did not preserve a literal backslash in the agent name"
@@ -387,7 +384,7 @@ assert_registry_matches "$expected" || fail "row edit did not preserve a literal
 write_fixture "$TEST_DIR/base.conf"
 before="$TEST_DIR/infer-before.conf"
 expected="$TEST_DIR/infer-expected.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 
 # The agent names its own family: a claude agent edits the claude row even
 # though the function is assigned to codex, and reports the row as dormant.
@@ -418,7 +415,7 @@ agents_set_row alpha.claude_task opus:high
 
 write_fixture "$TEST_DIR/base.conf"
 before="$TEST_DIR/reject-before.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 
 assert_fails "agent in two catalogs" agents_set_row editable.work collide:low
 assert_registry_matches "$before" || fail "ambiguous agent changed the registry"
@@ -453,7 +450,7 @@ printf '%s\n' "$assignment_list" | grep -q '^task=override.work family=claude ' 
 write_fixture "$TEST_DIR/switchall.conf"
 before="$TEST_DIR/switchall-before.conf"
 expected="$TEST_DIR/switchall-expected.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 sed -e 's/^one=codex$/one=claude/' \
     -e 's/^one\.work=codex$/one.work=claude/' \
     -e 's/^two=codex$/two=claude/' \
@@ -468,7 +465,7 @@ agents_set_all_assignments codex
 assert_registry_matches "$before" || fail "switch-all reversal changed registry rows"
 
 before="$TEST_DIR/switchall-reject.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "unknown family" agents_set_all_assignments nosuch
 assert_registry_matches "$before" || fail "unknown family changed the registry"
 stderr_out="$(agents_set_all_assignments nosuch 2>&1 >/dev/null || true)"
@@ -478,7 +475,7 @@ stderr_out="$(agents_set_all_assignments nosuch 2>&1 >/dev/null || true)"
 # codex-only functions in this fixture are pinned and do not cause it.
 write_fixture "$TEST_DIR/base.conf"
 before="$TEST_DIR/switchall-base.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "switch-all with a missing set" agents_set_all_assignments claude
 assert_registry_matches "$before" || fail "rejected switch-all changed the registry"
 stderr_out="$(agents_set_all_assignments claude 2>&1 >/dev/null || true)"
@@ -491,7 +488,7 @@ stderr_out="$(agents_set_all_assignments claude 2>&1 >/dev/null || true)"
 write_fixture "$TEST_DIR/model.conf"
 before="$TEST_DIR/model-before.conf"
 expected="$TEST_DIR/model-expected.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 sed -e 's/^one=claude$/one=codex/' \
     -e 's/^one\.work=claude$/one.work=codex/' \
     -e 's/^two=claude$/two=codex/' \
@@ -582,7 +579,7 @@ agents_resolve plain.work
 [[ "$AGENT_FAMILY" == "codex" ]] || fail "a fixed assignment beside a caller stopped resolving"
 
 before="$TEST_DIR/caller-before.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 assert_fails "switching a caller function" agents_set_assignment friend codex
 assert_registry_matches "$before" || fail "rejected caller switch changed the registry"
 stderr_out="$(agents_set_assignment friend codex 2>&1 >/dev/null || true)"
@@ -686,7 +683,7 @@ write_test_registry "$TEST_DIR/tierset.conf" --replace-provided-sections \
 write_fixture "$TEST_DIR/tierset.conf"
 before="$TEST_DIR/tierset-before.conf"
 expected="$TEST_DIR/tierset-expected.conf"
-agents_registry_text > "$before"
+agents_registry_text | sed 's/[[:space:]]*#.*$//' > "$before"
 
 # A function without an options section gets one after its last row.
 awk '{ print }

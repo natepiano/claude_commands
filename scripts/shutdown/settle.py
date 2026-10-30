@@ -843,9 +843,9 @@ def begin(
             timers = _session_timer_snapshot(session)
             stop_errors: list[Exception] = []
             def save_timers(current: SessionShutdown) -> None:
-                current["timers"] = timers
+                current["timers"] = store.merge_timer_restores(current["timers"], timers)
                 try:
-                    _stop_recorded_timers(timers)
+                    _stop_recorded_timers(current["timers"])
                 except Exception as error:
                     stop_errors.append(error)
             saved = store.update_session(login, session["session_id"], save_timers)
@@ -956,6 +956,8 @@ def _down_all(started: float) -> int:
                 if current["progress"]["kind"] == "restarting":
                     current["progress"] = {"kind": "waiting"}
                 current["stop_deadline"] = deadline
+                # This stop now covers the account, even when it adopts a selected restore.
+                current["hold"] = "account"
                 current["then"] = "stop"
             selected.append(store.update_session(saved["login"], session_id, bound))
 
