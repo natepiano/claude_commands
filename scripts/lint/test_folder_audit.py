@@ -246,6 +246,57 @@ class FolderAuditTests(unittest.TestCase):
         self.assertEqual(folder_audit.main(["disarm"]), 0)
         self.assertFalse(folder_audit.armed())
 
+    def test_rerun_prunes_source_after_stop_following_delete(self) -> None:
+        source = self.root / "source"
+        source.mkdir()
+        git(source, "init", "-q")
+        git(source, "commit", "-q", "--allow-empty", "-m", "c")
+        worktree = self.rust / "stopped-worktree"
+        git(source, "worktree", "add", "-q", "--detach", str(worktree), "HEAD")
+        delete = tmp_sweep.delete_tree
+        def stop(path: str) -> None:
+            delete(path)
+            raise RuntimeError("stopped before prune")
+        with unittest.mock.patch.object(tmp_sweep, "delete_tree", side_effect=stop):
+            with self.assertRaisesRegex(RuntimeError, "stopped before prune"):
+                _ = folder_audit.remove(worktree, 0, 1000)
+        self.assertFalse(worktree.exists())
+        proc = self.root / "proc"
+        proc.mkdir()
+        _ = folder_audit.audit(self.rust, [], frozenset[str](), 1001, files=[], removing=True,
+                               proc=str(proc), sockets=str(self.root / "unix"))
+        listed = subprocess.run(["git", "-C", str(source), "worktree", "list"],
+                                capture_output=True, text=True, check=True).stdout
+        self.assertNotIn(str(worktree), listed)
+        self.assertFalse(list(folder_audit.state_dir().glob("*.prune")))
+
+    def test_missing_source_finishes_removal_and_clears_prune_record(self) -> None:
+        candidate = folder(self.rust / "missing-source-worktree")
+        source = self.root / "gone.git"
+        with unittest.mock.patch.object(folder_audit, "worktree_sources", return_value=[source]):
+            result = folder_audit.remove(candidate, 0, 1000)
+        self.assertEqual(result, folder_audit.REMOVED)
+        self.assertFalse(candidate.exists())
+        self.assertFalse(list(folder_audit.state_dir().glob("*.prune")))
+        self.assertIn(str(candidate), (folder_audit.state_dir() / folder_audit.REMOVED_LOG).read_text())
+
+    def test_failed_existing_source_keeps_record_until_source_is_gone(self) -> None:
+        candidate = folder(self.rust / "failed-prune-worktree")
+        source = self.root / "invalid.git"
+        source.mkdir()
+        with unittest.mock.patch.object(folder_audit, "worktree_sources", return_value=[source]):
+            result = folder_audit.remove(candidate, 0, 1000)
+        self.assertTrue(result.startswith("removal failed:"))
+        self.assertFalse(candidate.exists())
+        records = list(folder_audit.state_dir().glob("*.prune"))
+        self.assertEqual(len(records), 1)
+        before = records[0].read_bytes()
+        folder_audit.resume_pending_prunes()
+        self.assertEqual(records[0].read_bytes(), before)
+        source.rmdir()
+        folder_audit.resume_pending_prunes()
+        self.assertFalse(records[0].exists())
+
     def test_a_removed_linked_worktree_is_pruned_from_its_source(self) -> None:
         source = self.root / "source"
         source.mkdir()

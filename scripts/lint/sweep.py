@@ -2121,35 +2121,42 @@ def record_sweep_removal(target: str, cause: Literal["budget take", "floor take"
     now = time.time()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a+", encoding="utf-8") as handle:
-            # Append and retention share a lock, including across budget and floor passes.
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            _ = handle.write(json.dumps({"at": now, "path": os.path.abspath(target), "cause": cause}) + "\n")
-            handle.flush()
-            if os.fstat(handle.fileno()).st_size > MIB:
+        with path.with_suffix(".lock").open("a+", encoding="utf-8") as lock:
+            # Open the data only after the stable lock, including after a replacement.
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with path.open("a+", encoding="utf-8") as handle:
+                _ = handle.write(json.dumps({"at": now, "path": os.path.abspath(target), "cause": cause}) + "\n")
+                handle.flush()
+                if os.fstat(handle.fileno()).st_size <= MIB:
+                    return
                 _ = handle.seek(0)
                 retained = [event for event in parse_sweep_removals(handle)
                             if event.at >= now - 35 * DAY_SECONDS]
-                rows: list[str] = []
-                size = 0
-                for event in sorted(retained, key=lambda event: event.at, reverse=True):
-                    row = json.dumps({"at": event.at, "path": event.path, "cause": event.cause}) + "\n"
-                    size += len(row.encode("utf-8"))
-                    if size > MIB // 2:
-                        break
-                    rows.append(row)
-                _ = handle.seek(0)
-                _ = handle.truncate()
-                handle.writelines(reversed(rows))
+            rows: list[str] = []
+            size = 0
+            for event in sorted(retained, key=lambda event: event.at, reverse=True):
+                row = json.dumps({"at": event.at, "path": event.path, "cause": event.cause}) + "\n"
+                size += len(row.encode("utf-8"))
+                if size > MIB // 2:
+                    break
+                rows.append(row)
+            temporary = path.with_suffix(".tmp")
+            try:
+                _ = temporary.write_text("".join(reversed(rows)), encoding="utf-8")
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
     except OSError as error:
         print(f"lint sweep: could not record removal in {path}: {error}", file=sys.stderr)
 
 
 def read_sweep_removals() -> list[SweepRemoval]:
     try:
-        with sweep_removals_path().open(encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
-            return parse_sweep_removals(handle)
+        path = sweep_removals_path()
+        with path.with_suffix(".lock").open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH)
+            with path.open(encoding="utf-8") as handle:
+                return parse_sweep_removals(handle)
     except OSError as error:
         print(f"lint sweep: could not read removals: {error}", file=sys.stderr)
         return []

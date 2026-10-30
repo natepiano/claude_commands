@@ -1230,6 +1230,108 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
                           now=NOW + timedelta(seconds=seconds),
                           profile=gate.StepProfile("test", "check", "test", gate.ExpectedPeak(int(need * GIB), "measured", 5)))
 
+    def test_orphaned_scope_stays_charged_visible_and_blocks_until_empty(self) -> None:
+        self.readings_for()
+        reservation = self.running(100, 12)
+        scope = self.builds / "orphan.scope"
+        scope.mkdir(parents=True)
+        _ = (scope / "cgroup.procs").write_text("101\n")
+        _ = (scope / "memory.current").write_text(str(13 * GIB))
+        _ = (scope / "memory.swap.current").write_text("0")
+        sidecar = self.root / "scope-path"
+        _ = sidecar.write_text(str(scope))
+        row = cast(dict[str, object], json.loads(reservation.read_text()))
+        row["sidecar"] = str(sidecar)
+        row["session_id"] = "orphan-owner"
+        _ = reservation.write_text(json.dumps(row))
+        _ = reservation.with_suffix(".max").write_text(str(14 * GIB))
+        _ = reservation.with_suffix(".wave").write_text(f"{14 * GIB} {int(NOW.timestamp())}")
+        del self.processes[100]  # The shell stopped; its scope child still owns memory.
+        result = self.admit_at()
+        self.assertEqual((result.decision.state, result.decision.charged), ("hold", 14 * GIB))
+        view, _ = gate.read_queue(self.root / "admission", gate.process_table(self.root / "proc"), NOW.timestamp())
+        self.assertEqual(len(view.running), 1)
+        with patch("memory_admit.time.time", return_value=NOW.timestamp()):
+            self.assertEqual(gate.blocker_fields(gate.current_blocker(self.root / "admission/400-warmup.waiting")),
+                             {"session_id": "orphan-owner", "session_name": "", "pool": "memory"})
+        for suffix in (".reservation", ".max", ".wave"):
+            self.assertTrue(reservation.with_suffix(suffix).exists())
+        _ = (scope / "cgroup.procs").write_text("")
+        self.assertEqual(self.admit_at().decision.state, "admit")
+        for suffix in (".reservation", ".max", ".wave"):
+            self.assertFalse(reservation.with_suffix(suffix).exists())
+
+    def test_orphaned_scope_does_not_take_identity_from_reused_owner_pid(self) -> None:
+        self.readings_for()
+        reservation = self.running(100, 12)
+        scope = self.builds / "orphan.scope"
+        scope.mkdir(parents=True)
+        _ = (scope / "cgroup.procs").write_text("101\n")
+        _ = (scope / "memory.current").write_text(str(14 * GIB))
+        _ = (scope / "memory.swap.current").write_text("0")
+        sidecar = self.root / "scope-path"
+        _ = sidecar.write_text(str(scope))
+        row = cast(dict[str, object], json.loads(reservation.read_text()))
+        row["sidecar"] = str(sidecar)
+        row["step"] = ""
+        _ = reservation.write_text(json.dumps(row))
+        self.processes[100] = "unrelated-start"
+        process = self.root / "proc/100"
+        process.mkdir(parents=True)
+        _ = (process / "environ").write_bytes(b"CODEX_THREAD_ID=unrelated-session\0CLAUDE_SESSION_NAME=unrelated-name\0")
+        _ = (process / "cmdline").write_bytes(b"cargo\0clippy\0")
+        (process / "cwd").symlink_to(self.root / "unrelated-folder")
+        result = self.admit_at()
+        self.assertEqual(result.decision.state, "hold")
+        self.assertEqual(gate.blocker_fields(result.blocker), {"unit": "orphan.scope"})
+        with patch("memory_admit.time.time", return_value=NOW.timestamp()):
+            self.assertEqual(gate.blocker_fields(gate.current_blocker(self.root / "admission/400-warmup.waiting")),
+                             {"unit": "orphan.scope"})
+        view, _ = gate.read_queue(self.root / "admission", gate.process_table(self.root / "proc"), NOW.timestamp())
+        self.assertEqual(len(view.running), 1)
+        entry = view.running[0]
+        self.assertEqual((entry.session_id, entry.session_name, entry.folder, entry.step), ("", "", "test", ""))
+
+    def test_scope_counter_disappearing_uses_owner_lifetime(self) -> None:
+        reservation = self.running(100, 12)
+        scope = self.builds / "ending.scope"
+        scope.mkdir(parents=True)
+        _ = (scope / "cgroup.procs").write_text("101\n")
+        sidecar = self.root / "scope-path"
+        _ = sidecar.write_text(str(scope))
+        row = cast(gate.Reservation, json.loads(reservation.read_text()))
+        row["sidecar"] = str(sidecar)
+        for missing in ("memory.current", "memory.swap.current"):
+            for owner in ("live", "gone", "reused"):
+                with self.subTest(missing=missing, owner=owner):
+                    for counter in ("memory.current", "memory.swap.current"):
+                        _ = (scope / counter).write_text("0")
+                    (scope / missing).unlink()
+                    processes = {} if owner == "gone" else {100: gate.ProcessIdentity(1, "first" if owner == "live" else "other")}
+                    with patch.object(gate, "tree_memory", return_value=gate.MeasuredMemory(2 * GIB)) as tree:
+                        reading = gate.step_memory(row, NOW, processes, self.root / "proc")
+                    if owner == "live":
+                        self.assertEqual(reading, gate.MeasuredMemory(2 * GIB))
+                        tree.assert_called_once_with(100, "first", processes, self.root / "proc")
+                    else:
+                        self.assertIsInstance(reading, gate.GoneMemory)
+                        tree.assert_not_called()
+
+    def test_width_write_interruption_keeps_reservation_for_retry(self) -> None:
+        reservation = self.running(100, 12)
+        before = reservation.read_bytes()
+        write_text = Path.write_text
+        def stop(path: Path, data: str) -> int:
+            _ = write_text(path, data[:10])
+            raise RuntimeError("stopped during width write")
+        with patch.object(Path, "write_text", side_effect=None, autospec=True) as write:
+            write.side_effect = stop
+            with self.assertRaisesRegex(RuntimeError, "stopped during width write"):
+                gate.set_width(reservation, 8, self.root)
+        self.assertEqual(reservation.read_bytes(), before)
+        gate.set_width(reservation, 8, self.root)
+        self.assertEqual(json.loads(reservation.read_text())["test_threads"], 8)
+
     def test_mature_step_keeps_observed_peak_in_budget_and_blocker(self) -> None:
         self.readings_for()
         reservation = self.running(100, 12)

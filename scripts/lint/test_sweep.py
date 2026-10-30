@@ -13,8 +13,10 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from collections.abc import Iterable
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
@@ -364,6 +366,47 @@ class SweepTests(SweepCase):
 
 
 class RebuildTests(SweepCase):
+    def test_stopped_retention_keeps_rows_and_rerun_finishes(self) -> None:
+        path = sweep.sweep_removals_path()
+        path.parent.mkdir(parents=True)
+        kept = json.dumps({"at": time.time(), "path": "/tmp/kept/target", "cause": "floor take"}) + "\n"
+        _ = path.write_text("x" * sweep.MIB + "\n" + kept)
+        with mock.patch.object(os, "replace", side_effect=RuntimeError("stopped before publish")):
+            with self.assertRaisesRegex(RuntimeError, "stopped before publish"):
+                sweep.record_sweep_removal("/tmp/first/target", "budget take")
+        self.assertIn(kept, path.read_text())
+        sweep.record_sweep_removal("/tmp/retry/target", "budget take")
+        self.assertEqual({event.path for event in sweep.read_sweep_removals()},
+                         {"/tmp/kept/target", "/tmp/first/target", "/tmp/retry/target"})
+
+    def test_retention_and_contending_append_keep_both_records(self) -> None:
+        path = sweep.sweep_removals_path()
+        path.parent.mkdir(parents=True)
+        _ = path.write_text("x" * sweep.MIB + "\n")
+        before = path.open()
+        self.addCleanup(before.close)
+        append_at_lock = threading.Event()
+        flock = fcntl.flock
+        def locked(fd: int, operation: int) -> None:
+            if threading.current_thread().name == "append-removal":
+                append_at_lock.set()
+            flock(fd, operation)
+        append = threading.Thread(target=sweep.record_sweep_removal,
+                                  args=("/tmp/append/target", "floor take"), name="append-removal")
+        parse = sweep.parse_sweep_removals
+        def contend(lines: Iterable[str]) -> list[sweep.SweepRemoval]:
+            append.start()
+            self.assertTrue(append_at_lock.wait(5))
+            return parse(lines)
+        with mock.patch.object(fcntl, "flock", side_effect=locked):
+            with mock.patch.object(sweep, "parse_sweep_removals", side_effect=contend):
+                sweep.record_sweep_removal("/tmp/retention/target", "budget take")
+            append.join(5)
+        self.assertFalse(append.is_alive())
+        self.assertEqual({event.path for event in sweep.read_sweep_removals()},
+                         {"/tmp/retention/target", "/tmp/append/target"})
+        self.assertTrue(before.read().startswith("x" * sweep.MIB + "\n"))
+
     def test_removal_trim_keeps_newest_half_megabyte_and_next_append_does_not_trim(self) -> None:
         path = sweep.sweep_removals_path()
         path.parent.mkdir(parents=True)
@@ -392,7 +435,10 @@ class RebuildTests(SweepCase):
             with self.subTest(failure=failure):
                 errors = io.StringIO()
                 unreadable = mock.Mock(spec=Path)
-                unreadable.configure_mock(**{"open.side_effect": failure})
+                lock = sweep.sweep_removals_path().with_suffix(".lock")
+                lock.parent.mkdir(parents=True, exist_ok=True)
+                lock.touch()
+                unreadable.configure_mock(**{"open.side_effect": failure, "with_suffix.return_value": lock})
                 with (mock.patch.object(sweep, "sweep_removals_path", return_value=unreadable),
                       redirect_stderr(errors)):
                     output = self.report()

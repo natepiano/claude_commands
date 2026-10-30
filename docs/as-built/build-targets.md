@@ -254,3 +254,7 @@ the log does not record that connection. Journal retention also limits the evide
 - **The deployment target, not an rpath.** One environment word fixes every crate in one place; crates that emit `-Wl,-rpath,/usr/lib/swift` cover only their own binaries.
 - **The power-profile comparison keys on the samples, like with like.** Every change the samples show gets a comparison, so no switch needs a hand-kept marker. Rows match step kind, caller and rebuild class so a cold build is never set against an edited-crate rebuild, and Change is withheld below 10 runs a side.
 - **One row per hold event, not per hold.** `forget` of one source file would otherwise leave half an interval. In-force state comes from the coordination records only, because an event can be lost.
+
+Removal-log append, retention and readers take a separate stable lock before opening the log; retention replaces a complete temporary file, so a stopped pass keeps the rows and the next append uses the current log.
+
+Before deleting a linked worktree, the folder audit saves its source repositories beside the removal log; a rerun prunes those sources after the folder is gone and removes the record only after every prune succeeds.

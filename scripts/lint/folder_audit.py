@@ -41,6 +41,8 @@ with --send, each maker session also gets one message that lists its folders.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -249,15 +251,78 @@ def armed() -> bool:
     return (state_dir() / ARMED_NAME).is_file()
 
 
+@dataclass(frozen=True)
+class PendingWorktreePrune:
+    removed_path: Path
+    sources: list[Path]
+
+
+def read_pending_prune(record: Path) -> PendingWorktreePrune:
+    value = cast(object, json.loads(record.read_text()))
+    if isinstance(value, dict):
+        row = cast(dict[str, object], value)
+        path, sources = row.get("path"), row.get("sources")
+        if isinstance(path, str) and Path(path).is_absolute() and isinstance(sources, list):
+            entries = cast(list[object], sources)
+            if all(isinstance(source, str) and Path(source).is_absolute() for source in entries):
+                return PendingWorktreePrune(Path(path), [Path(str(source)) for source in entries])
+    raise ValueError(f"invalid pending prune record: {record}")
+
+
+def finish_pending_prune(record: Path, pending: PendingWorktreePrune) -> None:
+    for source in pending.sources:
+        try:
+            _ = source.stat()
+        except FileNotFoundError:
+            continue
+        _ = subprocess.run(["git", "--git-dir", str(source), "worktree", "prune"],
+                           capture_output=True, check=True)
+    record.unlink()
+
+
+def resume_pending_prunes() -> None:
+    directory = state_dir()
+    if not directory.exists():
+        return
+    with (directory / "prune.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for record in directory.glob("*.prune"):
+            try:
+                pending = read_pending_prune(record)
+                # A partial delete must pass the normal removal checks again.
+                if not os.path.lexists(pending.removed_path):
+                    finish_pending_prune(record, pending)
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                print(f"folder audit: pending prune {record}: {error}", file=sys.stderr)
+
+
 def remove(path: Path, changed: float, now: float) -> str:
     """Remove path and prune its worktrees; REMOVED, or why it stays."""
-    sources = worktree_sources(path)
-    try:
-        tmp_sweep.delete_tree(str(path))
-    except OSError as error:
-        return f"removal failed: {error}"
-    for source in sources:
-        _ = subprocess.run(["git", "--git-dir", str(source), "worktree", "prune"], capture_output=True, check=False)
+    directory = state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    record = directory / (hashlib.sha256(os.fsencode(path)).hexdigest() + ".prune")
+    with (directory / "prune.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            sources = worktree_sources(path)
+            if record.exists():
+                previous = read_pending_prune(record)
+                if previous.removed_path != path:
+                    raise ValueError(f"pending prune path differs: {record}")
+                sources = list(dict.fromkeys(previous.sources + sources))
+            if sources:
+                temporary = record.with_suffix(".tmp")
+                try:
+                    _ = temporary.write_text(json.dumps({"path": str(path), "sources": [str(source) for source in sources]}))
+                    os.replace(temporary, record)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            tmp_sweep.delete_tree(str(path))
+            if sources:
+                finish_pending_prune(record, PendingWorktreePrune(path, sources))
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            return f"removal failed: {error}"
+
     log = state_dir() / REMOVED_LOG
     try:
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -355,6 +420,8 @@ def _mtime(path: Path) -> float:
 def audit(rust: Path, temps: list[Path], expected: frozenset[str] | None, now: float,
           files: list[Path] | None = None, removing: bool = False, proc: str = tmp_sweep.PROC_DIR,
           sockets: str = UNIX_SOCKETS) -> list[Loose]:
+    if removing:
+        resume_pending_prunes()
     changes: dict[Path, float | str] = {}
     for entry in candidates(rust, temps, expected):
         when = last_change(entry)

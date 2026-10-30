@@ -762,12 +762,62 @@ def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
     return MeasuredMemory(used, swap_bytes=swapped)
 
 
+@dataclass(frozen=True)
+class PopulatedStepScope:
+    directory: Path
+
+
+@dataclass(frozen=True)
+class LiveOwnerProcess:
+    pass
+
+
+@dataclass(frozen=True)
+class EndedStep:
+    pass
+
+
+def reservation_lifetime(row: Reservation, owner_live: bool) -> PopulatedStepScope | LiveOwnerProcess | EndedStep:
+    """A scope outlives its shell while any of its processes remain."""
+    sidecar = row.get("sidecar", "")
+    if sidecar:
+        try:
+            scope_name = Path(sidecar).read_text().strip()
+        except FileNotFoundError:
+            scope_name = ""
+        if scope_name:
+            scope = Path(scope_name)
+            members = scope / "cgroup.procs"
+            check_memory_reading(members)
+            try:
+                if members.read_text().split():
+                    return PopulatedStepScope(scope)
+            except FileNotFoundError:
+                pass
+    return LiveOwnerProcess() if owner_live else EndedStep()
+
+
 def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIdentity],
                 proc: Path = PROC) -> StepMemory:
     identity = processes.get(row["pid"])
-    if identity is None or identity.start != row["start_time"]:
+    owner_live = identity is not None and identity.start == row["start_time"]
+    lifetime = reservation_lifetime(row, owner_live)
+    if isinstance(lifetime, EndedStep):
         return GoneMemory()
-    reading = tree_memory(row["pid"], row["start_time"], processes, proc)
+    if isinstance(lifetime, PopulatedStepScope):
+        current = lifetime.directory / "memory.current"
+        swap = lifetime.directory / "memory.swap.current"
+        check_memory_reading(current)
+        check_memory_reading(swap)
+        try:
+            used, swapped = int(current.read_text()), int(swap.read_text())
+            reading = MeasuredMemory(used + swapped, swap_bytes=swapped)
+        except FileNotFoundError:
+            if not owner_live:
+                return GoneMemory()
+            reading = tree_memory(row["pid"], row["start_time"], processes, proc)
+    else:
+        reading = tree_memory(row["pid"], row["start_time"], processes, proc)
     if isinstance(reading, MeasuredMemory) and now.timestamp() - _epoch(row["admitted_at"]) < RAMP_SECONDS:
         if reading.bytes == 0:
             return PromisedMemory(row["need"])
@@ -976,13 +1026,15 @@ def admission_dir(root: Path) -> Path:
 def live_reservations(directory: Path) -> list[tuple[Path, Reservation]]:
     live: list[tuple[Path, Reservation]] = []
     for path in directory.glob("*.reservation"):
+        owner_live = False
         try:
             row = cast(Reservation, json.loads(path.read_text()))
-            if process_start_time(row["pid"]) == row["start_time"]:
-                live.append((path, row))
-                continue
+            owner_live = process_start_time(row["pid"]) == row["start_time"]
         except (OSError, ValueError, KeyError, TypeError):
-            pass
+            row = None
+        if row is not None and not isinstance(reservation_lifetime(row, owner_live), EndedStep):
+            live.append((path, row))
+            continue
         path.unlink(missing_ok=True)
         path.with_suffix(".max").unlink(missing_ok=True)
         path.with_suffix(".wave").unlink(missing_ok=True)
@@ -1364,6 +1416,9 @@ class QueueIdentityReader:
         name = str(row.get("session_name", ""))
         folder = str(row.get("folder") or row.get("worktree") or "")
         step = str(row.get("step", ""))
+        owner = self.processes.get(pid)
+        if owner is None or owner.start != row.get("start_time"):
+            return {"session_id": session, "session_name": name, "step": step, "folder": folder}
         try:
             folder = str((self.proc / str(pid) / "cwd").readlink())
         except OSError:
@@ -1398,10 +1453,13 @@ def queue_rows(directory: Path, suffix: str, processes: dict[int, ProcessIdentit
             row = cast(dict[str, object], json.loads(path.read_text()))
             pid = row["pid"]
             identity = processes.get(pid) if isinstance(pid, int) else None
-            if identity is not None and identity.start == row["start_time"]:
-                rows.append((path, row))
+            owner_live = identity is not None and identity.start == row["start_time"]
         except (OSError, ValueError, KeyError, TypeError):
             continue
+        live = (not isinstance(reservation_lifetime(cast(Reservation, cast(object, row)), owner_live), EndedStep)
+                if suffix == "reservation" else owner_live)
+        if live:
+            rows.append((path, row))
     return rows
 
 
@@ -1633,7 +1691,12 @@ def set_width(path: Path, width: int, root: Path | None = None) -> None:
         except (OSError, ValueError, TypeError):
             return
         row["test_threads"] = width
-        _ = path.write_text(json.dumps(row, separators=(",", ":")))
+        temporary = path.with_suffix(".reservation.tmp")
+        try:
+            _ = temporary.write_text(json.dumps(row, separators=(",", ":")))
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def _epoch(instant: str) -> float:

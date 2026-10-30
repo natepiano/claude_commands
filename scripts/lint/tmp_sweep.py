@@ -87,6 +87,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field, replace
@@ -1137,8 +1138,17 @@ def write_cleanup_plan(plan: Path, roots: Roots, now: float, proc: str) -> int:
         path = entry.path if isinstance(entry, KeptEntry) else entry.entry.path
         rows.append(PlanEntry(path=path, action=action, reason=reason))
     # An existing plan is never replaced; apply uses exactly the reviewed remove list.
-    with plan.open("x", encoding="utf-8") as handle:
-        _ = handle.write(json.dumps({"version": 1, "entries": rows}, indent=2) + "\n")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=plan.parent,
+                                     prefix=f".{plan.name}.", delete=False) as handle:
+        temporary = Path(handle.name)
+        try:
+            _ = handle.write(json.dumps({"version": 1, "entries": rows}, indent=2) + "\n")
+            handle.close()
+            os.link(temporary, plan)
+        except FileExistsError:
+            raise FileExistsError(f"plan {plan} already exists; inspect it and remove it before making a new plan") from None
+        finally:
+            temporary.unlink(missing_ok=True)
     for row in rows:
         print(f"{row['action']} {row['path']}: {row['reason']}")
     print(f"tmp sweep: plan {plan}")

@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -980,6 +981,72 @@ def require_clean_promotion(repo: Path) -> None:
         raise GateRefused("promotion refused: " + (result.stdout.strip() or result.stderr.strip()))
 
 
+
+@dataclass(frozen=True)
+class RecordedPush:
+    """The gate's exact local commit and the source and base that produced it."""
+
+    base: str
+    commit: str
+    source_commit: str
+
+
+@dataclass(frozen=True)
+class NoRecordedPush:
+    pass
+
+
+def push_record_path(repo: Path, operation: str, source: str) -> Path:
+    directory = Path(os.environ.get("MERGE_GATE_PASSED_DIR", "~/.local/state/merge-gate")).expanduser()
+    identity = json.dumps([str(repo.resolve()), operation, source]).encode()
+    return directory / "push-recovery" / (hashlib.sha256(identity).hexdigest() + ".json")
+
+
+def read_push_record(path: Path) -> RecordedPush | NoRecordedPush:
+    try:
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return NoRecordedPush()
+    except (OSError, ValueError) as error:
+        raise GateRefused(f"push recovery record {path}: {error}") from error
+    if isinstance(value, dict):
+        fields = cast(dict[str, object], value)
+        hashes = [fields.get(key) for key in ("base", "commit", "source_commit")]
+        if all(isinstance(item, str) and re.fullmatch(r"[0-9a-f]{40,64}", item) for item in hashes):
+            return RecordedPush(*(cast(str, item) for item in hashes))
+    raise GateRefused(f"invalid push recovery record: {path}")
+
+
+def write_push_record(path: Path, record: RecordedPush) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Publish one complete record before changing refs or attempting a push.
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            json.dump({"base": record.base, "commit": record.commit,
+                       "source_commit": record.source_commit}, output)
+            output.flush()
+            os.fsync(output.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str) -> str:
+    """Trust only this checkpoint's recorded merge, with its original parents."""
+    record = read_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint))
+    if isinstance(record, NoRecordedPush):
+        return origin
+    head = checked_git(repo, "rev-parse", "HEAD")
+    if head != record.commit or record.source_commit != checkpoint:
+        return origin
+    parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()
+    if (parents != [record.commit, record.base, checkpoint]
+            or checked_git(repo, "rev-parse", origin) != record.base):
+        return origin
+    return record.commit
+
+
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
     main_repo = Path(str(args.main_repo)).expanduser().resolve()
@@ -990,14 +1057,25 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
     if checked_git(main_repo, "branch", "--show-current") != "main":
         raise GateRefused("promotion checkout must be on main")
     fetch_branches(main_repo, "main", args.merge_branch)
-    if checked_git(main_repo, "rev-parse", "HEAD") != checked_git(main_repo, "rev-parse", "origin/main"):
-        raise GateRefused("main HEAD differs from origin/main")
+    head = checked_git(main_repo, "rev-parse", "HEAD")
+    origin = checked_git(main_repo, "rev-parse", "origin/main")
+    path = push_record_path(main_repo, "promotion", args.merge_branch)
+    target = checked_git(main_repo, "rev-parse", f"origin/{args.merge_branch}")
+    if head != origin:
+        record = read_push_record(path)
+        if (not isinstance(record, RecordedPush) or head != record.commit
+                or record.source_commit != record.commit
+                or git(main_repo, "merge-base", "--is-ancestor", origin, head).returncode
+                or git(main_repo, "merge-base", "--is-ancestor", head, target).returncode):
+            raise GateRefused("main HEAD differs from origin/main")
+        target = record.commit
     if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
         raise GateRefused("main is not an ancestor of the merge branch")
-    check_settings(main_repo, f"origin/{args.merge_branch}", str(args.settings_blob))
+    check_settings(main_repo, target, str(args.settings_blob))
     hold.wait_until_free()
     require_clean_promotion(main_repo)
-    _ = checked_git(main_repo, "merge", "--ff-only", f"origin/{args.merge_branch}")
+    write_push_record(path, RecordedPush(origin, target, target))
+    _ = checked_git(main_repo, "merge", "--ff-only", target)
     _ = checked_git(main_repo, "push", "origin", "main")
     promoted = checked_git(main_repo, "rev-parse", "HEAD")
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
@@ -1086,8 +1164,9 @@ def merge_checkpoint(args: GateArguments) -> int:
         raise GateRefused("checkout is not on the merge branch")
     fetch_branches(repo, args.merge_branch, args.unit_branch)
     baseline = checked_git(repo, "rev-parse", "HEAD")
-    check_local_doc_commits(repo, f"origin/{args.merge_branch}")
     checkpoint = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.checkpoint}^{{commit}}")
+    origin = f"origin/{args.merge_branch}"
+    check_local_doc_commits(repo, checkpoint_retry_origin(repo, origin, checkpoint))
     previous = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.previous_checkpoint}^{{commit}}")
     if git(repo, "merge-base", "--is-ancestor", checkpoint, f"origin/{args.unit_branch}").returncode:
         raise GateRefused("checkpoint is not on origin unit branch")
@@ -1109,6 +1188,10 @@ def merge_checkpoint(args: GateArguments) -> int:
             abort = git(repo, "merge", "--abort")
             raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
                               + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
+        merged = checked_git(repo, "rev-parse", "HEAD")
+        if merged != baseline:
+            write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
+                              RecordedPush(baseline, merged, checkpoint))
         suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s),
                             source="checkpoint", full=args.full)
         if not suites.passed:

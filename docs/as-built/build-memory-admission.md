@@ -419,3 +419,9 @@ Turns end as `TurnCompleted | TurnRefusedForCapacity | TurnFailed`; runs as `Run
 `verify.sh ... --target-dir <name>` (a per-helper build folder with its own cargo token, pass records shared across folders, `calls.target_dir`, schema 10) is parked. It returns when the report's `Build-folder turn, behind another worker` row shows real time queueing for a worktree's build slot.
 
 A second promise rule is measured and declined (showrunner, 2026-10-28: simple wins). The rule: a running build whose need is above a limit keeps its full promise; the running builds at or under it are promised the largest gap in full plus `max(0, 0.6 x need - anon)` each. The replay used 4 h of 5 s admission samples (2026-10-28 03:27-07:27Z, 240 waits, 1863 wait minutes), and "short" counts admitting ticks where the running builds' real growth after the tick passes `MemAvailable` minus the reserve. With a 6 GiB limit the rule saves 331 of 1863 minutes against 249 for the current rule, with the short rate at 0.8% against 0% (5 GiB: 326 min, 0.9%; 8 GiB: 501 min, 1.4%). The same rule limited by the waiting step's need never gets below 6.9% short. At about 4% of the wait for a second rule and a nonzero short rate, it is not built; a shortfall is the 2026-09-30 freeze. Do not measure it again unless the mix of steps changes.
+
+A scoped reservation stays charged and visible after its owner shell stops while its scope still holds a process; admission, queue and blocker reads use that same rule and keep `.max` and `.wave` until both the owner and scope have ended.
+
+A test-width update replaces the reservation atomically under the admission lock, so a stopped write leaves the previous row for the next run.
+
+A cleanup plan is written to a temporary file and linked into place only when no plan exists; a rerun over an incomplete older plan names the file and asks the caller to inspect and remove it before making a new plan.

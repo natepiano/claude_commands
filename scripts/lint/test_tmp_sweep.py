@@ -816,6 +816,27 @@ class RunFolderTests(TmpSweepCase):
 
 
 class HandCleanupTests(TmpSweepCase):
+    def test_stopped_plan_write_can_be_planned_again(self) -> None:
+        ended = self.ended_run("ended")
+        plan = self.tmp.parent / "plan.json"
+        with mock.patch.object(json, "dumps", side_effect=RuntimeError("stopped during serialization")):
+            with self.assertRaisesRegex(RuntimeError, "stopped during serialization"):
+                _ = tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
+        self.assertFalse(plan.exists())
+        self.assertEqual(tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc)), 0)
+        self.assertEqual(tmp_sweep.planned_removals(plan), [str(ended)])
+        before = plan.read_bytes()
+        with self.assertRaises(FileExistsError):
+            _ = tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
+        self.assertEqual(plan.read_bytes(), before)
+
+    def test_incomplete_legacy_plan_names_file_and_clear_action(self) -> None:
+        plan = self.tmp.parent / "plan.json"
+        _ = plan.write_text('{"version":')
+        with self.assertRaisesRegex(FileExistsError, str(plan) + ".*remove"):
+            _ = tmp_sweep.write_cleanup_plan(plan, self.roots(), self.now, str(self.proc))
+        self.assertEqual(plan.read_text(), '{"version":')
+
     def ended_run(self, name: str) -> Path:
         run = write(self.unit / name / "board.log").parent
         _ = write(run / "mesh_roster.json", json.dumps({"fix": {"status": "ended"}}))
