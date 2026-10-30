@@ -22,11 +22,11 @@ The showrunner's answer to the second question: Python, for one memory model and
 - 2026-10-30 11:31 EDT (load 61–80, 19 waiters): 3.5 check processes per second, at least 0.48 of a core.
 - A step can start up to 5 s plus one lock wait after memory frees.
 
-**What it costs.** About 37 h of worker time over 5 phases. One systemd user unit and socket on natedev. The Mac is not affected: it runs no memory admission.
+**What it costs.** About 37 h of worker time over 3 phases. One systemd user unit and socket on natedev. The Mac is not affected: it runs no memory admission.
 
 **Down rule.** No build starts without an "admitted" answer from the service. The kernel holds the socket (socket activation), so a service restart is a short wait for the build, not an error. If the service cannot start, steps keep waiting, print why, and the user gets one alert. There is no second admission path.
 
-**Phases.** S1: one decision pass. S2: the service runs in shadow. S3: builds ask the service. S4: views and commands go to the service. S5: remove the polling path. S2 needs the natedev NixOS session. S1 and S3 change resources-unit's and verify-unit's files.
+**Phases.** S1: one decision pass. S2: the service runs in shadow. S3: builds, views and commands move to the service, and the same phase deletes the polling path. S2 needs the natedev NixOS session. S1 and S3 change other units' files. No second admission path exists at any time; the only rollback is a git revert (user, 2026-10-30 11:42 EDT).
 
 ---
 
@@ -100,7 +100,7 @@ A service that gets an unknown `v` answers `refused {"reason": "client version N
 **What moves where.**
 - `memory_admit.py` keeps the rules, the estimates (`expected_peak`, `filtered_peak`, `gate_estimate`, Phase 24's shape promises) and the readers (`read_meminfo`, `read_pressure`, `reservation_memory`, `sccache_memory`). The service and the old `check` both import it.
 - In S1, `check` and `read_queue_pass` both call `admission_pass`. This removes today's second copy before the service exists.
-- In S5, `check`, `locked_queue_read`, `current_blocker`, `blocker_snapshot`, `live_waiters`, `live_reservations`, `queue_rows`, `run_action`'s file protocol and every `flock` are deleted. The service is the only caller of `admission_pass`.
+- In S3, `check`, `locked_queue_read`, `current_blocker`, `blocker_snapshot`, `live_waiters`, `live_reservations`, `queue_rows`, `run_action`'s file protocol and every `flock` are deleted. The service is the only caller of `admission_pass`.
 - Estimates (git identity, history reads) run in the client, before it connects, as they run outside the lock today (Phase 12). They are sent in `admit`. The service checks the estimate's age (`HEAD_SECONDS`) and sends `wait {"reason": "estimate expired"}`, and the client re-estimates.
 
 **When a pass runs.** On every event: an admit, a cancel, a release, an owner exit, an empty scope, a width change, a bump, or an override. It also runs once per second while any waiter waits, because memory freed outside builds shows only in `/proc/meminfo`. A pass reads meminfo, PSI, sccache's `memory.stat`, and each running scope's `memory.current` and `memory.swap.current`. It reads the `/proc` tree only for unscoped reservations.
@@ -128,8 +128,10 @@ The socket file is mode 0600, so only the user's processes can connect. The serv
 | --- | --- | --- |
 | Service crash | systemd restarts it in 1 s. The socket stays open, so new connections wait in the backlog. Waiters reconnect with their `since`. Reservations come back from `state.json`. | Nothing, or one `admission service restarted; waiting again` line in the step output. |
 | Hang | The watchdog (30 s) kills and restarts it. A client that gets no `wait` line for 120 s prints `admission service not answering since HH:MM` and keeps waiting. | That line. Builds start again after the restart. |
-| Crash loop | systemd stops after its start limit, and the socket refuses. Clients retry every 2 s and print one line a minute. `OnFailure=` sends one alert through `alert_user`. | One phone alert: `build admission service is down; builds wait`. |
+| Crash loop | systemd stops after its start limit, and the socket refuses. Clients retry every 2 s and print one line a minute. `OnFailure=` sends one push through send.py's outage path after 2 min down, one per outage. | One phone alert: `build admission service is down; builds wait`. |
 | Version skew | The service answers `refused` with both versions. The service supports versions N and N−1 for one release. The install step restarts the service after the clients are in place. | The step stops with that line, only in a mixed install. |
+
+**No second path.** The only rollback is a git revert of S3 (user, 2026-10-30 11:42 EDT).
 
 **Rejected.** Falling back to the file lock: that is two admitters that cannot see each other's reservations, so both admit into the same free memory. Clients without socket activation: every restart would show as an error.
 
@@ -149,17 +151,15 @@ The resources-unit chain edits `memory_admit.py` serially: 21 → 16 → 25 → 
 - speed.md lever 5 (shorter exclusive holds);
 - the lock timeout path in `locked_queue_read`;
 - Phase 32's file-write transport (its rule stays, and it becomes the `admit_head` command);
-- queue-unit Phase 1's `queue.json`. It is removed in S5. Phase 1 still lands, because it brings a sub-second view now (see Questions).
+- queue-unit Phase 1's `queue.json`. S3 deletes it and its writer. Phase 1 still lands, because it brings a sub-second view now (see Questions).
 
 | Phase | Goal | Files (owner) | What changes for builds | Proof | Rollback | Effort |
 | --- | --- | --- | --- | --- | --- | --- |
 | **S1 One decision pass** | `admission_pass` decides for all waiters. `check` and `read_queue_pass` call it. | `memory_admit.py`, `test_memory_admit.py` (resources-unit) | Nothing. | The existing tests pass unchanged. A test feeds one `PassInputs` to the check path and the view path and asserts the same decisions. Land after Phases 30, 31, 32 and 26, and before 15. | Revert the commit. | 6 h |
 | **S2 Shadow** | The service runs, owns nothing, and logs what it would decide. | `admission_service.py`, `admission_client.py`, tests (queue-unit); systemd socket and service in `/etc/nixos/modules/linux/development.nix` (natedev session) | Nothing. The service reads Phase 1's `queue.json` and the reservation rows read-only every second. It runs `admission_pass` with its own fresh readings, and logs each "would admit W" with its time to `admission/shadow.jsonl`. | 24 h with at least 200 admissions (10-29 had 592, `builds-resources.md:403`). Adopt when: the service admits the same steps in the same order for at least 99% of real admissions; it never admits when a check at that instant held on budget, free memory or pressure; and its median "would admit" time is at least 2 s before the real admission. | Stop the unit. | 10 h |
-| **S3 Builds ask the service** | All callers use the client, at once. The service writes `queue.json` in the same format, so the Phase 1 view keeps working. | `memory_gate.sh` (resources-unit); `invoke.sh`, `verify.sh` (verify-unit); `pre-tool-use-brp-launch-gate.sh` (resources-unit); `merge_gate.py` `gate_reservation` (natedev showrunner); `build_hold.py` `admitted_processes`, `mac_idle.py`, `shutdown/stop.py` read `state.json` (resources-unit, report-unit, natedev showrunner) | One Python start per step instead of one every 5 s. The cancel path in `verify.sh:1171–1181` drops its reservation list, because the owner's end releases. | Cut over in a quiet hour. At start, the service imports the live `.reservation` files once, so running builds keep their charge. Then 24 h checks: no earlyoom kill caused by admission; `steps.mem_wait_s` against the 24 h before; no step that started without an `admitted` row. | One mode file, `admission/mode`, read by `memory_gate.sh`: `files` uses the old path. It is kept 7 days, then deleted in S5. Its cost: the old path stays tested until S5. | 12 h |
-| **S4 Views and commands** | `/build:queue`, build-why, mine, bump and admit-head use the socket. | `build_queue.py`, `build_why.py` (queue-unit); `commands/build/queue.md` | None. The view answers in under 0.25 s with no file. | The view tests on an in-process server. 50 timed runs at load above 100: all under 1 s, p95 under 0.25 s. | Revert. The service still writes `queue.json`. | 5 h |
-| **S5 Remove the polling path** | One admission path. | `memory_admit.py` (delete `check`, the locks, the file readers, `run_action`'s protocol, `blocker`); `memory_gate.sh` (the poll loop, the mode file); `queue.json`, `admission/lock`, `.waiting`, `.reservation`; `docs/as-built/build-memory-admission.md` | None. | `grep` finds no `flock` and no `.waiting` in admission code. The full merge gate passes. | Revert to S4. | 4 h |
+| **S3 Cut over and delete the polling path** | All callers, views and commands use the service, at once. The same phase deletes `check`, the locks, the file readers, the poll loop, `.waiting`, `.reservation`, `admission/lock` and the Phase 1 `queue.json` writer. | `memory_admit.py`, `memory_gate.sh`, `pre-tool-use-brp-launch-gate.sh`, `build_hold.py` `admitted_processes` (resources-unit); `invoke.sh`, `verify.sh` (verify-unit); `merge_gate.py` `gate_reservation`, `shutdown/stop.py` (natedev showrunner); `mac_idle.py`, `build_why.py` (report-unit); `build_queue.py`, `commands/build/queue.md` (queue-unit); `docs/as-built/build-memory-admission.md` | One Python start per step instead of one every 5 s. The cancel path in `verify.sh:1171–1181` drops its reservation list, because the owner's end releases. The view answers from the socket in under 0.25 s. | Before the cut-over: the full merge gate and the in-process server tests pass. Cut over in a quiet hour. At start, the service imports the live `.reservation` files once, so running builds keep their charge. Then: `grep` finds no `flock` and no `.waiting` in admission code; 50 timed views at load above 100 all under 1 s, p95 under 0.25 s. 24 h checks: no earlyoom kill caused by admission; `steps.mem_wait_s` against the 24 h before; no step that started without an `admitted` row. | A git revert of the phase. No mode file and no second path. | 21 h |
 
-Total: about 37 h of worker time.
+Total: about 37 h of worker time over 3 phases. Packaging call: views and commands (the former S4) fold into S3, because a separate phase would keep the `queue.json` writer alive as a second copy of queue state.
 
 ## 8. Tests
 
@@ -175,11 +175,12 @@ Total: about 37 h of worker time.
 - A Rust service: a second memory model and a tool build (user, 2026-10-30).
 - The connection as the reservation's lifetime: see §2.
 - Fallback to the file lock while the service is down: two admitters (§5).
+- A rollback path behind a mode file after the cut-over: the user did not approve it (2026-10-30 11:42 EDT). The rollback is a git revert.
 - A TCP socket: it needs a port and authentication. A 0600 Unix socket gets both from the file system.
 - Threads in the service: they need locks again. One loop decides in about 5 ms.
 
 ## Questions for the user
 
-1. **Land queue-unit Phase 1 (the `queue.json` snapshot) now, and remove it in S5?** Settled by your words (2026-10-30 11:26: "queue can keep it running"): yes. It makes the view sub-second before the service exists. The cost is about 2 h of code that S5 deletes.
-2. **Keep the old path for 7 days after S3, behind one mode file, as the rollback?** This is a second admission path under your rule. Recommendation: yes, for 7 days only. A bad cut-over would otherwise stop every build until a revert lands. The mode file switches all callers at once, so the two paths never run together.
-3. **Push to your phone when the service is down for 2 min?** All natedev builds wait while it is down. Recommendation: yes, one push per outage.
+1. **Land queue-unit Phase 1 (the `queue.json` snapshot) now, and remove it in S3?** Settled by your words (2026-10-30 11:26: "queue can keep it running"): yes. It makes the view sub-second before the service exists. The cost is about 2 h of code that S5 deletes.
+2. **A rollback path after the cut-over?** Settled by the user (2026-10-30 11:42 EDT, "i do not approve"): no second admission path at any time. S3 deletes the polling path in the same phase, and the only rollback is a git revert.
+3. **Push to your phone when the service is down for 2 min?** Settled by the showrunner (2026-10-30 11:4x EDT): yes, one push per outage after 2 min down, through send.py's outage path. All natedev builds wait while it is down. Recommendation: yes, one push per outage.
