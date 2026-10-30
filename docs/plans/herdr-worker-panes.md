@@ -94,7 +94,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 12. **The transport switch lives in `config/direct.conf`, with an end date.** `WORKER_TRANSPORT` is migration state, not a model default, so it stays out of `models.conf`. The cleanup phase deletes it, no later than 7 days after the default switch.
 13. **The right pane shows the worker's short name (user, 2026-10-30).** For example `impl1`, with no production or unit name.
 14. **The staff row is the one name (sdlc showrunner, 2026-10-30).** A hand `/rename` in a unit director's pane writes the row, and the tab title follows the row. Every launch and every restore of a member takes its name from its row (Phase 4). A showrunner's name is also its workspace's, which `Herdr.retitle` does not rename, so `/showrunner:rename` (`rename.py`) is the one way to rename a showrunner. A worker's name is set once (decision 13).
-15. **One way to find a row: `staff_sources.member` (herdr-unit, 2026-10-30; showrunner, 2026-10-30).** `staff_sources.py` imports `showrunners.py` (Phase 2 As-built), so `showrunners.py` never imports `staff_sources.py`, and no lazy import or copy of `member` goes around that rule. `staff.py` imports none of today's sources (Phase 1 As-built). Row names are workspace and tab names, not slugs: seed keeps slug `sdlc` as row `tools` (`scripts/production/test_staff_sources.py:28`), so no code finds a showrunner or unit row with `staff.by_path(<slug>)`. Code that needs a member's row calls `staff_sources.member(selector, staff.snapshot())`; a `showrunners.py` function that works on rows takes the row or the `StaffSnapshot` from its caller and never looks a member up itself. Tests use a slug that differs from its workspace name. One exception (showrunner, 2026-10-30): `showrunners.py main`'s attach and detach branch imports `showrunner_parent` inside that branch, so users keep one command; the module has no load-time import of it.
+15. **One way to find a row: `staff_sources.member` (herdr-unit, 2026-10-30; showrunner, 2026-10-30).** `staff_sources.py` imports `showrunners.py` (Phase 2 As-built), so `showrunners.py` never imports `staff_sources.py`, and no lazy import or copy of `member` goes around that rule. `staff.py` imports none of today's sources (Phase 1 As-built). Row names are workspace and tab names, not slugs: seed keeps slug `sdlc` as row `tools` (`scripts/production/test_staff_sources.py:28`), so no code finds a showrunner or unit row with `staff.by_path(<slug>)`. Code that needs a member's row calls `staff_sources.member(selector, staff.snapshot())`; a `showrunners.py` function that works on rows takes the row or the `StaffSnapshot` from its caller and never looks a member up itself. Tests use a slug that differs from its workspace name. One exception (showrunner, 2026-10-30): `showrunners.py main`'s attach and detach branch imports `showrunner_parent` inside that branch, so users keep one command; the module has no load-time import of it. The showrunner tree readers live in `showrunner_tree.py`, which imports `staff`, `staff_sources` and `showrunners` (sdlc, 2026-10-30; Phase 3c item 5); `showrunners.py main` imports it inside the branch that needs it, under the same exception.
 16. **The row stays four fields; a reader keeps its timer fields (herdr-unit, 2026-10-30).** The row is id, kind, short name and parent: the user's design, a map from short name to id and who reports to whom (Phase 1 As-built). It gains no session, socket, zone, doc or Units-table field. A reader moves to the record only for who exists and who reports to whom. It keeps reading timer fields (session, socket, zone, doc) from the update timer, keyed by the row: a showrunner row's name is its slug (decision 15), so the `registered_showrunners()` entry of that slug, or `showrunners.named(<slug>)`, gives them. A unit keeps its Units-table cells (Worktree, Plan) in the doc and its pane and running state in herdr, keyed by its row the same way. A row with no timer on this machine has no timer fields here, and the reader shows it without them. A reader that needs nothing from the record is out of the lists of Phases 16 and 17 and does not change (Reference → Staff record readers → Not moved): a source that `seed` reads; a reader of only timer fields, live state or Units-table cells of a member it already knows; and a reader that reaches the tree only through `showrunners.py` functions, which Phase 16 moves to the row. The worker and mesh sources move with the worker readers or go at cleanup.
 
 ## Questions for the user
@@ -271,6 +271,134 @@ Each item is my call under the decision criteria unless it names the user. A one
 - The interleaving test: a tool stopped between its staff step (a `move` of a unit row) and its source update (the Units row) holds `staff.operation()`; a `seed` started then waits, and after the tool ends the seed keeps the unit row under its new showrunner.
 - The `NoSuchMember` test: with no matching row, add and resume make one with `ensure`; retire, wrap and promote skip that `retire`; rename and transfer exit 2 and change no source.
 - Full gate green.
+
+### Phase 3b — Staff move command  · status: done
+
+**Depends on:** Phase 3
+
+Inserted 2026-10-30 (user, via the showrunner). Work Order: `staff.py move <unit> <showrunner>` changes one field, the unit row's parent, and moves the unit's live tab into the new showrunner's workspace through herdr.py's existing pane move; `transfer_unit.py` becomes that move plus one message to the unit and one to each showrunner. No stop, no restart.
+
+
+### Phase 3c — Staff record is the only source (batch 1: seed and showrunner tree)  · status: done
+
+**Depends on:** Phase 3b
+
+Inserted 2026-10-30 (user, via the showrunners). The readers switch runs in four batches, each its own phase and checkpoint, so the showrunner merges progress as each goes green (sdlc, 2026-10-30). It takes the showrunner-tree reader items from Phase 16 and the unit and joined reader items from Phase 17. The reader list is `$SESSION_DIR/phases/3c/reader_inventory.md` (2026-10-30). This replaces decision 16's "Not moved" seed sources: the sdlc showrunner, owner of the staff record, ruled that staff.json is the only source of who reports to whom.
+
+#### Work Order
+
+**Goal:** `staff.json` is the only place that says who reports to whom. A seed never overrides it, and every showrunner-tree read comes from it.
+
+**Spec:**
+1. `staff_sources.py` `seed` becomes a one-time import. It adds a row only for a member the record lacks. It never changes the parent of a row already in the record, and it never deletes a row. No snapshot read calls `_collect`. The module docstring and the plan name its removal date: 2026-11-13.
+2. `showrunners.py` parent and children (`parent_of`, `children_of`, `descendants_of`, `root_of`, `user_facing`, `highest_running`, `tree_lines`, `edges`, `parent_edges`, `stored_children`, `check_attach`, `edges_to_release`, `release_edges`) read the showrunner rows' `parent` from `staff.snapshot()`. No code reads `~/.local/state/showrunner/<child>/parent`. Its direct readers move too: `staff_sources.py:119, :164`, `showrunner_parent.py:85, :110`, `add_showrunner.py:243`, `production_lifecycle.py:370`, `rename.py:388, :517`.
+3. `production_tree.py --json` prints the same bytes for the same tree: `{"schema":1,"edges":[...]}`, same edge order and fields. Its showrunner edges come from the record.
+4. One read API: `staff.snapshot()`, `find`, `by_id` and `staff_sources.member()`. No second reader of `staff.json`, no cache of a parent, no copy of a tree walk.
+5. The tree readers live in one new module, `showrunner_tree.py` (sdlc, 2026-10-30). Every function of item 2 moves there with the same name and signature, and reads rows only through `staff.snapshot()` and `staff_sources.member()`. `showrunners.py` keeps timers, addresses and messages. It has no function that takes or reads a `StaffSnapshot`, it never imports `staff_sources` (no lazy import, no `import_module`), and it keeps no re-export or shim of a moved name. `showrunners.py main` imports `showrunner_tree` inside the branch that needs it, as decision 15 allows for attach and detach. Every caller imports `showrunner_tree`. `stored_parent` is removed; its callers call `parent_of`.
+
+**Files:**
+- `scripts/production/staff_sources.py`
+- `scripts/production/test_staff_sources.py`
+- `scripts/production/showrunners.py`
+- `scripts/production/test_showrunners.py`
+- `scripts/production/showrunner_parent.py`
+- `scripts/production/test_showrunner_parent.py`
+- `scripts/production/add_showrunner.py`
+- `scripts/production/production_lifecycle.py`
+- `scripts/production/rename.py`
+- `scripts/production/production_tree.py`
+- `scripts/production/test_add_showrunner.py`
+- `scripts/production/test_production_lifecycle.py`
+- `scripts/production/test_production_tree.py`
+- `scripts/production/test_rename.py`
+- `scripts/production/showrunner_tree.py`
+- `scripts/production/test_showrunner_tree.py`
+- `scripts/production/rename_test_support.py`
+- `scripts/production/change_review.py`
+- `scripts/production/test_change_review.py`
+- `scripts/production/dailies_input.py`
+- `scripts/production/proposals_folder.py`
+- `scripts/production/test_proposals_table.py`
+- `scripts/production/rename_outside.py`
+- `scripts/production/update_registration.py`
+- `scripts/production/test_update_registration_review.py`
+- `scripts/production/test_footer_counts.py`
+- `scripts/production/test_next_item.py`
+- `scripts/production/test_promote_showrunner.py`
+- `scripts/direct/board_json.py`
+- `scripts/direct/test_board_json.py`
+- `scripts/style/add_style.py`
+- `scripts/style/test_add_style.py`
+- `scripts/production/dailies_input_test_support.py`
+- `scripts/production/update_registration_test_support.py`
+- `scripts/production/staff_test_support.py`
+
+**Workers:** `2 writers` — impl: `staff_sources.py`, `showrunners.py`, `showrunner_tree.py`, `showrunner_parent.py` and their tests; test: every caller of a moved name and its tests (`add_showrunner.py`, `production_lifecycle.py`, `rename.py`, `production_tree.py`, `change_review.py`, `dailies_input.py`, `proposals_folder.py`, `rename_outside.py`, `update_registration.py`, `board_json.py`, `add_style.py`), `rename_test_support.py`, and the tests that patch a moved name.
+
+**State:** none new. The parent files under `~/.local/state/showrunner/` are no longer read; their writers go in Phase 16.
+
+**Acceptance:** a test moves a unit and a showrunner in the record, leaves a Units table and a parent file that still name the old parent, then shows that `seed`, `parent_of`, `children_of` and `production_tree.py --json` follow the record. A `production_tree.py --json` byte comparison before and after on one fixture tree.
+
+### Phase 3e — Tab reader for stop and resume  · status: done
+
+**Depends on:** Phase 3b
+
+Inserted 2026-10-30 (user, via natedev and sdlc: "1 yes 2 yes 3 yes - plus a resume message"). A unit changes showrunner or account in three steps: move (`staff.py move`, Phase 3b), stop (end the process at once) and resume (start the session again in its own tab, with a resume message as its opening prompt). The shutdown unit owns stop, resume, the resume message and the account move. This phase lifts shutdown's private reader `pane_restore._restored_panes` (herdr `pane list` `agent_session`) into herdr.py as the one public tab reader, on herdr.py's existing `panes()` parser; shutdown deletes its private copy when this merges. It runs beside Phase 3c and checkpoints alone, so shutdown builds on the merged reader (sdlc, 2026-10-30). The start environment for a resume and the transfer journal removal go in Phase 3e2.
+
+#### Work Order
+
+**Goal:** one public herdr.py reader gives each tab's label, workspace and Claude session id, also for a tab whose Claude has exited.
+
+**Spec:**
+1. `PaneIdentity` gains `workspace_id: str` and `session_id: str | None`. `Herdr.panes()` fills them from `pane list`: `workspace_id` from the pane's `workspace_id`; `session_id` from `agent_session.value` when `agent_session` is an object with a text `value`, else `None`. A wrong type raises `HerdrFailure`, as `label` does now. Existing callers of `panes()` and `lookup()` behave as before.
+2. A new frozen dataclass `TabSession(pane_id: str, label: str, workspace: str, session_id: str | None)`, where `workspace` is the workspace's label from one `workspace list` read (shutdown's `space`).
+3. `Herdr.tab_sessions() -> list[TabSession]` is built on `panes()` plus that one `workspace list` read; no second pane-list parser. A pane with no label is left out.
+4. `Herdr.session_of(label: str) -> TabSession | NoPane | SeveralPanes`, on the same match rule as `lookup` (one place for the rule: `lookup` and `session_of` share it).
+5. `fake_herdr.py` answers `pane list` with `workspace_id` and `agent_session` as the real server does (live shape, 2026-10-30: `{"agent":"claude","kind":"id","source":"herdr:claude","value":"<uuid>"}`, or `null`), and keeps `agent_session` after the pane's agent exits.
+
+**Files:**
+- `scripts/herdr/herdr.py`
+- `scripts/herdr/test_herdr.py`
+- `scripts/herdr/fake_herdr.py`
+- `scripts/shutdown/test_pane_restore.py`
+- `scripts/shutdown/test_stop.py`
+- `scripts/production/test_promote_showrunner.py`
+
+**Workers:** `1 writer` — tab: all listed files (the last three only get the two new pane fields in their typed pane fixtures).
+
+**State:** none.
+
+**Acceptance:** a `test_herdr.py` test starts Claude in a fake pane, ends it, and shows `session_of(<label>)` still returns that pane's session id, workspace label and pane id; `NoPane` and `SeveralPanes` cases; the `test_herdr*` suite passes, and `basedpyright` on the three files reads `0 errors, 0 warnings, 0 notes`.
+
+### Phase 3e2 — Resume start environment; transfer journal removed  · status: todo
+
+**Depends on:** Phase 3e2
+
+Inserted 2026-10-30. (1) A resume after an account move needs the new account's prepared environment. herdr `agent start` takes no environment: the agent inherits the pane shell's environment, set when the pane is made (`tab create --env`, `pane split --env`). Ruling (sdlc, 2026-10-30, answer A, one launcher): every resume goes through `launch_prepared_agent` with `--resume <id>`, because every resume needs the account's environment; `start_agent` gains no environment parameter and no resume path. One path for resume and account move (sdlc amendment, 2026-10-30). The new tab takes the old tab's place and name before the old tab closes (user rule: restart keeps tab order). herdr has no tab move, so herdr.py gains one primitive that moves the new pane into the old tab (`pane move <new> --tab <old tab> --target-pane <old pane>`) and then closes the old pane; the tab keeps its place and label. shutdown's resume calls it. (2) Delete the transfer journal from `transfer_unit.py` (`journal`, `STEPS`, `_load`, `_migrate_journal`, `_load_fields`, `_save`, `_completed_requests`, `_resumed`, `_check_journals`, `staff_move.PinnedUnit` when nothing else uses it), its tests and its doc lines (`docs/as-built/unit-transfer.md`, `commands/showrunner/transfer_unit.md`), because a transfer is now the move plus its messages. Inventory: `$SESSION_DIR/phases/3e_inventory.md`.
+
+### Phase 3c2 — Staff readers switch (batch 2: unit membership)  · status: todo
+
+**Depends on:** Phase 3e2
+
+Scope, composed in full at its start: `unit_lookup.py` (`marked_units`, `marked_unit`, `group_marked_units`, `session_unit_marks`, `_herdr_marked`), `production_units.py` (`live_unit_table`, `retired_units`, `unit_is_retired`), `production_tree.py` `unit_edges`, and the readers of a production's units (inventory rows "units of a production"). Membership comes from `find(kind="unit", parent=<showrunner id>)`; panes join by `STAFF_ID`. The Units table stops carrying the parent; it keeps the Worktree and Plan cells.
+
+### Phase 3c3 — Staff readers switch (batch 3: stall watch and review pool)  · status: todo
+
+**Depends on:** Phase 3c2
+
+Scope: `stall_watch.py` keys its stretch and prompt state by staff id, so the moves in `rename_unit.py`, `rename.py` and `transfer_unit.py` go; `review_pool.py` finds a unit's holder as its parent row, and `pool.json` keeps its path and bytes.
+
+### Phase 3c4 — Staff readers switch (batch 4: no showrunner from a folder or branch name)  · status: todo
+
+**Depends on:** Phase 3c3
+
+Scope: every inventory row that derives a unit's showrunner from a worktree path, branch, plan header or doc field (`assertion_guard.py`, `change_review.py`, `board_json.py`, `usage_report.py`, `waste_watch.py`, `outcomes.py`, `push_audit.py`, `proposals_folder.py`, `phase_table.py`, `rca.py`, `statusline.sh`) reads the row's parent instead.
+
+### Phase 3d — Unit folder names  · status: todo
+
+**Depends on:** Phase 3c4
+
+Inserted 2026-10-30 (user, via the showrunners). Work Order: `staff.py` refuses a unit short name that already exists. `add_unit` makes the worktree `~/worktrees/<short name>` and the branch `<short name>`, computed from the short name in the staff record and stored nowhere. `/showrunner:add_unit` says unit names are unique. A one-step rename moves an existing unit's folder, branch and session history through the rename path, only at the unit's phase boundary and on its showrunner's word, one unit at a time.
 
 ### Phase 4 — Member names come from the staff row  · status: todo
 

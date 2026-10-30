@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 from user_zone import user_zone
+from atomic_file import write_text_atomic
 
 
 class GitFacts(TypedDict):
@@ -53,6 +54,9 @@ class GitIdentityReader(Protocol):
     def git_facts(self, directory: str) -> GitFacts: ...
     def queue_bump(self, actor: str, session: str, step: str, folder: str,
                    old_position: int, at: float) -> None: ...
+    def head_admission(self, action: Literal["set", "admitted", "lapsed"], unit: str,
+                       step: str, need: int, free: int, reserve: int, why: str,
+                       set_by: str, at: float) -> None: ...
 
 
 class BuildLogStore(Protocol):
@@ -299,6 +303,110 @@ class Waiter(TypedDict):
     need_source: NotRequired[NeedSource]
     need_runs: NotRequired[int]
     test_threads: NotRequired[int | None]
+
+
+class HeadAdmissionOverride(TypedDict):
+    waiter: str
+    pid: int
+    start_time: str
+    unit: str
+    step: str
+    need: int
+    free: int
+    reserve: int
+    why: str
+    set_by: str
+
+
+@dataclass(frozen=True)
+class NoHeadAdmissionOverride:
+    pass
+
+
+class AdmitHeadRefused(ValueError):
+    """The requested head override cannot be set."""
+
+
+class ShowrunnerRegistry(Protocol):
+    def production_of(self, session_id: str) -> Path | None: ...
+
+
+def showrunner_is_registered(session_id: str) -> bool:
+    # This path runs only for a privileged command, never on a check poll.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
+    showrunners = cast(ShowrunnerRegistry, cast(object, importlib.import_module("showrunners")))
+    return showrunners.production_of(session_id) is not None
+
+
+def require_showrunner() -> str:
+    """Return the registered Claude showrunner id or refuse the caller."""
+    if os.environ.get("CODEX_THREAD_ID"):
+        raise AdmitHeadRefused("only a registered showrunner session may run this command")
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not session or not showrunner_is_registered(session):
+        raise AdmitHeadRefused("only a registered showrunner session may run this command")
+    return session
+
+
+def head_override_path(directory: Path) -> Path:
+    return directory / "admit-head.json"
+
+
+def head_override_matches(override: HeadAdmissionOverride, path: Path, waiter: Waiter) -> bool:
+    return (path.name == override["waiter"] and waiter["pid"] == override["pid"]
+            and waiter["start_time"] == override["start_time"])
+
+
+def read_head_override(directory: Path) -> HeadAdmissionOverride | NoHeadAdmissionOverride:
+    try:
+        value = cast(object, json.loads(head_override_path(directory).read_text()))
+    except FileNotFoundError:
+        return NoHeadAdmissionOverride()
+    if not isinstance(value, dict):
+        raise ValueError("invalid admit-head record")
+    row = cast(dict[str, object], value)
+    if (any(not isinstance(row.get(key), str) for key in ("waiter", "start_time", "unit", "step", "why", "set_by"))
+            or any(not isinstance(row.get(key), int) or isinstance(row.get(key), bool)
+                   for key in ("pid", "need", "free", "reserve"))):
+        raise ValueError("invalid admit-head record")
+    return cast(HeadAdmissionOverride, cast(object, row))
+
+
+def head_override_event(action: Literal["set", "admitted", "lapsed"], override: HeadAdmissionOverride,
+                        need: int, free: int, reserve: int, at: float) -> None:
+    record.head_admission(action, override["unit"], override["step"], need, free,
+                          reserve, override["why"], override["set_by"], at)
+
+
+def end_head_override(directory: Path, action: Literal["admitted", "lapsed"], override: HeadAdmissionOverride,
+                      need: int, free: int, reserve: int, at: float) -> None:
+    head_override_event(action, override, need, free, reserve, at)
+    head_override_path(directory).unlink()
+
+
+def admit_head(why: str = "") -> str:
+    actor = require_showrunner()
+    directory = admission_dir(store.root())
+    with (directory / "lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        ordered = sorted(live_waiters(directory), key=lambda item: waiter_order(item[1]))
+        if not ordered:
+            raise AdmitHeadRefused("nothing waits; no head to admit")
+        path, row = ordered[0]
+        proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
+        identities = QueueIdentityReader(process_table(proc), proc)
+        identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
+        host = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
+        reserve = decide(host.available, host.total, row["need"], []).reserve
+        override: HeadAdmissionOverride = {
+            "waiter": path.name, "pid": row["pid"], "start_time": row["start_time"],
+            "unit": waiter_unit_name(identity, row["pid"]),
+            "step": row.get("step", ""), "need": row["need"], "free": host.available,
+            "reserve": reserve, "why": why, "set_by": actor,
+        }
+        write_text_atomic(head_override_path(directory), json.dumps(override, separators=(",", ":")))
+        head_override_event("set", override, row["need"], host.available, reserve, time.time())
+        return f"head admission set for {override['unit']} {override['step']}"
 
 
 @dataclass(frozen=True)
@@ -1799,6 +1907,12 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             (directory / "pressure-recovery").unlink()
             recovery = NoRecoverySpacing()
         pressure = pressure_with_recovery(recovery, pressure, now.timestamp())
+        override = read_head_override(directory)
+        if not isinstance(override, NoHeadAdmissionOverride) and not any(
+                head_override_matches(override, path, row) for path, row in waiting):
+            reserve = decide(available, total, 0, []).reserve
+            end_head_override(directory, "lapsed", override, override["need"], available, reserve, now.timestamp())
+            override = NoHeadAdmissionOverride()
         candidates = sorted([row for path, row in waiting if path != mine] + ([waiter] if argv else []),
                             key=waiter_order)
         head = head_priority(candidates, available, total, running, now.timestamp())
@@ -1813,6 +1927,16 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 and waiter_order(head.waiter) < waiter_order(waiter)):
             head_need, head_label = head.waiter["need"], waiter_label(head.waiter)
         decision = queue_decision(available, total, waiter, running, head, pressure)
+        waiter_override: HeadAdmissionOverride | NoHeadAdmissionOverride = (
+            override if (not isinstance(override, NoHeadAdmissionOverride) and bool(argv)
+                         and head_override_matches(override, mine, waiter)
+                         and bool(candidates) and candidates[0] is waiter)
+            else NoHeadAdmissionOverride())
+        if not isinstance(waiter_override, NoHeadAdmissionOverride):
+            threshold = peak.bytes + decision.reserve
+            fits_free = available >= threshold
+            decision = replace(decision, state="admit" if fits_free and isinstance(pressure, NoPressureHold) else "hold",
+                               threshold=threshold, free_passes=fits_free)
         # History lookup stays outside the lock. If contention outlives the
         # estimate, keep its timestamp so the next shell poll refreshes it.
         if now.timestamp() - profile.estimated_at >= HEAD_SECONDS:
@@ -1846,6 +1970,9 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 reservation = Reserved(path)
             else:
                 reservation = NotReserved("untracked")
+            if not isinstance(waiter_override, NoHeadAdmissionOverride):
+                end_head_override(directory, "admitted", waiter_override, peak.bytes, available,
+                                  decision.reserve, now.timestamp())
         head_reason = (head_wait_reason(decision, peak.bytes, available, waiter, now.timestamp())
                        if candidates and candidates[0] is waiter else ReadyForAdmission())
         return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile,
@@ -1863,6 +1990,10 @@ class WaiterIdentity(TypedDict):
     session_name: str
     step: str
     folder: str
+
+
+def waiter_unit_name(identity: WaiterIdentity, pid: int) -> str:
+    return identity["session_name"] or Path(identity["folder"]).name or str(pid)
 
 
 class QueueIdentityReader:
@@ -2066,7 +2197,7 @@ def read_queue_pass(directory: Path, processes: ProcessTable, now: float) -> Que
         elif (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
               and waiter_order(head.waiter) < waiter_order(row)):
             head_identity = identities.identity(head.waiter["pid"], cast(dict[str, object], cast(object, head.waiter)))
-            reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head.waiter["pid"]),
+            reason = BehindHead(waiter_unit_name(head_identity, head.waiter["pid"]),
                                 head.waiter["since"], head_identity["session_id"])
         elif row is ordered[0][1]:
             reason = head_wait_reason(own, row["need"], available, row, now)
@@ -2345,6 +2476,11 @@ def clean_field(value: str) -> str:
 
 def run_action() -> None:
     action = sys.argv[1]
+    if action == "admit-head":
+        if len(sys.argv) != 2 and not (len(sys.argv) == 4 and sys.argv[2] == "--why"):
+            raise AdmitHeadRefused('usage: memory_admit.py admit-head [--why "<text>"]')
+        print(admit_head(sys.argv[3] if len(sys.argv) == 4 else ""))
+        return
     if action == "blocker":
         if len(sys.argv) != 4 or sys.argv[2] != "--waiter":
             raise ValueError("usage: memory_admit.py blocker --waiter <waiter file>")
@@ -2424,7 +2560,7 @@ def run_action() -> None:
 def main() -> None:
     try:
         run_action()
-    except LiveMemoryReading as error:
+    except (LiveMemoryReading, AdmitHeadRefused) as error:
         print(str(error), file=sys.stderr)
         sys.exit(2)
 

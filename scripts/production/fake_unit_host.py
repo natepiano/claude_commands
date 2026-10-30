@@ -251,6 +251,7 @@ def stopped_record(root: Path, worktree: Path, *, name: str = "alpha", cwd: Path
                    host_session: str = "agents", branch: str = "", plan: Path | None = None,
                    progress: Literal["waiting", "ready", "stopped"] = "stopped") -> shutdown_record.SessionShutdown:
     """One typed unit record builder; callers override only their scenario's values."""
+    del production, doc  # Parentage is supplied by staff, never persisted here.
     saved: shutdown_record.SessionShutdown = {
         "login": "owner@example.com", "label": "claude2", "machine": "natedev",
         "requested_at": "2026-10-09T21:49:10+00:00", "request_id": "request",
@@ -263,8 +264,7 @@ def stopped_record(root: Path, worktree: Path, *, name: str = "alpha", cwd: Path
             "checkout": {"kind": "git", "path": str(worktree), "head": {"kind": "branch", "name": branch},
                          "upstream": {"kind": "tracking", "ahead": 0}, "dirty": []} if branch else {"kind": "not a checkout"},
             "run_dirs": [], "codex_servers": [], "timers": [], "kind": "unit",
-            "host": {"kind": "unit", "production": production, "unit": unit,
-                     "doc": str(doc) if doc is not None else "/fixture/doc",
+            "host": {"kind": "unit", "unit": unit,
                      "session_name": host_session, "session_host": "herdr",
                      "plan": {"kind": "plan", "path": str(plan)} if plan is not None else {"kind": "no run record"}},
         },

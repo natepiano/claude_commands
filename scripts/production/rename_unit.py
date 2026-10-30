@@ -663,11 +663,11 @@ def run_shutdown(*arguments: str) -> None:
 
 
 def _unit_records(rename: StopTarget) -> list[SessionShutdown]:
-    """This production's shutdown records of the unit, under either id."""
-    return shutdown_records(rename.slug, (rename.old, rename.new))
+    """The journaled director remains the same when its staff name or parent moves."""
+    return shutdown_records(rename.slug, (rename.old, rename.new), session_id=rename.session_id)
 
 
-def shutdown_records(slug: str, units: tuple[str, ...]) -> list[SessionShutdown]:
+def shutdown_records(slug: str, units: tuple[str, ...], *, session_id: str = "") -> list[SessionShutdown]:
     try:
         saved = shutdown_record.all_session_records()
     except (shutdown_record.InvalidRecord, OSError) as error:
@@ -675,9 +675,26 @@ def shutdown_records(slug: str, units: tuple[str, ...]) -> list[SessionShutdown]
     found: list[SessionShutdown] = []
     for item in saved:
         host = item["session"]["host"]
-        if host["kind"] == "unit" and host["production"] == slug and host["unit"] in units:
+        if host["kind"] != "unit" or host["unit"] not in units:
+            continue
+        recorded_id = item["session"]["session_id"]
+        if (recorded_id == session_id if session_id else
+                staff_sources.unit_parent(host["unit"], recorded_id).slug == slug):
             found.append(item)
     return found
+
+
+def bind_stop_target(rename: StopTarget) -> None:
+    """Journal the director before changing the staff name or parent used to find it."""
+    records = _unit_records(rename)
+    if len(records) > 1:
+        raise RenameRefused(f"{rename.old} has {len(records)} shutdown records; settle them first")
+    if records:
+        rename.account, rename.session_id = records[0]["login"], records[0]["session"]["session_id"]
+    else:
+        marked = unit_lookup.marked_unit(rename.slug, rename.old)
+        if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
+            rename.session_id = marked.claude.session_id
 
 
 def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
@@ -1265,6 +1282,7 @@ def _apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
             with _merge_lock(rename):
                 _preflight(rename)
             rename.staff_id = _staff_id(rename.slug, rename.old)
+            bind_stop_target(rename)
             # The request is saved before anything changes, so every later refusal resumes.
             _save(path, rename)
         try:

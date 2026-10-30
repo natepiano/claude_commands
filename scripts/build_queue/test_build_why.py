@@ -14,7 +14,8 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
-from scripts.build_queue import build_queue, build_why
+from scripts.build_queue import build_queue, build_why, head_facts
+from scripts.build_queue.test_head_facts import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
 from scripts.lint import memory_admit as gate
 from scripts.lib.process_start_test_support import write_stat
 from scripts.lib.user_zone import user_zone
@@ -205,8 +206,9 @@ class BuildWhyTests(unittest.TestCase):
             charge, used = (10.0, 0.1) if index < 10 else (1.0, 1.0)
             _ = self.running(800 + index, f"holder-{index}", "clippy", charge, used, 3600, peak=charge)
         started = time.perf_counter()
-        explanation = gate.explain_queue()
-        lines = build_why.render_explanation(explanation, user_zone(), {})
+        reading = gate.locked_queue_read()
+        explanation = reading.explanation
+        lines = build_why.render_explanation(explanation, user_zone(), {}, head_facts.read_head_facts(reading))
         elapsed = time.perf_counter() - started
         self.assertEqual(len(explanation.running), 20)
         final = self.line("\n".join(lines), "Waiting because:")
@@ -376,6 +378,89 @@ class BuildWhyTests(unittest.TestCase):
             path.unlink()
         self.assertTrue(self.output().rstrip().endswith("Nothing waits."))
 
+    def test_four_head_facts_follow_first_in_line_in_the_specified_order(self) -> None:
+        write_bumps(NOW, [bump_line(NOW - 1)])
+        output = self.output()
+        prefixes = ("First in line:", "Head for:", "Bumps since it joined at",
+                    "Order rule:", "Cargo token waits:")
+        positions = [output.index(prefix) for prefix in prefixes]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(self.line(output, "Head for:"), "Head for: unknown")
+        joined = datetime.fromtimestamp(NOW - 122 * 60, user_zone()).strftime("%H:%M:%S")
+        self.assertEqual(self.line(output, "Bumps since it joined"),
+                         f"Bumps since it joined at {joined}: 1")
+        self.assertEqual(self.line(output, "Cargo token waits:"), "Cargo token waits: unknown")
+
+    def test_token_gaps_only_show_current_waiting_runs(self) -> None:
+        since = NOW - 122 * 60
+        write_token_gaps([
+            token_gap_line(since - 100, since + 10, session="id-inspectors-fix", pid=500,
+                           start_time="500"),
+            token_gap_line(NOW - 600, NOW - 500, session="id-widget", pid=100, start_time="100"),
+            token_gap_line(NOW - 400, NOW - 300, session="", step="clippy", pid=500, start_time="500"),
+            token_gap_line(NOW - 200, NOW - 46, session="id-inspectors-fix", pid=500, start_time="500"),
+        ])
+        lines = [line.strip() for line in self.output().splitlines() if line.strip().startswith("Cargo token:")]
+        self.assertEqual(lines, ["Cargo token: inspectors-fix-session nextest: waited 154 s (21:47-21:50)"])
+
+    def test_token_record_without_matching_waits_prints_none(self) -> None:
+        for lines in ([queue_time_line(NOW - 20)],
+                      [token_gap_line(NOW - 200, NOW - 46, session="unrelated", pid=999)]):
+            with self.subTest(lines=lines):
+                write_token_gaps(lines)
+                output = self.output()
+                self.assertEqual(self.line(output, "Cargo token waits:"), "Cargo token waits: none")
+                self.assertFalse(any(line.strip().startswith("Cargo token:") for line in output.splitlines()))
+
+    def test_bump_table_caps_at_eight_groups_and_right_aligns_bumps(self) -> None:
+        lines: list[bytes] = []
+        for index, count in enumerate((12, 10, 8, 7, 6, 5, 4, 3, 2, 1)):
+            for number in range(count):
+                lines.append(bump_line(NOW - 300 + len(lines), session=f"bumped-{index}",
+                                       step=f"step-{index}", folder=f"/tmp/folder-{index}",
+                                       actor=f"actor-{number % 2}"))
+        write_bumps(NOW, lines)
+        output = self.output()
+        section = output[output.index("Bumps since it joined"):output.index("Order rule:")]
+        rows = [line for line in section.splitlines() if line.startswith("|")]
+        self.assertEqual([cell.strip() for cell in rows[0].split("|")[1:-1]],
+                         ["Step", "Session", "Folder", "Bumps", "By", "Last bump"])
+        self.assertEqual(len(rows), 9)
+        self.assertEqual([line.split("|")[4].strip() for line in rows[1:]],
+                         ["12", "10", "8", "7", "6", "5", "4", "3"])
+        self.assertEqual(len({len(line.rsplit("|", 3)[0].rstrip()) for line in rows[1:]}), 1)
+        for index in range(8):
+            self.assertIn(f"step-{index}", section)
+        self.assertNotIn("step-8", section)
+        self.assertNotIn("step-9", section)
+        self.assertIn("and 2 more steps with 3 bumps", section)
+        self.assertNotIn("this step", section.lower())
+
+    def test_single_label_read_includes_bump_actor_and_bumped_step_sessions(self) -> None:
+        write_bumps(NOW, [bump_line(NOW - 3, actor="actor-one", session="bumped-one"),
+                          bump_line(NOW - 2, actor="actor-two", session="bumped-two")])
+        with mock.patch.object(roster, "unit_labels_for", return_value={}) as labels, \
+             mock.patch.object(roster, "roster", side_effect=AssertionError("no full roster")), \
+             mock.patch.object(gate, "locked_queue_read", wraps=gate.locked_queue_read) as reading, \
+             mock.patch.object(head_facts, "read_head_facts", wraps=head_facts.read_head_facts) as facts:
+            output = self.output()
+        labels.assert_called_once()
+        requested = set(cast(list[str], labels.call_args_list[0].args[0]))
+        self.assertTrue({"actor-one", "actor-two", "bumped-one", "bumped-two", "id-inspectors-fix"}
+                        <= requested)
+        self.assertIn("actor-one", output)
+        self.assertIn("bumped-two", output)
+        reading.assert_called_once_with()
+        facts.assert_called_once()
+
+    def test_bump_read_failure_prints_unknown_and_preserves_success_exit(self) -> None:
+        gate.store.host_file(gate.store.host_name(), NOW).mkdir(parents=True)
+        output = self.output()
+        self.assertRegex(self.line(output, "Bumps since it joined:"),
+                         r"^Bumps since it joined: unknown \(.+\)$")
+        self.assertNotIn("the admission state could not be read", output)
+        self.assertIn("First in line:", output)
+
     def test_backfill_and_position_bump_report_the_admission_deadlines(self) -> None:
         self.change_head(priority_since=NOW - 630, bump_order=-1)
         output = self.output()
@@ -399,7 +484,7 @@ class BuildWhyTests(unittest.TestCase):
         for error in (OSError("cannot read ledger"), ValueError("invalid ledger"), TimeoutError("lock busy")):
             with self.subTest(error=type(error).__name__):
                 output, errors = io.StringIO(), io.StringIO()
-                with mock.patch.object(gate, "explain_queue", side_effect=error), \
+                with mock.patch.object(gate, "locked_queue_read", side_effect=error), \
                      redirect_stdout(output), redirect_stderr(errors), mock.patch("sys.argv", ["build_why.py"]):
                     result = build_why.main()
                 self.assertEqual(result, 2)

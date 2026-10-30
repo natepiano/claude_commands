@@ -684,9 +684,7 @@ def _host(
         plan = plans.get(session_id)
         return {
             "kind": "unit",
-            "production": unit.production,
             "unit": unit.unit,
-            "doc": unit.doc,
             "session_name": unit.session_name,
             "session_host": unit.session_host,
             "plan": (

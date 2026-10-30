@@ -482,7 +482,8 @@ def unit_shutdowns(unit: Unit, ids: frozenset[str]) -> list[shutdown_record.Sess
     for saved in shutdown_record.all_session_records():
         owner = saved["session"]
         if owner["session_id"] in ids or (owner["kind"] == "unit"
-                and owner["host"]["production"] == unit.production.slug and owner["host"]["unit"] == unit.name):
+                and owner["host"]["unit"] == unit.name
+                and staff_sources.unit_parent(unit.name, owner["session_id"]).slug == unit.production.slug):
             found.append(saved)
     return found
 
@@ -794,7 +795,6 @@ def retire(unit: Unit, wait_minutes: float) -> int:
         if not left and pane is not None:
             records = unit_shutdowns(unit, frozenset(ids))
             candidates = [item for item in records if item["session"]["kind"] == "unit"
-                and item["session"]["host"]["production"] == unit.production.slug
                 and item["session"]["host"]["unit"] == unit.name
                 and item["session"]["session_id"] == session_id]
             if len(candidates) != 1:

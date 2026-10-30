@@ -2,22 +2,15 @@
 
 from __future__ import annotations
 
+from scripts.lib import test_hang_guard
+
 import json
 import shutil
 import subprocess
 from pathlib import Path
 from typing import TypedDict, cast, override
 
-from scripts.direct.recorder_fixture import (
-    LauncherFixture,
-    STUB_ATOMIC_JSON_WRITER,
-    TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS,
-    communicate_launcher,
-    configure_launcher_fixture,
-    launcher_environment,
-    launcher_registry,
-    prepare_launcher_runtime,
-)
+from scripts.direct.recorder_fixture import LauncherFixture, STUB_ATOMIC_JSON_WRITER, communicate_launcher, configure_launcher_fixture, launcher_environment, launcher_registry, prepare_launcher_runtime
 
 
 DIRECT_DIR = Path(__file__).parent
@@ -361,11 +354,11 @@ class ReviewLauncherFixture(LauncherFixture):
         return subprocess.run(
             ["bash", str(self.review_script), *options, str(session), str(self.working_dir),
              str(self.prompt_file), "review", "blind review", "reviewing the diff", "1", lens, early],
-            check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
+            check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def finish_early_launcher(self, process: subprocess.Popen[str], ready: Path,
-                              finish: Path, timeout: float = TEST_HANG_GUARD_SECS) -> tuple[str, str]:
+                              finish: Path, timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS) -> tuple[str, str]:
         ready.touch()
         finish.touch()
         return communicate_launcher(process, timeout)
@@ -402,7 +395,7 @@ class ReviewLauncherFixture(LauncherFixture):
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=TEST_HANG_GUARD_SECS,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def run_assigned_review(
@@ -425,7 +418,7 @@ class ReviewLauncherFixture(LauncherFixture):
             capture_output=True,
             text=True,
             env=environment,
-            timeout=TEST_HANG_GUARD_SECS,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def finish_implementation(self, session_dir: Path) -> None:
@@ -541,5 +534,5 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             environment["STUB_REVIEW_COMMIT"] = "1"
         command = self.pool_command(session)
         command[2:2] = ["--phase", "3"]
-        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         return result, session / "phases" / "3"

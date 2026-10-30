@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record argv and replay configured responses without starting external tools.
+"""Record argv, validate agent names and workspace ids, and replay responses without external tools.
 
 FAKE_HERDR_RESPONSES maps space-joined argv (excluding the executable) to
 {stdout, code} entries, optionally with stderr and write_files (path-to-text
@@ -17,6 +17,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
+from uuid import NAMESPACE_URL, uuid5
 
 
 class CommandResponse(TypedDict):
@@ -26,6 +27,79 @@ class CommandResponse(TypedDict):
     write_files: NotRequired[dict[str, str]]
     require_paths: NotRequired[list[str]]
     remove_paths: NotRequired[list[str]]
+
+
+class AgentStartOutcome(TypedDict):
+    arguments: list[str]
+    command_index: int
+    exit_code: int
+
+
+def command_refusal(argv: list[str]) -> CommandResponse | None:
+    if argv[2:4] == ["agent", "start"] and (len(argv) < 5 or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", argv[4]) is None):
+        return {"stdout": "", "code": 1, "stderr": json.dumps({"error": {
+            "code": "invalid_agent_name", "message": "invalid agent name",
+        }}) + "\n"}
+    for name, workspace in zip(argv, argv[1:]):
+        if name == "--workspace" and re.fullmatch(r"w[0-9A-Z]+", workspace) is None:
+            return {"stdout": "", "code": 1, "stderr": json.dumps({"error": {
+                "code": "workspace_not_found", "message": f"workspace {workspace} not found",
+            }, "id": "cli:tab:list"}) + "\n"}
+    return None
+
+
+def command_response(argv: list[str], responses: dict[str, CommandResponse | list[CommandResponse]],
+                     previous: list[list[str]]) -> CommandResponse:
+    response = responses.get(" ".join(argv), responses.get("default", {"stdout": "", "code": 0}))
+    if isinstance(response, list):
+        seen = previous.count(argv)
+        return response[min(seen, len(response) - 1)]
+    return response
+
+
+def option(arguments: list[str], name: str) -> str | None:
+    return arguments[arguments.index(name) + 1] if name in arguments[:-1] else None
+
+
+def pane_list(stdout: str, session: list[str], starts: list[AgentStartOutcome]) -> str:
+    """Supply real pane fields, keeping the latest successful launch's conversation after exit.
+
+    Explicit response fields win, including malformed values used to test the reader.
+    Launch outcomes are recorded when commands finish, including lifecycle check failures.
+    """
+    try:
+        decoded = cast(object, json.loads(stdout))
+    except ValueError:
+        return stdout
+    if not isinstance(decoded, dict):
+        return stdout
+    reply = cast(dict[str, object], decoded)
+    if not isinstance(reply.get("result"), dict):
+        return stdout
+    result = cast(dict[str, object], reply["result"])
+    if not isinstance(result.get("panes"), list):
+        return stdout
+    sessions: dict[str, dict[str, str]] = {}
+    for start in starts:
+        command = start["arguments"]
+        if command[:4] != [*session, "agent", "start"] or start["exit_code"] != 0:
+            continue
+        pane = option(command, "--pane")
+        if pane is None:
+            continue
+        kind = option(command, "--kind") or "claude"
+        value = option(command, "--session-id") or option(command, "--resume")
+        sessions[pane] = {"agent": kind, "kind": "id", "source": f"herdr:{kind}",
+                          "value": value or str(uuid5(NAMESPACE_URL, json.dumps([command, start["command_index"]])))}
+    for item in cast(list[object], result["panes"]):
+        if not isinstance(item, dict):
+            continue
+        pane = cast(dict[str, object], item)
+        ident = pane.get("pane_id")
+        if isinstance(ident, str):
+            _ = pane.setdefault("workspace_id", ident.split(":", 1)[0])
+            _ = pane.setdefault("agent_session", sessions.get(ident))
+    return json.dumps(reply)
 
 
 def herdr_listener(proc: Path, pid: int, name: str, environment: Mapping[str, str]) -> None:
@@ -46,26 +120,16 @@ def herdr_listener(proc: Path, pid: int, name: str, environment: Mapping[str, st
     listener.symlink_to(f"socket:[{pid}]")
 
 
-def main(argv: list[str]) -> int:
-    log = Path(os.environ["FAKE_HERDR_LOG"])
-    previous = log.read_text().splitlines() if log.exists() else []
-    with log.open("a") as output:
-        _ = output.write(json.dumps(argv) + "\n")
-    if argv[2:4] == ["agent", "start"] and (len(argv) < 5 or re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", argv[4]) is None):
-        _ = sys.stderr.write(json.dumps({"error": {
-            "code": "invalid_agent_name", "message": "invalid agent name",
-        }}) + "\n")
-        return 1
+def execute(argv: list[str], previous: list[list[str]], outcomes: Path) -> int:
+    refusal = command_refusal(argv)
+    if refusal is not None:
+        _ = sys.stderr.write(refusal.get("stderr", ""))
+        return refusal["code"]
     responses = cast(
         dict[str, CommandResponse | list[CommandResponse]],
         json.loads(Path(os.environ["FAKE_HERDR_RESPONSES"]).read_text()),
     )
-    response = responses.get(
-        " ".join(argv), responses.get("default", {"stdout": "", "code": 0})
-    )
-    if isinstance(response, list):
-        seen = sum(cast(list[str], json.loads(line)) == argv for line in previous)
-        response = response[min(seen, len(response) - 1)]
+    response = command_response(argv, responses, previous)
     for required in response.get("require_paths", []):
         if not Path(required).exists():
             _ = sys.stderr.write(f"fixture required path missing: {required}\n")
@@ -78,9 +142,27 @@ def main(argv: list[str]) -> int:
             path.unlink(missing_ok=True)
     for file, text in response.get("write_files", {}).items():
         _ = Path(file).write_text(text)
-    _ = sys.stdout.write(response["stdout"])
+    stdout = response["stdout"]
+    if argv[2:4] == ["pane", "list"] and response["code"] == 0:
+        starts = [cast(AgentStartOutcome, json.loads(line)) for line in outcomes.read_text().splitlines()] if outcomes.exists() else []
+        stdout = pane_list(stdout, argv[:2], starts)
+    _ = sys.stdout.write(stdout)
     _ = sys.stderr.write(response.get("stderr", ""))
     return response["code"]
+
+
+def main(argv: list[str]) -> int:
+    log = Path(os.environ["FAKE_HERDR_LOG"])
+    previous = [cast(list[str], json.loads(line)) for line in log.read_text().splitlines()] if log.exists() else []
+    with log.open("a") as output:
+        _ = output.write(json.dumps(argv) + "\n")
+    outcomes = log.with_name(log.name + ".agent-starts")
+    code = execute(argv, previous, outcomes)
+    if argv[2:4] == ["agent", "start"]:
+        outcome = AgentStartOutcome(arguments=argv, command_index=len(previous), exit_code=code)
+        with outcomes.open("a") as output:
+            _ = output.write(json.dumps(outcome) + "\n")
+    return code
 
 
 if __name__ == "__main__":
