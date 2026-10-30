@@ -1066,6 +1066,10 @@ class Herdr:
         require_success(result, context)
         return result.stdout
 
+    def run_in_pane(self, pane: str, command: list[str]) -> None:
+        """Run an argv command in an existing pane; herdr types its text into the shell."""
+        _ = self.run("pane", "run", pane, shlex.join(command))
+
     def result(self, *arguments: str) -> dict[str, object]:
         reply = decode_object(self.run(*arguments), "herdr response")
         return json_object(reply.get("result"), "herdr result")
