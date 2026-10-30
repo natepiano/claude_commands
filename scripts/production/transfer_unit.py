@@ -159,6 +159,9 @@ def build(from_slug: str, given: str, to_doc: Path, scratch: Path) -> UnitTransf
         raise RenameRefused(f"{worktree} is not on {branch}")
     record = staff.snapshot()
     member = staff_sources.member(staff_sources.UnitMember(giving.slug, unit), record)
+    if isinstance(member, staff_sources.NoSuchMember):
+        # A staff move can finish before this command moves the Units row.
+        member = staff_sources.member(staff_sources.UnitMember(receiving.slug, unit), record)
     parent = staff_sources.member(staff_sources.ShowrunnerMember(receiving.slug), record)
     if isinstance(member, staff_sources.NoSuchMember) or isinstance(parent, staff_sources.NoSuchMember):
         raise staff.StaffRefused(f"{giving.slug}/{unit} to {receiving.slug}: no matching staff row")

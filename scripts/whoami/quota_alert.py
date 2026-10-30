@@ -25,23 +25,23 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import note_file
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.whoami import note_file
+
 from scripts.lib import agents_registry  # noqa: E402
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone
 from scripts.whoami import agent_accounts
 from scripts.accounts import moves, next_moves, refusals, role_map
-import usage_store
+from scripts.whoami import usage_store
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
 import review
 
-from note_file import reset_time
-from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Report,
+from scripts.whoami.note_file import reset_time
+from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, Report,
                             codex_can_work, CodexWorkAvailable, codex_email_on_disk,
                             codex_homes, codex_live, observe_workers_home, NoWorkersHome)
 

@@ -8,7 +8,8 @@ import subprocess
 import unittest
 from io import StringIO
 from unittest import mock
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Iterable, Sequence
 from contextlib import closing, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
@@ -18,6 +19,7 @@ import bulk_run as run
 import bulk_rename as bulk
 import rules
 import style_ledger as ledger_api
+from approved_renames import BindingRename, NoBindingScope, rename_declaration
 from test_bulk_rename import CargoProjectTests, ScriptedServer, word_edits, stop_after_edit, stop_process
 
 
@@ -182,6 +184,26 @@ class WorkspaceRunTests(CargoProjectTests):
         self.runner = FakeRunner()
         self.server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
 
+    def test_doc_parameter_and_derive_field_share_one_tested_rename_commit(self) -> None:
+        source = '/// Add `old`.\nfn run(old: usize) -> usize { old + 1 }\n'
+        derived = '#[derive(serde::Serialize)]\nstruct R { old: usize }\n'
+        _ = (self.repo / 'src/lib.rs').write_text(source)
+        _ = (self.repo / 'beta/src/lib.rs').write_text(derived)
+        _ = (self.repo / 'README.md').write_text('run takes `old`.\n')
+        _ = self.git('add', '.')
+        _ = self.git('commit', '-qm', 'documented and derived fixture')
+        self.base, self.tree = self.git('rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD^{tree}')
+        ledger, definition, _ = self.setup_findings()
+        self.addCleanup(ledger.close)
+        self.server = self.derive_server(lambda text, offset, new: word_edits(text, 'old', new))
+        report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (2, 0, 0))
+        self.assertEqual((self.repo / 'src/lib.rs').read_text(), source.replace('old', 'number'))
+        self.assertIn('#[serde(rename = "old")] number:', (self.repo / 'beta/src/lib.rs').read_text())
+        self.assertEqual((self.repo / 'README.md').read_text(), 'run takes `old`.\n')
+        self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
+        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
+
     def test_metadata_only_rule_edit_selects_approved_findings_but_body_edit_is_stale(self) -> None:
         ledger, definition, findings = self.setup_findings()
         self.addCleanup(ledger.close)
@@ -217,10 +239,290 @@ class WorkspaceRunTests(CargoProjectTests):
         ledger.ticket_drop("read-1")
         return ledger, definition, tuple(findings)
 
+    def available(self, _repo: Path, _path: str) -> None:
+        pass
+
     def execute(self, ledger: ledger_api.Ledger, definition: rules.Rule) -> dict[str, object]:
         path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, self.server, self.runner,
-                            available=lambda repo, path: None)
+                            available=self.available)
         return bulk.object_fields(cast(object, json.loads(path.read_text())))
+
+    def approve_extra_rename(self, ledger: ledger_api.Ledger, definition: rules.Rule,
+                             line: int, old: str, new: str, path: str = 'src/lib.rs') -> ledger_api.HeldFinding:
+        ledger.ticket_add('read-extra-1', 'read-extra', 'read', 'names', '.', [path], [definition.rule_id])
+        ledger.ticket_assign('read-extra-1', 'main')
+        _ = ledger.ticket_base('read-extra-1')
+        finding = ledger.hold(definition.rule_id, path, line,
+                              (self.repo / path).read_text().splitlines()[line - 1],
+                              'rename', old, new, definition.blob, 'read-extra-1')
+        proposal = self.root / 'decision-extra.md'
+        _ = proposal.write_text('---\nunit: names-unit\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved extra rename\n')
+        ledger.file_held(finding.finding_id, proposal)
+        ledger.ticket_drop('read-extra-1')
+        return finding
+
+    def setup_field_reference(self, tail: str = '') -> tuple[ledger_api.Ledger, rules.Rule, tuple[ledger_api.HeldFinding, ...]]:
+        source = 'struct Record {\n    old: usize,\n}\nmod child;\n' + tail
+        child = self.repo / 'src/child.rs'
+        child_source = 'fn read(r: super::Record) -> usize { r.old }\n'
+        _ = (self.repo / 'src/lib.rs').write_text(source)
+        _ = child.write_text(child_source)
+        _ = self.git('add', '.')
+        _ = self.git('commit', '-qm', 'field references in another module')
+        self.base = self.git('rev-parse', 'HEAD')
+        self.tree = self.git('rev-parse', 'HEAD^{tree}')
+        ledger, definition, findings = self.setup_findings()
+        rename = self.server.rename
+        definitions = self.server.definitions
+
+        def references(path: Path, text: str, offset: int, new: str) -> bulk.WorkspaceRename:
+            result = rename(path, text, offset, new)
+            if path == self.repo / 'src/lib.rs' and new == 'number':
+                return bulk.WorkspaceRename((*result.documents, bulk.DocumentEdits(
+                    child, child_source, word_edits(child_source, 'old', new))))
+            return result
+
+        def resolve(path: Path, text: str, offsets: tuple[int, ...]) -> tuple[bulk.DefinitionResolution, ...]:
+            if path == child:
+                target = bulk.DefinitionTarget((self.repo / 'src/lib.rs').as_uri(), (1, 4), (1, 10))
+                return tuple(target for _ in offsets)
+            return definitions(path, text, offsets)
+
+        _ = self.enterContext(mock.patch.object(self.server, 'rename', side_effect=references))
+        _ = self.enterContext(mock.patch.object(self.server, 'definitions', side_effect=resolve))
+        return ledger, definition, findings
+
+    def test_names_held_reference_refuses_only_its_edit_group(self) -> None:
+        ledger, definition, findings = self.setup_field_reference()
+        source = (self.repo / 'src/lib.rs').read_text()
+        child = self.repo / 'src/child.rs'
+        child_source = child.read_text()
+        checked: Counter[str] = Counter()
+        reason = 'src/child.rs: another worktree holds the file'
+
+        def available(_repo: Path, path: str) -> None:
+            checked[path] += 1
+            if path == 'src/child.rs':
+                raise bulk.BulkRenameError(reason)
+
+        with mock.patch.object(self, 'available', side_effect=available):
+            report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (1, 1, 0))
+        self.assertEqual(report['refusals'], {findings[0].finding_id: reason})
+        self.assertEqual(checked, {'src/lib.rs': 1, 'src/child.rs': 1, 'beta/src/lib.rs': 2})
+        self.assertEqual((self.repo / 'src/lib.rs').read_text(), source)
+        self.assertEqual(child.read_text(), child_source)
+        self.assertIn('let number', (self.repo / 'beta/src/lib.rs').read_text())
+        self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
+        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
+        self.assertIsInstance(ledger.named_held((findings[0].finding_id,))[0].state, ledger_api.Filed)
+
+    def test_held_field_reference_preserves_an_independent_local_rename_in_the_same_file(self) -> None:
+        ledger, definition, findings = self.setup_field_reference('fn extra() { let other = 2; consume(other); }\n')
+        extra = self.approve_extra_rename(ledger, definition, 5, 'other', 'size')
+        self.server.edit = lambda text, offset, new: word_edits(text, 'other' if new == 'size' else 'old', new)
+        child = self.repo / 'src/child.rs'
+        original = (self.repo / 'src/lib.rs').read_text()
+        child_source = child.read_text()
+        checked: Counter[str] = Counter()
+        reason = 'src/child.rs: another worktree holds the file'
+
+        def available(_repo: Path, path: str) -> None:
+            checked[path] += 1
+            if path == 'src/child.rs':
+                raise bulk.BulkRenameError(reason)
+
+        with mock.patch.object(self, 'available', side_effect=available):
+            report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (2, 1, 0))
+        self.assertEqual(report['refusals'], {findings[0].finding_id: reason})
+        self.assertEqual((self.repo / 'src/lib.rs').read_text(), original.replace('other', 'size'))
+        self.assertEqual(child.read_text(), child_source)
+        self.assertEqual(checked, {'src/lib.rs': 2, 'src/child.rs': 1, 'beta/src/lib.rs': 2})
+        self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
+        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
+        self.assertIsInstance(ledger.named_held((findings[0].finding_id,))[0].state, ledger_api.Filed)
+        self.assertNotIn(extra.finding_id, cast(dict[str, str], report['refusals']))
+
+    def test_later_rename_is_proved_without_a_held_traits_overlay(self) -> None:
+        source = ('struct Record;\n'
+                  'trait Named { fn old(&self); }\n'
+                  'impl Named for Record { fn old(&self) {} }\n'
+                  'mod methods;\n'
+                  'mod child;\n'
+                  'fn call(record: Record) { record.old(); }\n')
+        root = self.repo / 'src/lib.rs'
+        child = self.repo / 'src/child.rs'
+        methods = self.repo / 'src/methods.rs'
+        child_source = 'fn call<T: super::Named>(record: &T) { record.old(); }\n'
+        methods_source = 'impl super::Record { fn other(&self) {} }\n'
+        _ = root.write_text(source)
+        _ = child.write_text(child_source)
+        _ = methods.write_text(methods_source)
+        _ = self.git('add', '.')
+        _ = self.git('commit', '-qm', 'trait and inherent method fixture')
+        self.base = self.git('rev-parse', 'HEAD')
+        self.tree = self.git('rev-parse', 'HEAD^{tree}')
+        ledger, definition, findings = self.setup_findings()
+        inherent = self.approve_extra_rename(ledger, definition, 1, 'other', 'old', 'src/methods.rs')
+        named_held = ledger.named_held
+
+        def trait_first(names: Iterable[str]) -> tuple[ledger_api.HeldFinding, ...]:
+            # Finding hashes normally choose cross-file order. Exercise the dangerous
+            # order explicitly: the held trait edit precedes the independent method edit.
+            return tuple(sorted(named_held(names), key=lambda finding: finding.path != 'src/lib.rs'))
+
+        original_rename = self.server.rename
+        original_definitions = self.server.definitions
+        checked_trees: list[str] = []
+
+        def edits(text: str, _offset: int, new: str) -> tuple[bulk.SourceEdit, ...]:
+            # The probe leaves the concrete call untouched, exercising destination-name proof.
+            old = 'other' if new == 'old' else 'old'
+            return tuple(edit for edit in word_edits(text, old, new)
+                         if text.count('\n', 0, edit.start) != 5)
+
+        self.server.edit = edits
+
+        def references(path: Path, text: str, offset: int, new: str) -> bulk.WorkspaceRename:
+            result = original_rename(path, text, offset, new)
+            if path == root:
+                return bulk.WorkspaceRename((*result.documents, bulk.DocumentEdits(
+                    child, child_source, word_edits(child_source, 'old', new))))
+            return result
+
+        def resolve(path: Path, text: str, offsets: tuple[int, ...]) -> tuple[bulk.DefinitionResolution, ...]:
+            if path not in {root, child, methods}:
+                return original_definitions(path, text, offsets)
+            current = text if path == root else self.server.documents[root]
+            method = text if path == methods else self.server.documents.get(methods, methods_source)
+            trait_name = 'number' if 'fn number' in current else 'old'
+            method_name = 'old' if 'fn old' in method else 'other'
+            trait_start = current.splitlines()[1].index('fn ' + trait_name) + 3
+            trait = bulk.DefinitionTarget(root.as_uri(), (1, trait_start), (1, trait_start + len(trait_name)))
+            method_start = method.index('fn ' + method_name) + 3
+            own = bulk.DefinitionTarget(methods.as_uri(), (0, method_start), (0, method_start + len(method_name)))
+            answers: list[bulk.DefinitionResolution] = []
+            for offset in offsets:
+                if path == root and text.count('\n', 0, offset) == 5:
+                    checked_trees.append(current)
+                    answers.append(own if method_name == 'old' or trait_name == 'number' else trait)
+                else:
+                    answers.append(own if path == methods else trait)
+            return tuple(answers)
+
+        reason = 'src/child.rs: another worktree holds the file'
+
+        def available(_repo: Path, path: str) -> None:
+            if path == 'src/child.rs':
+                raise bulk.BulkRenameError(reason)
+
+        with mock.patch.object(self.server, 'rename', side_effect=references), mock.patch.object(
+                self.server, 'definitions', side_effect=resolve), mock.patch.object(self, 'available', side_effect=available), mock.patch.object(
+                ledger, 'named_held', side_effect=trait_first):
+            report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (1, 2, 0))
+        refusals = cast(dict[str, str], report['refusals'])
+        self.assertEqual(refusals[findings[0].finding_id], reason)
+        self.assertIn("capture in an unedited file for 'old'", refusals[inherent.finding_id])
+        self.assertTrue(checked_trees)
+        self.assertTrue(all('trait Named { fn old' in text for text in checked_trees))
+        self.assertEqual(root.read_text(), source)
+        self.assertEqual(self.server.documents[root], source)
+        self.assertEqual(methods.read_text(), methods_source)
+        self.assertEqual(self.server.documents[methods], methods_source)
+        self.assertEqual(child.read_text(), child_source)
+        self.assertTrue(all(isinstance(row.state, ledger_api.Filed)
+                            for row in ledger.named_held((findings[0].finding_id, inherent.finding_id))))
+
+    def test_values_held_reference_refuses_the_whole_shared_target_group(self) -> None:
+        ledger, definition, findings = self.setup_values(dual_target=True)
+        third = next(finding for finding in findings if finding.path == 'src/worker.rs' and finding.line == 4)
+        proposal = cast(ledger_api.Filed, third.state).proposal
+        _ = proposal.write_text(proposal.read_text().replace('declined', 'approved'))
+        before = {path: (self.repo / path).read_bytes() for path in ('src/lib.rs', 'src/main.rs', 'src/worker.rs')}
+        checked: Counter[str] = Counter()
+        reason = 'src/main.rs: another worktree holds the file'
+
+        def available(_repo: Path, path: str) -> None:
+            checked[path] += 1
+            if path == 'src/main.rs':
+                raise bulk.BulkRenameError(reason)
+
+        with mock.patch.object(self, 'available', side_effect=available), mock.patch.object(
+                bulk, 'RustAnalyzer', side_effect=AssertionError('values started rust-analyzer')):
+            report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (1, 3, 0))
+        held = {finding.finding_id for finding in findings if finding.path == 'src/worker.rs' and finding.line in (2, 4)}
+        refusals = cast(dict[str, str], report['refusals'])
+        self.assertEqual({identity: refusals[identity] for identity in held}, dict.fromkeys(held, reason))
+        self.assertTrue(all(isinstance(row.state, ledger_api.Filed) for row in ledger.named_held(held)))
+        self.assertEqual({path: (self.repo / path).read_bytes() for path in before}, before)
+        self.assertFalse((self.repo / 'src/constants.rs').exists())
+        self.assertIn('const FIRST: usize = 42', (self.repo / 'beta/src/constants.rs').read_text())
+        self.assertTrue(all(count == (2 if path.startswith('beta/') else 1) for path, count in checked.items()))
+        self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
+        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
+
+    def test_values_hold_appearing_after_planning_still_aborts(self) -> None:
+        ledger, definition, _ = self.setup_values()
+        checked: Counter[str] = Counter()
+        reason = 'src/constants.rs: another worktree holds the file'
+
+        def available(_repo: Path, path: str) -> None:
+            checked[path] += 1
+            if path == 'src/constants.rs' and checked[path] == 2:
+                raise bulk.BulkRenameError(reason)
+
+        with mock.patch.object(self, 'available', side_effect=available):
+            report = self.execute(ledger, definition)
+        self.assertEqual((report['applied'], report['reverted']), (0, 2))
+        self.assertEqual(report['status'], 'batch aborted: ' + reason)
+        self.assertEqual(self.git('rev-parse', 'HEAD'), self.base)
+        self.assertEqual(self.git('diff', self.base), '')
+        self.assertFalse(self.runner.calls)
+        self.assertFalse((self.repo / 'src/constants.rs').exists())
+
+    def test_stale_lineage_or_missing_judged_commit_names_its_cause(self) -> None:
+        ledger, _, findings = self.setup_findings()
+        finding = findings[0]
+        for evidence, judged in ((ledger_api.NeedsJudgment('item changed'), ledger_api.JudgedCommit(self.base)),
+                                 (ledger_api.UnchangedSite(finding.path, finding.line), ledger_api.NoJudgedCommit())):
+            with self.subTest(evidence=evidence, judged=judged), mock.patch.object(
+                    ledger, 'finding_site', return_value=evidence), mock.patch.object(ledger, 'judged_commit', return_value=judged):
+                result = run.current_rename(ledger, finding, self.base, run.RenameSources())
+                self.assertEqual(result, bulk.Refusal(finding.finding_id,
+                    'changed since judged: site lineage is not unchanged or the judged commit is missing'))
+
+    def test_stale_unreadable_judged_file_names_its_cause(self) -> None:
+        ledger, _, findings = self.setup_findings()
+        finding = findings[0]
+        with mock.patch.object(run.RenameSources, 'judged_file', return_value=run.CommandResult(1)):
+            result = run.current_rename(ledger, finding, self.base, run.RenameSources())
+        self.assertEqual(result, bulk.Refusal(finding.finding_id,
+            'changed since judged: the file cannot be read at the judged commit'))
+
+    def test_stale_physical_line_bytes_names_its_cause(self) -> None:
+        ledger, _, findings = self.setup_findings()
+        finding = findings[0]
+        # Token-equivalent CRLF is still different judged physical line evidence.
+        source = (self.repo / finding.path).read_bytes().decode().replace('\n', '\r\n')
+        with mock.patch.object(run.RenameSources, 'judged_file', return_value=run.CommandResult(0, source)):
+            result = run.current_rename(ledger, finding, self.base, run.RenameSources())
+        self.assertEqual(result, bulk.Refusal(finding.finding_id,
+            'changed since judged: the judged line bytes differ from the current line'))
+
+    def test_stale_declaration_off_current_line_names_its_cause(self) -> None:
+        ledger, _, findings = self.setup_findings()
+        finding = findings[0]
+        source = (self.repo / finding.path).read_text()
+        declaration = rename_declaration(source, BindingRename(finding.line, finding.text, 'old', 'number'))
+        self.assertNotIsInstance(declaration, NoBindingScope)
+        assert not isinstance(declaration, NoBindingScope)
+        with mock.patch.object(run, 'rename_declaration', return_value=replace(declaration, offset=0)):
+            result = run.current_rename(ledger, finding, self.base, run.RenameSources())
+        self.assertEqual(result, bulk.Refusal(finding.finding_id,
+            'changed since judged: the declaration is not on the current line'))
 
     def setup_values(self, *, dual_target: bool = False) -> tuple[ledger_api.Ledger, rules.Rule, tuple[ledger_api.HeldFinding, ...]]:
         source = 'pub fn run() {\n    let first: usize = 42;\n    let second: usize = 43;\n    let third: usize = 44;\n}\n'
@@ -508,7 +810,8 @@ class WorkspaceRunTests(CargoProjectTests):
         self.tree = self.git("rev-parse", "HEAD^{tree}")
         ledger.set_tip(self.git("rev-parse", "HEAD"))
         report = self.execute(ledger, definition)
-        self.assertEqual(report["refusals"], {findings[0].finding_id: "changed since judged"})
+        self.assertEqual(report["refusals"], {findings[0].finding_id:
+            "changed since judged: site lineage is not unchanged or the judged commit is missing"})
         self.assertEqual(report["applied_ids"], [findings[1].finding_id])
         self.assertIn("let old = 2", path.read_text())
         self.assertIn("let number", (self.repo / "beta/src/lib.rs").read_text())
@@ -557,15 +860,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.base = self.git("rev-parse", "HEAD")
         self.tree = self.git("rev-parse", "HEAD^{tree}")
         ledger, definition, findings = self.setup_findings()
-        ledger.ticket_add("read-extra-1", "read-extra", "read", "names", ".", ["src/lib.rs"], [definition.rule_id])
-        ledger.ticket_assign("read-extra-1", "main")
-        _ = ledger.ticket_base("read-extra-1")
-        extra = ledger.hold(definition.rule_id, "src/lib.rs", 6, path.read_text().splitlines()[5],
-                            "rename", "other", "size", definition.blob, "read-extra-1")
-        proposal = self.root / "decision-extra.md"
-        _ = proposal.write_text('---\nunit: names-unit\nplan: /tmp/standing-names.md\nstatus: open\n---\nApproved extra rename\n')
-        ledger.file_held(extra.finding_id, proposal)
-        ledger.ticket_drop("read-extra-1")
+        extra = self.approve_extra_rename(ledger, definition, 6, 'other', 'size')
         self.server = ScriptedServer(lambda text, offset, new: word_edits(text, "old" if new == "number" else "other", new))
         available = mock.Mock()
         command = subprocess.run

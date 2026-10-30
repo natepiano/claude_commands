@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from unit_staff_test_support import unit_host
 import copy
 import io
@@ -9,19 +14,17 @@ import json
 import os
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from collections.abc import Callable
 from typing import Literal, cast, final, override
 from unittest.mock import call, patch
 
 from test_support import linux_process_fixture, ShutdownTestCase, empty_session_registry
-from account import Account
+from scripts.whoami.account import Account
 import inventory
 import herdr
 from fake_herdr import CommandResponse
@@ -249,7 +252,7 @@ class SharedHerdrStopTests(ShutdownTestCase):
         marked = unit_lookup.MarkedUnit("review-unit", unit_lookup.ClaudeNotRunning(), herdr.HerdrPlace("agents", "w3:pE"))
         cases: list[tuple[unit_lookup.MarkedUnit | None, list[herdr.PaneIdentity], int, int]] = [
             (marked, [], 1, 0),
-            (marked, [{"pane_id": "w3:pE", "label": "prod-review"}], 1, 1),
+            (marked, [{"pane_id": "w3:pE", "label": "prod-review", "workspace_id": "w3", "session_id": None}], 1, 1),
             (None, [], 0, 0),
         ]
         for found, panes, closes, issues in cases:

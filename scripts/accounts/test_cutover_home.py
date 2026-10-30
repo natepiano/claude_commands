@@ -19,12 +19,14 @@ from typing import cast, override
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.accounts import accounts, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.message import sessions
 from scripts.whoami import agent_accounts
 from scripts.whoami.test_agent_accounts import ServiceKeychain, folder_service
-import account
+from scripts.whoami import account
 
 
 def file_state(path: Path) -> tuple[int, int, int, int, int, int]:
