@@ -2710,7 +2710,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Ruled out:**
 - One cause-key form for all producers: derived symptoms cannot be matched to their cause by key parts; they must carry their source.
 
-### Phase 94d — The watchdog keeps recovery evidence until a fresh check confirms the unit  · status: todo
+### Phase 94d — The watchdog keeps recovery evidence until a fresh check confirms the unit  · status: done
 
 **Depends on:** Phase 94b (order only)
 
@@ -2721,7 +2721,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Spec:**
 - On the recovery-result path, read the result without deleting it, confirm liveness fresh with `_live_account`, then delete the result and remove the job. A confirmed live unit: success cleanup and the `restarted on` line. An absent unit: delete the result and remove the job, then the existing retry line and recovery handling. An unreadable read: keep the result file, the job and the outage; no `restarted on` or retry line. The existing error path still writes its `watchdog: <production>: <error>` line.
 - The held or blocked branch between the result read and `_live_account` (`(source.blocked and not owns_claim) or _held(source, dry_run=False)`, which drops the outage with `del retained[key]`) relies today on `_recovery_result` having deleted the file. After the reorder it deletes the result file itself, so no file stays in `unit-watchdog-results`.
-- `scripts/whoami/test_profile_notes_pass.py` `test_child_launch_options_cannot_substitute_executable_or_run_hooks`: use an argv form the policy permits, for example `("ps", "-eo", "pid=,ppid=,comm=,args=")`, and add a positive control: the same argv with no launch option starts once. Then the test fails only when the launch-option check is missing (today `ps -c 'touch …'` fails `ps_read`, so argument rejection alone makes it pass).
+- `scripts/whoami/test_profile_notes_pass.py` `test_child_launch_options_cannot_substitute_executable_or_run_hooks`: use an argv form the policy permits, for example `("ps", "-eo", "pid=,ppid=,comm=,args=")`, and add a positive control: the same argv with no launch option starts once. Then the test fails only when the launch-option check is missing (today `ps -c 'touch …'` fails `ps_read`, so argument rejection alone makes it pass). Assertion-Change: `scripts/whoami/test_profile_notes_pass.py::test_child_launch_options_cannot_substitute_executable_or_run_hooks` — the rejected-call input is the ps listing form, so the test pins the launch-option check; a successful-launch control is added.
 - No other behavior changes.
 
 **Files:**
