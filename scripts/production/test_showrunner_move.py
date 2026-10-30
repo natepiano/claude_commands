@@ -16,7 +16,7 @@ from showrunner_move import MovesItself, NotMoved, Proven, Started
 from scripts.accounts import accounts
 from scripts.whoami import account
 from scripts.accounts.moves import MoveEntry
-from scripts.shutdown.record import SessionShutdown
+from scripts.shutdown.shutdown_record import SessionShutdown
 
 UNIT = "aaaaaaaa-0000-0000-0000-000000000001"
 TARGET = Path("/home/someone/.claude1")
@@ -43,7 +43,7 @@ class SettleTest(unittest.TestCase):
                *, deadline: float = 100.0) -> showrunner_move.Outcome:
         reads = iter(records)
         clock = iter(float(tick) for tick in range(0, 1000, 30))
-        with patch("showrunner_move.record.all_session_records", side_effect=lambda: next(reads)), \
+        with patch("showrunner_move.shutdown_record.all_session_records", side_effect=lambda: next(reads)), \
              patch("showrunner_move.moves.read_moves", return_value=journal), \
              patch("showrunner_move.sessions.live_sessions", return_value=live()), \
              patch("showrunner_move.account.process_config_dir", return_value=account.ConfiguredClaudeFolder(config_dir) if config_dir is not None else account.ProcessEnvironmentUnread("unreadable")), \

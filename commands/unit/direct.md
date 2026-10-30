@@ -24,11 +24,11 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 
 <HeldAstraRoles>
 For LongLivedWorkers and LaunchImplementation, the director briefs and accepts;
-Astra authors the assigned design. Use one `roles.py` designer and at most one
-reviewer per design, with models resolved from `guild` in `agents.conf`. Open
-once; resume the same instance across rounds, phases and runs. `roles.py` saves
+Astra authors the assigned design. Use one `design_roles.py` designer and at most one
+reviewer per design, with models resolved from `design_roles` in `agents.conf`. Open
+once; resume the same instance across rounds, phases and runs. `design_roles.py` saves
 each headed prompt and reply; do not also use `astra_work.py brief` for that role.
-For a designer outside `roles.py`, include `config/guilds/designer.md` in its brief
+For a designer outside `design_roles.py`, include `config/design_roles/designer.md` in its brief
 and save it with `astra_work.py brief --run-directory <SESSION_DIR> --phase <id>
 --member <mesh name> --document <path> --round <N> --text-file <brief>`.
 Save its reply as `<SESSION_DIR>/design/phase<id>/round<N>_reply.md` without
@@ -50,7 +50,7 @@ explicit end. Run cleanup must not stop durable meshes. Account moves and holder
 restarts recover the same threads through the role lifecycle; never raw pause or
 silently replace a lost thread. Adoption uses its recorded transfer and destination.
 The existing checkpoint, visual check and gate order still applies.
-For rollback, set `[roles] new_open=false` in `config/guilds.conf`. Finish active
+For rollback, set `[roles] new_open=false` in `config/design_roles.conf`. Finish active
 turns and release servers through the holder lifecycle. Keep placements, fences,
 pending input, prompts, replies and unfinished reservations. Keep adopted ownership
 at its destination unless a reverse transfer proves no destination writer. Restore
@@ -414,7 +414,9 @@ at once, in the turn it arrives; it never waits for a better moment:
 1. Stop mid-step. Do not finish the step, dispatch, review or gate in progress,
    and start nothing new. Leave uncommitted work in place.
 2. Stop any build you started outside `verify.sh`, or name it in the line below.
-   Leave Codex workers running: the mover pauses them with this session.
+   For a move, leave Codex workers running; the mover pauses them after you exit.
+   For a stop, if ready names a running Codex worker, retry when its turn finishes;
+   start no new turns.
 3. Run the `shutdown.py ready --where "<phase N: the step you stopped in and what
    comes next>"` command the message gives.
 4. End the turn with `— blocked: shutdown requested by the user`.

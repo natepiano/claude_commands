@@ -1,14 +1,19 @@
 """Check assertion-guard behavior against real Git repositories."""
 from __future__ import annotations
 
+import os
 import resource
+import subprocess
+import sys
 import time
 import unittest
 from pathlib import Path
-from typing import override
+from typing import NamedTuple, override
+from unittest.mock import patch
 
 from scripts.direct.assertion_guard import commit_bases, default_base
-from scripts.direct.assertion_guard_test_support import AssertionFindingFixture, SeededGitRepositoryFixture, SeededMergeInProgressFixture, CLEAN, TILE_OLD, TILE_NEW
+from scripts.production import showrunners
+from scripts.direct.assertion_guard_test_support import GUARD, AssertionFindingFixture, SeededGitRepositoryFixture, SeededMergeInProgressFixture, CLEAN, TILE_OLD, TILE_NEW
 
 class AssertionRevisionTests(AssertionFindingFixture):
     def test_executable_matches_in_process_output_and_status(self) -> None:
@@ -296,6 +301,186 @@ class BranchBaseTests(SeededGitRepositoryFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.strip(), CLEAN)
 
+
+
+class DivergedBases(NamedTuple):
+    upstream: str
+    production: str
+
+
+class ProductionBaseTests(SeededGitRepositoryFixture):
+    repo: Path = Path()
+
+    def refill_from_production(self, merge_branch: str = "style/main") -> str:
+        _ = self.save("incoming.rs", self.rust("\n    ".join(
+            f"assert_eq!(incoming_{index}, expected);" for index in range(6))))
+        _ = self.save("ours.rs", self.rust("assert_eq!(ours, expected);"))
+        self.commit_base()
+        _ = self.git("checkout", "-q", "-b", merge_branch)
+        _ = self.save("incoming.rs", self.rust("helper();"))
+        _ = self.git("add", "incoming.rs")
+        _ = self.git("commit", "-q", "-m", "another unit removes six assertions")
+        tip = self.git("rev-parse", "HEAD")
+        _ = self.git("push", "-q", "origin", f"HEAD:refs/heads/{merge_branch}")
+        _ = self.git("checkout", "-q", "unit")
+        _ = self.git("merge", "-q", "--ff-only", f"origin/{merge_branch}")
+        return tip
+
+    def test_ticket_108_refill_excludes_imported_removals_and_blocks_our_own(self) -> None:
+        tip = self.refill_from_production()
+        _ = self.register_production("style/main")
+        self.assertEqual(self.git("rev-parse", "@{upstream}"), self.base)
+        self.assertEqual(default_base(self.repo), tip)
+        clean = self.guard()
+        self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+        self.assertEqual(clean.stdout.strip(), CLEAN)
+        _ = self.save("ours.rs", self.rust("helper();"))
+        result = self.guard()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("ours.rs:3 test_value removed:", result.stdout)
+        self.assertNotIn("incoming.rs", result.stdout)
+        self.assertIn("assertion guard: 1 blocking;", result.stdout)
+        self.assertEqual(result.stderr, "")
+        explicit = self.guard("--base", self.base)
+        self.assertEqual(explicit.returncode, 1, explicit.stdout + explicit.stderr)
+        self.assertIn("incoming.rs", explicit.stdout)
+        self.assertIn("assertion guard: 7 blocking;", explicit.stdout)
+
+    def test_upstream_base_wins_when_newer_than_production_base(self) -> None:
+        production_tip = self.refill_from_production("builds")
+        _ = self.register_production("builds")
+        _ = self.save("unit.txt", "newer unit checkpoint\n")
+        self.commit_base()
+        self.assertNotEqual(self.base, production_tip)
+        self.assertEqual(default_base(self.repo), self.base)
+
+    def test_no_production_match_keeps_the_upstream_base(self) -> None:
+        _ = self.refill_from_production()
+        _ = self.register_production("style/main", worktree="/other/worktree", branch="other")
+        self.assertEqual(default_base(self.repo), self.base)
+        result = self.guard()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("incoming.rs", result.stdout)
+        self.assertIn("assertion guard: 6 blocking;", result.stdout)
+
+    def test_production_base_without_upstream_includes_the_remote_default_branch(self) -> None:
+        tip = self.refill_from_production("main")
+        checkout = self.root / "checkout"
+        _ = self.git("clone", "-q", str(self.root / "remote.git"), str(checkout))
+        self.repo = checkout
+        _ = self.git("checkout", "-q", "-b", "unit", "--track", "origin/unit")
+        _ = self.git("merge", "-q", "--ff-only", "origin/main")
+        _ = self.git("branch", "--unset-upstream")
+        _ = self.git("update-ref", "-d", "refs/remotes/origin/unit")
+        _ = self.register_production("main")
+        self.assertEqual(self.git("symbolic-ref", "refs/remotes/origin/HEAD"), "refs/remotes/origin/main")
+        self.assertEqual(default_base(self.repo), tip)
+        _ = self.save("ours.rs", self.rust("helper();"))
+        result = self.guard()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("ours.rs:3 test_value removed:", result.stdout)
+        self.assertNotIn("incoming.rs", result.stdout)
+        self.assertEqual(self.git("symbolic-ref", "refs/remotes/origin/HEAD"), "refs/remotes/origin/main")
+
+    def test_branch_match_is_used_when_worktree_does_not_match(self) -> None:
+        tip = self.refill_from_production("builds")
+        _ = self.register_production("builds", worktree="/old/worktree")
+        self.assertEqual(default_base(self.repo), tip)
+
+    def test_worktree_match_precedes_a_branch_match_in_another_doc(self) -> None:
+        tip = self.refill_from_production("builds")
+        _ = self.register_production("unit", worktree="/other/worktree", slug="branch-match")
+        _ = self.register_production("builds", branch="old-branch", slug="worktree-match")
+        self.assertEqual(default_base(self.repo), tip)
+
+    def test_worktree_with_trailing_slash_precedes_another_productions_branch(self) -> None:
+        tip = self.refill_from_production("builds")
+        _ = self.register_production("unit", worktree="/other/worktree", slug="branch-match")
+        _ = self.register_production("builds", worktree=f"{self.repo}/", branch="old-branch",
+                                     slug="worktree-match")
+        self.assertEqual(default_base(self.repo), tip)
+
+    def test_worktree_with_tilde_precedes_another_productions_branch(self) -> None:
+        tip = self.refill_from_production("builds")
+        _ = self.register_production("unit", worktree="/other/worktree", slug="branch-match")
+        worktree = "~/" + os.path.relpath(self.repo, Path.home())
+        _ = self.register_production("builds", worktree=worktree, branch="old-branch", slug="worktree-match")
+        self.assertEqual(default_base(self.repo), tip)
+
+    def test_unrelated_sessions_module_preserves_import_and_base_callers(self) -> None:
+        _ = self.refill_from_production("builds")
+        _ = self.register_production("builds")
+        script = """
+import sys
+import types
+from pathlib import Path
+sys.modules["sessions"] = types.ModuleType("sessions")
+before = sys.path[:]
+from scripts.direct.assertion_guard import commit_bases, default_base
+if sys.path != before:
+    raise AssertionError("importing the guard changed sys.path")
+repo = Path(sys.argv[1])
+mode = sys.argv[2]
+if mode == "commit":
+    print(commit_bases(repo)[0])
+elif mode == "explicit":
+    print(default_base(repo, sys.argv[3]))
+else:
+    print(default_base(repo))
+"""
+        for mode, expected in (("commit", self.git("rev-parse", "HEAD")),
+                               ("explicit", self.base), ("default", self.base)):
+            with self.subTest(mode=mode):
+                result = subprocess.run(
+                    [sys.executable, "-c", script, str(self.repo), mode, self.base],
+                    cwd=GUARD.resolve().parents[2], env=self.environment,
+                    capture_output=True, text=True, check=False, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+                self.assertEqual(result.stderr, "")
+
+    def test_missing_production_ref_keeps_the_upstream_base(self) -> None:
+        _ = self.register_production("absent")
+        self.assertEqual(default_base(self.repo), self.base)
+
+    def test_unreadable_production_doc_keeps_the_upstream_base(self) -> None:
+        doc = self.register_production("builds")
+        doc.unlink()
+        self.assertEqual(default_base(self.repo), self.base)
+
+    def test_explicit_base_skips_production_lookup(self) -> None:
+        with patch.object(showrunners, "timer_docs", side_effect=AssertionError("unexpected lookup")):
+            self.assertEqual(default_base(self.repo, self.base), self.base)
+
+    def diverged_bases(self, unit_commits: int, production_commits: int) -> DivergedBases:
+        fork = self.base
+        for index in range(unit_commits):
+            _ = self.save("unit.txt", f"unit {index}\n")
+            self.commit_base()
+        upstream = self.base
+        _ = self.git("checkout", "-q", "--detach", fork)
+        for index in range(production_commits):
+            _ = self.save("production.txt", f"production {index}\n")
+            _ = self.git("add", "production.txt")
+            _ = self.git("commit", "-q", "-m", "production checkpoint")
+        production_tip = self.git("rev-parse", "HEAD")
+        _ = self.git("push", "-q", "origin", "HEAD:refs/heads/builds")
+        _ = self.git("checkout", "-q", "unit")
+        _ = self.git("merge", "-q", "--no-ff", "origin/builds", "-m", "refill")
+        _ = self.register_production("builds")
+        return DivergedBases(upstream, production_tip)
+
+    def test_diverged_bases_choose_production_with_fewer_commits_to_head(self) -> None:
+        bases = self.diverged_bases(unit_commits=1, production_commits=2)
+        self.assertEqual(default_base(self.repo), bases.production)
+
+    def test_diverged_bases_choose_upstream_with_fewer_commits_to_head(self) -> None:
+        bases = self.diverged_bases(unit_commits=2, production_commits=1)
+        self.assertEqual(default_base(self.repo), bases.upstream)
+
+    def test_diverged_bases_keep_upstream_on_a_tie(self) -> None:
+        bases = self.diverged_bases(unit_commits=1, production_commits=1)
+        self.assertEqual(default_base(self.repo), bases.upstream)
 
 
 if __name__ == "__main__":

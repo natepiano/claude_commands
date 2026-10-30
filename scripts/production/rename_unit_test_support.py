@@ -36,11 +36,11 @@ import progress_history
 
 if TYPE_CHECKING:
     from scripts.style import style_ledger
-    from scripts.shutdown import record as shutdown_record
+    from scripts.shutdown import shutdown_record
 else:
     import style_ledger
     # rename_unit puts the shutdown folder on the path.
-    import record as shutdown_record
+    import shutdown_record
 
 SCRIPT = Path(__file__).with_name("rename_unit.py")
 SLUG = "demo"
@@ -121,8 +121,8 @@ class UnitRenameFixture(unittest.TestCase):
             # No waits by default: a test that needs one sets it.
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
             "REVIEW_POOL_STATE": str(self.root / "state/review-pool"),
-            "GUILD_ROLES_STATE": str(self.root / "state/guilds/roles"),
-            "GUILD_OWNERSHIP_STATE": str(self.root / "state/guilds/ownership"),
+            "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
+            "DESIGN_OWNERSHIP_STATE": str(self.root / "state/astra/design-ownership"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),

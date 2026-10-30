@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import fcntl
 import json
 import os
 import shlex
@@ -86,7 +87,7 @@ class RoleMapTests(unittest.TestCase):
                   redirect_stderr(io.StringIO()) as errors):
                 cached = accounts.account_for_unscoped_launch({}, workers=True)
             self.assertEqual(cached, selected)
-            self.assertIn("natedev unreachable", errors.getvalue())
+            self.assertIn("natedev fetch failed: fixture offline", errors.getvalue())
             role_map.write_role_map(role_map.WorkersClaudeRouteChange(
                 role_map.DEFAULT_WORKERS_CLAUDE_ACCOUNT, "Codex recovered",
                 RoleMapReadTime.now(timezone.utc).isoformat()))
@@ -221,6 +222,40 @@ class RoleMapTests(unittest.TestCase):
                 selected = role_map.read_role_map()
             ssh.assert_called_once_with(("role-map-read",))
             self.assertEqual((selected.groups, selected.workers), ({"units": "claude1"}, "codex1"))
+
+    def test_a_role_write_recovers_interrupted_name_conversion_before_appending_history(self) -> None:
+        self.seed(self.home, groups={})
+        history = accounts.groups_file().with_name("roles.jsonl")
+        history.parent.mkdir(parents=True, exist_ok=True)
+        earlier = {"at": "2026-10-12T00:00:00Z", "role": "workers", "label": "codex1"}
+        converted = json.dumps(earlier) + "\n"
+        _ = history.write_text(converted[:17])
+        inode = history.stat().st_ino
+        recovery = history.with_name(f".{history.name}.workers")
+        _ = recovery.write_text(converted)
+        with patch.object(role_map, "is_role_map_host", return_value=True):
+            role_map.write_role_map(role_map.RoleMapChange("workers", "codex3", "replace stopped writer",
+                                                         "2026-10-13T00:00:00Z"))
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0], earlier)
+        self.assertEqual(rows[1]["label"], "codex3")
+        self.assertEqual(rows[1]["role"], "workers")
+        self.assertEqual(history.stat().st_ino, inode)
+        self.assertFalse(recovery.exists())
+
+    def test_an_auto_move_read_recovers_interrupted_role_history_conversion(self) -> None:
+        history = self.home / "roles.jsonl"
+        complete = json.dumps({"group": "units", "cause": "auto", "why": "auto: recovered"}) + "\n"
+        _ = history.write_text(complete[:17] + "damaged old bytes\n")
+        recovery = history.with_name(f".{history.name}.workers")
+        _ = recovery.write_text(complete)
+        with patch.object(fcntl, "flock", wraps=fcntl.flock) as flock:
+            evidence = role_map.recorded_auto_moves(history)
+        self.assertEqual(evidence, role_map.RecordedAutoMoves(frozenset({"recovered"})))
+        self.assertEqual(history.read_text(), complete)
+        self.assertFalse(recovery.exists())
+        self.assertGreaterEqual(sum(call.args[1] == fcntl.LOCK_EX for call in flock.call_args_list), 2)
 
     def test_scratch_home_writes_its_groups_workers_and_history_without_remote_changes(self) -> None:
         self.seed(self.home, groups={"units": "claude3", "showrunners": "claude1"})
@@ -428,7 +463,7 @@ class RoleMapTests(unittest.TestCase):
             actual = role_map.read_role_map()
         self.assertEqual(actual, expected)
         self.assertEqual((output.getvalue() + error.getvalue()).splitlines(), [
-            "role map from 2026-10-16 11:24 EDT; natedev unreachable"])
+            "role map from 2026-10-16 11:24 EDT; natedev fetch failed: offline"])
 
     def test_unreachable_natedev_without_cache_refuses_instead_of_using_local_selections(self) -> None:
         self.seed(self.home, groups={"units": "claude3"}, workers="codex3")
@@ -442,7 +477,7 @@ class RoleMapTests(unittest.TestCase):
 
     def test_status_refuses_an_unavailable_remote_map_unless_stored(self) -> None:
         self.seed(self.home, groups={"units": "claude3", "showrunners": "claude2"}, workers="codex3")
-        expected = "accounts: cannot read role map from natedev; no usable map"
+        expected = "role map: unavailable; cannot read role map from natedev; no usable map; restore access to natedev or its saved role map; run accounts.py status --stored"
         self.assertFalse(role_map.role_map_cache_file().exists())
         before = self.files(self.home)
         with (patch.object(role_map, "is_role_map_host", return_value=False),
@@ -494,7 +529,7 @@ class RoleMapTests(unittest.TestCase):
 
     def test_stored_status_without_usable_remote_cache_has_empty_roles_and_the_role_problem(self) -> None:
         self.seed(self.home, groups={"units": "claude3", "showrunners": "claude2"}, workers="codex3")
-        expected = "accounts: cannot read role map from natedev; no usable map"
+        expected = "role map: unavailable; cannot read role map from natedev; no usable map; restore access to natedev or its saved role map; run accounts.py status --stored"
         cache = role_map.role_map_cache_file()
         for contents in (None, "not JSON", '{"at": "invalid", "map": {}}'):
             if contents is None:
@@ -537,7 +572,7 @@ class RoleMapTests(unittest.TestCase):
         rows = cast(list[dict[str, object]], document["accounts"])
         selected = next(row for row in rows if row["label"] == "claude2")
         self.assertEqual(selected["roles"], ["units", "showrunners"])
-        self.assertIn("accounts: workers is on codex1, which is not set up on this machine; run accounts.py setup codex1",
+        self.assertIn("workers: cannot launch on this machine; workers is on codex1, which is not set up on this machine; run accounts.py setup codex1",
                       cast(list[str], document["problems"]))
         self.assertEqual(self.files(self.home), before)
 
@@ -657,9 +692,9 @@ class RoleMapTests(unittest.TestCase):
                 self.assertEqual(ssh.call_count, 1)
                 self.assertIn("| Folder", output)
                 for role in ("units", "showrunners"):
-                    self.assertIn(f"accounts: {role} is on claude2, which is {state} on this machine; {claude_step}",
+                    self.assertIn(f"{role}: cannot launch on this machine; {role} is on claude2, which is {state} on this machine; {claude_step}",
                                   output.splitlines())
-                self.assertIn(f"accounts: workers is on codex1, which is {state} on this machine; {codex_step}",
+                self.assertIn(f"workers: cannot launch on this machine; workers is on codex1, which is {state} on this machine; {codex_step}",
                               output.splitlines())
 
 

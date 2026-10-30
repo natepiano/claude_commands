@@ -65,12 +65,12 @@ from user_zone import user_zone  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.style import style_ledger
-    from scripts.shutdown import record as shutdown_record
-    from scripts.shutdown.record import SessionShutdown
+    from scripts.shutdown import shutdown_record
+    from scripts.shutdown.shutdown_record import SessionShutdown
 else:
     import style_ledger
-    import record as shutdown_record
-    from record import SessionShutdown
+    import shutdown_record
+    from shutdown_record import SessionShutdown
 
 RESERVED = frozenset({add_unit.NIGHTLY_REVIEW_UNIT})
 # Columns a unit rename edits outside the Units row; a File or Gate cell is never touched.
@@ -263,21 +263,29 @@ def _session_name(slug: str, unit: str) -> str:
     return names[0] if names else ""
 
 
-def _check_stopped(rename: UnitRename) -> None:
+def _check_stopped(rename: UnitRename, *, relaunch: bool = False) -> None:
     """The unit runs no Claude under either id, and nothing works inside its worktree.
 
     Its runs' leftovers are ended here too: a rename resumed past its stop step never ran that
-    step's `_stop_runs`, such as one stopped before the stop ended runs."""
+    step's `_stop_runs`, such as one stopped before the stop ended runs. Only
+    relaunch may accept its recorded session already live under the new id."""
     try:
         marked = unit_lookup.marked_units(rename.slug)
     except OSError as error:
         raise RenameRefused(f"{rename.old}: cannot tell whether Claude is running: {error}") from error
+    relaunched = False
     for unit in (rename.old, rename.new):
         found = marked.get(unit)
         if found and isinstance(found.claude, unit_lookup.LiveClaude):
-            raise RenameRefused(f"{unit} has a live Claude; stop it first")
+            if relaunch and unit == rename.new and found.claude.session_id == rename.session_id:
+                relaunched = True
+            else:
+                raise RenameRefused(f"{unit} has a live Claude; stop it first")
         if found and isinstance(found.claude, unit_lookup.ClaudeUnknown):
             raise RenameRefused(f"{unit}: cannot tell whether Claude is running: {found.claude.reason}")
+    if relaunched:
+        # Restart owns this session already. Do not stop the workers it restored.
+        return
     _stop_runs(rename)
     pids = unit_move.processes_inside(rename.worktree())
     if pids:
@@ -316,13 +324,51 @@ def check_stoppable(rename: StopTarget) -> None:
         raise RenameRefused(f"processes {', '.join(map(str, pids))} work inside {rename.worktree()}; stop them first")
 
 
-def _check_checkout(rename: UnitRename) -> None:
+def _check_checkout(rename: UnitRename, *, resume_doc: bool = False) -> None:
     # Untracked files are left alone: the doc commit stages only tracked changes, and the checkout
     # keeps untracked files of its own, such as the production log, which `!docs/**` keeps visible.
     checkout = Path(rename.checkout)
-    if (git(checkout, "branch", "--show-current") != rename.merge_branch
-            or git(checkout, "status", "--porcelain", "--untracked-files=no")):
-        raise RenameRefused(f"showrunner checkout must be clean and on {rename.merge_branch}")
+    if git(checkout, "branch", "--show-current") == rename.merge_branch:
+        if not git(checkout, "status", "--porcelain", "--untracked-files=no"):
+            return
+        if resume_doc and not rename.doc_commit and _own_doc_edits(rename):
+            return
+    raise RenameRefused(f"showrunner checkout must be clean and on {rename.merge_branch}")
+
+
+def _own_doc_edits(rename: UnitRename) -> bool:
+    """Accept only complete, deterministic writes of the pending doc step.
+
+    The crash may follow any one write. Unwritten files remain at HEAD; changed
+    files must exactly equal the rename applied to HEAD, including whitespace.
+    """
+    checkout, doc = Path(rename.checkout), Path(rename.doc)
+    allowed = {str(path.relative_to(checkout)): path for path in (doc, *_plans(rename))
+               if path.is_relative_to(checkout)}
+    changed = set(git(checkout, "diff", "--name-only", "-z", "HEAD").split("\0")) - {""}
+    if not changed or changed - allowed.keys():
+        return False
+    if git(checkout, "diff", "--summary", "HEAD") or git(checkout, "diff", "--cached", "--summary"):
+        # Atomic text writes cannot add/delete paths or change their Git modes.
+        return False
+    staged = set(git(checkout, "diff", "--cached", "--name-only", "-z").split("\0")) - {""}
+    if staged - changed:
+        return False
+    for relative in changed:
+        path = allowed[relative]
+        original = subprocess.run(["git", "-C", str(checkout), "show", f"HEAD:{relative}"],
+                                  capture_output=True, text=True, check=False)
+        if original.returncode or not path.is_file():
+            return False
+        expected = _doc_text(rename, original.stdout) if path == doc else _plan_text(rename, original.stdout)
+        if path.read_bytes() != expected.encode("utf-8"):
+            return False
+        if relative in staged:
+            indexed = subprocess.run(["git", "-C", str(checkout), "show", f":{relative}"],
+                                     capture_output=True, check=False)
+            if indexed.returncode or indexed.stdout != expected.encode("utf-8"):
+                return False
+    return True
 
 
 def _preflight(rename: UnitRename) -> None:
@@ -515,13 +561,13 @@ def _merge_rename(rename: UnitRename, save: Callable[[], None]) -> None:
 
 
 def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
-    from scripts.guilds import roles
+    from scripts.astra import design_roles
     from scripts.direct import workers
     workers.rename_unit(rename.slug, rename.old, rename.new,
                         runs=tuple(set((*retire_unit.runs_of(Path(rename.old_worktree)),
                                         *retire_unit.runs_of(Path(rename.new_worktree))))))
     try:
-        roles.rename_holder(rename.slug, rename.old, rename.new, rename.old_worktree, rename.new_worktree)
+        design_roles.rename_holder(rename.slug, rename.old, rename.new, rename.old_worktree, rename.new_worktree)
     except (OSError, ValueError, SystemExit) as error:
         raise RenameRefused(str(error)) from error
     if _is_style(rename):
@@ -825,6 +871,7 @@ def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
 
 def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
     if rename.session_id:
+        # Restart also resumes its own partial worker/timer restores on a retry.
         run_shutdown("restart", "--only", rename.session_id)
         _await_live(rename)
 
@@ -920,8 +967,8 @@ def _state_failures(rename: UnitRename) -> list[str]:
     identity = phase_table.production_identity(read_production(Path(rename.doc)))
     failures.extend(f"{note}: phase note still names {rename.old}"
                     for note in phase_table.owned_notes(identity, rename.old))
-    from scripts.guilds import roles
-    failures.extend(roles.rename_failures(rename.slug, rename.old, rename.old_worktree))
+    from scripts.astra import design_roles
+    failures.extend(design_roles.rename_failures(rename.slug, rename.old, rename.old_worktree))
     return failures
 
 
@@ -1181,9 +1228,9 @@ def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
             # Revalidated before every step: a resumed run may come back to a changed machine. A merge
             # gate leaves the checkout mid-merge while it runs, so the check waits for it too.
             with _merge_lock(rename):
-                _check_checkout(rename)
+                _check_checkout(rename, resume_doc=step.run is _commit_doc)
                 if step.stopped:
-                    _check_stopped(rename)
+                    _check_stopped(rename, relaunch=step.run is _relaunch)
                 if step.locked:
                     step.run(rename, lambda: _save(path, rename))
             if not step.locked:

@@ -19,7 +19,7 @@ import herdr
 import settle
 import shutdown
 import sessions
-from record import SessionShutdown
+from shutdown_record import SessionShutdown
 
 
 class ShutdownSendLeaf(StrEnum):

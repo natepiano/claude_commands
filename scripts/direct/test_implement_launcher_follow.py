@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import unittest
-from scripts.direct import implement_launcher_test_support as support
+from scripts.lib.test_agents_registry import write_registry
+from scripts.direct.implement_launcher_claims_test_support import CompletedWorkerFixture
 from scripts.direct.implement_launcher_test_support import AGENTS_REGISTRY as AGENTS_REGISTRY
 from scripts.direct.implement_launcher_test_support import TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS
 from typing import cast
@@ -11,10 +12,9 @@ import json
 import subprocess
 
 
-class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
+class ImplementLauncherWorkerTests(CompletedWorkerFixture):
     def test_a_repair_pass_leaves_the_impl_worker_followable(self) -> None:
-        session_dir = self.start_phase("repair-keeps-impl")
-        first = self.mesh_launch(session_dir)
+        session_dir, first = self.completed_worker()
         self.assertEqual(first.returncode, 0, first.stderr)
         impl = cast("dict[str, object]", json.loads((session_dir / "impl_worker_impl.json").read_text()))
         repair = self.mesh_launch(session_dir, kind="fix", fix_cause="retry test failed after integration")
@@ -26,8 +26,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_an_impl_worker_keeps_one_identity_when_followed_as_a_repair_worker(self) -> None:
-        run = self.start_phase("impl-becomes-fix")
-        opened = self.mesh_launch(run, kind="impl")
+        run, opened = self.completed_worker()
         self.assertEqual(opened.returncode, 0, opened.stderr)
         path = run / "impl_worker_impl.json"
         original = cast(dict[str, object], json.loads(path.read_text()))
@@ -47,8 +46,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertFalse((run / "impl_worker_fix.json").exists())
 
     def test_follow_refuses_transferring_and_redirected_roles_before_compaction_or_claim(self) -> None:
-        session = self.start_phase("adoption-fence")
-        initial = self.mesh_launch(session)
+        session, initial = self.completed_worker()
         self.assertEqual(initial.returncode, 0, initial.stderr)
         path = session / "mesh_roster.json"
         original = cast(dict[str, dict[str, object]], json.loads(path.read_text()))
@@ -70,8 +68,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
                 self.assertEqual(events.read_bytes() if events.exists() else b"", previous_events)
 
     def test_follow_up_of_a_worker_with_no_identity_record_resumes_its_roster_thread(self) -> None:
-        session_dir = self.start_phase("lost-identity")
-        first = self.mesh_launch(session_dir)
+        session_dir, first = self.completed_worker()
         self.assertEqual(first.returncode, 0, first.stderr)
         path = session_dir / "impl_worker_impl.json"
         identity = cast("dict[str, object]", json.loads(path.read_text()))
@@ -85,8 +82,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertIn("has no matching durable worker identity for slot impl", refused.stderr)
 
     def test_follow_up_reads_an_old_identity_and_leaves_only_worker_names(self) -> None:
-        session_dir = self.start_phase("old-run-follow")
-        first = self.mesh_launch(session_dir)
+        session_dir, first = self.completed_worker()
         self.assertEqual(first.returncode, 0, first.stderr)
         path = session_dir / "impl_worker_impl.json"
         identity = cast("dict[str, object]", json.loads(path.read_text()))
@@ -100,9 +96,8 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertEqual(converted["worker_id"], identity["seat_id"])
         self.assertNotIn("seat_id", converted)
 
-    def test_follow_up_rejects_wrong_slot_and_keeps_its_recorded_model(self) -> None:
-        session_dir = self.start_phase("identity")
-        first = self.mesh_launch(session_dir)
+    def test_follow_up_rejects_wrong_slot_and_uses_the_current_registry_model(self) -> None:
+        session_dir, first = self.completed_worker()
         self.assertEqual(first.returncode, 0, first.stderr)
         roster = cast("dict[str, object]", json.loads(
             (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
@@ -116,34 +111,30 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertEqual(self.open_passes(session_dir), before)
 
         registry = self.root / ".claude" / "config" / "agents.conf"
-        _ = registry.write_text(
-            AGENTS_REGISTRY.replace("impl=gpt-called:xhigh", "impl=gpt-blind:max"),
-            encoding="utf-8",
-        )
-        # A registry row changed after the worker opened: the follow-up keeps the worker's model.
+        _ = write_registry(registry, {"direct.codex": {"impl": "gpt-blind:max"}}, base_text=AGENTS_REGISTRY)
+        # A registry row changed after the worker opened: the next dispatch uses it.
         changed_model = self.mesh_launch(session_dir, to=name)
         self.assertEqual(changed_model.returncode, 0, changed_model.stderr)
-        self.assertIn("agent=gpt-called\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
+        self.assertIn("agent=gpt-blind\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
+        self.assertIn("effort=max\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
         identity = cast("dict[str, object]", json.loads((session_dir / "impl_worker_impl.json").read_text()))
         self.assertEqual(identity["model"], "gpt-called")
 
     def test_follow_up_resumes_a_worker_recorded_before_the_rename(self) -> None:
         # Seats recorded before the delegate -> direct rename stored the model of the user's
         # rows at that time, which the registry no longer names (rca of 2026-10-23).
-        session_dir = self.start_phase("before-rename")
-        first = self.mesh_launch(session_dir)
+        session_dir, first = self.completed_worker()
         self.assertEqual(first.returncode, 0, first.stderr)
         path = session_dir / "impl_worker_impl.json"
         identity = cast("dict[str, object]", json.loads(path.read_text()))
         _ = path.write_text(json.dumps({**identity, "model": "gpt-blind"}))
         resumed = self.mesh_launch(session_dir, to=str(identity["name"]))
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertIn("agent=gpt-blind\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
+        self.assertIn("agent=gpt-called\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
         self.assertEqual(json.loads(path.read_text()), {**identity, "model": "gpt-blind"})
 
     def test_mesh_disabled_follow_refuses_before_recording_a_pass(self) -> None:
-        session_dir = self.start_phase("mesh-disabled")
-        first = self.mesh_launch(session_dir)
+        session_dir, first = self.completed_worker()
         self.assertEqual(first.returncode, 0, first.stderr)
         roster = cast("dict[str, object]", json.loads(
             (session_dir / "mesh_roster.json").read_text(encoding="utf-8")

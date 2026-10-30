@@ -10,8 +10,8 @@
   ],
   "executionEnvironments": [
     {
-      "root": "scripts/guilds",
-      "extraPaths": [".", "scripts/guilds", "scripts/direct", "scripts/lib", "scripts/history", "scripts/agents", "scripts/astra", "scripts/production", "scripts/message"]
+      "root": "scripts/astra",
+      "extraPaths": [".", "scripts/direct", "scripts/lib", "scripts/history", "scripts/agents", "scripts/astra", "scripts/production", "scripts/message"]
     },
     {
       "root": "scripts/hierarchies",

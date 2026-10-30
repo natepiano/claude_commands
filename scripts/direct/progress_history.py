@@ -32,6 +32,7 @@ from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
 from scripts.lib import agents_registry, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.production import production_doc  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -4808,6 +4809,25 @@ class HolderNotNamed:
 
 
 @dataclass(frozen=True)
+class MalformedHolder:
+    raw_value: object
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ValueError("malformed holder needs a reason")
+
+    def to_fields(self) -> dict[str, object]:
+        return {"state": "MalformedHolder", "reason": self.reason, "raw_value": self.raw_value}
+
+
+def _validate_holder_schema(fields: dict[str, object], allowed: set[str], state: str) -> None:
+    unknown = fields.keys() - allowed
+    if unknown:
+        raise ValueError(f"{state} has unknown fields: {', '.join(sorted(unknown))}")
+
+
+@dataclass(frozen=True)
 class NamedHolder:
     resource_kind: Literal["account", "slot", "memory"]
     resource: str
@@ -4819,6 +4839,7 @@ class NamedHolder:
 
     @classmethod
     def from_fields(cls, fields: dict[str, object]) -> NamedHolder:
+        _validate_holder_schema(fields, {"state", "resource_kind", "resource", "holder"}, "NamedHolder")
         kind = fields.get("resource_kind")
         resource = fields.get("resource")
         holder = _object_dict(fields.get("holder")) or {}
@@ -4826,8 +4847,10 @@ class NamedHolder:
                 or kind not in ("account", "slot", "memory")):
             raise ValueError("invalid named holder fields")
         if holder.get("state") == "SessionHolder":
+            _validate_holder_schema(holder, {"state", "session_id"}, "SessionHolder")
             owner = SessionHolder(_string(holder.get("session_id")))
         elif holder.get("state") == "UnitHolder":
+            _validate_holder_schema(holder, {"state", "unit"}, "UnitHolder")
             owner = UnitHolder(_string(holder.get("unit")))
         else:
             raise ValueError("holder must name a session or unit")
@@ -4841,6 +4864,7 @@ class NamedHolder:
 
 def _holder_from_fields(fields: dict[str, object]) -> NamedHolder | HolderNotNamed:
     if fields.get("state") == "HolderNotNamed":
+        _validate_holder_schema(fields, {"state", "reason"}, "HolderNotNamed")
         return HolderNotNamed(_string(fields.get("reason")))
     return NamedHolder.from_fields(fields)
 
@@ -5059,6 +5083,21 @@ def _phase_repository(working_dir: str) -> RecordedPhaseMetadata | PhaseMetadata
     return PhaseMetadataNotRecorded("repository common directory is unavailable")
 
 
+def _phase_production_name(production: str, working_dir: str) -> RecordedPhaseMetadata | PhaseMetadataNotRecorded:
+    reference = production.strip("`")
+    if "/" not in reference and Path(reference).suffix.lower() != ".md":
+        return _recorded_phase_metadata(production, "phase plan header names no production")
+    document = Path(working_dir).expanduser() / Path(reference).expanduser()
+    try:
+        lines = document.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        return PhaseMetadataNotRecorded(f"production document cannot be read: {error}")
+    name = production_doc.production_name(lines)
+    if isinstance(name, production_doc.ProductionNameNotRecorded):
+        return PhaseMetadataNotRecorded(name.reason)
+    return _recorded_phase_metadata(name.value, "production document heading names no production")
+
+
 def _phase_plan_names(state: Mapping[str, object]) -> tuple[
     RecordedPhaseMetadata | PhaseMetadataNotRecorded, RecordedPhaseMetadata | PhaseMetadataNotRecorded
 ]:
@@ -5080,7 +5119,7 @@ def _phase_plan_names(state: Mapping[str, object]) -> tuple[
     text = (header.group(1) + header.group(2)) if header.group(1) is not None else header.group(3)
     production = re.split(r" — | \(", text, maxsplit=1)[0].strip()
     unit = re.search(r'(?:^| — )unit[ \t]+(?:`([^`]+)`|([^,;\s]+))', text)
-    return (_recorded_phase_metadata(production, "phase plan header names no production"),
+    return (_phase_production_name(production, working_dir),
             _recorded_phase_metadata((unit.group(1) or unit.group(2)).strip() if unit else "",
                                      "phase plan header names no unit"))
 
@@ -5719,22 +5758,41 @@ def _attribution_candidates(wait: dict[str, object]) -> list[dict[str, object]]:
 def _wait_holder_history(events: list[dict[str, object]]) -> dict[tuple[str, str], list[dict[str, object]]]:
     histories: dict[tuple[str, str], list[dict[str, object]]] = {}
     for event in events:
-        if event.get("event_type") not in ("wait_started", "wait_not_recorded", "wait_holder_seen"):
+        event_type = event.get("event_type")
+        terminal = event_type in ("wait_finished", "wait_unclosed")
+        if event_type not in ("wait_started", "wait_not_recorded", "wait_holder_seen") and not terminal:
             continue
-        fields = _object_dict(event.get("holder"))
-        holder: NamedHolder | HolderNotNamed
-        if fields is None:
-            holder = HolderNotNamed("recorded before holders")
+        if terminal and "holder" not in event:
+            continue
+        raw_value = event.get("holder")
+        fields = _object_dict(raw_value)
+        if "holder" not in event:
+            holder_fields = _holder_fields(HolderNotNamed("recorded before holders"))
+        elif fields is None:
+            holder_fields = MalformedHolder(raw_value, "holder must be an object").to_fields()
         else:
             try:
-                holder = _holder_from_fields(fields)
+                holder_fields = _holder_fields(_holder_from_fields(fields))
             except ValueError as error:
-                holder = HolderNotNamed(f"invalid holder record: {error}")
+                holder_fields = MalformedHolder(raw_value, f"invalid holder record: {error}").to_fields()
         key = (_string(event.get("run_id")), _string(event.get("wait_id")))
+        history = histories.setdefault(key, [])
+        # Terminal rows copy the start holder, not later holder observations.
+        # Keep new terminal evidence without repeating a copied observation.
+        if terminal and any(observation["holder"] == holder_fields for observation in history):
+            continue
         epoch = _number(event.get("timestamp_epoch"))
-        histories.setdefault(key, []).append({"at": _iso_time(epoch), "epoch": epoch,
-                                              "holder": _holder_fields(holder)})
+        history.append({"at": _iso_time(epoch), "epoch": epoch, "holder": holder_fields})
     return histories
+
+
+def _counted_uncertain_reasons(waits: Iterable[dict[str, object]]) -> str:
+    counts: dict[str, int] = {}
+    for wait in waits:
+        reason = _string((_object_dict(wait.get("wait_attribution")) or {}).get("reason"))
+        counts[reason] = counts.get(reason, 0) + 1
+    return "; ".join(f"{reason} ({count} times)" if count > 1 else reason
+                     for reason, count in counts.items())
 
 
 def _read_waits(args: argparse.Namespace) -> None:
@@ -5800,7 +5858,10 @@ def _read_waits(args: argparse.Namespace) -> None:
             phase["repository"] = _phase_metadata_fields(source.repository)
         for field in ("production", "repository"):
             if field in event:
-                phase[field] = _phase_metadata_fields(_recorded_phase_metadata(event[field], f"phase has no {field}"))
+                metadata = _recorded_phase_metadata(event[field], f"phase has no {field}")
+                if field == "production" and isinstance(metadata, RecordedPhaseMetadata):
+                    metadata = _phase_production_name(metadata.value, _string(event.get("working_dir")))
+                phase[field] = _phase_metadata_fields(metadata)
         if own_missing:
             phase.update(reason="wait emission has a missing record", wait_missing_n=len(own_missing),
                          recorded_wait_n=len(own))
@@ -5814,8 +5875,7 @@ def _read_waits(args: argparse.Namespace) -> None:
         if own_uncertain:
             _ = phase.pop("wait_n", None)
             phase.update(state="UncertainCoverage", recorded_wait_n=len(own),
-                         reason="; ".join(_string((_object_dict(wait.get("wait_attribution")) or {}).get("reason"))
-                                          for wait in own_uncertain),
+                         reason=_counted_uncertain_reasons(own_uncertain),
                          candidates=[candidate for wait in own_uncertain for candidate in _attribution_candidates(wait)],
                          attribution_miss_ids=[wait["wait_id"] for wait in own_uncertain])
         if own_without_id:

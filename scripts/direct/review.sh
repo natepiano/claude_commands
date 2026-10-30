@@ -230,7 +230,7 @@ fi
 
 if [[ -z "${FOLLOW_TO}" && -z "${NEW_SLOT}" && ( -n "${POOL_TYPE}" || -n "${POOL_LEASE}" ) ]]; then
   RESOLVE_ERROR_FILE="${ARTIFACT_DIR}/review_resolve${SUFFIX}.$$.txt"
-  if FOLLOW_TO="$("$PY" "${SCRIPT_DIR}/workers.py" resolve --session-dir "${SESSION_DIR}" --role review --owner-pid "$$" 2>"${RESOLVE_ERROR_FILE}")"; then
+  if FOLLOW_TO="$("$PY" "${SCRIPT_DIR}/workers.py" resolve --session-dir "${SESSION_DIR}" --working-dir "${WORKING_DIR}" --role review --owner-pid "$$" 2>"${RESOLVE_ERROR_FILE}")"; then
     rm -f "${RESOLVE_ERROR_FILE}"
   else
     RESOLVE_CAUSE="$(tr '\n' ' ' < "${RESOLVE_ERROR_FILE}")"
@@ -682,15 +682,13 @@ if [[ -n "${FOLLOW_TO}" ]]; then
     --claim-pid "${FOLLOW_LAUNCHER_PID}" --role review "${LENS_ARGS[@]}" "${TURN_WORKTREE_ARGS[@]}" "${TURN_IMAGE_ARGS[@]}" \
     --message-file "${PROMPT_FILE}" --summary-file "${FINDINGS_FILE}" \
     --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
-    --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
     --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 elif [[ -n "${NEW_SLOT}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
     --session-dir "${SESSION_DIR}" --name "${REVIEW_WORKER}" --role review "${LENS_ARGS[@]}" \
     --cwd "${WORKING_DIR}" --sandbox read-only --prompt-file "${PROMPT_FILE}" \
     --summary-file "${FINDINGS_FILE}" --reply-file "${REPLY_FILE}" \
-    --log-file "${LOG_FILE}" --model "${AGENT_MODEL}" \
-    --effort "${AGENT_EFFORT:-}" --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
+    --log-file "${LOG_FILE}" --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 else
   bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
     "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &

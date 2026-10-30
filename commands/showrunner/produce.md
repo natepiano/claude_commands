@@ -336,9 +336,9 @@ State:
 
 <HeldProductionDesign>
 The showrunner may hold one lasting Astra designer/reviewer pair for a production
-design through `roles.py`. It briefs, records cited rulings and acceptance, and
+design through `design_roles.py`. It briefs, records cited rulings and acceptance, and
 keeps the same threads across rounds, restarts and account moves. Configured
-`guild` models and explicit access policies apply. A writer needs an authorized
+`design_roles` models and explicit access policies apply. A writer needs an authorized
 production-design phase with exact output paths, baseline and reservation; until
 that phase exists, hold read-only roles only. New writing scope needs an idle
 rebind. Saved headed prompts and replies stay with the role; pending messages are
@@ -1119,7 +1119,9 @@ at once, in the turn it arrives:
 1. Stop mid-step and start nothing new: no merge, gate or launch that has not
    begun. Leave uncommitted work in place.
 2. Append a `### STATE` block to your LOG, and stop any build you started or name
-   it in the line below.
+   it in the line below. For a move, leave Codex workers running; the mover pauses
+   them after you exit. For a stop, if ready names a running Codex worker, retry
+   when its turn finishes; start no new turns.
 3. Run the `shutdown.py ready --where "<one line>"` command the message gives.
 4. End the turn.
 

@@ -12,6 +12,8 @@ file replaced by its last chat reply.
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
@@ -42,7 +44,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import MagicMock, patch
@@ -54,7 +56,7 @@ from scripts.lib import nix_env
 from scripts.message import process_table, sessions, roster as message_roster
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
-from scripts.guilds import astra_work, roles
+from scripts.astra import astra_work, design_roles
 from scripts.whoami import account, agent_accounts
 
 
@@ -97,7 +99,7 @@ def refuse_real_home(path: Path, source: str) -> None:
 
 
 def assert_fixture_environment() -> None:
-    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR"):
+    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE", "AGENTS_LOCAL_CONFIG_FILE"):
         value = os.environ.get(name)
         if not value:
             raise AssertionError(f"{name} is unset; codex_mesh fixture requires setUpModule")
@@ -143,6 +145,22 @@ class FixtureLoopBudget:
         if remaining <= 0:
             raise AssertionError(f"{self.name}: exceeded {self.seconds}s real-time fixture deadline")
         return remaining
+
+
+@dataclasses.dataclass
+class LifecycleTestClock:
+    """Keep real registry subprocess time outside scripted lifecycle deadlines."""
+
+    registry_seconds: float = 0.0
+
+    def time(self) -> float:
+        return time.time() - self.registry_seconds
+
+    def monotonic(self) -> float:
+        return time.monotonic() - self.registry_seconds
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
 
 
 def bounded_fixture[**P, R](callback: Callable[P, R]) -> Callable[P, R]:
@@ -210,11 +228,14 @@ def setUpModule() -> None:
     # Tier tests never read the caller's registry, config, or pacer choice.
     tier_files = {
         "AGENTS_CONFIG_FILE": str(Path(home.name) / "agents.conf"),
+        "AGENTS_LOCAL_CONFIG_FILE": str(Path(home.name) / "agents.local.conf"),
+        "CODEX_CATALOG_SYNC_STATE_FILE": str(Path(home.name) / "catalog-sync"),
         "CODEX_CONFIG_FILE": str(Path(home.name) / "codex.toml"),
         "CODEX_PACER_TIER_FILE": str(Path(home.name) / "pacer-tier"),
     }
     for path in tier_files.values():
         _ = Path(path).write_text("", encoding="utf-8")
+    _ = write_registry(Path(tier_files["AGENTS_CONFIG_FILE"]))
     for key, value in tier_files.items():
         unittest.addModuleCleanup(set_environment(key, value))
     authority = patch.object(role_map, "is_role_map_host", new=lambda: True)
@@ -586,6 +607,18 @@ class MeshCommandFixture(unittest.TestCase):
         self.home.mkdir()
         self.patches = contextlib.ExitStack()
         self.addCleanup(self.patches.close)
+        clock = LifecycleTestClock()
+        resolve = codex_mesh._turn_model_effort  # pyright: ignore[reportPrivateUsage]
+
+        def resolve_registry(args: argparse.Namespace) -> tuple[str, str]:
+            started = time.perf_counter()
+            try:
+                return resolve(args)
+            finally:
+                clock.registry_seconds += time.perf_counter() - started
+
+        _ = self.patches.enter_context(patch.object(codex_mesh, "time", clock))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "_turn_model_effort", resolve_registry))
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
             "HOME": str(self.home), "CODEX_HOME": str(self.home / ".codex"),
             "AGENT_NOTES_DIR": str(self.home),
@@ -640,8 +673,8 @@ class MeshCommandFixture(unittest.TestCase):
         if self.guard_frame_reads:
             _ = self.patches.enter_context(patch.object(codex_mesh.Client, "next_frame", bounded_read))
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
-            "GUILD_ROLES_STATE": str(self.session_dir / "guild-roles"),
-            "GUILD_OWNERSHIP_STATE": str(self.session_dir / "guild-ownership"),
+            "DESIGN_ROLES_STATE": str(self.session_dir / "design-roles"),
+            "DESIGN_OWNERSHIP_STATE": str(self.session_dir / "design-ownership"),
             "UNIT_RUN_DIR": "", "PLAN_DELEGATE_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "",
         })))
         _ = self.patches.callback(set_environment("USAGE_STATE_DIR", str(self.session_dir / "usage-state")))
@@ -1186,22 +1219,22 @@ class MeshCommandFixture(unittest.TestCase):
         self.write_pool_roster(entries)
         return replacement
 
-    def held_reviewer_record(self, lifecycle: roles.Lifecycle) -> roles.HeldDesign:
+    def held_reviewer_record(self, lifecycle: design_roles.Lifecycle) -> design_roles.HeldDesign:
         prompt = self.session_dir / "authorized.md"
-        design = roles.HeldDesign(roles.DesignPlacement("00000000-0000-4000-8000-000000000026", "fixture-host", 3),
+        design = design_roles.HeldDesign(design_roles.DesignPlacement("00000000-0000-4000-8000-000000000026", "fixture-host", 3),
             "fixture-repo", str(self.session_dir), str(self.session_dir / "design.md"), "design",
-            "2026-10-21T12:00:00+00:00", roles.UnitHolder("demo", "design-unit"), roles.DesignUnbound(),
-            (roles.RoleInstance("designer", "unused-designer", roles.RoleNotOpened()),
-             roles.RoleInstance("reviewer", "worker", lifecycle, str(prompt))))
-        roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("demo", "design-unit"), design_roles.DesignUnbound(),
+            (design_roles.RoleInstance("designer", "unused-designer", design_roles.RoleNotOpened()),
+             design_roles.RoleInstance("reviewer", "worker", lifecycle, str(prompt))))
+        design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         _ = prompt.write_text("Current authorized reviewer instructions.")
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "review",
             "held_design_id": design.placement.design_id, "held_role": "reviewer", "port": self.server.port,
             "authorized_generation": 3, "authorized_holder": "fixture-holder", "authorized_prompt": str(prompt),
             "access_policy": {"kind": "ReadOnlyReviewer"}}})
-        _ = self.patches.enter_context(patch.object(roles, "resolve_holder", return_value=roles.HolderReach("fixture-holder")))
+        _ = self.patches.enter_context(patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")))
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-holder",
-                                                               "GUILD_ROLES_HOST": "fixture-host"})))
+                                                               "DESIGN_ROLES_HOST": "fixture-host"})))
         return design
 
     def prepare_refusing_account(self, *, stub_ensure: bool = True) -> agent_accounts.KnownCodexAccount:
@@ -1332,8 +1365,8 @@ class FixtureHomeSafetyTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
         real = root / "real"
         real.mkdir()
-        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR"):
-            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR")}
+        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE", "AGENTS_LOCAL_CONFIG_FILE"):
+            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE", "AGENTS_LOCAL_CONFIG_FILE")}
             environment[name] = str(real / "nested")
             with (self.subTest(variable=name), patch(f"{__name__}.REAL_HOME", real),
                   patch.dict(os.environ, environment),
@@ -1406,19 +1439,19 @@ class MeshCommandTests(MeshCommandFixture):
     """Launcher and recovery behavior against the shared bounded fake server."""
 
     def test_held_turn_with_current_binding_reuses_the_server_without_blocking(self) -> None:
-        design = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
-        binding = roles.DesignBoundToPhase(str(self.session_dir / "phase-run"), "1",
+        design = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
+        binding = design_roles.DesignBoundToPhase(str(self.session_dir / "phase-run"), "1",
                                           str(self.session_dir), ("design.md",))
         design = dataclasses.replace(design, binding=binding)
-        roles._save(design)  # pyright: ignore[reportPrivateUsage]
-        context_path = self.session_dir / "guild_context.json"
+        design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        context_path = self.session_dir / "design_context.json"
         context = {"design_id": design.placement.design_id, "generation": design.placement.generation,
                    "holder_session": "fixture-holder", "cwd": design.repository,
                    "binding": {"kind": "DesignBoundToPhase", **dataclasses.asdict(binding)}}
         _ = context_path.write_text(json.dumps(context))
         server_path = self.session_dir / codex_mesh.SERVER_FILE
         server_record = cast(dict[str, object], json.loads(server_path.read_text()))
-        server_record["guild_context"] = context
+        server_record["design_context"] = context
         _ = server_path.write_text(json.dumps(server_record))
         before = server_path.read_bytes()
         args = self.start_args()
@@ -1454,21 +1487,21 @@ class MeshCommandTests(MeshCommandFixture):
         for stop_route in ("idle-stop", "sweep"):
             with self.subTest(stop_route=stop_route):
                 design_id = "00000000-0000-4000-8000-000000000027"
-                self.session_dir = roles.mesh_directory(design_id)
+                self.session_dir = design_roles.mesh_directory(design_id)
                 self.session_dir.mkdir(parents=True, exist_ok=True)
-                directory = roles.design_directory(design_id)
+                directory = design_roles.design_directory(design_id)
                 prompt = directory / "prompts/assignment.md"
                 reply = directory / "replies/assignment.md"
                 prompt.parent.mkdir(exist_ok=True)
                 reply.parent.mkdir(exist_ok=True)
-                binding = roles.DesignBoundToPhase(str(fixture_root / "phase-run"), "1",
+                binding = design_roles.DesignBoundToPhase(str(fixture_root / "phase-run"), "1",
                                                   str(fixture_root), ("design.md",))
-                design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 3),
+                design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 3),
                     "fixture-repo", str(fixture_root), str(fixture_root / "design.md"), "design",
-                    "2026-10-21T12:00:00+00:00", roles.UnitHolder("demo", "design-unit"), binding,
-                    (roles.RoleInstance("designer", "worker", roles.RoleOpen(THREAD_ID), str(prompt)),
-                     roles.RoleInstance("reviewer", "unused-reviewer", roles.RoleNotOpened())))
-                roles._save(design)  # pyright: ignore[reportPrivateUsage]
+                    "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("demo", "design-unit"), binding,
+                    (design_roles.RoleInstance("designer", "worker", design_roles.RoleOpen(THREAD_ID), str(prompt)),
+                     design_roles.RoleInstance("reviewer", "unused-reviewer", design_roles.RoleNotOpened())))
+                design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
                 header = astra_work.AstraWork("astra-designer", "worker", design.document,
                     design.created_at_utc, str(reply), astra_work.StandaloneWork())
                 _ = prompt.write_text(astra_work.header_line(header) + "\nContinue the authorized design.\n")
@@ -1482,11 +1515,11 @@ class MeshCommandTests(MeshCommandFixture):
                 context = {"design_id": design_id, "generation": 3, "holder_session": "fixture-holder",
                            "cwd": design.repository, "binding": {"kind": "DesignBoundToPhase",
                                                                    **dataclasses.asdict(binding)}}
-                _ = (self.session_dir / "guild_context.json").write_text(json.dumps(context))
+                _ = (self.session_dir / "design_context.json").write_text(json.dumps(context))
                 pending = self.session_dir / "worker.pending.json"
                 _ = pending.write_text(json.dumps({"thread_id": THREAD_ID,
                     "messages": ["Keep this pending design correction."], "accepting_messages": True}))
-                _ = roles.queue_message(design_id, "designer", "fixture-holder", "Keep this holder message.",
+                _ = design_roles.queue_message(design_id, "designer", "fixture-holder", "Keep this holder message.",
                                         message_id="00000000-0000-4000-8000-000000000028")
                 process = subprocess.Popen([sys.executable, "-c", "import signal; signal.pause()"],
                                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -1497,7 +1530,7 @@ class MeshCommandTests(MeshCommandFixture):
                 server_path = self.session_dir / codex_mesh.SERVER_FILE
                 _ = server_path.write_text(json.dumps({"pid": process.pid, "port": self.server.port,
                     "codex_home": str(agent_accounts.workers_home()),
-                    "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS, "guild_context": context}))
+                    "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS, "design_context": context}))
                 old = codex_mesh.SERVER_IDLE_SECS + 60
                 for name in codex_mesh.SWEEP_ACTIVITY_FILES:
                     path = self.session_dir / name
@@ -1540,7 +1573,7 @@ class MeshCommandTests(MeshCommandFixture):
                         started.append(codex_mesh._server_environment(session_dir, home))  # pyright: ignore[reportPrivateUsage]
                         _ = server_path.write_text(json.dumps({"pid": os.getpid(), "port": self.server.port,
                             "codex_home": str(home), "auto_compact_tokens": codex_mesh.AUTO_COMPACT_TOKENS,
-                            "guild_context": context}))
+                            "design_context": context}))
                         return self.server.port
 
                     args = self.start_args()
@@ -1548,14 +1581,14 @@ class MeshCommandTests(MeshCommandFixture):
                     args.message_file = str(prompt)
                     args.summary_file = str(reply)
                     with (
-                        patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-holder", "GUILD_ROLES_HOST": "fixture-host"}),
-                        patch.object(roles, "resolve_holder", return_value=roles.HolderReach("fixture-holder")),
+                        patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-holder", "DESIGN_ROLES_HOST": "fixture-host"}),
+                        patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")),
                         patch.object(codex_mesh, "_start_server", start_fixture_server),
                         contextlib.redirect_stderr(io.StringIO()) as errors,
                     ):
                         self.assertEqual(codex_mesh.command_follow(args), 0, errors.getvalue())
                     self.assertEqual(len(started), 1)
-                    self.assertEqual(started[0]["GUILD_DESIGN_ID"], design_id)
+                    self.assertEqual(started[0]["HELD_DESIGN_ID"], design_id)
                     self.assertEqual(started[0]["UNIT_RUN_DIR"], binding.run_directory)
                     self.assertEqual([_as_test_dict(request["params"])["threadId"]
                                       for request in self.methods("thread/resume")], [THREAD_ID])
@@ -1571,7 +1604,7 @@ class MeshCommandTests(MeshCommandFixture):
                     entry = self.worker_record()
                     self.assertEqual((entry["thread_id"], entry["held_design_id"], entry["access_policy"]),
                                      (THREAD_ID, design_id, policy))
-                    self.assertEqual([message.text for message in roles.pending_messages(design_id, "designer")],
+                    self.assertEqual([message.text for message in design_roles.pending_messages(design_id, "designer")],
                                      ["Keep this holder message."])
                 finally:
                     if process.poll() is None:
@@ -1580,7 +1613,7 @@ class MeshCommandTests(MeshCommandFixture):
                 self.session_dir = fixture_root
 
     def test_account_move_resume_refuses_a_fenced_source_before_touching_its_queue(self) -> None:
-        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        _ = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
         record = self.worker_record()
         record["transferring_role"] = {"adoption_id": "transfer-one", "destination": "/fixture/destination"}
         self.write_pool_roster({"worker": record})
@@ -1594,7 +1627,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.methods("turn/start"), [])
 
     def test_account_move_recovery_saves_the_held_reply_at_its_assignment_path(self) -> None:
-        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        _ = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
         reply = self.session_dir / "saved-replies/assignment.md"
         prompt = self.session_dir / "authorized.md"
         header = astra_work.AstraWork("astra-reviewer", "worker", str(self.session_dir / "design.md"),
@@ -1626,7 +1659,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_invalid_account_move_header_preserves_the_roster_for_a_later_follow(self) -> None:
-        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        _ = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
         prompt = self.session_dir / "authorized.md"
         _ = prompt.write_text("<!-- astra_work {invalid json} -->\nReviewer instructions.\n")
         record = self.worker_record()
@@ -1655,7 +1688,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.worker_record()["status"], "starting")
 
     def test_held_instruction_and_turn_claim_has_one_winner_and_uses_current_prompt(self) -> None:
-        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        _ = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
         def claim(pid: int) -> bool:
             return codex_mesh._claim_follow(str(self.session_dir), "worker", THREAD_ID, pid, "review")  # pyright: ignore[reportPrivateUsage]
 
@@ -1669,7 +1702,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_stale_held_assignment_cannot_claim_a_turn_or_replace_instructions(self) -> None:
-        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        _ = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
         record = self.worker_record()
         record.update({"authorized_generation": 2, "instructions_file": "previous.md"})
         self.write_pool_roster({"worker": record})
@@ -1679,7 +1712,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.methods("turn/start"), [])
 
     def test_held_thread_resume_failure_does_not_start_a_replacement(self) -> None:
-        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        _ = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
         self.failing_method = "thread/resume"
         args = self.start_args()
         args.to = "worker"
@@ -1696,7 +1729,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
 
     def test_held_roles_refuse_raw_pause_reopen_and_instruction_replacement(self) -> None:
-        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        _ = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
         instructions = self.session_dir / "replacement.md"
         _ = instructions.write_text("This text must not replace the authorized assignment.")
         before = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
@@ -1709,7 +1742,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.methods("thread/resume"), [])
 
     def test_adoption_fence_blocks_old_follow_reopen_move_and_cleanup_routes(self) -> None:
-        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        _ = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
         entry = self.worker_record()
         entry["transferring_role"] = {"adoption_id": "transfer-one", "destination": "/fixture/destination"}
         self.write_pool_roster({"worker": entry})
@@ -1735,7 +1768,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(_as_test_dict(self.methods("turn/start")[0]["params"])["sandboxPolicy"], {"type": "dangerFullAccess"})
 
     def test_end_from_recovery_marks_lost_thread_ended_before_failed_server_cleanup(self) -> None:
-        _ = self.held_reviewer_record(roles.RoleNeedsRecovery(THREAD_ID, "thread lost"))
+        _ = self.held_reviewer_record(design_roles.RoleNeedsRecovery(THREAD_ID, "thread lost"))
         entry = self.worker_record()
         entry["status"] = "failed"
         self.write_pool_roster({"worker": entry})
@@ -1748,7 +1781,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_move_without_a_prior_marker_parks_queued_text_before_interrupting(self) -> None:
-        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        _ = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
         entry = self.worker_record()
         entry.update({"status": "running", "turn_id": "live-one"})
         self.write_pool_roster({"worker": entry})
@@ -1771,7 +1804,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.methods("thread/start"), [])
 
     def test_idle_server_release_parks_queue_before_unsubscribe_and_preserves_thread(self) -> None:
-        _ = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
+        _ = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
         self.queued = [{"id": "queued-one", "input": [{"type": "text", "text": "Idle queued evidence."}]}]
         original = self.respond
 
@@ -1789,12 +1822,12 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertIn("Idle queued evidence.", (self.session_dir / "worker.pending.json").read_text())
 
     def test_idle_durable_account_move_without_run_marker_parks_queue_before_server_stop(self) -> None:
-        design = self.held_reviewer_record(roles.RoleOpen(THREAD_ID))
-        mesh = roles.mesh_directory(design.placement.design_id)
+        design = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
+        mesh = design_roles.mesh_directory(design.placement.design_id)
         mesh.mkdir(parents=True)
         _ = (mesh / codex_mesh.ROSTER_FILE).write_text(json.dumps({"worker": self.worker_record()}))
         _ = (mesh / codex_mesh.SERVER_FILE).write_bytes((self.session_dir / codex_mesh.SERVER_FILE).read_bytes())
-        roles._mesh_context(design, roles.HolderReach("fixture-holder"))  # pyright: ignore[reportPrivateUsage]
+        design_roles._mesh_context(design, design_roles.HolderReach("fixture-holder"))  # pyright: ignore[reportPrivateUsage]
         self.queued = [{"id": "queued-one", "input": [{"type": "text", "text": "Keep idle account-move text."}]}]
         stopped: list[int] = []
 
@@ -2782,6 +2815,7 @@ class MeshCommandTests(MeshCommandFixture):
                     "input": [{"type": "text", "text": "Review the second worktree"}],
                     "sandboxPolicy": WRITE_POLICY,
                     "serviceTier": "default",
+                    "model": "gpt-test", "effort": "high",
                     **overrides,
                 })
 
@@ -2798,12 +2832,13 @@ class MeshCommandTests(MeshCommandFixture):
             "input": [{"type": "text", "text": "Review the second worktree"}],
             "sandboxPolicy": WRITE_POLICY,
             "serviceTier": "default",
+            "model": "gpt-test", "effort": "high",
         })
 
-    def tier_environment(self, registry: str, config: str = "") -> dict[str, str]:
+    def tier_environment(self, registry: dict[str, dict[str, str]], config: str = "") -> dict[str, str]:
         registry_file = self.session_dir / "agents.conf"
         config_file = self.session_dir / "codex.toml"
-        _ = registry_file.write_text(registry, encoding="utf-8")
+        _ = write_registry(registry_file, registry)
         _ = config_file.write_text(config, encoding="utf-8")
         return {"AGENTS_CONFIG_FILE": str(registry_file), "CODEX_CONFIG_FILE": str(config_file),
                 "CODEX_PACER_TIER_FILE": str(self.session_dir / "pacer-tier")}
@@ -2813,8 +2848,8 @@ class MeshCommandTests(MeshCommandFixture):
             with self.subTest(task=task):
                 function, row = task.split(".")
                 environment = self.tier_environment(
-                    f"[delegate.options]\ncodex_service_tier=flex\n"
-                    + f"[{function}.options]\ncodex_service_tier.{row}=fast\n")
+                    {"delegate.options": {"codex_service_tier": "flex"},
+                     f"{function}.options": {f"codex_service_tier.{row}": "fast"}})
                 self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done"}})
                 self.server.requests.clear()
                 read = codex_mesh.Client.next_frame
@@ -2830,9 +2865,9 @@ class MeshCommandTests(MeshCommandFixture):
                             self.assertEqual(codex_mesh.command_send(argparse.Namespace(
                                 session_dir=str(self.session_dir), to="worker",
                                 message="Run finished: fixture build passed", message_file="")), 0)
-                        _ = Path(environment["AGENTS_CONFIG_FILE"]).write_text(
-                            "[delegate.options]\ncodex_service_tier=flex\n"
-                            + f"[{function}.options]\ncodex_service_tier.{row}=default\n")
+                        _ = write_registry(Path(environment["AGENTS_CONFIG_FILE"]),
+                            {"delegate.options": {"codex_service_tier": "flex"},
+                             f"{function}.options": {f"codex_service_tier.{row}": "default"}})
                     return frame
 
                 with patch.dict(os.environ, environment), patch.object(codex_mesh.Client, "next_frame", wake):
@@ -2854,12 +2889,12 @@ class MeshCommandTests(MeshCommandFixture):
                 self.assertEqual(self.worker_record().get("task"), task)
 
     def test_follow_resolves_registry_and_paced_tiers_instead_of_the_launch_tier(self) -> None:
-        cases = [
-            ("[delegate.options]\ncodex_service_tier=fast\ncodex_service_tier.review=default\n", "", "", "default"),
-            ("", 'service_tier = "fast"\n', "", "default"),
-            ("[delegate.options]\ncodex_service_tier=default\n", 'service_tier = "fast"\n', "", "default"),
-            ("[delegate.options]\ncodex_service_tier=pace\n", "", "", "default"),
-            ("[delegate.options]\ncodex_service_tier=fast\n", "", "default", "fast"),
+        cases: list[tuple[dict[str, dict[str, str]], str, str, str]] = [
+            ({"delegate.options": {"codex_service_tier": "fast", "codex_service_tier.review": "default"}}, "", "", "default"),
+            ({}, 'service_tier = "fast"\n', "", "default"),
+            ({"delegate.options": {"codex_service_tier": "default"}}, 'service_tier = "fast"\n', "", "default"),
+            ({"delegate.options": {"codex_service_tier": "pace"}}, "", "", "default"),
+            ({"delegate.options": {"codex_service_tier": "fast"}}, "", "default", "fast"),
         ]
         for registry, config, supplied, expected in cases:
             with self.subTest(registry=registry, supplied=supplied):
@@ -2873,8 +2908,8 @@ class MeshCommandTests(MeshCommandFixture):
                 self.assertEqual(_as_test_dict(self.methods("turn/start")[0]["params"])["serviceTier"], expected)
 
     def test_unknown_task_uses_the_function_tier_and_registry_errors_do_not_stop_a_turn(self) -> None:
-        for registry in ("[delegate.options]\ncodex_service_tier=default\n",
-                         "[delegate.options]\ncodex_service_tier=broken\n"):
+        for value in ("default", "broken"):
+            registry = {"delegate.options": {"codex_service_tier": value}}
             with self.subTest(registry=registry):
                 environment = self.tier_environment(registry)
                 self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "review"}})
@@ -2883,7 +2918,7 @@ class MeshCommandTests(MeshCommandFixture):
                     code, _output, errors = self.run_mesh(self.follow_cli())
                 self.assertEqual((code, errors), (0, ""))
                 self.assertEqual(_as_test_dict(self.methods("turn/start")[0]["params"])["serviceTier"], "default")
-                if "broken" in registry:
+                if value == "broken":
                     self.assertIn("cannot resolve service tier", (self.session_dir / "worker.log").read_text())
                     self.assertIn("broken", (self.session_dir / "worker.log").read_text())
 
@@ -2913,6 +2948,7 @@ class MeshCommandTests(MeshCommandFixture):
                     "input": [{"type": "text", "text": "Review the second worktree"}],
                     "sandboxPolicy": WRITE_POLICY,
                     "serviceTier": "default",
+                    "model": "gpt-test", "effort": "high",
                     **overrides,
                 })
 
@@ -3028,10 +3064,10 @@ class MeshCommandTests(MeshCommandFixture):
         }})
         roster_path = self.session_dir / codex_mesh.ROSTER_FILE
         before = roster_path.read_bytes()
-        with self.assertRaisesRegex(SystemExit, r"roles\.py recover"):
+        with self.assertRaisesRegex(SystemExit, r"design_roles\.py recover"):
             _ = codex_mesh._worker_sandbox(  # pyright: ignore[reportPrivateUsage]
                 self.start_args(), str(self.session_dir), "worker")
-        with self.assertRaisesRegex(SystemExit, r"roles\.py recover"):
+        with self.assertRaisesRegex(SystemExit, r"design_roles\.py recover"):
             _ = codex_mesh._resume_params(  # pyright: ignore[reportPrivateUsage]
                 str(self.session_dir), "worker", THREAD_ID)
         self.assertEqual(roster_path.read_bytes(), before)
@@ -3456,25 +3492,25 @@ class MeshCommandTests(MeshCommandFixture):
 
     def test_prime_held_titles_use_the_design_holder_before_the_mesh_record_exists(self) -> None:
         for index, (holder, prefix) in enumerate((
-                (roles.UnitHolder("sdlc", "roles-unit"), "sdlc · roles"),
-                (roles.ShowrunnerHolder("sdlc"), "sdlc"))):
+                (design_roles.UnitHolder("sdlc", "roles-unit"), "sdlc · roles"),
+                (design_roles.ShowrunnerHolder("sdlc"), "sdlc"))):
             for role, job in (("designer", "designer"), ("reviewer", "design reviewer")):
                 with self.subTest(holder=holder, role=role):
                     design_id = f"00000000-0000-4000-8000-00000000009{index}"
-                    directory = roles.design_directory(design_id)
+                    directory = design_roles.design_directory(design_id)
                     claim = directory / f"{role}.creation-claimed"
                     claim.unlink(missing_ok=True)
-                    design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 1),
+                    design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
                         "fixture-repo", str(self.session_dir), str(self.session_dir / "design.md"), "design",
-                        "2026-10-21T12:00:00+00:00", holder, roles.DesignUnbound(),
-                        (roles.RoleInstance("designer", "template" if role == "designer" else "other-designer",
-                                            roles.RoleNotOpened("claim")),
-                         roles.RoleInstance("reviewer", "template" if role == "reviewer" else "other-reviewer",
-                                            roles.RoleNotOpened("claim"))))
-                    roles._save(design)  # pyright: ignore[reportPrivateUsage]
+                        "2026-10-21T12:00:00+00:00", holder, design_roles.DesignUnbound(),
+                        (design_roles.RoleInstance("designer", "template" if role == "designer" else "other-designer",
+                                            design_roles.RoleNotOpened("claim")),
+                         design_roles.RoleInstance("reviewer", "template" if role == "reviewer" else "other-reviewer",
+                                            design_roles.RoleNotOpened("claim"))))
+                    design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
                     self.write_pool_roster({})
                     self.server.requests.clear()
-                    with patch.object(roles, "resolve_holder", return_value=roles.HolderReach("fixture-holder")), \
+                    with patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")), \
                             patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-holder"}):
                         result, output, errors = self.run_mesh(self.prime_cli(
                             "--held-design", design_id, "--held-role", role))
@@ -4268,10 +4304,12 @@ class MeshCommandTests(MeshCommandFixture):
         rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
         self.assertFalse(any(str(row["event_type"]).startswith("wait_") for row in rows))
 
-    def save_unresolved_refusal(self, source: agent_accounts.KnownCodexAccount) -> None:
+    def record_fixture_refusal(self, source: agent_accounts.KnownCodexAccount, *, recovered: bool = False) -> None:
         now = datetime.now(timezone.utc)
+        reset = now - timedelta(seconds=1) if recovered else now + timedelta(minutes=10)
+        observed = now - timedelta(minutes=19) if recovered else now
         refusals.write_refusal(refusals.AccountRefusal("codex", source.login,
-            refusals.KnownWindow("five_hour"), refusals.KnownReset(now + timedelta(minutes=10)), now))
+            refusals.KnownWindow("five_hour"), refusals.KnownReset(reset), observed))
 
     def skip_quota_wait_time(self) -> None:
         """Let one quota wait reach the deadline without a real sleep."""
@@ -4285,6 +4323,19 @@ class MeshCommandTests(MeshCommandFixture):
 
         _ = self.patches.enter_context(patch.object(codex_mesh, "time", SimpleNamespace(
             time=bounded_fixture(lambda: epoch + elapsed), monotonic=bounded_fixture(lambda: elapsed), sleep=sleep)))
+
+    @contextlib.contextmanager
+    def quota_reports(self, report: Callable[[list[str]], subprocess.CompletedProcess[str]]) -> Generator[None]:
+        """Intercept only quota reporting; per-turn registry resolution stays real."""
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def invoke(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            if len(command) > 1 and command[1] == str(codex_mesh.QUOTA_REPORT):
+                return report(command)
+            return run(command, **options)
+
+        with patch.object(subprocess, "run", side_effect=invoke):
+            yield
 
     def assert_finished_quota_continuation_has_no_rerun(self, later_failure: str) -> None:
         source = self.prepare_refusing_account()
@@ -4314,17 +4365,11 @@ class MeshCommandTests(MeshCommandFixture):
                 return frames
             return original(request)
 
-        def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            if command[0] == "bash":
-                self.assertEqual(command[-2], str(Path(codex_mesh.__file__).with_name("agents_config.sh")))
-                return subprocess.CompletedProcess(command, 0, "default", "")
+        def report(command: list[str]) -> subprocess.CompletedProcess[str]:
             self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
             commands.append(command)
             # The quota handler has routed the refusal; its short wait has now expired.
-            now = datetime.now(timezone.utc)
-            refusals.write_refusal(refusals.AccountRefusal("codex", source.login,
-                refusals.KnownWindow("five_hour"), refusals.KnownReset(now - timedelta(seconds=1)),
-                now - timedelta(minutes=19)))
+            self.record_fixture_refusal(source, recovered=True)
             return subprocess.CompletedProcess(command, 0, "", "")
 
         self.server.respond = respond
@@ -4333,7 +4378,7 @@ class MeshCommandTests(MeshCommandFixture):
         with (patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
               patch.object(codex_mesh, "_launcher_sessions", return_value=()),
               patch.object(codex_mesh, "CAPACITY_BUDGET_SECS", 0),
-              patch.object(subprocess, "run", side_effect=report),
+              self.quota_reports(report),
               contextlib.redirect_stderr(io.StringIO()) as errors):
             code = codex_mesh.command_start(args)
         self.assertEqual(code, 1, errors.getvalue())
@@ -4396,16 +4441,10 @@ class MeshCommandTests(MeshCommandFixture):
                                "status": "completed" if continuation_completed else "inProgress"}]}})]
             return original(request)
 
-        def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            if command[0] == "bash":
-                self.assertEqual(command[-2], str(Path(codex_mesh.__file__).with_name("agents_config.sh")))
-                return subprocess.CompletedProcess(command, 0, "default", "")
+        def report(command: list[str]) -> subprocess.CompletedProcess[str]:
             self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
             commands.append(command)
-            now = datetime.now(timezone.utc)
-            refusals.write_refusal(refusals.AccountRefusal("codex", source.login,
-                refusals.KnownWindow("five_hour"), refusals.KnownReset(now - timedelta(seconds=1)),
-                now - timedelta(minutes=19)))
+            self.record_fixture_refusal(source, recovered=True)
             return subprocess.CompletedProcess(command, 0, "", "")
 
         self.server.respond = respond
@@ -4413,7 +4452,7 @@ class MeshCommandTests(MeshCommandFixture):
         args.resident = True
         with (patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
               patch.object(codex_mesh, "_launcher_sessions", return_value=()),
-              patch.object(subprocess, "run", side_effect=report),
+              self.quota_reports(report),
               contextlib.redirect_stderr(io.StringIO()) as errors):
             code = codex_mesh.command_start(args)
         self.assertEqual(code, 1, errors.getvalue())
@@ -4469,16 +4508,10 @@ class MeshCommandTests(MeshCommandFixture):
                     "thread_id": THREAD_ID, "messages": ["Report the current date only"],
                     "accepting_messages": True}))
 
-        def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            if command[0] == "bash":
-                self.assertEqual(command[-2], str(Path(codex_mesh.__file__).with_name("agents_config.sh")))
-                return subprocess.CompletedProcess(command, 0, "default", "")
+        def report(command: list[str]) -> subprocess.CompletedProcess[str]:
             self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
             commands.append(command)
-            now = datetime.now(timezone.utc)
-            refusals.write_refusal(refusals.AccountRefusal("codex", source.login,
-                refusals.KnownWindow("five_hour"), refusals.KnownReset(now - timedelta(seconds=1)),
-                now - timedelta(minutes=19)))
+            self.record_fixture_refusal(source, recovered=True)
             return subprocess.CompletedProcess(command, 0, "", "")
 
         self.server.respond = respond
@@ -4487,7 +4520,7 @@ class MeshCommandTests(MeshCommandFixture):
         with (patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
               patch.object(codex_mesh, "_launcher_sessions", return_value=()),
               patch.object(codex_mesh, "_deliver_reply", side_effect=reply),
-              patch.object(subprocess, "run", side_effect=report),
+              self.quota_reports(report),
               contextlib.redirect_stderr(io.StringIO()) as errors):
             code = codex_mesh.command_start(args)
         self.assertEqual(code, 1, errors.getvalue())
@@ -4508,18 +4541,15 @@ class MeshCommandTests(MeshCommandFixture):
         source = self.prepare_stream_refusal_wait()
         commands: list[list[str]] = []
 
-        def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            if command[0] == "bash":
-                self.assertEqual(command[-2], str(Path(codex_mesh.__file__).with_name("agents_config.sh")))
-                return subprocess.CompletedProcess(command, 0, "default", "")
+        def report(command: list[str]) -> subprocess.CompletedProcess[str]:
             self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
-            self.save_unresolved_refusal(source)
+            self.record_fixture_refusal(source)
             commands.append(command)
             return subprocess.CompletedProcess(command, 0, "", "")
 
         with (patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
               patch.object(codex_mesh, "_launcher_sessions", return_value=()),
-              patch.object(subprocess, "run", side_effect=report)):
+              self.quota_reports(report)):
             code, errors = self.run_start()
         self.assertEqual(code, 1)
         self.assertIn("worker waits for room on codex2: the refused account has not recovered", errors)
@@ -4548,13 +4578,10 @@ class MeshCommandTests(MeshCommandFixture):
             self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
             self.next_thread_id = "replacement-thread"
 
-        def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            if command[0] == "bash":
-                self.assertEqual(command[-2], str(Path(codex_mesh.__file__).with_name("agents_config.sh")))
-                return subprocess.CompletedProcess(command, 0, "default", "")
+        def report(command: list[str]) -> subprocess.CompletedProcess[str]:
             self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
             self.assertEqual(Path(command[3]), target)
-            self.save_unresolved_refusal(agent_accounts.KnownCodexAccount(target, command[4], command[5]))
+            self.record_fixture_refusal(agent_accounts.KnownCodexAccount(target, command[4], command[5]))
             commands.append(command)
             return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -4565,7 +4592,7 @@ class MeshCommandTests(MeshCommandFixture):
               patch.object(codex_mesh, "_post_board_status"),
               patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
               patch.object(codex_mesh, "_launcher_sessions", return_value=()),
-              patch.object(subprocess, "run", side_effect=report)):
+              self.quota_reports(report)):
             code, errors = self.run_start()
         self.assertEqual(code, 1)
         self.assertIn("worker waits for room on codex1: the refused account has not recovered", errors)
@@ -4595,12 +4622,9 @@ class MeshCommandTests(MeshCommandFixture):
         def alive(pid: int) -> bool:
             return pid in table
 
-        def report(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
-            if command[0] == "bash":
-                self.assertEqual(command[-2], str(Path(codex_mesh.__file__).with_name("agents_config.sh")))
-                return subprocess.CompletedProcess(command, 0, "default", "")
+        def report(command: list[str]) -> subprocess.CompletedProcess[str]:
             self.assertEqual(command[1], str(codex_mesh.QUOTA_REPORT))
-            self.save_unresolved_refusal(source)
+            self.record_fixture_refusal(source)
             if "--stopped" in command:
                 self.assertEqual(self.worker_record()["status"], "failed")
                 self.assertNotIn("launcher_pid", self.worker_record())
@@ -4614,7 +4638,7 @@ class MeshCommandTests(MeshCommandFixture):
               patch.object(process_table, "snapshot", return_value=table) as snapshot,
               patch.object(sessions, "running_sessions", return_value=[director]),
               patch.object(sessions, "process_start", return_value="fixture-start"),
-              patch.object(subprocess, "run", side_effect=report)):
+              self.quota_reports(report)):
             code, errors = self.run_start()
         self.assertEqual(code, 1, errors)
         snapshot.assert_called()
@@ -4672,7 +4696,7 @@ class MeshCommandTests(MeshCommandFixture):
 
     def test_started_refusal_keeps_the_account_after_its_server_record_disappears(self) -> None:
         account = self.prepare_refusing_account()
-        self.save_unresolved_refusal(account)
+        self.record_fixture_refusal(account)
         original = self.respond
         def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "turn/start":
@@ -4718,7 +4742,7 @@ class MeshCommandTests(MeshCommandFixture):
     def test_followed_turn_reports_its_refusing_account_once(self) -> None:
         account = self.prepare_refusing_account()
         self.assertEqual(self.run_start()[0], 0)
-        self.save_unresolved_refusal(account)
+        self.record_fixture_refusal(account)
         self.skip_quota_wait_time()
         original = self.respond
         def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
@@ -4788,7 +4812,7 @@ class MeshCommandTests(MeshCommandFixture):
 
     def test_submission_refusal_reports_its_account_and_keeps_the_continuation_for_room(self) -> None:
         account = self.prepare_refusing_account()
-        self.save_unresolved_refusal(account)
+        self.record_fixture_refusal(account)
         original = self.respond
         def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "turn/start":
@@ -4851,7 +4875,7 @@ class MeshCommandTests(MeshCommandFixture):
         target, new = self.prepare_workers_move()
         account = agent_accounts.codex_account(target)
         assert isinstance(account, agent_accounts.KnownCodexAccount)
-        self.save_unresolved_refusal(account)
+        self.record_fixture_refusal(account)
         original = self.respond
         def respond(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "thread/resume":
@@ -6441,7 +6465,7 @@ class MeshCommandTests(MeshCommandFixture):
                     })
                     _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
                     if room_wait:
-                        self.save_unresolved_refusal(account)
+                        self.record_fixture_refusal(account)
                         worker = self.worker_record()
                         worker["continuation_owed"] = True
                         self.write_pool_roster({"worker": worker})
@@ -9203,7 +9227,7 @@ class DirectorLifetimeTests(MeshCommandFixture):
         self.server.respond = director_loaded_threads
         shim = home / ".claude" / "scripts" / "lib" / "py"
         shim.parent.mkdir(parents=True)
-        # Only process discovery/signalling and unrelated guild/Claude cleanup are synthetic.
+        # Only process discovery/signalling and unrelated design-role/Claude cleanup are synthetic.
         # The shell, stop, sweep, registry, shutdown history and worker ledger execute real code.
         _ = shim.write_text("#!/usr/bin/env python3\n" + "import sys\n"
             + f"sys.path.insert(0, {str(Path(codex_mesh.__file__).resolve().parents[2])!r})\n"
@@ -9211,7 +9235,7 @@ class DirectorLifetimeTests(MeshCommandFixture):
 from unittest.mock import patch
 from scripts.agents import codex_mesh
 script, *arguments = sys.argv[1:]
-if script.endswith('roles.py'):
+if script.endswith('design_roles.py'):
     raise SystemExit(0)
 if script.endswith('remove_workers.py'):
     from scripts.direct import remove_workers
@@ -9795,10 +9819,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
 
     def configure_allocation(self) -> None:
         registry = self.session_dir / "workers-agents.conf"
-        _ = registry.write_text("[codex.agents]\ngpt-fixture-sol=high,xhigh,max\n" +
-                                "[assignments]\ndirect=codex\n[direct.codex]\n" +
-                                "impl=gpt-fixture-sol:xhigh\n[direct.options]\n" +
-                                "codex_service_tier.impl=fast\n")
+        _ = write_registry(registry, {'codex.agents': {'gpt-fixture-sol': 'high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-fixture-sol:xhigh'}, 'direct.options': {'codex_service_tier.impl': 'fast'}})
         checkpoint = self.session_dir / "catalog-current"
         checkpoint.touch()
         self.patches.enter_context(patch.dict(os.environ, {
@@ -9883,8 +9904,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
     def test_new_review_thread_has_its_configured_shown_name_before_any_turn(self) -> None:
         self.configure_allocation()
         registry = self.session_dir / "workers-agents.conf"
-        _ = registry.write_text(registry.read_text().replace("impl=gpt-fixture-sol:xhigh\n",
-                                                          "impl=gpt-fixture-sol:xhigh\nreview=gpt-fixture-sol:xhigh\n"))
+        _ = write_registry(registry, {"direct.codex": {"review": "gpt-fixture-sol:xhigh"}}, update=True)
         state = self.session_dir / plan_history.STATE_FILENAME
         _ = state.write_text(json.dumps({"working_dir": str(self.session_dir),
                                          "production": "sdlc", "unit": "roles-unit"}))
@@ -10242,8 +10262,8 @@ class DetachedRunWatchTests(unittest.TestCase):
             elapsed = 0.0
             try:
                 with (
-                    patch.dict(os.environ, {"GUILD_ROLES_STATE": str(session / "guild-roles"),
-                                           "GUILD_OWNERSHIP_STATE": str(session / "guild-ownership")}),
+                    patch.dict(os.environ, {"DESIGN_ROLES_STATE": str(session / "design-roles"),
+                                           "DESIGN_OWNERSHIP_STATE": str(session / "design-ownership")}),
                     patch.object(codex_mesh, "time", SimpleNamespace(time=time.time, monotonic=bounded_fixture(lambda: elapsed))),
                 ):
                     codex_mesh._end_dead_runs(str(session), "worker", watch)  # pyright: ignore[reportPrivateUsage]
@@ -11778,7 +11798,7 @@ class SweepTests(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(patch.object(sys, "platform", "linux"))
         roles_state = self.enterContext(tempfile.TemporaryDirectory())
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"GUILD_ROLES_STATE": roles_state})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"DESIGN_ROLES_STATE": roles_state})))
 
     @staticmethod
     def write_sweep_server(folder: Path, quiet_secs: float, *, held: bool = False) -> None:
@@ -11824,7 +11844,7 @@ class SweepTests(unittest.TestCase):
             for quiet in (codex_mesh.SERVER_IDLE_SECS - 1, codex_mesh.SERVER_IDLE_SECS):
                 with self.subTest(mesh_log=mesh_log, quiet=quiet), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
-                    mesh = roles.state_root() / "held-design" / "mesh"
+                    mesh = design_roles.state_root() / "held-design" / "mesh"
                     with patch.object(time, "time", new=bounded_fixture(lambda: now)):
                         self.write_sweep_server(mesh, quiet, held=True)
                         label, reaped = self.sweep_recorded_server(
@@ -11839,7 +11859,7 @@ class SweepTests(unittest.TestCase):
     def test_held_design_server_keeps_its_startup_quiet_window_with_old_activity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            mesh = roles.state_root() / "held-design" / "mesh"
+            mesh = design_roles.state_root() / "held-design" / "mesh"
             self.write_sweep_server(mesh, codex_mesh.SERVER_IDLE_SECS + 60, held=True)
             self.assertEqual(self.sweep_recorded_server(
                 root / "ordinary-runs", mesh, age_secs=codex_mesh.SERVER_IDLE_SECS - 1,
@@ -11850,7 +11870,7 @@ class SweepTests(unittest.TestCase):
         for clients, busy in ((1, ()), (0, ("designer: ThreadLive",))):
             with self.subTest(clients=clients, busy=busy), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                mesh = roles.state_root() / "held-design" / "mesh"
+                mesh = design_roles.state_root() / "held-design" / "mesh"
                 old = codex_mesh.SERVER_IDLE_SECS + 60
                 self.write_sweep_server(mesh, old, held=True)
                 self.assertEqual(self.sweep_recorded_server(
@@ -11863,7 +11883,7 @@ class SweepTests(unittest.TestCase):
             with self.subTest(folder_exists=folder_exists), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 design = "released-design" if folder_exists else "missing-design"
-                mesh = roles.state_root() / design / "mesh"
+                mesh = design_roles.state_root() / design / "mesh"
                 if folder_exists:
                     self.write_sweep_server(mesh, 1)
                 self.assertEqual(self.sweep_recorded_server(
@@ -11876,7 +11896,7 @@ class SweepTests(unittest.TestCase):
         for quiet in (60, codex_mesh.SERVER_IDLE_SECS + 60):
             with self.subTest(quiet=quiet), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                design_mesh = roles.state_root() / "held-design" / "mesh"
+                design_mesh = design_roles.state_root() / "held-design" / "mesh"
                 self.write_sweep_server(design_mesh, 1, held=True)
                 _ = (design_mesh / codex_mesh.SERVER_FILE).write_text(json.dumps({"pid": 10, "port": 4010}))
                 runs = root / "ordinary-runs"
@@ -12770,7 +12790,8 @@ class SignInChangeTests(unittest.TestCase):
                 "thread_id": "thread-1", "status": "running", "turn_id": "turn-1", "launcher_pid": os.getpid(),
                 "port": 4001}}))
             old = FakeClient(4001, "worker")
-            args = argparse.Namespace(effort="", cwd="/original-worktree", turn_cwd="/turn-worktree")
+            args = argparse.Namespace(session_dir=directory, name="worker", role="impl",
+                                      effort="", cwd="/original-worktree", turn_cwd="/turn-worktree")
             with patch.object(codex_mesh, "ensure_server", return_value=(4002, True)) as ensure, \
                     patch.object(codex_mesh, "Client", FakeClient):
                 moved = codex_mesh._move_resident(  # pyright: ignore[reportPrivateUsage]
@@ -12858,7 +12879,9 @@ class SignInChangeTests(unittest.TestCase):
                 "role": "impl",
             }}))
             _ = (run / "worker.pending.json").write_text(json.dumps({"thread_id": "old-thread", "messages": ["held message"]}))
-            args = argparse.Namespace(model="gpt-test", effort="high", cwd=directory, sandbox="danger-full-access", resident=True, service_tier="")
+            args = argparse.Namespace(session_dir=directory, name="worker", role="impl",
+                                      model="gpt-test", effort="high", cwd=directory,
+                                      sandbox="danger-full-access", resident=True, service_tier="")
             with patch.object(codex_mesh, "ensure_server", return_value=(4002, True)), patch.object(codex_mesh, "Client", ResumeClient):
                 result = codex_mesh._move_resident(args, directory, "worker", "old-thread",  # pyright: ignore[reportPrivateUsage]
                     cast(codex_mesh.Client, cast(object, ResumeClient(4001, "worker"))))
@@ -13507,7 +13530,7 @@ class DevShellServerTests(unittest.TestCase):
             "NIX_LDFLAGS": "caller linker flags",
         }, clear=True)))
         _ = self.enterContext(patch.object(codex_mesh, "RUN_ROOTS", (self.session_dir.parent,)))
-        _ = self.enterContext(patch.object(codex_mesh, "_guild_context", return_value={}))
+        _ = self.enterContext(patch.object(codex_mesh, "_design_context", return_value={}))
         _ = self.enterContext(patch.object(codex_mesh, "_holds_old_sign_in", return_value=False))
         _ = self.enterContext(patch.object(codex_mesh, "_pid_alive", return_value=True))
         _ = self.enterContext(patch.object(codex_mesh, "_free_port", return_value=4321))
@@ -13519,7 +13542,7 @@ class DevShellServerTests(unittest.TestCase):
             loaded = {**environment, "IN_NIX_SHELL": "impure", "NIX_LDFLAGS": "nix linker flags",
                       "PKG_CONFIG_PATH": "/nix/pkg", "PATH": "/nix/bin"}
             for key in ("CODEX_HOME", "UNIT_RUN_DIR", "TMPDIR", "CLAUDE_CODE_SESSION_ID",
-                        "GUILD_DESIGN_ID", "GUILD_BINDING_GENERATION"):
+                        "HELD_DESIGN_ID", "DESIGN_BINDING_GENERATION"):
                 loaded[key] = "envrc must not choose this"
             return nix_env.Loaded(loaded, directory / ".envrc")
 
@@ -13584,7 +13607,7 @@ class DevShellServerTests(unittest.TestCase):
         self.assertEqual(environment["TMPDIR"], str(self.session_dir / "tmp"))
         self.assertEqual(environment["NIX_LDFLAGS"], "nix linker flags")
         self.assertEqual(environment["PATH"], "/nix/bin")
-        for key in ("CLAUDE_CODE_SESSION_ID", "GUILD_DESIGN_ID", "GUILD_BINDING_GENERATION"):
+        for key in ("CLAUDE_CODE_SESSION_ID", "HELD_DESIGN_ID", "DESIGN_BINDING_GENERATION"):
             self.assertNotIn(key, environment)
         caller = cast(dict[str, str], self.shell_load.call_args.args[1])
         self.assertEqual(caller["NIX_LDFLAGS"], "caller linker flags")
@@ -13914,14 +13937,14 @@ class DevShellServerTests(unittest.TestCase):
             "holder_session": "design-holder", "design_id": "design-one", "generation": 7,
             "binding": {"kind": "DesignBoundToPhase", "run_directory": str(self.session_dir)},
         }
-        with patch.object(codex_mesh, "_guild_context", return_value=context), patch.object(roles, "refresh_census"):
+        with patch.object(codex_mesh, "_design_context", return_value=context), patch.object(design_roles, "refresh_census"):
             _ = self.ensure()
         command = cast(list[str], self.launch.call_args.args[0])
         self.assertEqual(command[0], "codex")
         environment = cast(dict[str, str], self.launch.call_args.kwargs["env"])
         self.assertEqual(environment["CLAUDE_CODE_SESSION_ID"], "design-holder")
-        self.assertEqual(environment["GUILD_DESIGN_ID"], "design-one")
-        self.assertEqual(environment["GUILD_BINDING_GENERATION"], "7")
+        self.assertEqual(environment["HELD_DESIGN_ID"], "design-one")
+        self.assertEqual(environment["DESIGN_BINDING_GENERATION"], "7")
         self.assertEqual(environment["IN_NIX_SHELL"], "impure")
 
     def test_start_forwards_the_worktree_on_the_initial_launch_and_recovery(self) -> None:
@@ -14384,7 +14407,7 @@ class RunFolderNameSweepTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         roles_state = self.enterContext(tempfile.TemporaryDirectory())
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"GUILD_ROLES_STATE": roles_state})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"DESIGN_ROLES_STATE": roles_state})))
 
     def test_naming_one_real_root_sweeps_both(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

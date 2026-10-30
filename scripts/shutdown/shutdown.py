@@ -40,7 +40,7 @@ from inventory import (
     parse_inventory,
 )
 import inventory as inventory_work
-import record as recovery_store
+import shutdown_record as recovery_store
 from launch_permission import (
     RELEASED_HOLD_PREFIX,
     LaunchPurpose,
@@ -48,7 +48,7 @@ from launch_permission import (
     RecordedSessionRestoreLaunchPurpose,
     shutdown_state_root,
 )
-from record import (
+from shutdown_record import (
     CheckoutMove,
     InvalidRecord,
     SessionShutdown,
@@ -937,6 +937,8 @@ def main(arguments: list[str] | None = None) -> int:
     _ = forget.add_argument("--account", help="account login or label containing this session")
     down = commands.add_parser("down", help="start a safe account shutdown")
     _ = down.add_argument("account", nargs="?")
+    _ = down.add_argument("--all", dest="down_all", action="store_true",
+                          help="stop every local Claude session, with a shared 60-second deadline")
     _ = down.add_argument("--here", action="store_true")
     _ = down.add_argument("--also", metavar="MACHINE", default="",
                           help="also stop the account on the other machine; a stop covers only this machine by default")
@@ -1018,9 +1020,10 @@ def main(arguments: list[str] | None = None) -> int:
                          help="also stop the account on the other machine; a stop covers only this machine by default")
     _ = now.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
     restart = commands.add_parser(
-        "restart", help="bring back every session stopped for one account"
+        "restart", help="bring back stopped sessions; --all restores this machine across accounts"
     )
     _ = restart.add_argument("account", nargs="?")
+    _ = restart.add_argument("--all", action="store_true", dest="all_restart", help="restore every account on this machine")
     _ = restart.add_argument("--dry-run", action="store_true")
     _ = restart.add_argument("--only", metavar="NAME[,NAME...]", help="session ids or exact names, separated by commas")
     _ = restart.add_argument("--here", action="store_true")
@@ -1051,6 +1054,11 @@ def main(arguments: list[str] | None = None) -> int:
     if options.command == "restart":
         try:
             with restart_work.restore_history_pass():
+                if cast(bool, getattr(options, "all_restart", False)):
+                    if options.account is not None or options.only is not None:
+                        parser.error("restart --all cannot join an account or --only")
+                    return restart_work.restart_all(dry_run=options.dry_run,
+                        alerts=restart_work.NeverAlert() if options.no_alert else restart_work.AlertWhenNotBack())
                 return _dispatch(options)
         except (InvalidRecord, OSError, ValueError) as error:
             print(f"shutdown: {error}", file=sys.stderr)
@@ -1234,6 +1242,11 @@ def _stop_here(options: CommandLine, ids: tuple[str, ...]) -> bool:
 
 
 def _dispatch(options: CommandLine) -> int:
+    if options.command == "down" and getattr(options, "down_all", False):
+        if options.account or options.only or options.also or options.target or options.restart:
+            print("shutdown: down --all is local and cannot join an account, --only, --also, --to or --restart", file=sys.stderr)
+            return 2
+        return settle.down_all()
     if options.command in {"snapshot", "forget"}:
         try:
             return _snapshot() if options.command == "snapshot" else _forget(options.forget_name, options.account or "")

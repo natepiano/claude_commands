@@ -14,6 +14,7 @@ from typing import ClassVar, override
 from unittest.mock import patch
 
 from scripts.direct import assertion_guard
+from scripts.production import showrunners
 from scripts.production.cli_fixture import invoke_cli
 
 GUARD = Path(assertion_guard.__file__)
@@ -25,14 +26,19 @@ class GitRepositoryFixture(unittest.TestCase):
     repo: Path = Path()
     base: str = ""
     environment: dict[str, str] = {}
+    notifier_dir: Path = Path()
 
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.repo = self.root / "repo"
         self.repo.mkdir()
+        self.notifier_dir = self.root / "notifier"
+        self.notifier_dir.mkdir()
+        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.notifier_dir))
         self.environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
-                            "GIT_CONFIG_NOSYSTEM": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+                            "GIT_CONFIG_NOSYSTEM": "1", "PYTHONDONTWRITEBYTECODE": "1",
+                            "NOTIFIER_STATE_DIR": str(self.notifier_dir)}
         _ = self.environment.pop("VERIFY_ASSERTION_BASE", None)
         _ = self.git("init", "--bare", "-q", "-b", "main", str(self.root / "remote.git"))
         _ = self.git("init", "-q", "-b", "unit")
@@ -80,6 +86,20 @@ class GitRepositoryFixture(unittest.TestCase):
         return f"def {name}(self):\n    {assertion}\n"
 
 
+    def register_production(self, merge_branch: str, *, worktree: str = "", branch: str = "unit",
+                            slug: str = "fixture") -> Path:
+        doc = self.root / f"{slug}-production.md"
+        _ = doc.write_text(
+            f"- **Merge branch:** `{merge_branch}`\n\n## Units\n\n"
+            + "| Unit | Worktree | Branch |\n| --- | --- | --- |\n"
+            + f"| fixture | `{worktree or self.repo}` | `{branch}` |\n", encoding="utf-8")
+        timer = self.notifier_dir / f"showrunner-{slug}"
+        timer.mkdir()
+        _ = (timer / "conf").write_text(
+            f"TARGET=session:fixture\nCHECK=production_check.sh {doc}\n", encoding="utf-8")
+        return doc
+
+
 class MergeInProgressFixture(GitRepositoryFixture):
     @override
     def setUp(self) -> None:
@@ -108,6 +128,7 @@ class SeededGitRepositoryFixture(GitRepositoryFixture):
     repo: Path = Path()
     base: str = ""
     environment: dict[str, str] = {}
+    notifier_dir: Path = Path()
     seed: ClassVar[Path]
     case_root: ClassVar[Path]
     case_repo: ClassVar[Path]
@@ -134,6 +155,7 @@ class SeededGitRepositoryFixture(GitRepositoryFixture):
     def setUp(self) -> None:
         self.root, self.repo, self.base = self.case_root, self.case_repo, self.case_base
         self.environment = self.case_environment.copy()
+        self.notifier_dir = self.root / "notifier"
         shutil.rmtree(self.root)
         _ = shutil.copytree(self.seed, self.root)
 

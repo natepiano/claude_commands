@@ -26,7 +26,7 @@ import coverage_report
 import rules
 import style_ledger as ledger_api
 import style_proposals
-from approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename, binding_rename_check, binding_scope
+from approved_renames import BindingRename, NoBindingScope, refactor_rename, rename_declaration
 from issues import Issue, frontmatter
 from proposal_issue import ApprovedDecision, UnansweredDecision, decision_answer
 
@@ -183,29 +183,24 @@ def current_rename(ledger: ledger_api.Ledger, finding: ledger_api.HeldFinding, h
     if (not 0 < old_line <= len(old_lines) or not 0 < evidence.line <= len(new_lines)
             or old_lines[old_line - 1] != new_lines[evidence.line - 1]):
         return bulk.Refusal(finding.finding_id, "changed since judged")
-    pair = binding_rename(finding.kind, finding.before, finding.after, evidence.line, source.splitlines()[evidence.line - 1])
+    pair = refactor_rename(finding.kind, finding.before, finding.after, evidence.line, source.splitlines()[evidence.line - 1])
     if not isinstance(pair, BindingRename):
-        return bulk.Refusal(finding.finding_id, "finding is not a local binding name pair")
-    scope = binding_scope(source, pair)
+        return bulk.Refusal(finding.finding_id, "finding does not specify one identifier rename")
+    scope = rename_declaration(source, pair)
     if isinstance(scope, NoBindingScope):
-        return bulk.Refusal(finding.finding_id, "changed since judged")
-    declaration = bulk.BindingText(source).spans[scope.declaration]
-    if source.count("\n", 0, declaration.start) + 1 != evidence.line:
+        return bulk.Refusal(finding.finding_id, scope.reason)
+    if source.count("\n", 0, scope.offset) + 1 != evidence.line:
         return bulk.Refusal(finding.finding_id, "changed since judged")
     return bulk.RenameFinding(finding.finding_id, evidence.path, pair)
 
 
 class WorkspaceEdits:
-    """Local bindings have no readers outside their file: each file depends only on its own edits.
-
-    The proof rejects public-item/import renames. Dependencies map diagnostic readers to edited
-    files they read; taking the transitive closure also supports any future proved wider edits.
-    """
+    """Exact refactor edits; documents participating in one rename are reverted together."""
     def __init__(self, repo: Path, base: str, files: tuple[bulk.FileRenames, ...]) -> None:
         self.repo: Path = repo
         self.base: str = base
         self.files: dict[str, bulk.FileRenames] = {file.path: file for file in files}
-        self.dependencies: dict[str, frozenset[str]] = {path: frozenset((path,)) for path in self.files}
+        self.dependencies: dict[str, frozenset[str]] = {path: file.dependencies | {path} for path, file in self.files.items()}
         self.initial_untracked: set[str] = self.untracked()
 
     def untracked(self) -> set[str]:
@@ -231,9 +226,9 @@ class WorkspaceEdits:
             target = self.repo / path
             if target.is_symlink() or not target.is_file():
                 raise bulk.BulkRenameError(f"verification replaced {path}")
-            proof = binding_rename_check(path, file.original, target.read_bytes().decode(), tuple(item.finding.rename for item in file.kept))
-            if not proof.explained or not all(isinstance(proof.checks.get(item.finding.rename), AppliedInCode) for item in file.kept):
-                raise bulk.BulkRenameError(f"post-format binding proof failed: {path}")
+            if not bulk.file_edits_preserved(file, target.read_bytes().decode()):
+                raise bulk.BulkRenameError(f"post-format rename edit changed: {path}")
+
 
 
 def diagnostic_files(repo: Path, result: CommandResult) -> set[str]:
@@ -410,12 +405,16 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger, s
         for path, findings in groups.items():
             file = bulk.rename_file(server, repo / path, path, sources.current[path], tuple(findings), docs)
             files.append(file)
-            refused.update((item.finding_id, "changed since judged") for item in file.refusals)
+            refused.update((item.finding_id, item.reason) for item in file.refusals)
+            for document in file.related:
+                sources.current[document.path] = document.edited
         times["rename"] = time.monotonic() - started
-        candidates = tuple(file for file in files if file.kept)
+        candidates = tuple(file for file in bulk.combine_file_renames(files) if file.edited != file.original)
         workspace.files = {file.path: file for file in candidates}
-        workspace.dependencies = {file.path: frozenset((file.path,)) for file in candidates}
+        workspace.dependencies = {file.path: file.dependencies | {file.path} for file in candidates}
         _ = require_base(repo, base_tree)
+        for file in candidates:
+            available(repo, file.path)
         for file in candidates:
             _ = (repo / file.path).write_bytes(file.edited.encode())
         kept = set(workspace.files)

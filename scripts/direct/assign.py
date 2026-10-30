@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh
 from scripts.direct import workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
-from scripts.guilds import roles as guild_roles
+from scripts.astra import design_roles
 from scripts.lib import unit_runs
 from scripts.usage.agents_log import LENSES
 
@@ -337,21 +337,15 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         record = read_roster(dispatch.run, dispatch.worker)
         if not record or record.get("adopted_to"):
             refuse(f"{dispatch.worker}: worker is missing or adopted")
-        args = dispatch.args
         identity_path = worker_record_path(dispatch.run, dispatch.worker, dispatch.worker, role=dispatch.role)
         identity = read_object(identity_path)
         slot = text(identity.get("slot")) or dispatch.worker
         model = text(identity.get("model")) or text(record.get("model")) or dispatch.model
-        effort = text(record.get("effort")) or dispatch.effort
         expected = {"name": dispatch.worker, "slot": slot, "family": dispatch.family,
                     "model": model, "worker_id": record.get("thread_id")}
         _ = identity.pop("role", None)
         if (identity and identity != expected) or not record.get("thread_id"):
             refuse(f"{dispatch.worker} has no matching durable worker identity for slot {slot}")
-        if (args.model and model != dispatch.model
-                or (args.effort or ":" in args.model) and effort != dispatch.effort):
-            refuse(f"{dispatch.worker}: requested {dispatch.model}:{dispatch.effort}, "
-                   + f"worker identity is {model}:{effort}")
         if not identity:
             _ = identity_path.write_text(json.dumps(expected))
         claim_path = dispatch.run / f"impl_claim_{slot}.json"
@@ -377,11 +371,11 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 else:
                     refuse(f"{dispatch.worker} is already implementing")
             _ = status_path.write_text("error\n")
-        if record.get("transferring_role") or record.get("role_redirect") or guild_roles.transfer_route(
+        if record.get("transferring_role") or record.get("role_redirect") or design_roles.transfer_route(
                 text(record.get("thread_id")), text(record.get("held_design_id"))):
             refuse(f"{dispatch.worker}: TransferringRole; use its destination holder")
         if record.get("held_design_id"):
-            refuse(f"{dispatch.worker}: held roles resume through roles.py")
+            refuse(f"{dispatch.worker}: held roles resume through design_roles.py")
         config = Path(os.environ.get("UNIT_CONFIG", str(Path.home() / ".claude/config/direct.conf")))
         match = re.search(r"^UNIT_COMPACT_ABOVE_TOKENS=(\d+)", config.read_text(), re.M) if config.is_file() else None
         threshold = int(match.group(1)) if match else 0
@@ -403,7 +397,8 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
             _ = dispatch.mesh_call("reopen", capture=True)
         dispatch.claim_follow()
         _ = claim_path.write_text(json.dumps({"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}))
-        return WorkerClaim(identity_path, slot, model, effort)
+        # Each turn runs at the caller's model:effort (agents.conf default or explicit override).
+        return WorkerClaim(identity_path, slot, dispatch.model, dispatch.effort)
 
 
 def stage_two_submitted(receipts: Path, message: str) -> bool:
@@ -529,8 +524,12 @@ def execute(dispatch: Dispatch, paths: list[str]) -> int:
     follow = [PYTHON, MESH, "follow", "--session-dir", str(dispatch.run), "--to", dispatch.worker,
               "--claim-pid", str(os.getpid()), "--role", dispatch.role, "--cwd", str(dispatch.cwd),
               "--message-file", str(message), "--summary-file", str(summary), "--reply-file", str(reply),
-              "--log-file", str(log), "--model", dispatch.model, "--effort", dispatch.effort,
+              "--log-file", str(log),
               "--task", f"direct.{dispatch.role}", "--service-tier", dispatch.tier]
+    if args.model:
+        follow += ["--model", args.model]
+    if args.effort:
+        follow += ["--effort", args.effort]
     if dispatch.role == "review":
         follow += ["--read-only"]
     if args.lens:
