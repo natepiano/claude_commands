@@ -22,10 +22,11 @@ class MergeGateTypesTests(GateSuitesFixture):
         types_pids: list[int] = []
 
         def observed(suite: str, path: Path, argv: list[str], repo: Path,
-                     environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
+                     environment: dict[str, str], log: Path, *,
+                kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
             if suite == "types":
                 self.assertEqual(self.jobserver_tokens(), b"")
-            job = start(suite, path, argv, repo, environment, log)
+            job = start(suite, path, argv, repo, environment, log, kind=kind)
             if suite == "types":
                 types_pids.append(job.process.pid)
                 wait_for_file(self.state / "types-ran")

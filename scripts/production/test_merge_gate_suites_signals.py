@@ -26,8 +26,9 @@ class MergeGateSignalsTests(GateSuitesFixture):
         launched: list[merge_gate.RunningGateJob] = []
 
         def stop_after_start(suite: str, path: Path, argv: list[str], repo: Path,
-                             environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
-            job = start(suite, path, argv, repo, environment, log)
+                             environment: dict[str, str], log: Path, *,
+                kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
+            job = start(suite, path, argv, repo, environment, log, kind=kind)
             if suite == "hooks":
                 launched.append(job)
                 wait_until((self.state / "module-held").exists, self.state,

@@ -94,9 +94,10 @@ class MergeGateResourcesTests(GateSuitesFixture):
         available_at_start: list[bytes] = []
 
         def observed(suite: str, path: Path, argv: list[str], repo: Path,
-                     environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
+                     environment: dict[str, str], log: Path, *,
+                kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
             available_at_start.append(self.jobserver_tokens())
-            return start(suite, path, argv, repo, environment, log)
+            return start(suite, path, argv, repo, environment, log, kind=kind)
 
         with mock.patch.object(merge_gate, "start_gate_job", side_effect=observed):
             result = self.run_gate("--tests-only")
@@ -282,8 +283,9 @@ class MergeGateResourcesTests(GateSuitesFixture):
         sample = merge_gate.process_memory_mib
 
         def start_blocked(suite: str, path: Path, argv: list[str], repo: Path,
-                          environment: dict[str, str], log: Path) -> merge_gate.RunningGateJob:
-            job = start(suite, path, argv, repo, environment, log)
+                          environment: dict[str, str], log: Path, *,
+                kind: merge_gate.GateJobKind = merge_gate.GateJobKind.TEST_MODULE) -> merge_gate.RunningGateJob:
+            job = start(suite, path, argv, repo, environment, log, kind=kind)
             started.append(job)
             wait_for_file(self.state / f"{job.process.pid}.started")
             return job
