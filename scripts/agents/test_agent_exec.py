@@ -63,7 +63,7 @@ class ClaudeLauncherTests(unittest.TestCase):
                               + "print(json.dumps({'type': 'result', 'result': 'finished'}))\n")
         binary.chmod(0o755)
         self.environment = {key: value for key, value in os.environ.items() if not key.startswith("CLAUDE")}
-        self.environment.update(HOME=str(self.home), AGENT_NOTES_DIR=str(notes), AGENTS_CONFIG_FILE=str(registry),
+        self.environment.update(AGENTS_CONFIG_PUBLISH="0", HOME=str(self.home), AGENT_NOTES_DIR=str(notes), AGENTS_CONFIG_FILE=str(registry),
                                 CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
                                 XDG_CACHE_HOME=str(self.home / "cache"), XDG_STATE_HOME=str(self.home / "state"),
                                 PATH=str(binary.parent) + os.pathsep + os.environ["PATH"])
