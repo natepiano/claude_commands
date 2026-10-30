@@ -30,7 +30,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Generator, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -183,6 +183,25 @@ def _process_stat(process: Path) -> list[str]:
     return (process / "stat").read_text().rsplit(")", 1)[1].split()
 
 
+# A process that exits during a scan is gone, not unreadable: it is never an occupant.
+EXITED = (FileNotFoundError, ProcessLookupError)
+
+
+def still_running(pids: Iterable[int]) -> frozenset[int]:
+    """Drop processes that exited since a scan; any other unreadable read still raises."""
+    if (os.environ.get("HERDR_PLATFORM") or sys.platform) == "darwin":
+        return frozenset(pids)
+    root = Path(os.environ.get("HERDR_PROC") or PROC)
+    running: set[int] = set()
+    for pid in pids:
+        try:
+            if _process_stat(root / str(pid))[0] != "Z":
+                running.add(pid)
+        except EXITED:
+            continue
+    return frozenset(running)
+
+
 def process_parent(pid: int) -> int:
     """Read the OS parent; callers decide how unavailable evidence is handled."""
     if (os.environ.get("HERDR_PLATFORM") or sys.platform) == "darwin":
@@ -238,16 +257,19 @@ def pane_shell_state(place: herdr.HerdrPlace) -> PaneShellState:
                 if fields[0] == "Z":
                     continue
                 rows[int(process.name)] = (int(fields[1]), fields[3], fields[4], fields[19])
-            except FileNotFoundError:
+            except EXITED:
                 continue
         started = rows[shell][3]
     _, session, terminal, _ = rows[shell]
     members = {shell}
-    for pid, (_, other_session, other_terminal, _) in rows.items():
-        if other_session == session or terminal not in {"0", "?", "??", "-"} and other_terminal == terminal:
-            members.add(pid)
-        if scope and any(group in scope for group in herdr.pane_scopes(herdr.systemd_cgroups(
-                Path(os.environ.get("HERDR_PROC") or PROC) / str(pid)))):
+    for pid, (_, other_session, other_terminal, _) in list(rows.items()):
+        try:
+            scoped = bool(scope) and any(group in scope for group in herdr.pane_scopes(herdr.systemd_cgroups(
+                Path(os.environ.get("HERDR_PROC") or PROC) / str(pid))))
+        except EXITED:
+            del rows[pid]  # exited mid-scan: neither a member nor a parent
+            continue
+        if other_session == session or terminal not in {"0", "?", "??", "-"} and other_terminal == terminal or scoped:
             members.add(pid)
     while True:
         descendants = {pid for pid, (parent, _, _, _) in rows.items() if parent in members}
