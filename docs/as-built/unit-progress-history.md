@@ -588,3 +588,7 @@ recorder restarts no notifier and names no next report.
 `aggregate` calibrates phase estimates by
 raw percentage and pass kind and emits raw/suggested/reported error plus
 decision-source counts as JSON suitable for further analysis.
+
+### Reopened phase recovery (2026-10-29)
+
+`phase_reservation.enroll` saves the board answer, removes the release marker, then publishes its state through the shared atomic writer. A stop before that last write leaves restore able to repeat enrollment. The state file never marks a phase enrolled while its old release marker still excludes it.

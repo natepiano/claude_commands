@@ -2327,7 +2327,8 @@ def _select_phase(
             continue
         left: dict[str, style_ledger.DeclarationLeft] = {
             outcome.finding.finding_id: outcome for outcome in own if isinstance(outcome, style_ledger.DeclarationLeft)}
-        for finding_id, outcome in left.items():
+        left_waits: Counter[tuple[str, str]] = Counter()
+        for outcome in left.values():
             match outcome:
                 case style_ledger.DeclaredInSeveralFiles():
                     where = f"declared in {len(outcome.paths)} files: {', '.join(sorted(outcome.paths))}"
@@ -2347,7 +2348,8 @@ def _select_phase(
                                      style_ledger.DeclarationGoneFromFile))
                     and isinstance(outcome.evidence, style_ledger.OutsideRenameNotProven)):
                 where += "; " + style_ledger.outside_evidence_line(outcome.evidence)
-            print(f"waiting {issue.path}: {finding_id} {where}")
+            left_waits[(outcome.finding.path, where)] += 1
+        style_proposals.print_finding_waits(issue.path, left_waits)
         read = {outcome.finding.finding_id for outcome in own if not isinstance(outcome, style_ledger.DeclarationNotRead)}
         withdrew = any(isinstance(outcome, style_ledger.DeclarationRemoved) for outcome in own)
         built = any(isinstance(outcome, style_ledger.DeclarationRenamed) for outcome in own)
@@ -2364,27 +2366,43 @@ def _select_phase(
         moved = sites.destinations(tuple(finding for finding in unread_findings if finding.path in present))
         by_file: dict[str, list[style_ledger.HeldFinding]] = defaultdict(list)
         gone: dict[str, list[str]] = defaultdict(list)
+        blocked = {finding.path for finding in findings
+                   if not crate_in_scope(scope, style_proposals.crate_for(directories, finding.path))
+                   or busy.contains(finding.path) or finding.path in unsynced}
+        lower = {finding.finding_id for finding in findings
+                 if style_proposals.ranked_below_unit(family, style_proposals.crate_for(directories, finding.path), scopes)
+                 and finding.finding_id not in moved and (finding.finding_id in read or finding.path in present)}
+        # A cheap wait avoids extra site proof unless a later judgment could waive the finding.
+        # Keep that waiver's existing site condition even when its file is blocked.
+        superseding = {finding.finding_id: ledger.judged_again_without(finding, definition)
+                       for finding in findings if finding.finding_id in lower and finding.path in blocked}
+        site_evidence = ledger.finding_sites(
+            (outcomes[finding.finding_id].finding if selection == FamilySelection.COUNT else finding
+             for finding in findings if finding.finding_id in lower
+             and (finding.path not in blocked or isinstance(superseding[finding.finding_id], style_ledger.SupersedingJudgment))), tip)
+        site_waits: Counter[tuple[str, str]] = Counter()
         for finding in findings:
             # Dry-run follow proves the original row; only the selection location is
             # projected. Ask the shared site gate for that proof, rather than asking
             # it to reread a projected row that has not been written to the ledger.
-            site_finding = (outcomes[finding.finding_id].finding
-                            if selection == FamilySelection.COUNT else finding)
             if finding.finding_id not in read and finding.path not in present:
                 gone[f"{finding.path} is not in synced commit {tip}"].append(finding.finding_id)
             elif finding.finding_id in moved:
                 gone[f"{finding.path} site moved to {moved[finding.finding_id]} in synced commit {tip}"].append(finding.finding_id)
-            elif (style_proposals.ranked_below_unit(family, style_proposals.crate_for(directories, finding.path), scopes)
-                  and not style_proposals.judged_at_current_file(ledger, site_finding, tip)):
+            elif (finding.finding_id in site_evidence
+                  and not isinstance(site_evidence[finding.finding_id], style_ledger.UnchangedSite)):
                 # A lower-rank finding judged at an older file builds only once the judgment that reads the file again
                 # holds it again; a judgment that does not hold it settles it.
-                match ledger.judged_again_without(finding, definition):
+                judged_again = (superseding[finding.finding_id] if finding.finding_id in superseding
+                                else ledger.judged_again_without(finding, definition))
+                match judged_again:
                     case style_ledger.SupersedingJudgment(judgment_id=judgment):
                         gone[f"{finding.path} judged again in judgment {judgment} without it"].append(finding.finding_id)
                     case style_ledger.NotJudgedAgain():
-                        print(f"waiting {issue.path}: {finding.finding_id} {finding.path} changed since it was judged")
+                        site_waits[(finding.path, "changed since it was judged")] += 1
             else:
                 by_file[finding.path].append(finding)
+        style_proposals.print_finding_waits(issue.path, site_waits)
         # A finding in a removed file, whose site a merge moved to another file, or whose changed file a later judgment
         # read without it, can never build at its site, so it is waived and the decision can close.
         for words, finding_ids in sorted(gone.items()) if selection != FamilySelection.COUNT else ():
@@ -2396,7 +2414,7 @@ def _select_phase(
         outside = {path for path in by_file if not crate_in_scope(scope, style_proposals.crate_for(directories, path))}
         if outside:
             print(f"waiting {issue.path}: outside pilot scope")
-        for path in by_file.keys() & waits.keys():
+        for path in by_file.keys() & waits.keys() - blocked:
             previous_count = len(by_file[path])
             by_file[path] = [finding for finding in by_file[path] if exemptions.allows(finding, family)]
             refusals["waiting for rank"] += previous_count - len(by_file[path])
@@ -2409,20 +2427,21 @@ def _select_phase(
             print(f"waiting {issue.path}: {unsynced[path].line(tip)}")
         # A finding whose change edits another busy file waits, and so does a file rename whose edit the gate cannot
         # prove; the other findings of its file stay available.
+        footprint_waits: Counter[tuple[str, str]] = Counter()
         for path in sorted(set(by_file) - outside - held - set(changed)):
             free: list[style_ledger.HeldFinding] = []
             for finding in by_file[path]:
                 uncertain = edits.uncertain(finding)
                 if uncertain:
-                    print(f"waiting {issue.path}: {finding.finding_id} {uncertain[0]} has a path attribute the rename "
-                          + "gate cannot read")
+                    footprint_waits[(finding.path, f"{uncertain[0]} has a path attribute the rename gate cannot read")] += 1
                     continue
                 edited = next((edited for edited in edits.of(finding) if busy.contains(edited)), None)
                 if edited is None:
                     free.append(finding)
                 else:
-                    print(f"waiting {issue.path}: {finding.finding_id} edits {edited}, busy")
+                    footprint_waits[(finding.path, f"edits {edited}, busy")] += 1
             by_file[path] = free
+        style_proposals.print_finding_waits(issue.path, footprint_waits)
         if selection != FamilySelection.OWN:
             refusals["outside pilot scope"] += sum(len(by_file[path]) for path in outside)
             refusals["busy or rank held"] += sum(len(by_file[path]) for path in held)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import registry_text, write_registry
+from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
 
 from scripts.whoami.note_file import note_name
 
@@ -45,7 +45,20 @@ from user_action import ActionRequired, UserAction, parse_user_action
 
 Notes = list[quota_alert.AgentNote]
 
-REGISTRY = registry_text({'assignments': {'direct': 'codex', 'cli': 'claude', 'module_review': 'codex   # a trailing comment', 'ask_a_friend': 'caller'}, 'direct.codex': {'impl': 'gpt-6-sol:high'}, 'direct.claude': {'impl': 'opus:high'}, 'cli.codex': {'commit_prep': 'gpt-6-sol:high'}, 'cli.claude': {'commit_prep': 'sonnet:high'}, 'module_review.codex': {'review': 'gpt-6-sol:xhigh'}, 'module_review.claude': {'review': 'opus:max'}, 'ask_a_friend.codex': {'consultation': 'gpt-6-sol:max'}, 'ask_a_friend.claude': {'consultation': 'opus:max'}, 'codex.agents': {'gpt-6-sol': 'low,medium,high,xhigh,max'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max', 'sonnet': 'low,medium,high'}})
+REGISTRY = registry_text({
+    'assignments': ExactRows({'direct': 'codex', 'cli': 'claude',
+                              'module_review': 'codex   # a trailing comment', 'ask_a_friend': 'caller'}),
+    'direct.codex': ExactRows({'impl': 'gpt-6-sol:high'}),
+    'direct.claude': ExactRows({'impl': 'opus:high'}),
+    'cli.codex': ExactRows({'commit_prep': 'gpt-6-sol:high'}),
+    'cli.claude': ExactRows({'commit_prep': 'sonnet:high'}),
+    'module_review.codex': ExactRows({'review': 'gpt-6-sol:xhigh'}),
+    'module_review.claude': ExactRows({'review': 'opus:max'}),
+    'ask_a_friend.codex': ExactRows({'consultation': 'gpt-6-sol:max'}),
+    'ask_a_friend.claude': ExactRows({'consultation': 'opus:max'}),
+    'codex.agents': ExactRows({'gpt-6-sol': 'low,medium,high,xhigh,max'}),
+    'claude.agents': ExactRows({'opus': 'low,medium,high,xhigh,max', 'sonnet': 'low,medium,high'}),
+})
 
 REAL_RECIPIENTS = quota_alert.recipients
 REAL_TELL_USER = quota_alert.tell_user

@@ -303,7 +303,7 @@ class StylePlanTests(StylePlanFixture):
         self.commit_files({self.sources[0]: source + "fn unrelated() {}\n"})
         with mock.patch.object(style_proposals, "proposal_command"):
             _, output, _ = self.run_next()
-        self.assertIn(f"{findings[1].finding_id} {self.sources[0]} changed since it was judged", output)
+        self.assertIn(f"waiting {issue}: {self.sources[0]} changed since it was judged; source follow could not refresh the decision (2 findings)", output)
         self.assertFalse(any(t["kind"] == "proposal" for t in ledger.ticket_open("names-unit")))
 
     def test_decision_refill_skips_a_rule_that_left_the_catalog_and_coverage_goes_on(self) -> None:

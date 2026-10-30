@@ -75,6 +75,30 @@ class ReviewPage(HTMLParser):
             self.fallback.append(data)
 
 
+class PrivateNameTests(unittest.TestCase):
+    def test_private_names_ignore_case_without_hiding_similar_public_names(self) -> None:
+        for name, expected in (
+            (".index.json", True),
+            (".INDEX.JSON", True),
+            (".Index.Json", True),
+            (".index.lock", True),
+            (".INDEX.LOCK", True),
+            (".Index.Lock", True),
+            (".review-link-", True),
+            (".review-link-x", True),
+            (".Review-Link-x", True),
+            (".REVIEW-LINK-X", True),
+            ("index.json", False),
+            (".index.json.bak", False),
+            (".index.locked", False),
+            (".review-link", False),
+            ("review-link-draft.txt", False),
+            ("draft.txt", False),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(review_link.private_name(name), expected)
+
+
 class ReviewLinkTests(unittest.TestCase):
     root: Path = Path()
     snapshots: Path = Path()

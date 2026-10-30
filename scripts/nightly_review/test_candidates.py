@@ -83,6 +83,26 @@ class CandidatesTests(unittest.TestCase):
             code = candidates.main(arguments)
         return code, out.getvalue(), err.getvalue()
 
+    def test_record_repairs_an_interrupted_last_heading_before_queueing_it(self) -> None:
+        report = self.root / "2026-10-12/report.md"
+        report.parent.mkdir()
+        _ = report.write_text(REPORT)
+        ledger = self.root / "ledger.md"
+        expected = self.run_main(["record", str(report)])
+        self.assertEqual(expected[0], 0, expected[2])
+        expected_ledger = ledger.read_bytes()
+        first = expected[1].splitlines()[0]
+        for tail in (first.split(" — ")[0], first.removesuffix("posed")):
+            with self.subTest(tail=tail):
+                _ = ledger.write_text(tail)
+                with mock.patch("scripts.lib.atomic_file.os.replace", side_effect=OSError("publish stopped")):
+                    stopped = self.run_main(["record", str(report)])
+                self.assertEqual(stopped[0], 1)
+                retried = self.run_main(["record", str(report)])
+                self.assertEqual(retried, expected)
+                self.assertEqual(ledger.read_bytes(), expected_ledger)
+                self.assertEqual(len(candidates.ordered(ledger.read_text().splitlines())), 5)
+
     def test_a_gain_reads_as_time_tokens_or_unmeasured(self) -> None:
         self.assertEqual(candidates.read_gain("38 min waiting"), TimeGain(38.0))
         self.assertEqual(candidates.read_gain("2.5 h red CI"), TimeGain(150.0))
@@ -90,6 +110,58 @@ class CandidatesTests(unittest.TestCase):
         self.assertEqual(candidates.read_gain("3.1% of tokens"), TokenGain(3.1))
         for text in ("", "about a third of calls", "40 hits a day"):
             self.assertEqual(candidates.read_gain(text), Unmeasured())
+
+    def test_record_keeps_every_outcome_written_by_next(self) -> None:
+        report = self.root / "2026-10-12/report.md"
+        report.parent.mkdir()
+        _ = report.write_text("# Finished candidate\n**Target:** config\n**Gain per week:** 12 min waiting\n")
+        ledger = self.root / "ledger.md"
+        for outcome in ("proposed", "deferred", "accepted 2026-10-13, applied (config abc123)",
+                        "declined", "done 2026-10-13", "relayed 2026-10-13"):
+            with self.subTest(outcome=outcome):
+                decided = f"- 2026-10-12 config: Finished candidate [gain/week: 12 min waiting] — {outcome}\n"
+                _ = ledger.write_text(decided)
+                self.assertEqual(self.run_main(["record", str(report)]), (0, "nothing new to record\n", ""))
+                self.assertEqual(ledger.read_text(), decided)
+                if outcome.startswith(("done ", "relayed ")):
+                    self.assertEqual(self.run_main([]), (0, "no open candidates\n", ""))
+
+    def test_record_finishes_partial_records_with_outcome_words_in_the_title(self) -> None:
+        report = self.root / "2026-10-12/report.md"
+        report.parent.mkdir()
+        ledger = self.root / "ledger.md"
+        for title in ("Mark — done before publishing", "Notice — relayed to another session"):
+            for gain in ("", "**Gain per week:** 12 min waiting\n"):
+                with self.subTest(title=title, gain=gain):
+                    _ = report.write_text(f"# {title}\n**Target:** config\n{gain}")
+                    ledger.unlink(missing_ok=True)
+                    expected = self.run_main(["record", str(report)])
+                    self.assertEqual(expected[0], 0, expected[2])
+                    expected_ledger = ledger.read_bytes()
+                    for tail in (expected[1].rsplit(" — ", 1)[0], expected[1].rstrip().removesuffix("posed")):
+                        with self.subTest(tail=tail):
+                            _ = ledger.write_text(tail)
+                            self.assertEqual(self.run_main(["record", str(report)]), expected)
+                            self.assertEqual(ledger.read_bytes(), expected_ledger)
+                            self.assertEqual([item.title for item in candidates.ordered(ledger.read_text().splitlines())], [title])
+
+    def test_record_retries_output_when_printing_stops_before_publication(self) -> None:
+        report = self.root / "2026-10-12/report.md"
+        report.parent.mkdir()
+        _ = report.write_text(REPORT)
+        ledger = self.root / "ledger.md"
+        expected = self.run_main(["record", str(report)])
+        self.assertEqual(expected[0], 0, expected[2])
+        expected_ledger = ledger.read_bytes()
+        ledger.unlink()
+
+        with mock.patch("builtins.print", side_effect=RuntimeError("output stopped")):
+            with self.assertRaisesRegex(RuntimeError, "output stopped"):
+                _ = self.run_main(["record", str(report)])
+
+        self.assertFalse(ledger.exists())
+        self.assertEqual(self.run_main(["record", str(report)]), expected)
+        self.assertEqual(ledger.read_bytes(), expected_ledger)
 
     def test_only_lines_that_end_proposed_or_deferred_are_open(self) -> None:
         found = candidates.ranked(LEDGER.splitlines())

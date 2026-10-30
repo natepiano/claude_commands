@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
@@ -20,6 +21,7 @@ import showrunners
 import unit_effort
 import unit_lookup
 import herdr
+import sessions
 from production_units import Production, read_production
 from production_units import Refusal, plan_cell_is_retired, unit_table
 from scripts.accounts import accounts
@@ -33,6 +35,7 @@ PID = 4242
 PANE = "w7:p1"
 # add_showrunner.checked as written: setUp replaces it with a recording stand-in.
 ORIGINAL_CHECKED = add_showrunner.checked
+START_SHOWRUNNER = add_showrunner.main
 
 
 def setUpModule() -> None:
@@ -83,6 +86,13 @@ class PromoteShowrunnerTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for name, path in {
+            "NOTIFIER_STATE_DIR": self.root / "notifier",
+            "SESSIONS_DIR": self.root / "sessions",
+            "SHOWRUNNER_STATE_DIR": self.root / "showrunner-state",
+            "CONFIG": self.root / "showrunners.json",
+        }.items():
+            _ = self.enterContext(mock.patch.object(showrunners, name, path))
         parent = repo(self.root / "parent")
         self.parent_doc = parent / "parent-production.md"
         _ = self.parent_doc.write_text(doc_text(parent, (
@@ -94,9 +104,9 @@ class PromoteShowrunnerTests(unittest.TestCase):
         self.child_doc = self.worktree / "child-production.md"
         _ = self.child_doc.write_text(doc_text(self.worktree))
         commit_all(self.worktree)
-        sessions = self.root / "sessions"
-        sessions.mkdir()
-        _ = (sessions / f"{PID}.json").write_text(json.dumps({"status": "idle"}))
+        session_records = self.root / "sessions"
+        session_records.mkdir()
+        _ = (session_records / f"{PID}.json").write_text(json.dumps({"status": "idle"}))
         self.events, self.alive, self.started = [], [True, True, False], 0
         _ = (self.root / "herdr-responses.json").write_text(json.dumps({"default": {"code": 0, "stdout": ""}}))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
@@ -118,8 +128,9 @@ class PromoteShowrunnerTests(unittest.TestCase):
         _ = (directory / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "default@example.invalid"}}))
         self.runs_production, self.pane, self.child_refusal = True, unit_effort.Ready(), ""
         self.enterContext(mock.patch.dict(os.environ, {
-            "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFIER_SESSIONS_DIR": str(sessions), "UNIT_ACTIVE_DIR": str(self.root / "active")}))
+            "HOME": str(self.root), "AGENT_NOTES_DIR": str(notes), "NOTIFIER_SESSIONS_DIR": str(session_records), "UNIT_ACTIVE_DIR": str(self.root / "active")}))
         self.assertEqual(accounts.setup("claude2"), [])
+        _ = self.enterContext(mock.patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()))
         for module, name, stand_in in (
                 (showrunners, "production_of", self.production_of), (unit_lookup, "marked_unit", self.marked_unit),
                 (herdr, "stop_session", self.stop_host), (promote_showrunner, "type_place", self.type_pane), (promote_showrunner, "_alive", self.is_alive),
@@ -185,6 +196,99 @@ class PromoteShowrunnerTests(unittest.TestCase):
     def assert_nothing_stopped(self) -> None:
         self.assertFalse(any(event.startswith(("prompt herdr ", "stop herdr ", "start")) for event in self.events))
         self.assertFalse(plan_cell_is_retired(self.demo_row()["Plan"]))
+
+    def test_promotion_resumes_the_saved_conversation_after_stop(self) -> None:
+        with mock.patch.object(add_showrunner, "main", side_effect=RuntimeError("stopped after unit exit")):
+            with self.assertRaises(RuntimeError):
+                _ = self.run_main()
+        self.marked.clear()
+        self.assertFalse(plan_cell_is_retired(self.demo_row()["Plan"]))
+        pending = promote_showrunner.promotion_record(read_production(self.parent_doc), "demo-unit")
+        self.assertTrue(pending.exists())
+        self.events.clear()
+        code, out, err = self.run_main()
+        self.assertEqual(code, 0, (out, err))
+        self.assertIn("demo-unit is now the showrunner of child", out)
+        start = next(event for event in self.events if event.startswith("start "))
+        self.assertIn(f"--resume {SESSION}", start)
+        self.assertIn(f"--cwd {self.worktree}", start)
+        self.assertFalse(any(event.startswith("prompt herdr") for event in self.events))
+        self.assertTrue(plan_cell_is_retired(self.demo_row()["Plan"]))
+        self.assertFalse(pending.exists())
+
+    def test_started_child_without_timer_finishes_registration_without_second_start(self) -> None:
+        submitted = herdr.PromptSubmitted(datetime.now(UTC))
+
+        def start_child(_child: Production, _model: str, _effort: str, resume: str | None,
+                        cwd: Path, _selected: accounts.ClaudeLaunchAccount) -> herdr.PromptSubmitted:
+            self.assertEqual((resume, cwd), (SESSION, self.worktree))
+            self.marked.clear()
+            return submitted
+
+        with (mock.patch.object(add_showrunner, "main", START_SHOWRUNNER),
+              mock.patch("scripts.message.sessions.live_sessions", return_value=[]),
+              mock.patch.object(add_showrunner, "launch", side_effect=start_child) as started,
+              mock.patch.object(add_showrunner, "showrunner_appeared", side_effect=RuntimeError("stopped before timer"))):
+            with self.assertRaisesRegex(RuntimeError, "stopped before timer"):
+                _ = self.run_main()
+        started.assert_called_once()
+        pending = promote_showrunner.promotion_record(read_production(self.parent_doc), "demo-unit")
+        self.assertTrue(pending.exists())
+        place = herdr.HerdrPlace("agents", "w8:p1")
+        with (mock.patch.object(showrunners, "current_name", return_value=""),
+              mock.patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(5151)),
+              mock.patch.object(herdr, "herdr_place_of", return_value=place),
+              mock.patch.object(herdr.Herdr, "panes", return_value=[herdr.PaneIdentity(pane_id=place.pane, label="child")]),
+              mock.patch.object(herdr, "submitted_prompt", return_value=submitted),
+              mock.patch.object(herdr.Herdr, "submit_opening_prompt") as prompt,
+              mock.patch.object(add_showrunner, "showrunner_appeared", return_value=True) as appeared,
+              mock.patch.object(showrunners, "timer_slugs", return_value={"parent", "child"}),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=[]),
+              mock.patch.object(showrunners, "tell_others", return_value=["sent child", "sent parent"]),
+              mock.patch.object(add_showrunner, "main") as restart):
+            code, out, err = self.run_main()
+        self.assertEqual((code, err), (0, ""), out)
+        appeared.assert_called_once_with("child")
+        restart.assert_not_called()
+        prompt.assert_not_called()
+        self.assertIn("sent child", out)
+        self.assertIn("sent parent", out)
+        self.assertTrue(plan_cell_is_retired(self.demo_row()["Plan"]))
+        self.assertEqual((self.root / "showrunner-state/child/parent").read_text(), "parent\n")
+        self.assertFalse(pending.exists())
+
+    def test_saved_parent_after_interrupted_attach_still_sends_routing_notices(self) -> None:
+        def start_and_attach(_argv: list[str]) -> int:
+            self.marked.clear()
+            return showrunners.main(["attach", "child", "parent"])
+
+        pending = promote_showrunner.promotion_record(read_production(self.parent_doc), "demo-unit")
+
+        def send_notices(texts: dict[str, str], key: str) -> list[str]:
+            self.assertTrue(pending.exists())
+            self.assertEqual(set(texts), {"parent", "child"})
+            self.assertEqual(key, "showrunner-tree:child")
+            return ["sent child", "sent parent"]
+
+        with (mock.patch.object(showrunners, "timer_slugs", return_value={"parent", "child"}),
+              mock.patch.object(showrunners, "registered_showrunners", return_value=[])):
+            with (mock.patch.object(add_showrunner, "main", side_effect=start_and_attach),
+                  mock.patch.object(showrunners, "tell_others", side_effect=RuntimeError("stopped before notices"))):
+                with self.assertRaisesRegex(RuntimeError, "stopped before notices"):
+                    _ = self.run_main()
+            self.assertEqual((self.root / "showrunner-state/child/parent").read_text(), "parent\n")
+            self.assertTrue(pending.exists())
+            with (mock.patch.object(showrunners, "current_name", return_value="child"),
+                  mock.patch.object(showrunners, "tell_others", side_effect=send_notices) as notices,
+                  mock.patch.object(add_showrunner, "main") as restart):
+                code, out, err = self.run_main()
+        self.assertEqual((code, err), (0, ""), out)
+        restart.assert_not_called()
+        notices.assert_called_once()
+        self.assertIn("sent child", out)
+        self.assertIn("sent parent", out)
+        self.assertTrue(plan_cell_is_retired(self.demo_row()["Plan"]))
+        self.assertFalse(pending.exists())
 
     def test_each_refusal_names_its_cause_and_stops_nothing(self) -> None:
         def no_production() -> None:
