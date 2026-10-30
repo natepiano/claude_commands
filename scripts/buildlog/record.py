@@ -979,6 +979,16 @@ def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step
     })
 
 
+def sweep_trim(folder: str, bytes_freed: int, extent: Literal["whole", "partial"],
+               cause: Literal["budget take", "floor take"], at: float) -> None:
+    host = store.host_name()
+    store.append_line(store.host_file(host, at), {
+        "kind": "sweep_trim", "v": RECORD_VERSION,
+        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
+        "folder": folder, "bytes_freed": bytes_freed, "extent": extent, "cause": cause,
+    })
+
+
 def hold_build(args: list[str]) -> None:
     key, since, boot, pid, start, classification, session, command, cwd = args
     if classification not in {"other_session", "no_session"} or int(pid) <= 0 or not start.isdecimal():

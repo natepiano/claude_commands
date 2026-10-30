@@ -165,8 +165,8 @@ change, so a recent copy with preserved mtimes stays.
 
 Run `python3 scripts/lint/sweep.py rebuilds --days 7` to see cold rebuild
 compile-hours by clone kind and cause: `floor take`, `budget take`, `tmp sweep`
-or `none`. The command reads natedev's monthly build-log JSON lines, the
-journal and `~/.local/state/lint-sweep/removals.jsonl`. It writes no report, index or sweep state. `BUILDLOG_DIR` selects a
+or `none`. The command reads steps and trims from natedev's monthly build-log JSON lines, the
+journal and legacy `~/.local/state/lint-sweep/removals.jsonl`. It writes no report, index or sweep state. `BUILDLOG_DIR` selects a
 different build-log root.
 
 A cold step has `crates_compiled >= 50`. Its cause is the latest matching
@@ -181,21 +181,22 @@ clones, mktemp folders, scratchpad clones, scratch.py folders, other `/tmp`,
 `~/rust` worktrees, and other folders. Compile-hours use `finished_s`, with
 `duration_s` when that field is absent. The table also gives totals per day.
 
-Real budget and floor removals append one JSON record per affected target to
-`removals.jsonl`, with `at` (epoch seconds), `path` (target directory) and
-`cause` (`budget take` or `floor take`). This keeps evidence when a background
-caller discards output. The floor writes each target's record after its deletions
-and before releasing its locks, so a build can use the record while the pass continues.
-Orphan cleanup does not count as a rebuild cause.
-Dry runs write no removal record. A write failure prints one line and does
-not fail the sweep. Once the file exceeds 1 MiB, a writer drops records older
-than 35 days and keeps only the newest rows that fit in 512 KiB. This leaves
-room for later appends without another rewrite. A read error prints one line
-and leaves the journal as the source of evidence. Writers lock the file for
-append and retention. The existing
-`LINT_SWEEP_STATE_DIR` override also selects this file's directory.
-The report merges the file and journal into one event per path, cause and
-second. It reads sweep state without changing it.
+Real budget and floor takes write one `sweep_trim` build-log row per affected
+target through `record.sweep_trim`. It records the host, absolute `folder`, UTC
+`at`, confirmed `bytes_freed`, `extent` (`whole` or `partial`) and `cause`
+(`budget take` or `floor take`). `whole` means none of the scanned build units
+or incremental directories remain. Only successful last-link unlinks count as
+freed bytes; artifacts still linked from a clone free nothing. The floor writes
+the row before releasing the target's locks. Orphan cleanup alone writes no
+trim, and dry runs write none. A write failure prints one line and does not fail
+the sweep.
+
+`sweep_trim` is the one record of a trim. `rebuilds` reads those rows through the
+same build-log reader as its steps and merges them with the journal and legacy
+`removals.jsonl` rows by path, cause and second. Nothing writes `removals.jsonl`;
+its read-only legacy source remains until 2026-12-05. `LINT_SWEEP_STATE_DIR`
+selects that legacy file's directory. The report reads sweep state without
+changing it.
 
 `none` means no matching evidence, including a workspace's first recorded step.
 It does not prove that no deletion occurred. Attribution uses recorded paths;
@@ -219,6 +220,18 @@ the log does not record that connection. Journal retention also limits the evide
 - A module added to `scripts/build_hold`, `scripts/build_targets`, `scripts/buildlog` or `scripts/lint` shares no name with one in the others: importing `build_hold`, `targets` or `offload` puts several of them on `sys.path`.
 
 ### Copy records and lifetime
+
+`scratch.shared_build_folder(source)` returns `SharedBuildFolder(path,
+repo_identity)` for `copies.py` to set as `CARGO_BUILD_BUILD_DIR`. It calls
+`memory_admit.git_identity` only when used. The repository key alone names the
+folder under `~/.cache/claude-builds` (`SCRATCH_SHARED_BUILD_ROOT` overrides the
+root); each use updates the folder's one `.lint-sweep-used` stamp. An unknown
+repository returns `NoSharedBuildFolder(reason)` and keeps its own build folder.
+The shared folder outlives individual copy tasks, uses Cargo's build locks and
+is swept as one target by its own last use. A copy record can name its shared
+target; ending the copy never removes that target. The existing
+`style-sync-target` also outlives its production task and keeps `sync.lock`
+across checkout creation, lint and cleanup.
 
 `/tmp/claude/copies` is a kept root, with copies at `<pair>/<copy>`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
 

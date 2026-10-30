@@ -121,7 +121,7 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Ruled out:** a first-builds column in `rebuilds`; the shared-folder sweep extension computes first builds from build-log records.
 
-### Phase 4 — Short-lived clones share one build folder per repository  · status: todo
+### Phase 4 — Short-lived clones share one build folder per repository  · status: done
 **Depends on:** Phase 3, Phase 9 (the sweep change this phase extends), the case D verdict of verify-unit's Phase 1 trial (Spec 1–2, frozen), and, for the attribution reader only, report-unit's Phase 4f merged on `origin/builds` (the step row's `target_dir` and `repo_identity`, with `"unknown"` for older rows, in `scripts/buildlog/record.py`). The clone build folder (Spec 3 identity, lifetime, locks and one-target sweep) and the sweep trim row (Spec 6) start before 4f lands. The attribution reader (Spec 3, Attribution after the last copy record, and its Spec 4 tests) waits until 4f merges on `origin/builds`, or is written beside 4f on its tree (`origin/builds-report`). Global order: serial memory chain 21 → 16 → 25 → 24 → 26 → 15 → 27 → 20 → 11 → 17 → 18 → 19 → 8; **4** → 29 is a parallel branch that starts beside 24 Part B and joins before 11. The Change-Review uses `copies.py` (verify-copies Phase 3, verify-unit).
 
 #### Work Order
