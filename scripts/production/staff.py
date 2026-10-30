@@ -109,6 +109,7 @@ class StaffRow:
 @dataclass(frozen=True)
 class StaffSnapshot:
     rows: tuple[StaffRow, ...]
+    pending_retire: tuple[StaffId, ...] = ()
 
     def by_id(self, staff_id: StaffId) -> StaffRow | None:
         return _row_by_id(self.rows, staff_id)
@@ -231,11 +232,41 @@ def _is_owner() -> bool:
     return remote.other_machine() != OWNER_MACHINE
 
 
+def operation_fds() -> tuple[int, ...]:
+    """Descriptors a nested tool must preserve with subprocess pass_fds."""
+    try:
+        return (int(os.environ["STAFF_OPERATION_FD"]),) if _joined_operation(_file().parent / "operation.lock") else ()
+    except (KeyError, ValueError):
+        return ()
+
+
+def _joined_operation(path: Path) -> bool:
+    try:
+        descriptor = int(os.environ["STAFF_OPERATION_FD"])
+        opened, target = os.fstat(descriptor), path.stat()
+        if (opened.st_dev, opened.st_ino) != (target.st_dev, target.st_ino):
+            return False
+        # A distinct open must be blocked, and the inherited open description
+        # must already hold the lock. An unlocked fd is not proof.
+        with path.open("a", encoding="utf-8") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+        return False
+    except (KeyError, ValueError, OSError):
+        return False
+
+
 def operation() -> AbstractContextManager[None]:
-    """Order this machine's source reads and lifecycle source updates."""
+    """Order source changes, joining only a proven inherited operation lock."""
     @contextmanager
     def locked() -> Generator[None]:
         path = _file().parent / "operation.lock"
+        if _joined_operation(path):
+            yield
+            return
         with ExitStack() as resources:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -243,7 +274,15 @@ def operation() -> AbstractContextManager[None]:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             except OSError as error:
                 raise StaffUnreadable(f"staff operation: {error}") from error
-            yield
+            previous = os.environ.get("STAFF_OPERATION_FD")
+            os.environ["STAFF_OPERATION_FD"] = str(lock.fileno())
+            try:
+                yield
+            finally:
+                if previous is None:
+                    _ = os.environ.pop("STAFF_OPERATION_FD", None)
+                else:
+                    os.environ["STAFF_OPERATION_FD"] = previous
 
     return locked()
 
@@ -310,12 +349,12 @@ def _rows(value: object) -> list[StaffRow]:
     return sorted(rows, key=lambda row: row.id)
 
 
-def _load(*, initial: bool = False) -> list[StaffRow]:
+def _load(*, initial: bool = False) -> StaffSnapshot:
     try:
         text = _file().read_text(encoding="utf-8")
     except FileNotFoundError as error:
         if initial:
-            return []
+            return StaffSnapshot(())
         raise StaffAbsent(f"cannot read staff record: {error}") from error
     except (OSError, UnicodeError) as error:
         raise StaffUnreadable(f"cannot read staff record: {error}") from error
@@ -326,7 +365,16 @@ def _load(*, initial: bool = False) -> list[StaffRow]:
     schema = fields.get("schema")
     if type(schema) is not int or schema != 1:
         raise StaffUnreadable(f"unsupported staff schema: {schema!r}")
-    return _rows(fields.get("rows"))
+    return _snapshot_value(fields)
+
+
+def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
+    pending = fields.get("pending_retire", [])
+    if not isinstance(pending, list) or any(not isinstance(item, str) or not _ID.fullmatch(item)
+                                             for item in cast(list[object], pending)):
+        raise StaffUnreadable("invalid pending retirement ids")
+    return StaffSnapshot(tuple(_rows(fields.get("rows"))),
+                         tuple(sorted({StaffId(item) for item in cast(list[str], pending)})))
 
 
 def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
@@ -363,11 +411,24 @@ def _remote_row(arguments: list[str]) -> StaffRow:
 
 
 def _all_rows() -> list[StaffRow]:
-    return _load() if _is_owner() else _rows(_remote(["show"]))
+    return list(_load().rows) if _is_owner() else _rows(_remote(["show"]))
 
 
 def snapshot() -> StaffSnapshot:
-    return StaffSnapshot(tuple(_all_rows()))
+    if _is_owner():
+        return _load()
+    value = _remote(["show", "--snapshot"])
+    if not isinstance(value, dict):
+        raise StaffUnreadable("staff snapshot must be an object")
+    return _snapshot_value(cast(dict[str, object], value))
+
+
+def initial_snapshot() -> StaffSnapshot:
+    """Read a writer's starting record, including an installation not yet seeded."""
+    try:
+        return snapshot()
+    except StaffAbsent:
+        return StaffSnapshot(())
 
 
 def _row_by_id(rows: Sequence[StaffRow], staff_id: StaffId) -> StaffRow | None:
@@ -405,13 +466,16 @@ def find(*, kind: Kind | None = None, parent: StaffId | None = None) -> list[Sta
     return snapshot().find(kind=kind, parent=parent)
 
 
-def _store(rows: list[StaffRow]) -> None:
-    content = json.dumps({"schema": 1, "rows": [row.to_json() for row in rows]},
+def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
+    document: dict[str, object] = {"schema": 1, "rows": [row.to_json() for row in rows]}
+    if pending:
+        document["pending_retire"] = sorted(pending)
+    content = json.dumps(document,
                          indent=2, sort_keys=True) + "\n"
     atomic_file.write_text_atomic(_file(), content)
 
 
-def _transaction(edit: Callable[[list[StaffRow]], _Result]) -> _Result:
+def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result]) -> _Result:
     path = _file()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -420,21 +484,26 @@ def _transaction(edit: Callable[[list[StaffRow]], _Result]) -> _Result:
             for temporary in path.parent.glob(f".{path.name}.*"):
                 temporary.unlink()
             original = _load(initial=True)
-            proposed = list(original)
-            result = edit(proposed)
+            proposed = list(original.rows)
+            pending = set(original.pending_retire)
+            result = edit(proposed, pending)
             _validate(proposed)
             proposed.sort(key=lambda row: row.id)
-            if proposed == original:
+            if proposed == list(original.rows) and pending == set(original.pending_retire):
                 # A prior replace may have succeeded before its folder sync failed.
                 atomic_file.sync_folder(path.parent)
                 print("unchanged", file=sys.stderr)
             else:
-                _store(proposed)
+                _store(proposed, pending)
             return result
     except OSError as error:
         if isinstance(error, StaffUnreadable):
             raise
         raise StaffUnreadable(f"cannot write staff record: {error}") from error
+
+
+def _transaction(edit: Callable[[list[StaffRow]], _Result]) -> _Result:
+    return _record_transaction(lambda rows, pending: edit(rows))
 
 
 def _required(rows: list[StaffRow], staff_id: StaffId) -> StaffRow:
@@ -503,30 +572,72 @@ def retire(staff_id: StaffId) -> StaffRow | None:
         value = _remote(["retire", staff_id])
         return None if value is None else StaffRow.from_json(value)
 
-    def edit(rows: list[StaffRow]) -> StaffRow | None:
-        row = _row_by_id(rows, staff_id)
-        if row is None:
-            return None
-        if row.kind == "showrunner" and any(child.parent == row.id and child.kind == "unit" for child in rows):
-            raise StaffRefused(f"showrunner {row.name} still has units")
-        kept: list[StaffRow] = []
-        for member in rows:
-            if member.id == staff_id or (row.kind == "unit" and member.parent == staff_id):
-                continue
-            kept.append(replace(member, parent=None) if member.parent == staff_id else member)
-        rows[:] = kept
-        return row
+    return _transaction(lambda rows: _retire_row(rows, staff_id))
 
-    return _transaction(edit)
+
+def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
+    row = _row_by_id(rows, staff_id)
+    if row is None:
+        return None
+    if row.kind == "showrunner" and any(child.parent == row.id and child.kind == "unit" for child in rows):
+        raise StaffRefused(f"showrunner {row.name} still has units")
+    rows[:] = [replace(member, parent=None) if member.parent == staff_id else member
+               for member in rows if member.id != staff_id
+               and not (row.kind == "unit" and member.parent == staff_id)]
+    return row
+
+
+def defer_retire(staff_ids: Sequence[StaffId]) -> None:
+    """Remember members kept alive after their source records disappear."""
+    if not _is_owner():
+        _ = _remote(["defer-retire", *staff_ids])
+        return
+
+    def edit(rows: list[StaffRow], pending: set[StaffId]) -> None:
+        for staff_id in staff_ids:
+            row = _row_by_id(rows, staff_id)
+            if row is not None:
+                if row.kind == "worker":
+                    raise StaffRefused("pending retirement is for units and showrunners")
+                pending.add(staff_id)
+
+    _record_transaction(edit)
+
+
+def retire_pending() -> tuple[StaffId, ...]:
+    """Retire unheld units before showrunners, returning the remaining ids."""
+    if not _is_owner():
+        value = _remote(["retire-pending"])
+        if not isinstance(value, list) or any(not isinstance(item, str) or not _ID.fullmatch(item)
+                                               for item in cast(list[object], value)):
+            raise StaffUnreadable("invalid pending retirement ids")
+        return tuple(StaffId(item) for item in cast(list[str], value))
+
+    def edit(rows: list[StaffRow], pending: set[StaffId]) -> tuple[StaffId, ...]:
+        ordered = sorted(pending, key=lambda key: (0 if (row := _row_by_id(rows, key)) is None
+                                                     or row.kind == "unit" else 1, key))
+        for staff_id in ordered:
+            row = _row_by_id(rows, staff_id)
+            if row is not None:
+                held_kind = "worker" if row.kind == "unit" else "unit"
+                if any(child.parent == staff_id and child.kind == held_kind for child in rows):
+                    continue
+                _ = _retire_row(rows, staff_id)
+            pending.remove(staff_id)
+        return tuple(sorted(pending))
+
+    return _record_transaction(edit)
 
 
 def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
     """Apply source evidence in one transaction, preserving names matched by id."""
     if not _is_owner():
         value = _remote(["apply-seed"], input_text=json.dumps(seed_input.to_json(), sort_keys=True))
-        return StaffSnapshot(tuple(_rows(value)))
+        if not isinstance(value, dict):
+            raise StaffUnreadable("staff snapshot must be an object")
+        return _snapshot_value(cast(dict[str, object], value))
 
-    def edit(rows: list[StaffRow]) -> StaffSnapshot:
+    def edit(rows: list[StaffRow], pending: set[StaffId]) -> StaffSnapshot:
         entries = {member.key: member for member in seed_input.members}
         if len(entries) != len(seed_input.members) or any(not key for key in entries):
             raise StaffRefused("seed member keys must be nonempty and unique")
@@ -585,9 +696,9 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
                 print(f"seed: keeping unit {row.name}: worker rows remain", file=sys.stderr)
             else:
                 rows.remove(row)
-        return StaffSnapshot(tuple(sorted(rows, key=lambda row: row.id)))
+        return StaffSnapshot(tuple(sorted(rows, key=lambda row: row.id)), tuple(sorted(pending)))
 
-    return _transaction(edit)
+    return _record_transaction(edit)
 
 
 def _paths(rows: list[StaffRow]) -> dict[StaffId, str]:
@@ -612,6 +723,8 @@ class _Arguments(argparse.Namespace):
     name: str = ""
     parent: str | None = None
     json: bool = False
+    snapshot: bool = False
+    ids: list[str] = []
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -620,6 +733,7 @@ def _parser() -> argparse.ArgumentParser:
     show = verbs.add_parser("show", help="show the production staff")
     _ = show.add_argument("--kind", choices=_KINDS)
     _ = show.add_argument("--under", help="parent staff id or path")
+    _ = show.add_argument("--snapshot", action="store_true", help=argparse.SUPPRESS)
     get = verbs.add_parser("get", help="find a member by id or path")
     _ = get.add_argument("target")
     add = verbs.add_parser("ensure", help=argparse.SUPPRESS)
@@ -635,7 +749,10 @@ def _parser() -> argparse.ArgumentParser:
     retire_parser = verbs.add_parser("retire", help=argparse.SUPPRESS)
     _ = retire_parser.add_argument("target")
     apply_parser = verbs.add_parser("apply-seed", help=argparse.SUPPRESS)
-    for verb in (show, get, add, rename_parser, move_parser, retire_parser, apply_parser):
+    defer_parser = verbs.add_parser("defer-retire", help=argparse.SUPPRESS)
+    _ = defer_parser.add_argument("ids", nargs="*")
+    pending_parser = verbs.add_parser("retire-pending", help=argparse.SUPPRESS)
+    for verb in (show, get, add, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
         _ = verb.add_argument("--json", action="store_true")
     return parser
 
@@ -648,7 +765,11 @@ def _print_row(row: StaffRow, path: str) -> None:
     print(f"{row.id:<12}  {row.kind:<10}  {path}")
 
 
-def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | None:
+def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:
+    if arguments.verb == "defer-retire":
+        return defer_retire(tuple(StaffId(value) for value in arguments.ids))
+    if arguments.verb == "retire-pending":
+        return retire_pending()
     if arguments.verb == "ensure":
         assert arguments.kind is not None
         return ensure(arguments.kind, name=arguments.name, parent=_parent(arguments.parent))
@@ -663,6 +784,11 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | None:
 
 def _main(arguments: _Arguments) -> int:
     if arguments.verb == "show":
+        if arguments.snapshot:
+            record = snapshot()
+            print(json.dumps({"rows": [row.to_json() for row in record.rows],
+                              "pending_retire": list(record.pending_retire)}, sort_keys=True))
+            return 0
         rows = _all_rows()
         paths = _paths(rows)
         parent = None
@@ -692,9 +818,13 @@ def _main(arguments: _Arguments) -> int:
         return 0
     with operation() if _is_owner() else nullcontext():
         result = _mutate(arguments)
+    if isinstance(result, tuple):
+        print(json.dumps(result))
+        return 0
     if isinstance(result, StaffSnapshot):
         if arguments.json:
-            print(json.dumps([row.to_json() for row in result.rows], sort_keys=True))
+            print(json.dumps({"rows": [row.to_json() for row in result.rows],
+                              "pending_retire": list(result.pending_retire)}, sort_keys=True))
         else:
             paths = _paths(list(result.rows))
             for row in sorted(result.rows, key=lambda row: paths[row.id]):
