@@ -528,36 +528,20 @@ Unpriced (below every priced one):
 
 ### Phase 15 — The screenshot report's transcript tests pass in any temp folder · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** `scripts/shot_report/test_transcripts.py` passes with `TMPDIR` anywhere — a Claude scratchpad, `/tmp/claude/session/<id>`, or `/dev/shm` — so it can join the merge gate, and a scratchpad cwd never resolves through a second scratchpad decode.
-
-**Spec:**
-- Source: the showrunner, 2026-10-30, found by devtools: 8 tests in `test_transcripts.py` fail when `TMPDIR` is inside a Claude scratchpad path; under `/dev/shm` all 90 pass. Reproduced by the director with `TMPDIR` in this session's scratchpad: the same 8 fail, each with project `.claude` (the live `~/.claude` repository) in place of the fixture's project.
-- Cause 1 (production): `_scratchpad_project` (`transcripts.py:741`) matches any `claude-*` path segment that has `scratchpad` after it, anywhere in the cwd. A fixture path under a scratchpad `TMPDIR` holds such a segment, so a fixture cwd that is not a scratchpad gets decoded to the live repository.
-- Cause 2 (production): once `_scratchpad_project` decodes the cwd to a real folder, it calls `_project` on that folder (lines 751, 761, 773). When that folder is itself under a scratchpad, `_project` runs the scratchpad decoder again and returns the outer scratchpad's project.
-- Cause 3 (tests): `test_scratchpad_decodes_punctuation_and_missing_worktree` and `test_scratchpad_removed_worktree_matches_repository_outside_parent` encode the temp root by hand (`"-".join(parts).replace("_", "-")`), which is not Claude's rule (every non-alphanumeric character becomes `-`, `_claude_encoded`). A `TMPDIR` with `.` or another mark in it breaks them; seen with `TMPDIR=/dev/shm/shotrep.XXXX`.
-- Fix 1: the scan takes the folders that hold Claude's per-user temp roots as an explicit input, `scratchpad_roots: tuple[Path, ...]`, threaded from `scan_calls` (and the cached scan path) to `_project` and `_scratchpad_project`. A cwd is a scratchpad cwd only when it lies under one of those roots as `<root>/claude-<name>/<encoded project>/…/scratchpad…`. The default is Claude's real temp parents, `(Path("/tmp"), Path("/private/tmp"))`; `shot_report.py` keeps the default. One rule, no second "match anywhere" mode.
-- Fix 2: after a decode finds a real folder, its project comes from the git lookup alone (the repository step of `_project`), never from another scratchpad decode. Factor that step into one private helper that both paths call, so there is one git lookup, not two.
-- Fix 3: every test that builds an encoded project name uses `_claude_encoded` (or the same regex), and every scratchpad fixture lives under the test's own temp root and passes that root as `scratchpad_roots`. The test that uses a literal `/tmp/claude-1000/...` cwd moves under its temp root too.
-- New tests: (a) a fixture repository whose path lies under a scratchpad-shaped folder (`<root>/claude-9/-x-y/s/scratchpad/repo`), used as a plain cwd with `scratchpad_roots=(other_root,)`, resolves to `repo` with attribution `repository`; (b) a scratchpad cwd that decodes to a folder under another scratchpad-shaped folder resolves to that folder's own repository, not the outer one.
-- Real-path check: scan the live transcripts before and after the change with the roots `shot_report.py` uses — the local roots and the Mac mirror roots (Mac scratchpads may sit under another temp parent; if they do, add that parent to the default) — and compare `(project, project_attribution)` counts per source host. Any difference must be named in the summary with its cause; an unexplained shift fails the phase. Save no scan output beyond the count table.
-- No change to record fields, report text, the scan cache format, or `ProjectAttribution`'s members.
+- `scan_calls(..., scratchpad_roots: tuple[Path, ...] = DEFAULT_SCRATCHPAD_ROOTS)`, with `DEFAULT_SCRATCHPAD_ROOTS = (Path("/tmp"), Path("/private/tmp"))`, the parents of Claude's per-user temp folders. `shot_report.py` uses the default. Only `scan_calls` has a default: `_project`, `_claude_calls` and `_codex_calls` take `scratchpad_roots` as a required keyword-only argument, and the cached scan path passes it through.
+- `_scratchpad_project(cwd, known_cwds, scratchpad_roots)` decodes a cwd only when it is under a root as `<root>/claude-<name>/<encoded project>/…/scratchpad…`. Part 0 starts with `claude-` and has a name after it, part 1 starts with `-`, and `scratchpad` comes after part 1. A cwd outside every root goes to the git lookup.
+- `_repository_project(cwd) -> tuple[str, ProjectAttribution]` is the one git lookup (`repository` or `last_path`). `_project` calls it for a cwd that is not a scratchpad. A decoded scratchpad target also goes to it, so a target is never decoded a second time.
+- `CachedScanEvidence` has a `scratchpad_roots` field. `_load_cache` rebuilds the cache when the saved roots differ. A saved cache with no field counts as `DEFAULT_SCRATCHPAD_ROOTS` and is reused. `CACHE_FORMAT_VERSION` stays 7. Record fields, report text and `ProjectAttribution` members do not change.
 
 **Files:**
-- `scripts/shot_report/transcripts.py` — `scratchpad_roots` input; root-bound scratchpad match; one shared git lookup.
-- `scripts/shot_report/test_transcripts.py` — explicit roots, real encoding rule, the two new tests.
+- `scripts/shot_report/transcripts.py` — root-bound scratchpad decode, the shared git lookup, scratchpad roots in the cache identity.
+- `scripts/shot_report/test_transcripts.py` — scratchpad fixtures under each test's own temp root with explicit roots; `_claude_encoded` names; the `_project_cases` helper; tests for a repository under a scratchpad-shaped folder outside the roots, a nested scratchpad decode, a roots change on a warm cache and a saved cache without the field.
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `scripts/shot_report/transcripts.py` (and `scripts/shot_report/shot_report.py` only if a call site must change).
-- `test` — `scripts/shot_report/test_transcripts.py`: Fix 3 and new tests (a) and (b); runs the module under all three `TMPDIR` forms below.
+**Binds later work:** live attribution is the same before and after this change (28,112 calls), so it has no `changes.json` entry and no report measurement.
 
-**State:** none.
+**Gotchas:**
+- A test that builds a scratchpad cwd puts it under its own temp root and passes that root as `scratchpad_roots`. Never encode a Claude project path by hand: use `_claude_encoded` (every non-alphanumeric character becomes `-`).
 
-**Constraints from prior phases:** Phase 13's measurement change re-parses local transcripts once on the first scan after it landed; this phase changes attribution only for cwds that sit under a scratchpad-shaped folder outside the real temp parents, so it needs no `changes.json` entry unless the real-path check shows a shift, in which case report it to the director before any entry is added. The scan cache format is unchanged, so no re-parse is forced.
-
-**Acceptance gate:**
-- `python3 -m unittest discover -s scripts/shot_report -p 'test_*.py'` green three times, with `TMPDIR` set to (1) a folder inside a Claude scratchpad (`/tmp/claude-<uid>/<encoded>/<session>/scratchpad/x`), (2) `/tmp/claude/session/<id>/x`, (3) a `/dev/shm` folder whose name holds a `.`.
-- `basedpyright scripts/shot_report/transcripts.py scripts/shot_report/test_transcripts.py scripts/shot_report/shot_report.py` ends `0 errors, 0 warnings, 0 notes`.
-- The real-path count table shows no unexplained shift.
-- The checkpoint merge gate (`python3 ~/.claude/scripts/production/merge_gate.py --checkout <tree> --tests-only`) green.
+**Ruled out:** matching a `claude-*` segment anywhere in the cwd (a fixture under a scratchpad `TMPDIR` decoded to the live repository); a second scratchpad decode of a decoded target; forcing a re-parse of saved caches that lack the roots field.
