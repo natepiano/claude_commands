@@ -73,6 +73,75 @@ class SilenceTests(unittest.TestCase):
             self.assertEqual(silence.off(self.runner, lambda _push: 1), 1)
         self.assertIn("1 kept push delivered; 1 failed", output.getvalue())
 
+    def test_off_retries_failed_and_interrupted_posts_without_reposting_delivered_pushes(self) -> None:
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                _ = self.main("on")
+                second: silence.KeptPush = {**PUSH, "title": "Tests done"}
+                for push in (PUSH, second):
+                    _ = silence.keep(push, "Linux")
+                posted: list[str] = []
+
+                def fail_second(push: silence.KeptPush) -> int:
+                    if push == second:
+                        if interrupted:
+                            raise RuntimeError("stopped during release")
+                        return 1
+                    posted.append(push["title"])
+                    return 0
+
+                def deliver(push: silence.KeptPush) -> int:
+                    posted.append(push["title"])
+                    return 0
+
+                with redirect_stdout(io.StringIO()):
+                    if interrupted:
+                        with self.assertRaisesRegex(RuntimeError, "stopped during release"):
+                            _ = silence.off(self.runner, fail_second)
+                    else:
+                        self.assertEqual(silence.off(self.runner, fail_second), 1)
+                    self.assertEqual(silence.read_kept(), [second])
+                    self.assertEqual(silence.off(self.runner, deliver), 0)
+                    self.assertEqual(silence.off(self.runner, deliver), 0)
+                self.assertEqual(posted, [PUSH["title"], second["title"]])
+                self.assertEqual(silence.read_kept(), [])
+
+    def test_timer_off_retries_failed_and_interrupted_delivery_after_the_silence_record_is_gone(self) -> None:
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                _ = self.main("on", "--for", "45min")
+                record = silence.read_state()
+                assert record is not None and record["timer"] is not None
+                command = ["off", "--timer", record["timer"]]
+                _ = silence.keep(PUSH, "Linux")
+                posted: list[silence.KeptPush] = []
+
+                def fail_delivery(push: silence.KeptPush) -> int:
+                    self.assertEqual(push, PUSH)
+                    if interrupted:
+                        raise RuntimeError("stopped during timer release")
+                    return 1
+
+                def deliver(push: silence.KeptPush) -> int:
+                    posted.append(push)
+                    return 0
+
+                with mock.patch.object(silence, "post_kept", side_effect=fail_delivery):
+                    if interrupted:
+                        with self.assertRaisesRegex(RuntimeError, "stopped during timer release"):
+                            _ = self.main(*command)
+                    else:
+                        with redirect_stdout(io.StringIO()) as output:
+                            self.assertEqual(silence.main(command, self.runner, "Linux"), 1)
+                        self.assertIn("1 failed", output.getvalue())
+                self.assertIsNone(silence.read_state())
+                self.assertEqual(silence.read_kept(), [PUSH])
+                with mock.patch.object(silence, "post_kept", side_effect=deliver):
+                    self.assertIn("1 kept push delivered", self.main(*command))
+                    self.assertIn("0 kept pushes delivered", self.main(*command))
+                self.assertEqual(posted, [PUSH])
+                self.assertEqual(silence.read_kept(), [])
+
     def kept_titles(self) -> list[str]:
         return [push["title"] for push in silence.read_kept()]
 
@@ -124,8 +193,8 @@ class SilenceTests(unittest.TestCase):
         timer = self.commands[0]
         self.assertEqual(timer[:3], ["systemd-run", "--user", "--collect"])
         self.assertIn(f"--on-calendar={end.replace(tzinfo=user_zone()).astimezone(timezone.utc):%Y-%m-%d %H:%M:%S} UTC", timer)
-        self.assertEqual(timer[-2:], [str(silence.SILENCE), "off"])
         unit = timer[3].removeprefix("--unit=")
+        self.assertEqual(timer[-4:], [str(silence.SILENCE), "off", "--timer", unit])
         self.assertTrue(unit.startswith("silence-off-"))
         output = self.main("on", "--for", "1h30min")
         self.assertIn("until", output)
@@ -140,6 +209,60 @@ class SilenceTests(unittest.TestCase):
         unit = self.commands[0][3].removeprefix("--unit=")
         self.assertIn("0 kept pushes delivered", self.main("off"))
         self.assertEqual(self.commands[-1], ["systemctl", "--user", "stop", f"{unit}.timer"])
+
+    def test_extending_silence_retries_stopping_the_old_timer_before_replacing_its_record(self) -> None:
+        _ = self.main("on", "--for", "45min")
+        old = silence.read_state()
+        assert old is not None
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                with mock.patch.object(silence, "stop_timer", side_effect=(
+                        RuntimeError("stopped before timer stop") if interrupted else None),
+                        return_value=1), redirect_stderr(io.StringIO()) as errors:
+                    if interrupted:
+                        with self.assertRaisesRegex(RuntimeError, "stopped before timer stop"):
+                            _ = self.main("on", "--for", "90min")
+                    else:
+                        self.assertEqual(silence.main(["on", "--for", "90min"], self.runner, "Linux"), 1)
+                        self.assertIn("old end timer could not be stopped", errors.getvalue())
+                self.assertEqual(silence.read_state(), old)
+        _ = self.main("on", "--for", "90min")
+        self.assertEqual(self.commands[-1], ["systemctl", "--user", "stop", f"{old['timer']}.timer"])
+        newer = silence.read_state()
+        assert newer is not None
+        self.assertNotEqual(newer["timer"], old["timer"])
+
+    def test_an_interrupted_extension_leaves_a_timer_that_cannot_end_the_replacement_silence(self) -> None:
+        _ = self.main("on", "--for", "45min")
+        old = silence.read_state()
+        _ = silence.keep(PUSH, "Linux")
+        with mock.patch.object(silence, "stop_timer", side_effect=RuntimeError("stopped at old timer stop")):
+            with self.assertRaisesRegex(RuntimeError, "stopped at old timer stop"):
+                _ = self.main("on", "--for", "90min")
+        self.assertEqual(silence.read_state(), old)
+        stray = self.commands[-1]
+        _ = self.main("on", "--for", "90min")
+        current = silence.read_state()
+        assert current is not None
+        timer = next(command for command in reversed(self.commands) if command[0] == "systemd-run")
+        self.assertNotEqual(stray, timer)
+        posted: list[silence.KeptPush] = []
+
+        def deliver(push: silence.KeptPush) -> int:
+            posted.append(push)
+            return 0
+
+        with mock.patch.object(silence, "post_kept", side_effect=deliver):
+            commands_before = len(self.commands)
+            self.assertEqual(self.main(*stray[stray.index(str(silence.SILENCE)) + 1:]), "")
+            self.assertEqual(len(self.commands), commands_before)
+            self.assertEqual(silence.read_state(), current)
+            self.assertEqual(silence.read_kept(), [PUSH])
+            self.assertEqual(posted, [])
+            self.assertIn("1 kept push delivered", self.main(*timer[timer.index(str(silence.SILENCE)) + 1:]))
+        self.assertIsNone(silence.read_state())
+        self.assertEqual(silence.read_kept(), [])
+        self.assertEqual(posted, [PUSH])
 
     def test_a_past_end_or_a_bad_span_is_refused(self) -> None:
         for argv in (["on", "--until", "2020-01-01 07:00"], ["on", "--for", "soon"], ["on", "--for", "1x"]):
