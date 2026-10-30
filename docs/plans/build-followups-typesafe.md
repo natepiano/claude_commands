@@ -333,56 +333,65 @@ The governing rule, from the skill: **Jev makes the judgments, and code makes th
 - An area definition edit changes every content hash; `apply_labels` then refuses until a rescore.
 - In the area table, a row whose column count differs from its header ends the table.
 
-### Phase 6b — area threshold from the user's answer; run the reassess  · status: todo
+### Phase 6b — area threshold from the user's answer  · status: done
 
 **Depends on:** Phase 6
 
 #### Work Order
 
-**Goal:** the code matches the user's area answer (`THRESHOLDS["area"]` and `JEV_FIELDS`); then every open issue has a Jev proposal for each field in `JEV_FIELDS`, and the user reviews current values against Jev's and decides which to write. Split from Phase 6 on 2026-10-29 so Phase 6's answer-independent work runs first (showrunner agreed).
+**Goal:** the code matches the user's area answer (`THRESHOLDS["area"]` and `JEV_FIELDS`). Split from Phase 6 on 2026-10-29 so Phase 6's answer-independent work runs first (showrunner agreed). The live reassess, the user review and the writes moved to Phase 6c on 2026-10-30, so this code can merge while the user review runs.
 
-**Pending decision: Jev proposes area at 0.95, or the agent keeps proposing it**
-
-Actual problem:
-After the user's area merge (116 -> 62 areas), the code's `THRESHOLDS["area"] = Supported(0.90)` in `scripts/issue_score/questions.py` no longer meets the routing rule on held-out (error .103). 0.95 meets it on both splits, at the limit on held-out. Which branch this phase builds decides `THRESHOLDS["area"]`, `JEV_FIELDS` and the reassess's taken group. Asked through the showrunner about 12:00 EDT, 2026-10-29.
-
-What exists now:
-- 62-area run `20261029T155801.891126Z-3015dbcf`: area accuracy .67 tune, .66 held-out. At 0.95: tune error .083, 30% taken; held-out error .100 (3 of 30 wrong), 27% taken. At 0.90: held-out error .103.
-- `JEV_FIELDS` = goal, impact, alignment. Category stays agent-proposed.
-
-What should change:
-- Yes: `THRESHOLDS["area"] = Supported(0.95)`; `area` joins `JEV_FIELDS`; the `JEV_FIELDS` pin in `test_questions.py` gains `area`; `fixtures/proposal_expected.txt` loses `(agent proposes)` on its two area entries.
-- No: `THRESHOLDS["area"] = Unsupported("the user kept area agent-proposed after the 62-area rerun")`, so the code matches the measurement; `JEV_FIELDS` is unchanged.
-- Both: Phase 6 already made the version bump, the `commands/issue.md` Area bullet and the `lessons.md` entries. This phase appends the user's answer to the 62-area `lessons.md` entry.
-
-Recommendation:
-Yes. Area passes the user's rule (at most 10% wrong on tune; held-out checked once) at 0.95 on both splits. About 70% of area answers still go to the user.
+**Decision (2026-10-30, replaces 0.95): Jev proposes area when its top area beats the second by a gap of 0.3 or more.**
+The user, via natedev: "yes jev should score clear winners" (their example: 0.50 against 0.10 must pass). The showrunner set the value: 0.3 is the measured gap nearest the user's load goal. Stored 62-area run `20261029T155801.891126Z-3015dbcf`, plain gap rule on the averaged area probabilities: tune 21% to the user, 24.6% of taken answers differ from the vault; held-out 19%, 25.3%. The vault's area is in Jev's top 2 for 80% of issues. The user still confirms every value, so nothing is written unchecked. Below the gap, the user picks from Jev's top 2 areas.
 
 **Spec:**
-- `THRESHOLDS["area"]` and `JEV_FIELDS` per the answer. The code comment above the area threshold states the 62-area measurement and run id.
+- A new `ThresholdOutcome` variant in `questions.py` holds a minimum gap between the top and second averaged probabilities: `THRESHOLDS["area"]` uses it at 0.3, the one place the value lives. `is_sure()` in `decide.py` applies it; the existing guards (split, disagreeing orders) stay. The area fallback (`area_fits` below `EVIDENCE_ABSENT`) takes the gap between `unfiled` (1 - fits) and filed (fits). `area` joins `JEV_FIELDS`. The comment above the area threshold states the measurement and run id.
+- `propose` shows Jev's top 2 areas as the alternatives when area is unsure. `evaluate.py` sweeps and reports the gap rule for a gap-policy field (shares to the user and taken-wrong), and does not crash on the new variant. `docs/typesafe.md` names the new variant where it lists the outcome kinds (no copied values).
+
+**Files:**
+- `scripts/issue_score/questions.py` — the gap variant, `THRESHOLDS["area"]`, `JEV_FIELDS`
+- `scripts/issue_score/decide.py`, `scripts/issue_score/evaluate.py`, `scripts/issue_score/score_issues.py`, `docs/typesafe.md` — apply, report and document the gap rule
+- `scripts/issue_score/test_apply_labels.py` — guide walkthrough under Jev-proposed area
+- `scripts/issue_score/test_questions.py`, `scripts/issue_score/test_decide.py`, `scripts/issue_score/fixtures/proposal_expected.txt` — the threshold and `JEV_FIELDS` pins
+- `scripts/issue_score/test_reassess.py`, `scripts/issue_score/test_score_issues.py` — area-agent expectations
+- `scripts/issue_score/test_evaluate.py` — the configured-threshold pin
+- `~/.local/state/issue-score/lessons.md` — the user's answer (outside the repository)
+
+**Constraints from prior phases:**
+- These pins change by plan, and changing them is not weakening a test: `test_decide.py`'s expected area policy becomes the gap rule at 0.3; the comment above it (`test_decide.py:32`, "Phase 4 adds …") is rewritten to say what the policy is, with no phase history. The `test_questions.py` `JEV_FIELDS` set gains `area`.
+- `test_decide.py:280` changes with the new rule. The `test_questions.py` pin that every Jev field has a `Supported` policy accepts the gap variant. The hardcoded area-agent expectations in `test_reassess.py` and `test_score_issues.py` change too. `test_evaluate.py:362` pins the old configured threshold: keep a case for the historical policy (a run recorded at 0.90 stays readable) and add a case for current-policy routing.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `questions.py`, `lessons.md`
+- `test` — the test files and the fixture above
+
+**Acceptance gate:** `THRESHOLDS["area"]` is the gap rule at 0.3, `JEV_FIELDS` holds `area`, and unsure area shows the top 2 (pinned); the merge gate is green; basedpyright clean on `scripts/issue_score`.
+
+
+### Phase 6c — run the reassess; the user review and writes  · status: todo
+
+**Depends on:** Phase 6b
+
+#### Work Order
+
+**Goal:** every open issue has a Jev proposal for each field in `JEV_FIELDS`, and the user reviews current values against Jev's and decides which to write. Split from Phase 6b on 2026-10-30.
+
+**Spec:**
 - Run the full reassess: a fresh version-5 `score --fresh` run over every open issue, then `score_issues.py reassess <run-id>`.
 - Readiness gate: `complete=True` proves only scoring coverage. Fill `<run>-agent-proposals.json` for every row that waits on agent values, and run `reassess` again until every row reaches band routing (`test_unrated_and_default_issues_require_agent_values_before_provisional_score_and_band` shows this step). Only then give the user the review file.
 - Record the user's approvals in an approvals file against that review's JSON snapshot, run `apply_labels.py`, then read back each written issue and check that its frontmatter holds the approved values.
 
 **Files:**
-- `scripts/issue_score/questions.py` — `THRESHOLDS["area"]`, `JEV_FIELDS`
-- `scripts/issue_score/test_questions.py`, `scripts/issue_score/test_decide.py`, `scripts/issue_score/fixtures/proposal_expected.txt` — the threshold and `JEV_FIELDS` pins
-- `scripts/issue_score/test_reassess.py`, `scripts/issue_score/test_score_issues.py` — area-agent expectations (yes only)
-- `scripts/issue_score/test_evaluate.py` — the configured-threshold pin
-- `~/.local/state/issue-score/lessons.md` — the user's answer (outside the repository)
+- `~/.local/state/issue-score/` — the run, the review file and the approvals file (outside the repository)
+- `~/rust/hanadocs/` — the approved frontmatter edits (outside the repository; absolute paths or `git -C`, never `cd`)
 
 **Constraints from prior phases:**
-- These pins change by plan, and changing them is not weakening a test: `test_decide.py`'s expected area threshold .9 -> .95 (yes), or area leaves the `Supported` map and is asserted `Unsupported` (no); the comment above it (`test_decide.py:32`, "Phase 4 adds …") is rewritten to say what the policy is, with no phase history. The `test_questions.py` `JEV_FIELDS` set gains `area` (yes only).
 - Phase 6 made the version-5 bump, so version-5 cache entries can exist now. The full reassess run uses `score --fresh` with no further bump (about $0.20 for the vault; spend so far $1.48 of $20). Version-4 runs, `3015dbcf` included, are not reassess input.
-- `test_decide.py:280` fails under either answer and changes with it. With yes, the hardcoded area-agent expectations in `test_reassess.py` and `test_score_issues.py` change too. `test_evaluate.py:362` pins the old configured threshold: keep a case for the historical policy (a run recorded at 0.90 stays readable) and add a case for current-policy routing.
+- Live calls run as `with-typesafe <cmd>`; the key is never read, printed or logged.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `questions.py`, `lessons.md`
-- `test` — the test files and the fixture above
-- the unit director runs the live score, the reassess, the user review and `apply_labels.py`
+**Workers:** none — the unit director runs the live score, the reassess, the user review and `apply_labels.py`.
 
-**Acceptance gate:** `THRESHOLDS["area"]` and `JEV_FIELDS` match the user's answer (pinned); the merge gate is green; basedpyright clean on `scripts/issue_score`. A full reassess run on version 5 is within budget. The user has the review file, and the values the user approved are written.
-
+**Acceptance gate:** a full reassess run on version 5 is within budget; every row reaches band routing; the user has the review file; the values the user approved are written and read back.
 
 ### Phase 7 — the TypeSafe guide for other sessions  · status: done
 
