@@ -504,7 +504,7 @@ Unpriced (below every priced one):
 - `--settle` takes integer extra frames, not seconds.
 - Tests never start Hana: the natedev Hana ban holds, so the texts are proven against the fake BRP server only.
 
-### Phase 14 — A stopped `/hana_shot launch` never blocks the next launch or `shutdown` · status: todo
+### Phase 14 — A stopped `/hana_shot launch` never blocks the next launch or `shutdown` · status: done
 
 #### Work Order
 
