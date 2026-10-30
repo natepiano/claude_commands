@@ -37,14 +37,13 @@ CURRENT_READING_AGE = timedelta()
 
 
 def registry_view() -> str:
-    """The registry as the alert reads it: the defaults with the overlay its edits write."""
+    """Read the shared registry containing the alert's edits."""
     return agents_registry.registry_text(quota_alert.REGISTRY)
 
 
 def reset_registry(text: str) -> None:
-    """Make `text` the whole registry: the defaults, and no overlay over them."""
+    """Replace the shared test registry with `text` through the fixture writer."""
     _ = write_registry(quota_alert.REGISTRY, base_text=text)
-    agents_registry.overlay_path(quota_alert.REGISTRY).unlink(missing_ok=True)
 
 
 class CodexAccountAlertTests(unittest.TestCase):
