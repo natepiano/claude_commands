@@ -19,7 +19,7 @@ The build log records how long each build step waited on memory. A machine-wide 
 | `scripts/buildlog/report.py` | `memory_pressure_section()`, `cpu_disk_pressure_section()`, the pairing helper `sample_counter_deltas()` with `SampleCounterInterval` and `CounterNotRecorded`, and `MAX_SAMPLE_GAP_S`. It reuses `SCRATCH` and `SCRATCH_LABEL`. The samples' power profile feeds `power_profile_section()` (`docs/as-built/build-targets.md`, "What the reports read"). |
 | `scripts/buildlog/test_{record,index,store,sample,report,memory_records}.py` | Fixture tests; see Tests below. |
 
-The index reads old step/call fields `seat` and `delegate_session` as `worker` and `unit_session`, keeping a present new field's value and leaving source JSONL bytes unchanged.
+The index reads the former step/call field names in `index.FORMER_FIELDS` as `worker` and `unit_session`, keeping a present new field's value and leaving source JSONL bytes unchanged.
 
 ### Per-step stall: scope file → step record → `steps`
 
