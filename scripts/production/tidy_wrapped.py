@@ -28,11 +28,17 @@ class TidyRefused(Exception):
     pass
 
 
-def owned_paths(slug: str) -> tuple[Path, ...]:
+def outstanding_path(slug: str) -> Path:
     if not SLUG.fullmatch(slug) or slug in SHARED:
         raise TidyRefused(f"{slug!r} is not a production slug")
+    return STATE_DIR / "outstanding" / f"{slug}.json"
+
+
+def owned_paths(slug: str) -> tuple[Path, ...]:
+    outstanding = outstanding_path(slug)
     return (STATE_DIR / "footers-off" / slug, STATE_DIR / "review-paused" / f"{slug}.json",
-            STATE_DIR / "outstanding" / f"{slug}.json", STATE_DIR / "counts" / slug,
+            STATE_DIR / "outstanding" / f"{slug}.answered.jsonl",
+            outstanding, STATE_DIR / "counts" / slug,
             STATE_DIR / "reports" / f"{slug}.json", STATE_DIR / slug)
 
 

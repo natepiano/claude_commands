@@ -1,6 +1,8 @@
 """Approved-field edits use a real temporary review and never the user's vault."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ from typing import cast
 from unittest import mock
 
 from scripts.issue_score import apply_labels, records, score_issues, vault
+from scripts.issue_score.apply_labels import apply_labels as apply_approved_labels
 from scripts.issue_score.test_reassess import ReassessmentFixture
 
 
@@ -22,8 +25,126 @@ class ApplyLabelsTests(ReassessmentFixture):
         return path
 
     def apply(self, approvals: Path) -> list[Path]:
-        return apply_labels.apply_labels(approvals, issues_dir=self.issues,
-                                          area_definitions_path=self.definitions_path, rules_dirs=(self.root / "rules",))
+        return apply_approved_labels(approvals, issues_dir=self.issues,
+                                     area_definitions_path=self.definitions_path, rules_dirs=(self.root / "rules",))
+
+    def apply_cli(self, approvals: Path) -> tuple[int, str, str]:
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(apply_labels, "apply_labels", side_effect=self.apply), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = apply_labels.main([str(approvals)])
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_duplicate_issue_approval_refuses_before_writing_and_combining_fields_allows_retry(self) -> None:
+        target = self.issue("Duplicate approval")
+        before = target.read_text()
+        fields = {"backlog_impact": "⭐⭐⭐", "backlog_effort": "⭐⭐"}
+        path = self.approvals([self.judgment(target)], [
+            {"issue_path": str(target), "fields": {field: value}} for field, value in fields.items()])
+        approval = cast(dict[str, object], json.loads(path.read_text()))
+        review_path = Path(cast(str, approval["review_path"]))
+        review_bytes = review_path.read_bytes()
+        with mock.patch.object(os, "replace", wraps=os.replace) as replaced:
+            code, stdout, stderr = self.apply_cli(path)
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout, "")
+        self.assertEqual(stderr, f"issue-score: {target}: duplicate issue approval\n")
+        replaced.assert_not_called()
+        self.assertEqual(target.read_text(), before)
+        approval["approvals"] = [{"issue_path": str(target), "fields": fields}]
+        _ = path.write_text(json.dumps(approval, ensure_ascii=False))
+        self.assertEqual(self.apply_cli(path), (0, str(target) + "\n", ""))
+        expected = before.replace('backlog_impact: "⭐"', 'backlog_impact: "⭐⭐⭐"')
+        expected = expected.replace('backlog_effort: "⭐"', 'backlog_effort: "⭐⭐"')
+        self.assertEqual(target.read_text(), expected)
+        self.assertEqual(review_path.read_bytes(), review_bytes)
+
+    def test_guide_reassess_artifacts_preserve_agent_choices_and_apply_only_confirmed_values(self) -> None:
+        target, untouched = self.issue("Guide unrated issue"), self.issue("Guide unchanged issue")
+        _ = target.write_text(target.read_text().replace('backlog_impact: "⭐"', 'backlog_impact:')
+                              .replace("backlog_score: 5", "backlog_score:"))
+        before = {path: path.read_bytes() for path in (target, untouched)}
+        current_labels = self.loaded(target).labels
+        run_id = self.run_file("guide-walkthrough", [self.judgment(path) for path in before])
+        markdown, pending = self.reassess(run_id)
+        self.assertTrue(pending["complete"])
+        self.assertIn("## Awaiting agent proposals", markdown)
+        target_row = next(row for row in pending["rows"] if row["issue_path"] == str(target))
+        self.assertEqual(target_row["routing"]["status"], "awaiting-agent-proposals")
+        reports = self.state / "reports"
+        agent_path = reports / f"{run_id}-agent-proposals.json"
+        review_path = reports / f"{run_id}-reassess.json"
+        form = cast(records.AgentProposals, json.loads(agent_path.read_text()))
+        choices = {"category": "research", "area": "tooling", "backlog_urgency": "⭐⭐", "backlog_effort": "⭐⭐⭐"}
+        self.assertEqual(len(form["issues"]), 1)
+        self.assertEqual(form["issues"][0]["issue_path"], str(target))
+        self.assertEqual(form["issues"][0]["fields"], dict.fromkeys(choices, ""))
+        form["issues"][0]["fields"].update(choices)
+        _ = agent_path.write_text(json.dumps(form, ensure_ascii=False))
+        markdown, ready = self.reassess(run_id)
+        self.assertTrue(ready["complete"])
+        self.assertIn("## Routed to user by band", markdown)
+        target_row = next(row for row in ready["rows"] if row["issue_path"] == str(target))
+        self.assertEqual(target_row["routing"]["status"], "ready")
+        self.assertEqual(target_row["agent_proposed"], choices)
+        self.assertEqual(json.loads(agent_path.read_text()), form)
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        review_bytes, agent_bytes = review_path.read_bytes(), agent_path.read_bytes()
+        confirmed = {**{field: target_row["proposed"][field] for field in target_row["taken"]}, **choices}
+        approvals = self.root / "guide-approvals.json"
+        _ = approvals.write_text(json.dumps({"review_path": str(review_path), "approvals": [
+            {"issue_path": str(target), "fields": confirmed}]}, ensure_ascii=False))
+        self.assertEqual(self.apply_cli(approvals), (0, str(target) + "\n", ""))
+        self.assertEqual(self.loaded(target).labels, {**current_labels, **confirmed})
+        self.assertEqual(untouched.read_bytes(), before[untouched])
+        self.assertEqual(review_path.read_bytes(), review_bytes)
+        self.assertEqual(agent_path.read_bytes(), agent_bytes)
+        with mock.patch.object(os, "replace", wraps=os.replace) as replaced:
+            self.assertEqual(self.apply_cli(approvals), (0, "", ""))
+        replaced.assert_not_called()
+
+    def test_guide_stale_approval_recoveries_rescore_content_and_reconfirm_changed_fields(self) -> None:
+        for change in ("content", "definitions", "reviewed field"):
+            with self.subTest(change=change):
+                target = self.issue("Guide refusal " + change)
+                judgment = self.judgment(target)
+                approval: list[dict[str, object]] = [
+                    {"issue_path": str(target), "fields": {"backlog_impact": "⭐⭐⭐"}}]
+                path = self.approvals([judgment], approval)
+                review_path = self.state / "reports" / "approved-reassess.json"
+                review_bytes = review_path.read_bytes()
+                if change == "content":
+                    _ = target.write_text(target.read_text() + "A new requirement.\n")
+                elif change == "definitions":
+                    old = self.definitions["rendering"]
+                    self.definitions["rendering"] = "Drawing and presenting scenes."
+                    _ = self.definitions_path.write_text(self.definitions_path.read_text().replace(
+                        old, self.definitions["rendering"]))
+                else:
+                    _ = target.write_text(target.read_text().replace('backlog_impact: "⭐"', 'backlog_impact: "⭐⭐"'))
+                before = target.read_bytes()
+                code, stdout, stderr = self.apply_cli(path)
+                self.assertEqual(code, 2)
+                self.assertEqual(stdout, "")
+                self.assertIn(str(target), stderr)
+                if change == "reviewed field":
+                    self.assertIn("approved field backlog_impact changed since review", stderr)
+                else:
+                    self.assertIn("hash changed", stderr)
+                    self.assertIn("rescore needed", stderr)
+                    if change == "definitions":
+                        self.assertIn("area definitions changed at " + str(self.definitions_path), stderr)
+                    judgment = self.judgment(target)
+                self.assertEqual(target.read_bytes(), before)
+                self.assertEqual(review_path.read_bytes(), review_bytes)
+                # A new review and explicit confirmation replace the stale approval.
+                path = self.approvals([judgment], [
+                    {"issue_path": str(target), "fields": {"backlog_impact": "⭐⭐⭐⭐"}}])
+                self.assertNotEqual(review_path.read_bytes(), review_bytes)
+                self.assertEqual(self.apply_cli(path), (0, str(target) + "\n", ""))
+                expected = before.decode("utf-8")
+                old = next(line for line in expected.splitlines() if line.startswith("backlog_impact:"))
+                self.assertEqual(target.read_text(), expected.replace(old, 'backlog_impact: "⭐⭐⭐⭐"'))
 
     def test_only_explicitly_approved_frontmatter_fields_change_in_template_format(self) -> None:
         target = self.issue("Approved", extra='rank: 17\ntags:\n  - keep-me\n# Keep this comment.\n',
@@ -121,6 +242,9 @@ class ApplyLabelsTests(ReassessmentFixture):
         before = {issue: issue.read_text() for issue in (first, second)}
         path = self.approvals([self.judgment(issue) for issue in before], [
             {"issue_path": str(issue), "fields": {"backlog_impact": "⭐⭐⭐"}} for issue in before])
+        approval_bytes = path.read_bytes()
+        review_path = self.state / "reports" / "approved-reassess.json"
+        review_bytes = review_path.read_bytes()
         replace = os.replace
 
         def stop_on_second(source: Path, destination: Path) -> None:
@@ -134,6 +258,11 @@ class ApplyLabelsTests(ReassessmentFixture):
         expected_first = before[first].replace('backlog_impact: "⭐"', 'backlog_impact: "⭐⭐⭐"')
         self.assertEqual(first.read_text(), expected_first)
         self.assertEqual(second.read_text(), before[second])
+        with mock.patch.object(os, "replace", side_effect=stop_on_second):
+            self.assertEqual(self.apply_cli(path),
+                             (2, "", "issue-score: fixture stops the second issue replacement\n"))
+        self.assertEqual(first.read_text(), expected_first)
+        self.assertEqual(second.read_text(), before[second])
         first_modified = first.stat().st_mtime_ns
         with mock.patch.object(os, "replace", wraps=replace) as replaced:
             self.assertEqual(self.apply(path), [second])
@@ -144,6 +273,8 @@ class ApplyLabelsTests(ReassessmentFixture):
         with mock.patch.object(os, "replace", wraps=replace) as replaced:
             self.assertEqual(self.apply(path), [])
         replaced.assert_not_called()
+        self.assertEqual(path.read_bytes(), approval_bytes)
+        self.assertEqual(review_path.read_bytes(), review_bytes)
 
     def test_area_approval_rerun_uses_the_scored_vocabulary_after_a_partial_batch(self) -> None:
         area = "documentation"

@@ -791,7 +791,8 @@ def begin(
     store.register_account_hold_request(store.AccountHold(
         login=login, label=report["label"], machine=report["machine"], requested_at=at,
         request_id=request_id, requested_by=origin, then=then,
-    ), account_wide=not ids)
+    ), account_wide=not ids, expires_at=(datetime.fromisoformat(stop_deadline) + timedelta(
+        seconds=stop_work.TERM_GRACE_SECONDS + 1)).isoformat() if stop_deadline else "")
     added: list[SessionShutdown] = []
     for session in report["sessions"]:
         if session["kind"] == "worker":
@@ -811,6 +812,9 @@ def begin(
             settle_message={"kind": "not sent"}, where={"kind": "not said"},
             progress=progress, trail=[], stop_issues=[],
         )
+        scopes = stop_work.owner_pane_scopes(session, saved["workers"])
+        if scopes:
+            saved["owner_pane_scopes"] = scopes
         if stop_deadline:
             saved["stop_deadline"] = stop_deadline
         if move_id:
@@ -868,35 +872,43 @@ def _revoke_launches(login: str, only: tuple[str, ...] = ()) -> None:
 
 
 def down_all() -> int:
-    with launch_permission.block_launches_during_shutdown():
-        return _down_all()
+    started = time.monotonic()
+    deadline = store.RecordDeadline(started + stop_work.SHUTDOWN_GRACE_SECONDS + stop_work.TERM_GRACE_SECONDS + 1,
+                                    lambda: time.monotonic(), lambda seconds: time.sleep(seconds))
+    try:
+        with store.record_deadline(deadline), launch_permission.block_launches_during_shutdown():
+            return _down_all(started)
+    except store.RecordDeadlineExpired as error:
+        print(f"shutdown: {error}", file=sys.stderr, flush=True)
+        return 1
 
 
-def _down_all() -> int:
+def _down_all(started: float) -> int:
     """Request every local account together, then enforce their one shared deadline."""
     from inventory import all_live_accounts
 
-    started = time.monotonic()
     deadline = (now_utc() + timedelta(seconds=stop_work.SHUTDOWN_GRACE_SECONDS)).isoformat()
     request_id = str(uuid4())
     reports = all_live_accounts()
     with launch_permission.launch_barrier():
         pending = launch_permission.pending_launches()
     known = {report["login"] for report in reports}
-    for login in sorted({claim.login for claim in pending} - known):
+    saved_logins = {saved["login"] for saved in store.all_session_records()
+                    if not store.finished_stop_request(saved) or store.stop_incomplete(saved)}
+    for login in sorted(({claim.login for claim in pending} | saved_logins) - known):
         reports.append(run_inventory(login))
     # Admit the account holds before revocation, so no later launch can slip past.
     for report in reports:
         empty = report.copy()
         empty["sessions"] = []
-        _ = begin(report["login"], request_id=request_id, alerts="none", report=empty)
+        _ = begin(report["login"], request_id=request_id, alerts="none", report=empty, stop_deadline=deadline)
         _revoke_launches(report["login"])
     final = {report["login"]: report for report in all_live_accounts()}
     for login in final.keys() - {report["login"] for report in reports}:
         report = final[login]
         empty = report.copy()
         empty["sessions"] = []
-        _ = begin(login, request_id=request_id, alerts="none", report=empty)
+        _ = begin(login, request_id=request_id, alerts="none", report=empty, stop_deadline=deadline)
         _revoke_launches(login)
         reports.append(report)
     selected: list[SessionShutdown] = []
@@ -934,9 +946,10 @@ def _down_all() -> int:
         live = {session["session_id"]: session for session in report["sessions"] if session["kind"] != "worker"}
         for saved in store.session_records(report["login"]):
             session_id = saved["session"]["session_id"]
-            if session_id not in live:
+            if session_id not in live and (session_id in kept_ids
+                    or store.finished_stop_request(saved) and not store.stop_incomplete(saved)):
                 continue
-            if not store.request_matches_process(saved, live[session_id]):
+            if session_id in live and not store.request_matches_process(saved, live[session_id]):
                 refused = True
                 continue
             def bound(current: SessionShutdown) -> None:
@@ -948,7 +961,10 @@ def _down_all() -> int:
 
     def tell(saved: SessionShutdown) -> None:
         try:
-            _send_settle_message(saved)
+            with store.record_deadline(store.RecordDeadline(
+                    started + stop_work.SHUTDOWN_GRACE_SECONDS + stop_work.TERM_GRACE_SECONDS + 1,
+                    lambda: time.monotonic(), lambda seconds: time.sleep(seconds))):
+                _send_settle_message(saved)
         except (OSError, RuntimeError, subprocess.SubprocessError) as error:
             print(f"shutdown: {saved['session']['name']}: pause delivery: {error}", file=sys.stderr, flush=True)
 
@@ -1078,12 +1094,16 @@ def move_overdue(saved: SessionShutdown, now: datetime) -> bool:
 def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
               others: list[SessionShutdown], now: datetime) -> Step:
     """Choose only this owner's next action from a single machine observation."""
+    if reason := stop_work.stop_admission(owner):
+        return Hold(reason)
     progress = saved["progress"]["kind"]
     if "stop_deadline" in saved:
         if store.bounded_attempt_finished(saved):
             return Finished()
         if progress in {"stopped", "already gone", "process identity lost"} and saved["then"] == "restart":
             return RelaunchSession()
+        if now >= datetime.fromisoformat(saved["stop_deadline"]) + timedelta(seconds=stop_work.TERM_GRACE_SECONDS + 1):
+            return StopSession()
         return Hold("bounded shutdown owns this stop")
     if progress == "restarted":
         return Finished()
@@ -1109,7 +1129,7 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
     if owner["kind"] == "session account unreadable" and progress in {"waiting", "ready", "held by usage limit"}:
         return Hold("account unreadable")
     if progress in {"waiting", "ready", "held by usage limit"}:
-        if owner["kind"] in {"session absent", "session identity lost"}:
+        if owner["kind"] == "session absent":
             return StopSession()
         if owner["kind"] == "matching session":
             if saved["force"] == "now":
@@ -1280,8 +1300,11 @@ def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> in
         retained = True
     withdrawn_requests: list[str] = []
     def still_live(current: SessionShutdown) -> bool:
+        # Inventory proves registry session id and live process identity. A
+        # resumed process withdraws the old request without inheriting its work.
         report = inventory(account.login, frozenset({current["session"]["session_id"]}))
-        return stop_work.fresh_session(current["session"], report)["kind"] == "matching session"
+        return any(owner["kind"] != "worker" and owner["session_id"] == current["session"]["session_id"]
+                   for owner in report["sessions"])
     for saved in records:
         if ids and saved["session"]["session_id"] not in ids:
             continue
@@ -1304,8 +1327,10 @@ def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> in
             retained = True
             name = outcome.record["session"]["name"]
             detail = _progress_text(outcome.record)
-            action = shutdown_command("restart", account.login, "--here", "--only", outcome.record["session"]["session_id"])
-            print(f"{name} was not cancelled: {detail}; in a terminal on {outcome.record['machine']}: {action} brings it back")
+            failed_stop = outcome.record["progress"]["kind"] == "stop failed"
+            action = shutdown_command("now" if failed_stop else "restart", account.login, "--here", "--only", outcome.record["session"]["session_id"])
+            effect = "finishes the stop" if failed_stop else "brings it back"
+            print(f"{name} was not cancelled: {detail}; in a terminal on {outcome.record['machine']}: {action} {effect}")
         else:
             withdrawn_requests.append(outcome.record["request_id"])
             session = outcome.record["session"]
@@ -1340,6 +1365,18 @@ def cancel(account: Account, here: bool = False, only: Iterable[str] = ()) -> in
 
 
 def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
+    started = time.monotonic()
+    deadline = store.RecordDeadline(started + stop_work.TERM_GRACE_SECONDS + 1,
+                                    lambda: time.monotonic(), lambda seconds: time.sleep(seconds))
+    try:
+        with store.record_deadline(deadline):
+            return _now(account, here, only, started=started)
+    except store.RecordDeadlineExpired as error:
+        print(f"shutdown: {error}", file=sys.stderr, flush=True)
+        return 1
+
+
+def _now(account: Account, here: bool, only: Iterable[str], *, started: float) -> int:
     """Force waiting or reaping owners and retry owners whose stop failed."""
     for line in store.migrate(account.login):
         print(line)
@@ -1376,7 +1413,6 @@ def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
                and store.stop_incomplete(saved)]
     bounded_ids.update(saved["session"]["session_id"] for saved in retries)
     if live_owners or retries:
-        started = time.monotonic()
         selected_report = live.copy()
         selected_report["sessions"] = [owner for owner in live["sessions"]
             if owner["session_id"] in bounded_ids or (owner["kind"] == "worker"
@@ -1997,6 +2033,10 @@ def _tell_holdout_requesters(held: list[tuple[SessionShutdown, str]], summary: s
 
 
 def _stop_after_telling(saved: SessionShutdown, step: StopSession) -> SessionShutdown:
+    if "stop_deadline" in saved:
+        # The abandoned attempt must finish the bounded ownership proof, never
+        # the legacy completion shortcut, with a fresh retry budget.
+        return stop_work.bounded_stop([saved], started=time.monotonic(), grace_seconds=0)[0]
     try:
         tell_showrunner_stopping(saved)
     except Exception as error:
