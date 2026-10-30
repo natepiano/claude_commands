@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PY="$SCRIPT_DIR/../lib/py"
 SOURCE_DIR="$HOME/.claude/commands"
 LOG_DIR="/tmp/claude-to-codex-sync"
-LOCK_DIR="$LOG_DIR/lock"
+LOCK_FILE="$LOG_DIR/runner.lock"
 PENDING_FILE="$LOG_DIR/pending"
 EVENT_LOG="$LOG_DIR/events.log"
 LAST_STATUS_FILE="$LOG_DIR/last-status"
@@ -40,17 +40,16 @@ if [[ ! -f "$SYNC_SCRIPT" ]]; then
     exit 1
 fi
 
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-    touch "$PENDING_FILE"
-    log "sync already running; marked pending"
-    exit 0
+if [[ "${1:-}" != --locked ]]; then
+    status=0
+    "$PY" "$SCRIPT_DIR/../prioritize/runner_lock.py" run "$LOCK_FILE" bash "$0" --locked || status=$?
+    if (( status == 75 )); then
+        touch "$PENDING_FILE"
+        log "sync already running; marked pending"
+        exit 0
+    fi
+    exit "$status"
 fi
-
-cleanup() {
-    rmdir "$LOCK_DIR" 2>/dev/null || true
-}
-
-trap cleanup EXIT
 
 log "starting sync run"
 

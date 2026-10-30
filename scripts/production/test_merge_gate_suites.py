@@ -11,12 +11,39 @@ from pathlib import Path
 from typing import cast, final
 from unittest import mock
 from scripts.production import merge_gate
-from scripts.production.merge_gate_test_support import gate_suites
+from scripts.production.merge_gate_test_support import EXPECTED_SUITES, SUITE_MODULE, gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 
 @final
 class MergeGateSuitesTests(GateSuitesFixture):
+    def test_recovery_suites_include_their_real_regression_modules(self) -> None:
+        repo = Path(__file__).resolve().parents[2]
+        # Use the actual gate discovery; the fixture normally narrows TEST_SUITES.
+        with mock.patch.object(merge_gate, "TEST_SUITES", EXPECTED_SUITES):
+            found = {(suite, str(path.relative_to(repo / "scripts" / suite)))
+                     for suite, path in merge_gate.discover_test_modules(repo)}
+        self.assertTrue({
+            ("release", "test_release.py"), ("claude_to_codex", "test_sync.py"),
+            ("new_rust_project", "test_rust_generate.py"), ("validate_and_push", "test_rerun.py"),
+            ("exclude", "test_exclude.py"), ("prioritize", "tests/test_renumber.py"),
+            ("prioritize", "tests/test_run_watcher.py"),
+        }.issubset(found), found)
+
+    @gate_suites("prioritize")
+    def test_a_nested_suite_module_runs_and_retries_at_its_discovered_path(self) -> None:
+        flat = self.checkout / "scripts/prioritize/test_first.py"
+        nested = flat.parent / "tests/test_first.py"
+        # Reuse the shared job fixture, retaining its suite identity when nested.
+        self.write(nested, SUITE_MODULE)
+        _ = nested.write_text(nested.read_text().replace("suite = module.parent.name", 'suite = "prioritize"'))
+        flat.unlink()
+        self.write(self.state / "signal-prioritize", "once")
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Rerun alone: prioritize/tests/test_first.py passed", result.stdout)
+        self.assertEqual(len([row for row in self.module_events() if row["event"] == "start"]), 2)
+
     @gate_suites("hooks", "notify")
     def test_missing_suite_refuses_instead_of_silently_shrinking_gate(self) -> None:
         (self.checkout / "scripts" / "notify" / "test_first.py").unlink()
@@ -84,7 +111,7 @@ class MergeGateSuitesTests(GateSuitesFixture):
         scripts = self.checkout / "scripts"
         modules = [*((suite, scripts / suite / "test_first.py") for suite in self.suites),
                    ("lib", scripts / "lib" / "test_second.py")]
-        ordered = merge_gate.module_order(modules, timings)
+        ordered = merge_gate.module_order(modules, timings, self.checkout)
         self.assertEqual([(suite, path.name) for suite, path in ordered[:2]],
                          [("lib", "test_second.py"), ("direct", "test_first.py")])
         result = self.run_gate("--tests-only")
