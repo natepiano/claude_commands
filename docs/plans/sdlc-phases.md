@@ -626,7 +626,7 @@ The showrunner sent a wrong result (2026-10-29): accounts-unit ended its turn at
 
 **Acceptance gate:** `scripts/hooks/test_stop_direct_continue.py` has one test per return in `main()`, each feeding a payload on stdin and reading the hook's output. One test writes a fresh `heartbeat.log` whose last line is "agent finished", sets context above the threshold, gives no live background task, and asserts a block; it fails on the tree before the fix. Another gives one running background task above the threshold and asserts no block. The `scripts.direct.test_phase_artifacts` suite stays green.
 
-### Phase 19 — An uncertain wait reason prints once, with its count  · status: todo
+### Phase 19 — An uncertain wait reason prints once, with its count  · status: done
 **Depends on:** none (showrunner add-on from hierarchies-unit, 2026-10-29)
 
 `progress_history.py` (near line 5869) joins one reason per uncertain wait with "; ", so an `UncertainCoverage` cell repeats "worker hana_catalyst-lfo-impl6 has 0 active pass matches" five times.

@@ -3424,12 +3424,6 @@ def _follow_worker(args: argparse.Namespace) -> int:
         print(f"codex_mesh: follow: {error}", file=sys.stderr)
         return 2
     record = _lookup(session_dir, name)
-    if record.get("unit_ledger"):
-        # Unit identity is durable: assigning new work never upgrades a live thread.
-        if model := record.get("model"):
-            args.model = model
-        if effort := record.get("effort"):
-            args.effort = effort
     if record.get("held_design_id") and _as_str(_attr(args, "message_file")) != record.get("authorized_prompt"):
         moving = bool(_attr(args, "account_move")) and isinstance(
             _read_account_move(session_dir, name, _as_str(record.get("thread_id"))), AccountMoveMarker)

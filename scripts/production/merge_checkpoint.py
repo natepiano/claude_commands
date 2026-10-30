@@ -524,11 +524,41 @@ def allowed(path: str, ownership: tuple[str, ...]) -> bool:
     return any(path == item or path.startswith(item.rstrip("/") + "/") for item in ownership)
 
 
+def _origin_merge_refs(request: MergeRequest) -> list[str]:
+    return list(dict.fromkeys([
+        f"origin/{request.production.merge_branch}",
+        *change_review.reviewed_merge_refs(request.production.checkout, change_review.registered_productions),
+    ]))
+
+
+def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Keep paths whose checkpoint content differs from every origin merge base."""
+    if not paths:
+        return ()
+    own = set(paths)
+    for ref in _origin_merge_refs(request):
+        try:
+            base = git(request.production.checkout, "merge-base", ref, request.commit)
+            if base.returncode:
+                continue
+            changed = git(request.production.checkout, "diff", "--name-only", "--no-renames", "-z",
+                          base.stdout.strip(), request.commit, "--", *paths)
+            if changed.returncode:
+                continue
+        except OSError:
+            continue
+        own.intersection_update(changed.stdout.split("\0"))
+    return tuple(path for path in paths if path in own)
+
+
 def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
     staged = good(git(request.production.checkout, "diff", "--cached", "--name-only"), "scope")
     if staged:
         raise Stop("scope", "held", f"staged paths in merge checkout: {staged.replace(chr(10), ', ')}",
                    "the showrunner will clear unrelated staged paths, then rerun the checkpoint")
+    own_paths = _unit_paths(request, paths)
+    imported = len(paths) - len(own_paths)
+    paths = own_paths
     if isinstance(request.kind, ShrinkCommit):
         plan = request.unit.plan.as_posix()
         next_items = str(Path(plan).with_name(Path(plan).stem + "-next.md"))
@@ -550,7 +580,8 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
         if unexpected:
             raise Stop("scope", "held", f"outside Owns: {', '.join(unexpected)}",
                        f"explain why these paths changed: {', '.join(unexpected)}")
-    report("scope", "ok", f"{len(paths)} changed paths are allowed")
+    report("scope", "ok", f"{len(paths)} changed paths are allowed"
+           + (f"; {imported} came from origin merge branches" if imported else ""))
 
 
 def hub_paths(lines: tuple[str, ...], unit: str) -> tuple[str, ...]:
