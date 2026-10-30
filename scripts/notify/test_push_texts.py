@@ -4,6 +4,7 @@ from __future__ import annotations
 import ast
 import importlib
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from code_kind import is_test_code  # noqa: E402
 
+import gpu_xid
 import push_texts
 from push_texts import ActionTemplate, PushExample, PushText, SessionTemplate
 from user_action import NO_SESSION_LINE, SessionLine
@@ -110,6 +112,36 @@ class PushTextTests(unittest.TestCase):
                     text = push.message
                     self.assertLess(len(text), 500)
                     self.assertLess(len(push.title), 45)
+
+    def test_every_gpu_xid_renders_its_meaning_and_restart_action(self) -> None:
+        for code, meaning in gpu_xid.XID_MEANINGS.items():
+            with self.subTest(xid=code):
+                push = push_texts.render("nixos.gpu_stopped", xid=code, meaning=meaning, time="02:17 EDT")
+                self.assertEqual(push.sender, "gpu")
+                self.assertEqual(push.need, "decision")
+                self.assertEqual(push.title, "natedev GPU stopped")
+                self.assertIn(f"Xid {code}", push.message)
+                self.assertIn(meaning, push.message)
+                self.assertIn("02:17 EDT", push.message)
+                self.assertEqual(push.message.splitlines()[0], "Action: Restart natedev to bring the GPU back.")
+
+    def test_gpu_xid_command_reports_known_codes_without_extra_output(self) -> None:
+        for code, meaning in gpu_xid.XID_MEANINGS.items():
+            with self.subTest(xid=code):
+                result = subprocess.run([sys.executable, str(Path(gpu_xid.__file__)), code],
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, meaning + "\n")
+                self.assertEqual(result.stderr, "")
+
+    def test_gpu_xid_command_refuses_unknown_codes_on_one_line(self) -> None:
+        for code, shown in (("999", "'999'"), ("999\nsecond line", "'999\\nsecond line'")):
+            with self.subTest(code=code):
+                result = subprocess.run([sys.executable, str(Path(gpu_xid.__file__)), code],
+                                        capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, f"gpu_xid: unknown Xid code: {shown}\n")
 
     def test_failed_restart_catalog_examples_show_named_sessions(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.restart_failed")

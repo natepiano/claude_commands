@@ -29,12 +29,16 @@ Exit 0 when the unit is resumed; 1 on a refusal or a failed step; 2 on usage.
 """
 from __future__ import annotations
 
+
 import argparse
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import completion_receipt, staff
 
 import add_unit
 import production_units
@@ -248,16 +252,20 @@ def resume(unit: RetiredUnit) -> int:
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
+    row = add_unit.ensure_staff_unit(unit.production, unit.name)
     if resume_folder(unit).resolve() == unit.worktree.resolve():
         make_worktree(unit)
     launch(unit)
     unmark(unit)
     print(f"{unit.name} resumed")
+    completed = resume_record(unit.production, unit.name).with_suffix(".done")
+    completion_receipt.write_receipt(completed, row.id, {"session_id": unit.session_id,
+                                                   "doc": str(unit.production.doc), "unit": unit.name})
     resume_record(unit.production, unit.name).unlink(missing_ok=True)
     return 0
 
 
-def main(argv: list[str]) -> int:
+def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("slug")
     _ = parser.add_argument("unit")
@@ -265,10 +273,26 @@ def main(argv: list[str]) -> int:
     options = parser.parse_args(argv)
     try:
         unit = find_unit(cast(str, options.slug), cast(str, options.unit))
+        completed = completion_receipt.read_receipt(resume_record(unit.production, unit.name).with_suffix(".done"),
+                                                staff.initial_snapshot())
+        if (not unit.retired and isinstance(completed, completion_receipt.OwnedReceipt)
+                and completed.owner.kind == "unit" and completed.fields.get("doc") == str(unit.production.doc)
+                and completed.fields.get("unit") == unit.name):
+            print(f"{unit.name} already resumed")
+            return 0
         return dry_run(unit) if cast(bool, options.dry_run) else resume(unit)
+    except (staff.StaffRefused, staff.StaffUnreadable):
+        raise
     except (Refused, retire_unit.Refused, production_units.Refusal, unit_names.BadName, InvalidRecord, OSError) as error:
         print(f"refused: {error}")
         return 1
+
+
+def main(argv: list[str]) -> int:
+    def run() -> int:
+        with staff.operation():
+            return _main(argv)
+    return staff.cli_result(run)
 
 
 if __name__ == "__main__":
