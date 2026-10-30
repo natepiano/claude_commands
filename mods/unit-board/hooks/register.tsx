@@ -8,13 +8,16 @@ import { UnitView } from './unit';
 import { AccountsView } from './accounts';
 import type { StoredAccountsStatus } from '../types/accounts';
 import { QueueView } from './queue';
-import type { QueuePaneState, QueueSnapshot } from '../types/queue';
+import type { QueuePaneState, QueueLines } from '../types/queue';
 
 const PANE = 'unit-board';
 const ACCOUNTS = 'accounts-board';
 const ACCOUNT_PANES = { plugin: 'unit-board', key: 'accountsPanes' } as const;
 const QUEUE = 'build-queue';
 const QUEUE_PANES = { plugin: 'unit-board', key: 'queuePanes' } as const;
+let queueColumns = 100;
+type QueueWidthRefresh = { kind: 'idle' } | { kind: 'requested'; columns: number };
+let queueWidthRefresh: QueueWidthRefresh = { kind: 'idle' };
 const PANES = { plugin: 'unit-board', key: 'panes' } as const;
 
 type Selection = { kind: 'board' } | { kind: 'unit'; production: string; unit: string };
@@ -263,30 +266,54 @@ async function queueRun($: EngineInterface, args: string[], isOpen = () => true)
 }
 
 type QueueReady = Extract<QueuePaneState, { kind: 'queue' }>;
-function queuePaneCalls($: EngineInterface): TablePaneCalls<QueueReady, void> {
+function validQueueLines(value: unknown): value is QueueLines {
+  if (!value || typeof value !== 'object') return false;
+  const data = value as QueueLines;
+  const tones = ['default', 'success', 'error', 'warning', 'inactive'];
+  return Number.isInteger(data.columns) && data.columns > 0 && Number.isFinite(data.as_of)
+    && Array.isArray(data.lines) && data.lines.every(line => Array.isArray(line) && line.every(
+      part => part && typeof part.text === 'string' && tones.includes(part.tone) && typeof part.bold === 'boolean'));
+}
+function normalizeQueueState(value: unknown): QueuePaneState {
+  const saved = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  const selector = typeof saved.selector === 'string' ? saved.selector : null;
+  if (saved.kind === 'queue' && validQueueLines(saved.data)) return { kind: 'queue', data: saved.data, selector };
+  if (saved.kind === 'failed') return { kind: 'failed', reason: 'Build queue could not be read.', selector };
+  return { kind: 'loading', selector };
+}
+type QueueOpening = { kind: 'saved' } | { kind: 'view' } | { kind: 'card'; selector: string };
+function queuePaneCalls($: EngineInterface, opening: QueueOpening = { kind: 'saved' }): TablePaneCalls<QueueReady, void> {
   return {
     open: () => $.ui.open({ id: QUEUE, title: 'Build queue', closeOnEscape: true }),
     every: callback => $.clock.every(10_000, callback),
     stat: path => $.fs.stat(path),
-    prepare: async () => {},
-    load: async (_context, isOpen) => {
-      const data = JSON.parse(await queueRun($, ['--json'], isOpen)) as QueueSnapshot;
-      const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(cell => typeof cell === 'string');
-      const rows = (value: unknown): value is string[][] => Array.isArray(value) && value.every(strings);
-      if (!data || !strings(data.running_header) || !rows(data.running) || !strings(data.waiting_header)
-        || !rows(data.waiting) || !strings(data.problems) || typeof data.head?.text !== 'string'
-        || !['default', 'error'].includes(data.head.tone) || !data.totals
-        || !['promised', 'measured', 'free', 'reserve'].every(key => typeof data.totals[key as keyof QueueSnapshot['totals']] === 'string')
-        || data.running.some(row => row.length !== data.running_header.length)
-        || data.waiting.some(row => row.length !== data.waiting_header.length)) throw new Error('Invalid queue snapshot.');
-      return { kind: 'queue', data };
+    prepare: async isOpen => {
+      const panes = (await $.state.get(QUEUE_PANES)).value ?? {};
+      if (!isOpen()) return;
+      const state: QueuePaneState = opening.kind === 'saved' ? normalizeQueueState(panes[QUEUE])
+        : { kind: 'loading', selector: opening.kind === 'card' ? opening.selector : null };
+      await $.state.set(QUEUE_PANES, { ...panes, [QUEUE]: state });
+    },
+    load: async (...[, isOpen]) => {
+      const state = normalizeQueueState((await $.state.get(QUEUE_PANES)).value?.[QUEUE]);
+      if (!isOpen()) throw new Error('Pane closed.');
+      const args = ['--json', '--columns', String(queueColumns)];
+      const selector = state.selector;
+      if (selector !== null) args.push(selector);
+      const data: unknown = JSON.parse(await queueRun($, args, isOpen));
+      if (!validQueueLines(data)) throw new Error('Invalid queue lines.');
+      return { kind: 'queue', data, selector };
     },
     advance: async state => state,
-    read: async () => (await $.state.get(QUEUE_PANES)).value?.[QUEUE],
+    read: async () => normalizeQueueState((await $.state.get(QUEUE_PANES)).value?.[QUEUE]),
     put: async (state, isOpen) => {
       if (!isOpen()) return;
       const previous = (await $.state.get(QUEUE_PANES)).value ?? {};
-      if (isOpen()) await $.state.set(QUEUE_PANES, { ...previous, [QUEUE]: state });
+      if (!isOpen()) return;
+      const saved = normalizeQueueState(previous[QUEUE]);
+      if (state.kind === 'loading' && saved.kind === 'loading') return;
+      const selected: QueuePaneState = state.kind === 'queue' ? state : { ...state, selector: saved.selector };
+      await $.state.set(QUEUE_PANES, { ...previous, [QUEUE]: selected });
     },
     drop: async isClosed => {
       if (!isClosed()) return;
@@ -379,7 +406,8 @@ export const register: Register = on => {
       catch { /* A pane refresh failure cannot replace the settled bump result. */ }
       return { text: line };
     }
-    await queue.start(queuePaneCalls($), true);
+    queueWidthRefresh = { kind: 'idle' };
+    await queue.start(queuePaneCalls($, wanted ? { kind: 'card', selector: wanted } : { kind: 'view' }), true);
     return { text: 'Build queue opened.' };
   });
   on('turn.complete', async ($, e, next) => {
@@ -402,12 +430,18 @@ export const register: Register = on => {
     return AccountsView(elements, e.props.bodyColumns, state.data, state.zone, state.now);
   });
   on('ui.render', { component: 'Pane', requestId: QUEUE }, async ($, e) => {
-    const state = (await $.state.get(QUEUE_PANES)).value?.[QUEUE];
+    queueColumns = Math.max(1, Math.floor(e.props.bodyColumns));
+    const state = normalizeQueueState((await $.state.get(QUEUE_PANES)).value?.[QUEUE]);
     const elements = $.ui.resolve(e);
     const { Text } = elements;
-    if (!state || state.kind === 'loading') return <Text color="inactive">Loading build queue…</Text>;
+    if (state.kind === 'loading') return <Text color="inactive">Loading build queue…</Text>;
     if (state.kind === 'failed') return <Text color="error">{state.reason}</Text>;
-    return QueueView(elements, e.props.bodyColumns, state.data);
+    if (queueColumns !== state.data.columns
+      && (queueWidthRefresh.kind === 'idle' || queueWidthRefresh.columns !== queueColumns)) {
+      queueWidthRefresh = { kind: 'requested', columns: queueColumns };
+      void queue.refresh(queuePaneCalls($), true);
+    } else if (queueColumns === state.data.columns) queueWidthRefresh = { kind: 'idle' };
+    return QueueView(elements, queueColumns, state.data);
   });
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const state = await readPane($, PANE);

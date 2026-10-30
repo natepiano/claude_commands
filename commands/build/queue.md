@@ -1,13 +1,13 @@
 ---
-description: Show running and waiting build steps, or move a waiting step to the head. Args - `[bump <position|session|folder>]`.
+description: Show running and waiting build steps, or one step's place and why it waits. Args - `[<position|session|folder>|close]`.
 ---
 
-With `unit-board@nate-local`, `/build:queue [close|bump <selector>]` opens or controls the Build queue pane without a model turn. Run `/reload-plugins` in a session started before the mod change.
+Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py $ARGUMENTS`. Show the output as is inside a `text` code block.
 
-Run `python3 ~/.claude/scripts/build_queue/build_queue.py $ARGUMENTS`. Show its output as is: Running table first, Waiting table second, including `empty` rows, totals and any roster problem. Both tables start with `# | Showrunner | Unit | Session | Step | Folder`. Showrunner, Unit and Session come from the local session roster; unmatched steps show `—` for both roles and the recorded session name or folder basename for Session. Step is the bare step name. Running adds `Promised | Using | Delta | State`; Delta is promised minus using, and starting steps show `—` until measured. Waiting adds `Waiting since | Needs | Free | Reason`; Free is available memory, and a memory-hold Reason names the required free memory and its parts. Times use the user's zone.
+Each running or waiting step takes one line, even in a narrow pane. `↑` marks a step moved up; the move lines name who moved it, when, and from which place. The `#1 waits on` block shows admission's checks once, with pass/fail marks and their numbers. `starts` is an estimate at the last hour's completion pace, not a promise.
 
-For the full reason the head waits, run `build-why` at a terminal (`~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_why.py`).
+`/build:queue <position|session|folder>` shows the matching step's card: whether it is next, who is ahead, why it waits and its likely start. A session with several waiting steps gets several cards. `build-why` keeps the head's full recorded history and release advice.
 
-Show the head explanation above Waiting. It names budget holders with charged and measured memory, or the free-memory or pressure hold; `Stalled:` means the head waited at least 15 min while free memory covers its need.
+With `unit-board@nate-local`, the command opens the queue or card in a pane and refreshes it every 10 seconds. `close` closes it. Run `/reload-plugins` in sessions started before the mod change.
 
-`bump <position|session|folder>` moves one waiting step to the head for the next admission. Any session or the user may run it. Memory limits still apply. An unknown or ambiguous match changes nothing; use its position, shown Session name, full session id, recorded session name, folder path or folder name. The result and build log name who moved which step. Use `/build:status` for holds and target state.
+Moving a step up is the user's, through `/showrunner:bump`. Never run `bump` for a session. Use `/build:status` for holds and target state.

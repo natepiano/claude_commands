@@ -38,8 +38,10 @@ from typing import NamedTuple, NotRequired, TypedDict, cast, override
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import nix_env as nix_env
+from place import HerdrPlace as HerdrPlace
 
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
@@ -564,12 +566,6 @@ class ObservedAgentState:
 @dataclass(frozen=True)
 class WaitTimedOut:
     """The CLI or its subprocess exhausted the wait deadline."""
-
-
-@dataclass(frozen=True)
-class HerdrPlace:
-    session: str
-    pane: str
 
 
 @dataclass(frozen=True)

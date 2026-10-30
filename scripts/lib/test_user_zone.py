@@ -22,6 +22,7 @@ PROBE = ("import sys; sys.path.insert(0, sys.argv[1]); import user_zone; from da
 HARDCODED = re.compile(r"""ZoneInfo\(\s*["'](?!UTC)|TZ=["']?[A-Z][a-z]+/|%[HMS] ?[PE][DS]T\b""")
 # The scripts that may name a zone, each because the zone there is a fact and never the user's setting.
 NAMES_A_ZONE = {
+    "build_queue/queue_fixture.py": "one fixed zone, so a golden render is the same in every user zone",
     "model_study/turns.py": "the zone the roster's stored times were recorded in",
     "prioritize/renumber.py": "one fixed zone, so a date is the same on both machines",
     "whoami/agent_accounts.py": "the offset a stored reset time is written with",

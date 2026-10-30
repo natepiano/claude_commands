@@ -1,0 +1,15 @@
+#4 of 32 · cargo-liner · berth · cargo-liner-berth-parallel-impl · clippy · 2.9 GiB
+Folder /home/natepiano/rust/cargo-liner/repo. Waited 37 min (since 10:09). Likely start ~10:51.
+
+Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.
+  #1 ↑  tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40; from #1 by
+      work-lead at 10:46
+  #2 ↑  tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40
+  #3    tool-based-ui · hana-migration mend  joined 10:07, 2 min before it
+  Moved-up steps go first, then the longest wait. It joined 2nd of the steps waiting now.
+
+Waits on
+  ✗ #1's turn      strict until 10:56:00 (9 min 48 s left): younger steps wait
+
+Likely start ~10:51: 4th in line at 44 steps an hour, an estimate.
+  Each step moved up ahead of it adds about 1 min.

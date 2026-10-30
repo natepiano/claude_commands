@@ -89,10 +89,11 @@ class UnitStatusFixture(unittest.TestCase):
         hooks = root / "scripts/hooks"
         hooks.mkdir()
         _ = (hooks / "direct_run.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
-        for name in ("add_unit.py", "production_units.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_pane.py"):
+        for name in ("add_unit.py", "production_units.py", "live_units.py", "showrunners.py", "unit_lookup.py", "unit_marks.py", "session_pane.py"):
             _ = shutil.copy2(SCRIPT.with_name(name), script.with_name(name))
         (root / "scripts/herdr").mkdir()
-        _ = shutil.copy2(SCRIPT.parents[1] / "herdr/herdr.py", root / "scripts/herdr/herdr.py")
+        for name in ("herdr.py", "place.py"):
+            _ = shutil.copy2(SCRIPT.parents[1] / "herdr" / name, root / "scripts/herdr" / name)
         for name in ("atomic_file.py", "user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "lib" / name, root / "scripts/lib" / name)
         for name in ("active", "sessions"):

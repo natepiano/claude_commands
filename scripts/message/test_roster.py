@@ -24,6 +24,7 @@ from unittest import mock
 
 from scripts.astra import design_roles
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.message import unit_labels
 
 SCRIPTS = Path(__file__).parents[1]
 sys.path.insert(0, str(Path(__file__).parent))
@@ -2337,10 +2338,10 @@ class UnitLabelsTests(unittest.TestCase):
         environment = {"HERDR_PROC": str(root / "proc"), "NOTIFIER_SESSIONS_DIR": str(root / "sessions")}
         notifier = root / "notifier"
         (notifier / "showrunner-cargo-liner-style").mkdir(parents=True)
-        with mock.patch.object(roster, "_newest_sessions", return_value=records), \
+        with mock.patch.object(unit_labels, "newest_sessions", return_value=records), \
              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier), \
-             mock.patch.object(roster, "_registered_showrunners", return_value=registered), \
-             mock.patch.object(roster, "_live_runs", side_effect=AssertionError("no meshes")) as meshes, \
+             mock.patch.object(unit_labels, "registered_showrunners", return_value=registered), \
+             mock.patch.object(unit_labels, "live_runs", side_effect=AssertionError("no meshes")) as meshes, \
              mock.patch.object(unit_lookup, "every_marked_unit", side_effect=AssertionError("no mark scan")) as marks_read, \
              mock.patch.object(herdr, "herdr_places", side_effect=AssertionError("no process scan")) as places, \
              mock.patch.object(process_table, "snapshot", side_effect=AssertionError("no process table")) as processes, \
@@ -2369,8 +2370,8 @@ class UnitLabelsTests(unittest.TestCase):
              "updatedAt": 1, "tmux": "", "formerNames": []},
         ]
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        with mock.patch.object(roster, "_newest_sessions", return_value=records), \
-             mock.patch.object(roster, "_registered_showrunners", return_value=[]):
+        with mock.patch.object(unit_labels, "newest_sessions", return_value=records), \
+             mock.patch.object(unit_labels, "registered_showrunners", return_value=[]):
             labels = roster.unit_labels_for(["requested", "missing"], {"HERDR_PROC": str(root)})
         self.assertEqual(labels, {"requested": roster.UnitLabels("scratch", "—", "—")})
 

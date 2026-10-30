@@ -8,8 +8,6 @@ from pathlib import Path
 from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
-import unit_lookup
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 
@@ -90,6 +88,8 @@ class SessionMarks:
     def has(self, unit: str) -> bool:
         """Whether a session carries the unit's mark. An unreadable host has not said no."""
         if self._units is None:
+            import unit_lookup
+
             try:
                 self._units = set(unit_lookup.marked_units(self._slug))
             except OSError:

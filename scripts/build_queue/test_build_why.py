@@ -14,11 +14,12 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
-from scripts.build_queue import build_queue, build_why, head_facts
+from scripts.build_queue import build_why, head_facts
+from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_head_facts import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
 from scripts.lint import memory_admit as gate
 from scripts.lib.user_zone import user_zone
-from scripts.message import roster
+from scripts.message import roster, unit_labels
 
 GIB = gate.GIB
 NOW = datetime(2026, 10, 30, 1, 51, tzinfo=UTC).timestamp()
@@ -76,9 +77,10 @@ class BuildWhyTests(unittest.TestCase):
         for number in range(16):
             _ = self.waiter(600 + number, f"younger-{number}", number + 1, 20 - number)
         entries = [self.entry(name) for name in ("widget", "demo", "organon", "frame-cost", "inspectors-fix")]
-        _ = self.enterContext(mock.patch.object(build_queue, "read_roster", return_value=roster.Roster(entries, [])))
+        labels = roster.unit_labels(entries)
+        _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value=labels))
         _ = self.enterContext(mock.patch.object(roster, "roster", return_value=roster.Roster(entries, [])))
-        _ = self.enterContext(mock.patch.object(roster, "unit_labels_for", return_value=roster.unit_labels(entries)))
+        _ = self.enterContext(mock.patch.object(roster, "unit_labels_for", return_value=labels))
 
     def entry(self, name: str) -> roster.RosterEntry:
         return roster.RosterEntry(
@@ -90,16 +92,9 @@ class BuildWhyTests(unittest.TestCase):
             session=roster.NoClaudeSession(),
         )
 
-    def process(self, pid: int, used: float = 0) -> None:
-        directory = self.proc / str(pid)
-        directory.mkdir()
-        fields = ["S", "1", *(["0"] * 17), str(pid)]
-        _ = (directory / "stat").write_text(f"{pid} (verify) {' '.join(fields)}\n")
-        _ = (directory / "status").write_text(f"VmRSS: {gib(used) // 1024} kB\nVmSwap: 0 kB\n")
-
     def running(self, pid: int, name: str, step: str, need: float, used: float,
                 age: int, *, peak: float = 0) -> Path:
-        self.process(pid, used)
+        write_process(self.proc, pid, gib(used))
         folder = "/tmp/p34-merge" if name == "widget" else f"/tmp/{name}"
         row: dict[str, object] = {
             "pid": pid, "start_time": str(pid), "need": gib(need), "repo": "hana", "step": step,
@@ -115,7 +110,7 @@ class BuildWhyTests(unittest.TestCase):
         return path
 
     def waiter(self, pid: int, name: str, need: float, minutes: int) -> Path:
-        self.process(pid)
+        write_process(self.proc, pid)
         row: dict[str, object] = {
             "pid": pid, "start_time": str(pid), "need": gib(need), "since": NOW - minutes * 60,
             "session_id": f"id-{name}", "session_name": name, "step": "nextest", "folder": f"/tmp/{name}",

@@ -55,15 +55,13 @@ only I can bump
 
 ## Phases
 
-### Phase 1 — /build:queue answers in under a second, one line per step, and says why each step waits  · status: todo
+### Phase 1 — /build:queue answers in under a second, one line per step, and says why each step waits  · status: done
 
 **Carried over** from report-unit Phase 4g (handover 2026-10-30 11:3x EDT). Report-unit's two workers started Part A at about 11:20 EDT and stopped mid-turn. Their draft edits are in `4g_partA_v2.patch` in the run's handover folder, `/tmp/claude/unit/2ac94b9b-8a9d-4a9b-b908-b4f87dd4d5d0/handover/` (`git diff --binary` against `builds-report` `e27c243c`; `git apply --3way`): `queue.md`, `queue.tsx`, `register.tsx`, `queue.d.ts`, `build_queue.py`, `head_facts.py`, `roster.py`, new `queue_card.py`, `queue_fixture.py`, `queue_lines.py`, `queue_view.py` and `scripts/message/unit_labels.py`. It is unreviewed and untested: the writer starts from it, reads all of it against the Spec and keeps only what matches. The design notes, mocks, measurements and report-unit's worker prompts are in the same folder.
 
-**Depends on:** Part A1 depends on nothing. Part A2 depends on report-unit 4d and 4e on `origin/builds` (the draft builds on `head_facts.py` from 4e; report sends one hash after its 4c lands, about 13:00 EDT); merge `origin/builds` first. Part B also depends on resources-unit's ordered-walk checkpoint (resources Phase 30: the queue starts steps in queue order, and every bump is refused until the user's `/showrunner:bump` path lands) on `origin/builds`.
+**Depends on:** Part A1 depends on nothing. Part A2 depends on report-unit 4d and 4e on `origin/builds` (the draft builds on `head_facts.py` from 4e; report sends one hash after its 4c lands, about 13:00 EDT); merge `origin/builds` first. Part B moved to Phase 1c (showrunner, 2026-10-30: Part A and Phase 1b land as one checkpoint; Part B lands on its own after resources Phase 30).
 
-**Order of work:** resources-unit's unmerged work (its phase 25, then Phase 30) also changes `memory_admit.py`, `test_memory_admit.py`, `build_why.py`, `test_build_why.py`, `build-memory-admission.md` and `build-targets.md`, and a merge cannot land on uncommitted edits to those files. Part A, before that merge: every other file, in two steps (showrunner, 2026-10-30: start every item that does not need `head_facts.py` now). A1, now: `queue_lines.py`, the `unit_labels.py` move out of `roster.py`, the pane (`queue.tsx`, the build queue parts of `register.tsx`, `queue.d.ts`, `queue.test.ts`) and `queue.md`. A2, after the unit director merges `origin/builds` with report-unit 4d and 4e: `head_facts.py`, `queue_view.py`, `queue_card.py`, `queue_fixture.py`, `build_queue.py` and the golden files. In Part A `build_queue.py` keeps `locked_queue_read()` and the existing `LineWaiter`, and `queue_lines.py` gets its own cell width. Part B, after the unit director merges `origin/builds`: Spec 1–3, one cell width for every Python caller (showrunner, 2026-10-30): `terminal_width` moves to the new `scripts/lib/terminal_cells.py` (a combining mark counts 0, a wide character 2), and `queue_lines.py`, `build_why.py` and `scripts/production/dailies_render.py` import it; `queue_lines.py` and `build_why.py` keep no width function and `dailies_render.display_width` is deleted. dailies_render.py is outside queue-unit's Owns: the showrunner approved the edit; claim it on berth (a holder goes to the showrunner), run `scripts.production.test_dailies_render`, and the notice carries an also-touches line trial-merged against its owner's tip, the switch to `queue_read()`, the docs for those files and the live timing.
-
-**Bridge to the service:** the `queue.json` snapshot (Spec 1) is how the view answers in under 1 s while polling admission stays. The service design says whether the service's view command replaces it; the view, card and renderer (Spec 4–11) read whichever source the design picks.
+**Order of work:** resources-unit's unmerged work (its phase 25, then Phase 30) also changes `memory_admit.py`, `test_memory_admit.py`, `build_why.py`, `test_build_why.py`, `build-memory-admission.md` and `build-targets.md`, and a merge cannot land on uncommitted edits to those files. Part A, before that merge: every other file, in two steps (showrunner, 2026-10-30: start every item that does not need `head_facts.py` now). A1, now: `queue_lines.py`, the `unit_labels.py` move out of `roster.py`, the pane (`queue.tsx`, the build queue parts of `register.tsx`, `queue.d.ts`, `queue.test.ts`) and `queue.md`. A2, after the unit director merges `origin/builds` with report-unit 4d and 4e: `head_facts.py`, `queue_view.py`, `queue_card.py`, `queue_fixture.py`, `build_queue.py` and the golden files. In Part A `build_queue.py` keeps `locked_queue_read()` and the existing `LineWaiter`, and `queue_lines.py` gets its own cell width. Part B: Phase 1c.
 
 #### Work Order
 
@@ -75,14 +73,7 @@ User requirements (2026-10-30, verbatim): "build queue is unusable for me ... i 
 
 Measured (natedev, 2026-10-30 10:30–11:00 EDT, load 130–184 on 32 cores): `build_queue.py` takes 3.3–6.1 s. The full roster build takes 3.9 s for about 28 labels; `roster.unit_labels_for` gives the same labels in 0.02–0.12 s. The shared admission lock wait is 0.13–7.24 s (median 2.07 s): about 6 `check` passes per second hold `LOCK_EX` 77% of the time. Imports cost 0.22–0.54 s. The pane is about 89 columns; the waiting table needs about 256, so `queue.tsx` prints about 370 `Label: value` lines for 32 steps.
 
-1. **Queue snapshot (one lock-free read).** `memory_admit.py` edits start only after resources-unit's ordered-walk checkpoint is on origin/builds; resources-unit reviews the memory_admit.py diff.
-   - Split `read_queue_pass` into `gather_queue_inputs(directory, processes, now, memory: Mapping[Path, StepMemory] = {}) -> QueueInputs` (every file and `/proc` read it does today: waiter rows with their file names, reservation rows with their measured memory and resolved identity, sccache memory, the meminfo reading or unavailable, pressure after recovery, `now`) and a pure `queue_read_from(inputs) -> QueueRead` (no file read). `read_queue_pass` calls both, so admission, the locked read and the snapshot reader run one decision path. `memory` lets a caller pass readings it already took; a missing path is read.
-   - `write_queue_snapshot(directory, inputs)` writes `admission/queue.json` (`{"v": 1, "written_at": <epoch>, "inputs": ...}`) through `queue.json.tmp` and `os.replace`, no fsync (the file is a cache; an unreadable file reads as absent). The serial form and its parser live in `memory_admit.py` only; writer and reader import the same code.
-   - One helper calls it at the end of every `LOCK_EX` section: `check`, `bump_waiter`, `release`, `set_width`, and any exclusive section the ordered-walk checkpoint adds (its `give-back`). The write runs after the section's own changes, on success and on an exception path. `check` passes the process table and the memory readings it already took. A failed write (OSError, ValueError) never changes the section's result or exit code; the old file stays and goes stale.
-   - `queue_read() -> QueueRead`: parse `queue.json`; when `0 <= time.time() - written_at <= SNAPSHOT_MAX_AGE_SECONDS` (10) and the version and shape are valid, return `queue_read_from(inputs)`; else return `locked_queue_read()`. With waiters, their polls rewrite the file every few seconds; with no waiters nobody polls, so the lock is free. The reading's `now` is the snapshot's `now`; the view shows it as the "as of" time.
-   - Moving the `/proc` scan out of the lock and fewer `check` passes stay with resources-unit (not in this phase).
-2. **Per-step checks from admission.** `read_queue_pass` already computes each waiter's own `queue_decision`. Keep its numbers: `LineWaiter` gains `decision: AdmissionDecision`, `budget: BudgetCheck` and `free: FreeCheck`, built by the one function that builds the head's `BudgetCheck` and `FreeCheck` today (no second construction). `fits_now` stays.
-3. **One selector matcher.** `memory_admit.match_waiters(selector: str, view: QueueView) -> list[int]` holds the match rule that `bump_waiter` uses today (position, session id, session name, folder, folder name). `bump_waiter` calls it under the lock; the card calls it on the snapshot reading. `build_queue.bump_selector` (shown names, report-unit 4a) stays the front of both.
+1–3. Part B: moved to Phase 1c.
 4. **Labels and imports.** `build_queue.py` reads the queue first (`queue_read()`), then makes one `roster.unit_labels_for(ids, os.environ)` call with every id it shows: running and waiting session ids, bump actors, token-wait sessions (`head_facts.session_ids`). `read_roster`, `read_queue_and_roster`, the thread pool and the `Roster: …` problems line go. `build_why.py` uses `queue_read()`. Module-level imports in `scripts/build_queue/*` are only what the read path uses; the bump path and argparse-only modules import inside their functions. `roster.unit_labels_for` and the file-only helpers it uses move from `scripts/message/roster.py` into the new `scripts/message/unit_labels.py`, which imports no herdr, role_map or design_roles; `roster.py` imports them from it, so there is one copy (showrunner approved 2026-10-30; the notice carries an also-touches line for shutdown-unit, trial-merged against its tip).
 5. **One renderer.** New `scripts/build_queue/queue_lines.py`: `Span(text, tone, bold)` with `Tone = Literal["default", "success", "error", "warning", "inactive"]` (the mod's own tone names), `Line = tuple[Span, ...]`, terminal cell width (move `build_why._terminal_width` here; build_why imports it), right/left column padding, `cut_tail(text, cells)` with `…`, word wrap with a hanging indent, `plain(lines) -> str` and `json_form(lines, columns, as_of)`. `queue_view.render_view(model, columns) -> list[Line]` and `queue_card.render_card(model, matches, columns) -> list[Line]` produce every line. `build_queue.py [--columns N] [--json] [<selector>]` and `build_queue.py bump <selector>`: no word prints the view, one word prints the card, `bump` keeps its report-unit 4a and Phase 1 behavior and refusal (exit 3). `--columns` defaults to `COLUMNS` when it is a positive integer, else the stdout terminal width when stdout is a terminal, else 100. Text output prints `plain(lines)` (no Markdown table, so Claude Code cannot turn it into records). `--json` prints `{"columns": N, "as_of": <epoch>, "lines": [[{"text", "tone", "bold"}]]}`. No `--wide` mode: the card holds every fact of one step (unit director's call; a one-line revert of the Spec).
 6. **The view (Mock A).** Order of lines, at 100 columns, from the 10:46 queue (the full 32-row form is the tester's golden file):
@@ -156,17 +147,11 @@ Measured (natedev, 2026-10-30 10:30–11:00 EDT, load 130–184 on 32 cores): `b
 **Files:**
 - `scripts/message/roster.py` — owner shutdown-unit; the label helpers move out
 - `scripts/message/unit_labels.py` — new; the file-only label helpers moved out of roster.py
-- `scripts/lint/memory_admit.py` — `gather_queue_inputs`, `queue_read_from`, `write_queue_snapshot` and its calls in every `LOCK_EX` section, `queue_read`, `SNAPSHOT_MAX_AGE_SECONDS`, `LineWaiter` checks, `match_waiters` (owner resources-unit; it reviews this diff)
-- `scripts/lint/test_memory_admit.py` — snapshot and matcher tests (owner resources-unit)
 - `scripts/build_queue/build_queue.py` — the read, labels, CLI words, `--columns`, `--json`
 - `scripts/build_queue/queue_lines.py` — new: spans, cell widths, cut and wrap, plain and JSON forms
 - `scripts/build_queue/queue_view.py` — new: Mock A
 - `scripts/build_queue/queue_card.py` — new: Mock B
 - `scripts/build_queue/head_facts.py` — `BumpRecord` scan to the oldest waiter, per-row moves, pace reader
-- `scripts/build_queue/build_why.py` — `queue_read()`, cell width from `scripts/lib/terminal_cells.py`
-- `scripts/lib/terminal_cells.py` — new: `terminal_width`, the one cell width
-- `scripts/lib/test_terminal_cells.py` — new: its test
-- `scripts/production/dailies_render.py` — imports `terminal_width`; `display_width` deleted; outside Owns, showrunner approved 2026-10-30
 - `scripts/production/unit_marks.py` — new: the file-only session unit marks moved out of `unit_lookup.py`, so the label lookup loads no herdr
 - `scripts/production/unit_lookup.py` — imports the moved marks from `unit_marks.py`; outside Owns, showrunner approved 2026-10-30
 - `scripts/production/production_units.py` — imports `unit_lookup` inside the one function that uses it; owner natedev, showrunner approved 2026-10-30
@@ -196,12 +181,9 @@ Measured (natedev, 2026-10-30 10:30–11:00 EDT, load 130–184 on 32 cores): `b
   - Rest lines: strict window line; mixed reasons grouped by kind with place runs; `BehindOlderFit`.
   - Unknown report-unit 4e facts print no line; known head time and token wait print one line each.
   - Pace: window edge, torn last line, no lines (`—` and the footer), read error.
-  - Snapshot: a written file round-trips to the same `QueueRead` as the locked read; age 10 s uses it, 10.1 s and a future time take the locked read; wrong `v`, bad JSON and a missing file take the locked read; each of `check`, `bump_waiter`, `release`, `set_width` rewrites it; a failed write leaves the result and the old file; a reader never sees a partial file (temp + replace).
-  - `match_waiters` gives the same matches `bump_waiter` used before; `LineWaiter` checks equal the head's construction for the same row.
   - Timing: a fake `roster.roster` that sleeps 5 s and a counting `unit_labels_for`: the view and the card finish under 1 s, `roster.roster` is never called, `unit_labels_for` is called once per run with every shown id.
   - Pane: paints spans in order with their tones; no record lines at any width; a width change asks one forced refresh; `/build:queue 4` passes the selector; invalid JSON shows `Build queue could not be read.`
 
-**State:** `admission/queue.json` (new; rewritten under the admission lock at the end of every exclusive section; a cache that readers ignore when older than 10 s).
 
 **Constraints from prior phases:**
 - report-unit Phase 1: `tablePane` is the one pane lifecycle; a failed run shows only `Build queue could not be read.`; a bump refusal is `memory_admit.UnmatchedWaiter`, printed on stdout with exit 3, and the mod forwards only that. The report-unit Phase 1 binding that the head line keeps its `{"text", "tone"}` JSON field ends here: the pane and the CLI change together to `QueueLines`.
@@ -218,10 +200,75 @@ Measured (natedev, 2026-10-30 10:30–11:00 EDT, load 130–184 on 32 cores): `b
 - `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY python3 -m unittest scripts.build_queue.test_build_queue scripts.build_queue.test_build_why scripts.build_queue.test_head_facts scripts.build_queue.test_queue_view scripts.build_queue.test_queue_card scripts.lint.test_memory_admit scripts.build_targets.test_build_targets scripts.message.test_roster scripts.buildlog.test_record scripts.buildlog.test_parse scripts.buildlog.test_test_phase_peak` green.
 - `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python` over each slot's own changed Python files: `0 errors, 0 warnings, 0 notes`.
 - `command claude plugin test mods/unit-board` green; `nix shell nixpkgs#typescript --command tsc --noEmit -p mods/unit-board` clean.
-- Live on natedev, steps waiting, from the worktree's scripts: three runs each of `build_queue.py`, `build_queue.py --json --columns 89`, `build_queue.py 4` and `build_why.py`, every run under 1.0 s wall; the summary lists the 12 times and whether each read the snapshot. No screenshot.
-- Live: the snapshot write adds at most 10 ms median to an exclusive hold over at least 200 `check` passes; the summary gives the median and the max.
 - The notice has `also touches` lines for `memory_admit.py` and `test_memory_admit.py` (resources-unit, against `origin/builds-resources`; resources-unit reviewed the diff) `register.tsx` (natedev unit-board-unit, against `origin/natedev`) and `scripts/message/roster.py` (shutdown-unit, against its branch tip).
 - Change-Review line: /build:queue shows one line per step and answers one step at once | on natedev while steps wait, run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py`, then the same with `4` | one line per step with ↑ marks and a `#1 waits on` block, and a card whose first line answers `Next?`, each in under a second.
+
+### Phase 1b — The queue view renders each row once, aligns past place 99, and sends whole spans  · status: done
+**Depends on:** Phase 1
+**Estimate:** about 1 h of worker time.
+
+#### Work Order
+
+**Goal:** four small render defects the Phase 1 Part A2 review found after the hard landing (repair round 3). None changes an answer the view gives today.
+
+**Spec:**
+1. **One move lookup per row.** `head_facts` indexes the bump history once per model by step identity; `queue_view.move_lines`, `move_mark` and the card reuse each row's moves. Measured: 4,000 rows and 5,000 unrelated records took 0.915 s against 0.149 s with none. `step_labels` builds its fallback only when the label is missing.
+2. **A later join is said as later.** In the card's steps-ahead list, a moved step with no move record that joined after the selected step says `joined HH:MM, N min after it`, never `0 min before it` (`queue_card.py` line 66).
+3. **Columns hold past place 99.** The view sizes its place column from the largest shown place, so rows #99 and #100 put the names at one column (`queue_view.py` line 285).
+4. **Whole spans.** `queue_lines.wrap` merges neighbouring spans of equal tone and bold as each row closes. Measured live: `--json` was 37,140 bytes against 3,939 bytes of text, and the pane painted one `Text` per word.
+
+**Acceptance:** a test per item: a render with 5,000 unrelated bump records stays within 10% of one with none; the later-join text; equal name columns at #99 and #100 at 140 columns; a one-tone wrapped line gives one span per row. The five golden renders are unchanged as text. Live `build_queue.py --json` is at most 3 times the text size: measured live 9.4 times with one span per word (37,140 bytes against 3,939), 2.3–2.6 times with whole spans; every span keeps its `tone` and `bold` keys so the pane needs no defaults.
+
+### Phase 1c — /build:queue reads a lock-free snapshot and answers in under a second every time  · status: todo
+**Depends on:** Phase 1, and resources-unit's ordered-walk checkpoint (resources Phase 30: the queue starts steps in queue order, and every bump is refused until the user's `/showrunner:bump` path lands) on `origin/builds`; merge `origin/builds` first.
+**Estimate:** about 2 h of worker time.
+
+Phase 1 Part B, split out so Part A and Phase 1b land as one checkpoint (showrunner, 2026-10-30). Phase 1 Part A measured 0.4–1.2 s live at load 100–135 (3 of 12 runs over 1.0 s); the admission lock wait is the rest.
+
+#### Work Order
+
+**Goal:** `/build:queue`, its card and build-why read the queue from a lock-free snapshot, so every run answers in under 1 s; the card's checks behind #1 and its selector come from admission.
+
+**Bridge to the service:** the `queue.json` snapshot (Spec 1) is how the view answers in under 1 s while polling admission stays. The service design says whether the service's view command replaces it; the view, card and renderer (Spec 4–11) read whichever source the design picks.
+
+**Spec:**
+
+1. **Queue snapshot (one lock-free read).** `memory_admit.py` edits start only after resources-unit's ordered-walk checkpoint is on origin/builds; resources-unit reviews the memory_admit.py diff.
+   - Split `read_queue_pass` into `gather_queue_inputs(directory, processes, now, memory: Mapping[Path, StepMemory] = {}) -> QueueInputs` (every file and `/proc` read it does today: waiter rows with their file names, reservation rows with their measured memory and resolved identity, sccache memory, the meminfo reading or unavailable, pressure after recovery, `now`) and a pure `queue_read_from(inputs) -> QueueRead` (no file read). `read_queue_pass` calls both, so admission, the locked read and the snapshot reader run one decision path. `memory` lets a caller pass readings it already took; a missing path is read.
+   - `write_queue_snapshot(directory, inputs)` writes `admission/queue.json` (`{"v": 1, "written_at": <epoch>, "inputs": ...}`) through `queue.json.tmp` and `os.replace`, no fsync (the file is a cache; an unreadable file reads as absent). The serial form and its parser live in `memory_admit.py` only; writer and reader import the same code.
+   - One helper calls it at the end of every `LOCK_EX` section: `check`, `bump_waiter`, `release`, `set_width`, and any exclusive section the ordered-walk checkpoint adds (its `give-back`). The write runs after the section's own changes, on success and on an exception path. `check` passes the process table and the memory readings it already took. A failed write (OSError, ValueError) never changes the section's result or exit code; the old file stays and goes stale.
+   - `queue_read() -> QueueRead`: parse `queue.json`; when `0 <= time.time() - written_at <= SNAPSHOT_MAX_AGE_SECONDS` (10) and the version and shape are valid, return `queue_read_from(inputs)`; else return `locked_queue_read()`. With waiters, their polls rewrite the file every few seconds; with no waiters nobody polls, so the lock is free. The reading's `now` is the snapshot's `now`; the view shows it as the "as of" time.
+   - Moving the `/proc` scan out of the lock and fewer `check` passes stay with resources-unit (not in this phase).
+2. **Per-step checks from admission.** `read_queue_pass` already computes each waiter's own `queue_decision`. Keep its numbers: `LineWaiter` gains `decision: AdmissionDecision`, `budget: BudgetCheck` and `free: FreeCheck`, built by the one function that builds the head's `BudgetCheck` and `FreeCheck` today (no second construction). `fits_now` stays.
+3. **One selector matcher.** `memory_admit.match_waiters(selector: str, view: QueueView) -> list[int]` holds the match rule that `bump_waiter` uses today (position, session id, session name, folder, folder name). `bump_waiter` calls it under the lock; the card calls it on the snapshot reading. `build_queue.bump_selector` (shown names, report-unit 4a) stays the front of both.
+4. **The read.** `build_queue.py` and `build_why.py` change from `locked_queue_read()` to `queue_read()`. The card's selector uses `match_waiters` in place of `queue_card.select_waiters`' own match rule (`queue_card.matches_step` goes), and its budget and free checks behind #1 come from each step's `LineWaiter` checks through the view's check-line function.
+5. **One cell width.** One cell width for every Python caller (showrunner, 2026-10-30): `terminal_width` moves to the new `scripts/lib/terminal_cells.py` (a combining mark counts 0, a wide character 2), and `queue_lines.py`, `build_why.py` and `scripts/production/dailies_render.py` import it; `queue_lines.py` and `build_why.py` keep no width function and `dailies_render.display_width` is deleted. dailies_render.py is outside queue-unit's Owns: the showrunner approved the edit; claim it on berth (a holder goes to the showrunner), run `scripts.production.test_dailies_render`, and the notice carries an also-touches line trial-merged against its owner's tip, the switch to `queue_read()`, the docs for those files and the live timing.
+6. **Docs.** `docs/as-built/build-memory-admission.md` (`queue.json`, `queue_read`, `LineWaiter` checks, `match_waiters`), `docs/as-built/build-targets.md` (the `/build:queue` row only). Also correct two lines report-unit 4f left wrong: the index schema number in `build-memory-admission.md` (23, now 24) and the `rebuild_bin` call in `build-targets.md`.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — `gather_queue_inputs`, `queue_read_from`, `write_queue_snapshot` and its calls in every `LOCK_EX` section, `queue_read`, `SNAPSHOT_MAX_AGE_SECONDS`, `LineWaiter` checks, `match_waiters` (owner resources-unit; it reviews this diff)
+- `scripts/lint/test_memory_admit.py` — snapshot and matcher tests (owner resources-unit)
+- `scripts/build_queue/build_why.py` — `queue_read()`, cell width from `scripts/lib/terminal_cells.py`
+- `scripts/lib/terminal_cells.py` — new: `terminal_width`, the one cell width
+- `scripts/lib/test_terminal_cells.py` — new: its test
+- `scripts/production/dailies_render.py` — imports `terminal_width`; `display_width` deleted; outside Owns, showrunner approved 2026-10-30
+- `scripts/build_queue/build_queue.py`, `scripts/build_queue/queue_card.py` — `queue_read()`, `match_waiters`, `LineWaiter` checks
+- `scripts/build_queue/queue_lines.py` — imports `terminal_width`
+- `docs/as-built/build-memory-admission.md`, `docs/as-built/build-targets.md` — item 6
+
+**Workers:** 1 writer + 1 tester.
+- `test` — the snapshot, matcher and check tests:
+  - Snapshot: a written file round-trips to the same `QueueRead` as the locked read; age 10 s uses it, 10.1 s and a future time take the locked read; wrong `v`, bad JSON and a missing file take the locked read; each of `check`, `bump_waiter`, `release`, `set_width` rewrites it; a failed write leaves the result and the old file; a reader never sees a partial file (temp + replace).
+  - `match_waiters` gives the same matches `bump_waiter` used before; `LineWaiter` checks equal the head's construction for the same row.
+
+**State:** `admission/queue.json` (new; rewritten under the admission lock at the end of every exclusive section; a cache that readers ignore when older than 10 s).
+
+**Acceptance gate:**
+- `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY python3 -m unittest scripts.build_queue.test_build_queue scripts.build_queue.test_build_why scripts.build_queue.test_head_facts scripts.build_queue.test_queue_view scripts.build_queue.test_queue_card scripts.build_queue.test_queue_lines scripts.lint.test_memory_admit scripts.lib.test_terminal_cells scripts.production.test_dailies_render scripts.message.test_unit_labels scripts.build_targets.test_build_targets scripts.buildlog.test_record scripts.buildlog.test_parse scripts.buildlog.test_test_phase_peak` green.
+- `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python` over each slot's own changed Python files: `0 errors, 0 warnings, 0 notes`.
+- Live on natedev, steps waiting, from the worktree's scripts: three runs each of `build_queue.py`, `build_queue.py --json --columns 89`, `build_queue.py 4` and `build_why.py`, every run under 1.0 s wall; the summary lists the 12 times and whether each read the snapshot. No screenshot.
+- Live: the snapshot write adds at most 10 ms median to an exclusive hold over at least 200 `check` passes; the summary gives the median and the max.
+- The notice has `also touches` lines for `memory_admit.py` and `test_memory_admit.py` (resources-unit, against `origin/builds-resources`; resources-unit reviewed the diff) and `dailies_render.py` (its owner, against its tip).
 
 ### Phase 2 — One decision pass decides for every waiting step, and the check and the queue read both call it  · status: todo
 **Depends on:** Phase 1
