@@ -32,7 +32,7 @@ import conversation_pause
 from probe_session import PROBE_ENV
 import unit_runs
 if TYPE_CHECKING:
-    from record import PausedSeat
+    from shutdown_record import PausedSeat
     from ..direct.worker_state import worker_ledger
 else:
     from worker_state import worker_ledger
@@ -906,7 +906,7 @@ def _left_since_offered(directory: Path, roster: dict[str, dict[str, object]]) -
 
 
 def codex_seats(run_directories: list[Path]) -> list[PausedSeat]:
-    from record import PausedSeat
+    from shutdown_record import PausedSeat
 
     seats: list[PausedSeat] = []
     for directory in run_directories:
@@ -946,9 +946,8 @@ def _codex_servers(run_directories: list[Path]) -> list[CodexServer]:
             entry = cast(dict[str, object], raw_entry)
             status = entry.get("status")
             launcher = _positive_int(entry.get("launcher_pid"))
-            launcher_is_live = "launcher_pid" not in entry or (
-                launcher is not None and _pid_alive(launcher)
-            )
+            # Saved status alone does not prove a launcher is still doing work.
+            launcher_is_live = launcher is not None and _pid_alive(launcher)
             if status in {"running", "starting"} and launcher_is_live:
                 busy.append(name)
         servers.append({"run_dir": str(directory), "pid": pid, "busy_workers": busy})
@@ -1901,7 +1900,7 @@ def _snapshot_host_process(owner: Session, hosts: _SnapshotHosts) -> RecoveryHos
 
 def _snapshot_gone_hosts(hosts: _SnapshotHosts, boot_id: str) -> frozenset[tuple[str, str]]:
     """Positive host loss is distinct from an unavailable host identity."""
-    from record import all_snapshots
+    from shutdown_record import all_snapshots
     gone: set[tuple[str, str]] = set()
     reader = hosts.reader
     for saved in all_snapshots():

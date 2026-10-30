@@ -43,7 +43,7 @@ import unit_lookup
 import unit_move
 import unit_names
 from production_units import Production
-from record import InvalidRecord
+from shutdown_record import InvalidRecord
 
 ADD_UNIT = Path(__file__).resolve().parent / "add_unit.py"
 RETIRED = re.compile(r"^\s*\(retired [^)]*\)\s*")

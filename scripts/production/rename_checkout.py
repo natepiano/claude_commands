@@ -34,8 +34,8 @@ import unit_move  # noqa: E402
 from rename_state import RenameRefused, write_text  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-import record as shutdown_record  # noqa: E402
-from record import SessionShutdown  # noqa: E402
+import shutdown_record  # noqa: E402
+from shutdown_record import SessionShutdown  # noqa: E402
 
 PARENT_LINE = "- **Parent production:** "
 CHECKOUT_LINE = "- **Showrunner checkout:** "

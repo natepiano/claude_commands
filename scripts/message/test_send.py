@@ -34,7 +34,7 @@ import postmaster
 import silence
 from test_postmaster import FakeClock
 import codex_daemon
-import record as shutdown_record
+import shutdown_record
 import restart
 import roster
 import settle

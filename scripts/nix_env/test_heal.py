@@ -227,9 +227,9 @@ class HealTests(NixFixture):
 
     def test_missing_shutdown_record_is_distinct_from_an_in_progress_record(self) -> None:
         sys.path.insert(0, str(heal.SCRIPTS / "shutdown"))
-        from scripts.shutdown import record
+        from scripts.shutdown import shutdown_record
 
-        with patch.object(record, "find_session", return_value=None):
+        with patch.object(shutdown_record, "find_session", return_value=None):
             completion = heal.stop_completion(self.session, "test-account")
         self.assertIsInstance(completion, heal.StopPending)
         if not isinstance(completion, heal.StopPending):
