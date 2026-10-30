@@ -1300,6 +1300,13 @@ class MemoryQueueFixture(unittest.TestCase):
             return self.readings[pid]
         _ = self.enterContext(patch.object(gate, "tree_memory", side_effect=reading))
 
+    def waiter(self, pid: int, since: float, folder: str, name: str, need: float = 10.9) -> Path:
+        row: gate.Waiter = {"pid": pid, "start_time": self.processes[pid], "since": since, "need": int(need * GIB),
+                            "session_id": f"session-{pid}", "session_name": name, "step": "nextest", "folder": folder}
+        path = gate.admission_dir(self.root) / f"{pid}-{self.processes[pid]}.waiting"
+        _ = path.write_text(json.dumps(row))
+        return path
+
     def running(self, pid: int, need: float, age: float = 180) -> Path:
         row: gate.Reservation = {"pid": pid, "start_time": self.processes[pid], "need": int(need * GIB),
                                  "repo": "test", "step": "nextest", "worktree": "test", "sidecar": "",
@@ -2750,6 +2757,114 @@ class LiveMemoryTripwireTests(MemoryQueueFixture):
                 self.assert_record(reading, in_process=False)
 
 
+class OrderedAdmissionTests(MemoryQueueFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        environment = fake_memory_readings(self.root)
+        environment.update({"BUILDLOG_MEMINFO": str(self.meminfo), "BUILDLOG_BUILD_BUDGET_GIB": "10"})
+        _ = cast(object, self.enterContext(patch.dict(os.environ, environment)))
+        _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
+        self.processes[500] = "younger"
+        _ = self.meminfo.write_text(f"MemAvailable: {24 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+
+    def scenario(self, window: str, older_need: float, younger_need: float) -> tuple[Path, Path]:
+        directory = gate.admission_dir(self.root)
+        for suffix in ("waiting", "reservation"):
+            for path in directory.glob(f"*.{suffix}"):
+                path.unlink()
+        _ = self.running(100, 5.8)
+        self.readings[100] = gate.MeasuredMemory(int(5.8 * GIB))
+        if window != "none":
+            path = self.waiter(300, NOW.timestamp() - 2400, "/tmp/head", "head", 19.3)
+            row = cast(gate.Waiter, json.loads(path.read_text()))
+            row.update(label="head nextest", holds_younger=True,
+                       priority_since=NOW.timestamp() - (600 if window == "backfill" else 0))
+            _ = path.write_text(json.dumps(row))
+        return (self.waiter(400, NOW.timestamp() - 120, "/tmp/berth", "berth", older_need),
+                self.waiter(500, NOW.timestamp() - 60, "/tmp/handler", "handler", younger_need))
+
+    def test_younger_poll_keeps_room_for_older_fitting_step_in_each_window(self) -> None:
+        for window in ("none", "backfill"):
+            with self.subTest(window=window):
+                _ = self.scenario(window, 2.9, 3.0)
+                result = self.check(pid=500, need=3, free=24)
+                self.assertEqual(result.decision.state, "hold")
+                self.assertEqual(result.head_reason, gate.BehindOlderFit("berth", NOW.timestamp() - 120, "session-400"))
+                self.assertEqual(self.check(pid=400, need=2.9, free=24).decision.state, "admit")
+
+    def test_older_smaller_step_gets_room_before_younger_in_each_window(self) -> None:
+        for window in ("none", "backfill"):
+            with self.subTest(window=window):
+                _ = self.scenario(window, 1, 4)
+                self.assertEqual(self.check(pid=500, need=4, free=24).decision.state, "hold")
+                self.assertEqual(self.check(pid=400, need=1, free=24).decision.state, "admit")
+
+    def test_younger_starts_when_older_does_not_fit_in_each_window(self) -> None:
+        for window in ("none", "backfill"):
+            with self.subTest(window=window):
+                _ = self.scenario(window, 5, 3)
+                self.assertEqual(self.check(pid=500, need=3, free=24).decision.state, "admit")
+
+    def test_strict_window_keeps_behind_head_reason(self) -> None:
+        _ = self.scenario("strict", 2.9, 3)
+        view = gate.queue_view()
+        self.assertIsInstance(view.waiting[-1].reason, gate.BehindHead)
+        self.assertEqual(self.check(pid=500, need=3, free=24).decision.state, "hold")
+
+    def test_one_snapshot_agrees_in_check_queue_explain_blocker_and_shell(self) -> None:
+        _, younger = self.scenario("none", 2.9, 3)
+        self.assert_older_fit_snapshot(younger)
+
+    def test_open_recovery_slot_reserves_first_fitting_waiter_in_each_window(self) -> None:
+        for window in ("none", "backfill"):
+            with self.subTest(window=window):
+                _, younger = self.scenario(window, 3, 3)
+                directory = gate.admission_dir(self.root)
+                if window == "none":
+                    (directory / "100.reservation").unlink()
+                else:
+                    self.readings[100] = gate.MeasuredMemory(GIB)
+                gate.write_recovery(directory, gate.RecoveryStarts(NOW.timestamp() + 120, NOW.timestamp()))
+                self.assert_older_fit_snapshot(younger)
+                self.assertEqual(self.check(pid=400, need=3, free=24).decision.state, "admit")
+                self.assertEqual(gate.read_recovery(directory),
+                                 gate.RecoveryStarts(NOW.timestamp() + 120, NOW.timestamp() + 30))
+
+    def test_strict_wait_line_names_reserved_head_without_duplicate_behind_text(self) -> None:
+        _ = self.scenario("strict", 2.9, 3)
+        result = self.check(pid=500, need=3, free=24)
+        with patch.dict(os.environ, {"BUILDLOG_MEM_DETAIL": "1"}):
+            fields = self.shell_fields(result)
+        self.assertEqual(len(fields), 18)
+        self.assertNotIn("behind head", fields[8])
+        self.assertEqual(int(fields[16]), int(19.3 * GIB))
+        self.assertIn("head", fields[17])
+
+    def assert_older_fit_snapshot(self, younger: Path) -> None:
+        reason = gate.BehindOlderFit("berth", NOW.timestamp() - 120, "session-400")
+        result = self.check(pid=500, need=3, free=24)
+        self.assertEqual(result.head_reason, reason)
+        self.assertEqual(result.decision.state, "hold")
+        view = gate.queue_view()
+        self.assertEqual(view.waiting[-1].reason, reason)
+        explanation = gate.explain_queue()
+        self.assertEqual(explanation.line.steps[-1].waiter.reason, reason)
+        self.assertIsInstance(gate.current_blocker(younger), gate.NoSingleBlocker)
+        self.assertIsInstance(result.blocker, gate.NoSingleBlocker)
+        fields = self.shell_fields(result)
+        self.assertEqual(len(fields), 15)
+        self.assertTrue(fields[8].startswith("behind older step berth"), fields[8])
+
+    def shell_fields(self, result: gate.CheckResult) -> list[str]:
+        arguments = ["memory_admit.py", "check", str(self.meminfo), "500", "", "0",
+                     "-", "-", "-", "-", "-", "-", "cargo", "check"]
+        with patch.object(sys, "argv", arguments), patch.object(gate, "check", return_value=result), \
+             redirect_stdout(io.StringIO()) as output:
+            gate.run_action()
+        return output.getvalue().strip().split("|")
+
+
 class QueueApiTests(MemoryQueueFixture):
     @override
     def setUp(self) -> None:
@@ -2766,13 +2881,6 @@ class QueueApiTests(MemoryQueueFixture):
             return self.readings[pid]
         _ = self.enterContext(patch.object(gate, "tree_memory", side_effect=reading))
         _ = self.meminfo.write_text(f"MemAvailable: {int(23.1 * GIB) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
-
-    def waiter(self, pid: int, since: float, folder: str, name: str) -> Path:
-        row: gate.Waiter = {"pid": pid, "start_time": self.processes[pid], "since": since, "need": int(10.9 * GIB),
-                            "session_id": f"session-{pid}", "session_name": name, "step": "nextest", "folder": folder}
-        path = gate.admission_dir(self.root) / f"{pid}-{self.processes[pid]}.waiting"
-        _ = path.write_text(json.dumps(row))
-        return path
 
     def queue(self) -> tuple[Path, Path, Path]:
         return (self.waiter(300, NOW.timestamp() - 2400, "/tmp/clone88ci", "clone88ci"),
@@ -2823,7 +2931,7 @@ class QueueApiTests(MemoryQueueFixture):
 
         # Exercise a nonzero head charge at the decision boundary; strict heads normally use BehindHead.
         decision = gate.decide(8 * GIB, 60 * GIB, 3 * GIB, [gate.PromisedMemory(4 * GIB)], head_need=7 * GIB)
-        with patch.object(gate, "queue_decision", return_value=decision):
+        with patch.object(gate, "decide", return_value=decision):
             charged = gate.queue_view().waiting[1].reason
         self.assertIsInstance(charged, gate.NeedsMemory)
         if not isinstance(charged, gate.NeedsMemory):
@@ -2929,17 +3037,26 @@ class QueueApiTests(MemoryQueueFixture):
             row = cast(gate.Waiter, json.loads(path.read_text()))
             self.assertEqual(row.get("priority_since"), NOW.timestamp())
 
-    def test_bump_restarts_strict_window_during_backfill(self) -> None:
-        path = self.waiter(300, NOW.timestamp() - 2400, "/tmp/head", "head")
-        row = cast(gate.Waiter, json.loads(path.read_text()))
-        row["holds_younger"], row["priority_since"] = True, NOW.timestamp() - 600
-        _ = path.write_text(json.dumps(row))
+    def test_bump_refusal_keeps_backfill_window_and_all_waiter_bytes(self) -> None:
+        paths = self.queue()
+        row = cast(gate.Waiter, json.loads(paths[0].read_text()))
+        row.update(holds_younger=True, priority_since=NOW.timestamp() - 600)
+        _ = paths[0].write_text(json.dumps(row))
+        before = {path: path.read_bytes() for path in paths}
+        original = gate.queue_view()
         self.assertIsInstance(gate.head_window(row, NOW.timestamp()), gate.BackfillUntil)
-        _ = gate.bump_waiter("head", "actor")
-        self.assertEqual(self.check(need=1, free=40).decision.state, "hold")
-        row = cast(gate.Waiter, json.loads(path.read_text()))
-        self.assertEqual(row.get("priority_since"), NOW.timestamp())
-        self.assertIsInstance(gate.head_window(row, NOW.timestamp()), gate.StrictUntil)
+        for selector in ("2", "session-400", "warmup", "/tmp/warmup-tree", "warmup-tree", "missing", "99"):
+            with self.subTest(selector=selector), patch.object(fcntl, "flock", side_effect=AssertionError("bump took a lock")), \
+                 patch.object(gate, "read_queue", side_effect=AssertionError("bump read the queue")):
+                with self.assertRaises(gate.BumpOff) as refused:
+                    gate.bump_waiter(selector, "actor")
+                self.assertEqual(str(refused.exception),
+                                 "only the user can bump; bump is off until /showrunner:bump sets queue priority")
+            self.assertEqual({path: path.read_bytes() for path in paths}, before)
+            self.assertEqual(gate.queue_view(), original)
+            self.assertEqual(buildlog_rows(self.root), [])
+        self.assertIsInstance(gate.head_window(cast(gate.Waiter, json.loads(paths[0].read_text())), NOW.timestamp()),
+                              gate.BackfillUntil)
 
     def test_psi_11_holds_backfill_without_making_the_young_head_strict(self) -> None:
         _ = self.waiter(300, NOW.timestamp() - 540, "/tmp/head", "head")
@@ -3057,71 +3174,6 @@ class QueueApiTests(MemoryQueueFixture):
         self.assertIsInstance(head.head_reason, gate.HeadAdmissionStatus)
         self.assertIsInstance(view.waiting[1].reason, gate.BehindHead)
 
-    def test_bump_by_position_session_id_session_name_and_folder_starts_the_selected_waiter_first(self) -> None:
-        for selector in ("2", "session-400", "warmup", "/tmp/warmup-tree", "warmup-tree"):
-            with self.subTest(selector=selector):
-                for path in gate.admission_dir(self.root).glob("*.reservation"):
-                    path.unlink()
-                _ = self.queue()
-                moved = gate.bump_waiter(selector, "actor")
-                self.assertEqual(moved.pid, 400)
-                self.assertEqual(gate.queue_view().waiting[0].pid, 400)
-                older = self.check(pid=300, free=40, since=NOW.timestamp() - 2400)
-                self.assertEqual(older.decision.state, "hold")
-                selected = self.check(pid=400, free=40, since=NOW.timestamp() - 300)
-                self.assertEqual(selected.decision.state, "admit")
-                self.assertFalse((self.root / "admission/400-warmup.waiting").exists())
-
-    def test_moved_waiter_keeps_its_wait_time_and_head_position_after_another_check(self) -> None:
-        paths = self.queue()
-        original_waiters = gate.queue_view().waiting
-        original = original_waiters[-1]
-        _ = gate.bump_waiter("warmup", "actor")
-        moved = gate.bump_waiter("third", "actor")
-        self.assertEqual((moved.pid, moved.since), (original.pid, original.since))
-        waiting = gate.queue_view().waiting
-        self.assertEqual([row.pid for row in waiting], [500, 400, 300])
-        self.assertEqual({row.pid: row.since for row in waiting}, {row.pid: row.since for row in original_waiters})
-        head = waiting[0]
-        self.assertEqual((head.pid, head.since), (original.pid, original.since))
-        self.assertIsInstance(head.reason, gate.HeadAdmissionStatus)
-        self.assertEqual(cast(gate.HeadAdmissionStatus, head.reason).decision.state, "admit")
-        with patch.object(gate, "read_pressure", return_value=gate.MemoryPressure(11)):
-            held = self.check(pid=original.pid, free=0, since=original.since)
-        self.assertEqual(held.decision.state, "hold")
-        row = cast(dict[str, object], json.loads(paths[-1].read_text()))
-        self.assertEqual(row["since"], original.since)
-        head = gate.queue_view().waiting[0]
-        self.assertEqual((head.pid, head.since), (original.pid, original.since))
-        previous_head = self.check(pid=400, free=40, since=original_waiters[1].since)
-        self.assertEqual(previous_head.decision.state, "hold")
-        older = self.check(pid=300, free=40, since=NOW.timestamp() - 2400)
-        self.assertEqual(older.decision.state, "hold")
-        selected = self.check(pid=original.pid, free=40, since=original.since)
-        self.assertEqual(selected.decision.state, "admit")
-
-    def test_unknown_and_ambiguous_selectors_name_matches_and_move_nothing(self) -> None:
-        _ = self.waiter(300, NOW.timestamp() - 2400, "/one/shared", "first-session")
-        _ = self.waiter(400, NOW.timestamp() - 300, "/two/shared", "second-session")
-        before = {path: path.read_text() for path in (self.root / "admission").glob("*.waiting")}
-        for selector, word in (("missing", "unknown"), ("99", "unknown"), ("shared", "ambiguous")):
-            with self.assertRaisesRegex(ValueError, word) as result:
-                _ = gate.bump_waiter(selector, "actor")
-            if selector == "shared":
-                self.assertIn("first-session", str(result.exception))
-                self.assertIn("second-session", str(result.exception))
-            self.assertEqual({path: path.read_text() for path in before}, before)
-        self.assertEqual(list(self.root.glob("*/*.jsonl")), [])
-
-    def test_bump_writes_one_row_in_the_private_hold_event_log(self) -> None:
-        _ = self.queue()
-        _ = gate.bump_waiter("2", "actor-id")
-        rows = buildlog_rows(self.root)
-        self.assertEqual(len(rows), 1)
-        row = rows[0]
-        self.assertEqual({key: row[key] for key in ("kind", "actor", "session", "step", "folder", "old_position", "at")},
-                         {"kind": "queue_bump", "actor": "actor-id", "session": "session-400", "step": "nextest",
-                          "folder": "/tmp/warmup-tree", "old_position": 2, "at": store.utc_iso(NOW.timestamp())})
 
     def test_queue_view_and_check_agree_on_heads_that_can_and_cannot_fit_after_drain(self) -> None:
         _ = self.running(100, 30)
@@ -3176,7 +3228,8 @@ class QueueApiTests(MemoryQueueFixture):
         self.assertTrue(paths[0].exists())
         self.assertIsInstance(view.waiting[0].reason, gate.HeadAdmissionStatus)
         self.assertEqual(cast(gate.HeadAdmissionStatus, view.waiting[0].reason).decision.state, "admit")
-        self.assertIsInstance(view.waiting[1].reason, gate.ReadyForAdmission)
+        self.assertEqual(view.waiting[1].reason,
+                         gate.BehindOlderFit("warmup", NOW.timestamp() - 300, "session-400"))
         self.assertEqual(view.available, int(23.1 * GIB) // 1024 * 1024)
         self.assertEqual(signal.getsignal(signal.SIGALRM), previous)
         self.assertEqual(signal.getitimer(signal.ITIMER_REAL)[0], 0)
@@ -3984,7 +4037,8 @@ class QueueExplanationTests(MemoryQueueFixture):
         memories = [step.measured for step in view.running]
         priority = gate.head_priority([row for _, row in ordered], view.available, host.total, memories, NOW.timestamp())
         self.assertEqual(head.decision, gate.queue_decision(
-            view.available, host.total, ordered[0][1], memories, priority, host.pressure))
+            view.available, host.total, ordered[0][1], [row for _, row in ordered], memories, priority, host.pressure,
+            recovery=gate.NoRecoverySpacing(), now=NOW.timestamp()))
         self.assertEqual(head.decision.state, "hold")
         self.assertEqual((host.available, host.total, host.reserve, host.budget),
                          (16 * GIB, 60 * GIB, 3 * GIB, 21 * GIB))

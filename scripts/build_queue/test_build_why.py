@@ -261,7 +261,8 @@ class BuildWhyTests(unittest.TestCase):
             self.fail(f"expected head admission status, got {reason}")
         running = [row.measured for row in view.running]
         head = gate.head_priority([row for _, row in ordered], view.available, 60 * GIB, running, NOW)
-        decision = gate.queue_decision(view.available, 60 * GIB, ordered[0][1], running, head, gate.NoPressureHold())
+        decision = gate.queue_decision(view.available, 60 * GIB, ordered[0][1], [row for _, row in ordered], running, head,
+                                      gate.NoPressureHold(), recovery=gate.NoRecoverySpacing(), now=NOW)
         self.assertEqual(reason.decision, decision)
         self.assertEqual(decision.state, "hold")
         self.assertAlmostEqual(decision.charged / GIB, 18.1, places=5)

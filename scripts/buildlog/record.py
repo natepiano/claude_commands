@@ -968,15 +968,6 @@ def hold_event(args: list[str]) -> None:
     store.append_line(store.host_file(host, instant.timestamp()), record)
 
 
-def queue_bump(actor: str, session: str, step: str, folder: str, old_position: int, at: float) -> None:
-    host = store.host_name()
-    store.append_line(store.host_file(host, at), {
-        "kind": "queue_bump", "v": RECORD_VERSION,
-        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
-        "actor": actor, "session": session, "step": step, "folder": folder, "old_position": old_position,
-    })
-
-
 def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step: str,
                    need: int, free: int, reserve: int, why: str, set_by: str, at: float) -> None:
     host = store.host_name()

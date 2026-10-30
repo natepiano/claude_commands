@@ -23,6 +23,31 @@ from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 @final
 class SharedGateAdmissionTests(GateSuitesFixture):
+    def test_gate_behind_an_older_fitting_step_prints_its_reason(self) -> None:
+        pid, older_pid = os.getpid(), 999999
+        self.admission_directory.mkdir(parents=True, exist_ok=True)
+        older = self.admission_directory / "older.waiting"
+        self.write(older, json.dumps({"pid": older_pid, "start_time": "older", "need": 400 * (1 << 20),
+            "since": time.time() - 60, "session_id": "older-id", "session_name": "older-step", "step": "check"}))
+        processes = {pid: memory_admit.ProcessIdentity(1, "gate"), older_pid: memory_admit.ProcessIdentity(1, "older")}
+        environment = {**self.environment, "BUILDLOG_BUILD_BUDGET_GIB": "0.6", "BUILDLOG_PROC": str(self.root / "proc")}
+        output = io.StringIO()
+
+        def process_start(candidate: int) -> str:
+            return processes[candidate].start
+
+        def next_poll(_seconds: float) -> None:
+            older.unlink()
+
+        with mock.patch.dict(os.environ, environment), \
+             mock.patch.object(memory_admit, "process_table", return_value=processes), \
+             mock.patch.object(memory_admit, "process_start_time", side_effect=process_start), \
+             mock.patch.object(time, "sleep", side_effect=next_poll), redirect_stdout(output):
+            with merge_gate.gate_reservation(self.checkout, 512, self.state, merge_gate.BuildHoldWait()):
+                pass
+        self.assertIn("behind older step older-step", output.getvalue())
+        self.assert_gate_released()
+
     def test_memory_wait_reports_changes_and_only_one_reminder_per_minute(self) -> None:
         busy = self.occupy_memory_queue()
         checks = memory_admit.check

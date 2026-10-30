@@ -368,6 +368,8 @@ def gate_wait_reasons(result: memory_admit.CheckResult) -> tuple[str, ...]:
         if decision.pressure.swap_used_percent > memory_admit.SWAP_USED_LIMIT:
             return ("swap memory pressure",)
         return ("memory pressure",)
+    if isinstance(result.head_reason, memory_admit.BehindOlderFit):
+        return (memory_admit.older_fit_text(result.head_reason),)
     reasons: list[str] = []
     if result.head_need:
         reasons.append(f"queue head {result.head_label}")

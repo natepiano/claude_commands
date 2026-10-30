@@ -45,8 +45,6 @@ class StepParser(Protocol):
 class GitIdentityReader(Protocol):
     def git_directory(self, argv: list[str], cwd: str) -> str: ...
     def git_facts(self, directory: str) -> GitFacts: ...
-    def queue_bump(self, actor: str, session: str, step: str, folder: str,
-                   old_position: int, at: float) -> None: ...
     def head_admission(self, action: Literal["set", "admitted", "lapsed"], unit: str,
                        step: str, need: int, free: int, reserve: int, why: str,
                        set_by: str, at: float) -> None: ...
@@ -423,6 +421,21 @@ class AdmissionLimits:
 
 
 @dataclass(frozen=True)
+class NoOrderHold:
+    pass
+
+
+@dataclass(frozen=True)
+class HeldBehindHead:
+    waiter: Waiter
+
+
+@dataclass(frozen=True)
+class HeldBehindOlderFit:
+    waiter: Waiter
+
+
+@dataclass(frozen=True)
 class AdmissionDecision:
     state: Literal["admit", "hold"]
     threshold: int
@@ -435,6 +448,7 @@ class AdmissionDecision:
     budget_passes: bool = True
     free_passes: bool = True
     head_need: int = 0
+    order_hold: NoOrderHold | HeldBehindHead | HeldBehindOlderFit = NoOrderHold()
 
 
 @dataclass(frozen=True)
@@ -459,6 +473,17 @@ class BehindHead:
     head_name: str
     head_since: float
     head_session_id: str
+
+
+@dataclass(frozen=True)
+class BehindOlderFit:
+    older_name: str
+    older_since: float
+    older_session_id: str
+
+
+def older_fit_text(reason: BehindOlderFit, label: str = "") -> str:
+    return f"behind older step {label or reason.older_name}"
 
 
 @dataclass(frozen=True)
@@ -489,7 +514,7 @@ class ReadingUnavailable:
     pass
 
 
-WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure
+WaitReason = NeedsBuildBudget | NeedsMemory | BehindHead | BehindOlderFit | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure
 
 
 def head_wait_reason(decision: AdmissionDecision, need: int, available: int,
@@ -855,8 +880,8 @@ class WaiterGone(FileNotFoundError):
     """The requested waiter has left the admission ledger."""
 
 
-class UnmatchedWaiter(ValueError):
-    """A bump selector matched no waiting step, or more than one."""
+class BumpOff(ValueError):
+    """Queue bumps are disabled until user queue priority replaces them."""
 
 
 def blocker_fields(blocker: Blocker) -> dict[str, str]:
@@ -879,7 +904,7 @@ class CheckResult:
     profile: StepProfile | GateProfile
     head_need: int = 0
     head_label: str = ""
-    head_reason: HeadAdmissionStatus | ReadyForAdmission = ReadyForAdmission()
+    head_reason: HeadAdmissionStatus | BehindHead | BehindOlderFit | ReadyForAdmission = ReadyForAdmission()
     blocker: Blocker = NoSingleBlocker()
 
 
@@ -1664,11 +1689,6 @@ def pressure_with_recovery(recovery: RecoverySpacing, pressure: Pressure, now: f
     return pressure
 
 
-def recovery_pressure(directory: Path, pressure: Pressure, now: float) -> Pressure:
-    """Read the bounded recovery window; only check writes it under its lock."""
-    return pressure_with_recovery(read_recovery(directory), pressure, now)
-
-
 def pressure_text(pressure: MemoryPressure) -> str:
     if pressure.next_start_at:
         return "memory pressure recovery: starts at least 30 s apart"
@@ -1750,19 +1770,49 @@ def head_priority(waiters: list[Waiter], available: int, total: int | None,
     return NoHeadPriority()
 
 
-def queue_decision(available: int, total: int | None, row: Waiter,
+@dataclass(frozen=True)
+class WaiterAdmission:
+    waiter: Waiter
+    decision: AdmissionDecision
+
+
+def admission_walk(available: int, total: int | None, ordered: list[Waiter],
                    running: list[StepMemory], head: HeadPriority | NoHeadPriority,
-                   pressure: Pressure, *,
+                   pressure: Pressure, *, recovery: RecoverySpacing, now: float,
+                   limits: AdmissionLimits | ReadHostAdmissionLimits = READ_HOST_ADMISSION_LIMITS) -> list[WaiterAdmission]:
+    """Keep room for each fitting waiter before considering younger waiters."""
+    promised = list(running)
+    marked: list[Waiter] = []
+    admissions: list[WaiterAdmission] = []
+    recovering = isinstance(recovery, RecoveryStarts) and now < recovery.ends_at
+    for row in sorted(ordered, key=waiter_order):
+        strict = (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
+                  and waiter_order(head.waiter) < waiter_order(row))
+        head_need = head.waiter["need"] if strict and isinstance(head, HeadPriority) else 0
+        decision = decide(available, total, row["need"], running if strict else promised, head_need, pressure, limits=limits)
+        if strict and isinstance(head, HeadPriority):
+            decision = replace(decision, state="hold", order_hold=HeldBehindHead(head.waiter))
+        elif (isinstance(head, HeadPriority) and waiter_order(head.waiter) == waiter_order(row)
+              and not has_running_step(promised)):
+            decision = replace(decision, state="admit" if isinstance(pressure, NoPressureHold) else "hold")
+        elif marked and ((decision.state == "admit" and recovering)
+                         or (decision.state == "hold" and decide(available, total, row["need"], running,
+                                                                pressure=pressure, limits=limits).state == "admit")):
+            decision = replace(decision, state="hold", order_hold=HeldBehindOlderFit(marked[0]))
+        admissions.append(WaiterAdmission(row, decision))
+        if decision.state == "admit":
+            marked.append(row)
+            promised.append(PromisedMemory(row["need"]))
+    return admissions
+
+
+def queue_decision(available: int, total: int | None, row: Waiter, ordered: list[Waiter],
+                   running: list[StepMemory], head: HeadPriority | NoHeadPriority,
+                   pressure: Pressure, *, recovery: RecoverySpacing, now: float,
                    limits: AdmissionLimits | ReadHostAdmissionLimits = READ_HOST_ADMISSION_LIMITS) -> AdmissionDecision:
-    younger = (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
-               and waiter_order(head.waiter) < waiter_order(row))
-    head_need = head.waiter["need"] if younger and isinstance(head, HeadPriority) else 0
-    decision = decide(available, total, row["need"], running, head_need, pressure, limits=limits)
-    if younger:
-        return replace(decision, state="hold")
-    if isinstance(head, HeadPriority) and waiter_order(head.waiter) == waiter_order(row) and not has_running_step(running):
-        return replace(decision, state="admit" if isinstance(pressure, NoPressureHold) else "hold")
-    return decision
+    snapshot = ordered if any(waiter is row for waiter in ordered) else [*ordered, row]
+    return next(entry.decision for entry in admission_walk(available, total, snapshot, running, head, pressure,
+                                                           recovery=recovery, now=now, limits=limits) if entry.waiter is row)
 
 
 GENERIC_REPO_NAMES = frozenset({"", "repo", "c", "clone", "scratch", "tmp", "repository"})
@@ -2031,7 +2081,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         if (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
                 and waiter_order(head.waiter) < waiter_order(waiter)):
             head_need, head_label = head.waiter["need"], waiter_label(head.waiter)
-        decision = queue_decision(available, total, waiter, running, head, pressure)
+        decision = queue_decision(available, total, waiter, candidates, running, head, pressure,
+                                  recovery=recovery, now=now.timestamp())
         waiter_override: HeadAdmissionOverride | NoHeadAdmissionOverride = (
             override if (not isinstance(override, NoHeadAdmissionOverride) and bool(argv)
                          and head_override_matches(override, mine, waiter)
@@ -2048,7 +2099,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             decision = replace(decision, state="hold")
             print("memory admission: estimate expired while waiting for the lock; refresh on the next poll", file=sys.stderr)
         blocker = reservation_blocker(waiter, candidates, [row for _, row in live], running,
-                                      available, total, pressure, now.timestamp(), processes, proc)
+                                      available, total, pressure, now.timestamp(), processes, proc, recovery=recovery)
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
         if argv and decision.state == "hold" and start is not None:
             identity = waiter_identity(step, worktree)
@@ -2081,7 +2132,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 end_head_override(directory, "admitted", waiter_override, peak.bytes, available,
                                   decision.reserve, now.timestamp())
         head_reason = (head_wait_reason(decision, peak.bytes, available, waiter, now.timestamp())
-                       if candidates and candidates[0] is waiter else ReadyForAdmission())
+                       if candidates and candidates[0] is waiter
+                       else queue_order_reason(decision, QueueIdentityReader(processes, proc)))
         return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile,
                            head_need, head_label, head_reason, blocker)
 
@@ -2155,6 +2207,18 @@ class QueueIdentityReader:
         return {"session_id": session, "session_name": name or self.names.get(session, ""), "step": step, "folder": folder}
 
 
+def queue_order_reason(decision: AdmissionDecision, identities: QueueIdentityReader) -> BehindHead | BehindOlderFit | ReadyForAdmission:
+    hold = decision.order_hold
+    if isinstance(hold, NoOrderHold):
+        return ReadyForAdmission()
+    waiter = hold.waiter
+    identity = identities.identity(waiter["pid"], cast(dict[str, object], cast(object, waiter)))
+    name = waiter_unit_name(identity, waiter["pid"])
+    if isinstance(hold, HeldBehindHead):
+        return BehindHead(name, waiter["since"], identity["session_id"])
+    return BehindOlderFit(name, waiter["since"], identity["session_id"])
+
+
 def queue_rows(directory: Path, suffix: str, processes: dict[int, ProcessIdentity]) -> list[tuple[Path, dict[str, object]]]:
     rows: list[tuple[Path, dict[str, object]]] = []
     for path in sorted(directory.glob(f"*.{suffix}")):
@@ -2172,17 +2236,19 @@ def queue_rows(directory: Path, suffix: str, processes: dict[int, ProcessIdentit
 def reservation_blocker(waiter: Waiter, waiters: list[Waiter], reservations: list[Reservation],
                         running: list[StepMemory], available: int, total: int | None,
                         pressure: Pressure, now: float, processes: dict[int, ProcessIdentity],
-                        proc: Path) -> Blocker:
+                        proc: Path, *, recovery: RecoverySpacing) -> Blocker:
     """Name the unique reservation whose release would admit this waiter."""
     head = head_priority(waiters, available, total, running, now)
-    if queue_decision(available, total, waiter, running, head, pressure).state == "admit":
+    if queue_decision(available, total, waiter, waiters, running, head, pressure,
+                      recovery=recovery, now=now).state == "admit":
         return NoSingleBlocker()
     blockers: list[int] = []
     for index, memory in enumerate(running):
         remaining = running[:index] + running[index + 1:]
         freed = memory.bytes - memory.swap_bytes if isinstance(memory, MeasuredMemory) else 0
         after_head = head_priority(waiters, available + freed, total, remaining, now)
-        if queue_decision(available + freed, total, waiter, remaining, after_head, pressure).state == "admit":
+        if queue_decision(available + freed, total, waiter, waiters, remaining, after_head, pressure,
+                          recovery=recovery, now=now).state == "admit":
             blockers.append(index)
     if len(blockers) != 1:
         return NoSingleBlocker()
@@ -2231,9 +2297,10 @@ def blocker_snapshot(waiter_path: Path) -> Blocker:
     except (OSError, ValueError):
         return NoSingleBlocker()
     available, total = host.available, host.total
-    pressure = recovery_pressure(directory, read_pressure(host), now)
+    recovery = read_recovery(directory)
+    pressure = pressure_with_recovery(recovery, read_pressure(host), now)
     return reservation_blocker(matching[0], [row for _, row in ordered], reservations, running,
-                               available, total, pressure, now, processes, proc)
+                               available, total, pressure, now, processes, proc, recovery=recovery)
 
 
 def current_blocker(waiter_path: Path) -> Blocker:
@@ -2282,7 +2349,8 @@ def read_queue_pass(directory: Path, processes: dict[int, ProcessIdentity], now:
     except (OSError, ValueError):
         unavailable = True
     available, total = host.available, host.total
-    pressure = recovery_pressure(directory, read_pressure(host), now)
+    recovery = read_recovery(directory)
+    pressure = pressure_with_recovery(recovery, read_pressure(host), now)
     ordered = sorted(((path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)),
                      key=lambda item: waiter_order(item[1]))
     head = head_priority([row for _, row in ordered], available, total, memory, now)
@@ -2290,19 +2358,18 @@ def read_queue_pass(directory: Path, processes: dict[int, ProcessIdentity], now:
     waiting: list[WaitingStep] = []
     first: HeadExplanation | NoWaiter = NoWaiter()
     line: list[LineWaiter] = []
-    for _, row in ordered:
+    admissions = admission_walk(available, total, [row for _, row in ordered], memory, head, pressure,
+                                recovery=recovery, now=now)
+    for admission in admissions:
+        row, own = admission.waiter, admission.decision
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
-        own = queue_decision(available, total, row, memory, head, pressure)
         reason: WaitReason = ReadyForAdmission()
         if unavailable:
             reason = ReadingUnavailable()
-        elif (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
-              and waiter_order(head.waiter) < waiter_order(row)):
-            head_identity = identities.identity(head.waiter["pid"], cast(dict[str, object], cast(object, head.waiter)))
-            reason = BehindHead(waiter_unit_name(head_identity, head.waiter["pid"]),
-                                head.waiter["since"], head_identity["session_id"])
         elif row is ordered[0][1]:
             reason = head_wait_reason(own, row["need"], available, row, now)
+        elif not isinstance(own.order_hold, NoOrderHold):
+            reason = queue_order_reason(own, identities)
         elif isinstance(own.pressure, MemoryPressure):
             reason = own.pressure
         elif own.state == "hold":
@@ -2396,14 +2463,16 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
     available = host.available + freed
     total = host.total if isinstance(host.total, int) else None
     limits = AdmissionLimits(host.budget, host.reserve)
-    waiter: Waiter = {"pid": head.waiter.pid, "start_time": "", "need": head.waiter.need,
-                      "since": head.waiter.since}
+    ordered: list[Waiter] = [{"pid": step.pid, "start_time": "", "need": step.need, "since": step.since}
+                            for step in (head.waiter, *(row.waiter for row in explanation.line.steps))]
+    waiter = ordered[0]
     if isinstance(head.bump, QueueBump):
         waiter["priority_since"] = head.bump.priority_since
         waiter["holds_younger"] = head.bump.holds_younger
         waiter["bump_order"] = -1 if head.bump.by_position else 0
-    priority = head_priority([waiter], available, total, remaining, explanation.now, limits=limits)
-    decision = queue_decision(available, total, waiter, remaining, priority, host.pressure, limits=limits)
+    priority = head_priority(ordered, available, total, remaining, explanation.now, limits=limits)
+    decision = queue_decision(available, total, waiter, ordered, remaining, priority, host.pressure,
+                              recovery=NoRecoverySpacing(), now=explanation.now, limits=limits)
     charge_drop = sum(row.charged for row in released)
     growth_drop = sum(growth_headroom(row.step.measured) for row in released)
     if decision.state == "admit":
@@ -2480,49 +2549,8 @@ def smallest_head_release(explanation: QueueExplanation) -> HeadAfterEnd:
     return all_ended
 
 
-@dataclass(frozen=True)
-class WaiterRowSelector:
-    row_key: str
-    original_selector: str
-
-
-def bump_waiter(selector: str | WaiterRowSelector, actor: str) -> WaitingStep:
-    directory = admission_dir(store.root())
-    with (directory / "lock").open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        view, ordered = read_queue(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())
-        matches: list[int] = []
-        if isinstance(selector, WaiterRowSelector):
-            matches = [position for position, item in enumerate(ordered)
-                       if item[0].name == selector.row_key]
-            original_selector = selector.original_selector
-        elif selector.isdecimal():
-            original_selector = selector
-            position = int(selector) - 1
-            if 0 <= position < len(view.waiting):
-                matches = [position]
-        else:
-            original_selector = selector
-            matches = [position for position, item in enumerate(view.waiting)
-                       if selector in (item.session_id, item.session_name, item.folder, Path(item.folder).name)]
-        if len(matches) != 1:
-            labels = ", ".join(f"{position + 1}: {item.session_name or item.session_id or item.pid} {item.folder}"
-                               for position, item in enumerate(view.waiting) if not matches or position in matches)
-            raise UnmatchedWaiter(f"{original_selector!r}: {'unknown' if not matches else 'ambiguous'} waiter; matches: {labels or 'none'}")
-        position = matches[0]
-        moved = view.waiting[position]
-        path, row = ordered[position]
-        # Each move gets an order before all current waiters. Keep the wait time.
-        row["bump_order"] = min(0, *(item.get("bump_order", 0) for _, item in ordered)) - 1
-        row["holds_younger"] = True
-        row["priority_since"] = time.time()
-        temporary = path.with_suffix(".bump")
-        _ = temporary.write_text(json.dumps(row, separators=(",", ":")))
-        os.replace(temporary, path)
-        record.queue_bump(actor, moved.session_id or moved.session_name, moved.step, moved.folder, position + 1, view.now)
-        reason = moved.reason if isinstance(moved.reason, (NeedsBuildBudget, NeedsMemory, ReadingUnavailable, MemoryPressure)) else ReadyForAdmission()
-        return WaitingStep(moved.pid, moved.session_id, moved.session_name, moved.step, moved.folder,
-                           row["since"], moved.need, reason)
+def bump_waiter(_selector: str, _actor: str) -> NoReturn:
+    raise BumpOff("only the user can bump; bump is off until /showrunner:bump sets queue priority")
 
 
 def write_admission_record(path: Path, row: object) -> None:
@@ -2659,6 +2687,8 @@ def run_action() -> None:
     summary = ", ".join(f"{row['repo']} {row['step']} in {row['worktree']}" for row in live)
     if isinstance(result.head_reason, HeadAdmissionStatus):
         summary = f"{head_wait_text(result.head_reason, user_zone())}; {summary}".rstrip("; ")
+    elif isinstance(result.head_reason, BehindOlderFit):
+        summary = f"{older_fit_text(result.head_reason)}; {summary}".rstrip("; ")
     elif isinstance(decision.pressure, MemoryPressure):
         summary = f"{pressure_text(decision.pressure)}; {summary}".rstrip("; ")
     if diagnostics.getvalue():

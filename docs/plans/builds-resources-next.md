@@ -13,3 +13,11 @@
   - Why needed: after Phase 4 the build-log `sweep_trim` row is the one record of a trim and nothing writes `~/.local/state/lint-sweep/removals.jsonl`; the read-only legacy reader is a second source to keep only until its 35-day retention has passed.
   - Completion condition: on or after 2026-12-05 the reader and the file are deleted, `sweep.py rebuilds` reads only the journal and the build-log rows, and `test_sweep.py` passes.
   - Revealed by: Phase 25 review (Phase 4 Spec 6; builds showrunner 2026-10-30: next, dated on or after 2026-12-05)
+
+- [ ] **EASY backfill with p90 step durations from the build log (option B for the strict window): measure after Phase 30 has run for a day**
+  - Revealed by: Phase 30 (builds showrunner 2026-10-30: next)
+
+- [ ] **Make the build_targets.py call from verify.sh cheap: it costs 199 ms of CPU on every step**
+  - Why needed: verify measured `build_targets.py` at 199 ms of CPU each time `verify.sh` starts it, on every step; it is the most costly helper.
+  - Completion condition: the call uses fewer imports or a lighter entry path; the change reports before and after CPU figures for the same call, and the build_targets and verify tests pass.
+  - Revealed by: verify-unit measurement (builds showrunner 2026-10-30: next)
