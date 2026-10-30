@@ -350,7 +350,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Gotchas:** `codex_mesh.py end --cleanup-only` is models-unit's and was queued, not shipped, at this checkpoint; until it lands, the cleanup exits 1 and the record stays and is counted. A rerun after a stop between the log append and the journal rewrite logs the outcome twice; that is accepted.
 
-### Phase 13a — The change review check skips commits already on another production's merge branch  · status: todo
+### Phase 13a — The change review check skips commits already on another production's merge branch  · status: done
 **Depends on:** none. A fix the showrunner asked for ahead of Phase 14 (2026-10-29): performance's frame-cost checkpoint a20f211eb3 merges init/catalyst, and the change-review step held it for 15 catalyst commits whose rows were written when they landed there.
 
 #### Work Order
