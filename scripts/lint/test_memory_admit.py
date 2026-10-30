@@ -1234,6 +1234,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         self.readings_for()
         reservation = self.running(100, 12)
         _ = reservation.with_suffix(".max").write_text(str(13 * GIB))
+        os.utime(reservation.with_suffix(".max"), (NOW.timestamp(), NOW.timestamp()))
         self.readings[100] = gate.MeasuredMemory(2 * GIB)
         result = self.admit_at()
         self.assertEqual((result.decision.state, result.decision.charged, result.decision.measured),
@@ -1302,6 +1303,26 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
                     near_peak.unlink()
                     near_peak.mkdir()
                 elif contents is not None:
+                    _ = near_peak.write_text(contents)
+                result = self.admit_at()
+                self.assertEqual((result.decision.state, result.decision.charged), ("hold", 13 * GIB))
+
+    def test_invalid_near_peak_record_does_not_use_expired_peak_publication_time(self) -> None:
+        self.readings_for()
+        reservation = self.running(100, 12)
+        maximum = reservation.with_suffix(".max")
+        _ = maximum.write_text(str(13 * GIB))
+        published_at = NOW.timestamp() - 2000
+        os.utime(maximum, (published_at, published_at))
+        near_peak = reservation.with_suffix(".wave")
+        self.readings[100] = gate.MeasuredMemory(2 * GIB)
+        for contents in ("", "bad", f"{13 * GIB} -1", str(int(published_at)),
+                         f"{12 * GIB} {int(published_at)}", "directory"):
+            with self.subTest(contents=contents):
+                if contents == "directory":
+                    near_peak.unlink()
+                    near_peak.mkdir()
+                else:
                     _ = near_peak.write_text(contents)
                 result = self.admit_at()
                 self.assertEqual((result.decision.state, result.decision.charged), ("hold", 13 * GIB))
@@ -1700,6 +1721,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
             self.assertGreater(end, "18:47:54")
             reservation = self.running(pid, 1)
             _ = reservation.with_suffix(".max").write_text(str(peak))
+            os.utime(reservation.with_suffix(".max"), (NOW.timestamp(), NOW.timestamp()))
             # No per-step current snapshot exists; use zero to test peak alone.
             self.readings[pid] = gate.MeasuredMemory(0)
         service = self.builds / "sccache.service"
@@ -1717,6 +1739,8 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
                         self.readings[pid] = gate.MeasuredMemory(0)
                         reservation = self.running(pid, 3.14, age=-started)
                         _ = reservation.with_suffix(".max").write_text(str(peak))
+                        published_at = NOW.timestamp() + second
+                        os.utime(reservation.with_suffix(".max"), (published_at, published_at))
                         charged_peaks += max(peak, int(3.14 * GIB))
                 result = self.admit_at(seconds=second, need=need)
                 self.assertEqual(result.decision.state, "hold", f"recorded peaks at +{second}s")
