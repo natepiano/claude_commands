@@ -14,10 +14,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from datetime import timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.accounts import moves
+from scripts.accounts import moves, worker_names
 from scripts.accounts import accounts
 from scripts.shutdown import test_account_move as move_fixture
 from scripts.shutdown.test_restart import STOPPED, entry
@@ -283,6 +283,21 @@ class MoveJournalTests(unittest.TestCase):
                 else:
                     self.assertIsInstance(evidence, moves.UnreadableMoveJournal)
                 self.assertEqual(path.read_bytes(), valid + suffix)
+
+    def test_an_auto_entry_read_recovers_interrupted_worker_name_conversion(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True)
+        row = {**self.requested(), "cause": "auto", "why": "auto: recovered"}
+        complete = json.dumps(row) + "\n"
+        _ = path.write_text(complete[:70] + "damaged old bytes\n")
+        recovery = path.with_name(f".{path.name}.workers")
+        _ = recovery.write_text(complete)
+        with patch.object(fcntl, "flock", wraps=fcntl.flock) as flock:
+            evidence = moves.recorded_auto_entries()
+        self.assertEqual(evidence, moves.RecordedAutoEntries(frozenset({"recovered"})))
+        self.assertEqual(path.read_text(), complete)
+        self.assertFalse(recovery.exists())
+        self.assertTrue(any(call.args[1] == fcntl.LOCK_EX for call in flock.call_args_list))
 
     def test_move_and_routing_appends_write_one_complete_encoded_line(self) -> None:
         with patch.object(os, "write", wraps=os.write) as write:
@@ -738,6 +753,42 @@ class MoveJournalTests(unittest.TestCase):
         unchanged = path.stat().st_mtime_ns
         self.assertEqual(moves.read_moves(), loaded)
         self.assertEqual(path.stat().st_mtime_ns, unchanged)
+
+    def test_a_partial_worker_name_conversion_recovers_all_history_on_rerun(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True)
+        original = (json.dumps({**self.requested(), "subject": "seats"}) + "\ninvalid JSON\n"
+                    + json.dumps({"role": "seats", "label": "codex2"}) + "\n")
+        migrate = worker_names.migrate_locked_journal
+        for failure in (OSError("disk full"), KeyboardInterrupt("stopped during write")):
+            with self.subTest(failure=type(failure).__name__):
+                _ = path.write_text(original)
+                inode = path.stat().st_ino
+
+                def interrupted(source: TextIO, journal: Path) -> list[str]:
+                    write = source.write
+
+                    def partial_write(text: str) -> int:
+                        _ = write(text[:70])
+                        source.flush()
+                        raise failure
+
+                    with patch.object(source, "write", side_effect=partial_write):
+                        return migrate(source, journal)
+
+                with patch.object(worker_names, "migrate_locked_journal", side_effect=interrupted):
+                    with self.assertRaises(type(failure)):
+                        _ = worker_names.role_history_lines(path)
+                self.assertNotEqual(path.read_text(), original)
+                lines = worker_names.role_history_lines(path)
+                self.assertEqual(len(lines), 3)
+                self.assertEqual(json.loads(lines[0]), {**self.requested(), "subject": "workers"})
+                self.assertEqual(lines[1], "invalid JSON\n")
+                self.assertEqual(json.loads(lines[2]), {"role": "workers", "label": "codex2"})
+                self.assertEqual(path.read_text(), "".join(lines))
+                self.assertEqual(path.stat().st_ino, inode)
+                self.assertFalse(path.with_name(f".{path.name}.workers").exists())
+                self.assertFalse(path.with_name(f".{path.name}.tmp").exists())
 
     def test_confirmation_deduplicates_old_names_before_validation_and_keeps_other_workers(self) -> None:
         path = moves.store_file()

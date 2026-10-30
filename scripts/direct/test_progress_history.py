@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import argparse
 import hashlib
 import io
@@ -93,7 +95,7 @@ class ProgressHistoryTests(unittest.TestCase):
         # the test wrote instead of reading an empty one beside it.
         self.team_slot = ""
         self.agents_config_file = self.root / ".claude" / "config" / "agents.conf"
-        self.agents_config_file.parent.mkdir(parents=True, exist_ok=True)
+        _ = write_registry(self.agents_config_file)
         _ = subprocess.run(
             ["git", "init", "-b", "feature/rubric"],
             cwd=self.working_dir,
@@ -3355,9 +3357,7 @@ with patch.object(fcntl, "flock", admission):
         ]
 
     def test_a_pass_records_a_digest_of_the_configuration_it_ran_under(self) -> None:
-        _ = self.agents_config_file.write_text(
-            "[direct.implementation.codex]\nagent = gpt-called\n", encoding="utf-8"
-        )
+        _ = write_registry(self.agents_config_file, {"direct.codex": {"impl": "gpt-called:xhigh"}})
         session_dir = self.start_run("digest", 20_000)
         self.start_phase_and_pass(session_dir, 20_010)
         expected = hashlib.sha256(
@@ -3416,6 +3416,7 @@ with patch.object(fcntl, "flock", admission):
         self.assertEqual(started[0].get("team_slot"), "")
 
     def test_an_unreadable_conf_leaves_the_digest_empty_and_records_the_pass(self) -> None:
+        self.agents_config_file.unlink()
         session_dir = self.start_run("no-registry", 21_000)
         self.start_phase_and_pass(session_dir, 21_010)
         started = self.pass_events("no-registry", "pass_started")
@@ -5307,24 +5308,10 @@ with patch.object(fcntl, "flock", admission):
     def write_agents_registry(self) -> None:
         """A registry under the temporary home, so arm-review resolves the same
         agent review.sh would without reading this machine's real assignments."""
-        _ = self.agents_config_file.write_text(
-            "\n".join(
-                (
-                    "[assignments]",
-                    "direct=codex",
-                    "",
-                    "[direct.codex]",
-                    "implementation=gpt-called:xhigh",
-                    "review=gpt-blind:max",
-                    "",
-                    "[codex.agents]",
-                    "gpt-called=low,medium,high,xhigh,max",
-                    "gpt-blind=low,medium,high,xhigh,max",
-                    "",
-                )
-            ),
-            encoding="utf-8",
-        )
+        _ = write_registry(self.agents_config_file, {
+            "direct.codex": {"impl": "gpt-called:xhigh", "review": "gpt-blind:max"},
+            "codex.agents": {"gpt-called": "low,medium,high,xhigh,max", "gpt-blind": "low,medium,high,xhigh,max"},
+        })
 
     def arm_early_review(self, session_dir: Path, at: int) -> str:
         return self.run_command(

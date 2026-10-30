@@ -5,7 +5,6 @@ from __future__ import annotations
 import fcntl
 import json
 import math
-import os
 import sys
 import shlex
 import subprocess
@@ -17,8 +16,10 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, NotRequired, Protocol, TypedDict, cast
 
 if TYPE_CHECKING:
+    from ._push_fallback import fallback_matches, marker_path, object_record, text
     from ..notify.review import ReleaseOutcome, posting_wait_seconds
 else:
+    from _push_fallback import fallback_matches, marker_path, object_record, text
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "notify"))
     try:
         from review import ReleaseOutcome, posting_wait_seconds
@@ -82,19 +83,6 @@ class HookResponse(TypedDict):
     hookSpecificOutput: HookDecision
 
 
-def object_record(value: object) -> dict[str, object]:
-    if not isinstance(value, dict):
-        raise ValueError("expected an object")
-    return cast(dict[str, object], value)
-
-
-def text(record: dict[str, object], key: str) -> str:
-    value = record.get(key)
-    if not isinstance(value, str):
-        raise ValueError(f"missing {key}")
-    return value
-
-
 class HoldReview(Protocol):
     def release_if_matches(self, source: str, identity: str, *, timeout: float,
                            clock: Callable[[], float], sleep: Callable[[float], None]) -> ReleaseOutcome: ...
@@ -122,15 +110,13 @@ def matches_failed_push(raw: str, *, clock: Callable[[], float] = time.monotonic
     if text(payload, "tool_name") != "PushNotification":
         return GateOutcome.ALLOW
     session_id = text(payload, "session_id")
-    if not session_id or Path(session_id).name != session_id or session_id in (".", ".."):
-        raise ValueError("invalid session_id")
+    marker = marker_path(session_id)
     push = object_record(payload.get("tool_input"))
     message = text(push, "message")
-    directory = Path(os.environ.get("NOTIFY_STATE_DIR", str(Path.home() / ".local/state/notify"))) / "failed"
+    directory = marker.parent
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        marker = directory / f"{session_id}.json"
         try:
             record = object_record(cast(object, json.loads(marker.read_text(encoding="utf-8"))))
         except FileNotFoundError:
@@ -141,13 +127,15 @@ def matches_failed_push(raw: str, *, clock: Callable[[], float] = time.monotonic
         age = time.time() - stamp
         if not 0 <= age < MARKER_MAX_AGE_SECONDS:
             return GateOutcome.DENY
-        if " ".join(message.split()) != " ".join(text(record, "fallback").split()):
+        if not fallback_matches(message, record):
             return GateOutcome.DENY
-        marker.unlink()
-    if record.get("held") is True and record.get("need") != "blocked":
-        return GateOutcome.HELD
-    if record.get("reviewed", True) is not True and record.get("need") != "blocked":
-        return GateOutcome.UNREVIEWED
+        # PostToolUse consumes approval after delivery; an interrupted allow can retry.
+        if record.get("held") is True and record.get("need") != "blocked":
+            marker.unlink()
+            return GateOutcome.HELD
+        if record.get("reviewed", True) is not True and record.get("need") != "blocked":
+            marker.unlink()
+            return GateOutcome.UNREVIEWED
     source = record.get("held_source")
     identity = record.get("held_identity")
     if isinstance(source, str) and source and isinstance(identity, str) and identity:
@@ -164,6 +152,13 @@ def matches_failed_push(raw: str, *, clock: Callable[[], float] = time.monotonic
                 break
             outcome = release_hold(source, identity, machine, remaining, clock=clock, sleep=sleep)
         if outcome is ReleaseOutcome.DELIVERED:
+            with (directory / ".lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    if json.loads(marker.read_text(encoding="utf-8")) == record:
+                        marker.unlink()
+                except FileNotFoundError:
+                    pass
             return GateOutcome.DELIVERED
     return GateOutcome.ALLOW
 
