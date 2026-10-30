@@ -206,6 +206,35 @@ def local_options(arguments: list[str]) -> send.Options:
 
 
 class SendTests(ShutdownTestCase):
+    def test_outcome_parser_preserves_first_header_payload_and_acknowledgement(self) -> None:
+        acknowledged = send.acknowledged_skip_reason("shutdown-fixture", "2026-10-30T12:00:00+00:00")
+        self.assertEqual(acknowledged, "key 'shutdown-fixture' acknowledged at 2026-10-30T12:00:00+00:00; `send.py reopen` to resume")
+        window = "key 'shutdown-fixture' last sent to Unit at 2026-10-30T12:00:00+00:00, inside its 60-minute window"
+        cases: tuple[tuple[str, send.Outcome, str, str, bool], ...] = (
+            ("SENT: to the user\n", "sent", "to the user", "", False),
+            ("SKIPPED: " + window + "\n", "skipped", window, "", False),
+            ("SKIPPED: " + acknowledged + "\n", "skipped", acknowledged, "", True),
+            ("KEPT: until silence ends\n", "kept", "until silence ends", "", False),
+            ("REPLACED: newer push\n", "replaced", "newer push", "", False),
+            ("QUEUED: recipient offline\n", "queued", "recipient offline", "", False),
+            ("HELD: review refused\n", "held", "review refused", "", False),
+            ("FAILED: transport failed\n", "failed", "transport failed", "", False),
+            ("REFUSED: action required\n", "refused", "action required", "", False),
+            ("reviewing draft\nunknown: progress\nSENT: delivered\n", "sent", "delivered", "", False),
+            ("SENT: rewritten:\nnew body\nFAILED: quoted earlier result\n\n", "sent", "rewritten:", "new body\nFAILED: quoted earlier result\n", False),
+            ("SENT", "sent", "", "", False),
+        )
+        for output, outcome, detail, payload, is_acknowledged in cases:
+            with self.subTest(output=output):
+                parsed = send.parse_outcome(output)
+                self.assertIsInstance(parsed, send.OutcomeHeader)
+                assert isinstance(parsed, send.OutcomeHeader)
+                self.assertEqual((parsed.outcome, parsed.detail, parsed.payload), (outcome, detail, payload))
+                self.assertEqual(send.is_acknowledged_skip(parsed.detail), is_acknowledged)
+        for output in ("", "reviewing draft\nunknown: still working\n", "sent: not a protocol header\n"):
+            with self.subTest(output=output):
+                self.assertIsInstance(send.parse_outcome(output), send.NoOutcomeHeader)
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()

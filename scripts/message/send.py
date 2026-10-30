@@ -235,6 +235,41 @@ Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "rep
 Need = Literal["note", "decision", "blocked"]
 CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
 EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4, "replaced": 0, "kept": 0}
+OUTCOME_HEADERS: dict[str, Outcome] = {outcome.upper(): outcome for outcome in EXIT}
+_ACKNOWLEDGED_AT = " acknowledged at "
+
+
+@dataclass(frozen=True)
+class OutcomeHeader:
+    """The first send result and the payload that follows it."""
+    outcome: Outcome
+    detail: str
+    payload: str
+
+
+@dataclass(frozen=True)
+class NoOutcomeHeader:
+    """The command output contains no send result."""
+
+
+def parse_outcome(stdout: str) -> OutcomeHeader | NoOutcomeHeader:
+    """Read the first outcome header; later headers are payload text."""
+    lines = stdout.removesuffix("\n").split("\n")
+    for index, line in enumerate(lines):
+        word, _, detail = line.partition(": ")
+        if word in OUTCOME_HEADERS:
+            return OutcomeHeader(OUTCOME_HEADERS[word], detail, "\n".join(lines[index + 1:]))
+    return NoOutcomeHeader()
+
+
+def acknowledged_skip_reason(key: str, at: str) -> str:
+    """Name the acknowledgement that prevents a keyed send."""
+    return f"key {key!r}{_ACKNOWLEDGED_AT}{at}; `send.py reopen` to resume"
+
+
+def is_acknowledged_skip(reason: str) -> bool:
+    """Distinguish an acknowledged skip from a repeat-window skip."""
+    return _ACKNOWLEDGED_AT in reason
 
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
@@ -940,7 +975,7 @@ def claim(message: Message, repeat: timedelta | None, at: datetime, *, live: boo
     with key_states() as states:
         state = states.setdefault(message.key, {"last": {}})
         if "acknowledged" in state:
-            return f"key {message.key!r} acknowledged at {state['acknowledged']}; `send.py reopen` to resume"
+            return acknowledged_skip_reason(message.key, state["acknowledged"])
         last = state["last"].get(message.to)
         if repeat is not None and last is not None and at - datetime.fromisoformat(last) < repeat:
             if live:
@@ -1690,17 +1725,14 @@ def remote(message: Message, host: str, options: Options) -> Result:
             raise AssertionError("a user message must state its action")
         failure = reviewed_failure(err, FailedPush(message.summary, options.action, message.text, need=options.need),
                                    prefix="send.py: failed push JSON: ", machine=host, remote_record=True)
-    lines = out.removesuffix("\n").split("\n")
-    headers = [(index, line.partition(": ")) for index, line in enumerate(lines)
-               if line.partition(": ")[0] in ("SENT", "HELD", "SKIPPED", "QUEUED", "FAILED", "REFUSED", "REPLACED", "KEPT")]
-    if not headers:
+    parsed = parse_outcome(out)
+    if isinstance(parsed, NoOutcomeHeader):
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
         return Result("held" if isinstance(failure, FailedPush) and failure.held else "failed", f"ssh {host}: {why}", failure)
-    index, (word, _, detail) = headers[0]
-    payload = "\n".join(lines[index + 1:])
-    if payload:
-        detail += "\n" + payload
-    return Result(cast(Outcome, word.lower()), f"on {host}: {detail}", failure)
+    detail = parsed.detail
+    if parsed.payload:
+        detail += "\n" + parsed.payload
+    return Result(parsed.outcome, f"on {host}: {detail}", failure)
 
 
 # ---------------------------------------------------------------------------

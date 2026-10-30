@@ -46,10 +46,12 @@ from scripts.accounts.accounts import HAND_ORIGIN
 from scripts.accounts import outage_alerts
 if TYPE_CHECKING:
     from ..accounts import refusals, accounts
+    from ..message import send as message_send
     from . import restart as restart_work
     from ..notify import review
     from ..notify.push_texts import RenderedPush, render, user_send_argv
 else:
+    import send as message_send
     import review
     from push_texts import RenderedPush, render, user_send_argv
 
@@ -176,7 +178,29 @@ class MessageQueued(TypedDict):
     kind: Literal["queued"]
     reason: str
 
+class MessageAcknowledged(TypedDict):
+    kind: Literal["acknowledged"]
+    reason: str
+
+class MessageWindowSkipped(TypedDict):
+    kind: Literal["window skipped"]
+    reason: str
+
+class MessageKept(TypedDict):
+    kind: Literal["kept"]
+    reason: str
+
+class MessageReplaced(TypedDict):
+    kind: Literal["replaced"]
+    reason: str
+
+class MessageUnconfirmed(TypedDict):
+    kind: Literal["unconfirmed"]
+    reason: str
+
 MessageDelivery = MessageSent | MessageQueued
+MessageSendOutcome = (MessageDelivery | MessageAcknowledged | MessageWindowSkipped
+                      | MessageKept | MessageReplaced | MessageUnconfirmed)
 
 
 @dataclass(frozen=True)
@@ -301,7 +325,7 @@ def run_notifier(verb: str, instance: str) -> None:
 
 def _deliver_message(
     command: list[str], recipient: str, text: str
-) -> MessageDelivery:
+) -> MessageSendOutcome:
     timeout = 60.0
     if recipient == "user":
         timeout = review.user_send_seconds() + 15
@@ -319,18 +343,26 @@ def _deliver_message(
         )
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(f"send to {recipient} timed out after {timeout:g} seconds") from error
+    parsed = message_send.parse_outcome(result.stdout)
+    if isinstance(parsed, message_send.OutcomeHeader):
+        detail = parsed.detail
+        if result.returncode == 0:
+            if parsed.outcome == "sent":
+                return MessageSent(kind="sent")
+            if parsed.outcome == "skipped":
+                if message_send.is_acknowledged_skip(detail):
+                    return MessageAcknowledged(kind="acknowledged", reason=detail)
+                return MessageWindowSkipped(kind="window skipped", reason=detail)
+            if parsed.outcome == "kept":
+                return MessageKept(kind="kept", reason=detail)
+            if parsed.outcome == "replaced":
+                return MessageReplaced(kind="replaced", reason=detail)
+        elif result.returncode == 1 and parsed.outcome == "queued":
+            return MessageQueued(kind="queued", reason=detail)
     if result.returncode == 0:
-        return {"kind": "sent"}
+        return MessageUnconfirmed(kind="unconfirmed", reason="send returned no outcome header")
     if result.returncode == 1:
-        reason = next(
-            (
-                line.removeprefix("QUEUED: ")
-                for line in result.stdout.splitlines()
-                if line.startswith("QUEUED: ")
-            ),
-            "exit 1",
-        )
-        return {"kind": "queued", "reason": reason}
+        return MessageQueued(kind="queued", reason="exit 1")
     reason = (result.stderr or result.stdout).splitlines()
     raise RuntimeError(
         reason[0] if reason else f"send to {recipient} exited {result.returncode}"
@@ -344,8 +376,8 @@ def send_message(
     machine: str = "",
     key: str = "",
     repeat_minutes: int = 0,
-) -> MessageDelivery:
-    """Send a shutdown message to a session, never to the user."""
+) -> MessageSendOutcome:
+    """Send to a session; a repeat window requires the observed send outcome."""
     if recipient == "user":
         raise ValueError("user messages require alert_user")
     command = [
@@ -363,7 +395,11 @@ def send_message(
             command.extend(("--repeat-minutes", str(repeat_minutes)))
     if machine:
         command.extend(("--machine", machine))
-    return _deliver_message(command, recipient, text)
+    outcome = _deliver_message(command, recipient, text)
+    # Calls without a repeat window retain their existing acceptance rule.
+    if not repeat_minutes and outcome["kind"] not in {"sent", "queued"}:
+        return MessageSent(kind="sent")
+    return outcome
 
 
 def stopped_sessions_text(count: int) -> str:
@@ -375,7 +411,7 @@ def alert_user(push: RenderedPush, *, machine: str = "") -> bool:
     """Send a registry action through the shutdown alert path."""
     command = [*_send_command(), *user_send_argv(push, machine=machine)[2:]]
     try:
-        return _deliver_message(command, "user", "")["kind"] == "sent"
+        return _deliver_message(command, "user", "")["kind"] != "queued"
     except (OSError, RuntimeError) as error:
         print(f"shutdown: user alert failed: {error}", file=sys.stderr)
         return False
@@ -1215,8 +1251,8 @@ def _send_settle_message(saved: SessionShutdown) -> None:
         if current["settle_message"]["kind"] == "sent":
             current["reasked_at"] = at
             return
-        current["settle_message"] = ({"kind": "sent", "at": at} if delivery["kind"] == "sent"
-                                    else {"kind": "queued", "at": at, "reason": delivery["reason"]})
+        current["settle_message"] = ({"kind": "queued", "at": at, "reason": delivery["reason"]}
+                                    if delivery["kind"] == "queued" else {"kind": "sent", "at": at})
     _ = store.update_session(saved["login"], session["session_id"], save)
 
 
@@ -1850,8 +1886,9 @@ def _unit_showrunner(saved: SessionShutdown) -> str:
 
 
 def showrunner_was_told(saved: SessionShutdown) -> bool:
-    """A legacy marker or a sent line proves the showrunner heard about this stop."""
-    return "showrunner_told" in saved or any(line["kind"] == "sent" for line in saved.get("showrunner_lines", []))
+    """A delivered or queued line permits the next outcome line in order."""
+    return "showrunner_told" in saved or any(
+        line["kind"] in {"delivered", "queued"} for line in saved.get("showrunner_lines", []))
 
 
 def _showrunner_line_identity(told: str, text: str) -> tuple[str, ...]:
@@ -1859,19 +1896,19 @@ def _showrunner_line_identity(told: str, text: str) -> tuple[str, ...]:
     return (told,) if told in {SHOWRUNNER_TOLD_BACK, SHOWRUNNER_TOLD_STOPPING} else (told, text)
 
 
-def _complete_showrunner_send(saved: SessionShutdown, told: str, text: str) -> SessionShutdown:
-    """Keep delivery evidence on the exact request, whether active or archived."""
-    acknowledged = saved
-    def sent(current: SessionShutdown) -> None:
-        nonlocal acknowledged
+def _complete_showrunner_send(saved: SessionShutdown, line: store.ShowrunnerLineDelivered | store.ShowrunnerLineQueued) -> SessionShutdown:
+    """Keep the send result on the exact request, whether active or archived."""
+    updated = saved
+    def remember(current: SessionShutdown) -> None:
+        nonlocal updated
         lines = current.get("showrunner_lines", [])
-        for index, line in enumerate(lines):
-            if _showrunner_line_identity(line["line"], line["text"]) == _showrunner_line_identity(told, text):
-                lines[index] = store.ShowrunnerLineSent(kind="sent", line=told, text=text)
+        for index, current_line in enumerate(lines):
+            if _showrunner_line_identity(current_line["line"], current_line["text"]) == _showrunner_line_identity(line["line"], line["text"]):
+                lines[index] = line
                 break
-        acknowledged = current
-    _ = store.update_showrunner_line(saved, sent)
-    return acknowledged
+        updated = current
+    _ = store.update_showrunner_line(saved, remember)
+    return updated
 
 
 def send_showrunner_line(saved: SessionShutdown, told: str, showrunner: str, summary: str, text: str) -> SessionShutdown:
@@ -1880,20 +1917,21 @@ def send_showrunner_line(saved: SessionShutdown, told: str, showrunner: str, sum
     with store.showrunner_line_lock(saved):
         current = saved
         reserved = False
-        pending = store.ShowrunnerLinePending(kind="pending", line=told, summary=summary, text=text)
+        offered: store.ShowrunnerLinePending | store.ShowrunnerLineQueued = store.ShowrunnerLinePending(
+            kind="pending", line=told, summary=summary, text=text)
         def claim(record: SessionShutdown) -> None:
-            nonlocal current, reserved, pending
+            nonlocal current, reserved, offered
             current = record
             if record.get("showrunner_told") == told:
                 return
             lines = record.setdefault("showrunner_lines", [])
             for line in lines:
                 if _showrunner_line_identity(line["line"], line["text"]) == line_identity:
-                    reserved = line["kind"] == "pending"
-                    if line["kind"] == "pending":
-                        pending = line
+                    reserved = line["kind"] != "delivered"
+                    if line["kind"] != "delivered":
+                        offered = line
                     return
-            lines.append(pending)
+            lines.append(offered)
             reserved = True
         _ = store.update_showrunner_line(saved, claim)
         if not reserved:
@@ -1901,16 +1939,23 @@ def send_showrunner_line(saved: SessionShutdown, told: str, showrunner: str, sum
         identity = json.dumps([saved["login"], saved["request_id"], saved["requested_at"],
                                saved["session"]["session_id"], *line_identity], ensure_ascii=True)
         key = "shutdown-unit-" + hashlib.sha256(identity.encode()).hexdigest()
-        delivered = send_message(showrunner, pending["summary"], pending["text"], key=key, repeat_minutes=5_256_000)
-        if delivered["kind"] == "sent":
-            return _complete_showrunner_send(current, told, pending["text"])
+        outcome = send_message(showrunner, offered["summary"], offered["text"], key=key, repeat_minutes=5_256_000)
+        if outcome["kind"] in {"sent", "acknowledged"}:
+            return _complete_showrunner_send(current, store.ShowrunnerLineDelivered(
+                kind="delivered", line=told, text=offered["text"]))
+        if outcome["kind"] == "queued":
+            return _complete_showrunner_send(current, store.ShowrunnerLineQueued(
+                kind="queued", line=told, summary=offered["summary"], text=offered["text"],
+                reason=outcome["reason"], at=record_time()))
         return current
 
 
 def tell_showrunner_stopping(saved: SessionShutdown) -> None:
     """Before a unit is stopped, one line to its production's showrunner: what stops, why, and when it is back."""
     showrunner = _unit_showrunner(saved)
-    if not showrunner or showrunner_was_told(saved):
+    retry_stopping = any(line["line"] == SHOWRUNNER_TOLD_STOPPING and line["kind"] != "delivered"
+                         for line in saved.get("showrunner_lines", []))
+    if not showrunner or (showrunner_was_told(saved) and not retry_stopping):
         return
     name = saved["session"]["name"]
     target = saved.get("target", "")

@@ -499,21 +499,31 @@ class OwnerPaneScope(TypedDict):
 
 
 class ShowrunnerLinePending(TypedDict):
-    """This line has not yet had a successful send."""
+    """This line is claimed and has no send result yet."""
     kind: Literal["pending"]
     line: str
     summary: str
     text: str
 
 
-class ShowrunnerLineSent(TypedDict):
+class ShowrunnerLineQueued(TypedDict):
+    """send.py keeps this line for delivery; no receipt is known."""
+    kind: Literal["queued"]
+    line: str
+    summary: str
+    text: str
+    reason: str
+    at: str
+
+
+class ShowrunnerLineDelivered(TypedDict):
     """Delivery of this exact line has succeeded."""
-    kind: Literal["sent"]
+    kind: Literal["delivered"]
     line: str
     text: str
 
 
-ShowrunnerLine = ShowrunnerLinePending | ShowrunnerLineSent
+ShowrunnerLine = ShowrunnerLinePending | ShowrunnerLineQueued | ShowrunnerLineDelivered
 
 
 class SessionShutdown(TypedDict):
@@ -1370,12 +1380,17 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
         for index, value in enumerate(_items(values["showrunner_lines"], f"{place}.showrunner_lines")):
             where = f"{place}.showrunner_lines[{index}]"
             line = _mapping(value, where)
-            if line.get("kind") not in {"pending", "sent"}:
-                raise InvalidRecord(f"{where}.kind must be pending or sent")
+            if line.get("kind") == "sent":
+                line["kind"] = "delivered"
+            if line.get("kind") not in {"pending", "queued", "delivered"}:
+                raise InvalidRecord(f"{where}.kind must be pending, queued or delivered")
             _ = _string(_required(line, "line", where), f"{where}.line")
             _ = _string(_required(line, "text", where), f"{where}.text")
-            if line["kind"] == "pending":
+            if line["kind"] in {"pending", "queued"}:
                 _ = _string(_required(line, "summary", where), f"{where}.summary")
+            if line["kind"] == "queued":
+                _ = _string(_required(line, "reason", where), f"{where}.reason")
+                _ = _utc_time(_required(line, "at", where), f"{where}.at")
     return cast(SessionShutdown, cast(object, values))
 
 

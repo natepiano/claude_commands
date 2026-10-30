@@ -675,7 +675,8 @@ class SettleTests(ShutdownTestCase):
         def deliver(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
             del options
             commands.append(command)
-            outcome = "SKIPPED: inside repeat window\n" if len(commands) == 2 else "SENT: fixture\n"
+            outcome = ("SKIPPED: key 'fixture' acknowledged at " + NOW + "\n"
+                       if len(commands) == 2 else "SENT: fixture\n")
             return subprocess.CompletedProcess(command, 0, outcome, "")
 
         with (
@@ -705,6 +706,48 @@ class SettleTests(ShutdownTestCase):
         for command in commands:
             self.assertIn("--repeat-minutes", command)
             self.assertGreater(float(command[command.index("--repeat-minutes") + 1]), 0)
+
+    def test_queued_showrunner_line_stays_queued_until_an_acknowledged_retry(self) -> None:
+        saved = self.unit_for_showrunner()
+        responses = iter((
+            (1, "QUEUED: fixture recipient unavailable\n"),
+            (0, "SKIPPED: key 'fixture' last sent to fixture-runner at " + NOW
+             + ", inside its 5256000-minute window\n"),
+            (0, "SKIPPED: key 'fixture' acknowledged at " + NOW + "; `send.py reopen` to resume\n"),
+        ))
+
+        def deliver(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            del options
+            code, output = next(responses)
+            return subprocess.CompletedProcess(command, code, output, "")
+
+        with (
+            patch.object(settle_showrunners, "current_name", return_value="fixture-runner"),
+            patch.object(subprocess, "run", side_effect=deliver) as sender,
+        ):
+            self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
+            settle.tell_showrunner_stopping(saved)
+            current = shutdown_record.session_records(LOGIN)[0]
+            queued = current.get("showrunner_lines", [])
+            self.assertEqual([line["kind"] for line in queued], ["queued"])
+            self.assertEqual(queued[0].get("reason"), "fixture recipient unavailable")
+            self.assertEqual(queued[0].get("at"), NOW)
+            self.assertTrue(settle.showrunner_was_told(current))
+            settle.tell_showrunners_outcome([current])
+            current = shutdown_record.session_records(LOGIN)[0]
+            self.assertEqual([line["kind"] for line in current.get("showrunner_lines", [])], ["queued"])
+            self.assertEqual(current.get("showrunner_lines", []), queued)
+            settle.tell_showrunners_outcome([current])
+            current = shutdown_record.session_records(LOGIN)[0]
+            self.assertEqual([line["kind"] for line in current.get("showrunner_lines", [])], ["delivered"])
+            settle.tell_showrunner_stopping(current)
+            settle.tell_showrunners_outcome([current])
+        self.assertEqual(sender.call_count, 3)
+        commands = [cast(list[str], sent.args[0]) for sent in sender.call_args_list]
+        keys = [command[command.index("--key") + 1] for command in commands]
+        self.assertEqual(keys, [keys[0]] * 3)
+        self.assertEqual([sent.kwargs["input"] for sent in sender.call_args_list],
+                         [sender.call_args_list[0].kwargs["input"]] * 3)
 
     def test_failed_showrunner_outcome_does_not_block_other_units(self) -> None:
         class Killed(BaseException):
@@ -2196,12 +2239,12 @@ class SettleTests(ShutdownTestCase):
                         "then close its record in a terminal on natedev: " + settle.shutdown_command("forget", "unit", "--account", LOGIN))
                     self.assertEqual(text, summary)
                     self.assertNotIn("shutdown.py restart", text)
-                    self.assertIn(shutdown_record.ShowrunnerLineSent(kind="sent",
+                    self.assertIn(shutdown_record.ShowrunnerLineDelivered(kind="delivered",
                         line=settle.SHOWRUNNER_TOLD_BACK, text=text), current.get("showrunner_lines", []))
                 else:
                     self.assertIn("Unit did not come back: restart prompt not submitted", summary)
                     self.assertIn(settle.shutdown_command("restart", LOGIN, "--here", "--only", "unit"), text)
-                    self.assertIn(shutdown_record.ShowrunnerLineSent(kind="sent",
+                    self.assertIn(shutdown_record.ShowrunnerLineDelivered(kind="delivered",
                         line=settle.not_back_text(saved), text=text), current.get("showrunner_lines", []))
                     if isinstance(observed, restart_work.SessionLivenessUnknown):
                         self.assertIn("liveness unknown: scratch registry unreadable", summary)
@@ -2230,7 +2273,7 @@ class SettleTests(ShutdownTestCase):
         self.assertNotIn("shutdown.py restart", cast(str, back[0].args[2]))
         current = shutdown_record.find_session(LOGIN, "unit")
         assert current is not None
-        self.assertIn(shutdown_record.ShowrunnerLineSent(kind="sent",
+        self.assertIn(shutdown_record.ShowrunnerLineDelivered(kind="delivered",
             line=settle.SHOWRUNNER_TOLD_BACK, text=cast(str, back[0].args[2])), current.get("showrunner_lines", []))
         alert.assert_not_called()
 
@@ -4741,10 +4784,10 @@ class SettleTests(ShutdownTestCase):
         with patch.object(review, "NOTIFY_CONFIG", config):
             for machine, expected in (("", 220), ("natedev", 260)):
                 with (self.subTest(machine=machine),
-                      patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as sender):
+                      patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture\n", "")) as sender):
                     _ = settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5"), machine=machine)
                 self.assertEqual(sender.call_args.kwargs["timeout"], expected)
-            with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as sender:
+            with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture\n", "")) as sender:
                 self.assertEqual(settle.send_message("session:owner", "Shutdown", "Stop work"), {"kind": "sent"})
             self.assertEqual(sender.call_args.kwargs["timeout"], 60)
 
@@ -4764,7 +4807,7 @@ class SettleTests(ShutdownTestCase):
         for index, progress in enumerate(progresses):
             saved = session_shutdown(top_level(str(index), str(index)), progress=progress)
             self.save(saved)
-            with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as sender, patch.object(shutdown_record, "session_records", side_effect=AssertionError("alert consulted shutdown state")), patch.object(review, "user_send_seconds", return_value=85):
+            with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "SENT: fixture\n", "")) as sender, patch.object(shutdown_record, "session_records", side_effect=AssertionError("alert consulted shutdown state")), patch.object(review, "user_send_seconds", return_value=85):
                 _ = settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5"))
             self.assertEqual(sender.call_args.kwargs["input"], "")
             self.assertIn("nixos.ups_battery", cast(list[str], sender.call_args.args[0]))

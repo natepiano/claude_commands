@@ -4503,7 +4503,7 @@ class RestartTests(ShutdownTestCase):
         def send(argv: list[str], *, input: str, capture_output: bool, text: bool, check: bool, timeout: int) -> subprocess.CompletedProcess[str]:
             del capture_output, text, check, timeout
             sent.append((argv, input))
-            return subprocess.CompletedProcess(argv, 0, '', '')
+            return subprocess.CompletedProcess(argv, 0, 'SENT: fixture\n', '')
         output = io.StringIO()
         with patch.object(restart, 'named_claude_account', return_value=self.account), patch.object(restart, '_up', return_value=restart.MachineRestartResult('natedev', LABEL, 'nothing')), patch.object(restart, 'run_remote', return_value=(2, '')), patch.object(restart, 'other_machine', return_value='Mac'), patch.object(settle, '_send_command', return_value=['fake-send']), patch.object(subprocess, 'run', send), redirect_stdout(output):
             self.assertEqual(restart.restart(restart.AccountNamed(LABEL), dry_run=False, alerts=restart.AlertWhenNotBack()), 0)
@@ -6995,7 +6995,7 @@ class RestartTests(ShutdownTestCase):
 
                 def update(login: str, session_id: str,
                            change: Callable[[SessionShutdown], None]) -> SessionShutdown:
-                    if change.__name__ == "save_timers":
+                    if isinstance(change, shutdown_record.PersistSessionThenAct):
                         snapshot_captured.set()
                         if not publish_snapshot.wait(HANG_GUARD_SECONDS):
                             raise AssertionError("source restore did not reconcile its late enable")
