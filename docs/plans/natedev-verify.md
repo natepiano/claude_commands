@@ -312,17 +312,20 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 ### Phase 6c — Name a removed assertion by the test that holds it, not by a nested function  · status: done
 
-**Depends on:** 6b (merged). Runs in `/home/natepiano/worktrees/claude-build-followups-verify-base`, branch `natedev-verify-base`, from origin/builds d27e24a1. Before the imported-constant follow-up.
+#### As-built
 
-**Origin:** builds showrunner 2026-10-30, reported by models via devtools and natedev. Wrong result.
+- `name_tests(findings, sources, code)` in `assertion_guard.py` gives each finding the name of the innermost test that encloses its line. An assertion after or inside a nested helper carries the test name, and an `Assertion-Change: <path>::<test>` ruling names that test.
+- `enclosing_tests(rows, rust)` returns `TestScope(first, last, name)` items. Python uses `ast` to find `test_*` functions. Rust walks masked code for `fn` items marked by `TEST_MARK` (`#[test]`, `tokio::test`, `async_std::test`, `rstest`, `test_case`) and pairs their braces. A nested helper's scope ends where its body ends.
+- A line outside every test keeps the name of the nearest `def` or `fn` above it. A Python syntax error or unbalanced Rust braces gives no test scopes, so all names in that file use this rule.
+- `aggregate_test_removals(findings)` folds each `removed` finding of a removed test into the one `test removed` finding for that test and sets `Finding.removed_assertions`. The report prints `(N assertions)`. `run()` calls it once, after the intersection across all bases.
+- `finding_identity` excludes the owner name, so the base intersection does not depend on naming. The report keeps the first base's name.
 
-**Defect:** `assertion_guard.py` names a removed assertion by the nearest nested `def`, not by the test that holds it. A test `test_outer` with a nested `def final_diff()` and a removed assertion after it reports `final_diff removed`, so a ruling must name `final_diff`, which is not a test. Reproduced on main d27e24a1.
+**Files:**
+- `scripts/direct/assertion_guard.py` — `TestScope`, `enclosing_tests`, `name_tests`, `aggregate_test_removals`, `Finding.removed_assertions`
+- `scripts/direct/assertion_guard_test_support.py` — shared repo fixtures and guard helpers
+- `scripts/direct/test_assertion_guard_revisions.py`, `scripts/direct/test_assertion_guard_strings.py` — owner and aggregation tests for Python and Rust
 
-**Fix:** one place maps a line to its owning test. An assertion belongs to the innermost enclosing test (Python `test_*`; Rust `#[test]`-family fn), and a nested helper's scope ends where its body ends. An assertion in a non-test helper outside any test keeps its current name.
-
-**Files:** `scripts/direct/assertion_guard.py`, `scripts/direct/assertion_guard_test_support.py`, `scripts/direct/test_assertion_guard*.py`, `docs/as-built/phase-checks.md` if it describes the naming.
-
-**Acceptance gate:** regressions for Python and Rust (assertion after a nested helper; assertion inside a nested helper) name the enclosing test, and its ruling clears them; each fails without the fix. The 6b real cases still hold (7a4fb6b8 14/14, b1408dc8 6/6, 2520c27d 0 blocking). basedpyright 0/0/0 on changed files; the merge gate passes.
+**Gotchas:** Aggregate only after every base is compared. Aggregation per base drops a removal that only one base holds. Rust test bounds come from masked code, so `RUST_LITERAL` must hide every string form (`r`, `br`, `cr` raw strings). A brace in an unmasked literal moves a test scope.
 
 ### Phase 7 — Keep the cargo token through a long lint, and keep a run's queue place when the Mac is taken  · status: todo
 
