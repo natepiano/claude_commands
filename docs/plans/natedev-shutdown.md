@@ -14,7 +14,7 @@ Landed in checkpoint `6cfdcbb1` (branch `f0f21af6`, main `fe789e33`, 2026-10-30)
 - Transfer, rename and retire of a unit whose Claude runs under an interactive pane shell refuse before any stop, with one line that names the shell.
 - Review: five closure passes, four repair rounds. Merge gate: full suite green.
 
-## Phase 5: pane close for unit operations — next
+## Phase 5: pane close for unit operations — done
 
 **Goal:** transfer, rename and retire work for a unit whose Claude runs under an interactive pane shell. Today they refuse.
 
@@ -24,8 +24,10 @@ Landed in checkpoint `6cfdcbb1` (branch `f0f21af6`, main `fe789e33`, 2026-10-30)
 2. **F003: a process in the unit's folder is a blocker, never permission to stop it.** Retire must not terminate a process only because its working directory is in the checkout. An unowned process there blocks retirement.
 3. **F007: one pane-host fixture.** Extend `scripts/production/fake_unit_host.py` with session-qualified observations; `unit_operation_test_support.py` keeps only the failed-stop injection.
 4. **F012: a stop that takes over a restoring timer keeps the restore intent.** At the one takeover decision in `restart.py` `_restore_timers`, under the owner's record lock, merge `was_enabled=True` into the covering stop's record before undoing the late enable. `settle.py` merges its timer snapshot by instance (OR of the flags), so publication order cannot lose the intent. Catch an undo failure inside the update and report it after.
+5. **`restart --all` keeps stay-down stops down** (showrunner, 2026-10-30). `restart --all` skips a `then=stop` record only when its request was a single-session or `--only` stop, or a self-stop. It never skips a `down --all` record or a reboot entry. `restart --only` restores a skipped session.
 
 **Acceptance.**
 - Transfer, rename and retire of a pane-shell unit complete on fixtures: the stop finishes, only the unit's own pane closes, and the unit moves.
 - Regressions, each failing before the change: a visitor or another unit's shell in the checkout is never signalled and blocks retirement, with and without a marked pane; a director that resumes before the close refuses the close; F012 runs real `settle.begin` in both publication orders, and the stop's later restart enables the timer, with an originally disabled timer as the control.
+- Item 5: the morning path (`down --all`, a reboot, `restart --all`) restores every session; a single-session stay-down stop stays down, and `--only` brings it back.
 - One live check, started by the showrunner: transfer of a throwaway pane-shell unit.
