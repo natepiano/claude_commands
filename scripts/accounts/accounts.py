@@ -64,7 +64,7 @@ from scripts.accounts.role_map import (  # noqa: E402
 if TYPE_CHECKING:
     from scripts.agents.codex_mesh import WorkersRunSwitch
     from scripts.shutdown.inventory import ListedSession, Session, ShowrunnerRegistrations
-    from scripts.shutdown.record import SessionShutdown
+    from scripts.shutdown.shutdown_record import SessionShutdown
 
 
 class PromptTakingMember(Protocol):
@@ -3046,9 +3046,9 @@ class MoveShutdownReady:
 def _prepare_move_shutdown(saved: SessionShutdown, *, dry_run: bool) -> MoveShutdownReady | MoveRefused:
     """Close only a proven live session's unconfirmed restart before moving it."""
     if TYPE_CHECKING:
-        from scripts.shutdown import record
+        from scripts.shutdown import shutdown_record
     else:
-        record = import_module("record")
+        shutdown_record = import_module("shutdown_record")
     restart = cast(RestartRecordLiveness, cast(object, import_module("restart")))
     settle = cast(ShutdownLocation, cast(object, import_module("settle")))
     if not restart.restart_failed_session_running(saved):
@@ -3056,11 +3056,11 @@ def _prepare_move_shutdown(saved: SessionShutdown, *, dry_run: bool) -> MoveShut
     name = saved["session"]["name"]
     if dry_run:
         return MoveShutdownReady((f"{name}: would close its unconfirmed restart record; the session is running",))
-    outcome = record.forget_failed_restart(saved["login"], saved["session"]["session_id"],
+    outcome = shutdown_record.forget_failed_restart(saved["login"], saved["session"]["session_id"],
                                          settle.local_machine(), saved["request_id"])
-    if not isinstance(outcome, record.SessionForgotten):
+    if not isinstance(outcome, shutdown_record.SessionForgotten):
         return MoveRefused("already has a shutdown in progress")
-    _ = record.acknowledge_snapshot(saved["login"], saved["session"]["session_id"])
+    _ = shutdown_record.acknowledge_snapshot(saved["login"], saved["session"]["session_id"])
     return MoveShutdownReady((f"{name}: closed its unconfirmed restart record; the session is running",))
 
 
@@ -3071,10 +3071,10 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
     transition_id = move_id or uuid4().hex
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory, record
+        from scripts.shutdown import inventory, shutdown_record
     else:
         inventory = import_module("inventory")
-        record = import_module("record")
+        shutdown_record = import_module("shutdown_record")
     outcomes: dict[str, SessionMoveRequested | SessionMoveRefused] = {}
     owners: dict[str, ListedSession] = {}
     groups: dict[str, list[str]] = {}
@@ -3092,7 +3092,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
                 refuse(session_id, destination.reason)
             return tuple(outcomes[session_id] for session_id in ids)
         live = {item.session_id: item for item in inventory.listing()}
-        before = {saved["session"]["session_id"]: saved for saved in record.all_session_records()}
+        before = {saved["session"]["session_id"]: saved for saved in shutdown_record.all_session_records()}
         for session_id in ids:
             found = live.get(session_id)
             if found is None:
@@ -3122,7 +3122,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
                                   if entry["kind"] == "requested"}
                 result = subprocess.run(command, capture_output=True, text=True, check=False,
                     env={**os.environ, "REFUSAL_WATCH_INVENTORY": "read existing"})
-                saved_by_id = {saved["session"]["session_id"]: saved for saved in record.all_session_records()}
+                saved_by_id = {saved["session"]["session_id"]: saved for saved in shutdown_record.all_session_records()}
                 for session_id in selected_ids:
                     saved = saved_by_id.get(session_id)
                     if saved is None or saved.get("target") != target:
@@ -3152,10 +3152,10 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
                         if "reset" in fields:
                             request["reset"] = fields["reset"]
                         moves.append_move(request)
-            except (OSError, ValueError, record.InvalidRecord) as error:
+            except (OSError, ValueError, shutdown_record.InvalidRecord) as error:
                 for session_id in selected_ids:
                     refuse(session_id, str(error))
-    except (AccountsError, OSError, ValueError, inventory.InvalidInventory, record.InvalidRecord) as error:
+    except (AccountsError, OSError, ValueError, inventory.InvalidInventory, shutdown_record.InvalidRecord) as error:
         for session_id in ids:
             if session_id not in outcomes:
                 refuse(session_id, str(error))
@@ -3364,10 +3364,10 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     if isinstance(checked, MoveRefused):
         return checked
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory, record
+        from scripts.shutdown import inventory, shutdown_record
     else:
         inventory = import_module("inventory")
-        record = import_module("record")
+        shutdown_record = import_module("shutdown_record")
     registrations = inventory.showrunner_registrations()
     members = live_group_members(registrations=registrations)[group]
     selected = [session for session in members if not session_on_account(session, target)]
@@ -3381,7 +3381,7 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             for runner in inventory.unregistered_showrunners(members, registrations=registrations))
     if dry_run:
         closing: tuple[str, ...] = ()
-        for saved in record.all_session_records():
+        for saved in shutdown_record.all_session_records():
             if saved["session"]["session_id"] not in ids:
                 continue
             prepared = _prepare_move_shutdown(saved, dry_run=True)
@@ -3424,10 +3424,10 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
     target = note_file.canonical_label(target)
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory, record
+        from scripts.shutdown import inventory, shutdown_record
     else:
         inventory = import_module("inventory")
-        record = import_module("record")
+        shutdown_record = import_module("shutdown_record")
     try:
         now = datetime.now(timezone.utc)
         checked = check_move_target(target, now, repair=not dry_run)
@@ -3450,7 +3450,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         if session_on_account(owner, target):
             return MoveRefused(f"{owner.name} is already on {checked.destination.label}")
         closing: tuple[str, ...] = ()
-        for saved in record.all_session_records():
+        for saved in shutdown_record.all_session_records():
             if saved["session"]["session_id"] != owner.session_id:
                 continue
             prepared = _prepare_move_shutdown(saved, dry_run=True)
@@ -3465,7 +3465,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         stdout, stderr, code = _move_output(results, checked.notices, owner.session_id, GROUP_NOT_CONFIGURED)
         outcome = MoveStartFailed if code else MoveStarted
         return outcome(owner.session_id, target, stdout, stderr, code)
-    except (AccountsError, record.InvalidRecord, inventory.InvalidInventory, OSError, ValueError) as error:
+    except (AccountsError, shutdown_record.InvalidRecord, inventory.InvalidInventory, OSError, ValueError) as error:
         return MoveRefused(str(error))
 
 

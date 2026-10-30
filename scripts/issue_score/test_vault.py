@@ -5,7 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import override
+from unittest import mock
 
+from scripts.feature_log import feature_log
 from scripts.issue_score import vault
 
 
@@ -37,9 +39,9 @@ class VaultTests(unittest.TestCase):
         path = self.root / "issue-areas.md"
         content = (
             "# Draft definitions for user review\n\n"
-            "| area | definition | issues |\n| --- | --- | --- |\n"
-            '| "[[Rendering]]" | Drawing scenes and managing render passes. | 12 |\n'
-            "| TOOLING | Tools used to build and inspect the project. | 3 |\n"
+            "| area | definition |\n| --- | --- |\n"
+            '| "[[Rendering]]" | Drawing scenes and managing render passes. |\n'
+            "| TOOLING | Tools used to build and inspect the project. |\n"
         )
         _ = path.write_text(content, encoding="utf-8")
         before = path.stat()
@@ -60,15 +62,32 @@ class VaultTests(unittest.TestCase):
         self.assertIn("not found", str(raised.exception))
         self.assertFalse(path.parent.exists())
 
+    def test_legacy_three_column_area_definitions_ignore_only_the_issues_cell(self) -> None:
+        path = self.root / "issue-areas.md"
+        _ = path.write_text(
+            "| area | definition | issues |\n| --- | --- | --- |\n"
+            + "| rendering | Drawing scenes. | Not a live count |\n"
+            + "| tooling | Building projects. | 999 |\n"
+            + "| invalid | Missing third cell. |\n", encoding="utf-8")
+        self.assertEqual(vault.load_area_definitions(path), {
+            "rendering": "Drawing scenes.", "tooling": "Building projects.",
+        })
+
+    def test_area_definition_rows_must_match_the_header_column_count(self) -> None:
+        path = self.root / "issue-areas.md"
+        _ = path.write_text("area | definition\n--- | ---\nrendering | Drawing scenes.\n"
+                            + "tooling | Extra cell. | 5\n", encoding="utf-8")
+        self.assertEqual(vault.load_area_definitions(path), {"rendering": "Drawing scenes."})
+
     def test_area_definitions_without_outer_pipes_load_every_row_and_stop_at_prose(self) -> None:
         path = self.root / "issue-areas.md"
         _ = path.write_text(
             "# Draft definitions\n\n"
-            + "area | definition | issues\n--- | --- | ---\n"
-            + '"[[Rendering]]" | Drawing scenes. | 12\n'
-            + "TOOLING | Building and inspecting projects. | 3\n"
+            + "area | definition\n--- | ---\n"
+            + '"[[Rendering]]" | Drawing scenes.\n'
+            + "TOOLING | Building and inspecting projects.\n"
             + "Definitions end here.\n"
-            + "ignored | Outside the definitions table. | 1\n",
+            + "ignored | Outside the definitions table.\n",
             encoding="utf-8",
         )
         self.assertEqual(vault.load_area_definitions(path), {
@@ -80,8 +99,8 @@ class VaultTests(unittest.TestCase):
         path = self.root / "issue-areas.md"
         for content in (
             "# No table here.\n",
-            "| area | definition | issues |\n| --- | --- | --- |\n",
-            "area | definition | issues\n--- | --- | ---\nrendering | | 0\n",
+            "| area | definition |\n| --- | --- |\n",
+            "area | definition\n--- | ---\nrendering |\n",
         ):
             with self.subTest(content=content):
                 _ = path.write_text(content, encoding="utf-8")
@@ -89,6 +108,7 @@ class VaultTests(unittest.TestCase):
                     _ = vault.load_area_definitions(path)
                 self.assertIn(str(path), str(raised.exception))
                 self.assertIn("no area definitions", str(raised.exception))
+                self.assertIn("area | definition", str(raised.exception))
 
     def test_long_body_cuts_before_the_section_that_would_cross_the_cap(self) -> None:
         kept = "# Problem\n" + "a" * 14_000 + "\n"
@@ -122,6 +142,97 @@ class VaultTests(unittest.TestCase):
         self.assertEqual(issue.labels["backlog_goal"], "1 - Ship Hana")
         self.assertEqual(issue.labels["backlog_alignment"], "⭐⭐")
         self.assertEqual(issue.labels["category"], "feature")
+
+    def test_scoring_loader_builds_style_rule_state_and_names_missing_rules(self) -> None:
+        rules = self.root / "rules"
+        (rules / "rust").mkdir(parents=True)
+        _ = (rules / "rust" / "names.md").write_text(
+            '---\nsummary: "Name each type for its guarantee."\n---\n# Names\nLong explanatory body.\n')
+        single = self.issue("Single rule", fields=(
+            'style_rule: "global:rust/names.md"\nstyle_crate: renderer\nstyle_count: 7\n'), body="")
+        multiple = self.issue("Multiple rules", fields=(
+            'style_rules:\n  - "global:rust/names.md"\n  - "global:rust/missing.md"\n'
+            + 'style_crate: widgets\nstyle_findings:\n  - first\n  - second\n'), body="")
+        closed = self.issue("Closed style", fields='style_rule: "global:rust/names.md"\n')
+        _ = closed.write_text(closed.read_text().replace("status: open", "status: closed"))
+        loaded = {issue.path: issue for issue in vault.load_scoring_issues(self.root, rules_dirs=(rules,))}
+        self.assertEqual(set(loaded), {single, multiple})
+        self.assertEqual(loaded[single].style_inputs,
+                         vault.StyleInputs((vault.RuleSummary("global:rust/names.md", "Name each type for its guarantee."),),
+                                           "renderer", 7))
+        state = vault.build_state(loaded[multiple])["issue"]
+        self.assertEqual(state.get("style_rules"), [
+            {"name": "global:rust/names.md", "summary": "Name each type for its guarantee.", "status": "available"},
+            {"name": "global:rust/missing.md", "status": "missing"},
+        ])
+        self.assertEqual(state.get("style_crate"), "widgets")
+        self.assertEqual(state.get("finding_count"), 2)
+        self.assertEqual(state["title"], "Multiple rules")
+        self.assertEqual(state["project"], "hana")
+        self.assertTrue(set(state).isdisjoint(vault.LABEL_FIELDS))
+
+    def test_project_names_follow_only_present_base_files_and_their_project_filters(self) -> None:
+        bases = self.root / "home-base"
+        bases.mkdir()
+        base = bases / "issues - freshly-added.base"
+        _ = base.write_text('filters:\n  and:\n    - project.contains(link("hana_diegetic"))\n')
+        _ = (bases / "other.base").write_text('project.contains(link("not-a-project-base"))\n')
+        self.assertEqual(vault.load_project_names(bases), {"freshly-added": "hana_diegetic"})
+        _ = base.write_text('filters:\n  and:\n    - project.contains(link("hana"))\n')
+        self.assertEqual(vault.load_project_names(bases), {"freshly-added": "hana"})
+        base.unlink()
+        self.assertEqual(vault.load_project_names(bases), {})
+
+    def test_local_style_rule_uses_the_owning_repository_for_project_and_member_crate(self) -> None:
+        owner = self.root / "owning-checkout"
+        global_rules = self.root / "global-rules"
+        relative = Path("docs/member/style/adding-a-keybinding.md")
+        rule = owner / relative
+        rule.parent.mkdir(parents=True)
+        _ = rule.write_text('---\nsummary: "Document the new shortcut and its action."\n---\n')
+        decoy = global_rules / relative
+        decoy.parent.mkdir(parents=True)
+        _ = decoy.write_text('---\nsummary: "This belongs to a different repository."\n---\n')
+        registry = {"new-owner": feature_log.ProjectSpec("fixture/new-owner", frozenset({"new-member"}),
+                                                       frozenset(), (owner,))}
+        with mock.patch.dict(feature_log.PROJECTS, registry, clear=True):
+            for project in ("new-owner", "new-member"):
+                with self.subTest(project=project):
+                    target = self.issue("Repository local rule", fields=(
+                        'style_rule: "local:' + relative.as_posix() + '"\nstyle_crate: new-member\nstyle_count: 1\n'))
+                    _ = target.write_text(target.read_text().replace('project: "[[hana]]"', 'project: "[[' + project + ']]"'))
+                    before = {path: path.read_bytes() for path in (target, rule, decoy)}
+                    loaded = vault.load_scoring_issues(self.root, rules_dirs=(global_rules,))
+                    self.assertEqual([issue.path for issue in loaded], [target])
+                    self.assertEqual(loaded[0].style_inputs, vault.StyleInputs((
+                        vault.RuleSummary("local:" + relative.as_posix(), "Document the new shortcut and its action."),
+                    ), "new-member", 1))
+                    self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_github_style_rule_url_uses_the_owning_repository_and_preserves_the_reference(self) -> None:
+        owner = self.root / "owning-url-checkout"
+        fallback = self.root / "fallback-rules"
+        relative = Path("docs/cargo-port/style/adding-a-keybinding.md")
+        rule = owner / relative
+        rule.parent.mkdir(parents=True)
+        _ = rule.write_text('---\nsummary: "Document a shortcut alongside its action."\n---\n')
+        decoy = fallback / relative
+        decoy.parent.mkdir(parents=True)
+        _ = decoy.write_text('---\nsummary: "This summary belongs to another repository."\n---\n')
+        reference = "https://github.com/fixture/new-url-owner/blob/main/" + relative.as_posix()
+        target = self.issue("Repository URL rule", fields=(
+            'style_rules:\n  - "' + reference + '"\nstyle_crate: new-url-member\nstyle_count: 3\n'))
+        _ = target.write_text(target.read_text().replace('project: "[[hana]]"', 'project: "[[new-url-member]]"'))
+        registry = {"new-url-owner": feature_log.ProjectSpec("fixture/new-url-owner", frozenset({"new-url-member"}),
+                                                           frozenset(), (owner,))}
+        before = {path: path.read_bytes() for path in (target, rule, decoy)}
+        with mock.patch.dict(feature_log.PROJECTS, registry, clear=True):
+            loaded = vault.load_scoring_issues(self.root, rules_dirs=(fallback,))
+        self.assertEqual([issue.path for issue in loaded], [target])
+        self.assertEqual(loaded[0].style_inputs, vault.StyleInputs((
+            vault.RuleSummary(reference, "Document a shortcut alongside its action."),
+        ), "new-url-member", 3))
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     def test_area_vocabulary_normalizes_deduplicates_and_excludes_style(self) -> None:
         _ = self.issue("Rendering")

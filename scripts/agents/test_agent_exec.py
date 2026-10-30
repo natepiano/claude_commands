@@ -1,6 +1,8 @@
 """Claude shell launchers keep a caller account or select the showrunners account."""
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import json
 import os
 from pathlib import Path
@@ -46,10 +48,7 @@ class ClaudeLauncherTests(unittest.TestCase):
         groups.parent.mkdir(parents=True, exist_ok=True)
         _ = groups.write_text(json.dumps({"showrunners": "claude3"}))
         registry = self.home / "agents.conf"
-        _ = registry.write_text("[assignments]\ncli=claude\nsample=claude\n"
-                               + "[cli.claude]\ninteractive=opus:high\n"
-                               + "[sample.claude]\ntask=opus:high\n"
-                               + "[claude.agents]\nopus=low,medium,high,max\n")
+        _ = write_registry(registry, {'assignments': {'cli': 'claude', 'sample': 'claude'}, 'cli.claude': {'interactive': 'opus:high'}, 'sample.claude': {'task': 'opus:high'}, 'claude.agents': {'opus': 'low,medium,high,max'}})
         binary = self.home / "bin/claude"
         binary.parent.mkdir()
         _ = binary.write_text(f"#!{sys.executable}\nimport json, os, sys\n"

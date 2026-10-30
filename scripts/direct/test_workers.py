@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import fcntl
 import io
 import json
@@ -156,6 +158,9 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.patches.enter_context(patch.dict(os.environ, {
             "UNIT_WORKERS_STATE": str(self.session_dir.parent / "unit-workers"),
             "NOTIFIER_STATE_DIR": str(self.session_dir.parent / "notifier"),
+            "AGENTS_CONFIG_FILE": str(write_registry(self.session_dir / "registry.conf", {
+                "direct.codex": dict.fromkeys(("impl", "test", "fix", "review"), "gpt-kept-sol:xhigh"),
+            })),
         }))
         self.write_run_context(self.session_dir)
 
@@ -220,9 +225,7 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
 
         self.server.respond = open_second
         registry = self.session_dir.parent / "registry.conf"
-        _ = registry.write_text("[codex.agents]\ngpt-kept-sol=high,xhigh,max\n" +
-                                "[assignments]\ndirect=codex\n[direct.codex]\n" +
-                                "impl=gpt-kept-sol:xhigh\n")
+        _ = write_registry(registry, {'codex.agents': {'gpt-kept-sol': 'high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': dict.fromkeys(('impl', 'test', 'fix', 'review'), 'gpt-kept-sol:xhigh')})
         checkpoint = self.session_dir.parent / "catalog-current"
         checkpoint.touch()
         self.patches.enter_context(patch.dict(os.environ, {

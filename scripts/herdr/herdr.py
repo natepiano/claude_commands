@@ -2273,12 +2273,14 @@ def save_shared_layout(running: set[str]) -> None:
             client.save_layout()
 
 
-def reload_agent_rules(name: str) -> None:
-    """Make the running session `name` read its agent detection rules again; a failure is a line on stderr."""
+def reload_agent_rules(name: str) -> bool:
+    """Return whether session `name` reloaded its detection rules; report a failure on stderr."""
     try:
         _ = Herdr(name).run("server", "reload-agent-manifests")
     except HerdrFailure as error:
         print(f"herdr {name}: detection rules not reloaded: {error}", file=sys.stderr)
+        return False
+    return True
 
 
 def close_agent(session: str, pane: str) -> None:

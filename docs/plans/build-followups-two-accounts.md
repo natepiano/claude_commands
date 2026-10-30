@@ -222,7 +222,7 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 - `scripts/production/add_unit.py` — unit-account check, guard env, launch prefix; puts the repo root on `sys.path`.
 - `scripts/production/test_add_unit.py` — prefix, refusal, held named account, role change after readiness, manual resume.
 - `scripts/shutdown/inventory.py` — `config_dir` capture on the session snapshot.
-- `scripts/shutdown/record.py` — ignores an obsolete entry-level `config_dir`.
+- `scripts/shutdown/shutdown_record.py` — ignores an obsolete entry-level `config_dir`.
 - `scripts/shutdown/restart.py` — prefix for non-unit resumes.
 - `scripts/shutdown/test_inventory.py`, `test_record.py`, `test_restart.py` — capture, round trip, prefix.
 - `scripts/delegate/test_remove_workers.py` — owner's dir inherited.
@@ -277,11 +277,11 @@ Each step lists what changes live, what the user does, and how to undo it. Steps
 **Files:**
 - `scripts/accounts/accounts.py` — `swap`, its outcome and inventory types, `set_role` identity check, `account_label` on role history.
 - `scripts/accounts/test_accounts.py` — swap refusals, dry run, rollback, peer refusal, one selection through write and shutdown, burn attribution across logout and re-login.
-- `scripts/shutdown/record.py` — `then` on `SessionShutdown` and `AccountHold`, `ShutdownContinuation`.
+- `scripts/shutdown/shutdown_record.py` — `then` on `SessionShutdown` and `AccountHold`, `ShutdownContinuation`.
 - `scripts/shutdown/settle.py` — `begin`/`down` with `then`, `report_stop`, `shutdown_command`, `alert_user`.
 - `scripts/shutdown/shutdown.py` — `down --restart`.
 - `scripts/shutdown/stop.py` — `_retry_owner_cleanup`.
-- `scripts/shutdown/test_record.py`, `test_settle.py`, `test_shutdown_cli.py`, `test_stop.py` — the above.
+- `scripts/shutdown/test_shutdown_record.py`, `test_settle.py`, `test_shutdown_cli.py`, `test_stop.py` — the above.
 - `commands/accounts.md` — `/showrunner:accounts`.
 - `docs/as-built/shutdown-and-restart.md` — `--restart`, the retry of a failed stop, restart per session.
 
@@ -986,7 +986,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/accounts/new_account.py`, `commands/new_account.md` — `/new_account` with `HomeLogin` and the per-folder deny line.
 - `scripts/nightly_review/settings.json` — one edit deny per account folder.
 - `scripts/production/waiting.py`, `showrunner_move.py`, `add_showrunner.py` — canonical quota holds, move target and new-showrunner label.
-- `scripts/shutdown/record.py` — both spellings read, `claudeN` stored.
+- `scripts/shutdown/shutdown_record.py` — both spellings read, `claudeN` stored.
 - `scripts/message/roster.py`, `scripts/statusline/statusline.jq` — a peer's legacy label parsed; the space-free `by-label.json` lookup.
 - `scripts/notify/push_catalog.py`, `push_texts_reviewed.json` — examples and approvals.
 - `docs/accounts.md`, `docs/quota_alerts.md`, `commands/showrunner/accounts.md` and the as-builts that print a label — labels without a space.
@@ -1210,7 +1210,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Each machine changes over on its own. While `~/.claude` holds a login (`home_account_state() -> LegacyHomeLogin | ConfigOnlyHome`), a process with no `CLAUDE_CONFIG_DIR` reads as that login's account and the table prints `~/.claude holds a login; run accounts.py cutover-home` (on macOS the note names one `/login` in `~/.claude2` instead); once it holds none, such a process reads as no account everywhere and the status line shows no account piece. `account.process_config_dir(pid)` returns `ConfiguredClaudeFolder | NoAccountSetting | ProcessEnvironmentUnread`, and every consumer handles all three.
 - `accounts.py exec <claudeN|units|showrunners>` launches on a numbered folder or a group's account; `prepared_account` and `account_prefix` never unset `CLAUDE_CONFIG_DIR`. Launchers that choose no account (`message/send.py`, `cli_agent/cli_agent.sh`, `agents/agent_exec.sh`, `agent_bg.sh`, the style-eval and berth_fix launchers) go through `account_for_unscoped_launch(environment) -> ClaudeLaunchAccount | LegacyHomeLaunch`: the caller's numbered folder, else the showrunners group's folder, else `LegacyHomeLaunch` while `~/.claude` still holds a login. Shell launchers share `scripts/agents/claude_account.sh`. herdr's unit, child-showrunner, standalone and restart launches keep their pane path and carry the resolver's `CLAUDE_CONFIG_DIR`.
 - `accounts.py cutover-home <label>` renames `.credentials.json` and the `oauthAccount` block of `$HOME/.claude.json` into `~/.claudeN` (both atomic, never copied, never printed), under the journal `~/.local/state/accounts/cutover-home.json` written before the first rename; a rerun finishes an interrupted run and `--undo` renames back. It refuses while any Claude process uses the affected folder (`--undo`: `~/.claudeN`), when the destination holds a login or an `oauthAccount`, when a process's argv is unreadable, and on macOS in both directions. It appends a dated `home_cutovers` entry (label, login, time) to `config/accounts.json`.
-- History resolves a record naming `default` or `~/.claude` from a login the record carries or from a `home_cutovers` entry dated after it, else leaves it unresolved; today's login never names a past record. `burn`, `_historical_roles`, `_unit_role_history`, `group_accounts`, `moves.py` and `shutdown/record.py` follow this, and a resume of such a record goes to that label's folder.
+- History resolves a record naming `default` or `~/.claude` from a login the record carries or from a `home_cutovers` entry dated after it, else leaves it unresolved; today's login never names a past record. `burn`, `_historical_roles`, `_unit_role_history`, `group_accounts`, `moves.py` and `shutdown/shutdown_record.py` follow this, and a resume of such a record goes to that label's folder.
 - `$HOME/.claude.json` stays the seed and MCP baseline; the seed copies each project's trust entries into a new folder's `.claude.json`. On macOS `agent_accounts.claude_credentials` reads the keychain only for `~/.claude`; a numbered folder's keychain lookup is Phase 33's.
 
 **Files:**
@@ -2137,9 +2137,9 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/shutdown/settle.py` — `running_restart_line`, used by `report_stop` and `tell_showrunners_outcome`.
 - `scripts/shutdown/shutdown.py` — status and follow print the shared line.
 - `scripts/accounts/accounts.py` — `_prepare_move_shutdown`, `MoveShutdownReady`, the move, group and session paths.
-- `scripts/shutdown/record.py` — `forget_failed_restart`.
+- `scripts/shutdown/shutdown_record.py` — `forget_failed_restart`.
 - `scripts/accounts/refusal_watch.py` — the `open_ids` filter.
-- `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_record.py`, `scripts/accounts/test_moves.py`, `scripts/accounts/test_refusal_watch.py` — the line on every surface, the move closing a live failed record and refusing the rest, the guarded archive, the watcher.
+- `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_record.py`, `scripts/accounts/test_moves.py`, `scripts/accounts/test_refusal_watch.py` — the line on every surface, the move closing a live failed record and refusing the rest, the guarded archive, the watcher.
 
 **Binds later work:** "Readout of the moves": a live `restart failed` record kept its session out of every move only until this code reached a machine (field case cargo-liner-style and cargo-liner, closed by hand with `forget` 2026-10-18 01:46 EDT); from then a move archives the record without a journal entry and moves the session on its own request. "The closing command names the machine that holds the record": `shutdown status` without `--here` draws peer records, but `forget` takes only local records, so the line's command fails for a peer record (`matches no local session`).
 
@@ -2902,7 +2902,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Files:**
 - `scripts/shutdown/settle.py` — `begin`, `save_timers`, `now`, `_reserve_showrunner_line`, `tell_showrunner_stopping`, `tell_showrunners_outcome`.
-- `scripts/shutdown/record.py` — the `store` module of settle; changed only if a pending-registration or claim reader belongs there.
+- `scripts/shutdown/shutdown_record.py` — the `store` module of settle; changed only if a pending-registration or claim reader belongs there.
 - `scripts/shutdown/test_settle.py` — one stop-and-rerun test per row.
 
 **Workers:** 1 writer + 1 tester.
@@ -2949,7 +2949,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/whoami/agent_accounts.py`, `scripts/whoami/account.py`, `scripts/whoami/note_file.py`, `scripts/whoami/session_table.py`, `scripts/whoami/run_out.py`, `scripts/whoami/usage_store.py` — the registration blocks.
 - `scripts/whoami/five_hour.py`, `scripts/whoami/quota_alert.py`, `scripts/whoami/codex_pacer.py`, `scripts/whoami/agent_notes.py`, `scripts/whoami/whoami.py` — consumers.
 - `scripts/accounts/accounts.py`, `scripts/accounts/new_account.py`, `scripts/accounts/refusal_watch.py`, `scripts/accounts/refusals.py`, `scripts/accounts/unit_watchdog.py` — consumers.
-- `scripts/shutdown/inventory.py`, `scripts/shutdown/pane_record.py`, `scripts/shutdown/pane_restore.py`, `scripts/shutdown/record.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py` — consumers.
+- `scripts/shutdown/inventory.py`, `scripts/shutdown/pane_record.py`, `scripts/shutdown/pane_restore.py`, `scripts/shutdown/shutdown_record.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py` — consumers.
 - `scripts/production/cli_fixture.py`, `scripts/production/dailies_render.py`, `scripts/production/showrunner_move.py` — consumers.
 - `scripts/message/roster.py`, `scripts/nightly_review/nightly_review.py` — consumers.
 - `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_codex_alert_accounts.py`, `scripts/whoami/test_codex_homes.py`, `scripts/whoami/test_codex_pacer.py`, `scripts/whoami/test_five_hour.py`, `scripts/whoami/test_note_file.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_run_out.py`, `scripts/whoami/test_session_table.py`, `scripts/whoami/test_usage_store.py`, `scripts/whoami/test_quota_zero_episode.py` — tests.

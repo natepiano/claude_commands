@@ -32,11 +32,11 @@ from production_units import Production, read_production
 if TYPE_CHECKING:
     from scripts.message import sessions
     from scripts.message.sessions import SessionRecord
-    from scripts.shutdown import record as shutdown_record
-    from scripts.shutdown.record import SessionShutdown
+    from scripts.shutdown import shutdown_record
+    from scripts.shutdown.shutdown_record import SessionShutdown
 else:
     # retire_unit puts the message and shutdown folders on the path.
-    import record as shutdown_record
+    import shutdown_record
     import sessions
     from sessions import SessionRecord
 

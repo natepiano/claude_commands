@@ -32,11 +32,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import design_roles  # noqa: E402
 
 if TYPE_CHECKING:
-    from scripts.shutdown import record as shutdown_record
-    from scripts.shutdown.record import SessionShutdown
+    from scripts.shutdown import shutdown_record
+    from scripts.shutdown.shutdown_record import SessionShutdown
 else:
-    import record as shutdown_record
-    from record import SessionShutdown
+    import shutdown_record
+    from shutdown_record import SessionShutdown
 
 
 class StoppedUnitRestore(TypedDict):

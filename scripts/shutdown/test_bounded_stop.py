@@ -26,7 +26,7 @@ from account import Account
 import inventory
 import herdr
 import launch_permission
-import record
+import shutdown_record
 import settle
 import shutdown
 import stop
@@ -101,11 +101,11 @@ class BoundedShutdownTests(ShutdownTestCase):
         if signum == signal.SIGKILL or pid not in self.stubborn:
             _ = self.processes.pop(pid, None)
 
-    def save(self, session: inventory.Session) -> record.SessionShutdown:
+    def save(self, session: inventory.Session) -> shutdown_record.SessionShutdown:
         self.process(session["pid"], started=session["proc_start"])
         saved = entry(session, "waiting")
         saved["stop_deadline"] = (NOW_UTC + timedelta(seconds=60)).isoformat()
-        self.assertTrue(record.create_session(saved))
+        self.assertTrue(shutdown_record.create_session(saved))
         return saved
 
     def pause_workers(self, arguments: list[str]) -> int:
@@ -114,8 +114,8 @@ class BoundedShutdownTests(ShutdownTestCase):
             _ = self.processes.pop(pid, None)
         return 0
 
-    def run_stop(self, records: list[record.SessionShutdown], grace: float = 60, *,
-                 request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+    def run_stop(self, records: list[shutdown_record.SessionShutdown], grace: float = 60, *,
+                 request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
         with redirect_stdout(self.output):
             return stop.bounded_stop(records, started=0, grace_seconds=grace, request_exit=request_exit,
                 monotonic=lambda: self.elapsed, sleep=self.advance,
@@ -157,9 +157,9 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.natural_exits.update({101: 3, 201: 3})
         report = machine_inventory([director, worker])
         original = stop.bounded_stop
-        def bounded(records: list[record.SessionShutdown], *, started: float,
+        def bounded(records: list[shutdown_record.SessionShutdown], *, started: float,
                     machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
-                    request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+                    request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             del started
             self.assertEqual(records[0]["workers"], [worker])
             return original(records, started=0, machine_wide=machine_wide, keep=keep, request_exit=request_exit,
@@ -177,9 +177,9 @@ class BoundedShutdownTests(ShutdownTestCase):
     def test_saved_worker_marker_owns_a_build_without_scope_evidence(self) -> None:
         saved = self.save(top_level("owner", 101))
         worker = worker_session("worker", 201, owner="owner")
-        def workers(current: record.SessionShutdown) -> None:
+        def workers(current: shutdown_record.SessionShutdown) -> None:
             current["workers"] = [worker]
-        saved = record.update_session(saved["login"], "owner", workers)
+        saved = shutdown_record.update_session(saved["login"], "owner", workers)
         self.process(201, started=worker["proc_start"])
         self.process(301, 900, session_id="worker", arguments=("bash", "verify.sh"))
         self.natural_exits.update({101: 3, 201: 3})
@@ -216,11 +216,11 @@ class BoundedShutdownTests(ShutdownTestCase):
         director = top_level("owner", 101)
         director["proc_start"] = "Thu Oct 29 19:00:00 2026"
         saved = self.save(director)
-        def workers(current: record.SessionShutdown) -> None:
+        def workers(current: shutdown_record.SessionShutdown) -> None:
             worker = worker_session("worker", 201, owner="owner")
             worker["proc_start"] = "Thu Oct 29 19:00:01 2026"
             current["workers"] = [worker]
-        saved = record.update_session(saved["login"], "owner", workers)
+        saved = shutdown_record.update_session(saved["login"], "owner", workers)
         self.processes = {}
         shown = self.darwin_tables("301 900 301 S Thu Oct 29 18:00:00 2026 build\n",
             "301 900 301 S Thu Oct 29 18:00:00 2026 changed CLAUDE_CODE_SESSION_ID=worker\n")
@@ -284,11 +284,11 @@ class BoundedShutdownTests(ShutdownTestCase):
         director = top_level("owner", 101)
         director["proc_start"] = "100"
         saved = self.save(director)
-        def workers(current: record.SessionShutdown) -> None:
+        def workers(current: shutdown_record.SessionShutdown) -> None:
             worker = worker_session("worker", 201, owner="owner")
             worker["proc_start"] = "105"
             current["workers"] = [worker]
-        saved = record.update_session(saved["login"], "owner", workers)
+        saved = shutdown_record.update_session(saved["login"], "owner", workers)
         self.process(201, started="105")
         self.process(301, 900, started="110", arguments=("zsh",))
         shown = self.linux_table({101: "/user/app.slice/app-agents.slice/run-director.scope",
@@ -299,7 +299,7 @@ class BoundedShutdownTests(ShutdownTestCase):
         def observe(budget: float) -> inventory.ProcessObservation:
             captures.append(set(self.processes))
             return self.observe(budget)
-        def exit_requested(_saved: record.SessionShutdown) -> None:
+        def exit_requested(_saved: shutdown_record.SessionShutdown) -> None:
             self.assertEqual(captures, [{101, 201, 301}])
             _ = self.processes.pop(101)
             _ = self.processes.pop(201)
@@ -315,11 +315,11 @@ class BoundedShutdownTests(ShutdownTestCase):
         director = top_level("owner", 101)
         director["proc_start"] = "100"
         saved = self.save(director)
-        def workers(current: record.SessionShutdown) -> None:
+        def workers(current: shutdown_record.SessionShutdown) -> None:
             worker = worker_session("worker", 201, owner="owner")
             worker["proc_start"] = "105"
             current["workers"] = [worker]
-        saved = record.update_session(saved["login"], "owner", workers)
+        saved = shutdown_record.update_session(saved["login"], "owner", workers)
         self.process(201, started="105")
         self.process(301, 900, started="110")
         table = self.linux_table({101: "/user/app.slice/app-agents.slice/run-director.scope",
@@ -340,11 +340,11 @@ class BoundedShutdownTests(ShutdownTestCase):
                     director = top_level("owner", 101)
                     director["proc_start"] = "100"
                     saved = self.save(director)
-                    def workers(current: record.SessionShutdown) -> None:
+                    def workers(current: shutdown_record.SessionShutdown) -> None:
                         worker = worker_session("worker", 201, owner="owner")
                         worker["proc_start"] = "105"
                         current["workers"] = [worker]
-                    saved = record.update_session(saved["login"], "owner", workers)
+                    saved = shutdown_record.update_session(saved["login"], "owner", workers)
                     self.process(201, started="105")
                     self.process(301, 900, started="110", arguments=("zsh",))
                     self.process(302, 900, started="111", arguments=("wl-copy",))
@@ -526,11 +526,11 @@ class BoundedShutdownTests(ShutdownTestCase):
 
     def test_missing_recorded_worker_parent_blocks_completion_through_real_darwin_parser(self) -> None:
         saved = self.save(top_level("owner", 101))
-        def worker(current: record.SessionShutdown) -> None:
+        def worker(current: shutdown_record.SessionShutdown) -> None:
             worker = worker_session("worker", 201, owner="owner")
             worker["proc_start"] = "Thu Oct 29 19:00:00 2026"
             current["workers"] = [worker]
-        saved = record.update_session(saved["login"], "owner", worker)
+        saved = shutdown_record.update_session(saved["login"], "owner", worker)
         self.processes = {}
         row = "301 201 301 S Thu Oct 29 20:00:00 2026 bash build.sh\n"
         shown = self.darwin_tables(row, row)
@@ -706,13 +706,13 @@ class BoundedShutdownTests(ShutdownTestCase):
     def test_inflight_legacy_claim_yields_to_bounded_adoption_before_any_completion(self) -> None:
         session = top_level("owner", 101)
         saved = entry(session, "ready")
-        self.assertTrue(record.create_session(saved))
+        self.assertTrue(shutdown_record.create_session(saved))
         self.process(101, started=session["proc_start"])
         self.process(777, session_id="owner", arguments=("verify.sh",))
         def adopt(_login: str, _only: frozenset[str]) -> inventory.Inventory:
-            def bounded(current: record.SessionShutdown) -> None:
+            def bounded(current: shutdown_record.SessionShutdown) -> None:
                 current["stop_deadline"] = (NOW_UTC + timedelta(seconds=60)).isoformat()
-            _ = record.update_session(saved["login"], "owner", bounded)
+            _ = shutdown_record.update_session(saved["login"], "owner", bounded)
             return machine_inventory([session])
         result = stop.stop_session(saved, forced=True, fresh_inventory=adopt, clock=lambda: NOW_UTC,
             kill=self.kill, is_alive=lambda pid: pid in self.processes, session_record_exists=lambda _pid: False,
@@ -765,9 +765,9 @@ class BoundedShutdownTests(ShutdownTestCase):
                     table = self.observe(budget)
                     return inventory.ProcessObservation(table.processes,
                         shown.errors if 301 in table.processes else ())
-                def bounded(records: list[record.SessionShutdown], *, started: float,
+                def bounded(records: list[shutdown_record.SessionShutdown], *, started: float,
                             machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
-                            request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+                            request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
                     del started
                     if machine_wide:
                         return original(records, started=0, machine_wide=True, keep=keep, request_exit=request_exit, monotonic=lambda: self.elapsed,
@@ -783,7 +783,7 @@ class BoundedShutdownTests(ShutdownTestCase):
                     self.assertEqual({pid for _, pid, _ in self.signals}, set())
                     self.assertEqual(set(self.processes), {301})
                 else:
-                    saved = record.find_session(report["login"], "owner")
+                    saved = shutdown_record.find_session(report["login"], "owner")
                     assert saved is not None
                     stopped = bounded([saved], started=0)
                     self.assertEqual(stopped[0]["progress"]["kind"], "stop failed")
@@ -810,9 +810,9 @@ class BoundedShutdownTests(ShutdownTestCase):
             table = self.observe(budget)
             return inventory.ProcessObservation(table.processes, tuple(error for error in shown.errors
                 if any(error.startswith(f"pid {pid}:") for pid in table.processes)))
-        def bounded(records: list[record.SessionShutdown], *, started: float,
+        def bounded(records: list[shutdown_record.SessionShutdown], *, started: float,
                     machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
-                            request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+                            request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             del started
             return original(records, started=0, machine_wide=machine_wide, keep=keep, request_exit=request_exit,
                 monotonic=lambda: self.elapsed, sleep=self.advance, clock=lambda: NOW_UTC,
@@ -827,7 +827,7 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.assertEqual(set(self.processes), {201, 401})
         deferred.assert_called_once()
         self.assertEqual(deferred.call_args.args[0]["session"]["session_id"], "requester")
-        self.assertIsNone(record.find_session(report["login"], "postmaster"))
+        self.assertIsNone(shutdown_record.find_session(report["login"], "postmaster"))
 
     def test_positive_marker_wins_over_readable_external_service_membership(self) -> None:
         director = top_level("owner", 101)
@@ -849,9 +849,9 @@ class BoundedShutdownTests(ShutdownTestCase):
         saved = self.save(director)
         worker = worker_session("worker", 201, owner="owner")
         worker["proc_start"] = "unreadable-start"
-        def seats(current: record.SessionShutdown) -> None:
+        def seats(current: shutdown_record.SessionShutdown) -> None:
             current["workers"] = [worker]
-        saved = record.update_session(saved["login"], "owner", seats)
+        saved = shutdown_record.update_session(saved["login"], "owner", seats)
         self.natural_exits[101] = 3
         self.process(777, started="10", arguments=("tini",))
         with patch.object(sys, "platform", "darwin"):
@@ -920,9 +920,9 @@ class BoundedShutdownTests(ShutdownTestCase):
             first = "301 101 301 S Thu Oct 29 20:00:00 2026 bash build.sh\n" if 301 in self.processes else ""
             later = "301 1 301 S Thu Oct 29 20:00:00 2026 bash build.sh\n" if 301 in self.processes else ""
             return self.darwin_tables(owner + first, owner + later)
-        def owner_start(current: record.SessionShutdown) -> None:
+        def owner_start(current: shutdown_record.SessionShutdown) -> None:
             current["session"]["proc_start"] = "Thu Oct 29 20:00:00 2026"
-        saved = record.update_session(saved["login"], "owner", owner_start)
+        saved = shutdown_record.update_session(saved["login"], "owner", owner_start)
         self.processes[101] = inventory.ShutdownProcess(101, 1, saved["session"]["proc_start"])
         self.processes[301] = inventory.ShutdownProcess(301, 1, saved["session"]["proc_start"], ("bash", "build.sh"))
         with patch.object(sys, "platform", "darwin"), redirect_stdout(self.output):
@@ -949,15 +949,15 @@ class BoundedShutdownTests(ShutdownTestCase):
 
     def test_failed_bounded_attempt_is_terminal_for_scheduler_and_conductor_hold(self) -> None:
         saved = self.save(top_level("owner", 101))
-        def failed(current: record.SessionShutdown) -> None:
+        def failed(current: shutdown_record.SessionShutdown) -> None:
             current["force"] = "now"
             current["progress"] = {"kind": "stop failed", "at": NOW_UTC.isoformat(), "reason": "pid 777 unknown"}
-        saved = record.update_session(saved["login"], "owner", failed)
+        saved = shutdown_record.update_session(saved["login"], "owner", failed)
         owner = stop.fresh_session(saved["session"], machine_inventory([saved["session"]]))
         self.assertIsInstance(settle.next_step(saved, owner, [saved], NOW_UTC), settle.Finished)
-        self.assertTrue(record.shutdown_finished(saved))
-        record.set_account_hold(record.AccountHold(login=saved["login"], label=saved["label"], machine=saved["machine"], request_id=saved["request_id"], requested_at=saved["requested_at"], requested_by=saved["requested_by"], then="stop"))
-        self.assertIsInstance(record.release_finished_account_hold(saved["login"], conducting=True), record.HoldReleased)
+        self.assertTrue(shutdown_record.shutdown_finished(saved))
+        shutdown_record.set_account_hold(shutdown_record.AccountHold(login=saved["login"], label=saved["label"], machine=saved["machine"], request_id=saved["request_id"], requested_at=saved["requested_at"], requested_by=saved["requested_by"], then="stop"))
+        self.assertIsInstance(shutdown_record.release_finished_account_hold(saved["login"], conducting=True), shutdown_record.HoldReleased)
 
     def test_legacy_stop_claim_cannot_take_a_record_adopted_by_a_bounded_request(self) -> None:
         saved = self.save(top_level("owner", 101))
@@ -971,14 +971,14 @@ class BoundedShutdownTests(ShutdownTestCase):
 
     def test_now_retries_a_bounded_scope_after_its_director_has_exited(self) -> None:
         saved = self.save(top_level("owner", 101))
-        def failed(current: record.SessionShutdown) -> None:
+        def failed(current: shutdown_record.SessionShutdown) -> None:
             current["force"] = "now"
             current["progress"] = {"kind": "stop failed", "at": NOW_UTC.isoformat(), "reason": "old observation unknown"}
-        _ = record.update_session(saved["login"], "owner", failed)
+        _ = shutdown_record.update_session(saved["login"], "owner", failed)
         _ = self.processes.pop(101)
         self.process(777, arguments=("bash", "verify.sh"), session_id="owner")
         bounded = stop.bounded_stop
-        def retry(records: list[record.SessionShutdown], *, started: float, grace_seconds: float) -> list[record.SessionShutdown]:
+        def retry(records: list[shutdown_record.SessionShutdown], *, started: float, grace_seconds: float) -> list[shutdown_record.SessionShutdown]:
             del started
             return bounded(records, started=0, grace_seconds=grace_seconds,
                 monotonic=lambda: self.elapsed, sleep=self.advance, clock=lambda: NOW_UTC,
@@ -992,21 +992,21 @@ class BoundedShutdownTests(ShutdownTestCase):
         retried.assert_called_once()
         conductor.assert_not_called()
         self.assertEqual(self.processes, {})
-        current = record.find_session(saved["login"], "owner")
+        current = shutdown_record.find_session(saved["login"], "owner")
         assert current is not None
         self.assertEqual(current["progress"]["kind"], "stopped")
 
     def test_explicit_bounded_retry_schedules_restart_after_its_director_is_gone(self) -> None:
         saved = self.save(top_level("owner", 101))
-        def failed(current: record.SessionShutdown) -> None:
+        def failed(current: shutdown_record.SessionShutdown) -> None:
             current["then"] = "restart"
             current["progress"] = {"kind": "stop failed", "at": NOW_UTC.isoformat(), "reason": "unknown build"}
-        _ = record.update_session(saved["login"], "owner", failed)
-        def stopped(records: list[record.SessionShutdown], *, started: float, grace_seconds: float) -> list[record.SessionShutdown]:
+        _ = shutdown_record.update_session(saved["login"], "owner", failed)
+        def stopped(records: list[shutdown_record.SessionShutdown], *, started: float, grace_seconds: float) -> list[shutdown_record.SessionShutdown]:
             del started, grace_seconds
-            def done(current: record.SessionShutdown) -> None:
+            def done(current: shutdown_record.SessionShutdown) -> None:
                 current["progress"] = {"kind": "stopped", "at": NOW_UTC.isoformat()}
-            return [record.update_session(item["login"], item["session"]["session_id"], done) for item in records]
+            return [shutdown_record.update_session(item["login"], item["session"]["session_id"], done) for item in records]
         with (patch.object(settle, "run_inventory", return_value=machine_inventory([])),
               patch.object(settle, "unrecorded_local_sessions", return_value={}),
               patch.object(stop, "bounded_stop", side_effect=stopped) as bounded,
@@ -1022,16 +1022,16 @@ class BoundedShutdownTests(ShutdownTestCase):
         saved["progress"] = {"kind": "stopped", "at": NOW_UTC.isoformat()}
         owner = stop.fresh_session(saved["session"], machine_inventory([]))
         self.assertIsInstance(settle.next_step(saved, owner, [saved], NOW_UTC), settle.RelaunchSession)
-        self.assertFalse(record.shutdown_finished(saved))
+        self.assertFalse(shutdown_record.shutdown_finished(saved))
 
     def test_rejected_final_write_preserves_cleanup_failure_in_result_and_output(self) -> None:
         saved = self.save(top_level("owner", 101))
         self.natural_exits[101] = 3
         def cleanup(*_args: object) -> None:
-            def adopt(current: record.SessionShutdown) -> None:
+            def adopt(current: shutdown_record.SessionShutdown) -> None:
                 current["session"]["pid"] = 202
                 current["session"]["proc_start"] = "new-start"
-            _ = record.update_session(saved["login"], "owner", adopt)
+            _ = shutdown_record.update_session(saved["login"], "owner", adopt)
             raise OSError("could not remove build hold")
         with patch.object(stop, "_release_build_claims", side_effect=cleanup):
             result = self.run_stop([saved])
@@ -1039,7 +1039,7 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.assertIn("could not remove build hold", str(result[0]["progress"]))
         self.assertIn("ownership changed", str(result[0]["progress"]))
         self.assertIn("could not remove build hold", self.output.getvalue())
-        current = record.find_session(saved["login"], "owner")
+        current = shutdown_record.find_session(saved["login"], "owner")
         assert current is not None
         self.assertEqual(current["session"]["pid"], 202)
 
@@ -1050,17 +1050,17 @@ class BoundedShutdownTests(ShutdownTestCase):
                 saved = self.save(top_level("owner", 101))
                 self.natural_exits[101] = 3
                 def adopt(*_args: object) -> None:
-                    def replace(current: record.SessionShutdown) -> None:
+                    def replace(current: shutdown_record.SessionShutdown) -> None:
                         current["session"]["pid"] = 202
                         current["session"]["proc_start"] = "adopted-start"
                         current["progress"] = {"kind": "waiting"}
-                    _ = record.update_session(saved["login"], "owner", replace)
+                    _ = shutdown_record.update_session(saved["login"], "owner", replace)
                     self.process(202, started="adopted-start")
                     if failed:
                         raise OSError("cleanup failed")
                 with patch.object(stop, "_release_build_claims", side_effect=adopt):
                     result = self.run_stop([saved])
-                current = record.find_session(saved["login"], "owner")
+                current = shutdown_record.find_session(saved["login"], "owner")
                 assert current is not None
                 self.assertEqual(current["session"]["pid"], 202)
                 self.assertEqual(current["progress"]["kind"], "waiting")
@@ -1072,12 +1072,12 @@ class BoundedShutdownTests(ShutdownTestCase):
         saved = self.save(top_level("owner", 101))
         self.natural_exits[101] = 3
         def adopt(*_args: object) -> None:
-            def replace(current: record.SessionShutdown) -> None:
+            def replace(current: shutdown_record.SessionShutdown) -> None:
                 current["session"]["run_dirs"] = ["/new/director/run"]
-            _ = record.update_session(saved["login"], "owner", replace)
+            _ = shutdown_record.update_session(saved["login"], "owner", replace)
         with patch.object(stop, "_release_build_claims", side_effect=adopt):
             result = self.run_stop([saved])
-        current = record.find_session(saved["login"], "owner")
+        current = shutdown_record.find_session(saved["login"], "owner")
         assert current is not None
         self.assertEqual(current["session"]["run_dirs"], ["/new/director/run"])
         self.assertNotEqual(current["progress"]["kind"], "stopped")
@@ -1156,9 +1156,9 @@ class BoundedShutdownTests(ShutdownTestCase):
     def test_darwin_replacement_in_the_later_table_never_authorizes_a_signal_to_the_old_identity(self) -> None:
         saved = self.save(top_level("owner", 101))
         saved["session"]["proc_start"] = "Thu Oct 29 20:00:00 2026"
-        def start(current: record.SessionShutdown) -> None:
+        def start(current: shutdown_record.SessionShutdown) -> None:
             current["session"]["proc_start"] = saved["session"]["proc_start"]
-        saved = record.update_session(saved["login"], "owner", start)
+        saved = shutdown_record.update_session(saved["login"], "owner", start)
         observation = self.darwin_tables(
             "101 1 101 S Thu Oct 29 20:00:00 2026 claude\n",
             "101 1 999 S Thu Oct 29 20:00:01 2026 unrelated\n")
@@ -1200,9 +1200,9 @@ class BoundedShutdownTests(ShutdownTestCase):
             with self.subTest(first=first, later=later):
                 self.setUp()
                 saved = self.save(top_level("owner", 101))
-                def start(current: record.SessionShutdown) -> None:
+                def start(current: shutdown_record.SessionShutdown) -> None:
                     current["session"]["proc_start"] = "Thu Oct 29 20:00:00 2026"
-                saved = record.update_session(saved["login"], "owner", start)
+                saved = shutdown_record.update_session(saved["login"], "owner", start)
                 observation = self.darwin_tables(
                     f"101 1 101 {first} Thu Oct 29 20:00:00 2026 claude\n",
                     f"101 1 101 {later} Thu Oct 29 20:00:00 2026 <defunct>\n" if later else "")
@@ -1273,16 +1273,16 @@ class BoundedShutdownTests(ShutdownTestCase):
                 owner = top_level("postmaster", 101)
                 saved = self.save(owner)
                 if restoring:
-                    def begin_restore(current: record.SessionShutdown) -> None:
+                    def begin_restore(current: shutdown_record.SessionShutdown) -> None:
                         current["progress"] = {"kind": "restarting", "at": saved["requested_at"],
                             "prior": {"kind": "stopped", "at": saved["requested_at"]}}
                         current["timers"] = [{"instance": "postmaster", "was_enabled": True}]
-                    saved = record.update_session(saved["login"], "postmaster", begin_restore)
+                    saved = shutdown_record.update_session(saved["login"], "postmaster", begin_restore)
                 with (patch.object(settle, "run_inventory", return_value=machine_inventory([owner])),
                       patch.object(settle, "_launch_conductor") as conductor, redirect_stdout(self.output)):
                     self.assertEqual(settle.now(Account("claude", saved["login"], "claude2"), here=True, only=["postmaster"]), 0)
                 conductor.assert_not_called()
-                current = record.find_session(saved["login"], "postmaster")
+                current = shutdown_record.find_session(saved["login"], "postmaster")
                 if restoring:
                     self.assertEqual(current, saved)
                 else:
@@ -1293,15 +1293,15 @@ class BoundedShutdownTests(ShutdownTestCase):
     def test_down_all_leaves_a_kept_directors_restore_claim_and_timer_to_its_confirmer(self) -> None:
         owner = top_level("postmaster", 101)
         saved = self.save(owner)
-        def begin_restore(current: record.SessionShutdown) -> None:
+        def begin_restore(current: shutdown_record.SessionShutdown) -> None:
             current["progress"] = {"kind": "restarting", "at": saved["requested_at"],
                 "prior": {"kind": "stopped", "at": saved["requested_at"]}}
             current["timers"] = [{"instance": "postmaster", "was_enabled": True}]
-        saved = record.update_session(saved["login"], "postmaster", begin_restore)
+        saved = shutdown_record.update_session(saved["login"], "postmaster", begin_restore)
         with (patch.object(inventory, "all_live_accounts", return_value=[machine_inventory([owner])]),
               patch.object(settle, "_send_settle_message") as tell, redirect_stdout(self.output)):
             self.assertEqual(settle.down_all(), 0)
-        self.assertEqual(record.find_session(saved["login"], "postmaster"), saved)
+        self.assertEqual(shutdown_record.find_session(saved["login"], "postmaster"), saved)
         tell.assert_not_called()
         self.assertEqual(self.signals, [])
 
@@ -1330,7 +1330,7 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.assertEqual(result[0]["progress"]["kind"], "stopped")
 
     def test_darwin_ten_owners_and_two_hundred_children_use_only_two_tables_per_pass(self) -> None:
-        records: list[record.SessionShutdown] = []
+        records: list[shutdown_record.SessionShutdown] = []
         for number in range(10):
             owner = top_level(f"owner-{number}", 1000 + number)
             owner["proc_start"] = "Thu Oct 29 20:00:00 2026"
@@ -1354,10 +1354,10 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.assertLessEqual(len(calls), 6)
         self.assertTrue(all("-p" not in arguments for arguments in calls))
 
-    def evidence_stop(self, saved: record.SessionShutdown, *, errors: tuple[str, ...] = (),
+    def evidence_stop(self, saved: shutdown_record.SessionShutdown, *, errors: tuple[str, ...] = (),
                       observation_cost: float = 0.02, identity_cost: float = 0.01,
                       pause_cost: float = 0.1, unknown: bool = False,
-                      spawn: bool = False) -> list[record.SessionShutdown]:
+                      spawn: bool = False) -> list[shutdown_record.SessionShutdown]:
         def observe(budget: float) -> inventory.ProcessObservation:
             self.advance(min(observation_cost, budget))
             if spawn and self.elapsed > 3:
@@ -1478,9 +1478,9 @@ class BoundedShutdownTests(ShutdownTestCase):
     def test_build_born_between_observation_and_kill_requires_a_new_complete_observation(self) -> None:
         saved = self.save(top_level("owner", 101))
         self.stubborn.add(101)
-        def ready(current: record.SessionShutdown) -> None:
+        def ready(current: shutdown_record.SessionShutdown) -> None:
             current["progress"] = {"kind": "ready", "at": saved["requested_at"]}
-        saved = record.update_session(saved["login"], "owner", ready)
+        saved = shutdown_record.update_session(saved["login"], "owner", ready)
         kill = self.kill
         def spawn(pid: int, signum: int) -> None:
             if pid == 101 and signum == signal.SIGKILL:
@@ -1631,8 +1631,8 @@ class BoundedShutdownTests(ShutdownTestCase):
         owner = top_level("postmaster", 101)
         old = self.save(owner)
         real_bounded = stop.bounded_stop
-        def bounded(records: list[record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
-                            request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+        def bounded(records: list[shutdown_record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
+                            request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             _ = machine_wide, keep, request_exit
             del started
             with patch.object(stop, "bounded_stop", real_bounded):
@@ -1642,24 +1642,24 @@ class BoundedShutdownTests(ShutdownTestCase):
               patch.object(stop, "bounded_stop", side_effect=bounded), redirect_stdout(self.output)):
             self.assertEqual(settle.down_all(), 0)
         tell.assert_not_called()
-        self.assertIsNone(record.find_session(old["login"], "postmaster"))
-        self.assertIsNone(record.account_hold(old["login"]))
+        self.assertIsNone(shutdown_record.find_session(old["login"], "postmaster"))
+        self.assertIsNone(shutdown_record.account_hold(old["login"]))
         self.assertIn(101, self.processes)
         self.assertNotIn("stopped  postmaster", self.output.getvalue())
 
     def test_adopting_a_restoring_process_revokes_its_pending_confirmation_before_stop(self) -> None:
         import restart
         old = self.save(top_level("restoring", 101))
-        def restarting(current: record.SessionShutdown) -> None:
+        def restarting(current: shutdown_record.SessionShutdown) -> None:
             current["progress"] = {"kind": "restarting", "at": old["requested_at"],
                 "prior": {"kind": "stopped", "at": old["requested_at"]}}
-        claim = record.update_session(old["login"], "restoring", restarting)
+        claim = shutdown_record.update_session(old["login"], "restoring", restarting)
         current = top_level("restoring", 202)
         self.process(202, started=current["proc_start"])
         accepted: list[bool] = []
         real_bounded = stop.bounded_stop
-        def bounded(records: list[record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
-                            request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+        def bounded(records: list[shutdown_record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
+                            request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             _ = machine_wide, keep, request_exit
             del started
             with (patch.object(restart, "_prove_move", return_value=True),
@@ -1670,7 +1670,7 @@ class BoundedShutdownTests(ShutdownTestCase):
                 restart.confirm_entry(claim, old["requested_at"], True, observed_at=0)
             accepted.append(claim["progress"]["kind"] == "restarted")
             if accepted[-1]:
-                record.archive_session(old["login"], "restoring")
+                shutdown_record.archive_session(old["login"], "restoring")
             with patch.object(stop, "bounded_stop", real_bounded):
                 return self.run_stop(records, request_exit=request_exit)
         with (patch.object(inventory, "all_live_accounts", return_value=[machine_inventory([current])]),
@@ -1773,7 +1773,7 @@ class BoundedShutdownTests(ShutdownTestCase):
             advance(seconds)
             if not removed:
                 removed = True
-                record.archive_session(saved["login"], "owner")
+                shutdown_record.archive_session(saved["login"], "owner")
         with patch.object(self, "advance", side_effect=withdraw):
             stopped = self.run_stop([saved])
         self.assertEqual(stopped[0]["progress"]["kind"], "stop failed")
@@ -1787,10 +1787,10 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.natural_exits[202] = 3
         real_bounded = stop.bounded_stop
         told: list[str] = []
-        def tell(saved: record.SessionShutdown) -> None:
+        def tell(saved: shutdown_record.SessionShutdown) -> None:
             told.append(saved["session"]["name"])
-        def bounded(records: list[record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
-                            request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+        def bounded(records: list[shutdown_record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
+                            request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             _ = machine_wide, keep, request_exit
             del started
             with patch.object(stop, "bounded_stop", real_bounded):
@@ -1801,8 +1801,8 @@ class BoundedShutdownTests(ShutdownTestCase):
             self.assertEqual(settle.down_all(), 0)
         self.assertTrue(set(told) <= {"owner"})
         self.assertEqual(set(self.processes), {101})
-        self.assertEqual([saved["session"]["name"] for saved in record.session_records("owner@example.com")], ["owner"])
-        self.assertIsNone(record.account_hold("owner@example.com"))
+        self.assertEqual([saved["session"]["name"] for saved in shutdown_record.session_records("owner@example.com")], ["owner"])
+        self.assertIsNone(shutdown_record.account_hold("owner@example.com"))
 
     def test_force_note_finds_git_files_when_current_directory_is_a_subfolder(self) -> None:
         checkout = self.root / "checkout"
@@ -1825,8 +1825,8 @@ class BoundedShutdownTests(ShutdownTestCase):
         fast = self.save(top_level("fast", 101))
         slow = self.save(unit("slow", 201))
         slow["login"], slow["label"] = "second@example.com", "claude4"
-        record.archive_session(fast["login"], "slow")
-        self.assertTrue(record.create_session(slow))
+        shutdown_record.archive_session(fast["login"], "slow")
+        self.assertTrue(shutdown_record.create_session(slow))
         self.natural_exits[101] = 3
         self.stubborn.add(201)
         result = self.run_stop([slow, fast])
@@ -1872,9 +1872,9 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.process(304, 301, arguments=("bash", "notifier.sh"))
         self.process(305, 301, arguments=("timer", "timer-owned"))
         self.process(306, 301, arguments=("user-kept-build",))
-        def timer(current: record.SessionShutdown) -> None:
+        def timer(current: shutdown_record.SessionShutdown) -> None:
             current["timers"] = [{"instance": "timer-owned", "was_enabled": True}]
-        saved = record.update_session(saved["login"], "owner", timer)
+        saved = shutdown_record.update_session(saved["login"], "owner", timer)
         holds = self.root / "holds"
         holds.mkdir()
         _ = (holds / "owner").write_text(json.dumps({"keep": [{"pid": pid, "start_time": f"start-{pid}"} for pid in range(302, 307)]}))
@@ -2014,9 +2014,9 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.process(301, 101, session_id="owner", arguments=(
             "bash", "verify.sh", "test", "postmaster", "ups", "notifier.sh", "timer-owned"))
         self.process(302, 301)
-        def timers(current: record.SessionShutdown) -> None:
+        def timers(current: shutdown_record.SessionShutdown) -> None:
             current["timers"] = [{"instance": "timer-owned", "was_enabled": True}]
-        saved = record.update_session(saved["login"], "owner", timers)
+        saved = shutdown_record.update_session(saved["login"], "owner", timers)
         _ = self.run_stop([saved])
         self.assertEqual(self.processes, {})
         self.assertEqual({pid for _, pid, _ in self.signals}, {301, 302})
@@ -2031,7 +2031,7 @@ class BoundedShutdownTests(ShutdownTestCase):
         self.assertEqual(set(self.processes), {101, 102})
         self.assertEqual(self.signals, [])
         self.assertEqual(kept, [])
-        self.assertIsNone(record.find_session(saved["login"], "postmaster"))
+        self.assertIsNone(shutdown_record.find_session(saved["login"], "postmaster"))
         self.assertIn("kept  postmaster", self.output.getvalue())
         self.assertNotIn("stopped  postmaster", self.output.getvalue())
         self.assertIn("all 0 stopped", self.output.getvalue())
@@ -2072,11 +2072,11 @@ class BoundedShutdownTests(ShutdownTestCase):
     def test_requester_helper_waits_for_the_command_then_offers_a_full_checkpoint_window(self) -> None:
         saved = self.save(top_level("caller", 101))
         delivered = threading.Event()
-        def tell_owner(current: record.SessionShutdown) -> None:
+        def tell_owner(current: shutdown_record.SessionShutdown) -> None:
             del current
             delivered.set()
-        def checkpoint(records: list[record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
-                            request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+        def checkpoint(records: list[shutdown_record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
+                            request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             _ = machine_wide, keep, request_exit
             del started
             for saved in records:
@@ -2192,19 +2192,19 @@ class BoundedShutdownTests(ShutdownTestCase):
             with self.subTest(progress=progress):
                 session_id = "owner-" + progress.replace(" ", "-")
                 old = self.save(top_level(session_id, 101))
-                def finish(current: record.SessionShutdown) -> None:
+                def finish(current: shutdown_record.SessionShutdown) -> None:
                     if progress == "restart failed":
                         current["progress"] = {"kind": "restart failed", "at": old["requested_at"], "reason": "old folder"}
                     elif progress == "stopped":
                         current["progress"] = {"kind": "stopped", "at": old["requested_at"]}
                     else:
                         current["progress"] = {"kind": "restarted", "at": old["requested_at"]}
-                _ = record.update_session(old["login"], session_id, finish)
+                _ = shutdown_record.update_session(old["login"], session_id, finish)
                 fresh = entry(top_level(session_id, 202), "waiting")
                 fresh["session"]["cwd"] = "/new/current-folder"
                 fresh["request_id"] = "new-request"
-                self.assertTrue(record.create_session(fresh))
-                current = record.find_session(old["login"], session_id)
+                self.assertTrue(shutdown_record.create_session(fresh))
+                current = shutdown_record.find_session(old["login"], session_id)
                 self.assertIsNotNone(current)
                 if current is not None:
                     self.assertEqual(current["session"]["cwd"], "/new/current-folder")
@@ -2217,16 +2217,16 @@ class BoundedShutdownTests(ShutdownTestCase):
             with self.subTest(moving=moving):
                 identity = "moving" if moving else "restoring"
                 old = self.save(top_level(identity, 101))
-                def in_flight(current: record.SessionShutdown) -> None:
+                def in_flight(current: shutdown_record.SessionShutdown) -> None:
                     if moving:
                         current["target"] = "claude2"
                     else:
                         current["progress"] = {"kind": "restarting", "at": old["requested_at"],
                             "prior": {"kind": "stopped", "at": old["requested_at"]}}
-                _ = record.update_session(old["login"], identity, in_flight)
+                _ = shutdown_record.update_session(old["login"], identity, in_flight)
                 fresh = entry(top_level(identity, 202), "waiting")
-                self.assertFalse(record.create_session(fresh))
-                retained = record.find_session(old["login"], identity)
+                self.assertFalse(shutdown_record.create_session(fresh))
+                retained = shutdown_record.find_session(old["login"], identity)
                 self.assertIsNotNone(retained)
                 if retained is not None:
                     self.assertEqual(retained["session"]["pid"], 101)
@@ -2250,7 +2250,7 @@ class BoundedShutdownTests(ShutdownTestCase):
         with redirect_stdout(self.output):
             added = settle.begin(old["login"], request_id="new-move", target="claude2", report=machine_inventory([owner]))
         self.assertEqual(added, [])
-        self.assertEqual(record.find_session(old["login"], "owner"), old)
+        self.assertEqual(shutdown_record.find_session(old["login"], "owner"), old)
         self.assertIn("in flight for another process", self.output.getvalue())
 
     def test_account_down_refreshes_finished_record_but_refuses_an_open_moves_new_pid(self) -> None:
@@ -2258,12 +2258,12 @@ class BoundedShutdownTests(ShutdownTestCase):
             with self.subTest(moving=moving):
                 identity = "moving" if moving else "finished"
                 old = self.save(top_level(identity, 101))
-                def previous(saved: record.SessionShutdown) -> None:
+                def previous(saved: shutdown_record.SessionShutdown) -> None:
                     if moving:
                         saved["target"] = "claude2"
                     else:
                         saved["progress"] = {"kind": "stopped", "at": old["requested_at"]}
-                _ = record.update_session(old["login"], identity, previous)
+                _ = shutdown_record.update_session(old["login"], identity, previous)
                 live = top_level(identity, 202)
                 live["cwd"] = "/current-checkout"
                 with (patch.object(settle, "_warm", return_value=True),
@@ -2271,7 +2271,7 @@ class BoundedShutdownTests(ShutdownTestCase):
                       patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "requester"}), redirect_stdout(self.output)):
                     result = settle.down(Account("claude", old["login"], old["label"]), here=True,
                                          only=[identity], report=machine_inventory([live]))
-                retained = record.find_session(old["login"], identity)
+                retained = shutdown_record.find_session(old["login"], identity)
                 self.assertIsNotNone(retained)
                 if retained is not None:
                     self.assertEqual(retained["session"]["pid"], 101 if moving else 202)
@@ -2283,10 +2283,10 @@ class BoundedShutdownTests(ShutdownTestCase):
 
     def assert_account_conflict_writes_nothing(self, target: str) -> None:
         old = self.save(top_level("restoring", 101))
-        def restarting(current: record.SessionShutdown) -> None:
+        def restarting(current: shutdown_record.SessionShutdown) -> None:
             current["progress"] = {"kind": "restarting", "at": old["requested_at"],
                 "prior": {"kind": "stopped", "at": old["requested_at"]}}
-        previous = record.update_session(old["login"], "restoring", restarting)
+        previous = shutdown_record.update_session(old["login"], "restoring", restarting)
         report = machine_inventory([top_level("restoring", 202), top_level("healthy", 303)])
         with (patch.object(settle, "_warm", return_value=True),
               patch.object(settle, "_launch_conductor") as launch,
@@ -2294,9 +2294,9 @@ class BoundedShutdownTests(ShutdownTestCase):
               patch.object(settle, "_carry_trust") as trust, redirect_stdout(self.output)):
             self.assertEqual(settle.down(Account("claude", old["login"], old["label"]),
                 here=True, target=target, report=report), 1)
-        self.assertEqual(record.find_session(old["login"], "restoring"), previous)
-        self.assertIsNone(record.find_session(old["login"], "healthy"))
-        self.assertIsNone(record.account_hold(old["login"]))
+        self.assertEqual(shutdown_record.find_session(old["login"], "restoring"), previous)
+        self.assertIsNone(shutdown_record.find_session(old["login"], "healthy"))
+        self.assertIsNone(shutdown_record.account_hold(old["login"]))
         launch.assert_not_called()
         revoke.assert_not_called()
         trust.assert_not_called()
@@ -2317,14 +2317,14 @@ class BoundedShutdownTests(ShutdownTestCase):
             reads += 1
             if reads == 1:
                 return initial
-            self.assertIsNotNone(record.account_hold(final["login"]))
+            self.assertIsNotNone(shutdown_record.account_hold(final["login"]))
             return final
         with (patch.object(settle, "_warm", return_value=True),
               patch.object(settle, "run_inventory", side_effect=scan),
               patch.object(settle, "_launch_conductor") as launch,
               patch.object(settle, "_revoke_launches"), redirect_stdout(self.output)):
             self.assertEqual(settle.down(Account("claude", final["login"], final["label"]), here=True), 0)
-        arrived = record.find_session(final["login"], "arrived")
+        arrived = shutdown_record.find_session(final["login"], "arrived")
         self.assertIsNotNone(arrived)
         if arrived is not None:
             self.assertEqual(arrived["session"]["pid"], 202)
@@ -2332,11 +2332,11 @@ class BoundedShutdownTests(ShutdownTestCase):
 
     def test_now_replaces_stopped_record_from_old_folder_before_forcing_live_session(self) -> None:
         old = self.save(top_level("owner", 101))
-        _ = record.update_session(old["login"], "owner", lambda current: current.update(progress={"kind": "stopped", "at": old["requested_at"]}))
+        _ = shutdown_record.update_session(old["login"], "owner", lambda current: current.update(progress={"kind": "stopped", "at": old["requested_at"]}))
         current = top_level("owner", 202, status="busy")
         current["cwd"] = "/current-folder"
-        seen: list[record.SessionShutdown] = []
-        def stop_now(records: list[record.SessionShutdown], *, started: float, grace_seconds: float) -> list[record.SessionShutdown]:
+        seen: list[shutdown_record.SessionShutdown] = []
+        def stop_now(records: list[shutdown_record.SessionShutdown], *, started: float, grace_seconds: float) -> list[shutdown_record.SessionShutdown]:
             del started
             self.assertEqual(grace_seconds, 0)
             seen.extend(copy.deepcopy(records))
@@ -2354,7 +2354,7 @@ class BoundedShutdownTests(ShutdownTestCase):
         saved = self.save(top_level("owner", 101))
         for failed in (True, False):
             with self.subTest(stop_failed=failed):
-                def stop_now(records: list[record.SessionShutdown], *, started: float, grace_seconds: float) -> list[record.SessionShutdown]:
+                def stop_now(records: list[shutdown_record.SessionShutdown], *, started: float, grace_seconds: float) -> list[shutdown_record.SessionShutdown]:
                     del started, grace_seconds
                     for current in records:
                         if failed:
@@ -2385,14 +2385,14 @@ class BoundedShutdownTests(ShutdownTestCase):
     def test_down_all_stops_an_account_seen_only_by_the_final_inventory(self) -> None:
         report = machine_inventory([top_level("late-owner", 202)])
         report["login"], report["label"] = "late@example.com", "claude4"
-        selected: list[record.SessionShutdown] = []
-        def stopped(records: list[record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
-                            request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+        selected: list[shutdown_record.SessionShutdown] = []
+        def stopped(records: list[shutdown_record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
+                            request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             _ = machine_wide, keep, request_exit
             del started
             selected.extend(copy.deepcopy(records))
-            self.assertIsNotNone(record.account_hold(report["login"]))
-            self.assertIsNotNone(record.find_session(report["login"], "late-owner"))
+            self.assertIsNotNone(shutdown_record.account_hold(report["login"]))
+            self.assertIsNotNone(shutdown_record.find_session(report["login"], "late-owner"))
             for saved in records:
                 saved["progress"] = {"kind": "stopped", "at": saved["requested_at"]}
             return records
@@ -2408,9 +2408,9 @@ class BoundedShutdownTests(ShutdownTestCase):
 
     def test_down_all_blocks_a_recorded_restore_admitted_after_account_revocation(self) -> None:
         previous = self.save(top_level("late-restore", 101))
-        def finished(current: record.SessionShutdown) -> None:
+        def finished(current: shutdown_record.SessionShutdown) -> None:
             current["progress"] = {"kind": "stopped", "at": previous["requested_at"]}
-        _ = record.update_session(previous["login"], "late-restore", finished)
+        _ = shutdown_record.update_session(previous["login"], "late-restore", finished)
         reads = 0
         def scan() -> list[inventory.Inventory]:
             nonlocal reads
@@ -2434,14 +2434,14 @@ class BoundedShutdownTests(ShutdownTestCase):
         peer = machine_inventory([top_level("other", 202)])
         peer["login"], peer["label"] = "other@example.com", "claude4"
         events: list[str] = []
-        def stopped(records: list[record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
-                            request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+        def stopped(records: list[shutdown_record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
+                            request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             _ = machine_wide, keep, request_exit
             del started
             events.extend(saved["session"]["session_id"] for saved in records)
             self.assertNotIn("caller", events)
             return records
-        def defer(saved: record.SessionShutdown) -> None:
+        def defer(saved: shutdown_record.SessionShutdown) -> None:
             events.append("defer " + saved["session"]["session_id"])
         with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "caller"}),
               patch.object(inventory, "all_live_accounts", return_value=[machine_inventory([caller]), peer]),
@@ -2453,13 +2453,13 @@ class BoundedShutdownTests(ShutdownTestCase):
 
     def test_down_all_uses_the_open_restore_request_to_stop_its_current_process_without_archiving_it(self) -> None:
         old = self.save(top_level("restoring", 101))
-        def restarting(saved: record.SessionShutdown) -> None:
+        def restarting(saved: shutdown_record.SessionShutdown) -> None:
             saved["progress"] = {"kind": "restarting", "at": old["requested_at"],
                                  "prior": {"kind": "stopped", "at": old["requested_at"]}}
-        _ = record.update_session(old["login"], "restoring", restarting)
-        selected: list[record.SessionShutdown] = []
-        def stop_current(records: list[record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
-                            request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+        _ = shutdown_record.update_session(old["login"], "restoring", restarting)
+        selected: list[shutdown_record.SessionShutdown] = []
+        def stop_current(records: list[shutdown_record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
+                            request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             _ = machine_wide, keep, request_exit
             del started
             selected.extend(records)
@@ -2469,7 +2469,7 @@ class BoundedShutdownTests(ShutdownTestCase):
               patch.object(stop, "bounded_stop", side_effect=stop_current), redirect_stdout(self.output)):
             self.assertEqual(settle.down_all(), 1)
         self.assertEqual([saved["session"]["pid"] for saved in selected], [202])
-        retained = record.find_session(old["login"], "restoring")
+        retained = shutdown_record.find_session(old["login"], "restoring")
         self.assertIsNotNone(retained)
         if retained is not None:
             self.assertEqual(retained["progress"]["kind"], "waiting")
@@ -2479,18 +2479,18 @@ class BoundedShutdownTests(ShutdownTestCase):
 
     def test_down_all_stops_a_new_live_process_without_archiving_its_open_restore_request(self) -> None:
         old = self.save(top_level("restoring", 101))
-        def restarting(current: record.SessionShutdown) -> None:
+        def restarting(current: shutdown_record.SessionShutdown) -> None:
             current["target"] = "claude2"
             current["progress"] = {"kind": "restarting", "at": old["requested_at"],
                 "prior": {"kind": "stopped", "at": old["requested_at"]}}
-        previous = record.update_session(old["login"], "restoring", restarting)
+        previous = shutdown_record.update_session(old["login"], "restoring", restarting)
         current = top_level("restoring", 202)
         current["cwd"] = "/current-worktree"
         self.process(202, started=current["proc_start"])
         self.natural_exits[202] = 3
         bounded_stop = stop.bounded_stop
-        def bounded(records: list[record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
-                            request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+        def bounded(records: list[shutdown_record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
+                            request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             _ = machine_wide, keep, request_exit
             del started
             return bounded_stop(records, started=0, machine_wide=machine_wide, keep=keep, request_exit=request_exit, monotonic=lambda: self.elapsed, sleep=self.advance,
@@ -2501,7 +2501,7 @@ class BoundedShutdownTests(ShutdownTestCase):
               patch.object(settle, "_send_settle_message"),
               patch.object(stop, "bounded_stop", side_effect=bounded), redirect_stdout(self.output)):
             self.assertEqual(settle.down_all(), 0)
-        stopped = record.find_session(old["login"], "restoring")
+        stopped = shutdown_record.find_session(old["login"], "restoring")
         self.assertIsNotNone(stopped)
         if stopped is not None:
             self.assertEqual(stopped["request_id"], previous["request_id"])
@@ -2520,9 +2520,9 @@ class BoundedShutdownTests(ShutdownTestCase):
     def test_down_all_refreshes_current_checkout_and_production_doc_on_every_live_account(self) -> None:
         first = showrunner("runner", 101)
         old = self.save(first)
-        def finished(current: record.SessionShutdown) -> None:
+        def finished(current: shutdown_record.SessionShutdown) -> None:
             current["progress"] = {"kind": "stopped", "at": old["requested_at"]}
-        _ = record.update_session(old["login"], "runner", finished)
+        _ = shutdown_record.update_session(old["login"], "runner", finished)
         current = copy.deepcopy(first)
         current["cwd"], current["doc"] = "/current/runner", "/current/production.md"
         current["checkout"] = inventory.GitCheckout(kind="git", path="/current/runner",
@@ -2531,14 +2531,14 @@ class BoundedShutdownTests(ShutdownTestCase):
         first_report = machine_inventory([current])
         second_report = machine_inventory([unit("unit", 201), top_level("top", 202)])
         second_report["login"], second_report["label"] = "other@example.com", "claude4"
-        selected: list[record.SessionShutdown] = []
-        def stopped(records: list[record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
-                            request_exit: Callable[[record.SessionShutdown], None] = lambda _saved: None) -> list[record.SessionShutdown]:
+        selected: list[shutdown_record.SessionShutdown] = []
+        def stopped(records: list[shutdown_record.SessionShutdown], *, started: float, machine_wide: bool = False, keep: tuple[inventory.Session, ...] = (),
+                            request_exit: Callable[[shutdown_record.SessionShutdown], None] = lambda _saved: None) -> list[shutdown_record.SessionShutdown]:
             _ = machine_wide, keep, request_exit
             del started
             selected.extend(copy.deepcopy(records))
             for saved in records:
-                _ = record.update_session(saved["login"], saved["session"]["session_id"], finished)
+                _ = shutdown_record.update_session(saved["login"], saved["session"]["session_id"], finished)
                 saved["progress"] = {"kind": "stopped", "at": old["requested_at"]}
             return records
         with (patch.object(inventory, "all_live_accounts", return_value=[first_report, second_report]),

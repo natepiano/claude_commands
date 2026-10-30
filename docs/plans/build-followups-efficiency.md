@@ -13,7 +13,7 @@ Showrunner of build-followups, 2026-10-28 (measured by builds-unit):
 ## Delegation Context
 
 - **Project:** `~/.claude` config repo. The unit director names the worktree and branch git reports at dispatch in every Work Order.
-- **Project started:** 2026-10-28
+- **Project started:** 2026-10-28T00:02:06-04:00
 - **Stack:** Python 3 standard library checked by basedpyright; Claude Code command hooks registered in `settings.json`.
 - **Layout:** hooks and their tests in `scripts/hooks/`; the interpreter shim `scripts/lib/py`; hook registration in `settings.json` (`hooks` key); as-built docs in `docs/as-built/`.
 - **Baseline (natedev, 2026-10-28, child CPU user+sys per run of each registered command, Bash payload):** PreToolUse 357 ms (6 Python hooks: heredoc-guard 39, tool-output-read 38, showrunner-move-guard 64, change-review-gate 134, checkpoint-doc-gate 29, scratch-guard 54); PostToolUse 142 ms (berth_post_bash.sh 8, random-ack.sh 10, context-usage 59, banned-words 64); Stop 248 ms (direct-continue 57, conversation-pause 39, prose-banned-words 60, herdr_tab_title 91). About 0.5 s of CPU per Bash call and 0.25 s per Stop. The unit director's bench script feeds one payload to each command N times and reads `RUSAGE_CHILDREN`; the final numbers come from N=20 runs before and after on the same machine.

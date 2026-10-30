@@ -51,10 +51,10 @@ from rename_unit import shutdown_record  # noqa: E402
 from unit_move import PathMove, git  # noqa: E402
 
 if TYPE_CHECKING:
-    from scripts.shutdown.record import SessionShutdown
+    from scripts.shutdown.shutdown_record import SessionShutdown
 else:
     # rename_unit puts the shutdown folder on the path.
-    from record import SessionShutdown
+    from shutdown_record import SessionShutdown
 
 
 @dataclass

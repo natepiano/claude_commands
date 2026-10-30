@@ -64,12 +64,12 @@ from user_zone import user_zone  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.style import style_ledger
-    from scripts.shutdown import record as shutdown_record
-    from scripts.shutdown.record import SessionShutdown
+    from scripts.shutdown import shutdown_record
+    from scripts.shutdown.shutdown_record import SessionShutdown
 else:
     import style_ledger
-    import record as shutdown_record
-    from record import SessionShutdown
+    import shutdown_record
+    from shutdown_record import SessionShutdown
 
 RESERVED = frozenset({add_unit.NIGHTLY_REVIEW_UNIT})
 # Columns a unit rename edits outside the Units row; a File or Gate cell is never touched.

@@ -5405,19 +5405,23 @@ def _turn_service_tier(client: Client, args: argparse.Namespace) -> str:
 
 def _turn_model_effort(args: argparse.Namespace) -> tuple[str, str]:
     """Select explicit dispatch settings or the current role default at send time."""
-    role = _worker_role(args)
+    role = _roster_role(_attr(args, "role"))
+    # Freestanding resident threads may omit assignment metadata. Their task
+    # still selects a live registry default; an unnamed task uses direct.impl.
+    task = f"direct.{role.role}" if isinstance(role, AssignedWorkerRole) else (
+        _as_str(_attr(args, "task")) or "direct.impl")
     model = _as_str(_attr(args, "model"))
     effort = _as_str(_attr(args, "effort"))
     resolved = subprocess.run([
-        "bash", "-c", '''source "$1"; agents_resolve "direct.$2" || exit 2
+        "bash", "-c", '''source "$1"; AGENTS_CALLER_FAMILY=codex agents_resolve "$2" || exit 2
 if [[ -n "$3" || -n "$4" ]]; then
  pair="${3:-$AGENT_MODEL}"
  [[ "$pair" == *:* ]] || pair="$pair:${4:-$AGENT_EFFORT}"
  [[ -z "$4" ]] || pair="${pair%%:*}:$4"
- _agents_validate_pair "direct.$2" "$AGENT_FAMILY" "$pair" || exit 2
+ _agents_validate_pair "$2" "$AGENT_FAMILY" "$pair" || exit 2
 fi
 printf '%s\\n' "$AGENT_MODEL" "$AGENT_EFFORT"
-''', "mesh-turn", str(Path(__file__).with_name("agents_config.sh")), role, model, effort,
+''', "mesh-turn", str(Path(__file__).with_name("agents_config.sh")), task, model, effort,
     ], capture_output=True, text=True, timeout=30)
     if resolved.returncode:
         raise SystemExit(resolved.stderr.strip() or "cannot resolve turn model and effort")
