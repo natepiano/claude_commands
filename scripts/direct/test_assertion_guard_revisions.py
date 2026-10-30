@@ -16,6 +16,504 @@ from scripts.production import showrunners
 from scripts.direct.assertion_guard_test_support import GUARD, AssertionFindingFixture, SeededGitRepositoryFixture, SeededMergeInProgressFixture, CLEAN, TILE_OLD, TILE_NEW
 
 class AssertionRevisionTests(AssertionFindingFixture):
+    def test_module_path_import_allows_pairing_but_statement_macro_refuses(self) -> None:
+        prefix = ('mod module_path {}\nmod tests {\nuse super::module_path;\n'
+                  + 'const FIELD: &str = "strict";\n')
+        for statement in ("", "module_path!();\n    "):
+            with self.subTest(statement=statement):
+                self.change("value.rs", prefix + self.rust(statement + 'assert!(stdout.contains("strict"));')
+                            + "}\n", prefix + self.rust(statement + 'assert!(stdout.contains(FIELD));') + "}\n")
+                if statement:
+                    _ = self.assert_finding(self.guard(), "value.rs", "removed")
+                else:
+                    self.assert_clean(self.guard())
+
+
+    def test_matches_import_alias_refuses_range_endpoint_pairing(self) -> None:
+        for imports, support in (
+            ("use std::stringify as matches;\n", ""),
+            ("use ::std::stringify as matches;\n", ""),
+            ("use ::core::{stringify as matches};\n", ""),
+            ("use external::matches;\n", ""),
+            ("use std::{stringify as matches};\n", ""),
+            ("mod support;\nuse support::*;\n", "pub use std::stringify as matches;\n"),
+        ):
+            with self.subTest(imports=imports):
+                _ = self.save("support.rs", support)
+                prefix = imports + 'const LOW: i32 = 0;\nconst HIGH: i32 = 2;\n'
+                self.change("value.rs", prefix + self.rust(
+                    'assert!(matches!(ignored, 0..=2).contains("LOW") || actual);'),
+                    prefix + self.rust('assert!(matches!(ignored, LOW..=HIGH).contains("LOW") || actual);'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_macro_use_attributes_refuse_constant_pairing(self) -> None:
+        for attribute, in_glob in (
+            ("#[macro_use]", False),
+            ("#[macro_use(matches)]", False),
+            ("#[cfg_attr(feature = \"macros\", macro_use)]", False),
+            ("#[macro_use]", True),
+        ):
+            with self.subTest(attribute=attribute, in_glob=in_glob):
+                imported = attribute + "\nextern crate external;\n"
+                _ = self.save("support.rs", imported if in_glob else "")
+                prefix = ('mod support;\nuse support::*;\n' if in_glob else imported)
+                prefix += 'const FIELD: &str = "strict";\n'
+                self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));'),
+                            prefix + self.rust('assert!(stdout.contains(FIELD));'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_include_statement_refuses_constant_pairing(self) -> None:
+        _ = self.save("shadow.rs", "struct FIELD;\n")
+        for imports, macro in (
+            ("", "include"),
+            ("", "::std::include"),
+            ("", "::core::include"),
+            ("extern crate std as é;\n", "::é::include"),
+            ("", "::std::r#include"),
+        ):
+            with self.subTest(macro=macro):
+                prefix = imports + 'const FIELD: &str = "strict";\n'
+                local = f'{macro}!("shadow.rs");\n    '
+                self.change("value.rs", prefix + self.rust(
+                    local + 'assert!(std::mem::size_of_val(&"strict").le(&actual));'),
+                    prefix + self.rust(local + 'assert!(std::mem::size_of_val(&FIELD).le(&actual));'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_item_and_statement_user_macros_refuse_constant_pairing(self) -> None:
+        for invocation, at_item_level, in_glob in (
+            ("external!();", False, False),
+            ("external! {};", True, False),
+            ("crate::external![];", False, False),
+            ("#[cfg(test)]\nexternal!();", True, False),
+            ("external!();", True, True),
+        ):
+            with self.subTest(invocation=invocation, at_item_level=at_item_level, in_glob=in_glob):
+                _ = self.save("support.rs", invocation if in_glob else "")
+                prefix = 'const FIELD: &str = "strict";\n'
+                if in_glob:
+                    prefix += "mod support;\nuse support::*;\n"
+                elif at_item_level:
+                    prefix += invocation + "\n"
+                local = invocation + "\n    " if not at_item_level else ""
+                self.change("value.rs", prefix + self.rust(local + 'assert!(stdout.contains("strict"));'),
+                            prefix + self.rust(local + 'assert!(stdout.contains(FIELD));'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_expression_macros_allow_unrelated_constant_pairing(self) -> None:
+        prefix = 'const FIELD: &str = "strict";\n'
+        local = 'let noise = external::value!();\n    '
+        self.change("value.rs", prefix + self.rust(local + 'assert!(stdout.contains("strict"));'),
+                    prefix + self.rust(local + 'assert!(stdout.contains(FIELD));'))
+        self.assert_clean(self.guard())
+
+
+    def test_attributed_const_parameter_refuses_same_file_constant(self) -> None:
+        prefix = 'const LIMIT: i32 = 1;\n'
+        function = ('fn check<#[allow(non_upper_case_globals)] const LIMIT: i32>() {\n'
+                    + '    let values = [2i32];\n    ')
+        self.change("value.rs", prefix + function + 'assert!(values.contains(&1i32));\n}\n',
+                    prefix + function + 'assert!(values.contains(&LIMIT));\n}\n')
+        _ = self.assert_finding(self.guard(), "value.rs", "removed", "check")
+
+
+    def test_literal_constants_pair_across_git_revisions(self) -> None:
+        for literal, type_name, declaration in (
+            ('"\\ngit_hash: "', "&str", "const"),
+            ('r###"raw "# text"###', "&str", "const"),
+            ('b"bytes"', "&[u8]", "static"),
+            ('br##"raw bytes"##', "&[u8]", "const"),
+            ("42", "usize", "const"),
+            ("-1.5", "f64", "static"),
+            ("true", "bool", "const"),
+            ("'x'", "char", "const"),
+        ):
+            with self.subTest(literal=literal):
+                self.change("value.rs", self.rust(f"assert!(values.contains({literal}));"),
+                            f"{declaration} NAMED: {type_name} = {literal};\n"
+                            + "const ALIAS: " + type_name + " = NAMED;\n"
+                            + self.rust("assert!(values.contains(NAMED));"))
+                _ = self.git("add", "value.rs")
+                _ = self.git("commit", "-q", "-m", "name literal")
+                result = self.guard("--base", self.base, "--head", "HEAD")
+                if declaration == "static" or literal in ('br##"raw bytes"##', "42", "-1.5"):
+                    _ = self.assert_finding(result, "value.rs", "removed")
+                else:
+                    self.assert_clean(result)
+
+
+    def test_fixture_constant_and_embedded_function_checkpoint_is_clean(self) -> None:
+        before = self.rust('let source = "pub fn internal_fn() {}";\n'
+                           + '    assert!(stdout.contains("\\ngit_hash: "));\n'
+                           + '    assert!(source.contains("pub fn internal_fn()"));')
+        after = ('const SOURCE: &str = "pub fn internal_fn() {}";\n'
+                 + 'const GIT_HASH_FIELD: &str = "\\ngit_hash: ";\n'
+                 + 'const FUNCTION: &str = "pub fn internal_fn()";\n'
+                 + self.rust('let source = SOURCE;\n'
+                             + '    assert!(stdout.contains(GIT_HASH_FIELD));\n'
+                             + '    assert!(source.contains(FUNCTION));'))
+        self.change("value.rs", before, after)
+        _ = self.git("add", "value.rs")
+        _ = self.git("commit", "-q", "-m", "name CLI smoke fixtures")
+        self.assert_clean(self.guard("--base", self.base, "--head", "HEAD"))
+
+
+    def test_imported_constants_use_each_sides_revision(self) -> None:
+        cases = (
+            ("src/lib.rs", "src/common.rs", "mod common;\n", "use crate::common::{VALUE as NAMED};\n"),
+            ("src/checks.rs", "src/common/mod.rs", "", "use super::common::VALUE as NAMED;\n"),
+            ("tests/smoke.rs", "tests/common/mod.rs", "mod common;\n", "use common::*;\n"),
+            ("tests/smoke.rs", "tests/fixtures.rs", '#[path = "fixtures.rs"]\nmod common;\n',
+             "use common::VALUE as NAMED;\n"),
+        )
+        for test_path, constants_path, modules, imports in cases:
+            with self.subTest(test_path=test_path, constants_path=constants_path):
+                _ = self.git("rm", "-r", "-f", "--ignore-unmatch", "src", "tests", "Cargo.toml")
+                _ = self.save("Cargo.toml", '[package]\nname = "fixture"\nversion = "0.1.0"\n')
+                _ = self.save("src/lib.rs", "mod common;\nmod checks;\n")
+                _ = self.save(constants_path, 'pub const VALUE: &str = "git_hash";\n')
+                self.change(test_path, modules + imports + self.rust('assert!(stdout.contains(VALUE));'
+                            if "*" in imports else 'assert!(stdout.contains(NAMED));'),
+                            self.rust('assert!(stdout.contains("git_hash"));'))
+                # Renaming the old declaration makes reading it from HEAD incorrect.
+                _ = self.save(constants_path, 'pub const RENAMED: &str = "git_hash";\n')
+                _ = self.git("add", "--all")
+                _ = self.git("commit", "-q", "-m", "inline imported literal")
+                _ = self.assert_finding(self.guard("--base", self.base, "--head", "HEAD"), test_path, "removed")
+                inline_base = self.git("rev-parse", "HEAD")
+                _ = self.save(test_path, modules + imports.replace("VALUE", "RENAMED")
+                              + self.rust('assert!(stdout.contains(RENAMED));' if "*" in imports
+                                          else 'assert!(stdout.contains(NAMED));'))
+                _ = self.git("add", "--all")
+                _ = self.git("commit", "-q", "-m", "name imported literal")
+                _ = self.save(constants_path, 'pub const RENAMED: &str = "working tree decoy";\n')
+                _ = self.assert_finding(self.guard("--base", inline_base, "--head", "HEAD"), test_path, "removed")
+
+
+    def test_changed_constant_literal_still_reports_changed_assertion(self) -> None:
+        self.change("value.rs", "const BEFORE: usize = 40;\n" + self.rust("assert_eq!(actual, BEFORE);"),
+                    "const AFTER: usize = 32;\n" + self.rust("assert_eq!(actual, AFTER);"))
+        _ = self.assert_finding(self.guard(), "value.rs", "changed", status=0)
+
+
+    def test_constants_composed_of_literals_pair_without_resolving_runtime_calls(self) -> None:
+        for literal, declaration in (
+            ('"git_hash"', 'const FIELD: &str = concat!("git_", "hash");'),
+            ('42', 'const FIELD: usize = 40 + 2;'),
+            ('"git_hash"', 'const OTHER: &str = "git_hash";\nconst FIELD: &str = OTHER;'),
+            ('"git_hash"', 'const FIELD: &str = runtime_value();'),
+        ):
+            with self.subTest(declaration=declaration):
+                self.change("value.rs", self.rust(f'assert!(values.contains({literal}));'),
+                            declaration + "\n" + self.rust('assert!(values.contains(FIELD));'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_inline_module_constant_shadows_outer_literal(self) -> None:
+        prefix = 'const FIELD: &str = "strict";\nmod tests {\nconst FIELD: &str = "";\n'
+        self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));') + "}\n",
+                    prefix + self.rust('assert!(stdout.contains(FIELD));') + "}\n")
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_inline_test_module_literal_constant_pairs(self) -> None:
+        self.change("value.rs", '#[cfg(test)]\nmod tests {\n'
+                    + self.rust('assert!(stdout.contains("strict"));') + "}\n",
+                    '#[cfg(test)]\nmod tests {\nconst FIELD: &str = "strict";\n'
+                    + self.rust('assert!(stdout.contains(FIELD));') + "}\n")
+        self.assert_clean(self.guard())
+
+
+    def test_explicit_constant_import_precedes_globs_in_either_order(self) -> None:
+        modules = ('mod defaults { pub const FIELD: &str = "strict"; }\n'
+                   + 'mod configured { pub const FIELD: &str = ""; }\n')
+        for imports in ('use defaults::*;\nuse configured::FIELD;\n',
+                        'use configured::FIELD;\nuse defaults::*;\n'):
+            with self.subTest(imports=imports):
+                prefix = modules + imports
+                self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));'),
+                            prefix + self.rust('assert!(stdout.contains(FIELD));'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_multiple_glob_imports_leave_constant_names_unresolved(self) -> None:
+        prefix = ('mod first { pub const FIELD: &str = "strict"; }\n'
+                  + 'mod second { pub const FIELD: &str = "strict"; }\n'
+                  + 'use first::*;\nuse second::*;\n')
+        self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));'),
+                    prefix + self.rust('assert!(stdout.contains(FIELD));'))
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_function_local_module_leaves_qualified_paths_unresolved(self) -> None:
+        prefix = 'mod common { pub const FIELD: &str = "strict"; }\n'
+        local_module = 'mod common { pub const FIELD: &str = ""; }\n    '
+        self.change("value.rs", prefix + self.rust(local_module + 'assert!(stdout.contains("strict"));'),
+                    prefix + self.rust(local_module + 'assert!(stdout.contains(common::FIELD));'))
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_initializer_local_module_leaves_same_file_paths_unresolved(self) -> None:
+        prefix = ('mod common { pub const FIELD: &str = "strict"; }\n'
+                  + 'const LOCAL: () = { mod common { pub const FIELD: &str = ""; } };\n')
+        self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));'),
+                    prefix + self.rust('assert!(stdout.contains(common::FIELD));'))
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_inner_explicit_import_does_not_resolve_outer_constant(self) -> None:
+        prefix = ('const FIELD: &str = "strict";\n'
+                  + 'mod configured { pub const FIELD: &str = ""; }\n'
+                  + 'mod tests {\nuse super::configured::FIELD;\n')
+        self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));') + "}\n",
+                    prefix + self.rust('assert!(stdout.contains(FIELD));') + "}\n")
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_local_import_alias_does_not_resolve_outer_module_path(self) -> None:
+        prefix = ('mod common { pub const FIELD: &str = "strict"; }\n'
+                  + 'mod configured { pub const FIELD: &str = ""; }\n')
+        local_import = 'use crate::configured as common;\n    '
+        self.change("value.rs", prefix + self.rust(local_import + 'assert!(stdout.contains("strict"));'),
+                    prefix + self.rust(local_import + 'assert!(stdout.contains(common::FIELD));'))
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_second_binding_anywhere_in_file_leaves_name_written(self) -> None:
+        for binding in (
+            'const FIELD: &str = "";',
+            'static FIELD: &str = "";',
+            'let FIELD = "";',
+            'let (FIELD, other) = ("", "");',
+            'let Fixture { value: FIELD } = fixture;',
+            'fn FIELD() {}',
+            'mod FIELD {}',
+            'use configured::FIELD;',
+            'use configured::OTHER as FIELD;',
+            'use configured::OTHER as\nFIELD;',
+            'let r#FIELD = "";',
+        ):
+            with self.subTest(binding=binding):
+                prefix = 'const FIELD: &str = "strict";\n'
+                suffix = f"\nfn helper() {{ {binding} }}\n"
+                self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));') + suffix,
+                            prefix + self.rust('assert!(stdout.contains(FIELD));') + suffix)
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+        prefix = 'const FIELD: &str = "strict";\n'
+        suffix = "\nfn helper(FIELD: &str) {}\n"
+        self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));') + suffix,
+                    prefix + self.rust('assert!(stdout.contains(FIELD));') + suffix)
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_visible_and_unknown_globs_take_part_in_file_binding_census(self) -> None:
+        _ = self.save("common.rs", 'pub const FIELD: &str = "strict";\n')
+        _ = self.save("other.rs", 'pub const FIELD: &str = "strict";\n')
+        for declarations in (
+            'const FIELD: &str = "strict";\nmod common;\nuse common::*;\n',
+            'mod common;\nmod other;\nuse common::*;\nuse other::*;\n',
+            'const FIELD: &str = "strict";\nuse unreadable::*;\n',
+        ):
+            with self.subTest(declarations=declarations):
+                self.change("value.rs", declarations + self.rust('assert!(stdout.contains("strict"));'),
+                            declarations + self.rust('assert!(stdout.contains(FIELD));'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+        _ = self.save("common.rs", 'pub const OTHER: &str = "unrelated";\n')
+        declarations = 'const FIELD: &str = "strict";\nmod common;\nuse common::*;\n'
+        self.change("value.rs", declarations + self.rust('assert!(stdout.contains("strict"));'),
+                    declarations + self.rust('assert!(stdout.contains(FIELD));'))
+        self.assert_clean(self.guard())
+
+
+    def test_type_alias_and_qualified_paths_stay_written(self) -> None:
+        prefix = ('mod common { pub const FIELD: &str = "strict"; }\n'
+                  + 'struct Configured;\nimpl Configured { const FIELD: &str = ""; }\n')
+        local_alias = 'type common = Configured;\n    '
+        self.change("value.rs", prefix + self.rust(local_alias + 'assert!(stdout.contains("strict"));'),
+                    prefix + self.rust(local_alias + 'assert!(stdout.contains(common::FIELD));'))
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+        for path in ("self::FIELD", "crate::FIELD", "super::FIELD", "self :: FIELD"):
+            with self.subTest(path=path):
+                prefix = 'const FIELD: &str = "strict";\nmod tests {\n'
+                self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));') + "}\n",
+                            prefix + self.rust(f'assert!(stdout.contains({path}));') + "}\n")
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_type_alias_and_generic_parameters_refuse_bare_constant(self) -> None:
+        for binding in (
+            'type FIELD = Configured;',
+            'fn helper<FIELD>() {}',
+            'fn helper<const FIELD: &str>() {}',
+            'struct Helper<FIELD>(FIELD);',
+            'struct Helper<const FIELD: usize>;',
+        ):
+            with self.subTest(binding=binding):
+                prefix = 'const FIELD: &str = "strict";\n'
+                suffix = f"\n{binding}\n"
+                self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));') + suffix,
+                            prefix + self.rust('assert!(stdout.contains(FIELD));') + suffix)
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_static_values_stay_written_even_without_reassignment(self) -> None:
+        for declaration, mutation in (("static mut", 'FIELD = "";\n    '), ("static", "")):
+            with self.subTest(declaration=declaration):
+                prefix = f'{declaration} FIELD: &str = "strict";\n'
+                self.change("value.rs", prefix + self.rust(mutation + 'assert!(stdout.contains("strict"));'),
+                            prefix + self.rust(mutation + 'assert!(stdout.contains(FIELD));'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_signed_literal_constant_does_not_change_method_grouping(self) -> None:
+        prefix = 'const LIMIT: f64 = -2.0f64;\n'
+        self.change("value.rs", prefix + self.rust('assert!(values.contains(&-2.0f64.powi(2)));'),
+                    prefix + self.rust('assert!(values.contains(&LIMIT.powi(2)));'))
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_unit_struct_binding_refuses_literal_constant(self) -> None:
+        prefix = 'const FIELD: &str = "strict";\n'
+        local = 'struct FIELD;\n    '
+        self.change("value.rs", prefix + self.rust(local + 'assert!(std::mem::size_of_val(&"strict").le(&actual));'),
+                    prefix + self.rust(local + 'assert!(std::mem::size_of_val(&FIELD).le(&actual));'))
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_numeric_constant_stays_written_when_type_changes_size(self) -> None:
+        prefix = 'const LIMIT: u64 = 1;\n'
+        self.change("value.rs", prefix + self.rust('assert!(std::mem::size_of_val(&1).gt(&actual));'),
+                    prefix + self.rust('assert!(std::mem::size_of_val(&LIMIT).gt(&actual));'))
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_default_integer_range_constants_pair(self) -> None:
+        self.change("value.rs", self.rust('assert!(matches!(output.status.code(), Some(0..=2)));'),
+                    'const MIN_ACCEPTED_EXIT_CODE: i32 = 0;\nconst MAX_ACCEPTED_EXIT_CODE: i32 = 2;\n'
+                    + self.rust('assert!(matches!(output.status.code(), '
+                                + 'Some(MIN_ACCEPTED_EXIT_CODE..=MAX_ACCEPTED_EXIT_CODE)));'))
+        self.assert_clean(self.guard())
+
+
+    def test_matches_range_pattern_endpoints_pair(self) -> None:
+        for pattern, replacement, declarations in (
+            ("LOW..=HIGH", "0..=2", "const LOW: i32 = 0;\nconst HIGH: i32 = 2;\n"),
+            ("LOW..HIGH", "0..2", "const LOW: i32 = 0;\nconst HIGH: i32 = 2;\n"),
+            ("0..=HIGH", "0..=2", "const HIGH: i32 = 2;\n"),
+            ("Some(LOW..=HIGH)", "Some(0..=2)", "const LOW: i32 = 0;\nconst HIGH: i32 = 2;\n"),
+            ("LOW..=HIGH", "'a'..='z'", "const LOW: char = 'a';\nconst HIGH: char = 'z';\n"),
+        ):
+            with self.subTest(pattern=pattern, replacement=replacement):
+                self.change("value.rs", self.rust(f'assert!(matches!(actual, {replacement},));'),
+                            declarations + self.rust(f'assert!(matches!(actual, {pattern},));'))
+                self.assert_clean(self.guard())
+
+
+    def test_unsuffixed_float_refuses_nondefault_type_constant(self) -> None:
+        self.change("value.rs", self.rust('assert!(values.contains(&1.5));'),
+                    'const F: f32 = 1.5;\n' + self.rust('assert!(values.contains(&F));'))
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_numeric_pairing_refuses_unary_negative_assertion_literals(self) -> None:
+        self.change("value.rs", self.rust('assert!(values.contains(&-5));'),
+                    'const N: i32 = 5;\n' + self.rust('assert!(values.contains(&-N));'))
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_suffixed_numeric_literal_pairs_with_exact_declared_type(self) -> None:
+        for literal, type_name, value in (("5u64", "u64", "5"), ("5u64", "u64", "5u64"),
+                                         ("5i32", "i32", "5"), ("1.5f32", "f32", "1.5"),
+                                         ("1.5f64", "f64", "1.5f64")):
+            with self.subTest(literal=literal, type_name=type_name, value=value):
+                self.change("value.rs", self.rust(f'assert!(values.contains(&{literal}));'),
+                            f'const N: {type_name} = {value};\n' + self.rust('assert!(values.contains(&N));'))
+                self.assert_clean(self.guard())
+
+
+    def test_default_numeric_literals_pair_in_each_revision(self) -> None:
+        for literal, type_name in (("5", "i32"), ("1.5", "f64"), ("1e3", "f64")):
+            with self.subTest(literal=literal, type_name=type_name):
+                before = self.rust(f'assert!(values.contains(&{literal}));')
+                after = f'const N: {type_name} = {literal};\n' + self.rust('assert!(values.contains(&N));')
+                for base, head in ((before, after), (after, before)):
+                    self.change("value.rs", base, head)
+                    _ = self.git("add", "value.rs")
+                    _ = self.git("commit", "-q", "-m", "name or inline numeric literal")
+                    self.assert_clean(self.guard("--base", self.base, "--head", "HEAD"))
+
+
+    def test_numeric_pairing_preserves_digit_spelling_and_rejects_alias_types(self) -> None:
+        for literal, type_name, value in (("0", "i32", "0x0"), ("0", "i32", "0_0"),
+                                         ("1.5", "f64", "1.50"), ("5u64", "Count", "5"),
+                                         ("5u64", "core::primitive::u64", "5"),
+                                         ("5", "i32", "5i32"), ("5u64", "u64", "5u32")):
+            with self.subTest(literal=literal, type_name=type_name, value=value):
+                self.change("value.rs", self.rust(f'assert!(values.contains(&{literal}));'),
+                            'type Count = u64;\n' + f'const N: {type_name} = {value};\n'
+                            + self.rust('assert!(values.contains(&N));'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_numeric_declared_type_must_not_be_shadowed(self) -> None:
+        self.change("value.rs", self.rust('assert!(values.contains(&5i32));'),
+                    'type i32 = u64;\nconst N: i32 = 5;\n' + self.rust('assert!(values.contains(&N));'))
+        _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_glob_census_only_refuses_competing_names(self) -> None:
+        for imported in ('pub const FIELD: &str = "strict";\n',
+                         'pub const OTHER: &str = "unrelated";\n',
+                         'pub use nested::*;\n',
+                         'macro_rules! make_items { () => {} }\n'):
+            with self.subTest(imported=imported):
+                _ = self.save("common.rs", imported)
+                prefix = 'mod common;\nuse common::*;\nconst FIELD: &str = "strict";\n'
+                self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));'),
+                            prefix + self.rust('assert!(stdout.contains(FIELD));'))
+                if "OTHER" in imported:
+                    self.assert_clean(self.guard())
+                else:
+                    _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_item_and_binding_forms_refuse_competing_names(self) -> None:
+        for binding in ('struct FIELD;', 'struct FIELD(u8);', 'union FIELD { value: u8 }',
+                        'enum Other { FIELD }', 'enum Other { #[cfg(test)] FIELD }',
+                        'trait FIELD {}', 'type FIELD = ();', 'extern crate configured as FIELD;',
+                        'macro_rules! unrelated { () => {} }', 'for FIELD in values {}',
+                        'match value { FIELD => () }', 'future_keyword FIELD;', 'pub future_keyword FIELD;'):
+            with self.subTest(binding=binding):
+                prefix = 'const FIELD: &str = "strict";\n'
+                self.change("value.rs", prefix + self.rust(binding + '\nassert!(stdout.contains("strict"));'),
+                            prefix + self.rust(binding + '\nassert!(stdout.contains(FIELD));'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
+    def test_several_literal_constants_in_one_assertion_pair_independently(self) -> None:
+        self.change("value.rs", self.rust('assert!(values.contains("first") && values.contains("second"));'),
+                    'const FIRST: &str = "first";\nconst SECOND: &str = "second";\n'
+                    + self.rust('assert!(values.contains(FIRST) && values.contains(SECOND));'))
+        self.assert_clean(self.guard())
+
+
+    def test_nonstandard_or_ambiguous_glob_paths_stay_written(self) -> None:
+        for declaration in ('#[path = "fixtures.rs"]\nmod common;\n',
+                            '#[cfg_attr(test, path = "fixtures.rs")]\nmod common;\n', 'mod common;\n'):
+            with self.subTest(declaration=declaration):
+                _ = self.save("common.rs", 'pub const OTHER: &str = "unrelated";\n')
+                _ = self.save("fixtures.rs", 'pub const FIELD: &str = "";\n')
+                if "path" not in declaration:
+                    _ = self.save("common/mod.rs", 'pub const FIELD: &str = "";\n')
+                prefix = declaration + 'use common::*;\nconst FIELD: &str = "strict";\n'
+                self.change("value.rs", prefix + self.rust('assert!(stdout.contains("strict"));'),
+                            prefix + self.rust('assert!(stdout.contains(FIELD));'))
+                _ = self.assert_finding(self.guard(), "value.rs", "removed")
+
+
     def test_executable_matches_in_process_output_and_status(self) -> None:
         for arguments, weak in (((), False), ((), True), (("--base", "absent"), True)):
             with self.subTest(arguments=arguments, weak=weak):
@@ -310,6 +808,32 @@ class DivergedBases(NamedTuple):
 
 class ProductionBaseTests(SeededGitRepositoryFixture):
     repo: Path = Path()
+
+    def test_retired_production_rows_never_win_over_live_rows(self) -> None:
+        tip = self.refill_from_production("builds")
+        retired = self.register_production("unit", slug="retired")
+        live = self.register_production("builds", slug="live")
+        for column, marker in (("Status", "retired"), ("Status", "removed 2026-10-06"),
+                               ("Worktree", "removed 2026-10-06")):
+            worktree = str(self.repo) if column == "Status" else marker
+            status = marker if column == "Status" else "active"
+            _ = self.register_production("unit", slug="retired", worktree=worktree, status=status)
+            for docs in ((retired, live), (live, retired)):
+                with self.subTest(column=column, marker=marker, docs=docs):
+                    with patch.object(showrunners, "timer_docs", return_value=dict(enumerate(docs))):
+                        self.assertEqual(default_base(self.repo), tip)
+            if column == "Worktree":
+                # With branch-only matches, a removed Worktree must be skipped too.
+                _ = self.register_production("builds", slug="live", worktree="/different/worktree")
+                with patch.object(showrunners, "timer_docs", return_value={0: retired, 1: live}):
+                    self.assertEqual(default_base(self.repo), tip)
+
+        _ = self.register_production("builds", slug="live")
+        _ = self.register_production("unit", slug="retired", worktree_commentary="— retired 2026-10-06")
+        for docs in ((retired, live), (live, retired)):
+            with self.subTest(commentary="retired worktree", docs=docs):
+                with patch.object(showrunners, "timer_docs", return_value=dict(enumerate(docs))):
+                    self.assertEqual(default_base(self.repo), tip)
 
     def refill_from_production(self, merge_branch: str = "style/main") -> str:
         _ = self.save("incoming.rs", self.rust("\n    ".join(
