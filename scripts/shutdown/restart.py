@@ -8,7 +8,7 @@ import io
 import json
 from contextlib import contextmanager, redirect_stdout
 from contextvars import ContextVar
-from collections.abc import Callable, Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 import os
 import re
 import shlex
@@ -106,18 +106,6 @@ from push_texts import RenderedPush, render  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
 
-class RestartMessageSent(TypedDict):
-    kind: Literal["sent"]
-
-
-class RestartMessageQueued(TypedDict):
-    kind: Literal["queued"]
-    reason: str
-
-
-RestartMessageDelivery = RestartMessageSent | RestartMessageQueued
-
-
 class ShutdownServices(Protocol):
     NOTIFIER: Path
     SHOWRUNNER_TOLD_BACK: str
@@ -137,7 +125,8 @@ class ShutdownServices(Protocol):
     def send_message(
         self, recipient: str, summary: str, text: str, *,
         machine: str = "", key: str = "",
-    ) -> RestartMessageDelivery: ...
+    ) -> Mapping[str, str]: ...
+    def message_was_delivered(self, outcome: Mapping[str, object]) -> bool: ...
     def unrecorded_local_sessions(
         self, login: str, ids: tuple[str, ...], records: list[SessionShutdown],
     ) -> dict[str, str]: ...
@@ -1431,7 +1420,7 @@ def _send_restart_note(
     note: str,
     *,
     dry_run: bool,
-) -> RestartMessageDelivery:
+) -> Mapping[str, str]:
     session_id = record["session"]["session_id"]
     if dry_run:
         argv = [
@@ -1446,7 +1435,7 @@ def _send_restart_note(
             _message_key(record, session_id),
         ]
         _display(argv)
-        return RestartMessageSent(kind="sent")
+        return {"kind": "sent"}
     return settle.send_message(
         f"session:{session_id}",
         f"{record['label']} restarted",
@@ -1898,13 +1887,13 @@ def _restart_note_delivered(
                 f"restart note not delivered: {_error_reason(error)}",
             )
         return False
-    if delivery["kind"] == "sent":
+    if settle.message_was_delivered(delivery):
         return True
     if not dry_run:
         mark_restart_failed(
             record,
             "restart note not delivered: "
-            + _first_line(delivery["reason"], "queued"),
+            + _first_line(delivery.get("reason", "send not delivered"), "queued"),
         )
     return False
 
