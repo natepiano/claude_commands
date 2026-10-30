@@ -55,6 +55,8 @@ ENTRY_FIELDS = {
     "director_address", "slot_role", "session_dir", "thread", "shown_name", "job",
 }
 WORKER_SESSION_ID = "12345678-1234-5678-9abc-def012345678"
+NO_SHOWRUNNER = roster.NoShowrunner()
+NO_DIRECTOR = roster.NoDirector()
 
 
 class RosterTests(unittest.TestCase):
@@ -368,6 +370,51 @@ class RosterTests(unittest.TestCase):
             found = roster.roster(os.environ, roster.ThisMachine())
         self.assertEqual(found.problems, [])
         return {entry.name: entry for entry in found.entries}
+
+    def test_fast_labels_agree_with_full_roster_for_live_claude_sessions(self) -> None:
+        full = roster.unit_labels(list(self._entries().values()))
+        wanted = ["sid-director", "sid-runner", "sid-free"]
+        with mock.patch.object(process_table, "snapshot", side_effect=AssertionError("no process table")) as scan, \
+             mock.patch.object(codex_daemon, "loaded_sessions", side_effect=AssertionError("no daemon")) as daemon, \
+             mock.patch.object(account, "home_account_state", side_effect=AssertionError("no accounts")) as accounts:
+            fast = roster.unit_labels_for(wanted, self.environment)
+        self.assertEqual(fast, {session_id: full[session_id] for session_id in wanted})
+        self.assertEqual(fast["sid-director"], roster.UnitLabels("director", "alpha", "unit-one"))
+        scan.assert_not_called()
+        daemon.assert_not_called()
+        accounts.assert_not_called()
+
+    def test_renamed_production_has_the_same_full_and_fast_labels(self) -> None:
+        _ = (self.notifier / "showrunner-alpha").rename(self.notifier / "showrunner-builds")
+        _ = self.production_doc.write_text(
+            "## Production Context\n\n- **Formerly:** `alpha`\n\n" + self.production_doc.read_text(),
+        )
+        full = roster.unit_labels(self._entries().values())
+        fast = roster.unit_labels_for(["sid-director"], self.environment)
+        self.assertEqual(full["sid-director"], roster.UnitLabels("director", "builds", "unit-one"))
+        self.assertEqual(fast, {"sid-director": full["sid-director"]})
+
+    def test_duplicate_unit_marks_leave_both_sessions_unnamed_on_both_paths(self) -> None:
+        self._write_session("duplicate", "other-director", "sid-duplicate", self.home / "other", pid=991101)
+        self._herdr_process(991101, 991099, ["claude"], HERDR_PANE_ID="w1:p2",
+                            SHOWRUNNER_UNIT="alpha", SHOWRUNNER_UNIT_ID="unit-one")
+        running_session = sessions.running_session
+
+        def fixture_running(record: sessions.SessionRecord) -> bool:
+            return record["pid"] == 991101 or running_session(record)
+
+        with mock.patch.object(sessions, "running_session", side_effect=fixture_running), \
+             mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+            found = roster.roster(self.environment, roster.ThisMachine())
+            fast = roster.unit_labels_for(["sid-director", "sid-duplicate"], self.environment)
+        full = roster.unit_labels(found.entries)
+        self.assertTrue(any("its mark is on herdr sessions" in problem for problem in found.problems))
+        expected = {
+            "sid-director": roster.UnitLabels("director", "—", "—"),
+            "sid-duplicate": roster.UnitLabels("other-director", "—", "—"),
+        }
+        self.assertEqual({sid: full[sid] for sid in expected}, expected)
+        self.assertEqual(fast, expected)
 
     def _run_main(
         self, *arguments: str,
@@ -2026,6 +2073,160 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(director.role, "unit director")
         self.assertTrue(any("unit hosts for alpha were not read" in problem for problem in result.problems))
         self.assertEqual(self.ssh_calls(), [])
+
+
+class UnitLabelsTests(unittest.TestCase):
+    def test_folder_name_joins_showrunner_and_unit(self) -> None:
+        self.assertEqual(roster.UnitLabels("director", "hana", "lfo").folder_name(), "hana-lfo")
+        self.assertEqual(roster.UnitLabels("director", "hana", "hanami").folder_name(), "hana-hanami")
+
+    def test_folder_name_does_not_repeat_the_units_showrunner_prefix(self) -> None:
+        for unit in ("cargo-liner-style", "cargo-liner-style-types"):
+            with self.subTest(unit=unit):
+                self.assertEqual(roster.UnitLabels("director", "cargo-liner-style", unit).folder_name(), unit)
+
+    def test_folder_name_drops_a_missing_relationship(self) -> None:
+        self.assertEqual(roster.UnitLabels("director", "builds", "—").folder_name(), "builds")
+        self.assertEqual(roster.UnitLabels("director", "—", "lfo").folder_name(), "lfo")
+
+    def test_folder_name_uses_the_session_when_both_relationships_are_missing(self) -> None:
+        self.assertEqual(roster.UnitLabels("scratch").folder_name(), "scratch")
+
+    def entry(
+        self, session_id: str, name: str, *,
+        showrunner: roster.ShowrunnerRelationship = NO_SHOWRUNNER,
+        director: roster.DirectorRelationship = NO_DIRECTOR,
+        codex: bool = False,
+    ) -> roster.RosterEntry:
+        return roster.RosterEntry(
+            machine="fixture", kind="codex" if codex else "claude", role="freestanding",
+            name=name, status="running", reach=roster.CannotReceiveMessages("fixture"), cwd="/fixture",
+            showrunner=showrunner, director=director, assignment=roster.NotAWorker(),
+            session=roster.NoClaudeSession() if codex else roster.ClaudeSession(session_id),
+            thread=roster.CodexThread(session_id) if codex else roster.NoCodexThread(),
+        )
+
+    def test_labels_use_production_and_unit_short_names_not_session_names(self) -> None:
+        runner = roster.UnderShowrunner("builds", "builds-showrunner", "session:runner-id")
+        entries = [
+            self.entry("director-id", "report-director", showrunner=runner, director=roster.DirectsUnit("report-unit")),
+            self.entry("worker-thread", "report-test2", showrunner=runner,
+                       director=roster.UnderDirector("report-unit", "report-director", "session:director-id"),
+                       codex=True),
+            self.entry("runner-id", "builds-showrunner", showrunner=roster.RunsProduction("builds")),
+            self.entry("unmatched-id", "scratch"),
+            self.entry("offline-id", "orphan", showrunner=roster.ProductionWithoutRunningShowrunner("offline")),
+        ]
+        labels = roster.unit_labels(entries)
+        self.assertEqual(labels, {
+            "director-id": roster.UnitLabels("report-director", "builds", "report"),
+            "worker-thread": roster.UnitLabels("report-test2", "builds", "report"),
+            "runner-id": roster.UnitLabels("builds-showrunner", "builds", "—"),
+            "unmatched-id": roster.UnitLabels("scratch", "—", "—"),
+            "offline-id": roster.UnitLabels("orphan", "offline", "—"),
+        })
+        self.assertEqual(labels["director-id"].folder_name(), "builds-report")
+        self.assertEqual(labels["worker-thread"].folder_name(), "builds-report")
+
+    def test_labels_and_shown_name_agree_on_production_and_unit(self) -> None:
+        entry = self.entry("director-id", "report-director",
+                           showrunner=roster.UnderShowrunner("builds", "builds-showrunner", ""),
+                           director=roster.DirectsUnit("report-unit"))
+        shown = roster.shown_name(entry)
+        labels = roster.unit_labels([entry])["director-id"]
+        self.assertEqual(shown.production, roster.ProductionPart(labels.showrunner))
+        self.assertIsInstance(shown.unit, roster.UnitPart)
+        self.assertEqual(shown.render().split(" · ")[:2], [labels.showrunner, labels.unit])
+
+    def test_style_unit_keeps_its_registered_showrunner_prefix(self) -> None:
+        runner = roster.UnderShowrunner("cargo-liner-style", "cargo-liner", "session:liner")
+        entries = [
+            self.entry("style-director", "types-director", showrunner=runner,
+                       director=roster.DirectsUnit("cargo-liner-style-types-unit")),
+            self.entry("style-worker", "types-review", showrunner=runner,
+                       director=roster.UnderDirector("cargo-liner-style-types-unit", "types-director",
+                                                     "session:style-director"),
+                       codex=True),
+        ]
+        labels = roster.unit_labels(entries)
+        self.assertEqual(labels, {
+            "style-director": roster.UnitLabels("types-director", "cargo-liner-style", "cargo-liner-style-types"),
+            "style-worker": roster.UnitLabels("types-review", "cargo-liner-style", "cargo-liner-style-types"),
+        })
+        self.assertEqual(labels["style-worker"].folder_name(), "cargo-liner-style-types")
+
+    def test_labels_collapse_whitespace_without_changing_the_registered_name(self) -> None:
+        entry = self.entry("id", "report\n test2", showrunner=roster.UnderShowrunner(" builds\t", "runner", ""),
+                           director=roster.UnderDirector(" report-unit\n", "director", ""), codex=True)
+        self.assertEqual(roster.unit_labels([entry]), {"id": roster.UnitLabels("report test2", "builds", "report")})
+
+    def test_fast_lookup_uses_only_fixture_sessions_registry_and_unit_marks(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        doc = root / "production.md"
+        _ = doc.write_text(
+            "## Units\n| Unit | Plan | Worktree | Branch | Port | Owns |\n"
+            + "| --- | --- | --- | --- | --- | --- |\n"
+            + "| cargo-liner-style-types-unit | plan.md | /fixture/style | style | — | — |\n",
+        )
+        records: list[sessions.SessionRecord] = [
+            {"pid": pid, "sessionId": sid, "name": name, "messagingSocketPath": f"/fixture/{sid}.sock",
+             "updatedAt": 1, "tmux": "", "formerNames": []}
+            for pid, sid, name in (
+                (101, "runner-id", "cargo-liner"), (102, "style-id", "cargo-liner-style-types"),
+                (103, "free-id", "scratch"), (104, "worker-id", "types-review"),
+            )
+        ]
+        for record in records:
+            process = root / "proc" / str(record["pid"])
+            process.mkdir(parents=True)
+            marks = {
+                "style-id": "SHOWRUNNER_UNIT=cargo-liner-style\0SHOWRUNNER_UNIT_ID=cargo-liner-style-types-unit\0",
+                "worker-id": "CLAUDE_CODE_SESSION_ID=style-id\0",
+            }.get(record["sessionId"], "")
+            _ = (process / "environ").write_text(marks)
+        registered: list[showrunners.Showrunner] = [{
+            "session": "cargo-liner", "socket": "/fixture/runner-id.sock", "slug": "cargo-liner-style",
+            "zone": "America/New_York", "doc": str(doc),
+        }]
+        environment = {"HERDR_PROC": str(root / "proc"), "NOTIFIER_SESSIONS_DIR": str(root / "sessions")}
+        notifier = root / "notifier"
+        (notifier / "showrunner-cargo-liner-style").mkdir(parents=True)
+        with mock.patch.object(roster, "_newest_sessions", return_value=records), \
+             mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier), \
+             mock.patch.object(roster, "_registered_showrunners", return_value=registered), \
+             mock.patch.object(roster, "_live_runs", side_effect=AssertionError("no meshes")) as meshes, \
+             mock.patch.object(unit_lookup, "every_marked_unit", side_effect=AssertionError("no mark scan")) as marks_read, \
+             mock.patch.object(herdr, "herdr_places", side_effect=AssertionError("no process scan")) as places, \
+             mock.patch.object(process_table, "snapshot", side_effect=AssertionError("no process table")) as processes, \
+             mock.patch.object(account, "home_account_state", side_effect=AssertionError("no accounts")) as accounts, \
+             mock.patch.object(codex_daemon, "loaded_sessions", side_effect=AssertionError("no daemon")) as daemon:
+            labels = roster.unit_labels_for(["style-id", "runner-id", "free-id", "worker-id", "missing-id"],
+                                            environment)
+        self.assertEqual(labels, {
+            "style-id": roster.UnitLabels("cargo-liner-style-types", "cargo-liner-style", "cargo-liner-style-types"),
+            "worker-id": roster.UnitLabels("types-review", "cargo-liner-style", "cargo-liner-style-types"),
+            "runner-id": roster.UnitLabels("cargo-liner", "cargo-liner-style", "—"),
+            "free-id": roster.UnitLabels("scratch", "—", "—"),
+        })
+        meshes.assert_not_called()
+        marks_read.assert_not_called()
+        places.assert_not_called()
+        processes.assert_not_called()
+        accounts.assert_not_called()
+        daemon.assert_not_called()
+
+    def test_fast_lookup_returns_only_requested_session_ids(self) -> None:
+        records: list[sessions.SessionRecord] = [
+            {"pid": 101, "sessionId": "requested", "name": "scratch", "messagingSocketPath": "",
+             "updatedAt": 1, "tmux": "", "formerNames": []},
+            {"pid": 102, "sessionId": "other", "name": "unrequested", "messagingSocketPath": "",
+             "updatedAt": 1, "tmux": "", "formerNames": []},
+        ]
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with mock.patch.object(roster, "_newest_sessions", return_value=records), \
+             mock.patch.object(roster, "_registered_showrunners", return_value=[]):
+            labels = roster.unit_labels_for(["requested", "missing"], {"HERDR_PROC": str(root)})
+        self.assertEqual(labels, {"requested": roster.UnitLabels("scratch", "—", "—")})
 
 
 if __name__ == "__main__":
