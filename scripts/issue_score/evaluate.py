@@ -312,13 +312,18 @@ def _field_report(field: str, observations: list[FieldObservation]) -> list[str]
 def _covered(field: str, observations: list[FieldObservation], threshold: float) -> list[FieldObservation]:
     thresholds = dict(questions.THRESHOLDS)
     # Sweep this field even when production currently leaves it agent-only.
-    thresholds[field] = decide.Supported(threshold)
+    thresholds[field] = (decide.MinimumGap(threshold) if isinstance(thresholds[field], decide.MinimumGap)
+                         else decide.Supported(threshold))
     return [item for item in observations if decide.is_sure(field, item.decision, thresholds)]
+
+
+def _risk_thresholds(field: str) -> tuple[float, ...]:
+    return questions.RISK_GAPS if isinstance(questions.THRESHOLDS[field], decide.MinimumGap) else questions.RISK_THRESHOLDS
 
 
 def _threshold_outcome(field: str, observations: list[FieldObservation], *, complete: bool) -> decide.ThresholdOutcome:
     points: list[decide.RiskPoint] = []
-    for threshold in questions.RISK_THRESHOLDS:
+    for threshold in _risk_thresholds(field):
         covered = _covered(field, observations, threshold)
         if not covered:
             continue
@@ -333,6 +338,8 @@ def _threshold_outcome(field: str, observations: list[FieldObservation], *, comp
 def _outcome_text(outcome: decide.ThresholdOutcome) -> str:
     if isinstance(outcome, decide.Supported):
         return f"supported({outcome.threshold:.2f}); Jev proposes, pending held-out validation and user verdict"
+    if isinstance(outcome, decide.MinimumGap):
+        return f"supported_gap({outcome.gap:.2f}); Jev proposes, pending held-out validation and user verdict"
     if isinstance(outcome, decide.Unsupported):
         return f"unsupported ({outcome.reason}); agent-only"
     return "report-only; agent proposes pending user verdict"
@@ -340,9 +347,10 @@ def _outcome_text(outcome: decide.ThresholdOutcome) -> str:
 
 def _heldout_validation(field: str, observations: list[FieldObservation], *, complete: bool) -> str:
     policy = questions.THRESHOLDS[field]
-    if not isinstance(policy, decide.Supported):
+    if not isinstance(policy, (decide.Supported, decide.MinimumGap)):
         return _outcome_text(policy)
-    threshold = policy.threshold
+    threshold = policy.gap if isinstance(policy, decide.MinimumGap) else policy.threshold
+    gate = "gap" if isinstance(policy, decide.MinimumGap) else "threshold"
     covered = _covered(field, observations, threshold)
     if field in ("backlog_impact", "backlog_alignment"):
         errors = [float(abs(int(item.actual) - int(item.predicted)) > 1) for item in covered]
@@ -356,7 +364,7 @@ def _heldout_validation(field: str, observations: list[FieldObservation], *, com
     status = "partial" if not complete else "pass" if passed else "fail"
     coverage = float(len(covered) / len(observations)) if observations else 0.0
     recommendation = "Jev proposes, pending user verdict" if status == "pass" else "agent-only"
-    return (f"{status} at configured threshold {threshold:.2f}; Sure N: {len(covered)}; "
+    return (f"{status} at configured {gate} {threshold:.2f}; Sure N: {len(covered)}; "
             f"coverage: {coverage:.4f}; {measure}: {_metric(error)}; target: ≤ {target:.4f}; {recommendation}")
 
 
@@ -370,17 +378,21 @@ def _routing_summary(field: str, observations: list[FieldObservation]) -> str:
     policy = questions.THRESHOLDS[field]
     if isinstance(policy, decide.Supported):
         configured = f"at configured threshold {policy.threshold:.2f}"
+    elif isinstance(policy, decide.MinimumGap):
+        configured = f"at configured gap {policy.gap:.2f}"
     else:
         configured = f"under configured {'unsupported' if isinstance(policy, decide.Unsupported) else 'report-only'} policy"
     taken = _mean([float(decide.is_sure(field, item.decision)) for item in observations])
     routed = 1.0 - taken if isinstance(taken, float) else taken
+    covered = [item for item in observations if decide.is_sure(field, item.decision)]
+    wrong = _mean([float(item.actual != item.predicted) for item in covered])
     return (f"Routing {configured}: taken (sure): {_metric(taken)}; "
-            f"routed to the user (unsure): {_metric(routed)}.")
+            f"routed to the user (unsure): {_metric(routed)}; taken-wrong: {_metric(wrong)}.")
 
 
 def _risk_report(field: str, observations: list[FieldObservation], *, complete: bool, split: Split) -> list[str]:
     rows: list[list[object]] = []
-    for threshold in questions.RISK_THRESHOLDS:
+    for threshold in _risk_thresholds(field):
         covered = _covered(field, observations, threshold)
         taken = float(len(covered) / len(observations)) if observations else UndefinedMetric("no observations")
         routed = 1.0 - taken if isinstance(taken, float) else taken
@@ -390,7 +402,9 @@ def _risk_report(field: str, observations: list[FieldObservation], *, complete: 
             ordinal = [item for item in covered if isinstance(item.probabilities, dict)]
             row.append(_metric(_mean([float(abs(int(item.actual) - int(item.predicted)) > 1) for item in ordinal])))
         rows.append(row)
-    headers = ["Threshold", "Sure N", "Coverage", "Routed to user", "Exact error"]
+    gap_policy = isinstance(questions.THRESHOLDS[field], decide.MinimumGap)
+    headers = ["Gap" if gap_policy else "Threshold", "Sure N", "Coverage", "Routed to user",
+               "Taken-wrong" if gap_policy else "Exact error"]
     if field in ORDINAL_FIELDS:
         headers.append("Beyond-one error")
     recommendation = _judgment_text(field, observations, split=split, complete=complete)
@@ -531,7 +545,7 @@ def compare(run_id: str, *, split: Split = "all", repeat_run_id: str = "",
         paths = {issue.path for issue in issues}
         for field in FIELDS:
             lines += _field_report(field, [item for item in observations[field] if item.issue.path in paths])
-    lines += ["## Risk-coverage", "", "The production sure rule sweeps only this field's threshold; every other field keeps its configured threshold. Structural uncertainty remains unsure. Threshold selection requires a complete tuning run.", ""]
+    lines += ["## Risk-coverage", "", "The production sure rule sweeps only this field's probability threshold or minimum gap; every other field keeps its configured threshold. Structural uncertainty remains unsure. Threshold selection requires a complete tuning run.", ""]
     for field in FIELDS:
         lines += _risk_report(field, observations[field], complete=not partial, split=split)
     lines += _recommendations(observations, high, complete=not partial, split=split)

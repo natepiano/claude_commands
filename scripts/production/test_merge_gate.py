@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import fcntl
 
 import json
 import io
@@ -18,6 +19,102 @@ from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGat
 
 @final
 class MergeGateCheckpointTests(MergeGateFixture):
+    def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
+        copies = self.root / "copies"
+        checkout = copies / "show-maker" / "21-gate"
+        checkout.parent.mkdir(parents=True)
+        _ = self.git(self.checkout, "clone", str(self.checkout), str(checkout))
+        self.environment["SCRATCH_COPIES_ROOT"] = str(copies)
+        observed: list[Path] = []
+
+        def suites(repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
+            self.assertEqual(repo, checkout)
+            with (repo / ".claude-busy").open("a") as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(contender, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            observed.append(repo)
+            raise merge_gate.GateRefused("injected suite stop")
+
+        with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
+            result = self.run_gate("--tests-only", "--checkout", str(checkout))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("injected suite stop", result.stderr)
+        self.assertEqual(observed, [checkout])
+        excludes = (checkout / ".git/info/exclude").read_text().splitlines()
+        self.assertEqual(excludes.count("/.claude-busy"), 1)
+        self.assertEqual(excludes.count("/.scratch.json"), 1)
+        with (checkout / ".claude-busy").open("a") as contender:
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
+        checked = merge_gate.checked_git
+
+        def stop_at_push(repo: Path, *arguments: str) -> str:
+            if arguments == ("push", "origin", "integration"):
+                raise merge_gate.GateRefused("injected stop before push")
+            return checked(repo, *arguments)
+
+        with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
+            stopped = self.run_gate()
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("injected stop before push", stopped.stderr)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.assertNotEqual(merged, self.base)
+        self.assert_not_pushed()
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
+        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), merged)
+        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
+                         [merged, self.base, self.checkpoint])
+
+    def test_checkpoint_retry_refuses_a_remote_rewound_below_its_base(self) -> None:
+        self.write(self.checkout / "published.txt", "published code\n")
+        published = self.commit(self.checkout, "published non-doc change")
+        _ = self.git(self.checkout, "push", "origin", "integration")
+        checked = merge_gate.checked_git
+
+        def stop_at_push(repo: Path, *arguments: str) -> str:
+            if arguments == ("push", "origin", "integration"):
+                raise merge_gate.GateRefused("injected stop before push")
+            return checked(repo, *arguments)
+
+        with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
+            stopped = self.run_gate()
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("injected stop before push", stopped.stderr)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
+                         [merged, published, self.checkpoint])
+        _ = self.git(self.origin, "update-ref", "refs/heads/integration", self.base, published)
+
+        result = self.run_gate()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("merge HEAD differs from origin merge branch", result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
+        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.base)
+
+    def test_checkpoint_retry_refuses_a_recorded_merge_for_another_checkpoint(self) -> None:
+        checked = merge_gate.checked_git
+
+        def stop_at_push(repo: Path, *arguments: str) -> str:
+            if arguments == ("push", "origin", "integration"):
+                raise merge_gate.GateRefused("injected push failure")
+            return checked(repo, *arguments)
+
+        with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
+            stopped = self.run_gate()
+        self.assertIn("injected push failure", stopped.stderr)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.write(self.unit / "next.txt", "next checkpoint\n")
+        checkpoint = self.commit(self.unit, "next checkpoint")
+        _ = self.git(self.unit, "push", "origin", "unit-phase")
+        result = self.run_gate(checkpoint=checkpoint)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
+        self.assert_not_pushed()
+
     @gate_suites("folder_from_the_checkout")
     def test_a_folder_without_a_registry_entry_runs_and_is_reported(self) -> None:
         result = self.run_gate("--tests-only")

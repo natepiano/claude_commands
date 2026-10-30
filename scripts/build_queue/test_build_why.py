@@ -188,6 +188,42 @@ class BuildWhyTests(unittest.TestCase):
         self.assertNotIn("medium", final)
         self.assertIn("budget charge drops 12.0 GiB", final)
 
+    def test_recovery_spacing_names_its_start_in_the_display_zone_without_endings(self) -> None:
+        self.reset_running(available=40, need=4)
+        _ = self.running(800, "holder", "clippy", 6, 6, 3600)
+        gate.write_recovery(self.directory, gate.RecoveryStarts(NOW + 120, NOW + 37))
+        for zone, expected in (("America/New_York", "21:51:37 EDT"), ("UTC", "01:51:37 UTC")):
+            with self.subTest(zone=zone), mock.patch.dict(os.environ, {"USER_ZONE": zone}):
+                final = self.line(self.output(), "Waiting because:")
+                self.assertIn("no running step needs to end; recovery spacing starts it at " + expected, final)
+                self.assertNotIn("still leaves pressure", final)
+
+    def test_recovery_spacing_names_the_required_endings_before_its_start(self) -> None:
+        self.reset_running(available=40, need=4)
+        _ = self.running(800, "holder", "clippy", 20, 20, 3600)
+        gate.write_recovery(self.directory, gate.RecoveryStarts(NOW + 120, NOW + 37))
+        final = self.line(self.output(), "Waiting because:")
+        self.assertIn("stale-holder clippy end (budget charge drops 20.0 GiB; "
+                      + "free memory rises 20.0 GiB and promise not yet used drops 0.0 GiB); "
+                      + "then recovery spacing starts it at 21:51:37 EDT", final)
+        self.assertNotIn("no running step needs to end", final)
+        self.assertNotIn("still leaves pressure", final)
+
+    def test_recovery_release_finishes_with_the_start_time(self) -> None:
+        cases = (
+            (6, "no running step needs to end; recovery spacing starts it at 21:51:37 EDT."),
+            (20, "stale-holder clippy end (budget charge drops 20.0 GiB; "
+             + "free memory rises 20.0 GiB and promise not yet used drops 0.0 GiB); "
+             + "then recovery spacing starts it at 21:51:37 EDT."),
+        )
+        for index, (charge, expected) in enumerate(cases):
+            with self.subTest(charge=charge):
+                self.reset_running(available=40, need=4)
+                _ = self.running(800 + index, "holder", "clippy", charge, charge, 3600)
+                gate.write_recovery(self.directory, gate.RecoveryStarts(NOW + 120, NOW + 37))
+                final = self.line(self.output(), "Waiting because:")
+                self.assertEqual(final.partition("Frees when: ")[2], expected)
+
     def test_release_keeps_the_snapshot_limits_and_reports_a_pressure_hold(self) -> None:
         explanation = gate.explain_queue()
         with mock.patch.object(gate, "build_budget_bytes", side_effect=AssertionError("use snapshot budget")), \
@@ -225,7 +261,8 @@ class BuildWhyTests(unittest.TestCase):
             self.fail(f"expected head admission status, got {reason}")
         running = [row.measured for row in view.running]
         head = gate.head_priority([row for _, row in ordered], view.available, 60 * GIB, running, NOW)
-        decision = gate.queue_decision(view.available, 60 * GIB, ordered[0][1], running, head, gate.NoPressureHold())
+        decision = gate.queue_decision(view.available, 60 * GIB, ordered[0][1], [row for _, row in ordered], running, head,
+                                      gate.NoPressureHold(), recovery=gate.NoRecoverySpacing(), now=NOW)
         self.assertEqual(reason.decision, decision)
         self.assertEqual(decision.state, "hold")
         self.assertAlmostEqual(decision.charged / GIB, 18.1, places=5)
