@@ -23,7 +23,7 @@ Facts read 2026-10-29 on natedev. "unverified" marks a claim not checked.
 
 Not copies for this helper: unit worktrees (`add_unit.py:821`, `resume_unit.py:176`), `berth_fix/launch.sh:128`, test fixtures (`cli_fixture.py:125`), `merge_gate.py:775,806` test temp roots, `hana_shot` temp folders, `commands/mend_fix.md:24` (by-hand rsync of external projects; out of scope).
 
-Lifetime tools that exist: `scripts/lib/scratch.py` (tasks `run:`, `phase:`, `gate:`, `row:`, `until:`; root `/tmp/claude/scratch`, names `<task>-<word>-<6 chars>`; resources-unit), `tmp_sweep.py` (hourly, idle 4 h / 7 days), `sweep.py` floor (`FLOOR_ROOTS` includes `/tmp`, `sweep.py:216`; `source_git_dir` maps a clone to hana, `sweep.py:1788-1800`). W2: no script makes the hana clones; nothing sets `CARGO_TARGET_DIR`.
+Lifetime tools that exist: `scripts/lib/scratch.py` (tasks `run:`, `phase:`, `gate:`, `row:`, `until:`; root `/tmp/claude/scratch`, names `<task>-<word>-<6 chars>`; resources-unit), `tmp_sweep.py` (hourly; end evidence, else 7 days idle: since `3b89f3aa`, merged as `d72d9b8f` on 2026-10-29, no 4 h rule for top-level `/tmp/claude` entries or unit/delegate run folders; without end evidence an entry goes only after 7 days with no change, mtime or ctime anywhere in the tree, and no process), `sweep.py` floor (`FLOOR_ROOTS` includes `/tmp`, `sweep.py:216`; `source_git_dir` maps a clone to hana, `sweep.py:1788-1800`). W2: no script makes the hana clones; nothing sets `CARGO_TARGET_DIR`.
 
 ## Decision: seed vs shared build-dir
 
@@ -56,16 +56,17 @@ Expected (unverified): rule 1 fails on the lock (`sweep.py:123`), and seeding wi
 ## Cleanup
 
 Each copy is known to cleanup at birth. The helper does not add a cleaner.
-- **Record:** the helper makes the folder through `scratch.py` with a task: `phase:<unit>/<phase>` for gate, review and land copies (ended by `merge_checkpoint.py:970`), `gate:<id>` for a gate the caller ends, `run:<run id>` for run copies (ended by `end_session.sh:95`), else `until:` 24 h. The record also holds the provenance: source path, source commit, copy commit, target mode, seed source.
-- **Layout support (resources-unit, `scratch.py`):** a copies root `/tmp/claude/copies` with the two-level name; `tmp_sweep.py` treats each `<pair>/<copy>` as an entry and removes an empty `<pair>/`; the scratch guard hook allows the root.
-- **Floor:** a copy's target in use is busy to the floor sweep (resources-unit Phase 3, under repair). An idle copy's target is taken least recently used first, as now.
+- **Record:** the helper makes the folder through `scratch.py` with a task: `phase:<unit>/<phase>` for gate and review copies (ended by `merge_checkpoint.py:970`), `landed:<unit>/<branch>` for `work` and land copies, `gate:<id>` for a gate the caller ends, `run:<run id>` for run copies (ended by `end_session.sh:95`), else `until:` 24 h. Record fields (resources-unit, 2026-10-29): source path, source commit, copy commit, target mode, seed source, `borrows_from`, owner unit, task. A `phase:` record also names the run dir and phase id.
+- **Layout support (resources-unit, `scratch.py`):** `/tmp/claude/copies` is a kept root, like `scratch/` and `unit/`. Each `<pair>/<copy>` is one entry; its scratch record is its end evidence. `tmp_sweep.py` removes an empty `<pair>/`. The scratch guard hook allows the root.
+- **Busy lock:** a lock file `.claude-busy` in a copy or target folder, held with `flock` by its holder for the whole run. `tmp_sweep.py`, scratch end and the floor sweep skip a folder whose `.claude-busy` is locked. The lock dies with its process, so a crashed run leaves no stale mark. No `~/.claude` import is needed: hana sets it with `flock`.
+- **Floor:** a copy's target in use is busy to the floor sweep (resources-unit Phase 3, under repair), and so is a folder with a locked `.claude-busy`. An idle copy's target is taken least recently used first, as now.
 - **Shared build-dir (if chosen):** one per repository at `/tmp/claude/copies/build-dirs/<repo>`, held with `scratch.hold` like `style_sync.py lint_target`, under the hana budget (`sweep_budget_gib.hana=96`, `config/lint.conf:66-67`).
 - **Mac:** see Mac mirrors.
-- **Git:** the copy's own `clone --shared` git dir borrows objects from the source; a copy outliving a `git gc` of the source can lose objects. Copies are short-lived; the 7-day idle rule bounds it.
+- **Git:** the copy's own `clone --shared` git dir borrows objects from the source; a copy outliving a `git gc` of the source can lose objects. The record's `borrows_from` names the source git dir; scratch end and `tmp_sweep.py` keep a parent copy while a live record borrows from it. The 7-day idle rule bounds the rest.
 
 ## Survey changes
 
-Survey of every unit director, sent 14:05 EDT 2026-10-29 to 45 units, closed 23:00 EDT. 44 answered: 42 by 19:05 EDT, and two (phases, cargo-liner-style-values) whose 14:05 answers sat unread in the send.py queue until the close. resources-unit sent no answer; it owns the Lifetime and cleanup items. security-unit started after the survey. Each answer, with its unit, is in `.claude/handoff/copies-survey-answers.md` of this worktree. Most said the format suits them. These changes go into Phase 3; the unit that asked is in brackets.
+Survey of every unit director, sent 14:05 EDT 2026-10-29 to 45 units, closed 23:00 EDT. 45 sent, 45 answered: 42 by 19:05 EDT; two (phases, cargo-liner-style-values) whose 14:05 answers sat unread in the send.py queue until the close; and resources-unit, owner of the Lifetime and cleanup items, at 23:2x EDT ("suits, with these changes"). security-unit started after the survey. Each answer, with its unit, is in `.claude/handoff/copies-survey-answers.md` of this worktree. Most said the format suits them. These changes go into Phase 3; the unit that asked is in brackets.
 
 **Name.**
 - The phase part is a slug, `[a-z0-9-]`: `54b`, `94b`, `adhoc` for ad hoc work. A slash is refused. Where no phase exists, a free label takes its place: `sync-test`, `demo27-fastest4`, `adhoc-stallcpu-gate` [unit-board, merge-gate, messaging, fix-rounds, models].
@@ -87,18 +88,18 @@ Survey of every unit director, sent 14:05 EDT 2026-10-29 to 45 units, closed 23:
 - A seed comes only from a target built with the same `Cargo.lock` and toolchain [hana-migration]. The newest landed gate copy of the repository is the first seed choice [merge-gate].
 - A before/after pair gets the same fill from the same base build [fastest].
 
-**Lifetime and cleanup** (resources-unit, `scratch.py`; Phase 2 request).
-- Task `landed:<unit>/<branch>`: ended when the branch lands, not at the first checkpoint [widget, lfo, startup, style-unit].
-- A queued or running `verify.sh` run marks its copy busy; no idle rule or phase end removes a busy copy. A memory wait of 4 h 34 min passed the 4 h idle rule [widget, fix-rounds].
-- A `phase:` copy is not idle while its phase is open [organon, frame-cost].
-- A copy whose origin is a sibling copy is removed before that sibling [startup].
-- Removing a `before` copy never removes its `after` copy [shutdown].
-- `copies.py hand-over --to <unit>` renames the pair and moves the cleanup owner when a phase moves [demo].
+**Lifetime and cleanup** (resources-unit, `scratch.py`; Phase 2 request; resources-unit's answer, 23:2x EDT, in each item).
+- Task `landed:<unit>/<branch>`: ended when the branch lands, not at the first checkpoint [widget, lfo, startup, style-unit]. Ended when `origin/<branch>` is an ancestor of `origin/main` and the copy has no uncommitted or unpushed work; the `tmp_sweep.py` git check already keeps unpushed work. The 7-day no-change rule still applies after that.
+- A queued or running `verify.sh` run marks its copy busy; no idle rule or phase end removes a busy copy [widget, fix-rounds]. A memory wait of 4 h 34 min once passed the old 4 h idle rule; that rule is gone (`3b89f3aa`), and the busy lock still guards phase end, the floor and the 7-day rule. The mark is the `.claude-busy` lock (Cleanup); `verify.sh` takes it before its memory wait, so a queued run is busy too.
+- A `phase:` copy is not idle while its phase is open [organon, frame-cost]. Scratch reads the phase's open state from the run's progress recorder; the record names the run dir and phase id. An open phase keeps the copy at any age.
+- A copy whose origin is a sibling copy is removed before that sibling [startup]. The record keeps `borrows_from` (the parent copy's git dir, from `clone --shared`). Scratch end and `tmp_sweep.py` skip a parent while a live record borrows from it, and remove it after the last child. This also guards against lost objects.
+- Removing a `before` copy never removes its `after` copy [shutdown]. They are two separate records with no nesting; nothing to build.
+- `copies.py hand-over --to <unit>` renames the pair and moves the cleanup owner when a phase moves [demo]. It calls `scratch.py hand-over <path> --to <unit>`, which renames the pair folder and changes the owner and task in one atomic record replace.
 - A same-name copy at another source commit is replaced or refused, never built in [screenshot]; a same-name copy at the same commit is reused across review passes [style-unit].
-- A copy whose borrowed objects were pruned by `git gc` is refused loudly; the record names the borrowed object dir [models].
+- A copy whose borrowed objects were pruned by `git gc` is refused loudly; the record's `borrows_from` names the borrowed git dir [models].
 
 **Out of scope.**
-- hana's product frozen builds (`scripts/perf/build.py`, `hana-measure-*`) stay outside the helper. The floor sweep should honour a busy lock file in a target that hana can set without `~/.claude` (resources-unit request) [benchmark].
+- hana's product frozen builds (`scripts/perf/build.py`, `hana-measure-*`) stay outside the helper. They set the `.claude-busy` lock with `flock` in their target, with no `~/.claude` import; the floor sweep skips it (resources-unit Phase 21) [benchmark].
 - Codex work clones under `~/.cache` and delegate folders may move to `work` copies; each owner decides in Phase 4 [cables, trunk].
 - A Windows VM copy place: not in this plan [research].
 - Before/after profile trees that need `config` linked to `~/.claude/config` make the link themselves after make [accounts].
@@ -165,11 +166,11 @@ Hold length: 3 h. Count: about 17 hana builds — A 2, B 4, C 4, D 5 (one pair a
 
 **Goal:** names and cleanup support exist where they live.
 
-**Spec:** report-unit lands `unit_labels` / `unit_labels_for` (its Phase 3, `e4f5e836`, done) plus the join function and dropped-part rule (Naming). resources-unit adds the copies root to `scratch.py` (two-level name, provenance fields), `tmp_sweep.py` and the scratch guard; its Phase 3 in-use marking covers `/tmp/claude/copies`. If Phase 1 picks the shared build-dir, resources-unit owns its budget and hold. efficiency-unit changes `scripts/lib/nix_env.py` to trust a copy's `.envrc` only when the copy's copies.py/scratch.py record names a source repo under `~/rust`, `~/worktrees` or `~/.claude*`, and the copy's `.envrc` equals the source's `.envrc` blob at the copy commit (approved by builds). Today it refuses (`direnv: .envrc is blocked`), so verify.sh and style_sync lint fail in a copy. verify-unit sends efficiency the record's path and fields (source path, source commit, copy commit) when Phase 3 fixes them. Due before Phase 4. resources-unit also gets the Lifetime and cleanup items of Survey changes (task `landed:`, busy copy during a queued or running run, open-phase copies not idle, child before parent, a target busy lock file hana can set); report-unit's share is done: `UnitLabels.folder_name()` (its Phase 4, `2c96f13a`, on origin/builds; hana + lfo gives `hana-lfo`) gives the copies folder name.
+**Spec:** report-unit lands `unit_labels` / `unit_labels_for` (its Phase 3, `e4f5e836`, done) plus the join function and dropped-part rule (Naming). resources-unit answered 23:2x EDT 2026-10-29 ("suits, with these changes") and builds it as its Phase 21, "copies root and lifetime": the copies root as a kept root in `scratch.py` (two-level name, the record fields of Cleanup), `tmp_sweep.py` and the scratch guard; the `.claude-busy` lock read by `tmp_sweep.py`, scratch end and `sweep.py` (busy lock only); tasks `landed:` and open-phase `phase:`; `borrows_from` child before parent; and `scratch.py hand-over <path> --to <unit>`. Files: `scripts/lib/scratch.py`, `scripts/lint/tmp_sweep.py`, `scripts/lint/sweep.py`, the scratch guard hook and their tests. It shares no files with resources-unit's memory admission phases, so it runs beside its Phase 15; ETA 06:00 EDT 2026-10-30 if the builds showrunner approves the slot. Its Phase 3 in-use marking covers `/tmp/claude/copies`. If Phase 1 picks the shared build-dir, resources-unit owns its budget and hold. efficiency-unit changes `scripts/lib/nix_env.py` to trust a copy's `.envrc` only when the copy's copies.py/scratch.py record names a source repo under `~/rust`, `~/worktrees` or `~/.claude*`, and the copy's `.envrc` equals the source's `.envrc` blob at the copy commit (approved by builds). Today it refuses (`direnv: .envrc is blocked`), so verify.sh and style_sync lint fail in a copy. verify-unit sends efficiency the record's path and fields (source path, source commit, copy commit) when Phase 3 fixes them. Due before Phase 4. resources-unit's Phase 21 covers every Lifetime and cleanup item of Survey changes (before/after needs nothing); report-unit's share is done: `UnitLabels.folder_name()` (its Phase 4, `2c96f13a`, on origin/builds; hana + lfo gives `hana-lfo`) gives the copies folder name.
 
 **Files:** owned by report-unit, resources-unit and efficiency-unit; verify-unit sends the requests.
 
-**Acceptance gate:** all three merged on builds (report-unit's merged).
+**Acceptance gate:** all three merged on builds (report-unit's merged; resources-unit's is its Phase 21).
 
 Rough duration: half a day each, in parallel with Phase 1.
 
@@ -179,13 +180,18 @@ Rough duration: half a day each, in parallel with Phase 1.
 
 **Goal:** `copies.py make|list|remove` makes a named, registered copy with the chosen target mode.
 
-**Spec:** `copies.py make --source <worktree> --commit <sha> --phase <id> --purpose <word> [--task <task>]` prints the path. Steps: folder name from `unit_labels_for([build_hold.owning_session()], env)[…].folder_name()` (report-unit, hana + lfo gives `hana-lfo`); folder through `scratch.py`; own git (`clone --shared --no-checkout`, origin = source's origin URL, check `git rev-parse --absolute-git-dir` names the copy); target per Phase 1 verdict (seed: `cp -a` under the three source locks, skip `incremental/` unless the rule kept it; shared: set `CARGO_BUILD_BUILD_DIR` in the copy's `.cargo/config.toml`; neither: empty). `list` shows copies, task, source, size. `remove` ends one copy through scratch.py. Python API `make_copy(...)` for callers. Every item of Survey changes under Name, Source and Target, and `hand-over`.
+**Spec:** `copies.py make --source <worktree> --commit <sha> --phase <id> --purpose <word> [--task <task>]` prints the path. Steps: folder name from `unit_labels_for([build_hold.owning_session()], env)[…].folder_name()` (report-unit, hana + lfo gives `hana-lfo`); folder through `scratch.py`; own git (`clone --shared --no-checkout`, origin = source's origin URL, check `git rev-parse --absolute-git-dir` names the copy); target per Phase 1 verdict (seed: `cp -a` under the three source locks, skip `incremental/` unless the rule kept it; shared: set `CARGO_BUILD_BUILD_DIR` in the copy's `.cargo/config.toml`; neither: empty). `list` shows copies, task, source, size. `remove` ends one copy through scratch.py. Python API `make_copy(...)` for callers. Every item of Survey changes under Name, Source and Target, and the copies.py side of Lifetime and cleanup:
+- The record gets every field of Cleanup: source path, source commit, copy commit, target mode, seed source, `borrows_from` (the source's git dir from `clone --shared`; a sibling copy's when the source is a copy), owner unit, task. A `phase:` record also gets the run dir and phase id, from the caller's run.
+- `work` and land copies get task `landed:<unit>/<branch>`.
+- `copies.py hand-over <path> --to <unit>` calls `scratch.py hand-over <path> --to <unit>` (resources-unit); copies.py does not rename the folder or edit the record itself.
+- `make` adds `.claude-busy` to the copy's `.git/info/exclude`, so the lock file never shows as a change.
+- `verify.sh`: in a tree under `/tmp/claude/copies`, take `flock` on `<tree>/.claude-busy` before the memory wait, so a queued run is busy too, and hold it until the run ends.
 
-**Files:** `scripts/copies/copies.py`, `scripts/copies/test_copies.py`, `docs/as-built/frozen-copies.md`.
+**Files:** `scripts/copies/copies.py`, `scripts/copies/test_copies.py`, `scripts/direct/verify.sh` and a verify.sh test in `scripts/direct/`, `docs/as-built/frozen-copies.md`.
 
-**Constraints from prior phases:** Phase 1 verdict; Phase 2 names and scratch layout.
+**Constraints from prior phases:** Phase 1 verdict; Phase 2 names and scratch layout; resources-unit Phase 21 (`.claude-busy` readers, `landed:`, `borrows_from`, `scratch.py hand-over`).
 
-**Acceptance gate:** tests green (fake roster, fake source repo, the linked-worktree `.git` case); live: one hana gate copy made, built, and removed by `merge_checkpoint.py` ending its phase task.
+**Acceptance gate:** tests green (fake roster, fake source repo, the linked-worktree `.git` case, a `.claude-busy` lock held from before the memory wait to the run end, `hand-over` to another unit); live: one hana gate copy made, built, and removed by `merge_checkpoint.py` ending its phase task.
 
 Rough duration: one day.
 
