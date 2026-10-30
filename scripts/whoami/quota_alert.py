@@ -312,6 +312,20 @@ class AccountCodexQuotaFallback:
 
 
 @dataclass(frozen=True)
+class PendingClaudeSwitch:
+    """Assignments selected for a switch whose registry outcome is not yet saved."""
+
+    owner: agent_accounts.KnownCodexAccount
+    at: str
+    assignment_keys: tuple[str, ...]
+    hold: CreditsOffHold | ScheduledMoveHold | NoFallbackHold
+    claude_account: next_moves.ClaudeWorkersTarget | next_moves.DefaultClaudeAccount
+    cause: Literal["credits off", "refusal", "auto"]
+    why: str
+    description: str
+
+
+@dataclass(frozen=True)
 class UnknownOwnerCodexQuotaFallback:
     """A fallback saved before its refusing account was recorded."""
 
@@ -339,6 +353,24 @@ class UnknownRefusalNotice(TypedDict):
 RefusalNotice = KnownRefusalNotice | UnknownRefusalNotice
 
 
+class RestorationNoticeIdentity(TypedDict):
+    fallback_at: str
+    kind: Literal["routed back", "routing not restored"]
+
+
+@dataclass(frozen=True)
+class RestorationOutcomeOwed:
+    """A finished restore whose journal row and OWNER notice are not yet saved."""
+
+    routing: moves.RoutedBack | moves.RoutingNotRestored
+    notice: str
+
+
+class StoredRestorationOutcome(TypedDict):
+    routing: moves.RoutedBack | moves.RoutingNotRestored
+    notice: str
+
+
 class ZeroEpisodeNotice(TypedDict):
     id: str
     values: dict[str, str]
@@ -363,6 +395,9 @@ class State(TypedDict):
     codex_zero: NotRequired[dict[str, CodexZeroEpisode]]
     refusal_notices: NotRequired[dict[str, RefusalNotice]]
     fallback: CodexQuotaFallback
+    pending_switch: NotRequired[PendingClaudeSwitch]
+    restoration_owed: NotRequired[RestorationOutcomeOwed]
+    restoration_notice: NotRequired[RestorationNoticeIdentity]
     # One line per switch or switch-back the user has not been shown in OWNER.
     unseen: NotRequired[list[str]]
     pending_routing: NotRequired[moves.RoutedToClaude]
@@ -384,10 +419,20 @@ class StoredState(TypedDict):
     codex_zero: NotRequired[dict[str, CodexZeroEpisode]]
     refusal_notices: NotRequired[dict[str, RefusalNotice]]
     switch: NotRequired[StoredFallback]
+    pending_switch: NotRequired[StoredPendingClaudeSwitch]
+    restoration_owed: NotRequired[StoredRestorationOutcome]
+    restoration_notice: NotRequired[RestorationNoticeIdentity]
     unseen: NotRequired[list[str]]
     pending_routing: NotRequired[moves.RoutedToClaude]
     pending_move_failures: NotRequired[list[moves.FailedMove]]
     workers_move_notices: NotRequired[dict[str, str]]
+
+
+class StoredPendingClaudeSwitch(TypedDict):
+    switch: StoredFallback
+    cause: Literal["credits off", "refusal", "auto"]
+    why: str
+    description: NotRequired[str]
 
 
 def _read_fallback(value: object) -> CodexQuotaFallback:
@@ -419,6 +464,20 @@ def _read_fallback(value: object) -> CodexQuotaFallback:
     return UnknownOwnerCodexQuotaFallback(at, entries)
 
 
+def _stored_fallback(fallback: AccountCodexQuotaFallback | UnknownOwnerCodexQuotaFallback) -> StoredFallback:
+    record = StoredFallback(at=fallback.at, moved=list(fallback.moved))
+    if isinstance(fallback, AccountCodexQuotaFallback):
+        if isinstance(fallback.claude_account, next_moves.ClaudeWorkersTarget):
+            record["claude_account"] = fallback.claude_account.label
+        if isinstance(fallback.hold, CreditsOffHold):
+            record["credits_off_until"] = fallback.hold.until.isoformat()
+        if isinstance(fallback.hold, ScheduledMoveHold):
+            record["scheduled_move_until"] = fallback.hold.until.isoformat()
+        record["owner"] = agent_accounts.StoredCodexAccount(home=str(fallback.owner.home),
+            login=fallback.owner.login, label=fallback.owner.label)
+    return record
+
+
 def _stored_state(state: State) -> StoredState:
     saved = StoredState(episodes=state["episodes"])
     if "codex_zero" in state:
@@ -433,19 +492,22 @@ def _stored_state(state: State) -> StoredState:
         saved["pending_move_failures"] = state["pending_move_failures"]
     if "workers_move_notices" in state:
         saved["workers_move_notices"] = state["workers_move_notices"]
+    if "restoration_owed" in state:
+        owed = state["restoration_owed"]
+        routing = owed.routing.copy()
+        if isinstance(routing["owner"], moves.UnknownFallbackOwner):
+            routing["owner"] = "unknown"
+        saved["restoration_owed"] = StoredRestorationOutcome(routing=routing, notice=owed.notice)
+    if "restoration_notice" in state:
+        saved["restoration_notice"] = state["restoration_notice"]
     fallback = state["fallback"]
     if not isinstance(fallback, NoCodexQuotaFallback):
-        record = StoredFallback(at=fallback.at, moved=list(fallback.moved))
-        if isinstance(fallback, AccountCodexQuotaFallback):
-            if isinstance(fallback.claude_account, next_moves.ClaudeWorkersTarget):
-                record["claude_account"] = fallback.claude_account.label
-            if isinstance(fallback.hold, CreditsOffHold):
-                record["credits_off_until"] = fallback.hold.until.isoformat()
-            if isinstance(fallback.hold, ScheduledMoveHold):
-                record["scheduled_move_until"] = fallback.hold.until.isoformat()
-            record["owner"] = agent_accounts.StoredCodexAccount(home=str(fallback.owner.home),
-                login=fallback.owner.login, label=fallback.owner.label)
-        saved["switch"] = record
+        saved["switch"] = _stored_fallback(fallback)
+    if "pending_switch" in state:
+        pending = state["pending_switch"]
+        saved["pending_switch"] = StoredPendingClaudeSwitch(switch=_stored_fallback(AccountCodexQuotaFallback(
+            pending.owner, pending.at, pending.assignment_keys, pending.hold, pending.claude_account)),
+            cause=pending.cause, why=pending.why, description=pending.description)
     return saved
 
 
@@ -556,6 +618,14 @@ def _normalize_notice_text(notice: ZeroEpisodeNotice) -> None:
                         for key, value in notice["values"].items()}
 
 
+def _write_state(state: State) -> None:
+    """Save under the caller's state lock, including before a registry edit."""
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_name(f".{STATE.name}.tmp")
+    _ = tmp.write_text(json.dumps(_stored_state(state), indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, STATE)
+
+
 @contextmanager
 def state_file() -> Generator[State]:
     """The state under an exclusive lock, written back on exit.
@@ -589,6 +659,21 @@ def state_file() -> Generator[State]:
                 state["pending_routing"] = saved["pending_routing"]
             if "pending_move_failures" in saved:
                 state["pending_move_failures"] = saved["pending_move_failures"]
+            if "restoration_owed" in saved:
+                owed = saved["restoration_owed"]
+                routing = owed["routing"].copy()
+                if routing["owner"] == "unknown":
+                    routing["owner"] = moves.UnknownFallbackOwner()
+                state["restoration_owed"] = RestorationOutcomeOwed(routing, owed["notice"])
+            if "restoration_notice" in saved:
+                state["restoration_notice"] = saved["restoration_notice"]
+            if "pending_switch" in saved:
+                pending = saved["pending_switch"]
+                intent = _read_fallback(pending["switch"])
+                if isinstance(intent, AccountCodexQuotaFallback):
+                    state["pending_switch"] = PendingClaudeSwitch(intent.owner, intent.at, intent.moved,
+                        intent.hold, intent.claude_account, pending["cause"], pending["why"],
+                        pending.get("description", f"{pending['why']} ({intent.owner.label})"))
         except (OSError, ValueError):
             state = State(episodes={}, fallback=NoCodexQuotaFallback())
         before = json.dumps(_stored_state(state), sort_keys=True)
@@ -596,9 +681,7 @@ def state_file() -> Generator[State]:
             _ = cast(dict[str, object], cast(object, episode)).pop("acknowledged", None)
         yield state
         if json.dumps(_stored_state(state), sort_keys=True) != before:
-            tmp = STATE.with_name(f".{STATE.name}.tmp")
-            _ = tmp.write_text(json.dumps(_stored_state(state), indent=2) + "\n", encoding="utf-8")
-            os.replace(tmp, STATE)
+            _write_state(state)
 
 
 
@@ -764,11 +847,44 @@ class CodexWorkSwitchFailed:
 CodexWorkSwitch = CodexWorkMovedToClaude | NoWorkOnCodex | CodexWorkSwitchFailed
 
 
+def _complete_pending_claude_switch(state: State, pending: PendingClaudeSwitch) -> CodexWorkSwitch:
+    try:
+        current = registry_assignments()
+    except OSError as error:
+        return CodexWorkSwitchFailed(pending.owner.label, str(error))
+    moved = tuple(key for key in pending.assignment_keys if current.get(key) == "claude")
+    return _record_claude_switch(state, pending, moved)
+
+
+def _record_claude_switch(state: State, pending: PendingClaudeSwitch, moved: tuple[str, ...]) -> CodexWorkSwitch:
+    if moved:
+        previous = state["fallback"]
+        owed_keys = previous.moved if not isinstance(previous, NoCodexQuotaFallback) else ()
+        state["fallback"] = AccountCodexQuotaFallback(pending.owner, pending.at, tuple(dict.fromkeys((*moved, *owed_keys))),
+            pending.hold, pending.claude_account)
+        state["pending_routing"] = moves.RoutedToClaude(kind="routed to claude", at=pending.at,
+            tool="codex", fallback_at=pending.at, owner=pending.owner.label, moved=list(moved),
+            cause=pending.cause, why=pending.why)
+        if isinstance(pending.claude_account, next_moves.ClaudeWorkersTarget):
+            state["pending_routing"]["claude_account"] = pending.claude_account.label
+        restoration = (f"and stay there until the source weekly reset at {local_time(pending.hold.until.isoformat())}."
+                       if isinstance(pending.hold, ScheduledMoveHold) else "and move back when Codex recovers.")
+        state.setdefault("unseen", []).append(
+            f"{pending.description}: {', '.join(moved)} moved to Claude at {local_time(pending.at)}, " + restoration)
+    del state["pending_switch"]
+    _write_state(state)
+    _ = _retry_pending_move_journal(state)
+    return (CodexWorkMovedToClaude(pending.owner.label, moved) if moved
+            else NoWorkOnCodex(pending.owner.label))
+
+
 def switch_to_claude(state: State, note: AgentNote, stamp: str, owner: agent_accounts.KnownCodexAccount, *,
                      hold: CreditsOffHold | ScheduledMoveHold | NoFallbackHold = NO_FALLBACK_HOLD,
                      why: str = "Codex refused work for quota",
                      claude_account: next_moves.ClaudeWorkersTarget | next_moves.DefaultClaudeAccount = DEFAULT_CLAUDE_ACCOUNT) -> CodexWorkSwitch:
     """Move Codex assignments to Claude and report what the registry confirms."""
+    if "pending_switch" in state:
+        return _complete_pending_claude_switch(state, state["pending_switch"])
     episode = state["episodes"].get(note.label)
     account = f"{note.label} at {percent(note)}, resets {note.get('resets')}"
     cause: Literal["credits off", "refusal", "auto"] = (
@@ -792,6 +908,9 @@ def switch_to_claude(state: State, note: AgentNote, stamp: str, owner: agent_acc
             previous_route = role_map.read_role_map().workers_claude
             role_map.write_role_map(role_map.WorkersClaudeRouteChange(route, reason, stamp))
             route_written = True
+            state["pending_switch"] = PendingClaudeSwitch(owner, stamp, tuple(on_codex), hold,
+                claude_account, cause, reason, f"{trigger} ({account})")
+            _write_state(state)
         error = edit_registry("agents_set_all_assignments", "claude") if on_codex else None
         # The registry, not the exit status, says what moved: one mv writes the whole switch.
         moved = [key for key, family in registry_assignments().items() if key in on_codex and family == "claude"]
@@ -805,6 +924,9 @@ def switch_to_claude(state: State, note: AgentNote, stamp: str, owner: agent_acc
             rollback_error = f"route rollback failed: {failure}"
             error = f"{error}; {rollback_error}" if error else rollback_error
     if not moved and error:
+        if confirmed:
+            _ = state.pop("pending_switch", None)
+            _write_state(state)
         if episode is not None:
             episode["switch_failed"] = error
         notice = state.get("refusal_notices", {}).get(str(owner.home))
@@ -815,24 +937,39 @@ def switch_to_claude(state: State, note: AgentNote, stamp: str, owner: agent_acc
             + f"{local_time(stamp)}: {error}")
         return CodexWorkSwitchFailed(note.label, error)
     if not moved:
+        _ = state.pop("pending_switch", None)
         return NoWorkOnCodex(note.label)
-    state["fallback"] = AccountCodexQuotaFallback(owner, stamp, tuple(moved), hold, claude_account)
-    state["pending_routing"] = moves.RoutedToClaude(kind="routed to claude", at=stamp, tool="codex",
-        fallback_at=stamp, owner=owner.label, moved=moved, cause=cause, why=reason)
-    if isinstance(claude_account, next_moves.ClaudeWorkersTarget):
-        state["pending_routing"]["claude_account"] = claude_account.label
-    # Keep the fallback and its journal retry even when the append fails.
-    _ = _retry_pending_move_journal(state)
-    restoration = (f"and stay there until the source weekly reset at {local_time(hold.until.isoformat())}."
-                   if isinstance(hold, ScheduledMoveHold) else "and move back when Codex recovers.")
-    state.setdefault("unseen", []).append(
-        f"{trigger} ({account}): {', '.join(moved)} moved to Claude at {local_time(stamp)}, "
-        + restoration)
+    if "pending_switch" in state:
+        _ = _record_claude_switch(state, state["pending_switch"], tuple(moved))
     return CodexWorkMovedToClaude(note.label, tuple(moved))
+
+
+def _complete_restoration_outcome(state: State) -> bool:
+    if "restoration_owed" not in state:
+        return True
+    owed = state["restoration_owed"]
+    try:
+        moves.append_routing(owed.routing)
+    except OSError as error:
+        print(f"account moves: cannot record restored workers routing: {error}")
+        return False
+    identity = RestorationNoticeIdentity(fallback_at=owed.routing["fallback_at"], kind=owed.routing["kind"])
+    if state.get("restoration_notice") != identity:
+        state.setdefault("unseen", []).append(owed.notice)
+        state["restoration_notice"] = identity
+    del state["restoration_owed"]
+    _write_state(state)
+    return True
 
 
 def switch_back(state: State, now: datetime, readings: CodexAlertPassReadings) -> CodexFallbackRestoration:
     """Restore owed assignments when the selected account can work on allowance or credits."""
+    if not _complete_restoration_outcome(state):
+        return NoCodexFallbackRestoration()
+    if "pending_switch" in state:
+        _ = _complete_pending_claude_switch(state, state["pending_switch"])
+        if "pending_switch" in state:
+            return NoCodexFallbackRestoration()
     if isinstance(readings.workers, NoWorkersHome):
         return NoCodexFallbackRestoration()
     _finish_workers_transitions(now)
@@ -898,12 +1035,11 @@ def switch_back(state: State, now: datetime, readings: CodexAlertPassReadings) -
     restored_account = selected if isinstance(selected, agent_accounts.KnownCodexAccount) else NO_RESTORATION_ACCOUNT
     role_map.write_role_map(role_map.WorkersClaudeRouteChange(
         role_map.DEFAULT_WORKERS_CLAUDE_ACCOUNT, "Codex recovered", now.isoformat()))
-    state["fallback"] = NoCodexQuotaFallback()
-    if isinstance(fallback, AccountCodexQuotaFallback):
-        _ = state.get("refusal_notices", {}).pop(str(fallback.owner.home), None)
+    failed_keys: list[str] = []
     try:
         current = registry_assignments()
     except OSError as error:
+        failed_keys = list(fallback.moved)
         back = SwitchBack([], [], [f"{key} ({error})" for key in fallback.moved], restored_account)
     else:
         back = SwitchBack([], [], [], restored_account)
@@ -911,20 +1047,27 @@ def switch_back(state: State, now: datetime, readings: CodexAlertPassReadings) -
             if current.get(key) != "claude":
                 back.kept.append(key)
             elif error := edit_registry("agents_set_assignment", key, "codex"):
+                failed_keys.append(key)
                 back.failed.append(f"{key} ({error})")
             else:
                 back.moved.append(key)
+    state["fallback"] = replace(fallback, moved=tuple(failed_keys)) if failed_keys else NoCodexQuotaFallback()
+    if not failed_keys and isinstance(fallback, AccountCodexQuotaFallback):
+        _ = state.get("refusal_notices", {}).pop(str(fallback.owner.home), None)
     stamp = now.isoformat(timespec="seconds")
     owner = (fallback.owner.label if isinstance(fallback, AccountCodexQuotaFallback) and fallback.owner.label != "default"
              else moves.UnknownFallbackOwner())
     if back.failed:
-        moves.append_routing(moves.RoutingNotRestored(kind="routing not restored", at=stamp, tool="codex",
+        routing = moves.RoutingNotRestored(kind="routing not restored", at=stamp, tool="codex",
             fallback_at=fallback.at, owner=owner, restored=back.moved, kept=back.kept,
-            failed=back.failed, outcome="partial" if back.moved else "failed"))
+            failed=back.failed, outcome="partial" if back.moved else "failed")
     else:
-        moves.append_routing(moves.RoutedBack(kind="routed back", at=stamp, tool="codex",
-            fallback_at=fallback.at, owner=owner, restored=back.moved, kept=back.kept))
-    state.setdefault("unseen", []).append(f"Codex recovered at {local_time(stamp)}: {back.describe()}.")
+        routing = moves.RoutedBack(kind="routed back", at=stamp, tool="codex",
+            fallback_at=fallback.at, owner=owner, restored=back.moved, kept=back.kept)
+    state["restoration_owed"] = RestorationOutcomeOwed(routing,
+        f"Codex recovered at {local_time(stamp)}: {back.describe()}.")
+    _write_state(state)
+    _ = _complete_restoration_outcome(state)
     return back
 
 
@@ -1161,6 +1304,31 @@ def _workers_head_blocked(entry: next_moves.WorkersMove, reason: BlockedHeadReas
             state.setdefault("workers_move_notices", {})[entry.id] = fingerprint
 
 
+def _workers_request_replay(history: moves.RecordedAutoEntries) -> tuple[moves.RecordedAutoEntries, dict[str, moves.RequestedMove]]:
+    """A request without a result stays due until its target owns workers."""
+    if not history.entry_ids:
+        return history, {}
+    rows = moves.read_moves()
+    workers = role_map.read_role_map().workers
+    pending: dict[str, moves.RequestedMove] = {}
+    completed: set[str] = set()
+    for index, row in enumerate(rows):
+        if (row["kind"] != "requested" or row["tool"] != "codex" or row["subject"] != "workers"
+                or row.get("cause") != "auto" or not row["why"].startswith("auto: ")):
+            continue
+        entry_id = row["why"].removeprefix("auto: ")
+        later_rows = [later for later in rows[index + 1:] if later["move_id"] == row["move_id"]]
+        if later_rows:
+            if not any(later["kind"] == "failed" for later in later_rows):
+                completed.add(entry_id)
+        elif workers == row["to"]:
+            completed.add(entry_id)
+        else:
+            pending[entry_id] = row
+    return (moves.RecordedAutoEntries(history.entry_ids - (pending.keys() - completed)),
+            {key: request for key, request in pending.items() if key not in completed})
+
+
 def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> WorkersNextMovePass:
     """Run at most one workers entry, locking the log before fallback state."""
     from scripts.accounts import accounts
@@ -1171,10 +1339,17 @@ def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> 
     try:
         with next_moves.next_moves_lock():
             with state_file() as state:
+                if "pending_switch" in state:
+                    _ = _complete_pending_claude_switch(state, state["pending_switch"])
+                    if "pending_switch" in state:
+                        return WorkersNextMovePass(readings, moves.UnreadableMoveJournal())
                 journal_ready = _retry_pending_move_journal(state)
             if not journal_ready:
                 return WorkersNextMovePass(readings, moves.UnreadableMoveJournal())
             history = moves.recorded_auto_entries()
+            pending_requests: dict[str, moves.RequestedMove] = {}
+            if isinstance(history, moves.RecordedAutoEntries):
+                history, pending_requests = _workers_request_replay(history)
             entries = next_moves.read_next_moves()
             workers = [entry for entry in entries if isinstance(entry, next_moves.WorkersMove)]
             with state_file() as state:
@@ -1269,11 +1444,15 @@ def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> 
                     if refusal is not None and not refusals.resolved(refusal, _reading_for_account(readings, identity, now), now):
                         _workers_head_blocked(entry, TargetUnresolvedRefusal(), now)
                         continue
-                    move_id = uuid.uuid4().hex
-                    request: moves.RequestedMove = {"kind": "requested", "at": stamp, "tool": "codex",
-                        "subject": "workers", "move_id": move_id, "cause": "auto", "why": why,
-                        "from": owner.label, "to": target.label, "window": "weekly"}
-                    moves.append_move(request)
+                    if entry.id in pending_requests:
+                        request = pending_requests[entry.id]
+                        move_id = request["move_id"]
+                    else:
+                        move_id = uuid.uuid4().hex
+                        request = moves.RequestedMove(kind="requested", at=stamp, tool="codex",
+                            subject="workers", move_id=move_id, cause="auto", why=why,
+                            **{"from": owner.label, "to": target.label}, window="weekly")
+                        moves.append_move(request)
                     try:
                         _ = accounts.swap("workers", target.label, why=why, cause="auto")
                     except (accounts.AccountsError, OSError) as error:
@@ -1289,6 +1468,8 @@ def _workers_next_move_pass(readings: CodexAlertPassReadings, now: datetime) -> 
                         if not journal_ready:
                             return WorkersNextMovePass(readings, moves.UnreadableMoveJournal())
                         continue
+                    moves.append_move(moves.ConfirmedMove(kind="confirmed", at=stamp, tool="codex",
+                        subject="workers", move_id=move_id, home=str(target.home)))
                     readings = target_readings
                 next_moves.write_next_moves(tuple(saved for saved in kept if saved.id != entry.id))
                 with state_file() as state:
@@ -1922,6 +2103,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
     transition_line = ""
     no_room = ""
     with state_file() as state:
+        if "pending_switch" in state:
+            _ = _complete_pending_claude_switch(state, state["pending_switch"])
         current_workers = accounts.role_account("workers")
         owns_role = (current_workers.home == refusing_account.home
                      and isinstance(selected, agent_accounts.KnownCodexAccount) and selected.home == refusing_account.home
@@ -1989,7 +2172,11 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
                       else KnownRefusalNotice(kind="known", login=refusing_account.login, label=name))
             notices[home] = notice
             fallback = state["fallback"]
-            already = not isinstance(fallback, NoCodexQuotaFallback)
+            try:
+                already = (not isinstance(fallback, NoCodexQuotaFallback)
+                           and not any(family == "codex" for family in registry_assignments().values()))
+            except OSError:
+                already = False
             log: list[str] = [no_room] if owns_role else []
             if owns_role and not already:
                 if episode is not None:

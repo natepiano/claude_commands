@@ -19,14 +19,21 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 i=0
+read_failed=0
 while [ "$#" -gt 0 ]; do
   repo="$1"
   run="$2"
   shift 2
-  gh run view "$run" --repo "$repo" \
+  if ! gh run view "$run" --repo "$repo" \
     --json createdAt,updatedAt,status,conclusion,url,jobs |
     jq --arg label "${repo##*/}" --arg run "$run" '. + {label: $label, run_id: $run}' \
-      >"$tmp/$i.json"
+      >"$tmp/$i.json"; then
+    read_failed=1
+    jq -n --arg label "${repo##*/}" --arg run "$run" \
+      '{label: $label, run_id: $run, status: "unavailable", conclusion: null,
+        createdAt: "1970-01-01T00:00:00Z", url: "", error: "error: gh run view failed",
+        jobs: [{name: "read", error: "error: gh run view failed"}]}' >"$tmp/$i.json"
+  fi
   i=$((i + 1))
 done
 
@@ -48,7 +55,8 @@ jq -s -r --arg clock "$clock" '
   # Only a running stage shows a time. GitHub stamps startedAt on a queued job
   # too, so the job status, not startedAt, decides whether it has started.
   def cell:
-    if .status == "completed" then icon
+    if .error then .error
+    elif .status == "completed" then icon
     elif .status == "in_progress" then
       (if .startedAt == null or (.startedAt|startswith("0001")) then "…"
        else "… \((now - (.startedAt|fromdateiso8601)) | (if . < 0 then 0 else . end) | secs)" end)
@@ -64,12 +72,13 @@ jq -s -r --arg clock "$clock" '
   | "**\($clock)**",
     "",
     ($runs[]
-     | (if .status == "completed"
+     | if .error then "- **\(.label)** run `\(.run_id)` · \(.error)" else
+       (if .status == "completed"
         then ((.updatedAt|fromdateiso8601) - (.createdAt|fromdateiso8601))
         else (now - (.createdAt|fromdateiso8601)) end) as $elapsed
      | ([.jobs[]|select(.conclusion=="success")]|length) as $g
      | ([.jobs[]|select(.conclusion=="skipped")]|length) as $s
-     | "- **\(.label)** run `\(.run_id)` \(.url) · started **\(.createdAt|fromdateiso8601|strflocaltime("%H:%M:%S %Z"))** · \(.status) \(.conclusion // "-") · elapsed **\($elapsed|secs)** · **\($g) of \(.jobs|length) green\(if $s > 0 then " (\($s) skipped)" else "" end)**"),
+     | "- **\(.label)** run `\(.run_id)` \(.url) · started **\(.createdAt|fromdateiso8601|strflocaltime("%H:%M:%S %Z"))** · \(.status) \(.conclusion // "-") · elapsed **\($elapsed|secs)** · **\($g) of \(.jobs|length) green\(if $s > 0 then " (\($s) skipped)" else "" end)**" end),
     "",
     ("| stage | " + ($labels | join(" | ")) + " |"),
     ("|---|" + ($labels | map("---|") | join(""))),
@@ -79,3 +88,5 @@ jq -s -r --arg clock "$clock" '
     ($runs[] | select(.status == "completed")
      | "- **\(.label) finished — \(.conclusion)**")
 ' "$tmp"/*.json
+
+exit "$read_failed"

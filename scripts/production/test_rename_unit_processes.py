@@ -26,10 +26,10 @@ import unit_runs
 from rename_state import RenameRefused
 
 if TYPE_CHECKING:
-    from scripts.shutdown import record as shutdown_record
+    from scripts.shutdown import shutdown_record
 else:
     # rename_unit puts the shutdown folder on the path.
-    import record as shutdown_record
+    import shutdown_record
 
 from scripts.production.rename_unit_test_support import SLUG, TEST_HANG_GUARD_SECS, UnitRenameFixture
 
@@ -121,6 +121,7 @@ class RunProcessTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(os, "getsid", self.session))
         _ = self.enterContext(mock.patch.object(os, "kill", self.kill))
         _ = self.enterContext(mock.patch.object(shutdown_record, "all_session_records", lambda: [STOPPED_RECORD]))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", return_value=None))
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_units", self.no_units))
 
     def run_folder(self, name: str, worktree: Path) -> Path:

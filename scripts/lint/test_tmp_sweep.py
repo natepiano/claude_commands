@@ -172,6 +172,7 @@ class IdleTests(TmpSweepCase):
         self.assertEqual(result[1], (source.stat().st_blocks + independent.stat().st_blocks) * 512)
 
     def test_an_idle_entry_goes_and_a_recent_one_stays(self) -> None:
+        self.now: float = time.time() + 8 * DAY
         idle = write(self.tmp / "shots" / "1.png")
         loose = write(self.tmp / "notes.txt")
         busy = write(self.tmp / "trace" / "deep" / "run.json")
@@ -185,6 +186,7 @@ class IdleTests(TmpSweepCase):
                          [str(self.tmp / "notes.txt"), str(self.tmp / "shots")])
 
     def test_a_folders_own_time_does_not_count_unless_it_is_empty(self) -> None:
+        self.now = time.time() + 8 * DAY
         touched = write(self.tmp / "touched" / "old.txt").parent
         self.recent(touched)
         empty = self.tmp / "empty"
@@ -195,6 +197,7 @@ class IdleTests(TmpSweepCase):
         self.assertTrue(empty.is_dir())
 
     def test_a_link_out_of_an_entry_is_not_followed(self) -> None:
+        self.now = time.time() + 8 * DAY
         outside = write(self.tmp.parent / "outside" / "kept")
         (write(self.tmp / "links" / "file").parent / "out").symlink_to(outside.parent)
         (self.tmp / "loose-link").symlink_to(outside)
@@ -204,6 +207,7 @@ class IdleTests(TmpSweepCase):
         self.assertTrue(outside.is_file())
 
     def test_a_read_only_folder_is_deleted(self) -> None:
+        self.now = time.time() + 8 * DAY
         locked = write(self.tmp / "store" / "nix" / "file").parent
         locked.chmod(0o500)
         self.addCleanup(lambda: locked.chmod(0o700) if locked.exists() else None)
@@ -220,6 +224,7 @@ class IdleTests(TmpSweepCase):
         self.assertEqual(result.kept[tmp_sweep.UNREADABLE], [str(self.tmp / "hidden")])
 
     def test_a_dry_run_deletes_nothing_and_logs_nothing(self) -> None:
+        self.now = time.time() + 8 * DAY
         idle = write(self.tmp / "shots" / "1.png")
         status, output = self.run_once(dry_run=True)
         self.assertEqual(status, 0)
@@ -228,8 +233,74 @@ class IdleTests(TmpSweepCase):
         self.assertFalse((self.state / tmp_sweep.LOG_NAME).exists())
 
 
+class OwnerEndTests(TmpSweepCase):
+    now: float = 0.0
+
+    def test_unknown_folder_waits_seven_days_and_logs_why(self) -> None:
+        for hours in (5, 6 * 24, 8 * 24):
+            with self.subTest(hours=hours):
+                folder = write(self.tmp / f"backup-{hours}" / "wip.patch").parent
+                self.now = time.time() + hours * 3600
+                result = self.sweep()
+                logged = tmp_sweep.record(result, False, self.now)
+                if hours < 7 * 24:
+                    self.assertTrue(folder.exists())
+                    self.assertIn(str(folder), logged["kept_paths"][
+                        "no record proves its owner ended, and it changed in the last 7 days"])
+                else:
+                    self.assertFalse(folder.exists())
+                    row = next(row for row in logged["deleted"] if row["path"] == str(folder))
+                    self.assertEqual(row.get("reason"), "no record proves its owner ended; unchanged for 7 days and unused")
+
+    def test_old_unknown_folder_in_use_stays(self) -> None:
+        folder = write(self.tmp / "backup" / "files.tar").parent
+        fake_process(self.proc, 10, cwd=str(folder))
+        self.now = time.time() + 8 * DAY
+        result = self.sweep()
+        self.assertTrue(folder.exists())
+        self.assertIn(str(folder) + ": pid 10 works in it", result.kept[tmp_sweep.IN_USE])
+
+    def test_run_without_end_evidence_waits_seven_days(self) -> None:
+        folder = write(self.unit / "unknown-run" / "board.log").parent
+        _ = write(folder / "director", ENDED_SESSION)
+        self.now = time.time() + 5 * 3600
+        result = self.sweep()
+        self.assertTrue(folder.exists())
+        self.assertIn(str(folder), result.kept[
+            "no record proves its owner ended, and it changed in the last 7 days"])
+        self.now += 8 * DAY
+        result = self.sweep()
+        self.assertFalse(folder.exists())
+        self.assertEqual(result.deleted[0].get("reason"),
+                         "no record proves its owner ended; unchanged for 7 days and unused")
+
+    def test_recorded_worker_end_still_allows_idle_run_removal(self) -> None:
+        folder = write(self.unit / "ended-run" / "board.log").parent
+        _ = write(folder / "mesh_roster.json", json.dumps({"impl": {"status": "ended"}}))
+        self.now = time.time() + 5 * 3600
+        result = self.sweep()
+        self.assertFalse(folder.exists())
+        self.assertEqual(result.deleted[0].get("reason"), "all recorded workers ended; idle and unused")
+
+    def test_top_level_file_and_link_wait_but_tempfile_does_not(self) -> None:
+        file = write(self.tmp / "backup.patch")
+        link = self.tmp / "backup-link"
+        link.symlink_to(file)
+        temporary = write(self.tmp / "tmpabcdefgh" / "file").parent
+        self.now = time.time() + 5 * 3600
+        _ = self.sweep()
+        self.assertTrue(file.exists())
+        self.assertTrue(link.is_symlink())
+        self.assertFalse(temporary.exists())
+        self.now += 8 * DAY
+        _ = self.sweep()
+        self.assertFalse(file.exists())
+        self.assertFalse(link.is_symlink())
+
+
 class ProcessUseTests(TmpSweepCase):
     def test_an_entry_a_process_works_in_holds_open_or_maps_stays(self) -> None:
+        self.now: float = time.time() + 8 * DAY
         worked = write(self.tmp / "worked" / "a").parent
         held = write(self.tmp / "held" / "deep" / "log")
         mapped = write(self.tmp / "mapped" / "lib.so")
@@ -260,6 +331,7 @@ class ProcessUseTests(TmpSweepCase):
 
 
     def test_with_no_proc_an_lsof_scan_shows_which_processes_use_an_entry(self) -> None:
+        self.now = time.time() + 8 * DAY
         idle = write(self.tmp / "idle" / "a")
         used = write(self.tmp / "used" / "a")
         self.proc.rmdir()
@@ -497,6 +569,7 @@ class OwnerTests(TmpSweepCase):
             [str(self.delegate), str(self.unit), str(self.delegate / "active"), str(self.unit / "active")]))
 
     def test_a_run_folder_stays_while_its_director_runs(self) -> None:
+        self.now: float = time.time() + 8 * DAY
         live = write(self.unit / "live" / "board.log").parent
         _ = write(live / "director", f"{LIVE_SESSION}\n")
         ended = write(self.delegate / "ended" / "board.log").parent
@@ -521,6 +594,7 @@ class OwnerTests(TmpSweepCase):
                          sorted([str(marked), str(ended)]))
 
     def test_a_run_folder_whose_history_opens_with_a_live_session_stays(self) -> None:
+        self.now = time.time() + 8 * DAY
         history = self.tmp.parent / "history"
         runs = {LIVE_SESSION: self.unit / "started", ENDED_SESSION: self.unit / "started-ended"}
         for session, run in runs.items():
@@ -561,6 +635,7 @@ class OwnerTests(TmpSweepCase):
         self.assertIn(str(large), [entry["path"] for entry in result.deleted])
 
     def test_an_unreadable_session_record_keeps_session_and_run_folders(self) -> None:
+        self.now = time.time() + 8 * DAY
         self.unreadable_sessions()
         session = write(self.project / ENDED_SESSION / "scratchpad" / "a")
         run = write(self.unit / "run" / "director", f"{ENDED_SESSION}\n")
@@ -604,6 +679,7 @@ class LogTests(TmpSweepCase):
         self.assertEqual(self.log(), [*records[1:], current])
 
     def test_each_run_logs_what_went_and_why_the_rest_stayed(self) -> None:
+        self.now: float = time.time() + 8 * DAY
         _ = write(self.tmp / "shots" / "1.png")
         self.recent(write(self.tmp / "fresh.txt"))
         fake_process(self.proc, 10, cwd=str(write(self.tmp / "busy" / "a").parent))
@@ -622,6 +698,7 @@ class LogTests(TmpSweepCase):
         self.assertIsInstance(entry["freed_gib"], float)
 
     def test_a_run_waits_an_hour_after_the_last(self) -> None:
+        self.now = time.time() + 8 * DAY
         idle = write(self.tmp / "shots" / "1.png")
         run = tmp_sweep.run
 
@@ -666,6 +743,7 @@ class RunFolderTests(TmpSweepCase):
         self.assertTrue(roster.is_file())
 
     def test_a_paused_unit_keeps_a_run_that_records_its_worktree(self) -> None:
+        self.now: float = time.time() + 8 * DAY
         worktree = self.tmp.parent / "worktree"
         payload = write(self.unit / "paused-unit" / "board.log")
         _ = write(payload.parent / "progress_history_state.json", json.dumps({"working_dir": str(worktree)}))
@@ -1007,6 +1085,7 @@ class WorkerAndGitTests(TmpSweepCase):
         self.assertIn(str(folder), result.kept[tmp_sweep.WORKER_USES])
 
     def test_only_mesh_run_cwd_keeps_a_working_folder(self) -> None:
+        self.now = time.time() + 8 * DAY
         folder = write(self.tmp / "scratch" / "listed" / "file").parent
         unrelated = write(self.tmp / "unrelated" / "file").parent
         run = self.live_worker(folder)

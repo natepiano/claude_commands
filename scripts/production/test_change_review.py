@@ -20,6 +20,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
+import showrunners
 from change_review import Invisible, Malformed, Visible
 
 # Importable once change_review has put scripts/lib on the path.
@@ -63,6 +64,7 @@ def setUpModule() -> None:
     unittest.enterModuleContext(mock.patch.dict(os.environ, {
         "NEXT_STATE_DIR": folder.name, scratch.ROOT_ENV: f"{folder.name}/scratch",
         scratch.VISIBLE_ROOT_ENV: f"{folder.name}/repro"}))
+    _ = unittest.enterModuleContext(mock.patch.object(showrunners, "timer_docs", return_value={}))
 
 
 class ParseTest(unittest.TestCase):
@@ -702,6 +704,155 @@ class CommitTest(unittest.TestCase):
         self.assertIn("| C1 | A |", committed)
         self.assertIn("| C2 | C |", committed)
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+
+class ProductionMergeCommitsTest(unittest.TestCase):
+    repo: Path = Path()
+    own_doc: Path = Path()
+    other_doc: Path = Path()
+    previous: str = ""
+    foreign: str = ""
+
+    def git(self, *arguments: str, cwd: Path | None = None) -> str:
+        environment = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+                       "GIT_AUTHOR_DATE": "2026-10-29T12:00:00Z", "GIT_COMMITTER_DATE": "2026-10-29T12:00:00Z"}
+        return subprocess.run(["git", "-C", str(cwd or self.repo), "-c", "user.name=t",
+                               "-c", "user.email=t@t", "-c", "commit.gpgsign=false", *arguments],
+                              capture_output=True, text=True, check=True, env=environment).stdout.strip()
+
+    def commit(self, name: str, message: str) -> str:
+        _ = (self.repo / name).write_text(message, encoding="utf-8")
+        _ = self.git("add", name)
+        _ = self.git("commit", "-q", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    @override
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        origin, seed = root / "origin.git", root / "seed"
+        seed.mkdir()
+        _ = self.git("init", "--bare", str(origin), cwd=root)
+        _ = self.git("init", "-q", "-b", "own-merge", cwd=seed)
+        self.repo = seed
+        self.previous = self.commit("base.py", "base")
+        _ = self.git("remote", "add", "origin", str(origin))
+        _ = self.git("push", "-q", "origin", "own-merge")
+        _ = self.git("clone", "-q", "-b", "own-merge", str(origin), str(root / "clone"), cwd=root)
+        self.repo = root / "clone"
+        _ = self.git("checkout", "-q", "-b", "unit")
+        _ = self.git("checkout", "-q", "-b", "other-merge")
+        self.foreign = self.commit("foreign.py", "checkpoint(other): already reviewed in its production")
+        _ = self.git("push", "-q", "origin", "other-merge")
+        _ = self.git("checkout", "-q", "unit")
+        _ = self.git("merge", "-q", "--no-ff", "-m", "merge other production", "origin/other-merge")
+        self.own_doc, self.other_doc = root / "own-production.md", root / "other-production.md"
+        for doc, branch in ((self.own_doc, "own-merge"), (self.other_doc, "other-merge")):
+            _ = doc.write_text(f"- **Repository:** `{self.repo}`\n- **Merge branch:** `{branch}`\n"
+                               + f"- **Change review:** `{root / 'review.md'}`\n", encoding="utf-8")
+        _ = self.enterContext(mock.patch.object(change_review, "showrunner_of",
+                                               side_effect=change_review.ChangeReviewError("not running")))
+
+    def commits(self) -> list[change_review.Commit]:
+        return change_review.unit_commits(self.repo, "HEAD", self.previous, "own-merge",
+                                          productions=lambda: (self.own_doc, self.other_doc))
+
+    def test_imported_production_commits_leave_only_the_units_missing_line(self) -> None:
+        own = self.commit("unit.py", "checkpoint(unit): own work")
+        refused = change_review.missing(self.commits())
+        self.assertEqual(len(refused), 1)
+        self.assertTrue(refused[0].startswith(own[:8]))
+        self.assertNotIn(self.foreign[:8], refused[0])
+
+    def test_imported_production_commits_need_no_cover_when_unit_has_its_line(self) -> None:
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        commits = self.commits()
+        self.assertEqual([commit.sha for commit in commits], [own])
+        self.assertEqual(change_review.missing(commits), [])
+
+    def test_production_without_review_rows_keeps_its_commits_checked(self) -> None:
+        _ = self.other_doc.write_text(f"- **Repository:** `{self.repo}`\n- **Merge branch:** `other-merge`\n")
+        _ = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        self.assertEqual([item.split()[0] for item in change_review.missing(self.commits())], [self.foreign[:8]])
+
+    def test_production_in_another_repository_keeps_its_commits_checked(self) -> None:
+        other = self.repo.parent / "unrelated"
+        other.mkdir()
+        _ = self.git("init", "-q", cwd=other)
+        _ = self.other_doc.write_text(self.other_doc.read_text().replace(str(self.repo), str(other)))
+        _ = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        self.assertEqual([item.split()[0] for item in change_review.missing(self.commits())], [self.foreign[:8]])
+
+    def test_unreadable_production_doc_keeps_the_existing_exclusions(self) -> None:
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        with mock.patch.object(showrunners, "timer_docs", return_value={
+            "own": self.own_doc, "other": self.other_doc, "missing": self.repo.parent / "missing.md",
+        }):
+            commits = change_review.unit_commits(self.repo, "HEAD", self.previous, "own-merge")
+        self.assertEqual([commit.sha for commit in commits], [own])
+        self.assertEqual(change_review.missing(commits), [])
+
+    def test_linked_worktree_excludes_commits_reviewed_in_the_common_repository(self) -> None:
+        checkout = self.repo.parent / "unit-checkout"
+        _ = self.git("worktree", "add", "-q", "-b", "linked-unit", str(checkout), "unit")
+        self.repo = checkout
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        self.assertEqual([commit.sha for commit in self.commits()], [own])
+        self.assertEqual(change_review.missing(self.commits()), [])
+
+    def test_invalid_production_repository_keeps_valid_production_exclusions(self) -> None:
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        invalid_doc = self.repo.parent / "invalid-production.md"
+        not_git = self.repo.parent / "not-git"
+        not_git.mkdir()
+        for repository in (self.repo.parent / "missing-repository", not_git):
+            with self.subTest(repository=repository):
+                _ = invalid_doc.write_text(f"- **Repository:** `{repository}`\n"
+                                          + "- **Merge branch:** `invalid-merge`\n"
+                                          + f"- **Change review:** `{self.repo.parent / 'review.md'}`\n",
+                                          encoding="utf-8")
+                commits = change_review.unit_commits(
+                    self.repo, "HEAD", self.previous, "own-merge",
+                    productions=lambda: (self.own_doc, invalid_doc, self.other_doc))
+                self.assertEqual([commit.sha for commit in commits], [own])
+                self.assertEqual(change_review.missing(commits), [])
+
+    def test_incomplete_production_doc_keeps_valid_production_exclusions(self) -> None:
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        invalid_doc = self.repo.parent / "incomplete-production.md"
+        _ = invalid_doc.write_text(f"- **Repository:** `{self.repo}`\n"
+                                  + f"- **Change review:** `{self.repo.parent / 'review.md'}`\n",
+                                  encoding="utf-8")
+        commits = change_review.unit_commits(
+            self.repo, "HEAD", self.previous, "own-merge",
+            productions=lambda: (self.own_doc, invalid_doc, self.other_doc))
+        self.assertEqual([commit.sha for commit in commits], [own])
+        self.assertEqual(change_review.missing(commits), [])
+
+    def test_registered_productions_are_read_by_default(self) -> None:
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        with mock.patch.object(showrunners, "timer_docs", return_value={"own": self.own_doc, "other": self.other_doc}):
+            commits = change_review.unit_commits(self.repo, "HEAD", self.previous, "own-merge")
+        self.assertEqual([commit.sha for commit in commits], [own])
+
+    def test_repository_subdirectory_resolves_to_the_same_git_top_level(self) -> None:
+        subdirectory = self.repo / "src"
+        subdirectory.mkdir()
+        _ = self.other_doc.write_text(self.other_doc.read_text().replace(str(self.repo), str(subdirectory)))
+        own = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        self.assertEqual([commit.sha for commit in self.commits()], [own])
+
+    def test_absent_origin_branch_does_not_exclude_its_local_commits(self) -> None:
+        _ = self.git("update-ref", "-d", "refs/remotes/origin/other-merge")
+        _ = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        self.assertEqual([item.split()[0] for item in change_review.missing(self.commits())], [self.foreign[:8]])
+
+    def test_unreadable_timer_registry_keeps_the_existing_exclusions(self) -> None:
+        _ = self.commit("unit.py", f"checkpoint(unit): own work\n\n{SEE}")
+        with mock.patch.object(showrunners, "timer_docs", side_effect=OSError("cannot read production registry")):
+            commits = change_review.unit_commits(self.repo, "HEAD", self.previous, "own-merge")
+        self.assertEqual([item.split()[0] for item in change_review.missing(commits)], [self.foreign[:8]])
 
 
 class RepositoryTest(unittest.TestCase):

@@ -32,13 +32,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.accounts import accounts, moves  # noqa: E402
 
 if TYPE_CHECKING:
-    from scripts.shutdown import record
+    from scripts.shutdown import shutdown_record
     from scripts.message import sessions
     from scripts.whoami import account, note_file
 else:
     import account
     import note_file
-    import record
+    import shutdown_record
     import sessions
 
 WAIT_MINUTES = 20
@@ -143,7 +143,7 @@ def settle(started: Started, wanted: Path, since: str, deadline: float, *,
     if started.session_id == os.environ.get("CLAUDE_CODE_SESSION_ID", ""):
         return MovesItself()
     while True:
-        saved = next((item for item in record.all_session_records()
+        saved = next((item for item in shutdown_record.all_session_records()
                       if item["session"]["session_id"] == started.session_id), None)
         if saved is not None and saved["progress"]["kind"] in NOT_BACK:
             progress = saved["progress"]
@@ -191,7 +191,7 @@ def main(argv: list[str]) -> int:
         started, lines, notes = start(options, target)
         deadline = time.monotonic() + options.wait_minutes * 60
         outcomes = [(item, settle(item, wanted, since, deadline)) for item in started]
-    except (accounts.AccountsError, record.InvalidRecord, OSError, ValueError) as error:
+    except (accounts.AccountsError, shutdown_record.InvalidRecord, OSError, ValueError) as error:
         print(f"not moved: {error}", file=sys.stderr)
         return 1
     failed = bool(lines) or any(isinstance(outcome, NotMoved) for _, outcome in outcomes)

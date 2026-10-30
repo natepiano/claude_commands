@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,32 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertIn("charset=utf-8", reply.content_type)
         self.assertEqual(reply.body.decode("utf-8"), text)
 
+    def test_undeletable_expired_snapshot_does_not_prevent_bind_or_other_links(self) -> None:
+        expired = self.root / "aaaaaa"
+        expired.mkdir()
+        os.utime(expired, (0, 0))
+        other = self.root / "bbbbbb"
+        other.mkdir()
+        _ = (other / "draft.txt").write_text("still served", encoding="utf-8")
+        errors = StringIO()
+        with patch.object(shutil, "rmtree", side_effect=PermissionError("cannot delete snapshot")), redirect_stderr(errors):
+            with serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server:
+                # handle_request serves one disposable connection without a background service.
+                thread = threading.Thread(target=server.handle_request)
+                thread.start()
+                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                try:
+                    connection.request("GET", "/bbbbbb/draft.txt")
+                    response = connection.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.read(), b"still served")
+                finally:
+                    connection.close()
+                    thread.join(5)
+        self.assertTrue(expired.exists())
+        self.assertIn("cannot delete snapshot", errors.getvalue())
+        self.assertIn("aaaaaa", errors.getvalue())
+
     def test_images_keep_their_image_content_type_and_binary_bytes(self) -> None:
         image = b"\x89PNG\r\n\x1a\n\x00\xff"
         _ = (self.root / "diagram.png").write_bytes(image)
@@ -102,6 +129,46 @@ class ReviewLinksServerTests(unittest.TestCase):
         self.assertEqual(reply.status, 200)
         self.assertEqual(reply.content_type, "image/png")
         self.assertEqual(reply.body, image)
+
+    def test_inaccessible_sweep_entries_do_not_prevent_bind_or_other_links(self) -> None:
+        session = self.root / "manual"
+        session.mkdir()
+        target = self.root.parent / "unsearchable" / "snapshot"
+        target.mkdir(parents=True)
+        symlink = session / "link"
+        symlink.symlink_to(target, target_is_directory=True)
+        unreadable = session / "unreadable"
+        other = self.root / "bbbbbb"
+        other.mkdir()
+        _ = (other / "draft.txt").write_text("still served", encoding="utf-8")
+        is_dir = Path.is_dir
+
+        for inaccessible in (symlink, unreadable):
+            with self.subTest(entry=inaccessible.name):
+                if inaccessible == unreadable:
+                    unreadable.mkdir()
+
+                def checked_is_dir(path: Path) -> bool:
+                    if path == inaccessible:
+                        raise PermissionError("cannot inspect entry")
+                    return is_dir(path)
+
+                errors = StringIO()
+                with patch.object(Path, "is_dir", new=checked_is_dir), redirect_stderr(errors):
+                    with serve.ReviewLinksServer(("127.0.0.1", 0), self.root) as server:
+                        self.port = server.server_port
+                        thread = threading.Thread(target=server.handle_request)
+                        thread.start()
+                        try:
+                            reply = self.request("/bbbbbb/draft.txt")
+                            self.assertEqual(reply.status, 200)
+                            self.assertEqual(reply.body, b"still served")
+                        finally:
+                            thread.join(5)
+                self.assertTrue(symlink.is_symlink())
+                self.assertTrue(target.is_dir())
+                if inaccessible == unreadable:
+                    self.assertIn("cannot inspect entry", errors.getvalue())
 
     def test_directories_return_404_even_when_an_index_page_exists(self) -> None:
         snapshot = self.root / "session" / "snapshot"
@@ -152,6 +219,40 @@ class ReviewLinksServerTests(unittest.TestCase):
             self.assertEqual(self.request("/./" + filename).status, 404)
         (self.root / "index-alias.txt").symlink_to(self.root / ".index.json")
         self.assertEqual(self.request("/index-alias.txt").status, 404)
+
+    def test_private_files_in_any_letter_case_return_404(self) -> None:
+        private = "private source paths or incomplete bytes"
+        for folder in (self.root, self.root / "session"):
+            folder.mkdir(exist_ok=True)
+            for filename in (
+                ".index.json", ".INDEX.JSON", ".Index.Json",
+                ".index.lock", ".INDEX.LOCK", ".Index.Lock",
+                ".review-link-x", ".REVIEW-LINK-X", ".Review-Link-x",
+            ):
+                with self.subTest(folder=folder.name, filename=filename):
+                    _ = (folder / filename).write_text(private, encoding="utf-8")
+                    path = (folder / filename).relative_to(self.root).as_posix()
+                    for request_path in ("/" + path, "/" + path.replace(".", "%2e", 1)):
+                        reply = self.request(request_path)
+                        self.assertEqual(reply.status, 404)
+                        self.assertNotIn(private.encode("utf-8"), reply.body)
+        snapshot = self.root / "abc123"
+        snapshot.mkdir()
+        _ = (snapshot / "draft.txt").write_bytes(b"review content")
+        reply = self.request("/abc123/draft.txt")
+        self.assertEqual(reply.status, 200)
+        self.assertEqual(reply.body, b"review content")
+
+    def test_private_path_parts_are_blocked_before_symlink_resolution(self) -> None:
+        snapshot = self.root / "abc123"
+        snapshot.mkdir()
+        _ = (snapshot / "draft.txt").write_bytes(b"public snapshot through a private alias")
+        for name in (".INDEX.JSON", ".Index.Lock", ".Review-Link-x"):
+            (self.root / name).symlink_to(snapshot, target_is_directory=True)
+            for prefix in (name, "%2e" + name[1:]):
+                with self.subTest(prefix=prefix):
+                    self.assertEqual(self.request(f"/{prefix}/draft.txt").status, 404)
+        self.assertEqual(self.request("/abc123/draft.txt").status, 200)
 
 
 class SnapshotSweepTests(unittest.TestCase):

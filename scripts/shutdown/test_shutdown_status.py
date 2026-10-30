@@ -20,11 +20,11 @@ import shutdown
 import settle
 import inventory
 from scripts.accounts import accounts
-import record as record_store
+import shutdown_record as record_store
 from account import UnreadableAccount
 from inventory import Inventory
-from record import SessionShutdown
-from test_record import LegacyRecordFixture, write_old, move_old
+from shutdown_record import SessionShutdown
+from test_shutdown_record import LegacyRecordFixture, write_old, move_old
 
 
 LOGIN = "owner@example.com"

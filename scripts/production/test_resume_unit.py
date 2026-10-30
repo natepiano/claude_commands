@@ -17,11 +17,12 @@ from typing import cast, final, override
 from unittest import mock
 
 import resume_unit
+import add_unit
 import retire_unit
 import unit_lookup
 import unit_move
 from production_units import Production, read_production
-from record import SessionShutdown
+from shutdown_record import SessionShutdown
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
 
@@ -145,6 +146,19 @@ class ResumeUnitTests(unittest.TestCase):
         # The units account moved since the retire: the transcript is under the other config dir.
         self.configs.reverse()
         self.assert_resumed(*self.resume())
+
+    def test_resume_finishes_its_commit_after_the_retired_note_was_removed(self) -> None:
+        with mock.patch.object(add_unit, "commit_paths", side_effect=OSError("commit stopped")):
+            code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("retired", self.row())
+        self.assertIn("retire alpha-unit", git(self.checkout, "log", "-1", "--format=%s"))
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertIn("alpha-unit resumed", output)
+        self.assertEqual(git(self.checkout, "log", "-1", "--format=%s"), "production(alpha): resume alpha-unit")
+        self.assertEqual(git(self.checkout, "status", "--porcelain"), "")
+        self.assertFalse(resume_unit.resume_record(read_production(self.doc), "alpha-unit").exists())
 
     def test_a_failed_launch_keeps_the_note_and_a_rerun_resumes(self) -> None:
         document = self.doc.read_bytes()

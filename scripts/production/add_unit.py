@@ -12,7 +12,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 from uuid import uuid4
@@ -33,12 +33,13 @@ from production_units import Production, Refusal, cell_value, plan_cell_is_retir
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from probe_session import PROBE_ENV  # noqa: E402
+from atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     import herdr
     import launch_permission
     from scripts.accounts.accounts import ClaudeLaunchAccount
-    from record import SessionShutdown
+    from shutdown_record import SessionShutdown
 
 
 class ProductionPlanRequired(NamedTuple):
@@ -536,6 +537,8 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
 
     handoff: NoSessionHandoff | RunningSessionHandoff = NoSessionHandoff()
+    resuming_opening = (isinstance(request.session, ResumedSession)
+                        and pending_opening(request.production, request.unit, request.session.session_id))
     if isinstance(request.session, ResumedSession):
         session_id = request.session.session_id
         observed = sessions.session_liveness(session_id)
@@ -545,7 +548,8 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
             if isinstance(observed, sessions.SessionNotLive):
                 raise Refusal(f"session {session_id} does not run; use --resume")
             handoff = attach_source(session_id, observed.pid)
-        elif isinstance(observed, sessions.LiveSessionProcess):
+        elif (isinstance(observed, sessions.LiveSessionProcess)
+              and not resuming_opening):
             raise Refusal(f"session {session_id} already runs as pid {observed.pid}; "
                           + f"to make it this unit, run add_unit with --attach {session_id}")
     production = request.production
@@ -577,7 +581,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
             if (isinstance(existing.state, RetiredUnitRow)
                     and isinstance(request.session.handoff, ResumeStoppedSession)):
                 request = replace(request, launch_kind=ResumeInStartFolderLaunch())
-            else:
+            elif not resuming_opening:
                 raise Refusal(f"unit {request.unit} resumes in {request.session.cwd}; its Units row names {existing.worktree}")
         request = replace(request, worktree=Path(existing.worktree), branch=existing.branch)
     launch = UnitLaunch(
@@ -653,7 +657,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
 def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
     """Require one live, attributed inventory identity before requesting its safe stop."""
     import inventory
-    from record import session_records
+    from shutdown_record import session_records
 
     processes = sessions.session_processes(session_id)
     if isinstance(processes, sessions.SessionLivenessUnknown):
@@ -681,7 +685,7 @@ def run_attach_shutdown(arguments: list[str], timeout: float) -> subprocess.Comp
 def stop_for_attach(handoff: RunningSessionHandoff) -> SessionShutdown:
     import restart
     import settle
-    from record import session_records
+    from shutdown_record import session_records
 
     identity = str(uuid4())
     cancel = settle.shutdown_command("cancel", handoff.login, "--here", "--only", handoff.session_id)
@@ -749,7 +753,7 @@ def write_stub(request: UnitLaunch) -> None:
     stamp = datetime.now(request.production.zone).strftime("%Y-%m-%d %H:%M %Z")
     header = f"# {request.identity.session}\n\n> **Production: {request.production.slug}** — unit "
     source = f"`{request.identity.unit}`; production doc `{doc}`\n\n## Source\n\n{stamp}\n\n{request.plan.words}\n"
-    _ = path.write_text(header + source, encoding="utf-8")
+    write_text_atomic(path, header + source)
 
 
 def append_row(request: UnitLaunch, existing: NoUnitRow | ExistingUnitRow) -> None:
@@ -770,7 +774,7 @@ def append_row(request: UnitLaunch, existing: NoUnitRow | ExistingUnitRow) -> No
                 break
     else:
         lines.insert(insert_at, desired_row(request, headings))
-    _ = doc.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_text_atomic(doc, "\n".join(lines) + "\n")
 
 
 def remote_head(production: Production, branch: str) -> str:
@@ -825,7 +829,7 @@ def ensure_worktree(request: UnitLaunch) -> None:
         if not destination.exists():
             if _is_excluded_standing_plan(production, request.plan.path):
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                _ = destination.write_bytes((production.checkout / request.plan.path).read_bytes())
+                write_text_atomic(destination, (production.checkout / request.plan.path).read_text(encoding="utf-8"))
             else:
                 _ = git(production, "-C", str(worktree), "restore", f"--source={production.merge_branch}",
                         "--worktree", "--", request.plan.path.as_posix())
@@ -952,6 +956,12 @@ def launch_session(
         environment[PROBE_ENV] = "1"
     arguments.extend(["--remote-control", session_name, "-n", session_name, *flags])
     timeout_ms = int(request.timeout * 1000)
+    pending = opening_record(request.production, request.unit_id)
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(pending, json.dumps({
+        "session_id": session_id, "config_dir": str(selected.dir),
+        "prompt": prompt, "launched_at": datetime.now(UTC).isoformat(),
+    }) + "\n")
     host = herdr.shared_session()
     _ = herdr.start_server(host, timeout_ms)
     production = request.production
@@ -962,7 +972,62 @@ def launch_session(
     if isinstance(launched, herdr.nix_env.Refused):
         raise Refusal(launched.reason)
     outcome = launched.outcome
+    if isinstance(outcome, herdr.PromptSubmitted):
+        pending.unlink(missing_ok=True)
     return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
+
+
+def opening_record(production: Production, unit: str) -> Path:
+    """Keep pending prompt work in the checkout's Git directory, outside tracked files."""
+    checkout = production.checkout
+    directory = checkout / ".git"
+    if directory.is_file():
+        pointer = directory.read_text(encoding="utf-8").strip()
+        if not pointer.startswith("gitdir: "):
+            raise Refusal(f"invalid Git directory pointer: {directory}")
+        directory = (checkout / pointer.removeprefix("gitdir: ")).resolve()
+    return directory / "add-unit-openings" / f"{unit}.json"
+
+
+def pending_opening(production: Production, unit: str, session_id: str) -> bool:
+    """Whether this unit still owes an opening to the named conversation."""
+    path = opening_record(production, unit)
+    if not path.exists():
+        return False
+    fields = cast(dict[str, str], json.loads(path.read_text(encoding="utf-8")))
+    return fields["session_id"] == session_id
+
+
+class NoPendingOpening(NamedTuple):
+    """No live conversation still needs this saved opening."""
+
+
+def finish_opening(request: UnitLaunch, marked: MarkedUnitFound) -> herdr.PromptSubmitOutcome | NoPendingOpening:
+    """Finish the opening for this live session, without starting a second session."""
+    import herdr
+
+    pending = opening_record(request.production, request.unit_id)
+    if not pending.exists():
+        return NoPendingOpening()
+    fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
+    claude = marked.unit.claude
+    if not isinstance(claude, unit_lookup.LiveClaude) or claude.session_id != fields["session_id"]:
+        observed = sessions.session_liveness(fields["session_id"])
+        if isinstance(observed, sessions.SessionNotLive):
+            pending.unlink()
+            return NoPendingOpening()
+        if isinstance(observed, sessions.SessionLivenessUnknown):
+            raise Refusal(f"cannot tell whether pending session {fields['session_id']} runs: {observed.reason}")
+        raise Refusal("pending opening does not name the marked unit's live session")
+    transcript = herdr.SessionTranscript(Path(fields["config_dir"]), fields["session_id"])
+    at = datetime.fromisoformat(fields["launched_at"])
+    outcome = herdr.submitted_prompt(transcript, fields["prompt"], at)
+    if not isinstance(outcome, herdr.PromptSubmitted):
+        outcome = herdr.Herdr(marked.unit.place.session).submit_opening_prompt(
+            marked.unit.place.pane, herdr.OpeningPrompt(fields["prompt"], transcript), at, int(request.timeout * 1000))
+    if isinstance(outcome, herdr.PromptSubmitted):
+        pending.unlink(missing_ok=True)
+    return outcome
 
 
 def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted) -> str:
@@ -1092,7 +1157,7 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
     from scripts.accounts import accounts
     try:
         if source_fallback:
-            from record import all_session_records
+            from shutdown_record import all_session_records
 
             if not isinstance(request.launch_kind, UnitRestoreLaunch):
                 raise Refusal("--source-fallback requires a recorded unit restore")
@@ -1169,7 +1234,7 @@ def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
         return ""
     if explicit:
         return explicit
-    import record as shutdown_record
+    import shutdown_record
     try:
         saved = [item for item in shutdown_record.all_session_records()
                  if item["session"]["session_id"] == request.session.session_id]
@@ -1245,7 +1310,8 @@ def main(argv: list[str]) -> int:
         explicit_autocompact = cast(str, args.autocompact)
         if (explicit_autocompact and isinstance(request.session, ResumedSession)
                 and isinstance(request.session.handoff, ResumeStoppedSession)
-                and isinstance(request.launch_kind, NewWorkLaunch) and registered_unit(request)):
+                and isinstance(request.launch_kind, NewWorkLaunch) and registered_unit(request)
+                and not pending_opening(request.production, request.unit, request.session.session_id)):
             # Setting a registered unit's window is not new work: no new-work check or launch applies.
             set_autocompact(request, request.session.session_id, explicit_autocompact, cast(bool, args.check))
             return 0
@@ -1279,26 +1345,20 @@ def main(argv: list[str]) -> int:
             handoff = StoppedSessionHandoff(source, saved)
             request = replace(request, session=request.session._replace(handoff=ResumeStoppedSession()))
 
-        barrier = launch_permission.launch_barrier()
-        try:
-            _ = barrier.__enter__()
-        except OSError as error:
-            raise Refusal(
-                f"shutdown state unreadable: launch barrier: {error}"
-            ) from error
         outcome = herdr.PromptNotSubmitted("restore reused a session without submit proof")
-        try:
-            purpose: launch_permission.LaunchPurpose = (
-                launch_permission.RecordedSessionRestoreLaunchPurpose(
-                    request.launch_kind.session_id
-                )
-                if isinstance(request.launch_kind, UnitRestoreLaunch)
-                else launch_permission.RecordedSessionRestoreLaunchPurpose(handoff.session_id)
-                if isinstance(handoff, StoppedSessionHandoff)
-                else launch_permission.NewWorkLaunchPurpose()
+        purpose: launch_permission.LaunchPurpose = (
+            launch_permission.RecordedSessionRestoreLaunchPurpose(
+                request.launch_kind.session_id
             )
-            require_shutdown_launch_permission(unit_account, purpose)
-
+            if isinstance(request.launch_kind, UnitRestoreLaunch)
+            else launch_permission.RecordedSessionRestoreLaunchPurpose(handoff.session_id)
+            if isinstance(handoff, StoppedSessionHandoff)
+            else launch_permission.NewWorkLaunchPurpose()
+        )
+        from scripts.whoami.account import named_claude_account
+        with launch_permission.admitted_launch(named_claude_account(unit_account.label).login,
+                request.session.session_id if isinstance(request.session, ResumedSession) else "",
+                request.unit_id, lambda: require_shutdown_launch_permission(unit_account, purpose)):
             ready = preflight(request, unit_account)
             request = ready.launch
             if cast(bool, args.check):
@@ -1348,8 +1408,12 @@ def main(argv: list[str]) -> int:
                 outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
                                if isinstance(request.session, ResumedSession) else "", model=resume_model,
                                autocompact_window=resume_autocompact)
-        finally:
-            _ = barrier.__exit__(None, None, None)
+            elif opening_record(request.production, request.unit_id).exists():
+                recovered = finish_opening(request, marked_unit)
+                if not isinstance(recovered, NoPendingOpening):
+                    outcome = recovered
+                if isinstance(recovered, herdr.PromptNotSubmitted):
+                    raise Refusal(f"{request.identity.unit}: opening prompt not submitted: {recovered.reason}")
         if isinstance(request.launch_kind, UnitRestoreLaunch):
             print("restart-prompt-outcome: " + herdr.encode_prompt_outcome(outcome))
             if isinstance(outcome, herdr.PromptNotSubmitted):
