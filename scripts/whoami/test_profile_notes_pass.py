@@ -248,6 +248,7 @@ class ProfileNotesPassTests(unittest.TestCase):
 
     def test_child_launch_options_cannot_substitute_executable_or_run_hooks(self) -> None:
         entry = next(entry for entry in profile.patch_list(self.pass_) if entry.mode == "child_launch")
+        command = ("ps", "-eo", "pid=,ppid=,comm=,args=")
         options: tuple[dict[str, object], ...] = (
             {"executable": "/bin/sh"}, {"shell": True},
             {"preexec_fn": lambda: None}, {"startupinfo": object()},
@@ -258,11 +259,13 @@ class ProfileNotesPassTests(unittest.TestCase):
                 "mac": "/nix/store/fixture-python/bin/python3", "natedev": "/nix/store/fixture-python/bin/python3"}))
             for kwargs in options:
                 with self.subTest(option=next(iter(kwargs))), self.assertRaises(OSError):
-                    _ = guarded(object(), ["ps", "-c", "touch /tmp/claude/probe-marker"], **kwargs)
+                    _ = guarded(object(), command, **kwargs)
             # Popen permits executable and shell as positional arguments too.
             with self.assertRaises(OSError):
-                _ = guarded(object(), ["ps", "-c", "touch /tmp/claude/probe-marker"], -1, "/bin/sh")
+                _ = guarded(object(), command, -1, "/bin/sh")
             self.assertEqual(started.call_count, 0)
+            _ = guarded(object(), command)
+            self.assertEqual(started.call_count, 1)
 
     def test_private_scratch_test_compares_resolved_paths(self) -> None:
         # Model macOS: spelling a path through /tmp differs from its resolved path.

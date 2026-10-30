@@ -24,7 +24,7 @@ from datetime import date, datetime, timedelta
 from datetime import time as clock
 from pathlib import Path
 from socket import gethostname
-from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 
 import production_units
@@ -34,6 +34,8 @@ from session_pane import HerdrFailure, agent_status, read_place
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
+import context_usage  # noqa: E402
 import push_texts  # noqa: E402
 import rca  # noqa: E402
 import sessions  # noqa: E402
@@ -119,6 +121,8 @@ class PromptWait(TypedDict):
     tool: str
     # The prompt is gone after its alert went out: the alert is retired before the unit gets a new one.
     retiring: bool
+    # Delivered alert whose case must still open, even after the prompt and alert are gone.
+    case_pending: NotRequired[rca.Report]
 
 
 class Delivery(NamedTuple):
@@ -249,6 +253,22 @@ def latest_transcript_activity(session_id: str) -> float:
             if path.is_file():
                 latest = max(latest, path.stat().st_mtime)
     return latest
+
+
+def context_near_compaction(session_id: str) -> bool:
+    """Wake at the context hook's shared handoff threshold using its bounded tail reading."""
+    try:
+        transcript = sessions.latest_transcript(session_id, PROJECTS_DIR)
+        if transcript is None:
+            return False
+        reading = context_usage.latest_reading(transcript)
+    except OSError:
+        return False
+    if reading is None:
+        return False
+    window = context_usage.auto_compact_window(reading["model"])
+    return (window is not None
+            and context_usage.estimate_tokens(reading, 0) >= context_usage.handoff_threshold(window))
 
 
 def lines_from_end(path: Path, block: int = 1 << 20) -> Iterator[bytes]:
@@ -426,9 +446,17 @@ def forget(slug: str, unit: str) -> Delivery | None:
 
 def saved_prompt(path: Path) -> PromptWait | None:
     try:
-        old = cast(PromptWait, json.loads(path.read_text(encoding="utf-8")))
-        return PromptWait(since=float(old["since"]), alerted=old["alerted"] is True, tool=str(old.get("tool", "")),
-                          retiring=old.get("retiring") is True)
+        old = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+        prompt = PromptWait(since=float(cast(float, old["since"])), alerted=old["alerted"] is True,
+                            tool=str(old.get("tool", "")), retiring=old.get("retiring") is True)
+        if "case_pending" in old:
+            report = cast(dict[str, object], old["case_pending"])
+            prompt["case_pending"] = rca.Report(
+                session=str(report["session"]), machine=str(report["machine"]), kind=cast(rca.Kind, report["kind"]),
+                commands=tuple(cast(list[str], report["commands"])), transcript=str(report["transcript"]),
+                production=str(report["production"]), stopped=str(report["stopped"]), waits=str(report["waits"]),
+                source=str(report["source"]), key=str(report["key"]))
+        return prompt
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -446,8 +474,9 @@ def read_prompt(path: Path, now: float, pending: PendingTool | None = None) -> P
     if pending is None:
         return saved or PromptWait(since=now, alerted=False, tool="", retiring=False)
     if saved is not None and saved["tool"] in ("", pending.id):
-        return PromptWait(since=min(saved["since"], pending.started), alerted=saved["alerted"], tool=pending.id,
-                          retiring=False)
+        saved["since"] = min(saved["since"], pending.started)
+        saved["tool"] = pending.id
+        return saved
     if saved is not None and saved["alerted"]:
         saved["retiring"] = True
         return saved
@@ -455,8 +484,11 @@ def read_prompt(path: Path, now: float, pending: PendingTool | None = None) -> P
 
 
 def save_prompt(path: Path, prompt: PromptWait) -> None:
+    record: dict[str, object] = {**prompt}
+    if "case_pending" in prompt:
+        record["case_pending"] = prompt["case_pending"]._asdict()
     temporary = path.with_suffix(f".{os.getpid()}.tmp")
-    _ = temporary.write_text(json.dumps(prompt) + "\n", encoding="utf-8")
+    _ = temporary.write_text(json.dumps(record) + "\n", encoding="utf-8")
     os.replace(temporary, path)
 
 
@@ -651,7 +683,6 @@ def send_all(pending: list[Delivery], now: float) -> None:
     its prompt state, so the next tick tries it again and sends no new alert.
     """
     started: list[tuple[Delivery, subprocess.Popen[str]]] = []
-    reports: list[rca.Report] = []
     for item in pending:
         try:
             started.append((item, subprocess.Popen(item.command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -671,14 +702,20 @@ def send_all(pending: list[Delivery], now: float) -> None:
             print(f"stall-watch: {item.kind}: {err.strip() or out.strip() or process.returncode}", file=sys.stderr)
             continue
         if item.kind == "retire":
-            item.state_path.unlink(missing_ok=True)
+            prompt = saved_prompt(item.state_path)
+            if prompt is not None and "case_pending" in prompt:
+                # Move the saved report atomically so new prompts never wait for an old case.
+                case_id = hashlib.sha256(json.dumps(prompt["case_pending"]._asdict(), sort_keys=True).encode()).hexdigest()
+                _ = item.state_path.replace(STATE_DIR / f"{case_id}.case.json")
+            else:
+                item.state_path.unlink(missing_ok=True)
             continue
         if item.kind == "alert":
             prompt = read_prompt(item.state_path, 0)
             prompt["alerted"] = True
-            save_prompt(item.state_path, prompt)
             if item.report is not None:
-                reports.append(item.report)
+                prompt["case_pending"] = item.report
+            save_prompt(item.state_path, prompt)
             continue
         stretch = cast(Stretch, json.loads(item.state_path.read_text(encoding="utf-8")))
         if item.kind == "bump":
@@ -686,8 +723,23 @@ def send_all(pending: list[Delivery], now: float) -> None:
         else:
             stretch["tell_sent"] = True
         save_stretch(item.state_path, stretch)
-    for report in reports:
-        print(rca.open_case(report, datetime.fromtimestamp(now, ZoneInfo("UTC"))))
+    retry_cases(now)
+
+
+def retry_cases(now: float) -> None:
+    """Finish case creation independently of whether its prompt or sent alert still exists."""
+    for path in [*STATE_DIR.glob("*.prompt.json"), *STATE_DIR.glob("*.case.json")]:
+        prompt = saved_prompt(path)
+        if prompt is None or "case_pending" not in prompt:
+            continue
+        result = rca.open_case(prompt["case_pending"], datetime.fromtimestamp(now, ZoneInfo("UTC")))
+        print(result)
+        if result.startswith(("rca: opened ", "rca: joined ")):
+            del prompt["case_pending"]
+            if path.name.endswith(".case.json"):
+                path.unlink(missing_ok=True)
+            else:
+                save_prompt(path, prompt)
 
 
 def tick(now: float) -> None:
@@ -698,6 +750,7 @@ def tick(now: float) -> None:
         runs = unit_lookup.read_run_states()
     except (OSError, UnicodeError) as error:
         print(f"stall-watch: units: their run state is unknown: {error}", file=sys.stderr)
+        retry_cases(now)
         return
     for configured in showrunners.registered_showrunners():
         # A showrunner that is not running has no one to tell: its units are not watched.
@@ -761,9 +814,9 @@ def tick(now: float) -> None:
                 call = pending_tool(session_id)
                 prompt = read_prompt(waiting, now, call)
                 save_prompt(waiting, prompt)
-                if prompt["retiring"]:
+                if prompt["retiring"] and prompt["alerted"]:
                     pending.append(retire_alert(slug, name))
-                elif not prompt["alerted"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS:
+                elif not prompt["retiring"] and not prompt["alerted"] and now - prompt["since"] >= PROMPT_ALERT_SECONDS:
                     pending.append(prompt_alert(slug, name, pane, prompt["since"], zone, call,
                                                 prompt_report(slug, name, session_id, call, prompt["since"])))
                 continue
@@ -776,7 +829,8 @@ def tick(now: float) -> None:
             # A hold that states when it ends waits like a gate until then; the idle clock starts after it.
             held_until = (stated_hold_end(turn.group(0), now, zone)
                           if turn and turn.group("kind") == HOLDING_KIND else None)
-            if turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now)):
+            if (turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now))
+                    and not context_near_compaction(session_id)):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)

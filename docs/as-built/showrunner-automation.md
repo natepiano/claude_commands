@@ -210,7 +210,7 @@ Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so
 
 - **`unit_status.sh`** `waiting_on_user`: nothing when a spinner shows in the last 12 lines; `FORM WAITING on you in <unit>: …` for `Enter to select`. Otherwise it reads the last turn-end line (`^\s*(— )?(holding|gate|decision|blocked|done):`). `decision`, `gate` and `blocked` are waits on the user: first sight prints `=== DECISION for you from <unit> ===` … `=== end <unit> ===` and records the key in `decisions_seen`; a repeat prints `STILL WAITING on you, <unit>: …`. A wait naming `showrunner` or a peer unit (whole word) is the showrunner's: no wait line, and only `blocked:` prints `BLOCK in <unit>, open <age>: …`, aged from `blocks_open`. Any other turn-end clears the block entry.
 
-- **A hold with a stated end (2026-10-17).** A `holding:` turn-end that names a future time is silent in the stall watch until that time, like a waiting kind; the idle clock starts once it passes. `stated_hold_end(line, now, zone)` takes the latest `HH:MM` in the line, with an optional `YYYY-MM-DD` or `MM-DD` before it, in the production's zone unless followed by `UTC` or `GMT`; a time without a date, or a date without a year, is the occurrence nearest now (`hold_days`), so `until 01:00` read at 23:00 is tomorrow, `since 23:50` read at 00:10 is yesterday, and `Thu 10-22 11:47 EDT` is the nearest 22 October. A hold has no upper limit: real holds run for days. Seen on mul_add, bumped at 05:32 during a re-measure window its hold said ends at 16:09.
+- **A hold with a stated end (2026-10-17).** A `holding:` turn-end that names a future time is silent in the stall watch until that time, like a waiting kind, unless its context is at the compaction wake point; the idle clock starts once it passes. `stated_hold_end(line, now, zone)` takes the latest `HH:MM` in the line, with an optional `YYYY-MM-DD` or `MM-DD` before it, in the production's zone unless followed by `UTC` or `GMT`; a time without a date, or a date without a year, is the occurrence nearest now (`hold_days`), so `until 01:00` read at 23:00 is tomorrow, `since 23:50` read at 00:10 is yesterday, and `Thu 10-22 11:47 EDT` is the nearest 22 October. A hold has no upper limit: real holds run for days. Seen on mul_add, bumped at 05:32 during a re-measure window its hold said ends at 16:09.
 
 ### Manager tree: `production_tree.py`
 
@@ -241,7 +241,7 @@ Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so
 
 - An activity on a closed phase leaves that phase's record as `finish-phase` wrote it: status, `finished_at` and elapsed time. The printed `review trial:` line keeps its form, which `merge_checkpoint.py` parses.
 
-- The stall watch's standing-by, run-finished and retired-row skips, then its waiting-kind reset, run before any bump or notice. The turn-end pattern is built from `WAITING_KINDS` and `HOLDING_KIND`, so the pattern and the wait test cannot drift; a one-line reply's `●` or `⏺` bullet is allowed before the turn end.
+- The stall watch's standing-by, run-finished and retired-row skips, then its waiting-kind reset below the compaction wake point, run before any bump or notice. At the shared context-hook handoff threshold (`context_usage.handoff_threshold(window)`) or above, waiting kinds and future stated holds take the usual idle path: one bump and one showrunner tell per stretch, so the next request can compact. `context_near_compaction` reuses the context hook's bounded transcript-tail reading and model-specific handoff threshold from `scripts/hooks/context_usage.py`; missing or unreadable usage keeps the wait quiet. The turn-end pattern is built from `WAITING_KINDS` and `HOLDING_KIND`, so the pattern and the wait test cannot drift; a one-line reply's `●` or `⏺` bullet is allowed before the turn end.
 
 - Unit directors launch only on Claude. `production` has only `[production.claude]`; `claude --resume` never runs without resolved flags.
 
@@ -275,7 +275,7 @@ Each subcommand takes `--production`; `main` catches `merge_checkpoint.Stop`, so
 
 - Producer output shapes are not the obvious ones: the unconfigured berth board is a JSON envelope with exit 4, the ETA line is `dailies ETAs: <unit> <phase> <eta>; …`, and account labels use one spelling (`codex1`). Test fixtures come from calling the producers.
 
-- `unit_status.sh` routes `gate:` exactly as `decision:` and `blocked:`, while the stall watch treats all four waiting kinds as silent; a unit at a gate is quiet in the stall watch and flagged to the user by the status script.
+- `unit_status.sh` routes `gate:` exactly as `decision:` and `blocked:`, while the stall watch treats all four waiting kinds as silent below the compaction wake point; a unit at a gate below that point is quiet in the stall watch and flagged to the user by the status script.
 
 - `unit_status.sh` is zsh.
 

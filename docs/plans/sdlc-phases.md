@@ -549,7 +549,7 @@ The user approved this work through the showrunner (2026-10-29, ranked before Ph
 
 **Acceptance gate:** every row names path:line, a question 1-5, the rerun result and an owner; the unit director has checked each row against the tip; the list is sent. A wait whose holder is `[]`, or a named holder with an unknown field, comes back from `waits` (its output is JSON) as `MalformedHolder` with the raw value, and an absent holder key still reads as recorded before holders; a phase whose plan header names a production doc path reports that doc's production name; basedpyright over the whole `scripts/` tree reports no import cycle; the `progress_history` suite stays green; basedpyright 0/0/0.
 
-### Phase 14 — A plan's Depends line counts only this plan's own phases  · status: todo
+### Phase 14 — A plan's Depends line counts only this plan's own phases  · status: done
 **Depends on:** Phase 15 (order only: the showrunner ranks the rerun lens first)
 
 The showrunner sent a wrong result (2026-10-29): hierarchies-unit's phase 9 notice printed "Phase 6 needs Phase 2026 (not in the plan)". `phase_table.py parallel` reads each phase's `**Depends on:**` list from `plan_history.py`, which takes every number in the line (`re.findall(r"\b\d+[a-z]?\b", ...)`, near line 117). So a date (`2026-11-12`), a time (`19:00`), a commit hash with leading digits, another unit's phase (`phases-unit Phase 11`), and other numbered things (`Steps 1 and 4`) all count as this plan's phases.
@@ -566,7 +566,82 @@ The showrunner sent a wrong result (2026-10-29): hierarchies-unit's phase 9 noti
 **Files:**
 - `scripts/direct/plan_history.py`
 - `scripts/direct/test_progress_history.py` — the plan-parse tests
+- `scripts/direct/test_plan_history.py` — the dependency-parser tests
 
 **Workers:** `1 impl`.
 
 **Acceptance gate:** a test parses these Depends lines and gets exactly the ids shown: `the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4` → 3, 4, 5; `phases-unit Phase 11 (the wait-holder field and the phase origin fields) merged into sdlc; sdlc said 2026-10-29 its ETA is 19:00 EDT.` → none; `Phase 7; postmaster-unit's reply record (main abc8344f)` → 7; `Phase 19 (numbering only)` → 19; `Phase 10b, Phase 11` → 10b, 11; `none` → none. `phase_table.py parallel` on hierarchies-unit's plan prints no `Phase 2026`. The `scripts.direct.test_phase_table` and `scripts.direct.test_progress_history` suites stay green.
+
+### Phase 17 — Five rerun faults in the unit scripts clear on a rerun  · status: todo
+**Depends on:** Phase 16 (the sweep list) and Phase 14 (order only)
+
+The showrunner routed five rows of the rerun sweep (`docs/plans/sdlc-rerun-sweep.md`, checked at sdlc 097b1a0d) to phases-unit on 2026-10-29: the four rows in its phases-unit section and `scripts/direct/end_session.sh:87` from the fix-rounds section (fix-rounds-unit is stopped). Each row is a step that, if stopped at the named line, leaves a state that a rerun cannot get past or reads wrong. Line numbers are from 097b1a0d; find each by the code the row names.
+
+#### Work Order
+
+**Goal:** after a stop at each named line, the next run of the same command finishes the work and reports the true state.
+
+**Spec:**
+- `scripts/direct/assign.py` (claim check, row line 363): a launcher claim records the launcher's process start time beside its pid. A claim is live only when a process with that pid exists and has the same start time; a reused pid reads as a stale claim, and the rerun takes the worker. A claim with no start time (written before this change) keeps today's pid-only check.
+- `scripts/direct/findings.py` (`landed`, row line 1218): a stop after the state write and before the `finding_batch_landed` event no longer leaves history without the event. A rerun of `landed` for that round writes the missing event once and says so; a round whose event exists stays "no repair round in flight".
+- `scripts/direct/verify.sh` (lint pass cache, row line 2065): a recorded failure on a tree is never hidden by an older recorded pass for the same tree. A forced lint that fails deletes the old pass record before it publishes its failure record, so a stop between the two steps leaves no record and the next call runs lint again.
+- `scripts/direct/verify.sh` (resource wait close, row line 1157): when closing a recorded resource wait fails, cleanup keeps the wait's id where the next run finds it (or keeps the folder), and the next run closes that earlier wait before it opens its own.
+- `scripts/direct/end_session.sh` (row line 87): one run whose `roles.py unbind-run` fails no longer stops the cleanup of the other runs in the list. Each run is unbound and cleaned on its own; the script exits nonzero at the end and names each run that failed, so a rerun retries only those.
+
+**Files:**
+- `scripts/direct/assign.py`
+- `scripts/direct/test_assign_launcher.py`
+- `scripts/direct/findings.py`
+- `scripts/direct/test_findings.py`
+- `scripts/direct/verify.sh`
+- `scripts/direct/test_verify_hold_lint.py`
+- `scripts/direct/test_verify_hold_wait.py`
+- `scripts/direct/end_session.sh`
+- `scripts/direct/test_end_session.py`
+
+**Workers:** `2 impl` (one for `assign.py`, `findings.py`, `end_session.sh` and their tests; one for `verify.sh` and its two test modules).
+
+**Acceptance gate:** for each of the five rows, one test stops the command at the named line (a fault injected at that step), reruns the same command, and asserts the rerun's result: a reused pid takes the worker; `landed` restores `finding_batch_landed` exactly once; a failed forced lint after a saved pass reports the failure on the next ordinary call; a failed wait close is closed by the next run; a failed unbind still cleans the other runs and the rerun retries only the failed one. Each test fails on the tree before its fix. The `scripts.direct.test_assign_launcher`, `scripts.direct.test_findings`, `scripts.direct.test_end_session`, `scripts.direct.test_verify_hold_lint` and `scripts.direct.test_verify_hold_wait` suites stay green.
+
+### Phase 18 — The Stop hook lets a full-context stop through only when something live will wake the session  · status: done
+**Depends on:** none (showrunner fix, 2026-10-29: ahead of other work)
+
+The showrunner sent a wrong result (2026-10-29): accounts-unit ended its turn at 17:39:47 EDT at 98% context with "— blocked: my context is full; it compacts on the next turn". No request followed, so it sat stopped 3.5 h. `scripts/hooks/stop-direct-continue.py` (Phase 6) let the stop through. The return that fired is `workers_working(session_dir)`: it reads only the age of `heartbeat.log`, and the launcher wrote "agent finished" to that log at 17:39:38, 9 s before the stop. A finished worker writes the heartbeat too, so a fresh heartbeat is not a live wake source.
+
+#### Work Order
+
+**Goal:** at or above the handoff threshold, the hook lets a stop through only when a live wake source exists; otherwise it blocks once, so the next request runs compaction.
+
+**Spec:**
+- `scripts/hooks/stop-direct-continue.py` measures context before any wake-source check. Below the threshold, or when context cannot be measured, the stop passes, as now.
+- At or above the threshold, the only wake source is a live entry in the payload's `background_tasks` (`pending_background_tasks`): a launcher, a verification or an Agent subagent the CLI will report when it ends. The `heartbeat.log` age no longer counts; `workers_working` leaves the hook, and `direct_run.py` drops it if no other caller remains.
+- The other early returns keep their meaning: a subagent, no session id, no active run, a declared user or supplier wait (`record_turn_wait`), and `stop_hook_active` (block once only).
+
+**Files:**
+- `scripts/hooks/stop-direct-continue.py`
+- `scripts/hooks/direct_run.py`
+- `scripts/hooks/test_stop_direct_continue.py` — new
+
+**Workers:** `1 impl`.
+
+**Acceptance gate:** `scripts/hooks/test_stop_direct_continue.py` has one test per return in `main()`, each feeding a payload on stdin and reading the hook's output. One test writes a fresh `heartbeat.log` whose last line is "agent finished", sets context above the threshold, gives no live background task, and asserts a block; it fails on the tree before the fix. Another gives one running background task above the threshold and asserts no block. The `scripts.direct.test_phase_artifacts` suite stays green.
+
+### Phase 19 — An uncertain wait reason prints once, with its count  · status: done
+**Depends on:** none (showrunner add-on from hierarchies-unit, 2026-10-29)
+
+`progress_history.py` (near line 5869) joins one reason per uncertain wait with "; ", so an `UncertainCoverage` cell repeats "worker hana_catalyst-lfo-impl6 has 0 active pass matches" five times.
+
+#### Work Order
+
+**Goal:** an `UncertainCoverage` phase's reason names each distinct reason once.
+
+**Spec:**
+- `scripts/direct/progress_history.py` writes each distinct uncertain-wait reason once, in first-seen order, joined with "; ". A reason that repeats gets " (<n> times)" after it; a reason seen once has no count. `candidates` and `attribution_miss_ids` stay as they are.
+
+**Files:**
+- `scripts/direct/progress_history.py`
+- `scripts/direct/test_progress_history.py`
+
+**Workers:** `1 impl`.
+
+**Acceptance gate:** a test with five uncertain waits that share one reason and one wait with another reason gets "<reason> (5 times); <other reason>". `~/.claude/scripts/lib/py ~/.claude/scripts/hierarchies/measure.py baseline --full --since 2026-10-29T03:05:59Z --until 2026-10-30T00:00:00Z`, run against this tree, shows the hana_catalyst-lfo-impl6 reason once. The `scripts.direct.test_progress_history` suite stays green.
