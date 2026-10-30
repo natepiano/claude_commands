@@ -93,15 +93,15 @@ class QueueTests(unittest.TestCase):
     def test_both_tables_resolve_workers_directors_showrunners_and_unmatched_sessions(self) -> None:
         self.roster_read.return_value = roster.Roster([
             self.entry("worker-id", "organon-ci88", codex=True,
-                       showrunner=roster.UnderShowrunner("hana-production", "hana", "session:hana"),
+                       showrunner=roster.UnderShowrunner("hana", "hana-showrunner", "session:hana"),
                        director=roster.UnderDirector("organon-unit", "organon", "session:organon")),
             self.entry("director-id", "merge-gate",
-                       showrunner=roster.UnderShowrunner("hana-production", "hana", "session:hana"),
+                       showrunner=roster.UnderShowrunner("hana", "hana-showrunner", "session:hana"),
                        director=roster.DirectsUnit("merge-unit")),
-            self.entry("showrunner-id", "hana", showrunner=roster.RunsProduction("hana-production")),
+            self.entry("showrunner-id", "hana-showrunner", showrunner=roster.RunsProduction("hana")),
             self.entry("standalone-id", "standalone"),
             self.entry("orphan-id", "orphan",
-                       showrunner=roster.ProductionWithoutRunningShowrunner("offline-production")),
+                       showrunner=roster.ProductionWithoutRunningShowrunner("offline")),
         ], [])
         identities = (("worker-id", "clone88ci"), ("director-id", "old-director"),
                       ("showrunner-id", "old-showrunner"), ("standalone-id", "old-standalone"),
@@ -114,8 +114,8 @@ class QueueTests(unittest.TestCase):
             session, name, "clippy", f"/tmp/tree-{index}", GIB, memory_admit.MeasuredMemory(GIB),
         ) for index, (session, name) in enumerate(identities, 1))
         output = self.cli_output(memory_admit.QueueView(waiting, running, 20 * GIB, 0, GIB, NOW))
-        labels = ("hana | organon | organon-ci88", "hana | merge-gate | merge-gate", "hana | — | hana",
-                  "— | — | standalone", "— | — | orphan", "— | — | recorded", "— | — | tree-7")
+        labels = ("hana | organon | organon-ci88", "hana | merge | merge-gate", "hana | — | hana-showrunner",
+                  "— | — | standalone", "offline | — | orphan", "— | — | recorded", "— | — | tree-7")
         for index, label in enumerate(labels, 1):
             for step in ("nextest", "clippy"):
                 with self.subTest(index=index, step=step):
@@ -126,7 +126,7 @@ class QueueTests(unittest.TestCase):
 
     def test_roster_problems_preserve_matches_and_report_only_the_first_problem_after_totals(self) -> None:
         self.roster_read.return_value = roster.Roster(
-            [self.entry("known", "live-name", showrunner=roster.RunsProduction("production"))],
+            [self.entry("known", "live-name", showrunner=roster.RunsProduction("builds"))],
             ["one session unreadable", "second problem"],
         )
         running = (
@@ -134,12 +134,35 @@ class QueueTests(unittest.TestCase):
             memory_admit.RunningStep("unknown", "recorded", "doc", "/tmp/other", GIB, memory_admit.MeasuredMemory(GIB)),
         )
         output = self.cli_output(memory_admit.QueueView((), running, 20 * GIB, 0, GIB, NOW))
-        self.assertIn("| 1 | live-name | — | live-name | mend |", output)
+        self.assertIn("| 1 | builds | — | live-name | mend |", output)
         self.assertIn("| 2 | — | — | recorded | doc |", output)
         lines = output.splitlines()
         totals = next(index for index, line in enumerate(lines) if line.startswith("Totals:"))
         self.assertEqual(lines[totals + 1:], [
-            "Roster: one session unreadable; Showrunner and Unit director show — for unmatched steps"])
+            "Roster: one session unreadable; Showrunner and Unit show — for unmatched steps"])
+
+    def test_both_tables_use_the_shared_unit_labels_without_rewriting_names(self) -> None:
+        entries = [self.entry("style-id", "old-name")]
+        running = memory_admit.RunningStep(
+            "style-id", "recorded-name", "clippy", "/tmp/style", GIB, memory_admit.MeasuredMemory(GIB),
+        )
+        waiting = memory_admit.WaitingStep(
+            10, "style-id", "recorded-name", "nextest", "/tmp/style", NOW, GIB,
+            memory_admit.ReadyForAdmission(),
+        )
+        labels = {"style-id": roster.UnitLabels("style-impl", "cargo-liner", "cargo-liner-style-types")}
+        with mock.patch.object(roster, "unit_labels", return_value=labels) as lookup:
+            lines = build_queue.render_queue(
+                memory_admit.QueueView((waiting,), (running,), 20 * GIB, 0, GIB, NOW),
+                ZoneInfo("UTC"), entries,
+            )
+        lookup.assert_called_once_with(entries)
+        for step in ("clippy", "nextest"):
+            with self.subTest(step=step):
+                self.assertTrue(any(
+                    line.startswith(f"| 1 | cargo-liner | cargo-liner-style-types | style-impl | {step} | style |")
+                    for line in lines
+                ))
 
     def test_roster_exception_still_prints_both_tables_and_one_problem(self) -> None:
         self.roster_read.side_effect = RuntimeError("roster lookup failed")
@@ -153,7 +176,7 @@ class QueueTests(unittest.TestCase):
         lines = output.splitlines()
         totals = next(index for index, line in enumerate(lines) if line.startswith("Totals:"))
         self.assertEqual(lines[totals + 1:], [
-            "Roster: roster lookup failed; Showrunner and Unit director show — for unmatched steps"])
+            "Roster: roster lookup failed; Showrunner and Unit show — for unmatched steps"])
 
     def test_queue_and_local_roster_reads_overlap(self) -> None:
         rendezvous = threading.Barrier(2, timeout=2)
@@ -476,11 +499,11 @@ class QueueTests(unittest.TestCase):
         self.roster_read.assert_called_once_with(os.environ, roster.ThisMachine())
         self.assertEqual(output.getvalue(), (
             "**Running**\n\n"
-            + "| # | Showrunner | Unit director | Session | Step | Folder | Promised | Using | Delta | State |\n"
+            + "| # | Showrunner | Unit | Session | Step | Folder | Promised | Using | Delta | State |\n"
             + "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
             + "| empty |  |  |  |  |  |  |  |  |  |\n\n"
             + "**Waiting**\n\n"
-            + "| # | Showrunner | Unit director | Session | Step | Folder | Waiting since | Needs | Free | Reason |\n"
+            + "| # | Showrunner | Unit | Session | Step | Folder | Waiting since | Needs | Free | Reason |\n"
             + "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
             + "| empty |  |  |  |  |  |  |  |  |  |\n\n"
             + "Totals: promised 0.0 GiB; measured 0.0 GiB; free 20.0 GiB; reserve 1.0 GiB\n"))
