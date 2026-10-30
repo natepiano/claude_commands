@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from scripts.whoami.note_file import note_name
 
+from unit_staff_test_support import unit_host
+from scripts.production import staff_sources
 import io
 from datetime import datetime
 import json
@@ -67,7 +69,7 @@ def unit_session(session_id: str) -> inventory.UnitSession:
         run_dirs=[],
         codex_servers=[],
         timers=[],
-        host=inventory.UnitHost(
+        host=unit_host(
             kind="unit",
             production="demo",
             unit="alpha-unit",
@@ -897,6 +899,16 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         current = shutdown_store.find_session(LOGIN, "session-123")
         assert current is not None
         self.assertEqual(current["progress"], {"kind": "waiting"})
+
+    def test_follow_finishes_a_stopped_request_with_an_advisory_codex_pause_issue(self) -> None:
+        saved = session_shutdown(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER))
+        saved["then"] = "stop"
+        saved["stop_issues"] = [shutdown_store.CodexServerLeftRunning(kind="codex server left running",
+            at=OCTOBER, run_dir="/owned/run", cause="stop not confirmed")]
+        self.assertTrue(shutdown_store.create_session(saved))
+        status, text = self.follow_request()
+        self.assertEqual(status, 0, text)
+        self.assertEqual(shutdown_store.find_session(LOGIN, "session-123"), saved)
 
     def test_follow_prints_each_new_step_once_and_waits_for_pending_restart(self) -> None:
         saved = session_shutdown(shutdown_store.SessionWaiting(kind="waiting"))
@@ -2058,7 +2070,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         def listed(_login: str) -> list[inventory.ListedSession]:
             return [inventory.ListedSession(owner["session_id"], owner["pid"], owner["proc_start"],
                 owner["name"], owner["kind"], self.root / ".claude", LOGIN,
-                owner["host"]["production"] if owner["kind"] == "unit" else "", "")
+                staff_sources.unit_parent(owner["host"]["unit"]).slug if owner["kind"] == "unit" else "", "")
                 for owner in self.owners]
         _ = self.enterContext(patch.object(shutdown, "listing", side_effect=listed))
         def observed(login: str, only: Iterable[str] = ()) -> inventory.Inventory:

@@ -225,9 +225,7 @@ class StaffTestCase(unittest.TestCase):
         """Write real timer/doc sources; each listed unit initially has a worktree."""
         doc = self.source_root / f"{slug}-production.md"
         self.units_doc(doc, units, workspace=workspace or slug)
-        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}" / "conf"
-        timer.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(timer, f"TARGET=session:session-{slug}\nCHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
+        self.register_production(slug, doc)
         for unit in units:
             _ = self.worktree(unit)
         if parent:
@@ -235,6 +233,12 @@ class StaffTestCase(unittest.TestCase):
             parent_file.parent.mkdir(parents=True, exist_ok=True)
             write_text_atomic(parent_file, parent + "\n")
         return doc
+
+    def register_production(self, slug: str, doc: Path) -> None:
+        """Register an existing fixture document without making a second production."""
+        timer = Path(os.environ["NOTIFIER_STATE_DIR"]) / f"showrunner-{slug}" / "conf"
+        timer.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(timer, f"TARGET=session:session-{slug}\nCHECK=zsh /fixture/production_check.sh {shlex.quote(str(doc))}\n")
 
     def units_doc(self, doc: Path, units: tuple[str, ...], *, workspace: str, retired: tuple[str, ...] = ()) -> None:
         rows = [f"| `{unit}` | `{self.source_root / 'worktrees' / unit}` | {'retired' if unit in retired else 'active'} |" for unit in units]
