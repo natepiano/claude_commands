@@ -2734,7 +2734,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Ruled out:**
 - Delete the result after `dropped` is recorded in the no-recovery-source branch: a failed delete then stops recovery for good.
 
-### Phase 94e — Each derived account problem names the cause it comes from  · status: todo
+### Phase 94e — Each derived account problem names the cause it comes from  · status: done
 
 **Depends on:** Phase 94c (order only)
 
