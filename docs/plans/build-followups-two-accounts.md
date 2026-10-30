@@ -2805,11 +2805,11 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - A zero-count pass skips each unit that a newer pass changed (projection re-read under the lock), and the owed notice is checked again before it is sent.
 - Tests: `test_five_hour.py` (retry per recipient; Assertion-Change on the renamed low-window test, send count 3), `test_codex_winddown.py` (stop-and-rerun, stale-pass cases).
 
-### Phase 99 — A stopped `down` or `now` is finished by its rerun  · status: todo
+### Phase 99 — A stopped `down` or `now` is finished by its rerun  · status: done
 
 **Depends on:** Phase 95 (order only); also waits until herdr-unit's phase 3 has merged into natedev, because herdr edits `scripts/shutdown/settle.py` now. The showrunner says when.
 
-**Also touches:** shutdown-unit (`scripts/shutdown`).
+**Also touches:** shutdown-unit (`scripts/shutdown`, `scripts/message`).
 
 #### Work Order
 
@@ -2826,10 +2826,13 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Files:**
 - `scripts/shutdown/settle.py` — `begin`, `save_timers`, `now`, `_reserve_showrunner_line`, `tell_showrunner_stopping`, `tell_showrunners_outcome`.
 - `scripts/shutdown/shutdown_record.py` — the `store` module of settle; changed only if a pending-registration or claim reader belongs there.
-- `scripts/shutdown/test_settle.py` — one stop-and-rerun test per row.
+- `scripts/shutdown/restart.py` — the source fallback sends its showrunner line through the shared claim-and-send path.
+- `scripts/message/send.py` — a keyed send that did not go out (failed, refused or held) does not hold the repeat window, so the next stop or report sends the claimed line again.
+- `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_restart.py`, `scripts/message/test_send.py` — the stop-and-rerun and send-window tests.
+- `scripts/shutdown/test_account_move.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_shutdown_record.py` — fixture setup only (a stub keyword, live registration owners); no assertion changes.
 
 **Workers:** 1 writer + 1 tester.
-- `impl` — `settle.py` (and `record.py` if needed).
+- `impl` — `settle.py`, `shutdown_record.py`, `restart.py`, `scripts/message/send.py`.
 - `test` — the five tests from the Spec alone in `test_settle.py`; each fails before the change.
 
 **State:** account hold registrations, `SessionShutdown` records (`timers`, `progress`, `showrunner_told`) and notifier timers (scratch shutdown state in tests).
@@ -2841,7 +2844,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - Merge origin/natedev (with herdr-unit's phase 3) before the work starts and before the gate.
 - Merge timing: no checkpoint merge during the natedev build hold, 00:05–03:05 EDT (showrunner, 2026-10-29). While any natedev build hold is in force, run no tests, gates or type checks unless this unit holds it; check `build_hold.py status` first.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and the same for `scripts/accounts` pass with a scratch HOME set before import; `basedpyright` on the changed Python files reads `0 errors, 0 warnings, 0 notes`; each stop-and-rerun test fails on the code before the change.
+**Acceptance gate:** `python3 -m unittest discover -s scripts/shutdown -p 'test_*.py'` and the same for `scripts/accounts` and `scripts/message` pass with a scratch HOME set before import; `basedpyright` on the changed Python files reads `0 errors, 0 warnings, 0 notes`. The stop-and-rerun tests for rows 1, 3 and 5 fail on the code before the change. Rows 2 and 4 already hold on the base (`down` starts the conductor after every `begin`; `now` reads the live sessions, and `store.create_session` moves a finished stop record aside for the new stop), so their tests stay as guards.
 
 ### Phase 100 — All consumers import shared whoami modules by one name  · status: todo
 

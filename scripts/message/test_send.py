@@ -701,6 +701,52 @@ class SendTests(ShutdownTestCase):
             self.assertEqual(self.send("--key", "k", "--repeat-minutes", "30", "--text", "four").outcome, "sent")
         self.assertEqual([entry["outcome"] for entry in self.log()], ["sent", "skipped", "sent", "sent"])
 
+    def test_a_failed_keyed_session_send_retries_but_a_delivered_send_keeps_its_window(self) -> None:
+        options = local_options(["--to", "Recipient", "--from", "Sender", "--key", "result",
+                                 "--repeat-minutes", "30", "--text", "The unit is back."])
+        started = send.now()
+        self.outcome = send.Result("failed", "transport refused the message")
+        with mock.patch.object(send, "now", return_value=started):
+            self.assertEqual(send.send(options).outcome, "failed")
+        self.outcome = send.Result("sent", "delivered")
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)):
+            self.assertEqual(send.send(options).outcome, "sent")
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=2)):
+            self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual([message.text for message in self.relayed], [options.text, options.text])
+        self.assertEqual([entry["outcome"] for entry in self.log()], ["failed", "sent", "skipped"])
+
+    def test_a_queued_keyed_session_send_keeps_one_copy_and_its_window(self) -> None:
+        self.session("recipient", "Recipient")
+        options = local_options(["--to", "session:recipient", "--from", "Sender", "--key", "result",
+                                 "--repeat-minutes", "30", "--text", "The unit is back."])
+        started = send.now()
+        self.outcome = send.Result("queued", "relay unavailable")
+        with mock.patch.object(send, "now", return_value=started):
+            self.assertEqual(send.send(options).outcome, "queued")
+        self.outcome = send.Result("sent", "delivered")
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)):
+            self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(send.pending("session:recipient").count("The unit is back."), 1)
+        self.assertEqual(send.pending("session:recipient"), "")
+
+    def test_a_failed_send_does_not_clear_a_later_runs_window(self) -> None:
+        started = send.now()
+        options = local_options(["--to", "bogus", "--from", "Sender", "--key", "result",
+                                 "--repeat-minutes", "30", "--text", "The unit is back."])
+        def overlap(message: send.Message, timeout: float) -> send.Result:
+            del message, timeout
+            with (mock.patch.object(send, "now", return_value=started + timedelta(minutes=31)),
+                  mock.patch.object(send, "relay", return_value=send.Result("sent", "later delivery"))):
+                self.assertEqual(send.send(options).outcome, "sent")
+            return send.Result("failed", "earlier delivery failed")
+        with mock.patch.object(send, "now", return_value=started), mock.patch.object(send, "relay", overlap):
+            self.assertEqual(send.send(options).outcome, "failed")
+        with mock.patch.object(send, "now", return_value=started + timedelta(minutes=32)):
+            self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual([entry["outcome"] for entry in self.log()], ["sent", "failed", "skipped"])
+
     @staticmethod
     def emergency(*extra: str) -> list[str]:
         return ["--here", "--to", "user", "--from", "hana", "--summary", "GitHub credentials are cold", "--need", "blocked",

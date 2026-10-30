@@ -42,8 +42,9 @@ it reaches them is `user()`'s business: no caller names the channel.
 
 `--key` names a message. With `--repeat-minutes`, a send with the same key to the
 same recipient inside the window is skipped; `ack` skips every later send with
-the key until `reopen`. The window counts from the last attempt, delivered or
-not, as the queue keeps what did not arrive. While the user's silence is on, a
+the key until `reopen`. A failed send does not count. A delivered send or a
+message kept for later delivery holds the window, so a retry cannot deliver a
+queued copy twice. While the user's silence is on, a
 kept push with the same key from the same sender replaces the older kept one.
 
 One event sends one emergency push. An emergency push (`--to user --need blocked`)
@@ -281,7 +282,7 @@ QueuedMessage = KeyedMessage | UnkeyedMessage
 
 
 class KeyState(TypedDict):
-    # Recipient -> UTC ISO time of the last attempt, delivered or not; for a user emergency push, the last one sent.
+    # Recipient -> UTC ISO time of the claimed send; a failed send releases its claim.
     last: dict[str, str]
     acknowledged: NotRequired[str]
 
@@ -1908,7 +1909,8 @@ def parse(argv: list[str]) -> Options:
     _ = clears.add_argument("--self-clearing", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--key", help=("names the message for --repeat-minutes, ack and the queue; a kept push to"
                                            + " the user replaces an older kept one with this key from the same sender"))
-    _ = parser.add_argument("--repeat-minutes", type=float, help="skip a send with --key inside this window")
+    _ = parser.add_argument("--repeat-minutes", type=float,
+                           help="skip a delivered or kept send with --key inside this window; failed sends do not count")
     location = parser.add_mutually_exclusive_group()
     _ = location.add_argument("--machine", help="deliver from this ssh host instead (mac)")
     _ = location.add_argument("--here", action="store_true", help="resolve and deliver only here")
@@ -2208,8 +2210,9 @@ def send(options: Options) -> Result:
     if result.outcome == "sent" and message.key is not None:
         for recipient in dict.fromkeys((message.to, options.to)):
             _ = remove_queued_key(recipient, message.key)
-    # An emergency push that did not go out is not live: its resend goes out.
-    if live and key is not None and not refused and held is None and skip is None and result.outcome != "sent":
+    # A failed send can retry. A queue or kept push owns its copy until delivery.
+    if (key is not None and not refused and held is None and skip is None
+            and result.outcome in {"failed", "refused", "held"}):
         forget_sent(key, message.to, started)
     if emergency and options.clears_when and key is not None and result.outcome == "sent":
         posted_on = options.scope.host if isinstance(options.scope, NamedMachine) else machine()

@@ -441,6 +441,52 @@ class RestartTests(ShutdownTestCase):
         self.create([saved])
         return saved
 
+    def test_source_fallback_retries_queued_showrunner_line_then_reports_it_once(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        saved = entry(unit("queued-source-fallback"))
+        line = "queued-source-fallback came back on claude2: claude3 refused"
+        saved.update(target=LABEL, source_label=LABEL, showrunner_told="stopping", restart_issues=[line])
+        self.create([saved])
+        with patch.object(settle, "_unit_showrunner", return_value="fixture-runner"):
+            with patch.object(settle, "send_message", side_effect=Killed):
+                with self.assertRaises(Killed):
+                    restart._tell_source_fallback(saved)  # pyright: ignore[reportPrivateUsage]
+            with patch.object(settle, "send_message", return_value=settle.MessageQueued(
+                kind="queued", reason="fixture recipient unavailable")) as queued:
+                restart._tell_source_fallback(saved)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(queued.call_count, 1)
+            with patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as retry:
+                for _ in range(2):
+                    current = shutdown_record.find_session(LOGIN, saved["session"]["session_id"])
+                    assert current is not None
+                    restart._tell_source_fallback(current)  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual([item.args[1:3] for item in retry.call_args_list], [(line, line)])
+
+    def test_outcome_replays_a_queued_fallback_without_a_second_back_line(self) -> None:
+        class Killed(BaseException):
+            pass
+
+        saved = entry(unit("queued-fallback-outcome"))
+        line = "queued-fallback-outcome came back on claude2: claude3 refused"
+        saved.update(target=LABEL, source_label=LABEL, showrunner_told="stopping", restart_issues=[line],
+                     progress=shutdown_record.SessionRestarted(kind="restarted", at=RESTARTED))
+        self.create([saved])
+        with patch.object(settle, "_unit_showrunner", return_value="fixture-runner"):
+            with patch.object(settle, "send_message", side_effect=Killed):
+                with self.assertRaises(Killed):
+                    restart._tell_source_fallback(saved)  # pyright: ignore[reportPrivateUsage]
+            with patch.object(settle, "send_message", return_value=settle.MessageQueued(
+                kind="queued", reason="fixture recipient unavailable")) as queued:
+                settle.tell_showrunners_outcome(shutdown_record.session_records(LOGIN))
+            self.assertEqual([call.args[1:3] for call in queued.call_args_list], [(line, line)])
+            with patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as retry:
+                settle.tell_showrunners_outcome(shutdown_record.session_records(LOGIN))
+                settle.tell_showrunners_outcome(shutdown_record.session_records(LOGIN))
+            self.assertEqual([call.args[1:3] for call in retry.call_args_list], [(line, line)])
+            self.assertEqual(queued.call_args.kwargs["key"], retry.call_args.kwargs["key"])
+
     def test_moved_unit_uses_source_after_exception_failed_outcome_or_confirmation_timeout(self) -> None:
         for failure in ("exception", "outcome", "confirmation"):
             with self.subTest(failure=failure):
@@ -5051,14 +5097,24 @@ class RestartTests(ShutdownTestCase):
         launch.assert_called_once()
 
     def test_showrunner_snapshot_admission_checks_the_configured_launch_account_hold(self) -> None:
+        _ = self.enterContext(patch.object(shutdown_record, "registration_process_start", return_value="fixture-process-start"))
         self.configure_groups(showrunners="claude3")
         _ = self.recovery([showrunner("held-group")])
         shutdown_record.set_account_hold(shutdown_record.AccountHold(login="third@example.invalid", label="claude3", machine="natedev",
             requested_at=STOPPED, request_id="target-hold", requested_by=shutdown_record.FromTerminal(kind="terminal"), then="stop",
-            registration="in progress"))
+            registration="in progress", registration_owners={"target-hold":
+                shutdown_record.RegistrationOwner(pid=4242, proc_start="fixture-process-start")}))
+
+        def admission(command: list[str], *, env: dict[str, str], **_options: object) -> subprocess.CompletedProcess[str]:
+            output, error = io.StringIO(), io.StringIO()
+            with patch.dict(os.environ, env, clear=True), redirect_stdout(output), redirect_stderr(error):
+                status = shutdown.main(command[2:])
+            return subprocess.CompletedProcess(command, status, output.getvalue(), error.getvalue())
+
         with (patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(subprocess, "run", side_effect=admission),
               patch.object(restart, "_retire"), patch.object(restart, "_launch_session") as launch,
               redirect_stdout(io.StringIO()) as output):
             self.assertEqual(restart.up(LOGIN), 1)

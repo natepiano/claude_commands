@@ -974,8 +974,11 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(shutdown_store.release_finished_account_hold(held["login"], conducting=True), shutdown_store.HoldReleased(held))
 
     def test_a_registering_or_old_record_hold_is_never_released(self) -> None:
+        _ = self.enterContext(patch.object(shutdown_store, "registration_process_start", return_value="fixture-process-start"))
         held = account_hold()
         held["registration"] = "in progress"
+        held["registration_owners"] = {held["request_id"]:
+            shutdown_store.RegistrationOwner(pid=4242, proc_start="fixture-process-start")}
         shutdown_store.set_account_hold(held)
         self.assertEqual(shutdown_store.release_finished_account_hold(held["login"]), shutdown_store.HoldInUse(held))
         shutdown_store.clear_account_hold(held["login"])
