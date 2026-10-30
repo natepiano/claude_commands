@@ -48,7 +48,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,6 +73,8 @@ RESULT_TAIL_CHARS = 20_000
 # same worktree replaced this one while it waited for the cargo token. It ran nothing, so it is
 # neither a pass nor a failure, and the newer call's result answers instead.
 SUPERSEDED_STATUS = 76
+TREE_CHANGED_STATUS = 77
+TREE_CHANGED_VERDICT = "CANCELLED (exit 77): resubmit after your edits."
 SUPERSEDED_VERDICT = ("SUPERSEDED (exit 76): a newer call of the same verb replaced this one before it built. "
                       + "Nothing failed and nothing needs a repair; read the newer call's result.")
 # The verdict of a run whose supervisor is gone: it reported no exit status.
@@ -136,13 +138,15 @@ def _pool_state() -> Path:
     return Path(os.environ.get("REVIEW_POOL_STATE") or Path.home() / ".local/state/review-pool").expanduser()
 
 
-def _roster_folders() -> list[Path]:
-    """Every run's mesh folder: unit run folders, then review pool meshes."""
-    folders = [path.parent for root in RUN_ROOTS for path in sorted(root.glob(f"*/{codex_mesh.ROSTER_FILE}"))]
-    folders.extend(path.parent for path in sorted(_pool_state().glob(f"*/mesh/*/{codex_mesh.ROSTER_FILE}")))
+def _roster_folders() -> Iterator[Path]:
+    """Read unit runs first, before inspecting retained external meshes."""
+    for root in RUN_ROOTS:
+        for path in sorted(root.glob(f"*/{codex_mesh.ROSTER_FILE}")):
+            yield path.parent
+    for path in sorted(_pool_state().glob(f"*/mesh/*/{codex_mesh.ROSTER_FILE}")):
+        yield path.parent
     from scripts.guilds import roles
-    folders.extend(roles.durable_meshes())
-    return folders
+    yield from roles.durable_meshes()
 
 
 def caller_from_environment(environment: dict[str, str]) -> Caller:
@@ -156,10 +160,14 @@ def caller_from_environment(environment: dict[str, str]) -> Caller:
         roster = codex_mesh._read_json_object(folder / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
         for name, value in roster.items():
             entry = codex_mesh._as_dict(value)  # pyright: ignore[reportPrivateUsage]
-            if entry.get("thread_id") != thread_id or entry.get("status") == "ended" or entry.get("transferring_role") or entry.get("role_redirect"):
+            if (entry.get("thread_id") != thread_id or entry.get("status") in ("ended", "adopted")
+                    or entry.get("adopted_to") or entry.get("transferring_role") or entry.get("role_redirect")):
                 continue
             launcher = codex_mesh._pid_alive(codex_mesh._as_int(entry.get("launcher_pid")))  # pyright: ignore[reportPrivateUsage]
-            found.append((launcher, MeshCaller(str(folder), name, thread_id)))
+            caller = MeshCaller(str(folder), name, thread_id)
+            if entry.get("unit_ledger") or entry.get("unit_worker_ledger"):
+                return caller
+            found.append((launcher, caller))
     if not found:
         return NotMeshWorker()
     found.sort(key=lambda item: not item[0])
@@ -378,10 +386,22 @@ def _exit_words(exit_code: int | None) -> str:
 
 def result_text(record: RunRecord, exit_code: int | None) -> str:
     verdict = (ORPHAN_VERDICT if exit_code is None else "PASS (exit 0)" if exit_code == 0
-               else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS else f"FAIL (exit {exit_code})")
+               else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS
+               else TREE_CHANGED_VERDICT if exit_code == TREE_CHANGED_STATUS else f"FAIL (exit {exit_code})")
     heading = "Run ended with no result" if exit_code is None else "Run finished"
     lines = [f"{heading}: {record['label']}", f"Result: {verdict}", f"Log: {record['log']}"]
     tail = _tail(Path(record["log"]), RESULT_TAIL_LINES)
+    if exit_code == TREE_CHANGED_STATUS:
+        # Keep verify's resubmit instruction verbatim even if cleanup pushed it
+        # out of the bounded tail. Delivery queues this same text for the worker.
+        try:
+            with Path(record["log"]).open(encoding="utf-8", errors="replace") as log:
+                cancellation = next((line.rstrip("\n") for line in log
+                                     if line.startswith("verify.sh: cancelled — ")), "")
+        except OSError:
+            cancellation = ""
+        if cancellation and cancellation not in tail:
+            lines.extend(["", cancellation])
     if tail:
         lines.extend(["", f"Last {len(tail)} log lines (lines over {RESULT_LINE_CHARS} characters are cut):", *tail])
     return "\n".join(lines)
@@ -420,7 +440,7 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
     exit_code is None for a run whose supervisor is gone. Returns the delivery outcome the record keeps.
     """
     done_file = record["done_message_file"]
-    if done_file and exit_code not in (0, SUPERSEDED_STATUS):
+    if done_file and exit_code not in (0, SUPERSEDED_STATUS, TREE_CHANGED_STATUS):
         return f"nothing delivered: {_exit_words(exit_code)} with a done message"
     if done_file and exit_code == 0:
         try:

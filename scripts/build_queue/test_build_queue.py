@@ -45,6 +45,7 @@ class QueueTests(unittest.TestCase):
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "BUILDLOG_DIR": str(self.root / "buildlog"),
             "BUILDLOG_PROC": str(self.root / "proc"),
+            "BUILDLOG_BUILDS_CGROUP": str(self.root / "builds.slice"),
             "BUILDLOG_MEMINFO": str(self.root / "meminfo"),
             "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
@@ -60,7 +61,7 @@ class QueueTests(unittest.TestCase):
               showrunner: roster.ShowrunnerRelationship = NO_SHOWRUNNER,
               director: roster.DirectorRelationship = NO_DIRECTOR) -> roster.RosterEntry:
         return roster.RosterEntry(
-            machine="test-machine", kind="codex" if codex else "claude", role="agent",
+            machine="test-machine", kind="codex" if codex else "claude", role="freestanding",
             name=name, status="running", reach=roster.CannotReceiveMessages("test"), cwd="/tmp/tree",
             showrunner=showrunner, director=director, assignment=roster.NotAWorker(),
             thread=roster.CodexThread(session) if codex else roster.NoCodexThread(),

@@ -11,10 +11,15 @@ from pathlib import Path
 from typing import override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
 import herdr  # noqa: E402
 import herdr_tab_title  # noqa: E402
 from herdr_tab_title import StopPayload  # noqa: E402
+
+REAL_RETITLE = herdr.Herdr.retitle
 
 
 class HerdrTabTitleTests(unittest.TestCase):
@@ -30,13 +35,17 @@ class HerdrTabTitleTests(unittest.TestCase):
         (root / "config/herdr").mkdir(parents=True)
         _ = (root / "config/herdr/shared-session").write_text("agents\n")
         self.enterContext(patch.dict("os.environ", {
-            "NOTIFIER_SESSIONS_DIR": str(self.records), "XDG_CONFIG_HOME": str(root / "config")}))
+            "NOTIFIER_SESSIONS_DIR": str(self.records), "NOTIFIER_STATE_DIR": str(root / "notifier"),
+            "XDG_CONFIG_HOME": str(root / "config"), "XDG_STATE_HOME": str(root / "state"),
+            "SHOWRUNNER_UNIT": "", "SHOWRUNNER_UNIT_ID": ""}))
+        _ = self.enterContext(patch.object(names, "runtime_names", return_value=fixture_names()))
         self.record(41, "session-a", "showrunner-fixer")
         self.record(42, "session-b", "send-relay", entrypoint="sdk-cli")
         self.retitled, self.fault = [], False
         _ = self.enterContext(patch.object(herdr.Herdr, "retitle", autospec=True, side_effect=self.fake_retitle))
 
-    def fake_retitle(self, _client: herdr.Herdr, pane: str, title: str) -> bool:
+    def fake_retitle(self, _client: herdr.Herdr, pane: str, title: str, *, label: str = "") -> bool:
+        self.assertTrue(label)
         self.retitled.append((pane, title))
         if self.fault:
             raise herdr.HerdrFailure("server gone")
@@ -78,6 +87,51 @@ class HerdrTabTitleTests(unittest.TestCase):
               patch("sys.stdin", io.StringIO(json.dumps({"session_id": "session-a"})))):
             self.assertEqual(herdr_tab_title.main(), 0)
         self.assertEqual(self.retitled, [("w3:p7", "showrunner-fixer")])
+
+    def test_turn_end_preserves_shown_title_and_rename_keeps_identity_separate(self) -> None:
+        environment = {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents",
+                       "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"}
+        pane: dict[str, object] = {"pane_id": "w3:p7", "tab_id": "w3:t2", "workspace_id": "w3",
+                                   "label": "showrunner-fixer"}
+        tab: dict[str, object] = {"tab_id": "w3:t2", "label": "sdlc · roles · unit director"}
+
+        def result(_client: herdr.Herdr, *arguments: str) -> dict[str, object]:
+            return {"panes": [pane]} if arguments == ("pane", "list") else {"tabs": [tab]}
+
+        def run(_client: herdr.Herdr, *arguments: str) -> str:
+            target = pane if arguments[0] == "pane" else tab
+            target["label"] = arguments[-1]
+            return ""
+
+        with (patch.object(herdr.Herdr, "retitle", new=REAL_RETITLE),
+              patch.object(herdr.Herdr, "result", autospec=True, side_effect=result) as reads,
+              patch.object(herdr.Herdr, "run", autospec=True, side_effect=run) as writes,
+              patch.object(herdr.Herdr, "order_tabs", return_value={}) as ordered,
+              patch.object(herdr.Herdr, "save_layout") as saved,
+              patch.object(herdr, "saved_layout", return_value=herdr.SavedLayout(at=0.0, workspaces=[]))):
+            self.assertFalse(herdr_tab_title.sync({"session_id": "session-a"}, environment))
+            self.assertEqual(reads.call_count, 2)
+            writes.assert_not_called()
+            ordered.assert_not_called()
+            saved.assert_not_called()
+            self.record(41, "session-a", "renamed-director")
+            self.assertTrue(herdr_tab_title.sync({"session_id": "session-a"}, environment))
+            self.assertEqual(pane["label"], "renamed-director")
+            self.assertEqual(tab["label"], "sdlc · roles · unit director")
+            self.assertEqual(writes.call_count, 1)
+            ordered.assert_called_once()
+            saved.assert_called_once()
+
+    def test_showrunner_title_uses_timer_record_after_session_rename(self) -> None:
+        state = self.records.parent / "notifier"
+        instance = state / "showrunner-sdlc"
+        instance.mkdir(parents=True)
+        _ = (instance / "conf").write_text(
+            "TARGET=session:session-a\nCHECK=/scripts/production_check.sh /docs/sdlc-production.md\n")
+        environment = {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents", "NOTIFIER_STATE_DIR": str(state)}
+        self.record(41, "session-a", "renamed-showrunner")
+        self.assertTrue(herdr_tab_title.sync({"session_id": "session-a"}, environment))
+        self.assertEqual(self.retitled, [("w3:p7", "sdlc · showrunner")])
 
 
 if __name__ == "__main__":

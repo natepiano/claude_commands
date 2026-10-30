@@ -16,11 +16,11 @@ Own what a build may use and when it starts: memory admission and the memory que
 - **Project started:** 2026-10-29T14:07:00+00:00
 - **Stack:** Python 3.13, standard library only; basedpyright strict (`pyrightconfig.json`); unittest. Bash for the memory gate and hooks.
 - **Layout:**
-  - `scripts/lint/memory_admit.py` — the admission checker. `check_memory_reading(path)` :702 is the tripwire check: with `BUILDLOG_LIVE_MEMORY_TRIPWIRE` set, a path that resolves to `/proc/meminfo` or `/proc/pressure/memory` appends a record and raises `LiveMemoryReading`. `read_meminfo(path)` :722 reads `MemAvailable`/`MemTotal`; its path comes from the shell (`check <meminfo> …`) or from `BUILDLOG_MEMINFO` (`read_queue` :1182). `read_pressure()` :738 reads `BUILDLOG_MEMORY_PRESSURE`, default `/proc/pressure/memory`, and holds every step when `full avg10` > 10.0. It swallows `OSError`/`ValueError`. Both call `check_memory_reading` before they open the file. Callers: `check` :1000–:1001 and :1043–:1044, `read_queue` :1182 and :1185 (the `/build:queue` view). `run_action` :1320 (actions include `tripwire <path>`), `main` :1375 (a `LiveMemoryReading` exits 2 with its text as the last stderr line).
-  - `scripts/lint/memory_gate.sh` — `buildlog_wait_for_memory` :179. With the tripwire set it resolves `$meminfo` and refuses a live path through `memory_admit.py tripwire <path>` (:194–:205). Then it reads `MemAvailable` itself from `${BUILDLOG_MEMINFO:-/proc/meminfo}` (:206–:211) and starts `memory_admit.py check`. A checker that exits non-zero is refused with its last output line (:226–:229, `buildlog_memory_refuse` :153). On darwin with `BUILDLOG_MEMINFO` unset it grants at once and reads nothing (:182).
+  - `scripts/lint/memory_admit.py` — the admission checker. `check_memory_reading(path)` is the tripwire check: with `BUILDLOG_LIVE_MEMORY_TRIPWIRE` set, a path that resolves to `/proc/meminfo` or `/proc/pressure/memory` appends a record and raises `LiveMemoryReading`. `read_meminfo(path)` reads `MemAvailable`/`MemTotal`; its path comes from the shell (`check <meminfo> …`) or from `BUILDLOG_MEMINFO` (`read_queue`). `read_pressure()` reads `BUILDLOG_MEMORY_PRESSURE`, default `/proc/pressure/memory`, and holds every step when `full avg10` > 10.0. It swallows `OSError`/`ValueError`. Both call `check_memory_reading` before they open the file. Callers: `check` (in two places) and `read_queue` (the `/build:queue` view). `run_action` (actions include `tripwire <path>`), `main` (a `LiveMemoryReading` exits 2 with its text as the last stderr line).
+  - `scripts/lint/memory_gate.sh` — `buildlog_wait_for_memory`. With the tripwire set it resolves `$meminfo` and refuses a live path through `memory_admit.py tripwire <path>`. Then it reads `MemAvailable` itself from `${BUILDLOG_MEMINFO:-/proc/meminfo}` and starts `memory_admit.py check`. A checker that exits non-zero is refused with its last output line (`buildlog_memory_refuse`). On darwin with `BUILDLOG_MEMINFO` unset it grants at once and reads nothing.
   - `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — sources `memory_gate.sh` and calls `buildlog_wait_for_memory` with no arguments (a launch: no reservation).
   - `scripts/hooks/test_brp_launch_gate.py` — `setUp` :53 takes `BUILDLOG_MEMINFO`, `BUILDLOG_MEMORY_PRESSURE` and `BUILDLOG_LIVE_MEMORY_TRIPWIRE` from `fake_memory_readings(self.root)` (:74). `test_low_memory_wait_leaves_old_release_record_unchanged` :159 writes its low value to the returned `meminfo` file.
-  - `scripts/production/merge_gate.py` — `test_module_environment` :514 gives each test module a private `BUILDLOG_DIR` and the build-tool tripwires (`cargo`, `rustc`, `rustdoc`, `rustup`, `cargo-nextest` first on `PATH`, each appends its argv to `<root>/build-tool-calls.jsonl` and exits 99). `finish_gate_job` :536 reads that file, appends `a test started real <tool>: <args>` to the output, and sets status 1 and `GateJobResult.build_tool_started` :143. :859 never reruns a tripped module alone. Not in any unit's Owns cell: natedev showrunner's file.
+  - `scripts/production/merge_gate.py` — `test_module_environment` :514 gives each test module a private `BUILDLOG_DIR` and the build-tool tripwires (`cargo`, `rustc`, `rustdoc`, `rustup`, `cargo-nextest` first on `PATH`, each appends its argv to `<root>/build-tool-calls.jsonl` and exits 99). `finish_gate_job` reads that file, appends `a test started real <tool>: <args>` to the output, and sets status 1 and `GateJobResult.tripwire_tripped`. The gate never reruns a tripped module alone. Not in any unit's Owns cell: natedev showrunner's file.
   - `scripts/production/affected_modules.py` — affected-only module selection follows import edges (natedev c495a0b2): a change to a test helper selects every module that imports it. There is no `SHARED_TEST_HELPERS` list. natedev showrunner's file.
   - `scripts/production/test_merge_gate_suites.py` — tests of the gate's build-tool tripwire: `test_module_tool_calls_fail_even_when_its_tests_pass` :132 (asserts `a test started real <tool>: <args>` and no `Rerun alone:`), `test_module_can_put_its_own_build_tool_stub_first` :145. natedev 367da4f1 split `test_merge_gate.py` by subject into this module, `test_merge_gate_holds.py` and `test_merge_gate_ledger.py`. natedev showrunner's file.
   - Import idiom for a test helper: `from scripts.lib.nix_env_test_support import NixFixture` (`scripts/direct/test_verify_nix_shell.py` :13); the gate runs each module with the repo root as working directory.
@@ -29,7 +29,7 @@ Own what a build may use and when it starts: memory admission and the memory que
   - Fake `BUILDLOG_MEMINFO` but not `BUILDLOG_MEMORY_PRESSURE` (pressure leaks), checked on the worktree tree after merge 73a8d903: `scripts/buildlog/test_record.py` (report-unit); `scripts/buildlog/test_mac_idle.py` :333, `scripts/direct/test_verify_doc.py` :137, `test_verify_release_ack.py` :83 (verify-unit); `scripts/production/test_dailies_render_holds.py` :124, :255 (natedev showrunner).
   - Fake `BUILDLOG_MEMORY_PRESSURE` but not `BUILDLOG_MEMINFO`: `scripts/direct/test_verify_hold_wait.py` (verify-unit) — the meminfo read may be stubbed; the tripwire decides.
   - Fake neither but run `verify.sh`, `invoke.sh` or the gate: about 30 more modules (`scripts/direct/test_verify_memory_kill.py`, `test_verify_final_pass.py`, `test_verify_nix_shell.py`, `scripts/hooks/test_build_hold_guard.py`, `scripts/build_hold/test_hold_enforcer.py`, `scripts/lint/test_invoke_scope.py` and others). Many stub the gate or stop before it; a static count cannot tell, so Phase 2 uses the tripwire to find the set.
-- **Out of scope (unit director's call, 2026-10-29; a one-line change to the tripwire if wrong):** the process table (`BUILDLOG_PROC`, `process_start_time` :636). The gate reads it only for the pids that the test's private ledger names, so machine load cannot change an admission through it. The build budget is a constant unless `BUILDLOG_BUILD_BUDGET_GIB` is set: not live.
+- **Out of scope (unit director's call, 2026-10-29; a one-line change to the tripwire if wrong):** the process table (`BUILDLOG_PROC`, `process_start_time`). The gate reads it only for the pids that the test's private ledger names, so machine load cannot change an admission through it. The build budget is a constant unless `BUILDLOG_BUILD_BUDGET_GIB` is set: not live.
 - **Test lanes:** `test_*.py` beside each module.
 - **Build:** none (Python, shell and markdown).
 - **Test:** each changed module with `python3 -m unittest discover -s <dir> -p '<module>'` from the worktree root. Then the merge gate: `env HERDR_BIN=/nonexistent/herdr python3 ~/.claude/scripts/production/merge_gate.py --checkout <worktree> --tests-only`, run from `~/.claude` main after a merge of `origin/builds` (memory: merge origin before every gate). Check `build_hold.py status` first; no tests during a natedev build hold that this unit does not hold.
@@ -111,13 +111,13 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Binds later work:**
 - The shared-folder sweep extension: `sweep.py` keys use by workspace and finds clone kind from the path (gate or merge, `/tmp/claude/scratch`, phase). A folder shared by many clones is one target with many users; the keep window and the per-target lock (the cargo build-dir lock) cover all of them, and `rebuilds` attributes by clone path.
-- The typed reclamation split builds on `freed_by()` and the lstat path, and owns the over-count when a hard link outside the target shares the inode.
+- The typed reclamation split shipped in Phase 9 (`ReclamationEstimate`, `ConfirmedDeletion`, `reclaim`); a hard link outside the target now frees nothing.
 - The tmp_sweep memory phase: the `sweep.py` floor scan now runs 4 threads, so a working-set reading of `sweep.py` must come from this code.
 - The clone cache trial uses `sweep.py rebuilds` for its before/after cold compile-hours per clone kind.
 
 **Gotchas:**
 - Unlinking one hard-linked copy changes the shared inode's ctime. Output identity is (dev, ino, size, mtime), never ctime.
-- `freed_by()` runs after `remove()` in `shrink_floor()`, but before deletion in `choose()`.
+- `freed_by()` runs only on a dry run, through `reclaim()`; a real run credits the `ConfirmedDeletion` that `remove()` returns (Phase 9).
 
 **Ruled out:** a first-builds column in `rebuilds`; the shared-folder sweep extension computes first builds from build-log records.
 
@@ -135,9 +135,10 @@ Own what a build may use and when it starts: memory admission and the memory que
 3. **If adopted:**
    - `scripts/lib/scratch.py`: `new()` (:182) makes a task-owned folder today; it does not clone and takes no repository. Add an explicit clone operation (repository, commit, destination) that sets the shared build folder for that repository. Name the exact command in the as-built.
    - `scripts/hooks/pre-tool-use-scratch-guard.py` steers a hand clone of a Rust repository into `/tmp` or a scratchpad to that clone operation.
-   - `scripts/style/style_sync.py` already shares one `style-sync-target` per repository (:330) and serializes checkout creation through cleanup. Change only what the shared-folder lifetime needs, and keep its lock.
+   - `scripts/style/style_sync.py` already shares one `style-sync-target` per repository (:332) and serializes checkout creation through cleanup. Change only what the shared-folder lifetime needs, and keep its lock.
    - **Shared-target identity.** One mapping from repository to its shared folder. The folder has one use stamp for all its clones, a lifetime that does not end with one scratch task, and Cargo's build-folder lock. `rebuild_causes()` today finds a workspace by the target's parent path; give it the mapping, so a removal of the shared folder names the repository.
-   - The disk sweeps treat the shared build folder as one target with its own last use. The lock boundary returns a typed result (`TargetLocksAcquired | TargetLockBusy`), not `tuple[list[int], str | None]`.
+   - The disk sweeps treat the shared build folder as one target with its own last use. `lock_trees()` (sweep.py :491) returns `TargetLocksAcquired | TargetLockBusy`, not `tuple[list[int], str | None]`.
+   - Deletions of the shared folder go through `reclaim()` and count only `ConfirmedDeletion` bytes (Phase 9). Artifacts that Cargo hard-links into a clone's own target folder free nothing while that clone is present; a test in `test_sweep.py` covers a shared folder whose artifacts are still linked from a clone.
 4. **Tests** for each changed module, in `scripts/lib/test_scratch.py`, `scripts/hooks/test_scratch_guard.py`, `scripts/style/test_style_sync.py` and `scripts/lint/test_sweep.py`: two clones on one target, a busy shared target, and rebuild attribution after its removal. The existing busy-skip and exhaustion tests stay as gates.
 5. **Docs.** The scratch as-built names the shared build folder and the guard's steer.
 
@@ -156,12 +157,12 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Acceptance gate:**
 - The trial numbers (crates compiled, wall time, lock wait) are in the phase report with the adopt decision.
-- If adopted: the tests of each changed module pass; `basedpyright` over each changed file reports `0 errors, 0 warnings, 0 notes`; 24 h after merge, the first-build cold-h of mktemp and scratch.py folders, next to the 7-day figures. `rebuilds` does not separate first builds (a workspace's first step has cause `none`), so compute it from the build-log records: the first recorded step of each new workspace folder. The removal records in `rebuilds` name the shared folder's repository.
+- If adopted: the tests of each changed module pass; `basedpyright` over each changed file reports `0 errors, 0 warnings, 0 notes`. Post-merge check, 24 h after the merge reaches main (as in Phase 12's ruling): the first-build cold-h of mktemp and scratch.py folders, next to the 7-day figures. `rebuilds` does not separate first builds (a workspace's first step has cause `none`), so compute it from the build-log records: the first recorded step of each new workspace folder. The removal records in `rebuilds` name the shared folder's repository. The phase report records when the check is due; the result goes in a follow-up notice.
 - The notice has an `also touches scripts/style/style_sync.py (owner natedev style-unit)` line, tested against `origin/natedev`.
-- Change-Review line: a new temp clone of hana builds only the crates that changed | in any Claude session on natedev, make a clone with `python3 ~/.claude/scripts/lib/scratch.py new hana` and build it twice in two clones | the second clone's build log step compiles under half the crates of the first.
+- Change-Review line: a new temp clone of hana builds only the crates that changed | in any Claude session on natedev, make two clones of hana at one commit with the scratch.py clone command that Spec 3 adds (its exact form is in the scratch as-built) and build each with `verify.sh build` | the second clone's build log step compiles under half the crates of the first.
 
 ### Phase 5 — Clone builds turn incremental mode off, and mend uses the compile cache  · status: todo
-**Depends on:** Phase 3
+**Depends on:** Phase 3; Phase 12 (`invoke.sh`).
 
 #### Work Order
 
@@ -169,11 +170,11 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 **Spec:**
 
-1. **Trial first.** Two hana clones at one commit. Build both with `CARGO_INCREMENTAL=0` and record sccache hits for workspace crates on the second (stats before and after). Find why mend clears `RUSTC_WRAPPER` (does `cargo mend` drive rustc itself?), and test mend with sccache in a clone.
-2. **Adopt rule.** Adopt each change only on a measured gain: workspace-crate hits on the second clone, or a shorter mend run with the same result. The baseline is dated after Phase 3 (`e3b8e391`), so a sweep gain is not counted as a cache gain. The trial is case E in verify-unit's build hold (showrunner, 2026-10-29).
+1. **Trial first.** Two hana clones at one commit. Build both with `CARGO_INCREMENTAL=0` and record sccache hits for workspace crates on the second (stats before and after). invoke.sh :578-579 says a cache hit suppresses the rustc diagnostics that mend reads. Test that claim: run mend twice with sccache in a clone, and compare the findings of the cached second run with a run that has `RUSTC_WRAPPER=`.
+2. **Adopt rule.** Adopt each change only on a measured gain: workspace-crate hits on the second clone, or a shorter mend run with the same mend findings. The baseline is dated after Phase 3 (`e3b8e391`), so a sweep gain is not counted as a cache gain. The trial is case E in verify-unit's build hold (showrunner, 2026-10-29).
 3. **If adopted:** `scripts/direct/verify.sh` sets `CARGO_INCREMENTAL=0` for builds in a temp clone (not in `~/rust` worktrees, where incremental helps); `scripts/lint/invoke.sh` runs mend with sccache.
 4. **sccache size and disk room.** Report the full cache and the disk numbers to natedev, which decides the cache size and the disk room as root.
-5. **Tests** in the verify-unit test modules that cover the changed lines.
+5. **Tests** in the new `scripts/direct/test_verify_clone_incremental.py` for the `verify.sh` lines, and in `scripts/lint/test_invoke_scope.py` (owner verify-unit) for the `invoke.sh` lines.
 
 **Files:**
 - `scripts/direct/verify.sh` — item 3 (owner verify-unit; trial-merge against `origin/natedev-verify` and `origin/natedev`).
@@ -190,64 +191,43 @@ Own what a build may use and when it starts: memory admission and the memory que
 - If adopted: the changed modules' tests pass; `basedpyright` over every changed Python file reports `0 errors, 0 warnings, 0 notes`; the notice has `also touches` lines for verify.sh and invoke.sh (owner verify-unit), tested against `origin/natedev-verify` and `origin/natedev`.
 - Change-Review line: temp-clone builds and mend runs reuse the compile cache | in a terminal on natedev, `sccache --show-stats` before and after a second clone's build | the Rust hit count rises by the workspace crates of the second build.
 
-### Phase 6 — A session can launch an app that is already built without waiting at the BRP launch gate  · status: todo
-**Depends on:** Phase 1
+### Phase 6 — The BRP launch gate keeps waiting for every launch; the bypass moves to Phase 13  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the user's words (2026-10-29): "add it to the queue to make it so that a session can bypass the hook if it knows the app is already built". The BRP launch gate (`scripts/hooks/pre-tool-use-brp-launch-gate.sh`) treats every launch as a build and waits for memory admission. A launch whose binary is already built and up to date skips the wait.
+- Showrunner ruling B, 2026-10-29 18:13 EDT: ship "every launch waits". There is no bypass and no build record. `scripts/direct/verify.sh` does not change.
+- Rounds 1–3 built a freshness check in the hook: a build record from `verify.sh`'s build step, dep-info times, flags and features. Pass 3 found four more edges: feature-name normalization, `env!` and env-dep variables, build-script rerun-if inputs, and a race when the record is published. An Astra design review found that a freshness copy in the hook can never be certain: the hook's environment is not the environment of the MCP server whose cargo BRP runs.
+- Result: no code change. The hook stays as Phase 1 left it: every `mcp__brp__brp_launch` call runs the build-hold check (`check-local`) and then `buildlog_wait_for_memory`. The Phase 1 fake memory readings and tripwire tests stay. The bypass diff stays in the run folder (`phases/6/bypass_round3.patch`) for Phase 13.
 
-**Spec:**
+**Files:** none changed.
 
-1. **The hook decides from facts, not a claim.** For a `brp_launch_bevy_app` or `brp_launch_bevy_example` call, the hook finds the target's binary for the exact launch target and profile, and decides freshness without starting a compiler. `cargo build --offline` is still a build and is not allowed (Phase 3 architect review, F5): compare the binary's mtime with the newest input the fingerprint names. A fresh binary skips memory admission; a stale, missing or uncertain one keeps the current wait. The hook's build-hold check stays as it is.
-2. **A session can also say so.** A launch call whose session set `BRP_LAUNCH_PREBUILT=1` (or the tool's own flag, if the BRP tool has one) skips admission only when item 1 confirms the binary is fresh; a stale binary still waits, and the hook prints why.
-3. **Tests** in `scripts/hooks/test_brp_launch_gate.py`: fresh binary skips the wait; stale, missing and uncertain binaries wait and start no compiler; the session flag with a stale binary waits; fake memory readings throughout (Phase 1 helper).
+**Binds later work:** Phase 13 adds the bypass only through a bevy_brp prebuilt-only launch mode. A freshness check in the hook and a build record are ruled out.
 
-**Files:**
-- `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — items 1–2.
-- `scripts/hooks/test_brp_launch_gate.py` — item 3.
-- `docs/as-built/build-memory-admission.md` — the hook section. Phases 2 and 10 also edit this doc; the writer puts the section in the phase folder (`as_built_section.md`) and the director places it.
-
-**Workers:** `1 writer + 1 tester`
-- `impl` — items 1–2 and the doc section.
-- `test` — item 3.
-
-**Acceptance gate:**
-- `test_brp_launch_gate.py` passes; the hook's added checks take under 1 s on a fresh hana binary.
-- Change-Review line: launching an already-built Bevy app through BRP starts at once | in a Claude session on natedev with a built hana, launch it with the BRP launch tool | it starts without a `waiting for memory` line.
-
-### Phase 7 — A one-line command summarizes the machine's working set, and the disk-floor sweep uses less memory  · status: todo
+### Phase 7 — A one-line command summarizes the machine's working set, and the disk-floor sweep uses less memory  · status: done
 **Depends on:** Phase 3
 
-#### Work Order
+#### As-built
 
-**Goal:** the user's words (2026-10-29): "investigate why we use 12 GiB of running python helpers - we have to reduce our working set - more generally you should provide a quick way for me to summarize our working set by categorize that i can run from a simple shell command anytime". The survey (2026-10-29 10:50 EDT) found the causes; the style_plan cache, loss_census90 and codex_mesh follow findings went to the showrunner to route to their owners. This phase adds the summary command and cuts this unit's own share: the disk-floor sweep's 1.3–3.9 GB peak (`scripts/lint/tmp_sweep.py` :527–543, :1157).
-
-**Spec:**
-
-1. **`working-set` command.** A script in this unit's files (`scripts/build_targets/working_set.py`, with a shell name on PATH through the existing command wrappers) that prints, in under 2 s: memory by category (cargo/rustc, Claude sessions, Codex, Python helpers by script, other), resident PSS and swap for each, the top processes per category, and the machine totals (available, swap used). It reads `/proc` and one owner table kept in the script, and writes nothing. Its categories come from one table in the script. A process whose readings are gone or refused is counted as unavailable, not dropped.
-2. **Python helpers grouped by script and owner.** The Python row breaks down by script path and names the owning unit from the production docs' Owns cells.
-3. **The sweep's peak.** `tmp_sweep.py` stops holding the whole scan in memory at :527–543 and :1157 (stream the entries, keep only what the decision needs). The peak during a sweep falls under 300 MB, measured with `/usr/bin/time -v` on a dry run (`tmp_sweep.py --dry-run`) over the live `/tmp`, with a baseline taken after `e3b8e391`. This is `tmp_sweep.py`, not `sweep.py`, whose four scans Phase 3 added. Hard-link accounting, retention and keep-on-unavailable-evidence stay. The process-use boundary returns `ProcessUsesKnown | ProcessUsesUnavailable`, not `list[...] | None`.
-4. **Tests** for the categories table on a fixture `/proc` tree, and the sweep's existing tests still pass.
+- `scripts/build_targets/working_set.py` prints memory by category from `/proc`: cargo/rustc, Claude sessions, Codex, Python helpers and other. The Python row breaks down by script path and names the owning unit. Each row gives PSS, swap and its top three processes. The machine totals are total, available and swap used. The script writes nothing. A process that is unreadable or that exited is counted on its own line.
+- Owner rules come from `scripts/build_targets/working_set_owners.json`, generated from the production docs' Owns cells (73 rules, 13 units at checkpoint). `load_owners` validates the file; a bad file exits 1 and names the file. The rules are not in the script, because the push-text gate read an owner tuple that named `pushover.py` as a phone send.
+- Argv parsing finds the entry point past interpreter options, Node runtime options included. `node --redirect-warnings` is a known gap (follow-up add-on).
+- `scripts/lint/tmp_sweep.py` streams its scan. The process-use boundary returns `ProcessUsesKnown | ProcessUsesUnavailable`. `scripts/lint/folder_audit.py` uses the same types.
+- Measured on natedev 2026-10-29: `working_set.py` ran in 1.25 s, and its available and swap totals matched `free -m`. `tmp_sweep.py --dry-run` over the live `/tmp` peaked at 36 MB (was 1.3–3.9 GB).
+- The `working-set` PATH wrapper is natedev's change in `/etc/nixos/modules/common/agents.nix`, after this reaches main.
 
 **Files:**
-- `scripts/build_targets/working_set.py` — new — items 1–2.
-- `scripts/build_targets/test_working_set.py` — new — item 4.
-- `scripts/lint/tmp_sweep.py` — item 3.
-- `scripts/lint/test_tmp_sweep.py` — item 4.
+- `scripts/build_targets/working_set.py` — new — the category table, the owner lookup and the argv parsing.
+- `scripts/build_targets/test_working_set.py` — new — tests on a fixture `/proc` tree, owner file checks and argv forms.
+- `scripts/build_targets/working_set_owners.json` — new — the owner rules generated from the production docs' Owns cells.
+- `scripts/lint/tmp_sweep.py` — the streamed scan and the typed process-use result.
+- `scripts/lint/test_tmp_sweep.py` — tests for the streamed scan and both process-use results.
+- `scripts/lint/folder_audit.py` — the same process-use types; an unavailable process scan keeps a due folder.
+- `scripts/lint/test_folder_audit.py` — tests for a known empty and an unavailable process-use result, a kept due folder and the lsof fallback.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — items 1–3.
-- `test` — item 4.
-
-**Acceptance gate:**
-- `working-set` prints the table in under 2 s on natedev, and its machine totals (available, swap used) agree with `free -m` within 5%. Summed process PSS is a different quantity and is not compared.
-- The PATH wrapper is in `/etc/nixos/modules/common/agents.nix` (natedev's file; the director routes it).
-- A sweep run's max resident size is under 300 MB.
-- Change-Review line: one command prints the machine's memory by category | in a terminal on natedev, type `working-set` | a table of cargo, Claude, Codex, Python by script, and other, with PSS and swap per row.
+**Binds later work:** A new script whose owner must show in the table needs an Owns entry in its production doc. Regenerate `working_set_owners.json` from the production docs after an Owns cell changes.
 
 ### Phase 8 — Shared build state is written only by the installed copy  · status: todo
-**Depends on:** Phase 2; Phase 5 (`verify.sh`, `invoke.sh`); Phases 10, 12 and 11 (`memory_admit.py`, its tests and doc); report-unit's bare-step writer in `waiter_identity` merged into builds
+**Depends on:** Phase 2; Phase 5 (`verify.sh`, `invoke.sh`); Phases 10, 12 and 11 (`memory_admit.py`, its tests and doc); report-unit's bare-step writer in `waiter_identity` (merged at HEAD 64a94048)
 
 **Approved:** showrunner 2026-10-29, after Phase 2. report-unit keeps its bare-step writer (it fixes the cause in main) and drops only its read-side strip; this phase builds the repository field on report-unit's merge. The edit to `builds-production.md:14` is approved.
 
@@ -256,9 +236,9 @@ Own what a build may use and when it starts: memory admission and the memory que
 **Goal:** the showrunner's ruling (2026-10-29 13:15, on the user's word that the current state is a bad design): shared coordination code (memory gate, queue rows, holds) writes shared state from one installed copy, `~/.claude` main. Every caller runs that copy, never its own checkout's. Tests keep their fakes. Queue rows carry the repository and the step as separate fields.
 
 Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/buildlog/admission`):
-- All 19 live `.waiting` rows carry the combined label ("hana clippy"). Main's own `memory_admit.py` writes it (`:1066` `waiter_identity`, `"step": f"{repo} {step}"`, rewritten on each held poll at `:1037`). The 13 `.reservation` rows already keep `repo` and `step` apart. So the old format is main's writer, not an old copy.
+- All 19 live `.waiting` rows carry the combined label ("hana clippy"). Main's own `memory_admit.py` writes it (`waiter_identity`, `"step": f"{repo} {step}"`, rewritten by the held-poll write in `check`). The 13 `.reservation` rows already keep `repo` and `step` apart. So the old format is main's writer, not an old copy.
 - The read-side prefix strip is not in main. It is an uncommitted change in report-unit's worktree (`scripts/lint/memory_admit.py` :1126–1128 strip, :1068–1071 bare-step writer).
-- Checkout copies that run today: `verify.sh`'s relative lookups of `override_guard.sh` (:212), `local_release_wait.py` (:230, loads `scripts.build_hold` from its own tree), `mesh_runs.py` (:983), `mac_idle.py` (:1324, writes Mac-idle markers) and the `build_targets` fallback (:228); `memory_gate.sh:26` names `memory_admit.py` beside itself with no override; `merge_gate.py:52,59` imports `build_hold` from the copy that runs (it reads holds only); `scripts/message/top_level.py:80` and `scripts/production/retire_unit.py:75-79` write holds through the copy that runs. One live checkout `verify.sh` (claude-build-followups-verify, real `HOME`, no fake dirs) held a queue row at 13:20.
+- Checkout copies that run today: `verify.sh`'s relative lookups in the `override_guard.sh` source line, `LOCAL_RELEASE_WAIT_SCRIPT` (`local_release_wait.py`, loads `scripts.build_hold` from its own tree), `MESH_RUNS_SCRIPT` (`mesh_runs.py`), `MAC_IDLE_SCRIPT` (`mac_idle.py`, writes Mac-idle markers) and the `BUILD_TARGETS_SCRIPT` fallback; `memory_gate.sh:26` names `memory_admit.py` beside itself with no override; `merge_gate.py:52,59` imports `build_hold` from the copy that runs (it reads holds only); `scripts/message/top_level.py:80` and `scripts/production/retire_unit.py:75-79` write holds through the copy that runs. One live checkout `verify.sh` (claude-build-followups-verify, real `HOME`, no fake dirs) held a queue row at 13:20.
 - Already main by registration: the BRP launch hook, the build-hold hook, the `cargo` wrapper, `/build:queue`.
 
 **Spec:**
@@ -268,7 +248,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 3. **Callers run the installed copy.**
    - `memory_gate.sh`: `BUILDLOG_MEM_ADMIT_SCRIPT="${BUILDLOG_MEM_ADMIT_SCRIPT:-$HOME/.claude/scripts/lint/memory_admit.py}"`. `invoke.sh:89` sources `$HOME/.claude/scripts/lint/memory_gate.sh`.
    - `verify.sh`: one root, `SCRIPTS="$HOME/.claude/scripts"`, for `override_guard.sh`, `local_release_wait.py`, `mesh_runs.py`, `mac_idle.py` and the `build_targets` fallback. Tests fake `HOME` with a copied tree already; the `VERIFY_*_SCRIPT` overrides stay.
-   - `merge_gate.py`: imports `build_hold` from `Path.home() / ".claude"`.
+   - `merge_gate.py` reads holds only and already runs from `~/.claude` main (Delegation Context, Test). No change. The notice records this.
    - `top_level.py`, `retire_unit.py`: the `build_hold.py` path from `Path.home() / ".claude"`.
 4. **The plan lines that teach a checkout run** (`docs/plans/builds-production.md:14`, `docs/plans/build-followups-worker-seats.md:48`) name `~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --checkout <tree>`.
 5. **Tests:** `scripts/build_hold/override_guard.py` already finds the real home through the account database and refuses fake state variables when the installed script runs. Keep that refusal. Routing tests copy scripts under a fake home; the checkout-write refusal is tested against an injected canonical-home and state fixture, never real coordination state. A checkout-copy `memory_admit.py` against the real-dir path refuses (exit 2, named reason) and against a fake dir writes; same for `build_hold.py`; a `.waiting` row has `repository` and a bare `step`; the queue view shows both; `verify.sh` and `memory_gate.sh` resolve to `$HOME/.claude/scripts` under a fake `HOME`. Fake memory readings throughout (Phase 1 helper).
@@ -278,7 +258,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 - `scripts/build_hold/build_hold.py`, `scripts/build_hold/test_build_hold.py` — items 1, 5.
 - `scripts/build_queue/build_queue.py`, `scripts/build_queue/test_build_queue.py` — item 2 (owner report-unit).
 - `scripts/direct/verify.sh`, `scripts/lint/invoke.sh` — item 3 (owner verify-unit). The tests that cover the changed lines are named here at phase start, from a grep of each path.
-- `scripts/production/merge_gate.py` — item 3 (owner natedev showrunner).
+- `scripts/production/merge_gate.py` — no change (item 3); the notice records why.
 - `scripts/message/top_level.py`, `scripts/production/retire_unit.py` — item 3 (owners per natedev's Owners table, named in the notice).
 - `docs/plans/builds-production.md`, `docs/plans/build-followups-worker-seats.md` — item 4.
 - `docs/as-built/build-memory-admission.md` — the one-copy rule and the row fields.
@@ -290,30 +270,24 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 **Acceptance gate:**
 - The changed modules' tests pass; `basedpyright` over every changed Python file reports `0 errors, 0 warnings, 0 notes`.
 - Live, after install: every `.waiting` row in `~/.local/state/buildlog/admission` has `repository` and a bare `step` within one held poll; a run of a checkout copy's `memory_admit.py` against the real dir exits 2 with the named refusal.
-- The notice has `also touches` lines for verify.sh and invoke.sh (verify-unit, against `origin/natedev-verify` and `origin/natedev`), merge_gate.py and the hold callers (their owners, against `origin/natedev`), and build_queue.py (report-unit, against `origin/builds-report`); it confirms no read-side prefix strip remains in `memory_admit.py` or `build_queue.py`.
+- The notice has `also touches` lines for verify.sh and invoke.sh (verify-unit, against `origin/natedev-verify` and `origin/natedev`), the hold callers (their owners, against `origin/natedev`), and build_queue.py (report-unit, against `origin/builds-report`); it confirms no read-side prefix strip remains in `memory_admit.py` or `build_queue.py`.
 - Change-Review line: `/build:queue` shows the repository and the step in separate columns | in a Claude session on natedev while a build waits, type `/build:queue` | each row shows e.g. `hana` and `clippy` apart, and no row reads "hana clippy".
 
-### Phase 9 — The floor sweep counts what a deletion really frees  · status: todo
-**Depends on:** Phase 3
+### Phase 9 — The floor sweep counts what a deletion really frees  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the floor sweep stops only when its deletions have covered the shortfall. Moved from Phase 3 by the hard-landing rule (closure review pass 3, 2026-10-29): it is new in repair round 3, it is not a regression that Phase 3 caused (the old locked pass had the same gap, because `ln` takes no cargo lock), it breaks nothing that worked, and no test fails. Its effect is small: one pass stops short, and the next step's sweep reads free space again.
-
-**Spec:**
-
-1. `scripts/lint/sweep.py`: `shrink_floor()` calls `freed_by()` after `remove()` has deleted the paths, but budget selection calls it before deletion through `choose()`. Separate the two: a typed reclamation estimate (before deletion, from the scan) and a confirmed deletion account (from link counts read with `lstat` just before each unlink). A file's blocks count as freed only when no other link remains. Links that the same pass removed earlier still count as removed, so the pass does not reject its own unlinks. Both callers use the same two types.
-2. Tests: after the scan, add a hard link from outside the target to one output file; the pass does not count that file's blocks and takes the next candidate until the shortfall is covered. Also: links removed earlier in the pass, a failed removal, and a dry run, through both callers. When no candidate covers the shortfall, the existing exhaustion alert still goes out; the busy-skip and exhaustion tests stay as gates.
+- `scripts/lint/sweep.py` keeps two typed counts apart. `ReclamationEstimate(bytes)` comes from the scan's link counts: `freed_by()` returns it, before any deletion. `ConfirmedDeletion(bytes, failures)` comes from the deletion: `remove()` returns it, summed from each unlink.
+- `remove_entry_at()` reads `os.lstat` just before each unlink. A file's blocks (`st_blocks * 512`) count as freed only when `st_nlink` is 1, so a file with a link outside the target frees nothing. A link that the same pass removed earlier has already lowered the count, so the last link still counts as freed. A failed or partial removal credits only the files it removed.
+- `reclaim(group, scan, remaining, dry_run)` returns the estimate on a dry run and the confirmed account on a real run. Both callers, `shrink()` (orphans and the budget pass) and `shrink_floor()`, use it and the same two types. A dry run deletes nothing and records nothing.
+- `choose()` is gone. `shrink()` and `shrink_floor()` take the next candidate in removal order and subtract the confirmed bytes, until the account covers the shortfall. When no candidate covers it, the exhaustion alert still goes out.
+- `remove_entry()` opens the parent with `O_DIRECTORY | O_NOFOLLOW`. The recursive delete walks with directory fds and checks each directory's identity with `os.path.samestat` before it opens it and again before `rmdir`. A path replaced by a symlink during the pass is not followed and not credited.
 
 **Files:**
-- `scripts/lint/sweep.py` — item 1.
-- `scripts/lint/test_sweep.py` — item 2.
+- `scripts/lint/sweep.py` — the two types, `reclaim`, `remove_entry`, `remove_entry_at`, and the loops in `shrink` and `shrink_floor`.
+- `scripts/lint/test_sweep.py` — tests for an outside link added after the scan, an earlier unlink in the same pass, a failed and a partial removal, the dry run, a directory swapped for a symlink, and the exhaustion alert when an outside link leaves the floor short.
 
-**Workers:** `1 writer`
-
-**Acceptance gate:**
-- `test_sweep.py` passes; `basedpyright` over both files reports `0 errors, 0 warnings, 0 notes`.
-- Change-Review line: the floor sweep stops only after it frees the shortfall | run the sweep tests: `python3 -m unittest discover -s scripts/lint -p test_sweep.py` | the outside-link test passes, and the pass takes the next candidate.
+**Binds later work:** Phase 4 extends this sweep; its deletions go through `reclaim` and credit only `ConfirmedDeletion` bytes. A new caller of the sweep uses the same two types and does not count from the scan on a real run.
 
 ### Phase 10 — Memory admission names the reservation a waiting step waits on  · status: done
 
@@ -334,7 +308,7 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 **Gotchas:** Releasing a measured reservation frees only its resident bytes. Its swap bytes stay part of the build charge but do not count as freed RAM.
 
 ### Phase 11 — Memory admission promises what each repository's steps really use  · status: todo
-**Depends on:** Phase 10 and Phase 12 (same file, `memory_admit.py`)
+**Depends on:** Phase 10 and Phase 12 (same file, `memory_admit.py`); verify-unit's Phase 4 (branch `natedev-verify-memory`). Start after that merge reaches `origin/builds`, and merge `origin/builds` first.
 
 **Approved:** showrunner 2026-10-29 (ETA 22:00 EDT, after Phase 12), from the widget wait study (07:09–11:43 EDT): a measured floor per repository for filtered test runs, and the promises that are 3x or more too high.
 
@@ -349,11 +323,11 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 
 **Spec:**
 
-1. Replay first: for every step in the 14-day history, compute the promise that today's `expected_peak` gives from the history before that step, and compare it to the step's measured anon peak. Report, per repository and step, the count of promises under half the measured peak and over 3x the measured peak. Save the table in the as-built doc. The replay runs again on the result: neither count rises for any repository, and each count falls in total.
+1. Replay first: for every step in the 14-day history, compute the promise that today's `expected_peak` gives from the history before that step, and compare it to the step's measured anon peak. Report, per repository and step, the count of promises under half the measured peak and over 3x the measured peak. Fresh runs and compile runs (Spec 4's rule) are separate rows. Save the table in the as-built doc. The replay runs again on the result: neither count rises for any repository, and each count falls in total.
 2. `expected_peak` (`scripts/lint/memory_admit.py`): when a repository has 5 or more keyed rows, use only keyed rows; old unkeyed rows count only when keyed rows are fewer than 5.
 3. A repository with 1 to 4 own runs does not take the all-repository pool p90. Use the largest of its own runs, or the pool when that is lower. A repository with no own runs keeps today's rule.
-4. Filtered runs: replace the single `FILTERED_FLOOR` with a floor per repository, from that repository's measured filtered runs that compiled (check or build work in the same step). Keep 1 GiB as the floor for a repository with no such runs. `expected_peak()` returns `min(filtered, full)` today, so a floor above the full-run estimate would not hold: the floor wins over that minimum, and a test covers a floor above the full estimate; the replay includes that case (Phase 3 architect review, F11). Comment each new constant with the measurement that set it, as the current constants are.
-5. Tests in `scripts/lint/test_memory_admit.py`: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; the per-repository filtered floor; each test fakes both memory readings.
+4. A promise does not mix compile runs and no-compile runs (showrunner 2026-10-29 17:11 EDT, from the user's rule). Spec 4 applies to every step. A history row is a compile run when its index step (anon rows: joined by `call_id` and step name to `steps.call_id` and `steps.step`; index rows: their own column) has `crates_compiled > 0`. A row with no match counts as neither. The step being admitted is a compile run unless verify Phase 4's `is_fresh_test` proves it fresh. A compile run's promise comes only from earlier compile runs; for a filtered run the order is the same as `filtered_peak` today: the exact filter set, then the package's filtered runs, then the check/build peaks. The 1 GiB floor stays only for fresh runs and for a repository with no compile history; do not raise the fresh floor. Fresh runs keep verify Phase 4's `fresh_test_peak` unchanged. `expected_peak()` returns `min(filtered, full)` today, so a compile-run promise above the full-run estimate would not hold: the compile-run promise wins over that minimum, and a test covers a promise above the full estimate; the replay includes that case (Phase 3 architect review, F11). Comment each new constant with the measurement that set it, as the current constants are.
+5. Tests in `scripts/lint/test_memory_admit.py`: keyed rows win over unkeyed rows; 1–4 own runs do not take the pool; a compile run's promise uses only compile runs; an anon row with no `call_id` and step match counts as neither; a fresh run keeps the `fresh_test_peak` promise; each test fakes both memory readings.
 6. Docs: `docs/as-built/build-memory-admission.md` gets the replay table before and after, and the new rules. The replay script lives in the session folder and is not committed.
 
 **Files:**
@@ -366,12 +340,14 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 **Acceptance gate:**
 - The memory admission tests pass; `basedpyright` over both Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
 - The replay after the change: neither count rises for any repository, and each count falls in total. The before and after table goes in the checkpoint notice.
-- Change-Review line: memory promises match each repository's real use | on natedev run `cargo clippy` in `~/rust/cargo-liner` and read its reservation in `~/.local/state/buildlog/admission` | its `need` is near 1.9 GiB, not 3.0 GiB.
+- Change-Review line: memory promises match each repository's real use | on natedev run `cargo clippy` in `~/rust/cargo-liner` and read its reservation in `~/.local/state/buildlog/admission` | its `need` is near the compile-only keyed p90 that the replay measures (the phase report gives the figure), not 3.0 GiB.
 
-### Phase 12 — Memory admission counts host swap, sccache compiles and each step's peak  · status: todo
+### Phase 12 — Memory admission counts host swap, sccache compiles and each step's peak  · status: done
 **Depends on:** Phase 10 (same file, `memory_admit.py`). Runs before Phase 11.
 
 **Approved:** showrunner 2026-10-29 14:58 EDT, as proposed after the 14:48 and 14:51 EDT freezes; ETA 19:00 EDT, right after the Phase 10 checkpoint. The showrunner kept `RAMP_SECONDS` at 120 for now: herdr is fixing the swapped herdr server, which was the main cause. If a freeze happens after herdr reports its fix, the director makes `RAMP_SECONDS = 600` as a small fix checkpoint on this branch and sends the notice.
+
+**Ruling:** showrunner 2026-10-29 17:56 EDT: ship the peak charge as built. Check 3 h after the merge reaches main (before 00:05 EDT). If the median admission wait is more than 2x the 10:00–14:00 EDT baseline, or any step waits over 30 min while measured build anon is under budget, send the peak-decay patch as a small checkpoint: the peak decays after N = 25 min below it (N from the measured hana nextest wave gaps, max 954 s).
 
 #### Work Order
 
@@ -386,22 +362,60 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 
 **Spec:**
 
-1. **Charge the peak.** A running step is charged the largest of: its ramp promise while inside `RAMP_SECONDS`, its current memory (`tree_memory`), and its observed peak (the step's `.max` file). Never only its current RSS.
-2. **Charge sccache.** Read the anon of `builds.slice/sccache.service` (`memory.stat`) and add it to the build charge as its own running entry, so compile memory counts once. A missing or unreadable file adds nothing and does not fail the check.
+1. **Charge the peak.** A running step is charged the largest of: its ramp promise while inside `RAMP_SECONDS`, its current memory (`tree_memory`), and its observed peak (the step's `.max` file). Never only its current RSS. In the blocker lookup, a release still frees only the step's current resident bytes, not its peak charge.
+2. **Charge sccache.** Read the anon of `builds.slice/sccache.service` (`memory.stat`) and add it to the build charge once, so compile memory counts once. A missing or unreadable file adds nothing and does not fail the check. The sccache charge is not a reservation: it is not added to `running` beside `reservations`, it is never a blocker candidate, and `blocker` never names it. A test covers `blocker` with a sccache charge present.
 3. **Read host swap and "some" pressure.** `read_meminfo` also reads `SwapTotal` and `SwapFree`; `read_pressure` also reads the "some" line. Hold when swap used is over 85% and "some" avg10 is over 25%. Lower the "full" trigger from avg10 > 10 to > 5. Each new constant has a comment with the measurement that set it, as the current constants do. The hold result names the reading that caused it.
-4. **Space the starts after a hold.** After a pressure hold ends, admit at most one step every 30 s.
+4. **Space the starts after a hold.** After a pressure hold ends, admit at most one step every 30 s. A spacing hold gives `blocker` `{}`, as a pressure hold does.
 5. **Tests** in `scripts/lint/test_memory_admit.py`, each with faked readings (`memory_test_support.py`, with swap lines and a "some" line added to the fake files if the helper does not write them): a step past the ramp whose RSS dropped is charged its peak; sccache anon raises the charge, and a missing sccache file does not; swap over 85% with "some" over 25% holds and either alone does not; "full" avg10 6 holds; two waiters after a hold ends start 30 s apart. A replay of 14:47:12–54 EDT from the freeze study's readings holds all four steps.
-6. **Docs:** `docs/as-built/build-memory-admission.md` names the new charge, the swap and "some" holds, and the start spacing. The writer puts the section in the phase folder (`as_built_section.md`) if Phase 2 is not yet committed; the director places it.
+6. **Docs:** `docs/as-built/build-memory-admission.md` names the new charge, the swap and "some" holds, and the start spacing. The writer puts the section in the phase folder (`as_built_section.md`) while another phase has uncommitted edits to the doc; the director places it.
 
 **Files:**
 - `scripts/lint/memory_admit.py` — items 1–4.
 - `scripts/lint/test_memory_admit.py` — item 5.
 - `scripts/lint/memory_test_support.py` — item 5, only if the fake files need swap and "some" lines.
 - `docs/as-built/build-memory-admission.md` — item 6.
+- `scripts/build_queue/test_build_queue.py` — a private `BUILDLOG_BUILDS_CGROUP` fixture only (owner report-unit).
+- `scripts/lint/invoke.sh` — the sampler's atomic `.max` write only (owner verify-unit).
 
 **Workers:** `1 writer`
 
 **Acceptance gate:**
 - The memory admission tests pass; `basedpyright` over every changed Python file reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
 - The 14:47 replay holds all four steps. The notice gives the wait cost: how much longer a step would have waited on 2026-10-29 10:00–14:00 EDT, from the same replay over that window.
-- Change-Review line: memory admission waits when swap is nearly full | on natedev while swap is over 85% full and PSI "some" avg10 is over 25%, run `cargo clippy` in `~/rust/cargo-liner` | it waits for memory, and its wait line names swap.
+- Assertion-Change lines: these two lines go in the checkpoint commit message, word for word:
+  - `Assertion-Change: scripts/lint/test_memory_admit.py::test_full_memory_stall_holds_only_above_ten — Spec 3 lowers the full avg10 limit from 10 to 5; the test is renamed test_full_memory_stall_holds_only_above_five and its boundary cases move with it (4, 5 admit; 6 holds)`
+  - `Assertion-Change: scripts/lint/test_memory_admit.py::test_default_pressure_still_returns_pressure_when_tripwire_is_unset_or_empty — the default path's read is faked, because tests never read the live /proc/pressure/memory (as-built Invariants); the assertion is unchanged`
+- The notice has `also touches` lines for scripts/lint/invoke.sh (verify-unit, tested against origin/natedev-verify and origin/natedev) and scripts/build_queue/test_build_queue.py (report-unit, tested against origin/builds-report). `bash -n scripts/lint/invoke.sh` passes.
+- Change-Review line: memory admission waits when swap is nearly full | in a terminal on natedev, run `cargo clippy` in `~/rust/cargo-liner` with `BUILDLOG_MEMINFO` and `BUILDLOG_MEMORY_PRESSURE` pointing at files with SwapFree under 15% of SwapTotal and `some avg10=30.00` | it waits for memory, and its wait line names swap.
+
+### Phase 13 — A session can launch an app that is already built without waiting at the BRP launch gate  · status: todo
+**Depends on:** Phase 6, and a bevy_brp prebuilt-only launch mode (repository `~/rust/bevy_brp`, outside this production; the showrunner takes it to the user). This phase does not start until that mode is on bevy_brp's main and installed as `~/.cargo/bin/bevy_brp_mcp`.
+
+#### Work Order
+
+**Goal:** the user's words (2026-10-29): "add it to the queue to make it so that a session can bypass the hook if it knows the app is already built". The BRP launch gate (`scripts/hooks/pre-tool-use-brp-launch-gate.sh`) treats every launch as a build and waits for memory admission. A launch that asks bevy_brp to run only a binary that is already built skips the wait.
+
+**The launch tool today (read 2026-10-29):**
+- One tool, `brp_launch` (`mcp/src/tool/name.rs:452`), launches apps and examples. `settings.json` registers the hook on matcher `mcp__brp__brp_launch`, and `test_brp_launch_gate.py` sends that `tool_name`. `tool_input` has `target_name`, `profile`, `path`, `package_name`, `port`, `instance_count`, `env`, `search_order` and `args`.
+- An app already skips cargo when bevy_brp's own freshness check says Fresh. An example always builds. Cargo is called at `launch/build.rs:177`.
+- The smallest prebuilt-only mode is a `prebuilt: bool` parameter that skips `ensure_built` at `orchestration.rs:215`. In that mode, a missing binary should return `tool_call_failed_with_details`.
+
+**Spec:**
+
+1. **The parameter decides.** The hook skips memory admission only for a `mcp__brp__brp_launch` call whose `tool_input` sets the prebuilt-only parameter (use the name bevy_brp ships). Every other launch waits as today. The build-hold check stays first for every launch. The hook reads only `tool_input`: a session cannot set an environment variable for the hook, because the hook inherits Claude Code's environment from session start. Read stdin once. Parse `session_id` and `tool_input.<param>` from that one read. Skip admission only when the value is JSON `true`. A missing, non-boolean or unparseable value waits, as today. A parse failure still leaves `session_id` empty.
+2. **No freshness check in the hook and no build record.** Phase 6 showed that they cannot be certain.
+3. **Tests** in `scripts/hooks/test_brp_launch_gate.py`: a prebuilt call skips admission; a call without the parameter waits; a build hold still refuses a prebuilt call; fake memory readings throughout (Phase 1 helper). The suite stays at 55 s or less.
+4. **Docs.** `docs/as-built/build-memory-admission.md` gets the as-built text in its hook section.
+
+**Files:**
+- `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — items 1–2.
+- `scripts/hooks/test_brp_launch_gate.py` — item 3.
+- `docs/as-built/build-memory-admission.md` — item 4. The writer puts the section in the phase folder (`as_built_section.md`) while another phase has uncommitted edits to the doc; the director places it.
+
+**Workers:** `1 writer`
+- `impl` — items 1–4.
+
+**Acceptance gate:**
+- `test_brp_launch_gate.py` passes in 55 s or less; `basedpyright` over it reports `0 errors, 0 warnings, 0 notes`; `bash -n` passes on the hook.
+- Live on natedev with a built hana: pipe the hook JSON of a prebuilt launch into the installed hook with `BUILDLOG_MEMINFO` pointing at a file with MemAvailable under the threshold. It exits 0 at once with no deny and no `waiting for memory` line. The same JSON without the parameter prints `waiting for memory` (run it under `timeout 10`).
+- Change-Review line: launching an already-built Bevy app through BRP with the prebuilt option starts at once | in a Claude session on natedev with a built hana, launch it with the BRP launch tool and its prebuilt option | the launch returns at once while another build holds memory.

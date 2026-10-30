@@ -32,6 +32,35 @@ TEST_HANG_GUARD_SECS = 300
 
 @final
 class StyleLedgerRecordsTests(LedgerTestCase):
+    def test_metadata_only_rule_edit_accepts_pin_and_keeps_cell_current_but_body_edit_does_not(self) -> None:
+        rule_id = self.rule("metadata")
+        path = self.rule_dir / "metadata.md"
+        _ = subprocess.run(["git", "init", "-q", str(self.rule_dir.parent)], check=True)
+        _ = subprocess.run(["git", "-C", str(self.rule_dir.parent), "hash-object", "-w", str(path)], check=True,
+                           capture_output=True)
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip)
+            old = self.blob(rule_id)
+            ledger.ticket_add("read-1", "read", "read", "names", "crates/alpha", [self.sources[0]], [rule_id])
+            ledger.record(rule_id, self.sources[0], self.initial_tip, old, "clean", ticket="read-1", worker="old")
+            _ = path.write_text(path.read_text().replace("input_scope: file", "input_scope: file\napproval: always"))
+            current = self.blob(rule_id)
+            with self.ledger() as refreshed:
+                self.assertTrue(any(cell.path == self.sources[0] and cell.state == "current"
+                                    for cell in refreshed.cells(rule_id)))
+            try:
+                ledger.record(rule_id, self.sources[0], self.initial_tip, current, "clean", ticket="read-1", worker="new")
+            except style_ledger.LedgerError as error:
+                self.fail(f"metadata-only pin must remain valid: {error}")
+            self.assertEqual(ledger._judgments(rule_id, self.sources[0])[0].rule_blob, current)  # pyright: ignore[reportPrivateUsage]
+            with self.ledger() as refreshed:
+                state = tuple(refreshed.cells())
+                self.assertTrue(any(cell.rule == rule_id and cell.path == self.sources[0] and cell.state == "current"
+                                    for cell in state))
+            _ = path.write_text(path.read_text() + "Changed body\n")
+            with self.assertRaisesRegex(style_ledger.LedgerError, "differs from ticket pin"):
+                ledger.record(rule_id, self.sources[0], self.initial_tip, self.blob(rule_id), "clean", ticket="read-1", worker="body")
+
     def test_refill_lock_blocks_another_worktree_until_the_body_exits(self) -> None:
         worktree = self.root / "other-checkout"
         _ = self.git("worktree", "add", "-q", "-b", "other", str(worktree))

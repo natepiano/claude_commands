@@ -101,7 +101,8 @@ class PaneRestoreTests(unittest.TestCase):
     def records(self) -> list[dict[str, dict[str, str]]]:
         return [{"session": {"session_id": session_id}} for session_id in self.owned]
 
-    def open_tab(self, name: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
+    def open_tab(self, name: str, space: str, title: str, cwd: str, environment: dict[str, str], *, label: str = "") -> str:
+        del label
         self.opened.append((name, space, title, cwd, environment))
         return "w1:p3"
 
