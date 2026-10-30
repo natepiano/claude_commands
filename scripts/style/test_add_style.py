@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import json
 import os
 import shlex
@@ -584,10 +586,7 @@ class AddStyleTests(unittest.TestCase):
         )
         before = self.git("status", "--porcelain", "--untracked-files=all"), self.git("show-ref"), self.doc.read_text()
         agent_config = self.root / "agents.conf"
-        _ = agent_config.write_text(
-            "[assignments]\nproduction=claude\n\n[production.claude]\ndirector=opus:xhigh\n\n"
-            + "[claude.agents]\nopus=low,medium,high,xhigh\n",
-        )
+        _ = write_registry(agent_config, {'assignments': {'production': 'claude'}, 'production.claude': {'director': 'opus:xhigh'}, 'claude.agents': {'opus': 'low,medium,high,xhigh'}})
         catalog_sync = self.root / "catalog-synced"
         catalog_sync.touch()
 

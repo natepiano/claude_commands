@@ -243,6 +243,7 @@ def recorded_auto_entries() -> RecordedAutoEntries | UnreadableMoveJournal:
     """Read replay evidence under the same flock as journal appenders."""
     path = store_file()
     try:
+        worker_names.recover_pending_journal(path)
         with path.open("rb") as source:
             fcntl.flock(source.fileno(), fcntl.LOCK_SH)
             lines = source.read().splitlines(keepends=True)
@@ -292,7 +293,7 @@ def append_move(entry: MoveEntry) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8", errors="replace") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
-        _ = worker_names.migrate_locked_journal(output)
+        _ = worker_names.migrate_locked_journal(output, path)
         if entry["kind"] in ("confirmed", "wait ended", "room again", "failed"):
             _ = output.seek(0)
             for line in output:
@@ -361,7 +362,7 @@ def read_journal() -> list[JournalEntry]:
     try:
         with store_file().open("r+", encoding="utf-8", errors="replace") as source:
             fcntl.flock(source.fileno(), fcntl.LOCK_EX)
-            lines = worker_names.migrate_locked_journal(source)
+            lines = worker_names.migrate_locked_journal(source, store_file())
     except FileNotFoundError:
         return []
     entries: list[JournalEntry] = []
@@ -445,7 +446,7 @@ def append_routing(entry: RoutingEntry) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o600), "r+", encoding="utf-8", errors="replace") as output:
         fcntl.flock(output.fileno(), fcntl.LOCK_EX)
-        _ = worker_names.migrate_locked_journal(output)
+        _ = worker_names.migrate_locked_journal(output, path)
         _ = output.seek(0)
         for line in output:
             try:

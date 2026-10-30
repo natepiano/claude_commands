@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import fcntl
 import hashlib
 import json
@@ -836,7 +838,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
     def write_context_usage(self, tokens: int, *, window: int = 300_000) -> None:
         """A local model registry, configured window and last billed context; no real settings."""
         registry = self.root / "agents.conf"
-        _ = registry.write_text(f"[claude.context]\ndefault={window}\n")
+        _ = write_registry(registry, {"claude.context": {"default": str(window)}}, replace_sections=("claude.context",))
         self.environment.update(AGENTS_CONFIG_FILE=str(registry), CLAUDE_CODE_AUTO_COMPACT_WINDOW="400k")
         transcript = self.projects / "project" / "sid-unit-one.jsonl"
         entries = [{"type": "assistant", "message": {"model": "claude-test-1", "usage": usage}}

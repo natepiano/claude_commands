@@ -537,6 +537,10 @@ def write_role_map(change: RoleMapChange | WorkersClaudeRouteChange) -> None:
                 try:
                     previous = path.read_text(encoding="utf-8") if path.exists() else ""
                     values = _object(path) if previous else {}
+                    if history.with_name(f".{history.name}.workers").exists():
+                        with history.open("r+", encoding="utf-8") as source:
+                            fcntl.flock(source.fileno(), fcntl.LOCK_EX)
+                            _ = worker_names.migrate_locked_journal(source, history)
                     size = history.stat().st_size if history.exists() else -1
                     if change.role == "workers":
                         values = worker_names.configuration(values)
@@ -657,11 +661,12 @@ class RecordedAutoMoves:
 def recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoMoveHistory:
     """Recorded choices consume their entries even if log removal was interrupted."""
     try:
+        worker_names.recover_pending_journal(path, role_history=True)
         text = path.read_bytes()
         lines = text.splitlines(keepends=True)
     except FileNotFoundError:
         return RecordedAutoMoves(frozenset())
-    except OSError as error:
+    except (OSError, ValueError) as error:
         print(f"account moves: cannot read recorded auto moves: {error}")
         return UnreadableAutoMoveHistory()
     consumed: set[str] = set()

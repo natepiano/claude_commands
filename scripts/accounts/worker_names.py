@@ -5,7 +5,7 @@ import fcntl
 import json
 import os
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import TextIO, cast
 
@@ -53,10 +53,11 @@ def journal_entry(value: object) -> object:
     return result
 
 
-def migrate_locked_journal(source: TextIO) -> list[str]:
-    """Convert under the caller's exclusive append lock, without replacing its inode."""
+def migrate_locked_journal(source: TextIO, path: Path) -> list[str]:
+    """Keep a recovery image until conversion finishes, retaining the locked inode."""
+    recovery = path.with_name(f".{path.name}.workers")
     _ = source.seek(0)
-    lines = source.readlines()
+    lines = recovery.read_text(encoding="utf-8").splitlines(keepends=True) if recovery.exists() else source.readlines()
     converted: list[str] = []
     changed = False
     for line in lines:
@@ -71,11 +72,24 @@ def migrate_locked_journal(source: TextIO) -> list[str]:
             changed = True
         else:
             converted.append(line)
-    if changed:
+    if changed or recovery.exists():
+        if not recovery.exists():
+            temporary = recovery.with_suffix(".tmp")
+            try:
+                with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+                               "w", encoding="utf-8") as output:
+                    _ = output.write("".join(converted))
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary, recovery)
+            finally:
+                temporary.unlink(missing_ok=True)
         _ = source.seek(0)
         _ = source.write("".join(converted))
         _ = source.truncate()
         source.flush()
+        os.fsync(source.fileno())
+        recovery.unlink()
     return converted
 
 
@@ -86,4 +100,14 @@ def role_history_lines(path: Path) -> list[str]:
     with roles_lock():
         with path.open("r+", encoding="utf-8") as source:
             fcntl.flock(source.fileno(), fcntl.LOCK_EX)
-            return migrate_locked_journal(source)
+            return migrate_locked_journal(source, path)
+
+
+def recover_pending_journal(path: Path, *, role_history: bool = False) -> None:
+    """Repair an interrupted conversion before replay readers parse journal bytes."""
+    if not path.with_name(f".{path.name}.workers").exists():
+        return
+    with roles_lock() if role_history else nullcontext():
+        with path.open("r+", encoding="utf-8") as source:
+            fcntl.flock(source.fileno(), fcntl.LOCK_EX)
+            _ = migrate_locked_journal(source, path)
