@@ -617,6 +617,17 @@ def queue_bump(actor: str, session: str, step: str, folder: str, old_position: i
     })
 
 
+def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step: str,
+                   need: int, free: int, reserve: int, why: str, set_by: str, at: float) -> None:
+    host = store.host_name()
+    store.append_line(store.host_file(host, at), {
+        "kind": "head_admission", "v": RECORD_VERSION,
+        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
+        "action": action, "unit": unit, "step": step, "need": need, "free": free,
+        "reserve": reserve, "why": why, "set_by": set_by,
+    })
+
+
 def hold_build(args: list[str]) -> None:
     key, since, boot, pid, start, classification, session, command, cwd = args
     if classification not in {"other_session", "no_session"} or int(pid) <= 0 or not start.isdecimal():
