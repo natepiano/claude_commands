@@ -843,6 +843,8 @@ def follow(login: str, request_id: str) -> int:
                     continue
                 kind = saved["progress"]["kind"]
                 if kind in {"process identity lost", "stop failed", "restart failed", "manual restart", "timers pending"} or (kind == "waiting" and "alerted_at" in saved) or (kind in {"stopped", "already gone"} and saved["stop_issues"]):
+                    if kind == "stop failed":
+                        print(stop_work.stop_summary(list(known.values())), flush=True)
                     print(_follow_action(saved), flush=True)
                     return 1
             if all(identity in history.taken_out or saved["progress"]["kind"] == "restarted" or (
@@ -862,7 +864,7 @@ def follow(login: str, request_id: str) -> int:
                 elif all(saved["progress"]["kind"] == "restarted" for saved in known.values()):
                     summary = f"all {len(known)} back on {', '.join(sorted(destinations))}"
                 elif not destinations:
-                    summary = f"all {len(known)} stopped"
+                    summary = stop_work.stop_summary(list(known.values()))
                 else:
                     summary = f"all {len(known)} done: stopped or back on {', '.join(sorted(destinations))}"
                 print(summary, flush=True)

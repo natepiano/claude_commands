@@ -23,11 +23,13 @@ from scripts.astra import design_roles
 from scripts.direct import workers  # noqa: E402
 
 import add_unit
+import herdr
 import retire_unit
 import unit_lookup
 import unit_move
 from herdr import HerdrPlace
 from production_units import Production, read_production
+from scripts.production.unit_operation_test_support import PaneShellFixture, assert_pane_shell_refused
 
 if TYPE_CHECKING:
     from scripts.message import sessions
@@ -159,8 +161,14 @@ class RetireUnitTests(unittest.TestCase):
         def marked_unit(_slug: str, _name: str) -> unit_lookup.MarkedUnit | None:
             return self.marked
 
+        def process_info(*_arguments: str) -> dict[str, object]:
+            # Existing cases launch Claude with exec: it replaces the pane's shell.
+            pid = self.marked.claude.pid if self.marked and isinstance(self.marked.claude, unit_lookup.LiveClaude) else 4101
+            return {"process_info": {"shell_pid": pid}}
+
         self.config = self.root / "config"
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", marked_unit))
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "result", side_effect=process_info))
         _ = self.enterContext(mock.patch.object(unit_move, "config_dirs", lambda: [self.config]))
         self.transcript(self.worktree)
 
@@ -201,6 +209,25 @@ class RetireUnitTests(unittest.TestCase):
 
     def stops(self) -> list[list[str]]:
         return [call for call in self.calls if call[:2] != ["review_pool.py", "status"]]
+
+    def pane_shell_refused(self, *, live: bool) -> None:
+        pane = PaneShellFixture(self, self.worktree, self.root / "pane-proc", live=live, slug="alpha")
+
+        def invoke() -> subprocess.CompletedProcess[str]:
+            code, output = self.retire("--wait-minutes", "0")
+            return subprocess.CompletedProcess(["retire"], code, output, "")
+
+        before = self.doc.read_bytes()
+        assert_pane_shell_refused(self, pane, invoke)
+        self.assertEqual(self.calls, [], "preflight must not run any shutdown or cleanup command")
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertTrue(self.worktree.is_dir())
+
+    def test_live_director_in_pane_shell_refuses_before_stop(self) -> None:
+        self.pane_shell_refused(live=True)
+
+    def test_exited_directors_pane_shell_refuses_before_stop(self) -> None:
+        self.pane_shell_refused(live=False)
 
     def test_refuses_uncommitted_work_and_an_unmerged_checkpoint_and_changes_nothing(self) -> None:
         _ = (self.worktree / "late.txt").write_text("late\n", encoding="utf-8")
