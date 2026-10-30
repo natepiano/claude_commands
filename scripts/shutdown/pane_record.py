@@ -34,7 +34,7 @@ from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NamedTuple, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "herdr"))
@@ -149,14 +149,82 @@ def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
     return list(parts.arguments), parts.environment
 
 
+def _process_stat(process: Path) -> list[str]:
+    return (process / "stat").read_text().rsplit(")", 1)[1].split()
+
+
 def process_parent(pid: int) -> int:
     """Read the OS parent; callers decide how unavailable evidence is handled."""
     if (os.environ.get("HERDR_PLATFORM") or sys.platform) == "darwin":
         result = subprocess.run([os.environ.get("HERDR_PS", "ps"), "-o", "ppid=", "-p", str(pid)],
                                 capture_output=True, text=True, check=True, timeout=5)
         return int(result.stdout)
-    stat = (Path(os.environ.get("HERDR_PROC") or PROC) / str(pid) / "stat").read_text()
-    return int(stat.rsplit(")", 1)[1].split()[1])
+    return int(_process_stat(Path(os.environ.get("HERDR_PROC") or PROC) / str(pid))[1])
+
+
+def pane_shell_pid(place: herdr.HerdrPlace) -> int:
+    info = herdr.json_object(herdr.Herdr(place.session).result(
+        "pane", "process-info", "--pane", place.pane).get("process_info"), "pane process info")
+    shell = info.get("shell_pid")
+    if isinstance(shell, bool) or not isinstance(shell, int) or shell <= 0:
+        raise ValueError("pane process info: expected a positive shell_pid")
+    return shell
+
+
+class PaneShellState(NamedTuple):
+    pid: int
+    started: str
+    members: frozenset[int]
+
+
+def pane_shell_state(place: herdr.HerdrPlace) -> PaneShellState:
+    """Observe an exact pane's shell generation and all possible occupants.
+
+    Descendants, controlling terminal, OS session and dedicated pane scope are
+    blockers only. None of these memberships grants ownership or stop authority.
+    Unreadable evidence refuses an action instead of omitting an occupant.
+    """
+    shell = pane_shell_pid(place)
+    # pid -> parent, OS session, terminal, start generation
+    rows: dict[int, tuple[int, str, str, str]] = {}
+    if (os.environ.get("HERDR_PLATFORM") or sys.platform) == "darwin":
+        result = subprocess.run([os.environ.get("HERDR_PS", "ps"), "-axo", "pid=,ppid=,sess=,tty="],
+                                capture_output=True, text=True, check=True, timeout=5)
+        for line in result.stdout.splitlines():
+            pid, parent, session, terminal = line.split()
+            rows[int(pid)] = (int(parent), session, terminal, "")
+        started = herdr.darwin_process_identity(shell).started
+        scope: list[tuple[str, Path]] = []
+    else:
+        root = Path(os.environ.get("HERDR_PROC") or PROC)
+        scope = herdr.pane_scopes(herdr.systemd_cgroups(root / str(shell)))
+        for process in root.iterdir():
+            if not process.name.isdecimal():
+                continue
+            try:
+                # Membership is blocker evidence even for a foreign UID (sudo).
+                # An unreadable stat cannot establish that it is outside the pane.
+                fields = _process_stat(process)
+                if fields[0] == "Z":
+                    continue
+                rows[int(process.name)] = (int(fields[1]), fields[3], fields[4], fields[19])
+            except FileNotFoundError:
+                continue
+        started = rows[shell][3]
+    _, session, terminal, _ = rows[shell]
+    members = {shell}
+    for pid, (_, other_session, other_terminal, _) in rows.items():
+        if other_session == session or terminal not in {"0", "?", "??", "-"} and other_terminal == terminal:
+            members.add(pid)
+        if scope and any(group in scope for group in herdr.pane_scopes(herdr.systemd_cgroups(
+                Path(os.environ.get("HERDR_PROC") or PROC) / str(pid)))):
+            members.add(pid)
+    while True:
+        descendants = {pid for pid, (parent, _, _, _) in rows.items() if parent in members}
+        if descendants <= members:
+            break
+        members.update(descendants)
+    return PaneShellState(shell, started, frozenset(members))
 
 
 def _arguments(pid: int) -> list[str]:
