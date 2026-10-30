@@ -22,62 +22,17 @@ review, gate and report. Every prompt sent to a worker carries them inline per
 - Free text amends or narrows the selected work.
 - `single` and `verbose` are mutually exclusive.
 
-<Guild>
-Your guild is `units`. Your head is the `units` unit director in the `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/units/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `units`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
-
-Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild units
-
-Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
-In Synthesize / FixDispatch, send the units report when `findings.py gate` first
-returns `verdict=dispatch` with `round=4` for a phase instance; a repeated read
-sends no new report. The gate outcome does not change.
-For repeated titles in one run, normalize case and spaces. Count matching
-`finding_opened` titles across distinct `(phase_instance_id, round)` groups,
-or a `still_open`/`reopened` verdict after `finding_batch_landed` names that
-finding. Count one group once across lenses and one verdict per finding/round.
-Missing phase, round or repair order means `RepeatNotProven`; cite both event IDs.
-Send at most 100 words in six lines: Guild/event, Member/holder, Work,
-Evidence/time, Change, Result/cost/limit. Keep unsent reports with phase evidence.
-
-In LaunchImplementation, include `config/guilds/designer.md`, the expanded
-designers block and the loaded designers tip text in each Astra designer brief.
-For a designer that `roles.py` does not hold, save the brief before dispatch with:
-`~/.claude/scripts/lib/py ~/.claude/scripts/guilds/astra_work.py brief
---run-directory <SESSION_DIR> --phase <id> --member <mesh name>
---document <path> --round <N> --text-file <brief>`.
-Save the reply as `<SESSION_DIR>/design/phase<id>/round<N>_reply.md` without
-overwrite. A holder passes both `--run-directory` and `--phase` to each phase
-`astra_review.py` call. Codex holders pass the expanded block and loaded tip text
-to their worker, and relay its guild report unchanged.
-</Guild>
-
-<GuildHeadStanding>
-A plan headed `> **Standing:** guild-head` uses its event/daily loop instead
-of ticket dispatch. This branch takes precedence at startup, restart,
-compaction, phase selection in <NextPhase/>, and entry to <StandingPlanRefill/>.
-Read the plan and its production row, then process a member report or user
-feedback: check the cited evidence, publish an owned tip with
-`tips.py publish --head <guild> --from <folder>`, and reply with the tip path
-and pushed commit or a reason to decline. At a daily check-in, read only the
-uncovered interval on natedev and once on the Mac as the plan directs; record
-host coverage, and read turns only for flagged rows. Duplicate check-ins do
-no second read; cover a downtime gap once and state its length.
-
-Run no `style_plan.py` refill, ticket dispatch, phase, worker, checkpoint,
-shrink, FinalGate or RunSummary for this loop. The head writes its tips
-directly under the publish contract and routes process proposals through
-guilds to sdlc for guild-process-unit. Keep the session for its next report
-or timer. It remains a units guild member under <Guild/>; this section changes
-no other standing plan. An idle head ends each turn with
-`— holding: waiting on the next guild report or daily check-in`.
-</GuildHeadStanding>
-
 <HeldAstraRoles>
 For LongLivedWorkers and LaunchImplementation, the director briefs and accepts;
-Astra authors the assigned design. Use one `roles.py` designer and at most one
-reviewer per design, with models resolved from `guild` in `agents.conf`. Open
-once; resume the same instance across rounds, phases and runs. `roles.py` saves
+Astra authors the assigned design. Use one `design_roles.py` designer and at most one
+reviewer per design, with models resolved from `design_roles` in `agents.conf`. Open
+once; resume the same instance across rounds, phases and runs. `design_roles.py` saves
 each headed prompt and reply; do not also use `astra_work.py brief` for that role.
+For a designer outside `design_roles.py`, include `config/design_roles/designer.md` in its brief
+and save it with `astra_work.py brief --run-directory <SESSION_DIR> --phase <id>
+--member <mesh name> --document <path> --round <N> --text-file <brief>`.
+Save its reply as `<SESSION_DIR>/design/phase<id>/round<N>_reply.md` without
+overwrite. Pass both `--run-directory` and `--phase` to phase `astra_review.py` calls.
 
 For DelegatedPhaseReservationContract, prepare exact phase files, baseline and
 reservation before dispatch. Bind the designer to those output paths with explicit
@@ -95,7 +50,7 @@ explicit end. Run cleanup must not stop durable meshes. Account moves and holder
 restarts recover the same threads through the role lifecycle; never raw pause or
 silently replace a lost thread. Adoption uses its recorded transfer and destination.
 The existing checkpoint, visual check and gate order still applies.
-For rollback, set `[roles] new_open=false` in `config/guilds.conf`. Finish active
+For rollback, set `[roles] new_open=false` in `config/design_roles.conf`. Finish active
 turns and release servers through the holder lifecycle. Keep placements, fences,
 pending input, prompts, replies and unfinished reservations. Keep adopted ownership
 at its destination unless a reverse transfer proves no destination writer. Restore
@@ -177,42 +132,20 @@ A call site's arguments are what that file calls `$ARGUMENTS`.
 </TagReferenceContract>
 
 <LongLivedWorkers>
-Codex workers are run-scoped in every role. Open `impl` and `test` once, then send
-later implementation, repair, and follow-up work with `implement.sh --to
-<full-worker-name>` and reviews with `review.sh --to <full-worker-name>`. Keep a
-worker in the same role when the next assignment fits; otherwise move it, even
-mid-phase, under <RoleReassignment/>. A finished turn leaves its thread open.
+Unit workers persist across phases and plans. Dispatch with `assign.sh --role
+implement|test|fix|review --prompt <path> --cwd <worktree>`. The unit owns its
+read-only `review` worker; a concurrent review uses `review2`. The first use
+adopts a leased reviewer on the same thread. A busy leased reviewer finishes
+before adoption; new work uses `review2` meanwhile.
 
-When the production doc names a review pool, send code reviews with
-`review.sh --pool code --lease <slug>/<unit>/<phase>` instead of `--to`. Each
-review resumes the unit's own reviewer, which is never reset. A refusal
-`no primed code template: <cause>` means the pool could not prime itself: send
-that review to an idle worker with `--to`, and tell the showrunner the cause once.
+Keep each worker's thread. Pause, move and end it with the unit ledger as
+`docs/as-built/long-lived-workers.md` describes. Never open a fresh reviewer
+while its thread exists. Every review prompt names `config/review/code.md`
+under <ReviewPromptContract/>. Other prompts carry the Three Gods and Type
+Design Contract under <WritePromptContract/>.
 
-Compaction can erase earlier prompt text. Every opening, later-phase, repair,
-review, and follow-up prompt repeats the Three Gods sentence and carries the
-Type Design Contract verbatim or by its allowed pointer under
-<WritePromptContract/>.
-In a production whose doc names a review pool, review prompts use
-<ReviewPromptContract/>'s standing-instructions line.
-
-Before follow-up work, the launcher attempts to compact a worker whose recorded
-context is over `UNIT_COMPACT_ABOVE_TOKENS` (default `100000` in
-`config/direct.conf`). Success posts one board line with the before and after
-sizes. Failure posts one board line and the follow-up still runs; it costs
-tokens, not correctness, because the worker compacts itself when its context
-fills. The launcher then sends `Continue where you stopped.` and posts one board
-line per overflow.
-
-Open a new worker only when no open worker can take the work: the assignment needs
-more workers, every open worker is busy, or a reusable thread is gone. Name an extra
-slot for its role (`review`, `fix2`), never with a bare number, and keep it for
-reuse; an idle worker costs no context. A replacement under the same worker name
-starts fresh and receives an opening prompt. `review.sh --slot <role-name>`
-opens a new role-named worker; a call with neither `--to` nor `--slot` is only for
-a review outside a run.
-Phase cleanup leaves Codex workers open;
-`end_session.sh` ends them.
+The launcher compacts a worker above `UNIT_COMPACT_ABOVE_TOKENS`, then resumes
+it. A failed compaction leaves the thread available for its own compaction.
 </LongLivedWorkers>
 
 <CoreContract>
@@ -369,16 +302,33 @@ an empty `write_stdin` poll. A longer command, a `verify.sh` run or any other
 started with `mesh_runs.py start`, detaches and pushes its own result to the
 worker, per <WritePromptContract/> item 3. A live run keeps the worker's
 launcher attached, so the dispatch finishes only when the worker is done.
-Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record; cancel
-a run with `kill -TERM -- -<pid>`. A message from a worker's run saying no
+Records are in `${SESSION_DIR}/mesh_runs/`, each log beside its record.
+A message from a worker's run saying no
 launcher is attached carries the result to you: dispatch that worker
 (`implement.sh --to <full worker name>`) when it should act on it.
+
+When a decision makes a running or queued test, lint or build run useless,
+cancel it in the same turn to free its memory and its place in the queue.
+This applies when a phase is parked, a round fails, a newer tree replaces the
+run's tree, or a result already in hand answers the question. No run finishes
+only to complete a report.
+
+- For a `mesh_runs.py` run, read `pid` from its record in
+  `${SESSION_DIR}/mesh_runs/` (the `.json` beside its log). Signal only while
+  its `status` is `running` and `ps -p <pid> -o args=` shows
+  `mesh_runs.py supervise` with that record's path, so a reused pid is never
+  hit; then run `kill -TERM -- -<pid>`. A start that found the same run live
+  prints no pid: read it from that run's record.
+- A detached `verify.sh` run uses the same record and command: `verify.sh`
+  detaches through `mesh_runs.py` and handles TERM to stop its step.
+- For a run in the memory queue, cancel its owning run as above. The queue
+  drops dead callers on its next read. It has no separate cancel command;
+  `memory_admit.py release` only releases a reservation. A clean queue cancel
+  and one command for all run kinds are not built yet
+  (`docs/plans/sdlc-run-cancel-design.md`); report any run you cannot cancel.
 </WorkerRuns>
 
 <WorkerLaunchFailure>
-When the production doc names a review pool, on a pool review's `error` retry
-with `review.sh --to <full-worker-name>` for that review.
-
 A dispatch that dies in seconds never reached the provider, and a provider
 message it prints is a message some earlier call received. Workers launched
 together that fail within seconds of each other carrying **byte-identical text,
@@ -464,7 +414,9 @@ at once, in the turn it arrives; it never waits for a better moment:
 1. Stop mid-step. Do not finish the step, dispatch, review or gate in progress,
    and start nothing new. Leave uncommitted work in place.
 2. Stop any build you started outside `verify.sh`, or name it in the line below.
-   Leave Codex workers running: the mover pauses them with this session.
+   For a move, leave Codex workers running; the mover pauses them after you exit.
+   For a stop, if ready names a running Codex worker, retry when its turn finishes;
+   start no new turns.
 3. Run the `shutdown.py ready --where "<phase N: the step you stopped in and what
    comes next>"` command the message gives.
 4. End the turn with `— blocked: shutdown requested by the user`.
@@ -627,7 +579,7 @@ launcher's own `landed` and `abandon` reach that phase's ledger.
 
 | Command | Purpose |
 | --- | --- |
-| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <worker\|main\|both> [--lens <adversary\|contract\|craft\|ux>[,…]] [--detail <d>]` | create an id; `--lens` names every lens that raised it, comma-separated; legacy `both` means `adversary,contract` |
+| `open --severity <blocker\|minor\|nit> --title <t> --file <p> [--line N] --caught-by <worker\|main\|both> [--lens <adversary\|contract\|craft\|ux\|rerun>[,…]] [--detail <d>]` | create an id; `--lens` names every lens that raised it, comma-separated; legacy `both` means `adversary,contract` |
 | `status` | read the ledger for closure review |
 | `gate` | get `converged` or `dispatch`, plus batch and any advisory |
 | `dispatch --covers F001,F002,... --accepted-checks "<checks or none: reason>" [--keep F001=<regression\|broken\|gate\|ruling>:<evidence>]` | record the complete kept batch; repeat `--keep` per id from repair round 4 (the user, 2026-10-28) |
@@ -696,6 +648,7 @@ closes each at its own end. Name the phase on every launch,
 `implement.sh --phase <id>` and `review.sh --phase <id>`: the pass is stamped
 with it, and the launcher writes its files to that phase's `${PHASE_DIR}`.
 A launch without a phase is refused (the user, 2026-10-28).
+When a park makes a run useless, apply <WorkerRuns/>.
 
 Before each launch, check the prompt's phase against its active instance and title. Run start-phase and finish-phase at the real boundaries and keep parallel phases separately identified. Do not launch against a stale or absent instance. Classify planned implementation/deployment as implementation and command-only verification as an activity. A fix launch names its defect, failed gate or ledger batch. Correct active state only through supported recorder operations, preserving old evidence; never fabricate starts/finishes or rewrite historic records. Missing historic boundaries stay uncertain in analysis. (the user, 2026-10-28)
 
@@ -1108,7 +1061,7 @@ At an eligible point, in that same turn:
    collide the same way — then confirm no sentinel remains before continuing. A
    stale sentinel releases the reviewer onto a previous phase's diff, which
    returns a confident and entirely false blocker saying the phase implemented
-   nothing; and because the sentinel is what releases `review.sh` to call
+   nothing; and because the sentinel is what releases `assign.sh` to call
    `start-pass`, it opens the review pass while the writer is still running, so
    the recorder closes the live implementation pass as `interrupted` and refuses
    every later `progress` call in that phase. Both failures are silent until the
@@ -1116,14 +1069,8 @@ At an eligible point, in that same turn:
 3. Apply <ReviewDiffContract/> to the current partial tree. The worker has
    named no created files yet, so that check is vacuous; the snapshot is
    expected to be incomplete.
-4. When the production doc names a review pool, select no worker. Otherwise select its worker under <TeamReview/>, save the
-   slot as `${EARLY_REVIEW_SLOT}`, and apply <RoleReassignment/> when the open
-   worker's role changes; when every open worker is busy, name a new `review` worker
-   and keep it after the turn. With a pool, read `${EARLY_REVIEW_SLOT}`
-   when a cancel call needs it:
-   the one line in `${PHASE_DIR}/review_slot_adversary` for pass 1, or
-   `${PHASE_DIR}/review_slot` for a closure. A missing file means the launcher
-   opened no pass, so record nothing.
+4. Use the unit's own reviewer under <TeamReview/>. Save its slot as
+   `${EARLY_REVIEW_SLOT}` from the dispatch result.
    Write the applicable early-form prompt — the `adversary`
    lens of
    <BroadReviewPrompt/> for pass 1, <ClosureReview/> for a fix — including the
@@ -1132,14 +1079,11 @@ At an eligible point, in that same turn:
    that gains most from the extra time, and arming both against a partial
    tree would double the exposure to the void verdict below; `contract`
    launches at completion under <DualReview/> step 3.
-5. Launch `review.sh` exactly as <DualReview/> step 3 does — with
-   `--pool code --lease <slug>/<unit>/<phase>` when the production doc names
-   a review pool; otherwise with `--to` for an
-   open worker or `--slot "${EARLY_REVIEW_SLOT}"` for the new worker, and
-   `adversary` as its lens for pass 1 — appending one extra final argument:
-   `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. Save the
-   handle as `${REVIEW_DISPATCH_HANDLE}` and set `EARLY_REVIEW=launched`. Leave
-   `${DISPATCH_HANDLE}` untouched.
+5. Launch `assign.sh --role review --lens adversary --pass "${REVIEW_PASS}"
+   --phase "<phase id>" --session-dir "${SESSION_DIR}" --cwd "${WORKING_DIR}"
+   --prompt <early prompt> --early-ready "${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready"`
+   under <DispatchContract/>. Save the handle as `${REVIEW_DISPATCH_HANDLE}`
+   and set `EARLY_REVIEW=launched`. Leave `${DISPATCH_HANDLE}` untouched.
 6. Before the recorder call in <ProgressReport/> step 5, put the reviewer in
    the round table:
 
@@ -1150,21 +1094,21 @@ At an eligible point, in that same turn:
    marker watching the unsuffixed pair while the launcher writes the suffixed
    one retires the row on its first tick, reporting a live reviewer as gone.
    It is a presentation marker, not a pass event, so it cannot forge anything
-   convergence counts. It resolves the same reviewer `review.sh` will, retires
-   its row when `review.sh` errors or its process is gone, and is superseded
-   when the sentinel lets `review.sh` open the real pass. The two running rows
+   convergence counts. It resolves the same reviewer `assign.sh` will, retires
+   its row when `assign.sh` errors or its process is gone, and is superseded
+   when the sentinel lets `assign.sh` open the real pass. The two running rows
    are the announcement, and they carry what a sentence cannot: which agent each
    one is, when it started, and how long it has been going.
 
-The extra argument defers `review.sh`'s `start-pass` until the sentinel appears,
+The extra argument defers `assign.sh`'s `start-pass` until the sentinel appears,
 so the implementation pass and the review pass never overlap in the recorder. At
 most one early launch per dispatch; otherwise review runs synchronously, as it
 always may — early launch is opportunistic, never required.
 
 | Event | Required action |
 | --- | --- |
-| Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${PHASE_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** `review.sh`'s run then sends the reviewer its Stage 2. |
-| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `UNIT_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; with a pool, read the slot per step 4 and skip this call if the file is missing. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
+| Primary completes | After <LaunchImplementation/> step 7, write the final diff to `${PHASE_DIR}/final_diff_${REVIEW_PASS}.diff` — a closure review stays limited to its paths per <ClosureReview/> — then create `${PHASE_DIR}/final_diff_${REVIEW_PASS}.ready`. **Never create the sentinel before the diff is fully written.** `assign.sh`'s run then sends the reviewer its Stage 2. |
+| Primary errors, or the run stops | Kill the early reviewer. If the sentinel exists, close its pass with `UNIT_TEAM_ROLE=${EARLY_REVIEW_SLOT} … finish-pass --status canceled --orphaned-launcher` per <PassOwnership/>; skip this call if the launcher opened no pass. Before the sentinel no pass was recorded, so record nothing — a pre-sentinel kill counts toward no advisory, including the blind-review cancellation one. |
 | Reviewer errors before delivery | Report it in one line, clear `${REVIEW_DISPATCH_HANDLE}` and `${EARLY_REVIEW_SLOT}`, set `EARLY_REVIEW=none`, and leave the numbered artifacts. The primary continues and is reviewed synchronously at completion under the next `${REVIEW_PASS}` index. |
 | A verdict arrives before delivery | **It is void.** The reviewer cannot have read a diff that does not exist yet, so discard its findings entirely rather than reading them as evidence: open nothing in the ledger, preempt nothing, route no blocker into a fix dispatch. Say in one line that it is discarded and why, then follow the reviewer-error row. A void verdict is often fluent and specific — a stale diff supports confident claims about missing work — so the check is the timing, never how convincing the text reads. |
 
@@ -1221,6 +1165,11 @@ reports `No active phase to report`, continue without the progress report.
 
 <FixDispatch>
 Apply <LongLivedWorkers/>.
+When a repair round fails or its next edit replaces a run's tree, apply <WorkerRuns/>.
+
+Find a failing test's cause before you scope its repair: read the failure text
+and the fixture it runs in. A repair aimed at a cause no one has checked costs
+a full round.
 
 For a `dispatch` batch, set `${FIX_ROUND}` from the gate's `round` and create
 `${SESSION_DIR}/fix_prompt_${FIX_ROUND}.md` under
@@ -1347,13 +1296,8 @@ id whose verdict reads unclear, a claim the worker says it could not verify and
 the main read cannot verify either, or a new defect the repair introduced.
 Uncertainty routes to the reviewer; a hunk fully read and fully understood
 does not. A closure review costs a stage of the phase, so it is spent on a
-question, never on a path. Select its open worker under <TeamReview/>, post the
-<RoleReassignment/> handoff when its role changes, and launch it with
-`review.sh --to`; when every open worker is busy, open and retain a role-named
-review worker with `review.sh --slot review` instead.
-When the production doc names a review pool, use
-`review.sh --pool code --lease <slug>/<unit>/<phase>` instead of selecting an
-open worker.
+question, never on a path. Use the unit's own reviewer under <TeamReview/> and dispatch with
+`assign.sh --role review --prompt <closure prompt> --cwd <worktree>`.
 
 On completion, `implemented` continues as above; `error` applies
 <WorkerLaunchFailure/>, and then, if the error survives it,
@@ -1445,6 +1389,20 @@ allows the checkpoint but is batched at <FinalGate/> and reported by
 <RunSummary/>.
 </RunApplicationSmokeTest>
 
+<UserBuildGuard>
+Before a build goes to the user's machine (an install, a binary path given to
+the user, a deploy), run in that repository:
+
+`python3 ~/.claude/scripts/direct/assertion_guard.py --base main`
+
+Exit 1 (a removed, weaker or turned-off assertion or test with no
+`Assertion-Change:` ruling) or exit 2 (it could not run) stops the hand-off:
+route the finding through <FixDispatch/>, or record its ruling, then run it
+again. The user got a build that does not work from cargo-liner-tile
+checkpoint e21d5b93, where a worker weakened an `assert_eq!` (user,
+2026-10-28).
+</UserBuildGuard>
+
 <UXReview>
 Runs when the phase changes what users see, in the app or in any example; a
 phase that changes nothing on screen skips it and says so in one line. Guide:
@@ -1472,49 +1430,9 @@ instructions name; with none, skip and say so in one line.
    > production rules: <the production doc's rules that concern looks>. You
    > only review: edit nothing. Return only the verdict and the table.
 
-   For the pool, use this separate prompt:
-
-   > Judge these shots by your standing instructions, which hold the rules
-   > and the report format: <paths>. Scale: <shot pixels per logical pixel>.
-   > Context: <unit> phase <N> — <what changed, every state the shots must
-   > show, and each shot's window size in logical pixels>. Production rules:
-   > <the production doc's rules that concern looks>. You only review: edit
-   > nothing. Return only the verdict and the table.
-
-   Without `ui` in the production's `**Review pool:**` line, spawn a fresh
-   Claude Agent helper in the background; read its verdict once and stop it
-   with TaskStop. With `ui` listed, use this procedure on every check:
-
-   - Let `<slug>` be the production doc's filename without `-production.md`.
-     Count design checks within the phase from `k=1`, including repairs and
-     notice checks; resume from the largest saved `ux_<phase>_<k>_*` name plus
-     one.
-   - Write one full shot path per line to
-     `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`, using the next unused UX
-     pass index in this session. Write the helper prompt to
-     `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_helper.md` and the pool prompt to
-     `${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md`, then launch
-     `review.sh --phase "<phase id>" --pool ui --lease <slug>/<unit>/<phase> "${SESSION_DIR}" <worktree> "${SESSION_DIR}/ux_prompt_${PASS_INDEX}_pool.md" review "UI design check" "judging the shots" "${PASS_INDEX}" ux`
-     in the background. The launcher resumes the unit's UI reviewer and sends
-     every listed image; its thread carries what it learned from earlier reviews.
-   - Test `~/.local/state/review-pool/<slug>/ui_adopted`. While it is absent,
-     also start the fresh Claude helper with the prompt from its helper file
-     and those shots;
-     use only its verdict, defects and canonical candidates. Wait for both
-     results; stop the helper with TaskStop. When the marker exists, run no
-     helper and use only the pool's result.
-   - Save the full helper verdict, when run, and the successful pool verdict
-     from `${PHASE_DIR}/review_findings_${PASS_INDEX}_ux.txt` beside the turn
-     records in `$(~/.claude/scripts/lib/py ~/.claude/scripts/lib/unit_runs.py history-root)/review_turns/<session dir name>/`,
-     as `ux_<phase>_<k>_helper.txt` and `ux_<phase>_<k>_pool.txt`. Preserve each
-     pair. A failed shadow pool check leaves its pool file missing and gets
-     an error note; the helper's verdict still governs. An adopted pool
-     failure holds the design check until a successful retry.
-
-   Never create `ui_adopted` in this workflow. After ten shadow checks, the
-   user decides from `review_pool_report.py --shadow --root <history root>`
-   whether to create it by hand. Missing markers, new productions and pools
-   after `review_pool.py stop` use shadow.
+   Spawn a fresh Claude Agent helper in the background with that prompt.
+   Read its verdict once and stop it with TaskStop. This helper is the one
+   design check.
 
    Save each canonical
    candidate it lists, without viewing it, into a slot still empty:
@@ -1533,7 +1451,7 @@ instructions name; with none, skip and say so in one line.
 5. Re-entered after a `ux` repair that changed the screen, this step replaces
    1–4: re-shoot and re-judge only the rows raised, under its own `UX review`
    activity, given just those rows and their shots. Run step 3's design-check
-   procedure, including the pool, verdict selection and a new pair index;
+   procedure with the fresh Claude helper;
    then close the activity and record
    each with `findings.py verdict`. A `still_open` row returns to step 4's
    gate. Then continue to <PhaseEnd/> in loop or verbose, or

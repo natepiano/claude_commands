@@ -14,6 +14,7 @@ import sys
 import tempfile
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -43,12 +44,14 @@ from quota_alert import (RefusedAt, _refusal_window, blocked_next_move_line, blo
                          TargetIsCurrentAccount as TargetIsCurrentAccount)
 
 if TYPE_CHECKING:
-    from scripts.shutdown import inventory as inventory_module, record
+    from scripts.shutdown import inventory as inventory_module, shutdown_record
+    from scripts.herdr import herdr
     from scripts.message import sessions
 else:
     inventory_module = import_module("inventory")
-    record = import_module("record")
+    shutdown_record = import_module("shutdown_record")
     sessions = import_module("sessions")
+    herdr = import_module("herdr")
 
 
 @dataclass(frozen=True)
@@ -57,11 +60,11 @@ class NoSessionRefusal:
 
 
 class ShutdownProgressReader(Protocol):
-    def shutdown_in_progress(self, saved: record.SessionShutdown) -> bool: ...
+    def shutdown_in_progress(self, saved: shutdown_record.SessionShutdown) -> bool: ...
 
 
 class RestartRecordLiveness(Protocol):
-    def restart_failed_session_running(self, saved: record.SessionShutdown) -> bool: ...
+    def restart_failed_session_running(self, saved: shutdown_record.SessionShutdown) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -610,6 +613,42 @@ NO_SESSION_FILTER: frozenset[str] = frozenset()
 NO_MOVED_GROUPS: frozenset[accounts.ClaudeGroup] = frozenset()
 
 
+@dataclass(frozen=True)
+class NoSessionObservation:
+    """No earlier report can prove that completion work is unchanged."""
+
+
+@dataclass(frozen=True)
+class ReportSessionIdentities:
+    identities: frozenset[tuple[str, int, str]]
+
+
+_report_sessions: ContextVar[NoSessionObservation | ReportSessionIdentities] = ContextVar(
+    "refusal_report_sessions", default=NoSessionObservation())
+
+
+def _session_identities() -> ReportSessionIdentities:
+    return ReportSessionIdentities(frozenset((row["sessionId"], row["pid"], row.get("procStart", ""))
+                                           for row in sessions.live_sessions()))
+
+
+@contextmanager
+def session_observation() -> Generator[None]:
+    """Capture registry identities before the timer's first report scan."""
+    token = _report_sessions.set(_session_identities())
+    try:
+        yield
+    finally:
+        _report_sessions.reset(token)
+
+
+@herdr.process_action()
+def _action_group_members() -> dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]]:
+    """Read members fresh before refusal, queued or committed group moves."""
+    return accounts.live_group_members()
+
+
+@herdr.process_action()
 def live_owners(*, only: frozenset[str] = NO_SESSION_FILTER) -> list[inventory_module.Session]:
     owners: dict[str, inventory_module.Session] = {}
     home_state = account.home_account_state()
@@ -759,7 +798,7 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     pending_groups = (set(accounts.CLAUDE_GROUPS) if any(isinstance(rule, UnreadableNextMoveLog) for rule in configured)
                       else {rule.group for rule in configured if isinstance(rule, AutoMoveRule)})
     restart = cast(RestartRecordLiveness, cast(object, import_module("restart")))
-    open_ids = {saved["session"]["session_id"] for saved in record.all_session_records()
+    open_ids = {saved["session"]["session_id"] for saved in shutdown_record.all_session_records()
                 if not restart.restart_failed_session_running(saved)}
     entries = moves.read_moves()
     ended = {entry["move_id"] for entry in entries if entry["kind"] == "wait ended"}
@@ -922,8 +961,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
     fingerprint = _reading_values_fingerprint()
     if dry_run:
         lines.insert(0, accounts.group_status_line(selected_groups))
-    all_members: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]] = (accounts.live_group_members()
-        if not proof_group and (any(key.startswith("group:") for key in groups) or bool(selected_groups))
+    all_members: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]] = (_action_group_members()
+        if not proof_group and any(key.startswith("group:") for key in groups)
         else {"units": [], "showrunners": []})
     moved_groups: set[accounts.ClaudeGroup] = set()
     no_room_groups: set[accounts.ClaudeGroup] = set()
@@ -1049,53 +1088,72 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
             original_state = deepcopy(state)
     # A committed group choice is stable. Complete its off-target members without choosing again.
     if not proof_group and selected_groups:
-        for group_name in accounts.CLAUDE_GROUPS:
-            if group_name in moved_groups or group_name in waiting_groups or group_name in blocked_groups or group_name in no_room_groups:
-                continue
-            target = accounts.group_label(selected_groups, group_name)
-            if isinstance(target, accounts.GroupNotConfigured):
-                continue
-            members = [session for session in all_members[group_name]
+        eligible: set[accounts.ClaudeGroup] = {group for group in accounts.CLAUDE_GROUPS
+                    if group not in moved_groups | waiting_groups | blocked_groups | no_room_groups
+                    and isinstance(accounts.group_label(selected_groups, group), str)}
+        def completion_members(observed: dict[accounts.ClaudeGroup, list[inventory_module.ListedSession]],
+                               group_name: accounts.ClaudeGroup, target: str) -> list[inventory_module.ListedSession]:
+            return [session for session in observed[group_name]
                        if session.session_id not in open_ids and not accounts.session_on_account(session, target)
                        and not (session.session_id in state["sessions"] and state["sessions"][session.session_id]["state"] == "cancelled"
                                 and isinstance(detected.get(session.session_id), TranscriptRefusal)
                                 and state["sessions"][session.session_id]["entry_id"] == cast(TranscriptRefusal, detected[session.session_id]).entry_id)]
-            if not members:
-                continue
-            directory = accounts.claude_account_dir(target)
-            identity = accounts.account_identity(directory)
-            if not isinstance(identity, agent_accounts.NumberedAccount):
-                lines.append(f"{group_name}: move refused: account unreadable")
-                continue
-            held = refusals.load().get(refusals.key("claude", identity.login))
-            if held is not None and not refusals.resolved(held, refusals.stored_reading("claude", identity.login, now), now):
-                lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
-                continue
-            shutdown_hold = accounts.check_move_target_hold(target, dry_run=dry_run)
-            if isinstance(shutdown_hold, accounts.MoveRefused):
-                lines.append(f"{group_name}: {shutdown_hold.reason}")
-                if not dry_run:
-                    _ = _notify_no_room(shutdown_hold.reason, now)
-                continue
-            lines.extend(shutdown_hold.notices)
-            if not dry_run:
-                _notify_cleared_hold(group_name, target, shutdown_hold.notices, now)
-            prepared = (accounts.prepared_account_preview(target, resume=True) if dry_run
-                        else accounts.prepared_account(target, resume=True))
-            if isinstance(prepared, accounts.AccountRefused):
-                lines.append(f"{group_name}: move refused: {prepared.reason}")
-                continue
-            lines.extend(f"{session.name}: moving to {target} ({group_name})" for session in members)
-            if not dry_run:
-                transition = accounts.group_transition(group_name)
-                if isinstance(transition, accounts.NoGroupTransition):
-                    transition = accounts.set_group_account(group_name, target, why=f"complete {group_name} move to {target}", now=now)
-                why = f"complete {group_name} move to {target}"
-                if isinstance(transition.origin, accounts.AutoOrigin):
-                    why = transition.why.text if isinstance(transition.why, accounts.RecordedTransitionReason) else ""
-                _ = accounts.move_sessions(tuple(session.session_id for session in members), target,
-                    why=why, origin=transition.origin, move_id=transition.move_id,
-                    alerts="none" if isinstance(transition.origin, accounts.AutoOrigin) else "user")
+
+        if eligible:
+            # Reports can suggest work. A changed registry also finds late arrivals.
+            cached = accounts.live_group_members()
+            previous = _report_sessions.get()
+            changed = isinstance(previous, NoSessionObservation) or previous != _session_identities()
+            needs_completion = changed or any(completion_members(cached, group, target)
+                for group in eligible if isinstance(target := accounts.group_label(selected_groups, group), str))
+        else:
+            needs_completion = False
+        if needs_completion:
+            with herdr.process_action():
+                all_members = accounts.live_group_members()
+                for group_name in accounts.CLAUDE_GROUPS:
+                    if group_name not in eligible:
+                        continue
+                    target = accounts.group_label(selected_groups, group_name)
+                    if isinstance(target, accounts.GroupNotConfigured):
+                        continue
+                    members = completion_members(all_members, group_name, target)
+                    if not members:
+                        continue
+                    directory = accounts.claude_account_dir(target)
+                    identity = accounts.account_identity(directory)
+                    if not isinstance(identity, agent_accounts.NumberedAccount):
+                        lines.append(f"{group_name}: move refused: account unreadable")
+                        continue
+                    held = refusals.load().get(refusals.key("claude", identity.login))
+                    if held is not None and not refusals.resolved(held, refusals.stored_reading("claude", identity.login, now), now):
+                        lines.append(f"{group_name}: move refused: {target} holds an unresolved refusal")
+                        continue
+                    shutdown_hold = accounts.check_move_target_hold(target, dry_run=dry_run)
+                    if isinstance(shutdown_hold, accounts.MoveRefused):
+                        lines.append(f"{group_name}: {shutdown_hold.reason}")
+                        if not dry_run:
+                            _ = _notify_no_room(shutdown_hold.reason, now)
+                        continue
+                    lines.extend(shutdown_hold.notices)
+                    if not dry_run:
+                        _notify_cleared_hold(group_name, target, shutdown_hold.notices, now)
+                    prepared = (accounts.prepared_account_preview(target, resume=True) if dry_run
+                                else accounts.prepared_account(target, resume=True))
+                    if isinstance(prepared, accounts.AccountRefused):
+                        lines.append(f"{group_name}: move refused: {prepared.reason}")
+                        continue
+                    lines.extend(f"{session.name}: moving to {target} ({group_name})" for session in members)
+                    if not dry_run:
+                        transition = accounts.group_transition(group_name)
+                        if isinstance(transition, accounts.NoGroupTransition):
+                            transition = accounts.set_group_account(group_name, target, why=f"complete {group_name} move to {target}", now=now)
+                        why = f"complete {group_name} move to {target}"
+                        if isinstance(transition.origin, accounts.AutoOrigin):
+                            why = transition.why.text if isinstance(transition.why, accounts.RecordedTransitionReason) else ""
+                        _ = accounts.move_sessions(tuple(session.session_id for session in members), target,
+                            why=why, origin=transition.origin, move_id=transition.move_id,
+                            alerts="none" if isinstance(transition.origin, accounts.AutoOrigin) else "user")
     if not dry_run and state != original_state:
         _save_state(state)
     return lines
@@ -1156,9 +1214,8 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
             _save_state(state)
         return lines
     selected = accounts.group_accounts()
-    members = accounts.live_group_members()
     shutdown_progress = cast(ShutdownProgressReader, cast(object, import_module("settle")))
-    in_flight = {accounts.session_group(saved["session"]) for saved in record.all_session_records()
+    in_flight = {accounts.session_group(saved["session"]) for saved in shutdown_record.all_session_records()
                  if shutdown_progress.shutdown_in_progress(saved)}
     moved = set(moved_groups)
     held_refusals = refusals.load()
@@ -1248,6 +1305,7 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         moved.add(rule.group)
         if dry_run:
             continue
+        members = _action_group_members()
         transition = accounts.set_group_account(rule.group, rule.to, why=why, now=now, origin=accounts.AutoOrigin())
         selected[rule.group] = rule.to
         for group_rule in rules:

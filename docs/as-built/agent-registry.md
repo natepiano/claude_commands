@@ -1,5 +1,9 @@
 # Agent Registry — one place for family, agent, and effort assignments
 
+Code reviews now use the unit's persistent `review` and `review2` workers
+through `assign.sh --role review`. Any pool maintenance paths described below
+remain only for the pending archive cleanup; they do not dispatch new reviews.
+
 ## What it is
 
 Every external-CLI agent this configuration launches — `/unit:direct`'s implementer and reviewer, the production unit directors `add_unit.py` starts, the `~/.zshrc` CLI aliases, `/ask_a_friend`, and the `/team_review` / `/api_review` / `/module_review` review teams — resolves which vendor CLI to run, which model, and at what reasoning effort from one file (`config/agents.conf`) through one resolver (`scripts/agents/agents_config.sh`), and launches through one dispatcher (`scripts/agents/agent_exec.sh`). The problem it solves: without a registry each consumer carries its own private assignment state in its own conf file and hard-codes its own vendor flags, so switching a function between vendors means editing several scripts and auditing "what runs what" means reading all of them. Here, a major function switches between the `codex` and `claude` families, or a single sub-task is re-pointed to a different model or effort, with one `/agent` edit, and no consumer assembles vendor flags itself.
@@ -152,12 +156,12 @@ codex_mesh.py sweep  [--root <dir>] [--stop]
 `follow`, `compact`, `can-follow`, `release-follow`, the roster's `role`,
 `revision` and `context_tokens`, and overflow press-on are described in
 `long-lived-workers.md`; the role log and guarded roster writes in `usage-ledger.md`.
-`prime`, `fork` and `reset`, and `follow`'s `--cwd`, `--read-only` and
-`--image`, serve the review pool's reviewers and are described in
-`review-pool.md`. `prime --held-design --held-role` starts a held design role's
-thread for `scripts/guilds/roles.py`; held roles, their access policy and the
+`follow` takes `--cwd`, `--read-only` and `--image` for unit reviewers.
+`prime`, `fork` and `reset` remain for held designs and retained legacy state;
+`review-pool.md` records the earlier allocator. `prime --held-design --held-role` starts a held design role's
+thread for `scripts/astra/design_roles.py`; held roles, their access policy and the
 verbs that refuse them (`start`, `fork`, `reopen`, `set-instructions`, raw `stop`
-and `stop --pause`) are described in `guilds.md`.
+and `stop --pause`) are described in `long-lived-workers.md#lasting-roles`.
 
 `serve` spawns `codex app-server --listen ws://127.0.0.1:<free port>` detached
 (`start_new_session=True`) and records `{port, pid}` in
@@ -215,7 +219,7 @@ and the reap constants as module attributes.
 `send` and `steer` address a worker by mesh name through the roster file, which
 is why they work from an unrelated process — the unit director, or a peer
 worker. `send` to a held design role queues the text in the role store
-(`roles.queue_message`) and prints `queued for <name>; holder adds it to the next
+(`design_roles.queue_message`) and prints `queued for <name>; holder adds it to the next
 authorized assignment`. Otherwise `send` delivers only while a launcher is attached. To a `running` worker
 it calls `thread/queue/add`, and the message lands at the start of the target's
 **next** turn; to a `waiting_capacity` worker it stores the message in
@@ -231,7 +235,7 @@ a late message with nothing streaming it and nothing writing the summary.
 the `start` loop polls for, sets the worker's roster status to `ended`, and
 interrupts any live turn. Any other status, `ended` included, prints `<worker> is
 <status>; nothing to end` and exits 0, except that an `ended` held design role is
-ended again so `roles.py end` can confirm the thread release.
+ended again so `design_roles.py end` can confirm the thread release.
 
 `stop` sets every roster worker to `ended` (with `--pause`, a shutdown stop, every
 non-ended worker to the followable `paused` instead), SIGTERMs each recorded pid (SIGKILL
@@ -337,14 +341,9 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - Any awk that writes a user-supplied value into the conf passes it through `ENVIRON`, not `awk -v`. Row rewrites preserve trailing inline comments and spacing byte-exactly; conf writes build the full registry in a tmp file, then `agents_registry_store` keeps the rows that differ from the defaults and moves them over the overlay (mode 644), never in place. A write that leaves no row different removes the overlay.
 - `agent_exec` owns all redirection: wrappers must not redirect its stdout/stderr to a file, or dry-run output never reaches them. It exports nothing — provenance comes from the wrapper's own `agents_resolve`.
 - Callers pass **absolute** prompt/output/log paths to `agent_exec`.
-- `codex_mesh.py` is a launcher for `/unit:direct`, `/ask_a_friend` and the
-  review pool (`review_pool.py`), not a second dispatcher. It resolves
-  nothing: `implement.sh` and `launch_friend.sh`
-  resolve family, agent and effort through `agents_resolve`, exactly as for
-  `agent_exec`, and pass them in as `--model` / `--effort`, so the mesh path
-  changes only whether the worker has an address, never which agent runs or at
-  what effort. Anything else that needs a codex agent still goes through
-  `agent_exec`.
+- `codex_mesh.py` carries unit workers, held designs and ask-a-friend threads.
+  Unit allocation resolves its role through `agents_resolve`. Launchers pass
+  the selected model and effort on each turn; transport does not choose them.
 - Every worker in one run shares one app-server, and its pid file is the only
   record of it. A launch path that starts a server without writing
   `mesh_server.json` leaks a process that nothing will reap.
@@ -438,7 +437,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   thread. Only the unit director's `implement.sh --to <worker>` or
   `review.sh --to <worker>` (`codex_mesh.py follow`) starts its next turn,
   which receives held messages after its dispatch prompt
-  (a held design role is the exception: `implement.sh --to` refuses it, and only `roles.py resume` gives it a turn) —
+  (a held design role is the exception: `implement.sh --to` refuses it, and only `design_roles.py resume` gives it a turn) —
   `<PhaseMesh/>` in `docs/direct/write_prompt_contract.md` states this, and the register
   line's `reach=` field is what tells a peer which of the two it is addressing.
 - `/unit:direct` is itself implemented by `scripts/direct/*`, so any rename or signature change to those launchers must land together with the `commands/unit/direct.md` call-site edits in one change.

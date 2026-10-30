@@ -57,7 +57,7 @@ class EndSessionTests(unittest.TestCase):
         _ = shutil.copy2(UNIT_RUNS, scripts / "lib" / "unit_runs.py")
         self.script = direct_dir / "end_session.sh"
         _ = shutil.copy2(END_SESSION, self.script)
-        # Resolve the real package and its evolving lifecycle dependencies.
+        # Import the real package, so the script's current imports resolve.
         (direct_dir / "remove_run_scratch.py").symlink_to(REMOVE_RUN_SCRATCH)
         _ = (direct_dir / "remove_workers.py").write_text("", encoding="utf-8")
         (agents / "codex_mesh.py").symlink_to(END_SESSION.parents[1] / "agents" / "codex_mesh.py")
@@ -113,7 +113,7 @@ class EndSessionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(calls), 4)
-        self.assertTrue(calls[0].endswith(f"guilds/roles.py unbind-run {self.session_dir}"))
+        self.assertTrue(calls[0].endswith(f"astra/design_roles.py unbind-run {self.session_dir}"))
         self.assertIn("remove_workers.py --session-dir", calls[1])
         self.assertIn("codex_mesh.py stop", calls[2])
         self.assertIn("--pause", calls[2])
@@ -145,7 +145,7 @@ class EndSessionTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text(encoding="utf-8").splitlines()
-        unbinds = [line for line in calls if "guilds/roles.py unbind-run" in line]
+        unbinds = [line for line in calls if "astra/design_roles.py unbind-run" in line]
         self.assertEqual([line.split()[-1] for line in unbinds], [str(marked), str(side)])
         self.assertTrue(all(calls.index(line) < next(index for index, call in enumerate(calls)
                                                     if "remove_workers.py" in call) for line in unbinds))

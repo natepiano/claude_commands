@@ -49,23 +49,30 @@ require_ignored() {
     exit 1
 }
 
-# Check if already excluded
+ALREADY_EXCLUDED=false
 if grep -qxF "$FILENAME" "$EXCLUDE_FILE"; then
     require_ignored
-    echo "ALREADY_EXCLUDED: $FILENAME is already listed in .git/info/exclude"
-    exit 0
+    ALREADY_EXCLUDED=true
+else
+    # Keep the ignore rule until untracking succeeds, so a rerun can finish it.
+    echo "$FILENAME" >> "$EXCLUDE_FILE"
+    require_ignored appended
 fi
-
-# Append to exclude, before the file leaves the index, so a refusal changes nothing
-echo "$FILENAME" >> "$EXCLUDE_FILE"
-require_ignored appended
 
 # Check if tracked and remove from tracking if so
 WAS_TRACKED=false
 if git ls-files --error-unmatch "$FILENAME" >/dev/null 2>&1; then
     WAS_TRACKED=true
-    git rm --cached "$FILENAME" >/dev/null 2>&1
+    if ! git rm --cached "$FILENAME" >/dev/null 2>&1; then
+        echo "Error: could not untrack $FILENAME" >&2
+        exit 1
+    fi
     echo "UNTRACKED: Removed $FILENAME from git tracking (local file kept)"
+fi
+
+if [[ "$ALREADY_EXCLUDED" == "true" ]]; then
+    echo "ALREADY_EXCLUDED: $FILENAME is already listed in .git/info/exclude"
+    exit 0
 fi
 
 echo "EXCLUDED: Added $FILENAME to .git/info/exclude"

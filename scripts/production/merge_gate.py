@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Merge a checkpoint, run the complete gate, then push (and optionally promote).
 
-The default sampled memory cap is 4096 MiB. A 163-module run with an empty timing
+The default sampled memory cap is 6144 MiB: full-tree basedpyright peaked at 4065 MiB
+on 2026-10-30, so its 4878 MiB reservation did not fit a 4096 MiB cap. A 163-module run with an empty timing
 cache took 102.80 s, peaked at 2.027 GiB, and had a largest module peak of
 0.494 GiB (one-minute load 7.79-16.32). A sample is resident plus swapped memory.
 Each running job keeps a reservation: admission counts max(job memory, largest job peak seen so far, initially 96 MiB)
@@ -64,10 +65,11 @@ TEST_SUITES = (
     "lib", "hooks", "message", "accounts", "whoami", "agents", "build_hold", "build_queue",
     "mac_test", "usage", "bevy_upgrade", "bevy_migration_plan", "production", "direct", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
-    "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "guilds", "issue_score",
-    "hierarchies",
+    "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "issue_score",
+    "hierarchies", "release", "claude_to_codex", "new_rust_project", "validate_and_push",
+    "exclude", "prioritize",
 )
-DEFAULT_MEMORY_CAP_MIB = 4096
+DEFAULT_MEMORY_CAP_MIB = 6144
 DEFAULT_MAX_RUNNING_JOBS = max(1, (os.cpu_count() or 2) // 2)
 MODULE_MEMORY_MIB = 48
 # A module still running this long is killed and the run is red: a hung module holds every gate
@@ -140,7 +142,7 @@ class GateJobResult:
     seconds: float
     output: str
     killed_for: str = ""
-    build_tool_started: bool = False
+    tripwire_tripped: bool = False
 
 
 @dataclass(frozen=True)
@@ -169,6 +171,11 @@ class RunningGateJob:
     log: Path
     # Set when the runner kills the job for its memory or time limit.
     killed_for: str = ""
+    module: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.module:
+            self.module = self.path.name
 
 
 @dataclass
@@ -462,10 +469,16 @@ def one_minute_load() -> float:
     return float(Path("/proc/loadavg").read_text().split()[0])
 
 
-def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float]) -> list[tuple[str, Path]]:
+def test_module_name(repo: Path, suite: str, path: Path) -> str:
+    root = repo / "scripts" / suite
+    return str(path.relative_to(root)) if path.is_relative_to(root) else path.name
+
+
+def module_order(modules: Sequence[tuple[str, Path]], timings: dict[str, float],
+                 repo: Path) -> list[tuple[str, Path]]:
     """`modules` in start order: modules with no recorded time first, then the slowest recorded first."""
-    return sorted(modules, key=lambda item: (f"{item[0]}/{item[1].name}" in timings,
-                                             -timings.get(f"{item[0]}/{item[1].name}", 0)))
+    return sorted(modules, key=lambda item: (f"{item[0]}/{test_module_name(repo, *item)}" in timings,
+                                             -timings.get(f"{item[0]}/{test_module_name(repo, *item)}", 0)))
 
 
 def in_builds_slice() -> bool:
@@ -508,11 +521,12 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     except BaseException:
         output.close()
         raise
-    return RunningGateJob(suite, path, process, started, output, log)
+    module = test_module_name(repo, suite, path)
+    return RunningGateJob(suite, path, process, started, output, log, module=module)
 
 
 def test_module_environment(root: Path, environment: dict[str, str]) -> dict[str, str]:
-    """Give a module a private build log and commands that record toolchain calls."""
+    """Give a module a private build log and tripwires for tools and live memory."""
     buildlog = root / "buildlog"
     buildlog.mkdir()
     tools = root / "build-tool-tripwires"
@@ -530,6 +544,7 @@ raise SystemExit(99)
         _ = executable.write_text(script)
         executable.chmod(0o755)
     return {**environment, "TMPDIR": str(root), "BUILDLOG_DIR": str(buildlog),
+            "BUILDLOG_LIVE_MEMORY_TRIPWIRE": str(root / "live-memory-reads.jsonl"),
             "PATH": str(tools) + os.pathsep + environment.get("PATH", os.defpath)}
 
 
@@ -541,7 +556,23 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
     marker = job.log.parent / "build-tool-calls.jsonl"
     calls = [cast(list[str], json.loads(line)) for line in marker.read_text().splitlines()] if marker.exists() else []
     for call in calls:
-        captured += f"\n{job.path.name}: a test started real {Path(call[0]).name}: {shlex.join(call[1:])}\n"
+        captured += f"\n{job.module}: a test started real {Path(call[0]).name}: {shlex.join(call[1:])}\n"
+    memory_marker = job.log.parent / "live-memory-reads.jsonl"
+    readings = memory_marker.read_text(errors="replace").splitlines() if memory_marker.exists() else []
+    for line in readings:
+        try:
+            decoded = cast(object, json.loads(line))
+            if not isinstance(decoded, dict):
+                raise ValueError("record must be an object")
+            reading = cast(dict[str, object], decoded)
+            path, argv, pid = reading.get("reading"), reading.get("argv"), reading.get("pid")
+            if (not isinstance(path, str) or not isinstance(argv, list) or type(pid) is not int
+                    or not all(isinstance(arg, str) for arg in cast(list[object], argv))):
+                raise ValueError("record fields are invalid")
+            detail = f"{path}: {shlex.join(cast(list[str], argv))}"
+        except ValueError:
+            detail = f"(unreadable record): {line}"
+        captured += f"\n{job.module}: a test read live memory {detail}\n"
     shutil.rmtree(job.log.parent)
     if job.killed_for:
         captured = f"{job.killed_for}\n{captured}"
@@ -550,9 +581,10 @@ def finish_gate_job(job: RunningGateJob, status: int) -> GateJobResult:
         status = 0
     if job.suite == "types":
         status = 0 if status in (0, 3) and re.search(r"^0 errors, 0 warnings, 0 notes\s*$", captured, re.MULTILINE) else 1
-    if calls:
+    tripwire_tripped = bool(calls or readings)
+    if tripwire_tripped:
         status = 1
-    return GateJobResult(job.suite, job.path.name, status, seconds, captured, job.killed_for, bool(calls))
+    return GateJobResult(job.suite, job.module, status, seconds, captured, job.killed_for, tripwire_tripped)
 
 
 @dataclass(frozen=True)
@@ -648,7 +680,7 @@ class PassedTreeLedger:
             self.report_error(error)
         return NoCertifiedBase()
 
-    def record_pass(self, kind: Literal["full", "affected"] = "full") -> None:
+    def record_pass(self, selection: AffectedSelection | FullSuite) -> None:
         if self.unavailable or isinstance(self.tree, UnrecordableTestTree):
             return
         try:
@@ -659,7 +691,10 @@ class PassedTreeLedger:
                 return
             record = {"tree": self.tree.tree, "commit": self.tree.commit,
                       "at": datetime.now(UTC).isoformat(), "host": host_name(),
-                      "checkout": str(self.repo.resolve()), "suites": sorted(TEST_SUITES), "source": self.source, "kind": kind}
+                      "checkout": str(self.repo.resolve()), "suites": sorted(TEST_SUITES), "source": self.source,
+                      "kind": "full" if isinstance(selection, FullSuite) else "affected"}
+            if isinstance(selection, FullSuite):
+                record["reason"] = selection.reason
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as ledger:
                 line = (json.dumps(record) + "\n").encode("utf-8")
@@ -697,6 +732,12 @@ def report_selection(selection: AffectedSelection | FullSuite, total: int) -> No
     print(f"Tree-scanning modules: {len(selection.tree_scanners)} (always affected)", flush=True)
 
 
+def discover_test_modules(repo: Path) -> list[tuple[str, Path]]:
+    """Find every suite module, including tests in nested directories."""
+    return [(suite, path) for suite in TEST_SUITES
+            for path in sorted((repo / "scripts" / suite).rglob("test_*.py"))]
+
+
 def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_dirs: Sequence[str] = (),
                module_time_limit_s: float = DEFAULT_MODULE_TIME_LIMIT_S,
                max_running_jobs: int = DEFAULT_MAX_RUNNING_JOBS, *,
@@ -710,8 +751,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     absent = [name for name in type_dirs if not (repo / name).exists()]
     if absent:
         raise GateRefused(f"type dirs not found under {repo}: {', '.join(absent)}")
-    modules = [(suite, path) for suite in TEST_SUITES
-               for path in sorted((repo / "scripts" / suite).glob("test_*.py"))]
+    modules = discover_test_modules(repo)
     missing = [suite for suite in TEST_SUITES if not any(name == suite for name, _ in modules)]
     if missing:
         raise GateRefused(f"suites have no test modules: {', '.join(missing)}")
@@ -734,7 +774,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     selection: AffectedSelection | FullSuite = FullSuite("passed tree reused")
     if not reused:
         selection = (required if isinstance(required, FullSuite) else FullSuite("--full") if full else
-                     select_affected(repo, ledger.certified_base(), [path for _, path in modules]))
+                     select_affected(repo, ledger.certified_base(), [path for _, path in modules], state_dir=gate_state_dir()))
         report_selection(selection, len(modules))
         if isinstance(selection, AffectedSelection):
             selected = set(selection.modules)
@@ -750,7 +790,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     slow_modules: list[str] = []
     history_path = gate_state_dir() / "module_history.json"
     history = read_history(history_path)
-    pending = deque(module_order(modules, timings) if not reused else [])
+    pending = deque(module_order(modules, timings, repo) if not reused else [])
     running: list[RunningGateJob] = []
     results: list[GateJobResult] = []
     first_runs: dict[tuple[str, str], GateJobResult] = {}
@@ -785,13 +825,13 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                             types_peak_mib = max(types_peak_mib, measured)
                         elif measured > largest_module_peak_mib:
                             largest_module_peak_mib = measured
-                            largest_module = f"{job.suite}/{job.path.name}"
+                            largest_module = f"{job.suite}/{job.module}"
                         if measured > memory_cap_mib and not job.killed_for:
                             # Admission cannot stop a job that grows after it starts; on 2026-10-18 one
                             # module grew to 28 GiB in 56 minutes and filled natedev's swap.
                             job.killed_for = (f"killed: sampled memory {measured / 1024:.3f} GiB is over the "
                                               + f"{memory_cap_mib / 1024:.3f} GiB cap")
-                            print(f"{job.suite}/{job.path.name} {job.killed_for}", flush=True)
+                            print(f"{job.suite}/{job.module} {job.killed_for}", flush=True)
                             kill_job_group(job)
                 while (pending and len(running) < max_running_jobs
                        and admission.admits(bool(running)) and (not rerunning or not running)):
@@ -804,6 +844,8 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     log = root / "output.log"
                     job_environment = ({**environment, "TMPDIR": str(root)} if suite == "types"
                                        else test_module_environment(root, environment))
+                    if suite == "types":
+                        _ = job_environment.pop("BUILDLOG_LIVE_MEMORY_TRIPWIRE", None)
                     argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
                              *type_dirs]
                             if suite == "types" else
@@ -818,7 +860,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     status = job.process.poll()
                     if status is None and not job.killed_for and time.monotonic() - job.started >= module_time_limit_s:
                         job.killed_for = f"killed: still running after {module_time_limit_s:g} s, the module time limit"
-                        print(f"{job.suite}/{job.path.name} {job.killed_for}", flush=True)
+                        print(f"{job.suite}/{job.module} {job.killed_for}", flush=True)
                         kill_job_group(job)
                         status = job.process.poll()
                     if status is None:
@@ -826,15 +868,15 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     result = finish_gate_job(job, status)
                     running.remove(job)
                     admission.release(job.process.pid)
-                    if status < 0 and not job.killed_for and not hold.admits():
+                    if status < 0 and not job.killed_for and not result.tripwire_tripped and not hold.admits():
                         pending.appendleft((job.suite, job.path))
-                        print(f"{job.suite}/{job.path.name}: stopped during a natedev hold; queued again", flush=True)
+                        print(f"{job.suite}/{job.module}: stopped during a natedev hold; queued again", flush=True)
                         continue
                     if job.suite == "types":
                         if not job.killed_for and types_peak_mib:
                             types_peaks[types_key] = types_peak_mib
                     elif not rerunning:
-                        key, seconds = f"{job.suite}/{job.path.name}", result.seconds
+                        key, seconds = f"{job.suite}/{job.module}", result.seconds
                         past = history.get(key) or ([timings[key]] if key in timings else [])
                         if past and slower_than_recorded(seconds, statistics.median(past)):
                             slow_modules.append(f"{key} {seconds:.0f} s, median of the last {len(past)} runs "
@@ -853,7 +895,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                 if not pending and not running and not rerunning:
                     failed = [result for result in results
                               if result.suite != "types" and result.returncode and not result.killed_for
-                              and not result.build_tool_started]
+                              and not result.tripwire_tripped]
                     rerunning = True
                     if len(failed) > RERUN_LIMIT:
                         print(f"{len(failed)} modules failed; this is a real breakage, not load; no reruns", flush=True)
@@ -898,8 +940,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
         print(f"Slow module: {slow} ({SLOW_MODULE_FACTOR:g}x or more)", flush=True)
     if hold.seconds > 0:
         print(f"Gate hold wait: {hold.seconds:.2f}s (excluded from Gate tests)", flush=True)
+    full_reason = f"; full suite: {selection.reason}" if isinstance(selection, FullSuite) and not reused else ""
     print(f"Gate tests: {elapsed:.2f}s; at most {max_running_jobs} modules at once; "
-          + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB", flush=True)
+          + f"peak memory: {admission.peak_mib / 1024:.3f} GiB (sampled memory); cap: {memory_cap_mib / 1024:.3f} GiB{full_reason}", flush=True)
     print(f"Largest module peak: {largest_module_peak_mib / 1024:.3f} GiB (sampled memory); module: {largest_module or '(not sampled)'}", flush=True)
     print(f"One-minute load: start={starting_load:.2f} max={maximum_load:.2f} end={ending_load:.2f}", flush=True)
     if admission.peak_mib > memory_cap_mib:
@@ -907,7 +950,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     run = GateRun(tuple(results), elapsed, admission.peak_mib, admission.peak_mib <= memory_cap_mib, reused,
                   isinstance(selection, AffectedSelection))
     if run.passed and not reused:
-        ledger.record_pass("affected" if isinstance(selection, AffectedSelection) else "full")
+        ledger.record_pass(selection)
         if isinstance(selection, FullSuite):
             (gate_state_dir() / "full-required").unlink(missing_ok=True)
     return run
@@ -1204,7 +1247,8 @@ def nightly(args: GateArguments) -> int:
         _ = nightly_git(clone, "checkout", "--detach", commit)
         tree = checked_git(clone, "rev-parse", "HEAD^{tree}")
         try:
-            run = run_suites(clone, args.memory_cap_mib, module_time_limit_s=args.module_time_limit_s, full=True)
+            run = run_suites(clone, args.memory_cap_mib, args.type_dirs,
+                             module_time_limit_s=args.module_time_limit_s, full=True)
         except (GateRefused, OSError, subprocess.SubprocessError) as error:
             print(f"Nightly suite runner failed: {error}", flush=True)
             run = GateRun((GateJobResult("runner", "suite-run", 1, 0, str(error)),), 0, 0)
@@ -1244,7 +1288,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     _ = parser.add_argument("--mac-repo", default="~/.claude")
     _ = parser.add_argument("--settings-blob", default=SETTINGS_BLOB)
     _ = parser.add_argument("--memory-cap-mib", type=int, default=DEFAULT_MEMORY_CAP_MIB,
-                            help="sampled memory admission cap in MiB (default: 4096); measured 163-module run: 102.80 s, 2.027 GiB peak, 0.494 GiB largest module")
+                            help="sampled memory admission cap in MiB (default: 6144); measured 163-module run: 102.80 s, 2.027 GiB peak, 0.494 GiB largest module")
     _ = parser.add_argument("--module-time-limit-s", type=float, default=DEFAULT_MODULE_TIME_LIMIT_S,
                             help="kill a module still running after this many seconds (default: 1800); slowest measured: 387 s at load 152")
     _ = parser.add_argument("--tests-only", action="store_true")
@@ -1270,6 +1314,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return nightly(args)
             if args.tests_only:
                 return 0 if run_suites(Path(str(args.repo)).resolve(), int(args.memory_cap_mib),
+                                       args.type_dirs,
                                        module_time_limit_s=float(args.module_time_limit_s), full=args.full).passed else 1
             if args.promote_only:
                 promote(args)

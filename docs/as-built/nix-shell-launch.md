@@ -54,11 +54,20 @@ resolver before calling `exec`.
 | `berth_fix/launch.sh` | Proves the worktree before opening a window; both window and current-terminal starts use `nix_env.py exec`. Worktree approval failure is fatal. |
 | `agents/agent_bg.sh` | Proves the cwd while making worker settings, passes the loaded env through settings for the long-lived background daemon, and starts the CLI through `exec`. |
 | `agents/agent_exec.sh` | Claude print runs use `exec` after changing to their requested directory. |
-| `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and guild values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
+| `agents/codex_mesh.py` | The shared Codex app-server calls `ensure(worktree, environment)` and starts Codex directly with the loaded env. Protected account, run, temporary-directory and held-role values come from the caller. `Refused` logs the helper's line, remembers the failed shell, and falls back to the caller env so other workers keep their shared server. The recorded pid is the server's pid. |
 | `accounts/accounts.py` | `exec` calls `launch_shell_environment(cwd)` for every Claude and Codex label. That guard dynamically loads `nix_env` and calls `ensure(cwd, os.environ)`, puts the caller's HOME back, and exits 1 with the helper's reason on `Refused`. |
 | `cli_agent/cli_agent.sh` | Interactive and command Claude launches use `exec` in the caller's directory. |
 | `notify/review.py` | Loads the current directory's env before the Claude reviewer starts; refusal returns an unreviewed result. |
 | `make_a_worktree/direnv_allow.sh` | Thin, silent-on-success `ensure` call; failure retains the helper's stderr and exit status. `commands/make_a_worktree.md` requires stopping on failure. |
+
+The berth fixer reserves its conversation id before launch. It uses `-r` only
+when that id's transcript exists in `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects`;
+otherwise a rerun keeps the id and uses `--session-id`. Claude encodes the
+worktree path by replacing each character outside ASCII letters and digits
+with `-`, including slashes, dots and underscores. Every launch also repairs
+history left under the legacy worktree path after an interrupted checkout move,
+using the selected account's projects directory. It moves the old history only
+when that folder exists and the new one does not.
 
 `herdr agent start --help` and the herdr adoption documentation specify that
 `--kind claude` selects the executable itself. Prefixing its argument list with
@@ -121,7 +130,13 @@ restart continuation, using the account resolved from the config directory.
 `down` hands off to a detached conductor; its exit does not prove a stop.
 The healer saves a pending restart and uses the conductor's typed shutdown
 record to confirm the exact process stopped, without waiting in a loop. It
-rechecks holds before stopping and before the separate
+persists `stop_request_sent: false` before calling `down`, then saves `true`
+after `down` exits 0. A rerun with no shutdown record and an unsent request
+resends through the same request function only if the original pid and start
+still match. If that process is gone or its pid was reused, the pending stop is
+cleared, logged and alerted; no relaunch follows. Sent requests keep waiting
+for the conductor. Older journals without the mark are treated as sent.
+The healer rechecks holds before stopping and before the separate
 `shutdown.py restart <saved account> --only <id> --here` launch. A hold between these steps
 keeps the restart pending. Each sweep processes pending recoveries first,
 including sessions that have left the live registry, then new broken sessions.

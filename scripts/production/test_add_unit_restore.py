@@ -19,6 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
+import production_units
 import autocompact
 import conversation_pause
 import launch_permission
@@ -115,7 +116,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertIn("restart-prompt-outcome: ", output.getvalue())
 
     def test_each_production_names_its_unit_session_and_a_restore_keeps_the_recorded_name(self) -> None:
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         request = add_unit.UnitLaunch(
             production=production, identity=add_unit.UnitIdentity("review-unit", "review"),
             branch="build-followups-review", worktree=self.root / "project-review",
@@ -146,7 +147,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
               patch.object(herdr, "start_agent", side_effect=herdr.AgentExited("restored-unit", "w1:p1")),
               patch.object(herdr, "close_agent") as closed):
             request = add_unit.UnitLaunch(
-                production=add_unit.read_production(self.doc),
+                production=production_units.read_production(self.doc),
                 identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
                 branch="build-followups-alpha", worktree=self.root / "project-alpha",
                 plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
@@ -467,11 +468,11 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(writes, 0)
         self.assertEqual(self.recorded_prompts("session-123"), ())
 
-    def test_launch_barrier_covers_preflight_through_spawn(self) -> None:
+    def test_launch_claim_releases_global_barrier_before_spawn(self) -> None:
         note = self.root / "restart-note"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         request = add_unit.UnitLaunch(
-            production=add_unit.read_production(self.doc),
+            production=production_units.read_production(self.doc),
             identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
             branch="build-followups-alpha",
             worktree=self.root / "project-alpha",
@@ -515,7 +516,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
                 [
                     sys.executable,
                     "-c",
-                    "import os, record; assert record.create_session(record.parse_session_records(os.environ['TEST_RECORD'])[0])",
+                    "import os, shutdown_record; assert shutdown_record.create_session(shutdown_record.parse_session_records(os.environ['TEST_RECORD'])[0])",
                 ],
                 cwd=Path(__file__).parents[1] / "shutdown",
                 env={
@@ -539,13 +540,13 @@ class AddUnitRestoreTests(AddUnitTestCase):
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
-            self.assertIsNone(creator.poll(), "shutdown record appeared before spawn")
+            creator_stdout, creator_stderr = creator.communicate(timeout=30)
+            self.assertEqual(creator.returncode, 0, (creator_stdout, creator_stderr))
+            self.assertEqual(len(launch_permission.pending_launches()), 1)
             lock_path = Path(self.env["SHUTDOWN_STATE_DIR"]) / "launch.lock"
             with lock_path.open("a+", encoding="utf-8") as contender:
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(
-                        contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                    )
+                fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(contender.fileno(), fcntl.LOCK_UN)
 
             return SUBMITTED_PROMPT
 
@@ -699,7 +700,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
 
     def test_recorded_source_fallback_uses_add_unit_in_the_shared_host(self) -> None:
         from test_restart import entry, unit
-        import record
+        import shutdown_record
 
         self.commit_prepared_row(self.unit_row())
         directory = self.prepare_unit_account("claude1")
@@ -713,7 +714,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         flags = ("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior),
                  "--restart-note", str(note), "--session-name", "recorded-name", "--host-session", "shared-herdr",
                  "--account", "claude1")
-        with (patch.object(record, "all_session_records", return_value=[saved]),
+        with (patch.object(shutdown_record, "all_session_records", return_value=[saved]),
               patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
               patch.object(herdr, "shared_session", return_value="shared-herdr"),
               patch.object(herdr, "start_server") as start,
@@ -732,13 +733,13 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(agent.call_args.args[:2], ("shared-herdr", "w1:p1"))
 
     def test_source_fallback_requires_a_restore_of_its_recorded_source(self) -> None:
-        import record
+        import shutdown_record
 
         prior = self.root / "prior-session"
         prior.mkdir()
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume.", encoding="utf-8")
-        with (patch.object(record, "all_session_records", return_value=[]),
+        with (patch.object(shutdown_record, "all_session_records", return_value=[]),
               patch.object(herdr, "start_agent", side_effect=AssertionError("invalid fallback launched"))):
             new = self.cli("alpha", "--plan", "docs/plans/given.md", "--source-fallback", "--account", "claude2")
             self.assertEqual(new.returncode, 2)
@@ -799,17 +800,17 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertIsInstance(ordinary_resume.launch_kind, add_unit.NewWorkLaunch)
         self.assertIsInstance(new_work.launch_kind, add_unit.NewWorkLaunch)
 
-    def test_guilds_designer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
-        self.assert_guild_head_launch_and_restart("designers")
+    def test_named_designer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_named_unit_launch_and_restart("designers")
 
-    def test_guilds_reviewer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
-        self.assert_guild_head_launch_and_restart("reviewers")
+    def test_named_reviewer_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_named_unit_launch_and_restart("reviewers")
 
-    def test_guilds_showrunner_head_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
-        self.assert_guild_head_launch_and_restart("showrunners")
+    def test_named_showrunner_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_named_unit_launch_and_restart("showrunners")
 
-    def test_guilds_unit_head_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
-        self.assert_guild_head_launch_and_restart("units")
+    def test_named_unit_launch_adoption_restart_and_lookup_keep_exact_id(self) -> None:
+        self.assert_named_unit_launch_and_restart("units")
 
     def test_restore_flags_are_atomic_and_require_resume(self) -> None:
         note = self.root / "restart-note.txt"
@@ -856,7 +857,9 @@ class AddUnitRestoreTests(AddUnitTestCase):
 
         self.assertEqual(self.opened()[1], SHARED)
         self.assertEqual(self.opened()[7], str(prior))
-        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1", recorded_session], self.herdr_calls())
+        self.assertIn(["--session", SHARED, "tab", "rename", "w1:t1",
+                       recorded_session], self.herdr_calls())
+        self.assertIn(["--session", SHARED, "pane", "rename", "w1:p1", recorded_session], self.herdr_calls())
         claude = self.agent_arguments()
         prompt = self.opening_prompt()
         self.assertEqual(claude[claude.index("--remote-control") + 1], recorded_session)

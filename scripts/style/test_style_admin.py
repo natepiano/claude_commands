@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,60 @@ import style_admin
 
 @final
 class StyleAdminTests(unittest.TestCase):
+    def test_rename_reruns_after_source_move(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rust").mkdir()
+            (root / ".history").mkdir()
+            _ = (root / "rust/old.md").write_text("[[old]]\n")
+            history = root / ".history/run.jsonl"
+            _ = history.write_text('{"reviewed_units":[{"guideline_id":"rust/old.md"}]}\n')
+            with (mock.patch.object(style_admin, "NATE_STYLE_DIR", root),
+                  mock.patch.object(style_admin, "RUST_STYLE_DIR", root / "rust"),
+                  mock.patch.object(style_admin, "HISTORY_DIR", root / ".history"),
+                  contextlib.redirect_stdout(io.StringIO())):
+                with mock.patch.object(style_admin, "update_history_for_rename", side_effect=InterruptedError("stop after move")):
+                    with self.assertRaises(InterruptedError):
+                        style_admin.run_rename("old", "new")
+                style_admin.run_rename("old", "new")
+            self.assertEqual((root / "rust/new.md").read_text(), "[[new]]\n")
+            self.assertIn("rust/new.md", history.read_text())
+
+    def test_delete_reruns_after_source_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "rust").mkdir()
+            (root / ".history").mkdir()
+            _ = (root / "rust/old.md").write_text("rule\n")
+            _ = (root / "links.md").write_text("[[old]]\n")
+            history = root / ".history/run.jsonl"
+            _ = history.write_text('{"reviewed_units":[{"guideline_id":"rust/old.md"}]}\n')
+            with (mock.patch.object(style_admin, "NATE_STYLE_DIR", root),
+                  mock.patch.object(style_admin, "RUST_STYLE_DIR", root / "rust"),
+                  mock.patch.object(style_admin, "HISTORY_DIR", root / ".history"),
+                  contextlib.redirect_stdout(io.StringIO())):
+                with mock.patch.object(style_admin, "update_history_for_delete", side_effect=InterruptedError("stop after unlink")):
+                    with self.assertRaises(InterruptedError):
+                        style_admin.run_delete("old")
+                style_admin.run_delete("old")
+            self.assertFalse(history.exists())
+            self.assertEqual((root / "links.md").read_text(), "old\n")
+
+    def test_history_rewrite_stop_keeps_all_original_rows_for_rerun(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.jsonl"
+            original = '{"reviewed_units":[{"guideline_id":"rust/old.md"}]}\n'
+            _ = path.write_text(original)
+            rows = style_admin.load_jsonl(path)
+            assert "reviewed_units" in rows[0]
+            rows[0]["reviewed_units"][0]["guideline_id"] = "rust/new.md"
+            with mock.patch.object(json, "dumps", side_effect=InterruptedError("stop during serialization")):
+                with self.assertRaises(InterruptedError):
+                    style_admin.write_jsonl(path, rows)
+            self.assertEqual(path.read_text(), original)
+            style_admin.write_jsonl(path, rows)
+            self.assertIn("rust/new.md", path.read_text())
+
     def test_rename_updates_rule_links_and_history_without_changing_other_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

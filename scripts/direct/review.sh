@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 # review.sh — Invoke the configured worker agent for a review.
 #
-# Usage: review.sh [--to <worker> | --slot <new-slot> | --pool <type> --lease <slug>/<unit>/<phase>]
+# Usage: review.sh [--to <worker> | --slot <new-slot>]
 #                  [--phase <id>] <session_dir>
 #                  [working_dir] [prompt_file] [task]
 #                  [role_description] [pass_activity] [pass_index] [lens]
 #                  [early_ready_file]
 #   --to reuses an open Codex worker. --slot opens a role-named Codex worker for
 #   this review and leaves its thread open for later `--to` dispatches.
+#   With no worker or pool flags, a fresh read-only reviewer runs once.
+#   Ignored --pool code / --lease flags select the unit's own reviewer when
+#   neither --to nor --slot names a worker.
 #   role_description — 1-2 lines describing this review's responsibility,
 #   written as a header block into the shared heartbeat log
 #   pass_activity — short user-facing description for the progress header
 #   pass_index — 1 for a phase's broad review, incrementing for each closure
 #   review after it. Artifacts are written per index and never overwritten:
 #   a run that failed to converge can be read back round by round.
-#   lens — which reading this reviewer is doing, when a phase's broad review
-#   runs its three lenses at once: adversary, contract, or craft (code quality
-#   by the style guide). It suffixes every artifact below, so concurrent
-#   reviewers never overwrite each other, and it selects the worker the pass
-#   records under. The worker assignment is fixed, not meaningful.
-#   Empty is the single-reviewer layout: unsuffixed names, no worker, which is
-#   what a closure review and a solo broad review still run.
+#   lens — which reading this reviewer is doing. The shared lens list is in
+#   agents_log.py. It suffixes each artifact,
+#   so concurrent reviewers keep separate results. It does not select a worker.
+#   Empty is the single-reviewer layout, with unsuffixed artifact names.
 #   early_ready_file — early-launch mode: the reviewer starts while the
 #   implementer is still running, so its start-pass is deferred until this
 #   sentinel appears (the recorder closes any active pass as interrupted when
@@ -41,7 +41,7 @@
 #                                            one that was killed
 #   <session_dir>/review_findings_<N>.txt  — review findings for pass N
 #   <session_dir>/review_agent_<N>.log     — full agent log for pass N; a worker's
-#                                            pass adds `-<slot>`, a pool's `-pool`, so
+#                                            pass adds `-<slot>`, so
 #                                            two workers on one pass keep separate logs
 #   <session_dir>/review_findings.txt      — symlink to the current pass's findings
 #   <session_dir>/review_agent.log         — symlink to the current pass's log
@@ -65,43 +65,33 @@ POOL_TYPE=""
 POOL_LEASE=""
 # A phase running beside the current one names itself, so start-pass stamps this pass with it.
 PHASE_ID=""
+REQUESTED_LENS=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --to) FOLLOW_TO="${2:?--to requires a worker}" ;;
     --slot) NEW_SLOT="${2:?--slot requires a slot}" ;;
     --pool) POOL_TYPE="${2:?--pool requires a type}" ;;
     --lease) POOL_LEASE="${2:?--lease requires slug/unit/phase}" ;;
+    --lens) REQUESTED_LENS="${2:?--lens requires a lens}" ;;
     --phase) PHASE_ID="${2:?--phase requires a phase id}" ;;
     *) echo "ERROR: unknown review option '$1'." >&2; exit 2 ;;
   esac
   shift 2
 done
-if [[ -n "${POOL_TYPE}" && ( -n "${FOLLOW_TO}" || -n "${NEW_SLOT}" ) ]]; then
-  echo "ERROR: --pool excludes --to and --slot." >&2
-  exit 2
-fi
 if [[ -n "${FOLLOW_TO}" && -n "${NEW_SLOT}" ]]; then
   echo "ERROR: --to excludes --slot." >&2
   exit 2
 fi
-POOL_PRODUCTION=""
-POOL_UNIT=""
-POOL_PHASE=""
-if [[ -n "${POOL_TYPE}" ]]; then
-  if [[ "${POOL_TYPE}" != code && "${POOL_TYPE}" != ui ]]; then
-    echo "ERROR: --pool requires code or ui." >&2
-    exit 2
-  fi
-  if [[ ! "${POOL_LEASE}" =~ ^([^/]+)/([^/]+)/([^/]+)$ ]]; then
-    echo "ERROR: --pool requires --lease slug/unit/phase." >&2
-    exit 2
-  fi
-  POOL_PRODUCTION="${BASH_REMATCH[1]}"
-  POOL_UNIT="${BASH_REMATCH[2]}"
-  POOL_PHASE="${BASH_REMATCH[3]}"
-elif [[ -n "${POOL_LEASE}" ]]; then
-  echo "ERROR: --lease requires --pool." >&2
+if [[ "${POOL_TYPE}" == ui ]]; then
+  echo 'ERROR: --pool ui is retired; use the fresh Claude helper in <UXReview/> for the design check.' >&2
   exit 2
+fi
+if [[ -n "${POOL_TYPE}" && "${POOL_TYPE}" != code ]]; then
+  echo "ERROR: --pool requires code or ui." >&2
+  exit 2
+fi
+if [[ -n "${POOL_TYPE}" || -n "${POOL_LEASE}" ]]; then
+  echo 'review.sh: --pool code and --lease are ignored; using the unit reviewer.' >&2
 fi
 
 SESSION_DIR="${1:?Usage: review.sh <session_dir> [working_dir] [prompt_file] [task] [role_description]}"
@@ -123,7 +113,7 @@ SUBTASK="${4:-review}"
 ROLE_DESC="${5:-blind review of the current diff against its spec}"
 PASS_ACTIVITY="${6:-reviewing the current diff against its work order}"
 PASS_INDEX="${7:-1}"
-LENS="${8:-}"
+LENS="${REQUESTED_LENS:-${8:-}}"
 LENS_ARGS=()
 if [[ -n "${LENS}" ]]; then
   LENS_ARGS=(--lens "${LENS}")
@@ -137,32 +127,20 @@ esac
 
 # A closed set, like the pass kinds: an unrecognized lens would suffix artifacts
 # nobody reads and record a pass under a worker no column renders, both silently.
-case "${LENS}" in
-  '') LENS_SLOT='' ;;
-  adversary) LENS_SLOT="test" ;;
-  contract) LENS_SLOT=impl ;;
-  # No writer sits in `review` since the three-worker team was folded into two,
-  # so the third lens takes it and its pass never closes a writer's window.
-  craft) LENS_SLOT=review ;;
-  ux) LENS_SLOT=review ;;
-  *)
-    echo "ERROR: unknown review lens '${LENS}' (adversary, contract, craft, ux)" >&2
-    exit 2
-    ;;
-esac
+LENS_SLOT="$("${BASH_SOURCE[0]%/*}/../lib/py" - "${BASH_SOURCE[0]}" "${LENS}" <<'PYLENS'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parents[2]))
+from scripts.usage.agents_log import LENSES
+lens = sys.argv[2]
+if lens and lens not in LENSES:
+    print(f"ERROR: unknown review lens '{lens}' ({', '.join(LENSES)})", file=sys.stderr)
+    sys.exit(2)
+print({"adversary": "test", "contract": "impl", "": ""}.get(lens, "review"))
+PYLENS
+)"
 
-if [[ "${POOL_TYPE}" == ui && "${LENS}" != ux ]]; then
-  echo "ERROR: --pool ui requires lens ux." >&2
-  exit 2
-fi
-if [[ "${POOL_TYPE}" == code && "${LENS}" == ux ]]; then
-  echo "ERROR: --pool code does not accept lens ux." >&2
-  exit 2
-fi
-
-# A assigned pass belongs to the chair that actually ran it, not to the lens's
-# historical default chair. Worker names end in their semantic slot (`impl`,
-# `test`, `review`, `fix2`); solo reviewers retain the lens mapping above.
+# An explicit worker keeps its slot. A fresh reviewer uses the lens slot.
 if [[ -n "${FOLLOW_TO}" ]]; then
   TEAM_SLOT="${FOLLOW_TO##*-}"
   if [[ ! "${TEAM_SLOT}" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]]; then
@@ -180,15 +158,13 @@ else
 fi
 
 SUFFIX="${LENS:+_${LENS}}"
-# What the shared heartbeat log tags this reviewer's beats with. Three lenses
-# run at once against one log, and `review` on every line cannot be read.
+# Give each lens a separate tag in the shared activity log.
 BEAT_TAG="${SUBTASK}${LENS:+:${LENS}}"
 # The worker this pass records under, so concurrent reviewers key separate pass
-# records instead of each closing the last as interrupted. Exported even when the
-# lens is absent and the worker with it: the lens decides this launcher's worker, and
-# leaving the variable unset instead would let an inherited one decide it, which
-# is how a lone reviewer ends up closing a live worker's pass.
+# records instead of closing another worker's pass. Replace any inherited slot;
+# ordinary allocation sets the selected review slot after the launch check.
 export UNIT_TEAM_ROLE="${TEAM_SLOT}"
+export UNIT_RUN_DIR="${SESSION_DIR}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${FOLLOW_TO}" ]]; then
@@ -203,9 +179,7 @@ fi
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.11.
 PY="${SCRIPT_DIR}/../lib/py"
-POOL_HELPER="${SCRIPT_DIR}/review_pool.py"
 MESH_SESSION_DIR="${SESSION_DIR}"
-POOL_ALLOCATED=0
 MESH_CLAIMED=0
 TURN_THREAD_ID=""
 LEASE_ORDINAL=0
@@ -221,21 +195,17 @@ mkdir -p "${ARTIFACT_DIR}"
 FINDINGS_FILE="${ARTIFACT_DIR}/review_findings_${PASS_INDEX}${SUFFIX}.txt"
 STATUS_FILE="${ARTIFACT_DIR}/review_status${SUFFIX}"
 SLOT_FILE="${ARTIFACT_DIR}/review_slot${SUFFIX}"
+rm -f "${SLOT_FILE}"
 # Each worker logs on its own: a second worker taking the same pass and lens would
 # otherwise truncate the first one's log, and with it the reason that worker failed.
 if [[ -n "${REVIEW_WORKER}" ]]; then
   SEAT_SUFFIX="-${TEAM_SLOT}"
-elif [[ -n "${POOL_TYPE}" ]]; then
-  SEAT_SUFFIX="-pool"
 else
   SEAT_SUFFIX=""
 fi
 LOG_FILE="${ARTIFACT_DIR}/review_agent_${PASS_INDEX}${SUFFIX}${SEAT_SUFFIX}.log"
 REPLY_FILE="${ARTIFACT_DIR}/review_reply_${PASS_INDEX}${SUFFIX}.$$.txt"
 TREE_BASELINE_FILE="${ARTIFACT_DIR}/review_tree_${PASS_INDEX}${SUFFIX}.$$.json"
-if [[ -n "${POOL_TYPE}" ]]; then
-  rm -f "${SLOT_FILE}"
-fi
 
 AGENT_FILE="${ARTIFACT_DIR}/review_agent${SUFFIX}"
 HEARTBEAT_HELPER="${SCRIPT_DIR}/../agents/heartbeat.sh"
@@ -245,7 +215,7 @@ PROGRESS_HELPER="${SCRIPT_DIR}/progress_history.py"
 PROGRESS_STATE="${SESSION_DIR}/progress_history_state.json"
 HEARTBEAT_INTERVAL_SECS=60
 
-# Validate before pool allocation, compaction or any reviewer starts. UX has no
+# Validate before worker allocation, compaction or any reviewer starts. UX has no
 # pass window, so this command also records its launch evidence.
 if [[ -f "${PROGRESS_STATE}" ]]; then
   if ! UNIT_PASS_OWNER=launcher "$PY" "${PROGRESS_HELPER}" check-launch \
@@ -257,6 +227,29 @@ if [[ -f "${PROGRESS_STATE}" ]]; then
     exit 1
   fi
 fi
+
+if [[ -z "${FOLLOW_TO}" && -z "${NEW_SLOT}" && ( -n "${POOL_TYPE}" || -n "${POOL_LEASE}" ) ]]; then
+  RESOLVE_ERROR_FILE="${ARTIFACT_DIR}/review_resolve${SUFFIX}.$$.txt"
+  if FOLLOW_TO="$("$PY" "${SCRIPT_DIR}/workers.py" resolve --session-dir "${SESSION_DIR}" --working-dir "${WORKING_DIR}" --role review --owner-pid "$$" 2>"${RESOLVE_ERROR_FILE}")"; then
+    rm -f "${RESOLVE_ERROR_FILE}"
+  else
+    RESOLVE_CAUSE="$(tr '\n' ' ' < "${RESOLVE_ERROR_FILE}")"
+    rm -f "${RESOLVE_ERROR_FILE}"
+    echo "error" > "${STATUS_FILE}"
+    echo "ERROR: no unit reviewer: ${RESOLVE_CAUSE% }" >&2
+    exit 1
+  fi
+  REVIEW_WORKER="${FOLLOW_TO}"
+  TEAM_SLOT="${FOLLOW_TO##*-}"
+  export UNIT_TEAM_ROLE="${TEAM_SLOT}"
+fi
+# Resolution can change the worker slot after the launch check.
+if [[ -n "${REVIEW_WORKER}" ]]; then
+  SEAT_SUFFIX="-${TEAM_SLOT}"
+else
+  SEAT_SUFFIX=""
+fi
+LOG_FILE="${ARTIFACT_DIR}/review_agent_${PASS_INDEX}${SUFFIX}${SEAT_SUFFIX}.log"
 
 initialize_review_artifacts() {
   # Every reader of the unnumbered paths — the unit director's mid-run
@@ -270,29 +263,17 @@ initialize_review_artifacts() {
     TURN_FINDINGS_READY=1
   fi
   echo "reviewing" > "${STATUS_FILE}"
+  printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
   # Only meaningful while an early launch is showing in the progress report,
   # and read there only if written after the review was armed.
   echo "$$" > "${ARTIFACT_DIR}/review_pid${SUFFIX}"
 }
 
-# A assigned reviewer opens a new occupancy of a chair a writer has just left.
-# Without a line of its own the note under the progress table keeps showing the
-# words of the worker that sat there while the code was being written, aged by
-# however long the review has run -- a line describing the wrong agent, which
-# reads as a stalled one. A lone reviewer holds no worker and posts nothing.
-# A fresh blind reviewer has no peers and no address, so its line says
-# `mesh=none`. A assigned review names the reused mesh address instead.
+# Each review names its persistent worker on the unit board.
 board_post() {
   [[ -n "${TEAM_SLOT}" ]] || return 0
   bash "${BOARD_HELPER}" post "${SESSION_DIR}" "${TEAM_SLOT}" "$1" "$2" || true
 }
-
-# A solo review creates its artifacts before agent resolution. A assigned review
-# claims first, so a busy-worker refusal cannot overwrite another review's status
-# or findings.
-if [[ -z "${REVIEW_WORKER}" && -z "${POOL_TYPE}" ]]; then
-  initialize_review_artifacts
-fi
 
 claim_follow() {
   "$PY" - "${MESH_SESSION_DIR}" "${FOLLOW_TO}" "${SCRIPT_DIR}/../agents/codex_mesh.py" \
@@ -466,23 +447,23 @@ PY
 
 write_turn_record() {
   UNIT_LIB_DIR="${SCRIPT_DIR%/*}/lib" "$PY" - "${SESSION_DIR}" "${TURN_STARTED_AT}" "$$" "${TURN_RECORD_STATUS}" \
-    "${POOL_TYPE}" "${POOL_PRODUCTION}" "${REVIEW_WORKER}" "${TURN_THREAD_ID}" \
+    "" "" "${REVIEW_WORKER}" "${TURN_THREAD_ID}" \
     "${TURN_LEASE}" "${TURN_PROGRESS}" "${LENS}" "${PASS_INDEX}" \
     "${LEASE_ORDINAL}" "${PRIME_HASH}" "${TURN_RAISED}" <<'PY'
+import itertools
 import json
 import os
 import sys
 import time
 from pathlib import Path
 
-(session, started, pid, status, pool_type, pool, reviewer, thread_id,
+(session, started, pid, status, legacy_type, pool, reviewer, thread_id,
  lease, progress, lens, number, ordinal, prime_hash, raised) = sys.argv[1:]
 metadata = json.loads(progress)
 thread_id = thread_id or metadata.get("thread_id", "")
-parts = lease.split("/")
-unit, phase = parts[1:] if len(parts) == 3 else ("", "")
+unit, phase = metadata.get("unit", ""), metadata.get("phase", "")
 record = {
-    "arm": "pool" if pool_type else "own", "pool": pool,
+    "arm": "own", "pool": pool,
     "reviewer": reviewer, "thread_id": thread_id, "unit": unit, "phase": phase,
     "phase_instance_id": metadata.get("phase_instance_id", ""),
     "history_file": metadata.get("history_file", ""),
@@ -495,9 +476,15 @@ sys.path.insert(0, os.environ["UNIT_LIB_DIR"])
 from unit_runs import history_root
 root = history_root() / "review_turns" / Path(session).name
 root.mkdir(parents=True, exist_ok=True)
-with (root / f"{started}-{pid}.json").open("x", encoding="utf-8") as output:
-    json.dump(record, output, ensure_ascii=False)
-    output.write("\n")
+for sequence in itertools.count():
+    try:
+        output = (root / f"{started}-{pid}-{sequence}.json").open("x", encoding="utf-8")
+    except FileExistsError:
+        continue
+    with output:
+        json.dump(record, output, ensure_ascii=False)
+        output.write("\n")
+    break
 PY
 }
 
@@ -505,7 +492,7 @@ finish_review_exit() {
   local code=$?
   trap - EXIT
   set +e
-  if [[ -n "${POOL_TYPE}" && "${code}" -ne 0 ]]; then
+  if [[ "${code}" -ne 0 && "${TURN_FINDINGS_READY}" -eq 1 ]]; then
     echo error > "${STATUS_FILE}"
   fi
   count_turn_findings
@@ -514,23 +501,13 @@ finish_review_exit() {
     echo "ERROR: unable to write review turn record." >&2
     code=1
   fi
-  if [[ "${MESH_CLAIMED}" -eq 1 ]]; then
-    cleanup_mesh_review
-  fi
-  if [[ "${POOL_ALLOCATED}" -eq 1 ]]; then
-    "$PY" "${POOL_HELPER}" release --production "${POOL_PRODUCTION}" \
-      --reviewer "${REVIEW_WORKER}" --pid "$$" --thread-id "${TURN_THREAD_ID}" >>"${LOG_FILE}" 2>&1
-  fi
+  cleanup_mesh_review
   exit "${code}"
 }
 
-interrupt_pool_review() {
+interrupt_review() {
   TURN_RECORD_STATUS="canceled"
-  # Stop the child before releasing the pool's ownership of its reviewer.
-  if [[ -n "${AGENT_PID:-}" ]]; then
-    kill "${AGENT_PID}" 2>/dev/null || true
-    wait "${AGENT_PID}" 2>/dev/null || true
-  fi
+  # The persistent worker keeps its running turn when this wrapper stops.
   if [[ -n "${HEARTBEAT_LOOP_PID:-}" ]]; then
     kill "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
     wait "${HEARTBEAT_LOOP_PID}" 2>/dev/null || true
@@ -539,9 +516,9 @@ interrupt_pool_review() {
   exit "$1"
 }
 
-if [[ -n "${POOL_TYPE}" || -n "${FOLLOW_TO}" ]]; then
+if [[ -n "${FOLLOW_TO}" || -n "${NEW_SLOT}" ]]; then
   TURN_STARTED_AT="$(date +%s)"
-  TURN_LEASE="${POOL_LEASE}"
+  TURN_LEASE=""
   # The record joins to the phase --phase names, the same phase start-pass stamps:
   # with phases open side by side, the newest open phase is often another one.
   TURN_PROGRESS="$("$PY" - "${PROGRESS_STATE}" "${SESSION_DIR}" "${FOLLOW_TO}" "${PHASE_ID}" <<'PY'
@@ -560,21 +537,16 @@ try:
     roster = json.loads((Path(sys.argv[2]) / "mesh_roster.json").read_text(encoding="utf-8"))
 except (OSError, ValueError):
     roster = {}
-print(json.dumps({"phase_instance_id": phase.get("instance_id", ""),
+print(json.dumps({"unit": state.get("unit", ""), "phase": phase.get("id", ""),
+                  "phase_instance_id": phase.get("instance_id", ""),
                   "history_file": state.get("history_file", ""),
                   "thread_id": roster.get(sys.argv[3], {}).get("thread_id", "")}))
 PY
 )"
   trap finish_review_exit EXIT
-  if [[ -n "${POOL_TYPE}" ]]; then
-    trap 'interrupt_pool_review 143' TERM
-    trap 'interrupt_pool_review 130' INT
-    trap 'interrupt_pool_review 129' HUP
-  else
-    trap 'TURN_RECORD_STATUS=canceled; exit 143' TERM
-    trap 'TURN_RECORD_STATUS=canceled; exit 130' INT
-    trap 'TURN_RECORD_STATUS=canceled; exit 129' HUP
-  fi
+  trap 'interrupt_review 143' TERM
+  trap 'interrupt_review 130' INT
+  trap 'interrupt_review 129' HUP
 fi
 
 # shellcheck source=/dev/null
@@ -607,56 +579,10 @@ fi
 TREE_BASELINE_READY=0
 TURN_IMAGE_ARGS=()
 
-if [[ -n "${POOL_TYPE}" ]]; then
-  CODEX_MESH="${UNIT_CODEX_MESH:-$(_agents_registry_get direct.options codex_mesh)}"
-  if [[ "${AGENT_FAMILY}" != codex || "${CODEX_MESH}" != 1 ]]; then
-    echo "ERROR: --pool requires the Codex mesh." >&2
-    exit 2
-  fi
-  if [[ "${POOL_TYPE}" == ui ]]; then
-    SHOTS_FILE="${ARTIFACT_DIR}/ux_shots_${PASS_INDEX}.txt"
-    if [[ ! -r "${SHOTS_FILE}" ]]; then
-      echo "ERROR: UI shots file is unreadable: ${SHOTS_FILE}." >&2
-      exit 1
-    fi
-    while IFS= read -r shot || [[ -n "${shot}" ]]; do
-      shot="${shot%$'\r'}"
-      [[ -n "${shot}" ]] || continue
-      TURN_IMAGE_ARGS+=(--image "${shot}")
-    done < "${SHOTS_FILE}"
-    if [[ "${#TURN_IMAGE_ARGS[@]}" -eq 0 ]]; then
-      echo "ERROR: UI shots file has no paths: ${SHOTS_FILE}." >&2
-      exit 1
-    fi
-  fi
-  if ! POOL_ALLOCATION="$("$PY" "${POOL_HELPER}" allocate \
-    --production "${POOL_PRODUCTION}" --type "${POOL_TYPE}" \
-    --unit "${POOL_UNIT}" --phase "${POOL_PHASE}" --pass "${PASS_INDEX}" \
-    "${LENS_ARGS[@]}" --pid "$$" 2>>"${LOG_FILE}")"; then
-    # The pool's last line is its reason (`no primed code template: <cause>`); the director acts on it.
-    echo "ERROR: pool allocation failed: $(tail -n 1 "${LOG_FILE}"); see ${LOG_FILE}." >&2
-    exit 1
-  fi
-  allocation_field() {
-    "$PY" -c 'import json, sys; print(json.loads(sys.argv[1])[sys.argv[2]])' \
-      "${POOL_ALLOCATION}" "$1"
-  }
-  REVIEW_WORKER="$(allocation_field reviewer)"
-  POOL_ALLOCATED=1
-  FOLLOW_TO="${REVIEW_WORKER}"
-  MESH_SESSION_DIR="$(allocation_field mesh_dir)"
-  TURN_THREAD_ID="$(allocation_field thread_id)"
-  LEASE_ORDINAL="$(allocation_field lease_ordinal)"
-  PRIME_HASH="$(allocation_field prime_hash)"
-  TEAM_SLOT="pool_${REVIEW_WORKER}"
-  printf '%s\n' "${TEAM_SLOT}" > "${SLOT_FILE}"
-  export UNIT_TEAM_ROLE="${TEAM_SLOT}"
-fi
-
 if [[ -n "${REVIEW_WORKER}" ]]; then
   CODEX_MESH="${UNIT_CODEX_MESH:-$(_agents_registry_get direct.options codex_mesh)}"
   if [[ "${AGENT_FAMILY}" != "codex" || "${CODEX_MESH}" != "1" ]]; then
-    echo "ERROR: review worker ${REVIEW_WORKER} is not available through the Codex mesh." >&2
+    echo "ERROR: review worker ${REVIEW_WORKER} requires the Codex mesh." >&2
     exit 2
   fi
   if [[ -n "${FOLLOW_TO}" ]]; then
@@ -675,14 +601,11 @@ if [[ -n "${REVIEW_WORKER}" ]]; then
     claim_follow
     MESH_CLAIMED=1
   fi
-  if [[ -n "${NEW_SLOT}" ]]; then
-    trap cleanup_mesh_review EXIT
-  fi
   if [[ -z "${EARLY_READY_FILE}" || -e "${EARLY_READY_FILE}" ]]; then
     capture_tree_baseline
   fi
-  initialize_review_artifacts
 fi
+initialize_review_artifacts
 
 printf 'task=%s\nfamily=%s\nagent=%s\neffort=%s\n' \
   "${TASK}" "${AGENT_FAMILY}" "${AGENT_MODEL}" "${AGENT_EFFORT}" > "${AGENT_FILE}"
@@ -752,25 +675,20 @@ if [[ -n "${EARLY_READY_FILE}" && -n "${REVIEW_WORKER}" ]]; then
   fi
 fi
 
-TURN_WORKTREE_ARGS=()
-if [[ -n "${POOL_TYPE}" ]]; then
-  TURN_WORKTREE_ARGS=(--cwd "${WORKING_DIR}" --read-only)
-fi
+TURN_WORKTREE_ARGS=(--cwd "${WORKING_DIR}" --read-only)
 if [[ -n "${FOLLOW_TO}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" follow \
     --session-dir "${MESH_SESSION_DIR}" --to "${FOLLOW_TO}" \
     --claim-pid "${FOLLOW_LAUNCHER_PID}" --role review "${LENS_ARGS[@]}" "${TURN_WORKTREE_ARGS[@]}" "${TURN_IMAGE_ARGS[@]}" \
     --message-file "${PROMPT_FILE}" --summary-file "${FINDINGS_FILE}" \
     --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
-    --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
     --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 elif [[ -n "${NEW_SLOT}" ]]; then
   "$PY" "${SCRIPT_DIR}/../agents/codex_mesh.py" start \
     --session-dir "${SESSION_DIR}" --name "${REVIEW_WORKER}" --role review "${LENS_ARGS[@]}" \
-    --cwd "${WORKING_DIR}" --prompt-file "${PROMPT_FILE}" \
+    --cwd "${WORKING_DIR}" --sandbox read-only --prompt-file "${PROMPT_FILE}" \
     --summary-file "${FINDINGS_FILE}" --reply-file "${REPLY_FILE}" \
-    --log-file "${LOG_FILE}" --model "${AGENT_MODEL}" \
-    --effort "${AGENT_EFFORT:-}" --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
+    --log-file "${LOG_FILE}" --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 else
   bash "${SCRIPT_DIR}/../agents/agent_exec.sh" \
     "${TASK}" readonly "${WORKING_DIR}" "${PROMPT_FILE}" "${FINDINGS_FILE}" "${LOG_FILE}" &
@@ -835,7 +753,7 @@ if [[ -n "${REVIEW_WORKER}" && "${TREE_BASELINE_READY}" -ne 0 ]]; then
 fi
 
 # The durable record stores this count before finish-pass closes the pass.
-if [[ -n "${POOL_TYPE}" || -n "${FOLLOW_TO}" ]]; then
+if [[ -n "${FOLLOW_TO}" || -n "${NEW_SLOT}" ]]; then
   count_turn_findings
 fi
 

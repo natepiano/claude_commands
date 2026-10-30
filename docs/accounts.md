@@ -37,9 +37,13 @@ Times are in the user's zone setting (`config/user_zone.conf`). The numbers are 
 
 The JSON has no login or folder fields. `--json` cannot be combined with `--detail`.
 
-Lines below the table also say when an account is not set up, is not logged in, or has a folder that could not be read. These notes use the account label, with no login address. An existing folder or sign-in check gives the reason instead when it already explains the row. The JSON `problems` list has the same lines.
+Each problem below the table uses one form: `<home or account>: <what is wrong>; <cause>; <step to fix it>`. The table and JSON `problems` use the same lines; JSON omits the `* ` footnote prefix. A direct folder or sign-in check replaces the empty-row summary for that cause.
 
-Each Claude group with no account has a note: `accounts: units has no account; run accounts.py move units <claudeN>` (or `showrunners`). A configured group has no such note; its account has the group in the Role column. The JSON `problems` list has the same notes.
+A login in the legacy home with no account note has one line, rather than separate usage-read, cutover and note hints. The line names the missing note, gives its `login:` value, then gives the cutover command. Other checks keep their facts and commands.
+
+A reserved test-domain login has its own cause. For example: `~/.codex: test sign-in is stored; a test wrote ~/.codex/auth.json at 2026-10-29 01:14 UTC; delete ~/.codex/auth.json`. The time is the file's modification time in the user's zone. Reserved domains include `.invalid`, `.test`, `.example`, `.localhost`, `example.com`, `example.net` and `example.org`, including subdomains. Status prints no account-note or cutover step for a test sign-in. It deletes nothing.
+
+Each Claude group with no account has a note: `units: not configured; the role map selects no account; run accounts.py move units <claudeN>` (or `showrunners`). A configured group has no such note; its account has the group in the Role column. The JSON `problems` list has the same notes.
 
 `status --stored`, with or without `--json`, skips every live usage read, subprocess and network call. It shows saved readings regardless of their age; `read_at` records when they were read. On natedev it reads the local role map; elsewhere it reads only `role_map_cache.json`, without ssh or a cache write. If no usable cache exists, roles are empty and `problems` names the missing map. Other commands keep their normal role-map fetch and cache behavior.
 
@@ -163,7 +167,7 @@ Never `/logout` in a unit director's session: every unit on that account stops w
 
 ## Moving the legacy home login
 
-Each machine cuts over separately. While `~/.claude` still holds a login, processes without `CLAUDE_CONFIG_DIR` retain that login's attribution and status prints `~/.claude holds a login; run accounts.py cutover-home`. After cutover they have no account; a stale status-line label does not identify them. Unscoped helpers, including the message relay, retain the legacy launch without an account setting until this machine cuts over. Afterwards they keep the caller’s numbered folder or select the showrunners group.
+Each machine cuts over separately. While `~/.claude` still holds a login, processes without `CLAUDE_CONFIG_DIR` retain that login's attribution and status prints `~/.claude: legacy login is stored; the home still holds a login; run accounts.py cutover-home`. After cutover they have no account; a stale status-line label does not identify them. Unscoped helpers, including the message relay, retain the legacy launch without an account setting until this machine cuts over. Afterwards they keep the caller’s numbered folder or select the showrunners group.
 
 On Linux, in a terminal after its legacy sessions have stopped:
 
@@ -199,7 +203,7 @@ On each machine, stop every Codex process using `~/.codex`, including its long-l
 
 The command verifies the account note, prepares the numbered home's shared links, and renames only `auth.json`; it never copies credentials. It then prints setup's wait line and starts Codex once on the numbered home, reporting done only after Codex answers `initialize`, which can take up to 20 minutes while the shared session index builds. If that startup fails, the login move stays complete and the command exits non-zero naming `accounts.py setup codex2`, which finishes the index. A live process on the source, or an unreadable process environment, refuses the move with its pid and the step to stop it. The private `cutover-codex-home.json` journal lets a rerun finish after an interruption. A completed rerun changes nothing. `cutover-home codex2 --undo` renames the login back after all processes on `~/.codex2` stop; bare `cutover-home --undo` still applies to Claude.
 
-After this cutover on natedev and the Mac, `~/.codex` holds no login on either machine and remains the shared configuration and session store. Running the Codex executable without `CODEX_HOME` is signed out; the `codex` alias (`accounts.py exec workers`) still selects the mapped numbered home. Until cutover, status prints `~/.codex holds a login; run accounts.py cutover-home codex2`; afterwards that home has no account row.
+After this cutover on natedev and the Mac, `~/.codex` holds no login on either machine and remains the shared configuration and session store. Running the Codex executable without `CODEX_HOME` is signed out; the `codex` alias (`accounts.py exec workers`) still selects the mapped numbered home. Until cutover, status prints `codex2: legacy login is stored; ~/.codex still holds a login; run accounts.py cutover-home codex2`; afterwards that home has no account row.
 
 ## Move a session
 
@@ -212,7 +216,7 @@ In this terminal:
 
 The first form moves one local ungrouped session, found by id, else by exact name. The second selects the group's account for future launches and moves every live member not already on it. An empty group still selects its account (`<group>: no live session moves`); an open shutdown receives no duplicate request. A session can request its own move, then mark ready and end its turn.
 
-A move never waits on a session agreeing to it. An idle session is stopped with no pause message. A busy one gets `Pause for move: <label> → <target> (<why>, <time>)`; its second line says the request comes from the shutdown the user started, not from another session's own choice, and gives the check to run in its own terminal, `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py status <account label> --here`, which lists the session under the move. It then stops at once and runs `ready --where`; a session that answers the pause and goes idle without that line is stopped too.
+A move never waits on a session agreeing to it. An idle session is stopped with no pause message. A busy one gets `Pause for move: <label> → <target> (<why>, <time>)`; its second line says the request comes from the shutdown the user started, not from another session's own choice, and gives the check to run in its own terminal, `~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py status <account label> --here`, which lists the session under the move. It then stops at once and runs `ready --where`, leaving Codex workers running: the mover pauses them after the owner exits and offers their resume commands after restart. Running Codex workers and unpushed commits do not block a move; merge and owner-readiness checks still apply. A session that answers the pause and goes idle without that line is stopped too. `ready` only answers an open stop or move request; without one it explains that there is nothing to check and prints the status command.
 
 Use `--no-alert` for live checks: it adds `--no-alert` to each `shutdown.py down`, so no shutdown alert reaches the phone. With `--dry-run --no-alert`, it prints each planned `down` command and changes nothing.
 
@@ -261,7 +265,7 @@ Claude accounts have room until they have an unresolved provider refusal. Withou
 
 natedev holds the one role map for both machines: Claude groups in `~/.local/state/accounts/groups.json`, workers in `~/.claude/config/accounts.json`, and changes in `~/.local/state/accounts/roles.jsonl`. All readers and writers use `read_role_map()` / `write_role_map(change)`. On the Mac, writes run through `ssh natedev` and preserve the reason, cause and move id; failed writes refuse without changing local selections. Reads fetch the map once per command and save `~/.local/state/accounts/role_map_cache.json`. When natedev is unreachable, a cached map prints `role map from <time in the user's zone>; natedev unreachable`; without a usable cache the command refuses. No machine selects a substitute account.
 
-A role mapped to an account missing on this machine refuses with `accounts: <role> is on <label>, which is not set up on this machine; <setup step>`. A signed-out account instead says `not logged in on this machine` and names its login step. Status prints the same problem under the table. Set up and sign in the mapped account on each machine before launching that role.
+A role mapped to an account missing on this machine refuses with `accounts: <role> is on <label>, which is not set up on this machine; <setup step>`. A signed-out account instead says `not logged in on this machine` and names its login step. Status prints those facts and the same command under the table in its subject, fault, cause and repair form. Set up and sign in the mapped account on each machine before launching that role.
 
 `groups.json` stores explicitly selected group accounts. A manual group move, a refusal move or an account move entry writes it; selecting one group leaves the other unconfigured. Both groups may use the same account. Changes append `{at, group, label, why}` to `roles.jsonl`; historical burn skips these group entries. Launches, status, `accounts.py placement --explain` and the refusal watcher never initialize missing selections. Status and previews print `not configured`, and the watcher moves no member of an unconfigured group.
 

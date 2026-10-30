@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import json
 import os
 import shlex
@@ -21,7 +23,7 @@ import rules
 import style_ledger
 import unit_plans
 import style_rules
-from add_unit import read_production
+from production_units import read_production
 from production_units import production_field
 from scripts.accounts.accounts import NamedAccount
 from scripts.herdr import herdr
@@ -86,7 +88,7 @@ def run_script(script, *arguments):
     return real_run_script(script, *arguments)
 
 with mock.patch.object(add_style, "_run_script", side_effect=run_script), mock.patch.object(
-    add_style, "herdr_tab_open", side_effect=lambda name:
+    add_style, "herdr_tab_open", side_effect=lambda name, ending:
     (Path(os.environ["TEST_LIVE_SESSIONS"]) / name).exists()
 ):
     raise SystemExit(add_style.main(sys.argv[2:]))
@@ -216,6 +218,37 @@ class AddStyleTests(unittest.TestCase):
             _ = (member / "src/lib.rs").write_text("pub fn member() {}\n")
         _ = self.git("add", "--all")
         _ = self.git("commit", "-q", "-m", "Add workspace packages")
+
+    def interrupted_bootstrap_publish(self, path: Path) -> None:
+        injection = """import atomic_file
+real_replace = atomic_file.os.replace
+def interrupted_replace(source, destination):
+    if Path(destination) == Path(os.environ["TEST_STOP_FILE"]):
+        raise OSError("stopped before publish")
+    return real_replace(source, destination)
+atomic_file.os.replace = interrupted_replace
+"""
+        stopped_bootstrap = BOOTSTRAP.replace("real_run_script =", injection + "\nreal_run_script =", 1)
+        with mock.patch.dict(self.env, {"TEST_STOP_FILE": str(path)}), mock.patch.dict(
+            globals(), {"BOOTSTRAP": stopped_bootstrap}
+        ):
+            stopped = self.run_bootstrap(success=False)
+        self.assertEqual(stopped.returncode, 2, stopped.stderr)
+        self.assertIn("stopped before publish", stopped.stderr)
+        self.assertFalse(path.exists())
+        finished = self.run_bootstrap()
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertEqual(read_production(self.doc).merge_branch, "style/main")
+        self.assertEqual(len(list((self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))), 4)
+        self.assertIn("## Units", self.doc.read_text())
+        self.assertIn("## Phases", (self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md").read_text())
+        self.assertEqual(sum(call["command"] == "launch.py" for call in self.calls()), 1)
+
+    def test_interrupted_first_production_doc_publish_reruns_bootstrap(self) -> None:
+        self.interrupted_bootstrap_publish(self.doc)
+
+    def test_interrupted_first_unit_plan_publish_reruns_bootstrap(self) -> None:
+        self.interrupted_bootstrap_publish(self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md")
 
     def test_pilot_rows_and_package_scopes_are_ready_before_the_showrunner_launches(self) -> None:
         self.add_workspace_packages()
@@ -584,10 +617,7 @@ class AddStyleTests(unittest.TestCase):
         )
         before = self.git("status", "--porcelain", "--untracked-files=all"), self.git("show-ref"), self.doc.read_text()
         agent_config = self.root / "agents.conf"
-        _ = agent_config.write_text(
-            "[assignments]\nproduction=claude\n\n[production.claude]\ndirector=opus:xhigh\n\n"
-            + "[claude.agents]\nopus=low,medium,high,xhigh\n",
-        )
+        _ = write_registry(agent_config, {'assignments': {'production': 'claude'}, 'production.claude': {'director': 'opus:xhigh'}, 'claude.agents': {'opus': 'low,medium,high,xhigh'}})
         catalog_sync = self.root / "catalog-synced"
         catalog_sync.touch()
 
@@ -707,3 +737,7 @@ class AddStyleTests(unittest.TestCase):
         self.assertEqual({path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}, before)
         self.assertEqual((self.calls(), self.sync()), (calls, sync))
         self.assertEqual(production_field(self.doc.read_text().splitlines(), "Parent production"), str(self.parent))
+
+
+if __name__ == "__main__":
+    _ = unittest.main()

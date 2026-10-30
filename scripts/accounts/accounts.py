@@ -8,6 +8,7 @@ import asyncio
 import ctypes
 import errno
 import fcntl
+import io
 import json
 import math
 import os
@@ -20,8 +21,9 @@ import subprocess
 import sys
 import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import ContextVar
 from collections.abc import Callable, Generator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, redirect_stderr
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -62,7 +64,7 @@ from scripts.accounts.role_map import (  # noqa: E402
 if TYPE_CHECKING:
     from scripts.agents.codex_mesh import WorkersRunSwitch
     from scripts.shutdown.inventory import ListedSession, Session, ShowrunnerRegistrations
-    from scripts.shutdown.record import SessionShutdown
+    from scripts.shutdown.shutdown_record import SessionShutdown
 
 
 class PromptTakingMember(Protocol):
@@ -268,11 +270,28 @@ AccountSelection = ClaudeLaunchAccount | CodexWorkersAccount
 
 
 @dataclass(frozen=True)
+class NoObservedStateCause:
+    """No direct directory or identity fault explains the account state."""
+
+
+@dataclass(frozen=True)
+class ObservedStateCause:
+    """The inspection's direct diagnostic and its complete cause identity."""
+
+    diagnostic: str
+    key: ProblemCauseKey
+
+
+NO_OBSERVED_STATE_CAUSE = NoObservedStateCause()
+
+
+@dataclass(frozen=True)
 class AccountDirectoryReady:
     """A safe directory logged in as the account its note names."""
 
     login: str
     problems: tuple[str, ...] = ()
+    state_source: ObservedStateCause | NoObservedStateCause = field(default_factory=NoObservedStateCause)
 
 
 @dataclass(frozen=True)
@@ -280,6 +299,7 @@ class AccountDirectoryLoggedOut:
     """A safe directory that can start Claude to log in."""
 
     problems: tuple[str, ...]
+    state_source: ObservedStateCause | NoObservedStateCause = field(default_factory=NoObservedStateCause)
 
 
 @dataclass(frozen=True)
@@ -288,6 +308,7 @@ class AccountDirectoryWrongLogin:
 
     login: str
     problems: tuple[str, ...]
+    state_source: ObservedStateCause | NoObservedStateCause = field(default_factory=NoObservedStateCause)
 
 
 @dataclass(frozen=True)
@@ -295,6 +316,7 @@ class AccountDirectoryNotSetUp:
     """The named directory does not exist yet."""
 
     problems: tuple[str, ...]
+    state_source: ObservedStateCause | NoObservedStateCause = field(default_factory=NoObservedStateCause)
 
 
 @dataclass(frozen=True)
@@ -302,6 +324,7 @@ class AccountDirectoryBrokenLinks:
     """Directory or identity isolation, or a shared link, needs repair."""
 
     problems: tuple[str, ...]
+    state_source: ObservedStateCause | NoObservedStateCause = field(default_factory=NoObservedStateCause)
 
 
 @dataclass(frozen=True)
@@ -309,6 +332,7 @@ class AccountDirectoryUnreadable:
     """Identity or required account-note data cannot establish readiness."""
 
     problems: tuple[str, ...]
+    state_source: ObservedStateCause | NoObservedStateCause = field(default_factory=NoObservedStateCause)
 
 
 AccountDirectoryReadiness = (
@@ -334,6 +358,7 @@ class UnreadableClaudeDirectoryIdentity:
     """Existing identity data is inaccessible or malformed."""
 
     problem: str
+    cause_kind: Literal["access", "identity"] = "access"
 
 
 ClaudeDirectoryIdentity = ClaudeDirectoryLogin | ClaudeDirectoryLoggedOut | UnreadableClaudeDirectoryIdentity
@@ -422,6 +447,7 @@ class AccountStatus:
     unclassified: tuple[str, ...]
     missing_mcp_servers: tuple[str, ...]
     extra_mcp_servers: tuple[str, ...]
+    state_source: ObservedStateCause | NoObservedStateCause = field(default_factory=NoObservedStateCause)
 
 
 @dataclass(frozen=True)
@@ -935,7 +961,7 @@ def _directory_identity(config_dir: Path) -> ClaudeDirectoryIdentity:
         login = cast(dict[str, object], oauth).get("emailAddress")
         if isinstance(login, str) and login.strip():
             return ClaudeDirectoryLogin(login)
-    return UnreadableClaudeDirectoryIdentity(f"accounts: {path} has an invalid oauthAccount identity")
+    return UnreadableClaudeDirectoryIdentity(f"accounts: {path} has an invalid oauthAccount identity", "identity")
 
 
 _account_notes_directory = note_file.notes_dir
@@ -985,23 +1011,30 @@ def account_directory_readiness(label: str) -> AccountDirectoryReadiness:
     return _inspect_account_directory(selected, _account_note(label))
 
 
+def _observed_state_cause(selected: NamedAccount, kind: ProblemKind, path: Path,
+                          diagnostic: str) -> ObservedStateCause:
+    return ObservedStateCause(diagnostic, ProblemCauseKey(kind, CauseAccount(selected.label), CauseFile(str(path))))
+
+
 def _inspect_account_directory(
     selected: NamedAccount, expected: AccountNote, *, allow_shared_repair: bool = False,
 ) -> AccountDirectoryReadiness:
     label = selected.label
     destination = selected.dir
     if destination.is_symlink():
-        return AccountDirectoryBrokenLinks((
-            f"accounts: {destination} is a link; an account dir must be a real directory",
-        ))
+        diagnostic = f"accounts: {destination} is a link; an account dir must be a real directory"
+        return AccountDirectoryBrokenLinks((diagnostic,), _observed_state_cause(selected, "access", destination, diagnostic))
     try:
         metadata = destination.stat()
         if not stat.S_ISDIR(metadata.st_mode):
-            return AccountDirectoryBrokenLinks((f"accounts: {destination} is not a directory",))
+            diagnostic = f"accounts: {destination} is not a directory"
+            return AccountDirectoryBrokenLinks((diagnostic,), _observed_state_cause(selected, "access", destination, diagnostic))
     except FileNotFoundError:
-        return AccountDirectoryNotSetUp((f"accounts: {destination} is missing",))
+        diagnostic = f"accounts: {destination} is missing"
+        return AccountDirectoryNotSetUp((diagnostic,), _observed_state_cause(selected, "access", destination, diagnostic))
     except OSError as error:
-        return AccountDirectoryUnreadable((f"accounts: could not inspect {destination}: {error}",))
+        diagnostic = f"accounts: could not inspect {destination}: {error}"
+        return AccountDirectoryUnreadable((diagnostic,), _observed_state_cause(selected, "access", destination, diagnostic))
     identity_problems = _identity_link_problems(destination)
     shared_problems = (_shared_repair_problems(destination, main_config_dir().absolute(), SHARED, ALWAYS_LINKED)
                        if allow_shared_repair else _link_problems(destination))
@@ -1012,10 +1045,15 @@ def _inspect_account_directory(
     if (destination / ".claude.json").is_symlink():
         if not isinstance(expected, ExpectedAccountLogin):
             problems.append(expected.problem)
-        return AccountDirectoryBrokenLinks(tuple(problems))
+        path = destination / ".claude.json"
+        diagnostic = f"accounts: {path} is a link; identity stays in each account dir"
+        return AccountDirectoryBrokenLinks(tuple(problems), _observed_state_cause(selected, "access", path, diagnostic))
+    state_source: ObservedStateCause | NoObservedStateCause = NO_OBSERVED_STATE_CAUSE
     identity = _directory_identity(destination)
     if isinstance(identity, UnreadableClaudeDirectoryIdentity):
         problems.append(identity.problem)
+        state_source = _observed_state_cause(selected, identity.cause_kind,
+            agent_accounts.claude_config_file(destination), identity.problem)
     if isinstance(expected, UnreadableAccountNote):
         problems.append(expected.problem)
     if isinstance(identity, ClaudeDirectoryLoggedOut):
@@ -1030,19 +1068,29 @@ def _inspect_account_directory(
                 f"accounts: ~/.claude{_label_number(label)} is logged in as {identity.login}, not {label}; see Log out and in in ~/.claude/docs/accounts.md"
             )
     if links:
-        return AccountDirectoryBrokenLinks(tuple(problems))
+        return AccountDirectoryBrokenLinks(tuple(problems), state_source)
     if (
         isinstance(identity, UnreadableClaudeDirectoryIdentity)
         or isinstance(expected, UnreadableAccountNote)
         or private_problems
         or isinstance(identity, ClaudeDirectoryLogin) and isinstance(expected, MissingAccountNote)
     ):
-        return AccountDirectoryUnreadable(tuple(problems))
+        return AccountDirectoryUnreadable(tuple(problems), state_source)
     if isinstance(identity, ClaudeDirectoryLoggedOut):
         return AccountDirectoryLoggedOut(tuple(problems))
     if wrong_login:
         return AccountDirectoryWrongLogin(identity.login, tuple(problems))
     return AccountDirectoryReady(identity.login)
+
+
+class AccountInspectionProblems(list[str]):
+    """Command diagnostics with the state cause recorded by their inspection."""
+
+    state_source: ObservedStateCause | NoObservedStateCause
+
+    def __init__(self, inspection: AccountDirectoryReadiness) -> None:
+        super().__init__(inspection.problems)
+        self.state_source = inspection.state_source
 
 
 def check(label: str) -> list[str]:
@@ -1054,7 +1102,7 @@ def check(label: str) -> list[str]:
     parsed = numbered_account_label(label, "claude")
     expected = _account_note(parsed.label)
     directory = account_dir(parsed.label)
-    return list(_inspect_account_directory(NamedAccount(label, directory), expected).problems)
+    return AccountInspectionProblems(_inspect_account_directory(NamedAccount(label, directory), expected))
 
 
 def _setup_codex_home(label: str) -> list[str]:
@@ -2998,9 +3046,9 @@ class MoveShutdownReady:
 def _prepare_move_shutdown(saved: SessionShutdown, *, dry_run: bool) -> MoveShutdownReady | MoveRefused:
     """Close only a proven live session's unconfirmed restart before moving it."""
     if TYPE_CHECKING:
-        from scripts.shutdown import record
+        from scripts.shutdown import shutdown_record
     else:
-        record = import_module("record")
+        shutdown_record = import_module("shutdown_record")
     restart = cast(RestartRecordLiveness, cast(object, import_module("restart")))
     settle = cast(ShutdownLocation, cast(object, import_module("settle")))
     if not restart.restart_failed_session_running(saved):
@@ -3008,11 +3056,11 @@ def _prepare_move_shutdown(saved: SessionShutdown, *, dry_run: bool) -> MoveShut
     name = saved["session"]["name"]
     if dry_run:
         return MoveShutdownReady((f"{name}: would close its unconfirmed restart record; the session is running",))
-    outcome = record.forget_failed_restart(saved["login"], saved["session"]["session_id"],
+    outcome = shutdown_record.forget_failed_restart(saved["login"], saved["session"]["session_id"],
                                          settle.local_machine(), saved["request_id"])
-    if not isinstance(outcome, record.SessionForgotten):
+    if not isinstance(outcome, shutdown_record.SessionForgotten):
         return MoveRefused("already has a shutdown in progress")
-    _ = record.acknowledge_snapshot(saved["login"], saved["session"]["session_id"])
+    _ = shutdown_record.acknowledge_snapshot(saved["login"], saved["session"]["session_id"])
     return MoveShutdownReady((f"{name}: closed its unconfirmed restart record; the session is running",))
 
 
@@ -3023,10 +3071,10 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
     transition_id = move_id or uuid4().hex
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory, record
+        from scripts.shutdown import inventory, shutdown_record
     else:
         inventory = import_module("inventory")
-        record = import_module("record")
+        shutdown_record = import_module("shutdown_record")
     outcomes: dict[str, SessionMoveRequested | SessionMoveRefused] = {}
     owners: dict[str, ListedSession] = {}
     groups: dict[str, list[str]] = {}
@@ -3044,7 +3092,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
                 refuse(session_id, destination.reason)
             return tuple(outcomes[session_id] for session_id in ids)
         live = {item.session_id: item for item in inventory.listing()}
-        before = {saved["session"]["session_id"]: saved for saved in record.all_session_records()}
+        before = {saved["session"]["session_id"]: saved for saved in shutdown_record.all_session_records()}
         for session_id in ids:
             found = live.get(session_id)
             if found is None:
@@ -3074,7 +3122,7 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
                                   if entry["kind"] == "requested"}
                 result = subprocess.run(command, capture_output=True, text=True, check=False,
                     env={**os.environ, "REFUSAL_WATCH_INVENTORY": "read existing"})
-                saved_by_id = {saved["session"]["session_id"]: saved for saved in record.all_session_records()}
+                saved_by_id = {saved["session"]["session_id"]: saved for saved in shutdown_record.all_session_records()}
                 for session_id in selected_ids:
                     saved = saved_by_id.get(session_id)
                     if saved is None or saved.get("target") != target:
@@ -3104,10 +3152,10 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str, origin: MoveOr
                         if "reset" in fields:
                             request["reset"] = fields["reset"]
                         moves.append_move(request)
-            except (OSError, ValueError, record.InvalidRecord) as error:
+            except (OSError, ValueError, shutdown_record.InvalidRecord) as error:
                 for session_id in selected_ids:
                     refuse(session_id, str(error))
-    except (AccountsError, OSError, ValueError, inventory.InvalidInventory, record.InvalidRecord) as error:
+    except (AccountsError, OSError, ValueError, inventory.InvalidInventory, shutdown_record.InvalidRecord) as error:
         for session_id in ids:
             if session_id not in outcomes:
                 refuse(session_id, str(error))
@@ -3316,10 +3364,10 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
     if isinstance(checked, MoveRefused):
         return checked
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory, record
+        from scripts.shutdown import inventory, shutdown_record
     else:
         inventory = import_module("inventory")
-        record = import_module("record")
+        shutdown_record = import_module("shutdown_record")
     registrations = inventory.showrunner_registrations()
     members = live_group_members(registrations=registrations)[group]
     selected = [session for session in members if not session_on_account(session, target)]
@@ -3333,7 +3381,7 @@ def move_group(group: ClaudeGroup, target: str, *, dry_run: bool = False, why: s
             for runner in inventory.unregistered_showrunners(members, registrations=registrations))
     if dry_run:
         closing: tuple[str, ...] = ()
-        for saved in record.all_session_records():
+        for saved in shutdown_record.all_session_records():
             if saved["session"]["session_id"] not in ids:
                 continue
             prepared = _prepare_move_shutdown(saved, dry_run=True)
@@ -3376,10 +3424,10 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
     target = note_file.canonical_label(target)
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
     if TYPE_CHECKING:
-        from scripts.shutdown import inventory, record
+        from scripts.shutdown import inventory, shutdown_record
     else:
         inventory = import_module("inventory")
-        record = import_module("record")
+        shutdown_record = import_module("shutdown_record")
     try:
         now = datetime.now(timezone.utc)
         checked = check_move_target(target, now, repair=not dry_run)
@@ -3402,7 +3450,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         if session_on_account(owner, target):
             return MoveRefused(f"{owner.name} is already on {checked.destination.label}")
         closing: tuple[str, ...] = ()
-        for saved in record.all_session_records():
+        for saved in shutdown_record.all_session_records():
             if saved["session"]["session_id"] != owner.session_id:
                 continue
             prepared = _prepare_move_shutdown(saved, dry_run=True)
@@ -3417,7 +3465,7 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         stdout, stderr, code = _move_output(results, checked.notices, owner.session_id, GROUP_NOT_CONFIGURED)
         outcome = MoveStartFailed if code else MoveStarted
         return outcome(owner.session_id, target, stdout, stderr, code)
-    except (AccountsError, record.InvalidRecord, inventory.InvalidInventory, OSError, ValueError) as error:
+    except (AccountsError, shutdown_record.InvalidRecord, inventory.InvalidInventory, OSError, ValueError) as error:
         return MoveRefused(str(error))
 
 
@@ -3684,7 +3732,8 @@ def _existing_named_accounts() -> list[NamedAccount]:
     return sorted(accounts, key=lambda account: _label_number(account.label))
 
 
-def _status_for(config_dir: Path, folder: str, named: NamedAccount, problems: list[str]) -> AccountStatus:
+def _status_for(config_dir: Path, folder: str, named: NamedAccount, problems: list[str],
+                state_source: ObservedStateCause | NoObservedStateCause = NO_OBSERVED_STATE_CAUSE) -> AccountStatus:
     baseline = _mcp_server_names(accounts_home() / ".claude.json")
     account_is_safe_to_inspect = not config_dir.is_symlink() and not (
         (config_dir / ".claude.json").is_symlink()
@@ -3717,6 +3766,7 @@ def _status_for(config_dir: Path, folder: str, named: NamedAccount, problems: li
         unclassified=unclassified,
         missing_mcp_servers=tuple(sorted(baseline - current)),
         extra_mcp_servers=tuple(sorted(current - baseline)),
+        state_source=state_source,
     )
 
 
@@ -3742,7 +3792,9 @@ def account_statuses() -> list[AccountStatus]:
         folder = f"~/.claude{_label_number(label)}"
         named = on_disk.get(label)
         if named is not None:
-            statuses.append(_status_for(named.dir, folder, named, check(label)))
+            problems = check(label)
+            source = problems.state_source if isinstance(problems, AccountInspectionProblems) else NO_OBSERVED_STATE_CAUSE
+            statuses.append(_status_for(named.dir, folder, named, problems, source))
             continue
         statuses.append(AccountStatus(
             folder=folder,
@@ -3855,7 +3907,7 @@ REFRESH_STALE_USAGE = RefreshStaleUsage()
 
 def _stored_usage(
     statuses: list[AccountStatus], codex: list[CodexStatus], now: datetime,
-    source: UsageSource = REFRESH_STALE_USAGE,
+    source: UsageSource = REFRESH_STALE_USAGE, *, problems: list[StatusProblem], represented_stderr: set[str],
 ) -> dict[str, usage_store.StoredUsage]:
     """Each login's stored readings. A login with none read lately is read live first, all at once."""
     stored = usage_store.load()
@@ -3886,12 +3938,38 @@ def _stored_usage(
                 for index, status in enumerate(codex):
                     if status.home == startup.home:
                         codex[index] = replace(status, startup=startup, problems=(*status.problems, startup.problem))
+        pending_warnings = [(report, warning) for report in reports for warning in report.store_warnings]
+        represented_stderr.update(agent_accounts.usage_store_warning_line(warning) for _, warning in pending_warnings)
         try:
             usage_store.save(reports, now)
             stored = usage_store.load()
-        except OSError:
+        except (OSError, ValueError) as error:
             # Keep this reading visible even if the store cannot be written.
             _ = usage_store.merge(stored, reports, now)
+            pending_warnings = [(report, warning) for report, warning in pending_warnings
+                                if isinstance(warning, agent_accounts.UsageClaimFailed)] + [
+                (report, agent_accounts.UsageSaveFailed("; ".join(dict.fromkeys([
+                    *(warning.reason for warning in report.store_warnings if isinstance(warning, agent_accounts.UsageSaveFailed)),
+                    str(error)])))) for report in reports]
+        else:
+            # The final save recovers a failed per-read save, but cannot restore a missed hold.
+            pending_warnings = [(report, warning) for report, warning in pending_warnings
+                                if isinstance(warning, agent_accounts.UsageClaimFailed)]
+        for report, warning in pending_warnings:
+            directory = report.source
+            subject = next((_status_subject(status) for status in [*statuses, *codex]
+                            if (isinstance(directory, agent_accounts.ClaudeDirectorySource) and isinstance(status, AccountStatus)
+                                and status.config_dir == directory.directory)
+                            or (isinstance(directory, agent_accounts.CodexHomeSource) and isinstance(status, CodexStatus)
+                                and status.home == directory.home)), report.tool)
+            claim_failed = isinstance(warning, agent_accounts.UsageClaimFailed)
+            problems.append(StatusProblem(subject,
+                "usage store read continued without a hold" if claim_failed else "usage store reading not saved",
+                ProblemCause("usage claim" if claim_failed else "usage save", warning.reason,
+                    CauseFile(str(directory.directory if isinstance(directory, agent_accounts.ClaudeDirectorySource)
+                                  else directory.home if isinstance(directory, agent_accounts.CodexHomeSource)
+                                  else usage_store.store_file()))),
+                ProblemStep("check the usage store file and its permissions; run accounts.py status again")))
     return stored
 
 
@@ -3942,6 +4020,7 @@ class StatusReading:
     detail_lines: tuple[str, ...]
     zone: tzinfo
     checked_at: datetime
+    represented_stderr: tuple[str, ...] = ()
 
 
 class StatusAccountDocument(TypedDict):
@@ -4065,26 +4144,140 @@ def render_status_json(reading: StatusReading) -> str:
     return json.dumps(StatusDocument(accounts=accounts, problems=[note.removeprefix("* ") for note in reading.notes]))
 
 
-def _read_failure_note(row: StatusRow, zone: tzinfo) -> str:
-    previous = (f", so this shows the reading from {row.read_at.astimezone(zone):%H:%M}"
-                if isinstance(row.read_at, datetime) else " and no reading is stored yet")
+ProblemKind = Literal["warning", "usage claim", "usage save", "startup", "usage", "legacy", "unnoted", "test login", "access", "identity", "signed out", "wrong login", "unreadable note", "note", "state", "check", "role", "unclassified", "mcp servers"]
+
+
+@dataclass(frozen=True)
+class NoSeparateCause:
+    """The fault itself states all that is known about its cause."""
+
+
+@dataclass(frozen=True)
+class NoCauseFile:
+    """The cause does not name one file."""
+
+
+@dataclass(frozen=True)
+class CauseFile:
+    path: str
+
+
+NO_CAUSE_FILE = NoCauseFile()
+
+
+@dataclass(frozen=True)
+class DuplicateLoginHomes:
+    """The two homes that share one sign-in, in a stable order."""
+
+    homes: tuple[str, str]
+
+
+@dataclass(frozen=True)
+class NoCauseAccount:
+    """The cause does not name a numbered account."""
+
+
+@dataclass(frozen=True)
+class CauseAccount:
+    label: str
+
+
+@dataclass(frozen=True)
+class OwnProblemCause:
+    """This diagnostic describes its cause directly."""
+
+
+@dataclass(frozen=True)
+class ProblemCauseKey:
+    """One cause on one account or home, shared by its symptoms."""
+
+    kind: ProblemKind
+    account: CauseAccount | NoCauseAccount
+    location: CauseFile | DuplicateLoginHomes | NoCauseFile
+
+
+@dataclass(frozen=True)
+class ProblemCause:
+    kind: ProblemKind
+    explanation: str
+    location: CauseFile | DuplicateLoginHomes | NoCauseFile = NoCauseFile()
+    account: CauseAccount | NoCauseAccount = NoCauseAccount()
+    key: ProblemCauseKey | OwnProblemCause = OwnProblemCause()
+
+
+@dataclass(frozen=True)
+class NoUserStep:
+    """No separate user action is known or needed."""
+
+
+@dataclass(frozen=True)
+class ProblemStep:
+    instruction: str
+
+
+@dataclass(frozen=True)
+class StatusProblem:
+    """One subject, fault, cause and repair, before either status renderer."""
+
+    subject: str
+    wrong: str
+    cause: ProblemCause | NoSeparateCause
+    step: ProblemStep | NoUserStep
+    footnote: bool = False
+    origin: Literal["diagnostic", "account state", "role"] = "diagnostic"
+    state_source: ObservedStateCause | NoObservedStateCause = field(default_factory=NoObservedStateCause)
+
+
+def render_status_problem(problem: StatusProblem) -> str:
+    parts = [f"{problem.subject}: {problem.wrong}"]
+    if isinstance(problem.cause, ProblemCause):
+        parts.append(problem.cause.explanation)
+    if isinstance(problem.step, ProblemStep):
+        parts.append(problem.step.instruction)
+    return ("* " if problem.footnote else "") + "; ".join(parts)
+
+
+def is_test_login(login: str) -> bool:
+    """Recognize reserved test domains, including their subdomains."""
+    _, separator, domain = login.rpartition("@")
+    domain = domain.casefold().rstrip(".")
+    return bool(separator) and any(domain == reserved or domain.endswith("." + reserved)
+        for reserved in ("invalid", "test", "example", "localhost", "example.com", "example.net", "example.org"))
+
+
+NO_STARTUP_FAILURE = agent_accounts.NoCodexStartupFailure()
+
+
+def _read_failure_problem(row: StatusRow, zone: tzinfo,
+                          startup: agent_accounts.CodexStartupStatus = NO_STARTUP_FAILURE) -> list[StatusProblem]:
+    previous = (f"this shows the reading from {row.read_at.astimezone(zone):%H:%M}"
+                if isinstance(row.read_at, datetime) else "no reading is stored yet")
     match row.read_outcome:
         case agent_accounts.UsageReadOutcome.STALE_TOKEN:
             attempt = login_renewal_attempts().get(row.label)
-            reason = (f"login token expired; a probe session at {attempt.at.astimezone(zone):%H:%M} failed; log in on it by hand"
-                      if attempt is not None and isinstance(attempt.result, LoginRenewalFailed)
-                      else "login token expired; the next notes pass renews it")
+            failed = attempt is not None and isinstance(attempt.result, LoginRenewalFailed)
+            cause = (f"login token expired; a probe session at {attempt.at.astimezone(zone):%H:%M} failed"
+                     if failed and attempt is not None else "login token expired")
+            step = "log in on it by hand" if failed else "the next notes pass renews it"
         case agent_accounts.UsageReadOutcome.REFUSED_401:
-            reason = "the usage service did not accept this login; start a session on it to check it"
+            cause = "the usage service did not accept this login"
+            step = "start a session on it to check it"
         case agent_accounts.UsageReadOutcome.RATE_LIMITED_429:
             retry = (f"after {(row.attempted_at + timedelta(minutes=10)).astimezone(zone):%H:%M}"
                      if isinstance(row.attempted_at, datetime) else "in 2 min")
-            reason = f"the usage service is busy{previous}; next try {retry}"
+            cause, step = f"the usage service is busy; {previous}", f"next try {retry}"
         case agent_accounts.UsageReadOutcome.ERROR:
-            reason = f"the usage read failed{previous}; next try in 2 min"
+            cause, step = f"the usage read failed; {previous}", "next try in 2 min"
         case agent_accounts.UsageReadOutcome.OK | agent_accounts.UsageReadOutcome.HELD:
-            return ""
-    return f"* {row.label}: {reason}"
+            cause, step = "", ""
+    subject = row.label if _label_is(row.label, "claude") or _label_is(row.label, "codex") else row.folder
+    if isinstance(startup, agent_accounts.CodexStartupFailure):
+        return [StatusProblem(subject, "usage unavailable",
+            ProblemCause("startup", f"Codex did not start at {agent_accounts.codex_home_display(startup.home)}; {previous}"),
+            ProblemStep(f"run {startup.setup_command} and try again" + (f"; {step}" if step else "")), True)]
+    if row.read_outcome in (agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.HELD):
+        return []
+    return [StatusProblem(subject, "usage unavailable", ProblemCause("usage", cause), ProblemStep(step), True)]
 
 
 def render_status_table(reading: StatusReading) -> str:
@@ -4106,41 +4299,266 @@ def _render_table(rows: list[tuple[str, ...]]) -> str:
     ])
 
 
-def _account_state_notes(status: AccountStatus | CodexStatus) -> list[str]:
-    """Explain an empty row unless a folder or sign-in check already explains it."""
+def _status_subject(status: AccountStatus | CodexStatus) -> str:
+    return status.label if _label_is(status.label, "codex") or _label_is(status.label, "claude") else status.folder
+
+
+def _status_steps(status: AccountStatus | CodexStatus) -> tuple[str, str]:
+    setup = f"run accounts.py setup {status.label}"
+    login = (f"run CODEX_HOME={shlex.quote(str(status.home))} codex login" if isinstance(status, CodexStatus)
+             else f"run CLAUDE_CONFIG_DIR={shlex.quote(str(status.config_dir))} claude and /login")
+    return setup, login
+
+
+def status_check_problem(text: str, subject: str, *, setup: str, login: str,
+                          access_paths: tuple[str, ...] = (), note_paths: tuple[str, ...] = ()) -> StatusProblem:
+    """Convert command diagnostics at the status boundary; launches keep their words."""
+    text = text.removeprefix("accounts: ")
+    primary, separator, tail = text.partition("; ")
+    step = ProblemStep(tail if separator else setup)
+    if primary.startswith("cannot read role map from "):
+        return StatusProblem("role map", "unavailable", ProblemCause("role", text),
+            ProblemStep("restore access to natedev or its saved role map; run accounts.py status --stored"))
+    for marker in (" has no account", " has no mapped account"):
+        if primary.endswith(marker):
+            role = primary.split(marker, 1)[0]
+            return StatusProblem(role, "not configured", ProblemCause("role", "the role map selects no account"), step)
+    if " is on " in primary and " on this machine" in primary:
+        return StatusProblem(primary.split(" is on ", 1)[0], "cannot launch on this machine",
+            ProblemCause("role", primary), step)
+    read = re.fullmatch(r"could not (read|inspect) (.+?): (.+)", text, re.DOTALL)
+    if read is not None:
+        path = read[2]
+        kind: ProblemKind = "unreadable note" if path in note_paths else "access" if path in access_paths else "check"
+        return StatusProblem(subject, f"cannot {read[1]} {path}", ProblemCause(kind, read[3], CauseFile(path),
+            CauseAccount(Path(path).stem) if path in note_paths else NoCauseAccount()),
+            ProblemStep(f"check the file and its permissions; {setup}"))
+    for path in access_paths:
+        if primary == f"{path} is missing":
+            return StatusProblem(subject, "not set up", ProblemCause("access", f"{path} is missing"), ProblemStep(setup))
+        if primary in (f"{path} is not logged in", f"{path} has no readable sign-in"):
+            return StatusProblem(subject, "not logged in", ProblemCause("signed out", f"{path} has no readable sign-in"), ProblemStep(login))
+        if primary in (f"{path} is not a directory", f"{path} is a link"):
+            return StatusProblem(subject, f"cannot use {path}", ProblemCause("access", primary),
+                ProblemStep(f"use a real private directory; {setup}"))
+    if " has an invalid oauthAccount identity" in primary:
+        return StatusProblem(subject, "invalid sign-in", ProblemCause("identity", primary), ProblemStep(login))
+    if " has no readable login in its frontmatter" in primary:
+        path = primary.split(" has no readable login", 1)[0]
+        return StatusProblem(subject, "not selectable", ProblemCause("unreadable note", primary,
+            CauseFile(path), CauseAccount(Path(path).stem) if path in note_paths else NoCauseAccount()),
+            ProblemStep("set login: in the account note, then " + setup))
+    if " has no account note at " in primary:
+        return StatusProblem(subject, "not selectable", ProblemCause("note", primary,
+            account=CauseAccount(primary.split(" ", 1)[0])),
+            ProblemStep("add the account note with its login, then " + setup))
+    if primary.startswith("sign in as "):
+        return StatusProblem(subject, "not logged in", ProblemCause("signed out", "the home has no readable sign-in"),
+            ProblemStep(primary))
+    if " is logged in as " in primary:
+        return StatusProblem(subject, "wrong sign-in", ProblemCause("wrong login", primary),
+            step if separator else ProblemStep(login))
+    if " are logged in as " in primary or " hold " in primary:
+        cause = primary if tail.startswith("keep ") else text
+        homes = primary.split(" are logged in as ", 1)[0].split(" hold ", 1)[0].split(" and ", 1)
+        location = DuplicateLoginHomes((min(homes), max(homes))) if len(homes) == 2 else NoCauseFile()
+        return StatusProblem(subject, "login is stored in two homes", ProblemCause("identity", cause, location),
+            ProblemStep(tail if tail.startswith("keep ") else "keep each login in one home"))
+    if primary.endswith(" is a link"):
+        return StatusProblem(subject, "private file is linked", ProblemCause("check", text, CauseFile(primary.removesuffix(" is a link"))),
+            ProblemStep("use a private file in this home; " + setup))
+    if primary.startswith(subject + " "):
+        primary = primary[len(subject) + 1:]
+    return StatusProblem(subject, primary, NoSeparateCause(), step)
+
+
+def _account_state_problems(status: AccountStatus | CodexStatus) -> list[StatusProblem]:
     if status.is_set_up and status.account_is_safe_to_inspect and status.login:
         return []
-    directory = status.home if isinstance(status, CodexStatus) else status.config_dir
-    identity = directory / ("auth.json" if isinstance(status, CodexStatus) else ".claude.json")
-    for problem in status.problems:
-        if any(problem.startswith(f"accounts: {path} {reason}")
-               for path in (str(directory), status.folder, str(identity))
-               for reason in ("is missing", "is not a directory", "is a link", "is not logged in")):
-            return []
-        if any(problem.startswith(f"accounts: could not {action} {path}:")
-               for action in ("read", "inspect") for path in (str(directory), str(identity))):
-            return []
+    setup, login = _status_steps(status)
     if not status.is_set_up:
-        reason = "not set up: no folder holds this account"
+        wrong, kind, cause, step = "not set up", "access", "no folder holds this account", setup
     elif not status.account_is_safe_to_inspect:
-        reason = "its folder could not be read"
+        wrong, kind, cause, step = "folder unavailable", "access", "its folder could not be read", setup
     else:
-        reason = "not logged in"
-    return [f"* {status.label}: {reason}"]
+        wrong, kind, cause, step = "not logged in", "signed out", "no readable sign-in is stored", login
+    return [StatusProblem(_status_subject(status), wrong, ProblemCause(cast(ProblemKind, kind), cause), ProblemStep(step), True, origin="account state",
+        state_source=status.state_source if isinstance(status, AccountStatus) else NO_OBSERVED_STATE_CAUSE)]
 
 
-def _status_notes(status: AccountStatus, *, detail: bool) -> list[str]:
-    """What is wrong or unusual in one folder. Nothing for a folder in order."""
-    notes = [*status.problems, *_account_state_notes(status)]
+def _status_problems(status: AccountStatus | CodexStatus, *, detail: bool, zone: tzinfo) -> list[StatusProblem]:
+    subject = _status_subject(status)
+    directory = status.home if isinstance(status, CodexStatus) else status.config_dir
+    identity = directory / "auth.json" if isinstance(status, CodexStatus) else agent_accounts.claude_config_file(directory)
+    test_signin = status.account_is_safe_to_inspect and is_test_login(status.login)
+    setup, login_step = _status_steps(status)
+    unnoted = unnoted_home_line(directory, status.login)
+    source = status.state_source if isinstance(status, AccountStatus) else NO_OBSERVED_STATE_CAUSE
+    problems: list[StatusProblem] = []
+    for text in status.problems:
+        if text == unnoted or (isinstance(status, CodexStatus)
+                and isinstance(status.startup, agent_accounts.CodexStartupFailure) and text == status.startup.problem):
+            continue
+        problem = status_check_problem(text, subject, setup=setup, login=login_step,
+        access_paths=(str(directory), status.folder, str(identity)),
+        note_paths=(str(note_file.note_path(status.label)),) if _label_is(status.label, "claude") or _label_is(status.label, "codex") else ())
+        if isinstance(source, ObservedStateCause) and text == source.diagnostic and isinstance(problem.cause, ProblemCause):
+            problem = replace(problem, cause=replace(problem.cause, key=source.key))
+        problems.append(problem)
+    if status.login and not test_signin:
+        problems = [replace(problem, step=ProblemStep(f"repair the account note with login: {status.login}; {setup}"))
+                    if isinstance(problem.cause, ProblemCause) and problem.cause.kind == "unreadable note"
+                    else problem for problem in problems]
+    if unnoted in status.problems and not test_signin:
+        tool = "codex" if isinstance(status, CodexStatus) else "claude"
+        problems.append(StatusProblem(subject, "not selectable", ProblemCause("unnoted", "this login has no account note"),
+            ProblemStep(f"add ~/rust/hanadocs/agents/{tool}N.md with login: {status.login}")))
+    if test_signin:
+        # A test sign-in causes note advice, but not independent file faults.
+        problems = [replace(problem, step=ProblemStep(problem.step.instruction.removesuffix("; " + setup)))
+                    if isinstance(problem.step, ProblemStep) else problem
+                    for problem in problems if not (isinstance(problem.cause, ProblemCause)
+                        and problem.cause.kind in ("note", "unreadable note", "unnoted", "wrong login"))]
+        problems.insert(0, test_login_problem(subject, identity, zone))
+    else:
+        problems.extend(_account_state_problems(status))
     if detail and status.unclassified:
-        notes.append(f"{status.folder}: unclassified: {', '.join(status.unclassified)}")
-    mcp_differences = [
-        *(f"- {name}" for name in status.missing_mcp_servers),
-        *(f"+ {name}" for name in status.extra_mcp_servers),
-    ]
-    if mcp_differences:
-        notes.append(f"{status.folder}: mcpServers: {', '.join(mcp_differences)}")
-    return notes
+        problems.append(StatusProblem(subject, "unclassified entries", ProblemCause("unclassified", ", ".join(status.unclassified)),
+            ProblemStep(f"check these entries in {status.folder}; keep private files in this home")))
+    if isinstance(status, AccountStatus):
+        differences = [*(f"- {name}" for name in status.missing_mcp_servers), *(f"+ {name}" for name in status.extra_mcp_servers)]
+        if differences:
+            problems.append(StatusProblem(subject, "mcpServers differ from ~/.claude",
+                ProblemCause("mcp servers", ", ".join(differences)),
+                ProblemStep(f"check mcpServers in {status.folder}/.claude.json against ~/.claude.json")))
+    explicit = [problem for problem in problems if problem.origin == "diagnostic"
+                and isinstance(problem.cause, ProblemCause)]
+    note_causes: list[ProblemKind] = [problem.cause.kind for problem in explicit if isinstance(problem.cause, ProblemCause)
+                                     and problem.cause.kind in ("unreadable note", "note")]
+    note_cause: ProblemKind = note_causes[0] if note_causes else "unnoted"
+    bound: list[StatusProblem] = []
+    for problem in problems:
+        if isinstance(problem.cause, ProblemCause):
+            kind: ProblemKind = problem.cause.kind
+            if kind == "unnoted":
+                kind = note_cause
+            problem = replace(problem, cause=replace(problem.cause,
+                account=_status_cause_account(status), key=problem.cause.key if isinstance(problem.cause.key, ProblemCauseKey)
+                else _status_cause_key(status, kind, problem.cause.location)))
+        bound.append(problem)
+    return bound
+
+
+def _status_cause_account(status: AccountStatus | CodexStatus) -> CauseAccount | NoCauseAccount:
+    return CauseAccount(status.label) if _label_is(status.label, "claude") or _label_is(status.label, "codex") else NoCauseAccount()
+
+
+def _status_cause_key(status: AccountStatus | CodexStatus, kind: ProblemKind,
+                      specific: CauseFile | DuplicateLoginHomes | NoCauseFile = NO_CAUSE_FILE) -> ProblemCauseKey:
+    if not isinstance(specific, NoCauseFile):
+        return ProblemCauseKey(kind, _status_cause_account(status), specific)
+    location = (str(note_file.note_path(status.label)) if kind in ("note", "unreadable note", "unnoted")
+                and isinstance(_status_cause_account(status), CauseAccount) else status.folder)
+    return ProblemCauseKey(kind, _status_cause_account(status), CauseFile(location))
+
+
+def test_login_problem(subject: str, identity: Path, zone: tzinfo) -> StatusProblem:
+    file = _codex_folder(identity)
+    try:
+        stamp = datetime.fromtimestamp(identity.stat().st_mtime, timezone.utc).astimezone(zone)
+        written = f"at {stamp:%Y-%m-%d %H:%M %Z}"
+    except OSError:
+        written = "at an unknown time (the file time could not be read)"
+    return StatusProblem(subject, "test sign-in is stored", ProblemCause("test login", f"a test wrote {file} {written}", CauseFile(file),
+        CauseAccount(subject) if _label_is(subject, "claude") or _label_is(subject, "codex") else NoCauseAccount()),
+        ProblemStep(f"delete {file}"))
+
+
+def _problem_cause_key(problem: StatusProblem) -> ProblemCauseKey | NoSeparateCause:
+    if not isinstance(problem.cause, ProblemCause):
+        return NoSeparateCause()
+    if isinstance(problem.cause.key, ProblemCauseKey):
+        return problem.cause.key
+    account = problem.cause.account
+    if isinstance(account, NoCauseAccount) and isinstance(problem.cause.location, NoCauseFile):
+        account = CauseAccount(problem.subject)
+    return ProblemCauseKey(problem.cause.kind, account, problem.cause.location)
+
+
+def merge_status_problems(problems: list[StatusProblem]) -> list[StatusProblem]:
+    """Merge only diagnostics with the same typed cause and owner."""
+    groups: dict[ProblemCauseKey, list[StatusProblem]] = {}
+    result: list[StatusProblem] = []
+    direct_causes = {_problem_cause_key(problem) for problem in problems if problem.origin == "diagnostic"}
+    for problem in problems:
+        if isinstance(problem.state_source, ObservedStateCause) and problem.state_source.key in direct_causes:
+            continue
+        key = _problem_cause_key(problem)
+        if isinstance(key, NoSeparateCause):
+            result.append(problem)
+        else:
+            groups.setdefault(key, []).append(problem)
+    priority: tuple[ProblemKind, ...] = ("warning", "usage claim", "usage save", "test login", "startup", "unreadable note", "wrong login",
+        "identity", "access", "signed out", "unnoted", "note", "legacy", "usage", "state", "check", "role", "unclassified", "mcp servers")
+    for related in groups.values():
+        def rank(problem: StatusProblem) -> tuple[int, int]:
+            assert isinstance(problem.cause, ProblemCause)
+            return (priority.index(problem.cause.kind), {"diagnostic": 0, "role": 1, "account state": 2}[problem.origin])
+        chosen = min(related, key=rank)
+        assert isinstance(chosen.cause, ProblemCause)
+        if chosen.cause.kind == "unnoted" and isinstance(chosen.step, ProblemStep):
+            legacy_steps = list(dict.fromkeys(problem.step.instruction for problem in related
+                if isinstance(problem.cause, ProblemCause) and problem.cause.kind == "legacy"
+                and isinstance(problem.step, ProblemStep)))
+            if legacy_steps:
+                chosen = replace(chosen, step=ProblemStep(chosen.step.instruction + "; then " + "; then ".join(legacy_steps)))
+        assert isinstance(chosen.cause, ProblemCause)
+        if chosen.cause.kind == "signed out":
+            steps = list(dict.fromkeys(problem.step.instruction for problem in related
+                if problem.origin == "diagnostic" and isinstance(problem.step, ProblemStep)))
+            if steps:
+                chosen = replace(chosen, step=ProblemStep("; ".join(steps)))
+        if any(problem.footnote and problem.origin != "account state" for problem in related):
+            chosen = replace(chosen, footnote=True)
+        result.append(chosen)
+    # The same diagnostic can come from two inventory rows for one account.
+    unique: dict[str, StatusProblem] = {}
+    for problem in result:
+        _ = unique.setdefault(render_status_problem(problem), problem)
+    return list(unique.values())
+
+
+def _bind_usage_cause(problem: StatusProblem, row: StatusRow, status: AccountStatus | CodexStatus,
+                      diagnostics: list[StatusProblem]) -> StatusProblem:
+    assert isinstance(problem.cause, ProblemCause)
+    key = _status_cause_key(status, problem.cause.kind)
+    # A service refusal is independent of the files in an account home.
+    if row.read_outcome == agent_accounts.UsageReadOutcome.ERROR and problem.cause.kind != "startup":
+        blockers = [item for item in diagnostics if isinstance(item.cause, ProblemCause)
+                    and item.cause.kind in ("test login", "access", "signed out", "wrong login", "unnoted")]
+        if blockers:
+            primary = next((item for item in blockers if isinstance(item.cause, ProblemCause)
+                            and item.cause.kind == "test login"), blockers[0])
+            primary_key = _problem_cause_key(primary)
+            assert isinstance(primary_key, ProblemCauseKey)
+            key = primary_key
+    return replace(problem, cause=replace(problem.cause, key=key))
+
+
+def _bind_role_cause(problem: StatusProblem, statuses: list[AccountStatus | CodexStatus],
+                     diagnostics: list[StatusProblem]) -> StatusProblem:
+    if not isinstance(problem.cause, ProblemCause) or not isinstance(problem.cause.account, CauseAccount):
+        return problem
+    owner = problem.cause.account
+    status = next((item for item in statuses if _status_cause_account(item) == owner), None)
+    if status is None:
+        return problem
+    candidates = [item for item in diagnostics if isinstance(item.cause, ProblemCause)
+                  and item.cause.account == owner and (item.cause.kind == "test login"
+                  or item.cause.kind == problem.cause.kind)]
+    key = _problem_cause_key(candidates[0]) if candidates else _status_cause_key(status, problem.cause.kind)
+    assert isinstance(key, ProblemCauseKey)
+    return replace(problem, cause=replace(problem.cause, key=key))
 
 
 def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
@@ -4159,7 +4577,9 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
     if not selected_workers.label:
         codex = [replace(status, role="spare") if status.role == CODEX_ROLE else status for status in codex]
     now = datetime.now(timezone.utc)
-    usage = _stored_usage(statuses, codex, now, source)
+    store_problems: list[StatusProblem] = []
+    represented_stderr: set[str] = set()
+    usage = _stored_usage(statuses, codex, now, source, problems=store_problems, represented_stderr=represented_stderr)
     zone = agent_accounts.user_zone()
     try:
         groups = group_accounts()
@@ -4190,19 +4610,51 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
             (status.role,) if status.role in (CODEX_ROLE, "spare") else ()) for status in codex),
     )
     home_step = MAC_HOME_LOGIN_STEP if sys.platform == "darwin" else "run accounts.py cutover-home"
-    notes = [
-        *(note for row in rows if (note := _read_failure_note(row, zone))),
-        *role_problems,
-        *([f"~/.claude holds a login; {home_step}"]
-          if account.claude_account(main_config_dir()) is not None else []),
-        *([f"~/.codex holds a login; run accounts.py cutover-home {home_account_label('codex')}"]
-          if _codex_home_login(accounts_home() / ".codex") else []),
-        *(note for status in statuses for note in _status_notes(status, detail=detail)),
-        *(problem for status in codex for problem in status.problems),
-        *(note for status in codex for note in _account_state_notes(status)),
-        *(f"{status.folder}: unclassified: {', '.join(status.unclassified)}"
-          for status in codex if detail and status.unclassified),
-    ]
+    all_statuses: list[AccountStatus | CodexStatus] = [*statuses, *codex]
+    diagnostics_by_status = [_status_problems(status, detail=detail, zone=zone) for status in all_statuses]
+    diagnostics = [problem for local in diagnostics_by_status for problem in local]
+    problems: list[StatusProblem] = list(store_problems)
+    provenance = role_map.observed_map_provenance()
+    if isinstance(provenance, (role_map.CachedAfterFetchFailure, role_map.ExplicitStoredRoleMap)):
+        stamp = provenance.at.astimezone(zone).strftime("%Y-%m-%d %H:%M %Z")
+        cause = (f"natedev fetch failed: {provenance.failure}" if isinstance(provenance, role_map.CachedAfterFetchFailure)
+                 else "stored mode; no fetch was attempted")
+        problems.append(StatusProblem("role map", "using saved assignments",
+            ProblemCause("role", f"map saved at {stamp}; {cause}", CauseFile(str(role_map.role_map_cache_file()))),
+            ProblemStep("restore access to natedev; run accounts.py status again" if isinstance(provenance, role_map.CachedAfterFetchFailure)
+                        else "run accounts.py status to fetch current assignments")))
+    for row, status, local_diagnostics in zip(rows, all_statuses, diagnostics_by_status):
+        for problem in _read_failure_problem(row, zone, status.startup if isinstance(status, CodexStatus) else NO_STARTUP_FAILURE):
+            problems.append(_bind_usage_cause(problem, row, status, local_diagnostics))
+    note_paths = tuple(str(note_file.note_path(status.label)) for status in all_statuses
+                       if isinstance(_status_cause_account(status), CauseAccount))
+    problems.extend(_bind_role_cause(replace(status_check_problem(text, "roles",
+        setup="check the role map on natedev", login="check the selected account", note_paths=note_paths), origin="role"),
+        all_statuses, diagnostics) for text in role_problems)
+    main_login = account.claude_account(main_config_dir())
+    if main_login is not None:
+        if is_test_login(main_login.login):
+            problems.append(test_login_problem("~/.claude", agent_accounts.claude_config_file(main_config_dir()), zone))
+        else:
+            problems.append(StatusProblem("~/.claude", "legacy login is stored", ProblemCause("legacy", "the home still holds a login"), ProblemStep(home_step)))
+    codex_home = accounts_home() / ".codex"
+    codex_login = _codex_home_login(codex_home)
+    if codex_login:
+        home_status = next((status for status in codex if status.home == codex_home), None)
+        subject = _status_subject(home_status) if home_status is not None else "~/.codex"
+        label = home_account_label("codex")
+        label = label if _label_is(label, "codex") else "<codexN>"
+        related = [problem for problem in diagnostics if problem.subject == subject
+                   and isinstance(problem.cause, ProblemCause) and problem.cause.kind in ("test login", "unnoted")
+                   and (problem.cause.kind != "test login" or problem.cause.location == CauseFile(_codex_folder(codex_home / "auth.json")))]
+        legacy_key = _problem_cause_key(related[0]) if related else OwnProblemCause()
+        assert isinstance(legacy_key, (ProblemCauseKey, OwnProblemCause))
+        problems.append(StatusProblem(subject, "legacy login is stored", ProblemCause("legacy", "~/.codex still holds a login", key=legacy_key),
+            ProblemStep(f"run accounts.py cutover-home {label}")))
+        if home_status is None and is_test_login(codex_login):
+            problems.append(test_login_problem(subject, codex_home / "auth.json", zone))
+    problems.extend(diagnostics)
+    notes = [render_status_problem(problem) for problem in merge_status_problems(problems)]
     detail_lines: tuple[str, ...] = ()
     if detail:
         journal = moves.read_journal()
@@ -4210,14 +4662,56 @@ def _read_status(source: UsageSource, *, detail: bool) -> StatusReading:
                       if isinstance(source, RefreshStaleUsage) else ())
         detail_lines = (*live_lines,
             *_move_status_lines(moves.account_moves(journal), zone), *_routing_status_lines(journal, zone))
-    return StatusReading(rows, tuple(notes), detail_lines, zone, now)
+    return StatusReading(rows, tuple(notes), detail_lines, zone, now, tuple(represented_stderr))
+
+
+@dataclass
+class StatusCommandWarnings:
+    """Keep read diagnostics until the command has rendered its result."""
+
+    read_stderr: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class NoStatusCommandWarnings:
+    """This read has no enclosing CLI render."""
+
+
+_status_command_warnings: ContextVar[StatusCommandWarnings | NoStatusCommandWarnings] = ContextVar(
+    "status_command_warnings", default=NoStatusCommandWarnings())
 
 
 @role_map.role_map_command
 def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = False) -> StatusReading:
     """Read each account once for either renderer; stored mode performs no live work."""
-    with role_map.stored_role_map() if isinstance(source, StoredUsageOnly) else nullcontext():
-        return _read_status(source, detail=detail)
+    held = io.StringIO()
+    try:
+        with (nullcontext() if sys.stderr.isatty() else redirect_stderr(held),
+              role_map.stored_role_map() if isinstance(source, StoredUsageOnly) else nullcontext()):
+            reading = _read_status(source, detail=detail)
+    except BaseException:
+        # Restore stderr before replay, including when a later read fails.
+        _ = sys.stderr.write(held.getvalue())
+        raise
+    notes = list(reading.notes)
+    provenance = role_map.observed_map_provenance()
+    for line in dict.fromkeys(held.getvalue().splitlines()):
+        if not line.strip():
+            continue
+        if isinstance(provenance, role_map.CachedAfterFetchFailure) and line == role_map.cached_map_warning(provenance):
+            continue
+        if line in reading.represented_stderr:
+            # Reports carry these diagnostics, including recovery by the final save.
+            continue
+        mcp = re.fullmatch(r"~/(\.claude[0-9]+): mcpServers: .*", line)
+        if mcp and any(note.startswith(mcp[1][1:] + ": mcpServers differ") for note in notes):
+            continue
+        notes.append(render_status_problem(StatusProblem("accounts", "read warning",
+            ProblemCause("warning", line), NoUserStep())))
+    command_warnings = _status_command_warnings.get()
+    if isinstance(command_warnings, StatusCommandWarnings):
+        command_warnings.read_stderr.append(held.getvalue())
+    return replace(reading, notes=tuple(dict.fromkeys(notes)))
 
 
 def status_report(*, detail: bool = False, source: UsageSource = REFRESH_STALE_USAGE) -> str:
@@ -4580,10 +5074,22 @@ def main(argv: list[str]) -> int:
             return 1 if problems else 0
         if options.action == "status":
             source: UsageSource = StoredUsageOnly() if options.stored else RefreshStaleUsage()
-            if options.as_json:
-                print(render_status_json(read_status(source=source)))
-            else:
-                print(status_report(detail=options.detail, source=source))
+            held = io.StringIO()
+            warnings = StatusCommandWarnings()
+            warning_scope = _status_command_warnings.set(warnings)
+            try:
+                with nullcontext() if sys.stderr.isatty() else redirect_stderr(held):
+                    if options.as_json:
+                        print(render_status_json(read_status(source=source)))
+                    else:
+                        print(status_report(detail=options.detail, source=source))
+            except BaseException:
+                # The table may fail after a good read; replay after restoring stderr.
+                _ = sys.stderr.write("".join(warnings.read_stderr))
+                raise
+            finally:
+                _status_command_warnings.reset(warning_scope)
+                _ = sys.stderr.write(held.getvalue())
             return 0
         if options.action == "role":
             selected = role_account(options.role)
@@ -4631,7 +5137,11 @@ def main(argv: list[str]) -> int:
         print(error, file=sys.stderr)
         return 1
     except (AccountsError, next_moves.NextMoveError, role_map.RoleMapUnavailable, role_map.RoleMapWriteRefused) as error:
-        print(error, file=sys.stderr)
+        if options.action == "status":
+            problem = status_check_problem(str(error), "accounts", setup="check the account folders and role map", login="check the selected account")
+            print(render_status_problem(problem), file=sys.stderr)
+        else:
+            print(error, file=sys.stderr)
         return 2 if options.action == "exec" else 1
 
 

@@ -230,13 +230,13 @@ class OffloadSettingsTests(unittest.TestCase):
         self.assertEqual(destination.read_text().splitlines()[:2], ["mac=declined", "reason=unreachable"])
         self.assertTrue((self.root / "state" / "unreachable_until").exists())
 
-    def test_checked_in_settings_send_cargo_liner_to_the_mac_except_cargo_berth(self) -> None:
+    def test_checked_in_settings_send_every_cargo_liner_member_to_the_mac(self) -> None:
         config = offload.read_config(Path(__file__).resolve().parents[2] / "config" / "mac_test.conf")
-        self.assertEqual(config.values["linux_only.cargo-liner"], "cargo-berth")
+        self.assertEqual(config.values["linux_only.cargo-liner"], "")
         self.assertEqual(config.default_target_budget_gib, "24")
         self.assertNotIn("mac_budget_gib.cargo-liner", config.values)
         offload.write_backoff(time.time() + 60)
-        expected = {"cargo-port": "backoff", "cargo-tile": "backoff", "tui_pane": "backoff", "cargo-berth": "linux_only"}
+        expected = {"cargo-port": "backoff", "cargo-tile": "backoff", "tui_pane": "backoff", "cargo-berth": "backoff"}
         for package, reason in expected.items():
             with self.subTest(package=package):
                 request = offload.OffloadRequest(self.root, package, "cargo-liner", offload.NO_RESULT_FILE, ())

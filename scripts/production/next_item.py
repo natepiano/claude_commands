@@ -17,8 +17,9 @@ items of that production only: never of the production above it, and not of the 
 it, whose showrunners show their own (user, 2026-10-27). `--all-below` adds every production below
 it, at any depth, and pins under its own names, so it never moves the item the default shows. A
 change row belongs to the production its Production cell names, and a row without one to its
-list's root. Efficiency reads the Efficiency ledger line of each of those docs; a production with
-none has no efficiency items. A list that cannot be read is left out of a show with no kind, with
+list's production. Earlier lists stay in the queue after attachment. Current-list rows keep their
+IDs and pins; other rows name their list in their IDs. Efficiency reads the Efficiency ledger line of each of those
+docs; a production with none has no efficiency items. A list that cannot be read is left out, with
 one line on stderr.
 """
 from __future__ import annotations
@@ -33,12 +34,11 @@ from typing import TYPE_CHECKING, NamedTuple, TypeVar, cast
 import change_review
 import proposals_folder
 import proposals_table
-import showrunners
 from footer_counts import efficiency_ledger
-from add_unit import read_production
+from production_units import read_production
 from production_units import Refusal
 from proposals_folder import slug_of
-from update_registration import ALL_BELOW, RegistrationFailure, open_lists, question_queue, scope_queue
+from update_registration import RegistrationFailure, open_lists, question_queue
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import urgency  # noqa: E402
@@ -82,14 +82,9 @@ def _doc(production: Path | None) -> Path:
 
 
 def change_queue(doc: Path, below: bool = False) -> Queue:
-    """The change rows of the production, and with `below` of each production below it, from its list."""
-    path = change_review.scope_list(doc)
-    rows = change_review.scope_rows(path, doc, below)
-    # The root keeps the list's own pin; a lower showrunner pins its own row.
-    slug = proposals_folder.slug_of(doc)
-    name = change_review.queue(path) if slug == showrunners.root_of(slug) else f"{change_review.queue(path)}-{slug}"
-    return Queue(scope_queue(name, below), _as_text(change_review.row_entries(rows),
-                                                lambda entry: change_review.describe(entry.item)))
+    """The production's current and earlier change rows, and with `below` each lower one's."""
+    queue = change_review.change_queue(change_review.scope_list(doc), doc, below)
+    return Queue(queue.name, _as_text(queue.entries, lambda entry: change_review.describe(entry.item)))
 
 
 def efficiency_queue(doc: Path, below: bool = False) -> Queue:
@@ -97,7 +92,7 @@ def efficiency_queue(doc: Path, below: bool = False) -> Queue:
     ledgers = dict.fromkeys(ledger for each in proposals_folder.scope_docs(doc, below)
                             if (ledger := efficiency_ledger(each)) is not None)
     lines = [line for ledger in ledgers for line in candidates.read_lines(ledger)]
-    return Queue(scope_queue(candidates.QUEUE, below), _as_text(candidates.entries(lines), lambda entry: entry.item.line))
+    return Queue(urgency.scope_queue(candidates.QUEUE, below), _as_text(candidates.entries(lines), lambda entry: entry.item.line))
 
 
 def read_queue(kind: str, production: Path | None, below: bool = False) -> Queue:
@@ -109,7 +104,7 @@ def read_queue(kind: str, production: Path | None, below: bool = False) -> Queue
             case "proposal":
                 doc = _doc(production)
                 waiting, _ = proposals_table.waiting_entries(doc, below)
-                return Queue(scope_queue(proposals_table.queue(doc), below), _as_text(waiting, proposals_table.proposal_text))
+                return Queue(urgency.scope_queue(proposals_table.queue(doc), below), _as_text(waiting, proposals_table.proposal_text))
             case "question":
                 found = read_production(_doc(production))
                 due = open_lists(found, below).due
@@ -137,7 +132,7 @@ def show(kind: str, order: str, production: Path | None, below: bool = False) ->
             continue
         queues[queue.name] = queue.entries
         kinds[queue.name] = each
-    found = urgency.top_across(queues, scope_queue(f"next-{slug_of(doc)}", below), order)
+    found = urgency.top_across(queues, urgency.scope_queue(f"next-{slug_of(doc)}", below), order)
     if found is None:
         return "nothing is waiting for you"
     name, shown = found
@@ -164,7 +159,7 @@ def main(arguments: list[str]) -> int:
     _ = moved.add_argument("--kind", choices=KINDS, required=True)
     for action in (shown, moved):
         _ = action.add_argument("--production", type=Path)
-        _ = action.add_argument(f"--{ALL_BELOW}", action="store_true", dest="below")
+        _ = action.add_argument(f"--{urgency.ALL_BELOW}", action="store_true", dest="below")
     args = parser.parse_args(arguments)
     production = cast(Path | None, args.production)
     below = cast(bool, args.below)

@@ -83,6 +83,7 @@ class PendingRestart(TypedDict):
     config_dir: str
     pid: int
     proc_start: str
+    stop_request_sent: bool
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,8 @@ class StopComplete:
 @dataclass(frozen=True)
 class StopPending:
     """The conductor has not yet confirmed the stop."""
+
+    record_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -230,14 +233,16 @@ def read_pending(value: object) -> NoPendingRestart | PendingRestart:
     login, name, cwd = fields.get("login"), fields.get("name"), fields.get("cwd")
     config_dir, pid, proc_start = fields.get("config_dir"), fields.get("pid"), fields.get("proc_start")
     kind = fields.get("kind")
+    stop_request_sent = fields.get("stop_request_sent", True)
     if (kind not in ("stopping", "launching") or not isinstance(login, str) or not login
             or not isinstance(name, str) or not isinstance(cwd, str) or not Path(cwd).is_absolute()
             or not isinstance(config_dir, str) or not Path(config_dir).is_absolute()
             or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
-            or not isinstance(proc_start, str) or not proc_start):
+            or not isinstance(proc_start, str) or not proc_start
+            or not isinstance(stop_request_sent, bool)):
         raise ValueError("invalid nix-heal pending restart; refusing an unproven relaunch")
     return PendingRestart(kind="launching" if kind == "launching" else "stopping", login=login, name=name, cwd=cwd,
-                          config_dir=config_dir, pid=pid, proc_start=proc_start)
+                          config_dir=config_dir, pid=pid, proc_start=proc_start, stop_request_sent=stop_request_sent)
 
 
 def read_history() -> dict[str, HealHistory]:
@@ -312,16 +317,16 @@ def alert(session: HealSession, history: HealHistory, reason: str) -> None:
 def stop_completion(session: HealSession, login: str) -> StopComplete | StopPending | StopRefused:
     """Read the conductor's typed completion signal; down itself is asynchronous."""
     sys.path.insert(0, str(SCRIPTS / "shutdown"))
-    from scripts.shutdown import record
+    from scripts.shutdown import shutdown_record
 
-    saved = record.find_session(login, session.session_id)
+    saved = shutdown_record.find_session(login, session.session_id)
     if saved is None:
-        return StopPending()
+        return StopPending(record_missing=True)
     owner = saved["session"]
     if owner["pid"] != session.pid or owner["proc_start"] != session.proc_start or saved["then"] != "stop":
         return StopRefused("shutdown record no longer belongs to this heal stop")
     progress = saved["progress"]["kind"]
-    if progress == "stop failed" or record.stop_incomplete(saved):
+    if progress == "stop failed" or shutdown_record.stop_incomplete(saved):
         return StopRefused("shutdown did not complete the session stop")
     if progress in {"stopped", "already gone"} and sessions.process_start(session.pid) != session.proc_start:
         return StopComplete()
@@ -345,6 +350,22 @@ def confirm_relaunch(session: HealSession, history: HealHistory) -> bool:
     return False
 
 
+def request_stop(session: HealSession, pending: PendingRestart, history: HealHistory,
+                 histories: dict[str, HealHistory]) -> bool:
+    """Send the saved request and durably mark its acceptance before continuing."""
+    command = [str(SCRIPTS / "lib/py"), str(SCRIPTS / "shutdown/shutdown.py"), "down", pending["login"],
+               "--here", "--only", session.session_id]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
+    if result.returncode:
+        reason = (result.stderr or result.stdout).strip() or f"shutdown exit {result.returncode}"
+        log(session, history, "refused", reason)
+        alert(session, history, reason)
+        return False
+    pending["stop_request_sent"] = True
+    save_history(histories)
+    return True
+
+
 def resume_pending(session: HealSession, pending: PendingRestart, history: HealHistory,
                    histories: dict[str, HealHistory]) -> None:
     if pending["kind"] == "launching":
@@ -363,6 +384,15 @@ def resume_pending(session: HealSession, pending: PendingRestart, history: HealH
         return
     completion = stop_completion(session, pending["login"])
     if isinstance(completion, StopPending):
+        if completion.record_missing and not pending["stop_request_sent"]:
+            if sessions.process_start(session.pid) != session.proc_start:
+                history["pending"] = NoPendingRestart(kind="none")
+                reason = "unsent shutdown request lost its original session process; restart cancelled"
+                log(session, history, "refused", reason)
+                alert(session, history, reason)
+                return
+            if not request_stop(session, pending, history, histories):
+                return
         log(session, history, "pending", "waiting for shutdown stop completion")
         return
     if isinstance(completion, StopRefused):
@@ -467,16 +497,11 @@ def heal_one(session: HealSession, history: HealHistory, histories: dict[str, He
     history["restart_proc_start"] = session.proc_start
     history["healthy_since_restart"] = False
     pending = PendingRestart(kind="stopping", login=selected.login, name=session.name, cwd=str(session.cwd),
-                             config_dir=str(session.config_dir), pid=session.pid, proc_start=session.proc_start)
+                             config_dir=str(session.config_dir), pid=session.pid, proc_start=session.proc_start,
+                             stop_request_sent=False)
     history["pending"] = pending
     save_history(histories)
-    command = [str(SCRIPTS / "lib/py"), str(SCRIPTS / "shutdown/shutdown.py"), "down", selected.login,
-               "--here", "--only", session.session_id]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
-    if result.returncode:
-        reason = (result.stderr or result.stdout).strip() or f"shutdown exit {result.returncode}"
-        log(session, history, "refused", reason)
-        alert(session, history, reason)
+    if not request_stop(session, pending, history, histories):
         return
     resume_pending(session, pending, history, histories)
 

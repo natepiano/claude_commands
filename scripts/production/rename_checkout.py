@@ -27,15 +27,15 @@ from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import add_unit  # noqa: E402
+from production_units import Production, read_production  # noqa: E402
 import production_units  # noqa: E402
 import showrunners  # noqa: E402
 import unit_move  # noqa: E402
 from rename_state import RenameRefused, write_text  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
-import record as shutdown_record  # noqa: E402
-from record import SessionShutdown  # noqa: E402
+import shutdown_record  # noqa: E402
+from shutdown_record import SessionShutdown  # noqa: E402
 
 PARENT_LINE = "- **Parent production:** "
 CHECKOUT_LINE = "- **Showrunner checkout:** "
@@ -196,7 +196,7 @@ def _session_records(session_id: str) -> list[SessionShutdown]:
         raise RenameRefused(f"shutdown records unreadable: {error}") from error
 
 
-def _push(production: add_unit.Production) -> None:
+def _push(production: Production) -> None:
     _commit_checkout_line(production.doc, production.checkout)
     branch = production.merge_branch
     subject = _git(production.checkout, "log", "-1", "--format=%s")
@@ -217,7 +217,7 @@ def checkout(slug: str, destination: str = "") -> None:
     checked = showrunners.checked_doc(instance)
     if isinstance(checked, showrunners.NoCheckedDoc):
         raise RenameRefused(f"{slug} has no readable update timer: {checked.reason}")
-    production = add_unit.read_production(checked.path)
+    production = read_production(checked.path)
     old = production.checkout
     new = Path(destination).expanduser().resolve() if destination else _renamed(old, production.doc, slug)
     if new == old:

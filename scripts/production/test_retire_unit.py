@@ -7,6 +7,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,23 +19,26 @@ from typing import TYPE_CHECKING, Literal, cast, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scripts.guilds import roles
+from scripts.astra import design_roles
 from scripts.direct import workers  # noqa: E402
 
+import add_unit
+import herdr
 import retire_unit
 import unit_lookup
 import unit_move
 from herdr import HerdrPlace
-from add_unit import Production, read_production
+from production_units import Production, read_production
+from scripts.production.unit_operation_test_support import PaneShellFixture, assert_pane_shell_refused
 
 if TYPE_CHECKING:
     from scripts.message import sessions
     from scripts.message.sessions import SessionRecord
-    from scripts.shutdown import record as shutdown_record
-    from scripts.shutdown.record import SessionShutdown
+    from scripts.shutdown import shutdown_record
+    from scripts.shutdown.shutdown_record import SessionShutdown
 else:
     # retire_unit puts the message and shutdown folders on the path.
-    import record as shutdown_record
+    import shutdown_record
     import sessions
     from sessions import SessionRecord
 
@@ -141,8 +145,8 @@ class RetireUnitTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(runs),
                                                        "UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
                                                        "BUILD_HOLD_DIR": str(holds),
-                                                       "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
-                                                       "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership")}))
+                                                       "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
+                                                       "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")}))
         _ = self.enterContext(mock.patch.object(retire_unit, "MAC_CLAIMS", self.root / "claims"))
         _ = self.enterContext(mock.patch.object(retire_unit, "production_of", production_of))
         _ = self.enterContext(mock.patch.object(retire_unit, "run", self.fake_run))
@@ -157,8 +161,14 @@ class RetireUnitTests(unittest.TestCase):
         def marked_unit(_slug: str, _name: str) -> unit_lookup.MarkedUnit | None:
             return self.marked
 
+        def process_info(*_arguments: str) -> dict[str, object]:
+            # Existing cases launch Claude with exec: it replaces the pane's shell.
+            pid = self.marked.claude.pid if self.marked and isinstance(self.marked.claude, unit_lookup.LiveClaude) else 4101
+            return {"process_info": {"shell_pid": pid}}
+
         self.config = self.root / "config"
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", marked_unit))
+        _ = self.enterContext(mock.patch.object(herdr.Herdr, "result", side_effect=process_info))
         _ = self.enterContext(mock.patch.object(unit_move, "config_dirs", lambda: [self.config]))
         self.transcript(self.worktree)
 
@@ -199,6 +209,25 @@ class RetireUnitTests(unittest.TestCase):
 
     def stops(self) -> list[list[str]]:
         return [call for call in self.calls if call[:2] != ["review_pool.py", "status"]]
+
+    def pane_shell_refused(self, *, live: bool) -> None:
+        pane = PaneShellFixture(self, self.worktree, self.root / "pane-proc", live=live, slug="alpha")
+
+        def invoke() -> subprocess.CompletedProcess[str]:
+            code, output = self.retire("--wait-minutes", "0")
+            return subprocess.CompletedProcess(["retire"], code, output, "")
+
+        before = self.doc.read_bytes()
+        assert_pane_shell_refused(self, pane, invoke)
+        self.assertEqual(self.calls, [], "preflight must not run any shutdown or cleanup command")
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertTrue(self.worktree.is_dir())
+
+    def test_live_director_in_pane_shell_refuses_before_stop(self) -> None:
+        self.pane_shell_refused(live=True)
+
+    def test_exited_directors_pane_shell_refuses_before_stop(self) -> None:
+        self.pane_shell_refused(live=False)
 
     def test_refuses_uncommitted_work_and_an_unmerged_checkpoint_and_changes_nothing(self) -> None:
         _ = (self.worktree / "late.txt").write_text("late\n", encoding="utf-8")
@@ -308,9 +337,47 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
         self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
 
+    def test_rerun_commits_the_retired_note_before_removing_the_worktree(self) -> None:
+        snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "before"
+        _ = shutil.copytree(self.root, snapshot)
+        claude, marked = list(self.claude), self.marked
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        expected_tree = git(self.checkout, "rev-parse", "HEAD^{tree}")
+        expected_doc = self.doc.read_text()
+        shutil.rmtree(self.root)
+        _ = shutil.copytree(snapshot, self.root)
+        self.claude, self.marked, self.calls = claude, marked, []
+        before = git(self.checkout, "rev-parse", "HEAD")
+
+        with mock.patch.object(add_unit, "commit_paths",
+                               side_effect=OSError("fixture stop after retired note")) as commit:
+            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("fixture stop after retired note", output)
+        commit.assert_called_once()
+        self.assertEqual(self.doc.read_text(), expected_doc)
+        self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), before)
+        self.assertTrue(self.worktree.is_dir())
+        self.assertEqual(git(self.checkout, "branch", "--list", "--format=%(refname:short)", "alpha-branch"), "alpha-branch")
+
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(git(self.checkout, "rev-parse", "HEAD^{tree}"), expected_tree)
+        self.assertEqual(git(self.checkout, "status", "--porcelain"), "")
+        self.assertEqual(git(self.checkout, "log", "-1", "--format=%s"), "production(alpha): retire alpha-unit")
+        self.assertEqual(self.doc.read_text(), expected_doc)
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(git(self.checkout, "branch", "--list", "alpha-branch"), "")
+        self.assertEqual(git(self.checkout, "ls-remote", "--heads", "origin", "alpha-branch"), "")
+        head = git(self.checkout, "rev-parse", "HEAD")
+        code, output = self.retire()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(git(self.checkout, "rev-parse", "HEAD"), head)
+
     def test_role_cleanup_refusal_keeps_the_unit_row_worktree_and_branch(self) -> None:
         before = self.doc.read_bytes()
-        with mock.patch.object(roles, "end_holder", side_effect=roles.RoleRefused("designer turn is still running")):
+        with mock.patch.object(design_roles, "end_holder", side_effect=design_roles.RoleRefused("designer turn is still running")):
             code, output = self.retire()
         self.assertEqual(code, 1, output)
         self.assertIn("held role cleanup", output)
@@ -406,7 +473,7 @@ class RetireUnitTests(unittest.TestCase):
                 def return_director(_slug: str, _unit: str) -> None:
                     self.marked = unit_lookup.MarkedUnit("alpha-unit",
                         unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 5101), HerdrPlace("alpha", "w1:p1"))
-                with mock.patch.object(roles, "end_holder", side_effect=return_director):
+                with mock.patch.object(design_roles, "end_holder", side_effect=return_director):
                     code, output = self.retire()
                 self.assertEqual(code, 1, output)
                 self.assertIn(f"left running: marked session {DIRECTOR}, pid 5101", output)
@@ -464,7 +531,7 @@ class RetireUnitTests(unittest.TestCase):
         before = self.doc.read_bytes()
         def pending_stop(_slug: str, _unit: str) -> None:
             self.records = [self.shutdown_state("stopping")]
-        with mock.patch.object(roles, "end_holder", side_effect=pending_stop):
+        with mock.patch.object(design_roles, "end_holder", side_effect=pending_stop):
             code, output = self.retire()
         self.assertEqual(code, 1, output)
         self.assertIn(f"session {DIRECTOR}, pid 4101: shutdown stopping", output)
@@ -475,7 +542,7 @@ class RetireUnitTests(unittest.TestCase):
         before = self.doc.read_bytes()
         def relaunch(_slug: str, _unit: str) -> None:
             self.claude = [session(SEAT, "returned-worker", 5202)]
-        with mock.patch.object(roles, "end_holder", side_effect=relaunch):
+        with mock.patch.object(design_roles, "end_holder", side_effect=relaunch):
             code, output = self.retire()
         self.assertEqual(code, 1, output)
         self.assertIn(f"session {SEAT}, pid 5202", output)

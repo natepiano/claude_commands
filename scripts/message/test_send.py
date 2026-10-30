@@ -14,7 +14,8 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
+from collections.abc import Generator
+from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO, cast, override
@@ -22,7 +23,11 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.socket_test_support import short_socket_directory
 import send
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
 import rca
 import review
 import push_texts
@@ -30,7 +35,7 @@ import postmaster
 import silence
 from test_postmaster import FakeClock
 import codex_daemon
-import record as shutdown_record
+import shutdown_record
 import restart
 import roster
 import settle
@@ -47,10 +52,89 @@ def stream(*events: dict[str, object]) -> str:
     return "\n".join(json.dumps(event) for event in events) + "\n"
 
 
+@contextmanager
+def interrupt_replacement(target: Path, *, after: bool = False, skip: int = 0) -> Generator[None]:
+    """Stop before or after one chosen replacement, after skipping earlier writes to that target."""
+    replace = os.replace
+    matched = 0
+    def checkpoint(source: str | Path, destination: str | Path) -> None:
+        nonlocal matched
+        chosen = Path(destination) == target
+        stop = chosen and matched == skip
+        if chosen:
+            matched += 1
+        if stop and not after:
+            raise KeyboardInterrupt
+        replace(source, destination)
+        if stop:
+            raise KeyboardInterrupt
+    with mock.patch.object(os, "replace", checkpoint):
+        yield
+
+
 INIT: dict[str, object] = {"type": "system", "subtype": "init", "permissionMode": "auto"}
 
 
 class RelayAccountTests(unittest.TestCase):
+    def test_relay_publishes_its_sender_before_exec_and_keeps_the_socket_owners_pid(self) -> None:
+        with short_socket_directory() as directory:
+            root = Path(directory)
+            executable = root / "fake-claude"
+            _ = executable.write_text(
+                f"#!{sys.executable}\n"
+                + "import os, pathlib, socket, sys\n"
+                + "root = pathlib.Path(sys.argv[1])\n"
+                + "assert (root / 'relay_senders' / str(os.getpid())).read_text() == 'verify'\n"
+                + "with socket.socket(socket.AF_UNIX) as listener:\n"
+                + "    listener.bind(str(root / (str(os.getpid()) + '.sock')))\n"
+                + "    print(os.getpid())\n")
+            executable.chmod(0o755)
+            completed = subprocess.run([sys.executable, "-c", send.RELAY_EXEC,
+                str(root / "relay_senders"), "verify", str(executable), str(root)],
+                capture_output=True, text=True, check=True)
+            self.assertEqual((root / "relay_senders" / completed.stdout.strip()).read_text(), "verify")
+            self.assertEqual(list((root / "relay_senders").glob(".*.tmp")), [])
+
+    def test_an_interrupted_relay_record_publish_retries_before_starting_claude(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = ["-c", str(root), "verify", "/fixture/claude", "-p"]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(os, "getpid", return_value=4242), \
+                    mock.patch.object(os, "execvpe", side_effect=KeyboardInterrupt) as launch:
+                with mock.patch.object(os, "replace", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+                    exec(send.RELAY_EXEC, {})
+                launch.assert_not_called()
+                self.assertFalse((root / "4242").exists())
+                with self.assertRaises(KeyboardInterrupt):
+                    exec(send.RELAY_EXEC, {})
+                self.assertEqual((root / "4242").read_text(), "verify")
+                launch.assert_called_once_with("/fixture/claude", ["/fixture/claude", "-p"], os.environ)
+                self.assertFalse((root / ".4242.tmp").exists())
+
+    def test_relay_delivers_captured_sender_display_and_checks_that_payload_verbatim(self) -> None:
+        original = "Message from sender-address: Preview\n\nbody"
+        displayed = "Message from sender-address: Preview\nShown sender: sdlc · roles · worker test\n\nbody"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".claude").mkdir()
+            _ = (home / ".claude.json").write_text(json.dumps({
+                "oauthAccount": {"emailAddress": "fixture@example.invalid"}}))
+            for delivered, status in ((displayed, "verbatim"), (original, "NOT VERBATIM")):
+                with (
+                    self.subTest(status=status),
+                    mock.patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                    mock.patch.object(send, "claude_binary", return_value="claude"),
+                    mock.patch.object(send, "STATE", home / "message-state"),
+                    mock.patch.object(send, "run", return_value=(0, stream(INIT, call(delivered), answer(OK)), "")) as launch,
+                ):
+                    result = send.relay(send.Message("uds:/recipient", "sender-address", "Preview", original, None,
+                                                    "sdlc · roles · worker test"), 10)
+                self.assertEqual(result.outcome, "sent")
+                self.assertIn(f"; {status};", result.detail)
+                command = cast(list[str], launch.call_args.args[0])
+                self.assertEqual(command[command.index("-n") + 1], "sender-address")
+                self.assertIn(displayed, cast(str, launch.call_args.args[1]))
+
     def test_relay_before_cutover_keeps_home_login_without_requiring_numbered_folders(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -134,8 +218,9 @@ class SendTests(ShutdownTestCase):
 
     @override
     def setUp(self) -> None:
+        _ = self.enterContext(mock.patch.object(names, "load_names", return_value=fixture_names()))
         super().setUp()
-        directory = tempfile.TemporaryDirectory()
+        directory = short_socket_directory()
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         # No test opens a real rca.py case: it would write the machine's cases and message its owner.
@@ -202,6 +287,13 @@ class SendTests(ShutdownTestCase):
     def log(self) -> list[dict[str, object]]:
         return [send.as_dict(send.loads(line)) for line in (self.root / "log.jsonl").read_text().splitlines()]
 
+    def drain(self) -> tuple[int, list[str]]:
+        """Capture checkpoint reports together with the deferred reports that main prints."""
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code, lines = send.drain_socket_queues()
+        return code, [*output.getvalue().splitlines(), *lines]
+
     def postmaster_clock(self) -> FakeClock:
         clock = FakeClock()
         _ = self.enterContext(mock.patch.object(time, "time", clock.time))
@@ -254,6 +346,35 @@ class SendTests(ShutdownTestCase):
         entry = self.log()[0]
         self.assertEqual((entry["via"], entry["postmaster"], entry["seconds"], entry["text"]), ("postmaster", "delivered", 0.125, "body"))
 
+    def test_postmaster_shows_sender_job_and_keeps_reply_and_log_identity(self) -> None:
+        clock = self.postmaster_clock()
+        self.session("recipient", "Recipient")
+        self.session("worker", "Postmaster")
+        self.session("sender", "fixed-sender-address")
+        self.postmaster_heartbeat(clock)
+        texts: list[str] = []
+        self.postmaster_mod(clock, texts)
+        sender = roster.RosterEntry(
+            machine="fixture", kind="claude", role="worker", name="fixed-sender-address", status="working",
+            reach=roster.Messageable("session:sender"), cwd="/fixture",
+            showrunner=roster.UnderShowrunner("sdlc", "runner", "session:runner"),
+            director=roster.UnderDirector("roles-unit", "director", "session:director"),
+            assignment=roster.WorkerAssignment("test", "/fixture/run", "test", "test"),
+            session=roster.ClaudeSession("sender"),
+        )
+        with mock.patch.object(roster, "roster", return_value=roster.Roster([sender], [])):
+            result = send.send(local_options(["--to", "session:recipient", "--from", "fixed-sender-address",
+                                               "--summary", "Question", "--text", "body"]))
+        self.assertEqual(result.outcome, "sent")
+        self.assertEqual(len(texts), 1)
+        self.assertIn("sdlc · roles · worker test", texts[0])
+        self.assertRegex(texts[0], r"^Message from fixed-sender-address via postmaster: Question \[[a-f0-9]{8}\]")
+        self.assertIn("body", texts[0])
+        logged = self.log()[0]
+        self.assertEqual(logged["from"], "fixed-sender-address")
+        self.assertEqual(logged["to"], "session:recipient")
+        self.assertEqual(self.relayed, [])
+
     def test_postmaster_hash_mismatch_is_reported_as_not_verbatim(self) -> None:
         clock = self.postmaster_clock()
         self.session("recipient", "Recipient")
@@ -263,6 +384,166 @@ class SendTests(ShutdownTestCase):
         result = send.send(local_options(["--to", "session:recipient", "--from", "Sender", "--text", "body"]))
         self.assertEqual(result, send.Result("sent", "postmaster; NOT VERBATIM; session:recipient"))
         self.assertEqual(self.relayed, [])
+
+    def sender_entry(self, production: str = "sdlc") -> roster.RosterEntry:
+        return roster.RosterEntry(
+            machine="fixture", kind="claude", role="worker", name="sender-address", status="working",
+            reach=roster.Messageable("session:sender"), cwd="/fixture",
+            showrunner=roster.UnderShowrunner(production, "runner", "session:runner"),
+            director=roster.UnderDirector("roles-unit", "director", "session:director"),
+            assignment=roster.WorkerAssignment("test", "/fixture/run", "test", "test"),
+            session=roster.ClaudeSession("sender"),
+        )
+
+    def test_name_config_rename_changes_new_senders_but_keeps_queued_and_forwarded_display(self) -> None:
+        options = local_options(["--to", "session:absent", "--from", "sender-address", "--text", "before rename"])
+        with mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry()], [])):
+            self.assertEqual(send.send(options).outcome, "queued")
+            with mock.patch.object(names, "runtime_names", return_value=fixture_names(worker="builder")):
+                newer = local_options(["--to", "session:absent", "--from", "sender-address", "--text", "after rename"])
+                self.assertEqual(send.send(newer).outcome, "queued")
+        queued = send.read_queue(send.queue_for("session:absent"))
+        self.assertEqual([row.get("shown_sender") for row in queued],
+                         ["sdlc · roles · worker test", "sdlc · roles · builder test"])
+        self.assertEqual([row["from"] for row in queued], ["sender-address", "sender-address"])
+        self.session("absent", "Returned recipient")
+        with mock.patch.object(names, "runtime_names", side_effect=AssertionError("replay must keep the captured display")):
+            replay = send.pending("session:absent")
+        self.assertIn("Shown sender: sdlc · roles · worker test", replay)
+        self.assertIn("Shown sender: sdlc · roles · builder test", replay)
+        received = send.parse(["--here", "--to", "codex:remote-thread", "--from", "sender-address",
+                               "--forwarded-shown-sender", "sdlc · roles · worker test", "--summary", "Preview", "--text", "body"])
+        with mock.patch.object(names, "runtime_names", side_effect=AssertionError("receiver must not apply its names")), \
+                mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue:
+            self.assertEqual(send.send(received).outcome, "sent")
+        queue.assert_called_once_with("remote-thread", "body\nShown sender: sdlc · roles · worker test", timeout=send.TIMEOUT)
+
+    def test_queued_sender_display_survives_roster_changes_and_legacy_records_use_raw_sender(self) -> None:
+        queued_at = datetime(2026, 10, 20, tzinfo=timezone.utc)
+        with mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry()], [])) as read_roster:
+            for keyed in (False, True):
+                options = local_options([
+                    "--to", "session:absent", "--from", "sender-address", "--text", "Preview\nbody",
+                    *(["--key", "message-key"] if keyed else []),
+                ])
+                with mock.patch.object(send, "now", return_value=queued_at + timedelta(seconds=int(keyed))):
+                    self.assertEqual(send.send(options).outcome, "queued")
+            self.assertEqual(read_roster.call_count, 2)
+        path = send.queue_for("session:absent")
+        queued = send.read_queue(path)
+        self.assertEqual([entry["from"] for entry in queued], ["sender-address", "sender-address"])
+        self.assertEqual([entry.get("shown_sender") for entry in queued], ["sdlc · roles · worker test"] * 2)
+        legacy = dict(queued[0])
+        del legacy["shown_sender"]
+        legacy["text"] = "legacy body"
+        with path.open("a", encoding="utf-8") as target:
+            _ = target.write(json.dumps(legacy) + "\n")
+        self.session("absent", "Returned recipient")
+        with mock.patch.object(roster, "roster", side_effect=AssertionError("replay must not resolve the sender")):
+            replay = send.pending("session:absent")
+        self.assertEqual(replay.count("Shown sender: sdlc · roles · worker test"), 2)
+        self.assertRegex(replay, r"(?:\A|\n\n)Queued message \d+ of 3, from sender-address at "
+                         + r"[^\n]+:\nlegacy body(?:\n\n|\Z)")
+        self.assertEqual([entry["from"] for entry in self.log()], ["sender-address", "sender-address"])
+
+    def test_mesh_and_daemon_payloads_show_sender_without_changing_address_thread_or_log(self) -> None:
+        original = "Message from sender-address: Preview\n\nbody"
+        expected = "Message from sender-address: Preview\nShown sender: sdlc · roles · worker test\n\nbody"
+        with (
+            mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry()], [])),
+            mock.patch.object(send, "run", return_value=(0, "sent", "")) as launch,
+            mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue,
+        ):
+            self.assertEqual(send.send(local_options([
+                "--to", "mesh-address", "--codex", "--session-dir", "/fixture/run",
+                "--from", "sender-address", "--text", original,
+            ])).outcome, "sent")
+            self.assertEqual(send.send(local_options([
+                "--to", "codex:thread-address", "--from", "sender-address", "--text", original,
+            ])).outcome, "sent")
+        command = cast(list[str], launch.call_args.args[0])
+        self.assertEqual(command[command.index("--to") + 1], "mesh-address")
+        self.assertEqual(command[command.index("--session-dir") + 1], "/fixture/run")
+        self.assertEqual(command[command.index("--message") + 1], expected)
+        queue.assert_called_once_with("thread-address", expected, timeout=send.TIMEOUT)
+        self.assertEqual([(row["from"], row["to"], row["text"]) for row in self.log()], [
+            ("sender-address", "mesh-address", original), ("sender-address", "codex:thread-address", original),
+        ])
+
+    def test_relay_fallback_preserves_shown_sender_when_session_address_becomes_socket(self) -> None:
+        self.session("recipient", "Recipient")
+        with mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry()], [])) as read_roster:
+            self.assertEqual(send.send(local_options([
+                "--to", "session:recipient", "--from", "sender-address", "--summary", "Preview",
+                "--text", "Message from sender-address: Preview\n\nbody",
+            ])).outcome, "sent")
+        read_roster.assert_called_once()
+        relayed = self.relayed[0]
+        self.assertEqual(relayed.to, f"uds:{self.root / 'recipient.sock'}")
+        self.assertEqual(relayed.sender, "sender-address")
+        prompt = send.relay_prompt(relayed)
+        self.assertIn("----- BEGIN MESSAGE -----\nMessage from sender-address: Preview\n"
+                      + "Shown sender: sdlc · roles · worker test\n\nbody\n----- END MESSAGE -----", prompt)
+        self.assertEqual(self.log()[0]["from"], "sender-address")
+
+    def test_remote_forwarding_keeps_sending_machine_display_despite_receiver_name_collision(self) -> None:
+        original = "Message from sender-address: Preview\n\nbody"
+        for sender_rows, display in (
+            ([self.sender_entry()], "sdlc · roles · worker test"),
+            ([], "sender-address"),
+            ([self.sender_entry(), self.sender_entry("ambiguous")], "sender-address"),
+        ):
+            with self.subTest(display=display, matches=len(sender_rows)):
+                with (
+                    mock.patch.object(roster, "roster", return_value=roster.Roster(sender_rows, [])) as source_read,
+                    mock.patch.object(send, "run", return_value=(0, "SENT: forwarded\n", "")) as ssh,
+                ):
+                    self.assertEqual(send.send(send.parse([
+                        "--machine", "mac", "--to", "codex:remote-thread", "--from", "sender-address",
+                        "--key", "reply-key", "--text", original,
+                    ])).outcome, "sent")
+                source_read.assert_called_once()
+                command = cast(list[str], ssh.call_args.args[0])
+                forwarded = shlex.split(command[-1])
+                arguments = forwarded[forwarded.index("--here"):]
+                self.assertEqual(arguments[arguments.index("--from") + 1], "sender-address")
+                self.assertEqual(arguments[arguments.index("--forwarded-shown-sender") + 1], display)
+                self.assertEqual(ssh.call_args.args[1], original)
+                received = send.parse([*arguments, "--text", original])
+                with (
+                    mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry("wrong-host")], [])),
+                    mock.patch.object(send, "sender_shown_name", side_effect=AssertionError("receiver must not resolve sender")),
+                    mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue,
+                ):
+                    self.assertEqual(send.send(received).outcome, "sent")
+                expected = (original if display == "sender-address" else
+                            "Message from sender-address: Preview\nShown sender: sdlc · roles · worker test\n\nbody")
+                queue.assert_called_once_with("remote-thread", expected, timeout=send.TIMEOUT)
+                logged = self.log()[-1]
+                self.assertEqual((logged["from"], logged["to"], logged["key"], logged["text"]),
+                                 ("sender-address", "codex:remote-thread", "reply-key", original))
+
+    def test_forwarded_postmaster_display_does_not_read_receiver_roster_for_sender(self) -> None:
+        clock = self.postmaster_clock()
+        self.session("recipient", "Recipient")
+        self.session("worker", "Postmaster")
+        self.postmaster_heartbeat(clock)
+        texts: list[str] = []
+        self.postmaster_mod(clock, texts)
+        with mock.patch.object(roster, "roster", side_effect=AssertionError("explicit socket needs no receiver roster")):
+            result = send.send(send.parse([
+                "--here", "--to", f"uds:{self.root / 'recipient.sock'}", "--from", "sender-address",
+                "--forwarded-shown-sender", "sdlc · roles · worker test", "--summary", "Preview", "--text", "body",
+            ]))
+        self.assertEqual(result.outcome, "sent")
+        self.assertRegex(texts[0], r"^Message from sender-address via postmaster: Preview \[[a-f0-9]{8}\]\n"
+                         + r"Shown sender: sdlc · roles · worker test\n\nbody$")
+
+    def test_forwarded_sender_display_requires_local_delivery_and_nonempty_text(self) -> None:
+        for arguments in (["--forwarded-shown-sender", "display"],
+                          ["--here", "--forwarded-shown-sender", ""]):
+            with self.subTest(arguments=arguments), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                _ = send.parse(["--to", "codex:thread", "--from", "sender-address", "--text", "body", *arguments])
 
     def test_each_postmaster_miss_relays_once_with_unchanged_message_and_reason(self) -> None:
         self.session("recipient", "Recipient")
@@ -743,6 +1024,347 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertEqual(stopped.exception.code, 2)
         self.assertIn("anyone there", send.pending("bogus"))
 
+    def relay_record(self, pid: int, name: str, *, stale: bool = False) -> str:
+        directory = self.root / "relay_senders"
+        directory.mkdir(exist_ok=True)
+        _ = (directory / str(pid)).write_text(name)
+        path = self.root / "cc-socks" / f"{pid}.sock"
+        if stale:
+            path.parent.mkdir(exist_ok=True)
+            with socket.socket(socket.AF_UNIX) as listener:
+                listener.bind(str(path))
+        return f"uds:{path}"
+
+    def socket_queue(self, address: str, *entries: tuple[datetime, str], name: str = "") -> Path:
+        path = send.queue_path(address)
+        path.parent.mkdir(exist_ok=True)
+        values = [{"time": at.isoformat(), "from": "survey", "to": address, "key": None,
+                   "summary": "reply", "text": text, "reason": "gone", "to_name": name}
+                  for at, text in entries]
+        _ = path.write_text("".join(json.dumps(value) + "\n" for value in values))
+        return path
+
+    def test_a_dead_relay_socket_delivers_to_its_named_live_session(self) -> None:
+        self.session("verify-session", "verify")
+        address = self.relay_record(42, "verify")
+        result = send.send(local_options(["--to", address, "--from", "survey", "--text", "reply"]))
+        self.assertEqual(result.outcome, "sent")
+        self.assertEqual([(message.to, message.text) for message in self.relayed],
+                         [(f"uds:{self.root / 'verify-session.sock'}", "reply")])
+        self.assertFalse((self.root / "queue").exists())
+
+    def test_a_dead_socket_without_a_live_named_recipient_fails_loudly_and_never_queues(self) -> None:
+        address = f"uds:{self.root / 'cc-socks' / '42.sock'}"
+        for name in ("", "verify"):
+            with self.subTest(name=name):
+                if name:
+                    _ = self.relay_record(42, name)
+                output, errors = io.StringIO(), io.StringIO()
+                with redirect_stdout(output), redirect_stderr(errors):
+                    code = send.main(["--here", "--to", address, "--from", "survey", "--text", "reply"])
+                self.assertEqual(code, 3)
+                self.assertIn("FAILED:", output.getvalue())
+                self.assertIn(address, errors.getvalue())
+                self.assertIn(name or "(unknown)", errors.getvalue())
+                self.assertFalse((self.root / "queue").exists())
+        self.assertEqual(self.relayed, [])
+
+    def test_a_refused_relay_socket_reaches_the_named_session_for_sends_and_drains(self) -> None:
+        self.session("verify-session", "verify")
+        address = self.relay_record(42, "verify", stale=True)
+        attempts: list[str] = []
+        def relay(message: send.Message, timeout: float) -> send.Result:
+            attempts.append(message.to)
+            return send.Result("queued", "ECONNREFUSED") if message.to == address else self.relay(message, timeout)
+        with mock.patch.object(send, "relay", relay):
+            result = send.send(local_options(["--to", address, "--from", "survey", "--text", "reply"]))
+            self.assertEqual(result.outcome, "sent")
+            path = self.socket_queue(address, (send.now(), "stuck reply"))
+            self.assertEqual(self.drain()[0], 0)
+        destination = f"uds:{self.root / 'verify-session.sock'}"
+        self.assertEqual(attempts, [address, destination, address, destination])
+        self.assertEqual([message.to for message in self.relayed], [destination, destination])
+        self.assertFalse(path.exists())
+
+    def test_a_refused_socket_without_a_live_named_session_fails_loudly(self) -> None:
+        address = self.relay_record(42, "verify", stale=True)
+        self.outcome = send.Result("queued", "ECONNREFUSED")
+        output, errors = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            code = send.main(["--here", "--to", address, "--from", "survey", "--text", "reply"])
+        self.assertEqual(code, 3)
+        self.assertIn("FAILED:", output.getvalue())
+        self.assertIn(address, errors.getvalue())
+        self.assertIn("verify", errors.getvalue())
+        self.assertIn("ECONNREFUSED", errors.getvalue())
+        self.assertFalse((self.root / "queue").exists())
+        self.assertEqual(len(self.relayed), 1)
+
+    def test_a_recipient_that_exits_after_the_queue_decision_keeps_its_session_key(self) -> None:
+        self.session("recipient", "Recipient")
+        address = f"uds:{self.root / 'recipient.sock'}"
+        self.outcome = send.Result("queued", "relay timed out")
+        enqueue = send.enqueue
+        def leave(message: send.Message, reason: str, at: datetime) -> None:
+            self.assertEqual(message.to, "session:recipient")
+            (self.root / "sessions/recipient.json").unlink()
+            enqueue(message, reason, at)
+        with mock.patch.object(send, "enqueue", leave):
+            result = send.send(local_options(["--to", address, "--from", "survey", "--text", "reply"]))
+        self.assertEqual(result.outcome, "queued")
+        self.assertEqual([path.name for path in (self.root / "queue").iterdir()], ["session-recipient.jsonl"])
+        self.assertEqual(send.read_queue(send.queue_path("session-recipient"))[0]["text"], "reply")
+
+    def test_enqueue_rejects_an_unregistered_raw_socket_at_the_queue_boundary(self) -> None:
+        address = self.relay_record(42, "verify")
+        with self.assertRaisesRegex(ValueError, "dead socket.*verify.*message not queued"):
+            send.enqueue(send.Message(address, "survey", "reply", "reply", None), "failed", send.now())
+        self.assertFalse((self.root / "queue").exists())
+
+    def test_a_socket_that_dies_during_relay_fails_instead_of_creating_a_raw_socket_queue(self) -> None:
+        self.session("recipient", "Recipient")
+        address = f"uds:{self.root / 'recipient.sock'}"
+        def relay(message: send.Message, timeout: float) -> send.Result:
+            del message, timeout
+            (self.root / "sessions/recipient.json").unlink()
+            return send.Result("queued", "ENOENT")
+        with mock.patch.object(send, "relay", relay):
+            result = send.send(local_options(["--to", address, "--from", "survey", "--text", "reply"]))
+        self.assertEqual(result.outcome, "failed")
+        self.assertIn("ENOENT", result.detail)
+        self.assertFalse((self.root / "queue").exists())
+
+    def test_socket_drain_delivers_young_replies_with_their_original_times(self) -> None:
+        self.session("verify-session", "verify")
+        at = send.now() - timedelta(hours=1)
+        known = self.socket_queue(self.relay_record(42, "verify"), (at, "record reply"))
+        legacy = self.socket_queue(f"uds:{self.root / 'cc-socks/43.sock'}", (at, "legacy reply"), name="verify")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(send.main(["drain-sockets"]), 0)
+        self.assertEqual([message.text for message in self.relayed],
+            [f"Stuck message from {at.isoformat()}:\nrecord reply", f"Stuck message from {at.isoformat()}:\nlegacy reply"])
+        self.assertTrue(all(message.to == f"uds:{self.root / 'verify-session.sock'}" for message in self.relayed))
+        self.assertEqual(output.getvalue().count("SENT: stuck reply"), 2)
+        self.assertFalse(known.exists())
+        self.assertFalse(legacy.exists())
+        self.assertEqual(self.drain(), (0, []))
+        self.assertEqual(len(self.relayed), 2)
+
+    def test_socket_drain_archives_old_files_and_reports_their_count_and_date_range(self) -> None:
+        at = send.now()
+        oldest, newest = at - timedelta(days=3), at - timedelta(hours=24)
+        first = self.socket_queue("uds:/fixture/cc-socks/42.sock", (oldest, "old reply"))
+        second = self.socket_queue("uds:/fixture/cc-socks/43.sock", (newest, "another old reply"))
+        originals = {path.name: path.read_bytes() for path in (first, second)}
+        with mock.patch.object(send, "now", return_value=at):
+            code, lines = self.drain()
+        self.assertEqual(code, 0)
+        self.assertEqual(lines, [f"archiving 2 socket queue files: oldest {oldest.isoformat()}, newest {newest.isoformat()}"])
+        self.assertEqual({path.name: path.read_bytes() for path in (self.root / "socket-queue-archive").iterdir()}, originals)
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+        self.assertEqual(self.drain(), (0, []))
+
+    def test_an_interrupted_socket_drain_retries_without_duplicate_or_lost_messages(self) -> None:
+        self.session("verify-session", "verify")
+        at = send.now()
+        path = self.socket_queue(self.relay_record(42, "verify"), (at, "reply one"), (at, "reply two"))
+        with interrupt_replacement(path, skip=1), self.assertRaises(KeyboardInterrupt):
+            _ = self.drain()
+        self.assertTrue(path.exists())
+        self.assertEqual(len(send.read_queue(path)), 2)
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(self.drain()[0], 0)
+        self.assertEqual([message.text for message in self.relayed],
+                         [f"Stuck message from {at.isoformat()}:\nreply one", f"Stuck message from {at.isoformat()}:\nreply two"])
+        self.assertFalse(path.exists())
+        self.assertEqual(self.drain(), (0, []))
+        self.assertEqual(len(self.relayed), 2)
+
+    def test_a_socket_reply_stopped_before_its_receipt_is_archived_without_resending(self) -> None:
+        self.session("verify-session", "verify")
+        at = send.now()
+        path = self.socket_queue(self.relay_record(42, "verify"), (at, "reply"))
+        with mock.patch.object(send, "log", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            _ = self.drain()
+        self.assertEqual(len(self.relayed), 1)
+        self.assertFalse((self.root / "log.jsonl").exists())
+        attempts = (self.root / "socket-recovery-attempts.jsonl").read_text().splitlines()
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(send.as_dict(send.loads(attempts[0]))["key"], send.read_queue(path)[0].get("socket_recovery"))
+        code, lines = self.drain()
+        self.assertEqual(code, 3)
+        self.assertEqual(lines, [f"UNCONFIRMED: stuck reply from {at.isoformat()} to verify may have arrived;"
+                                 + " archived, not resent"])
+        archived = list((self.root / "socket-queue-archive").glob("*.jsonl"))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(send.read_queue(archived[0])[0]["text"], "reply")
+        self.assertFalse(path.exists())
+        self.assertEqual(self.drain(), (0, []))
+        self.assertEqual(len(self.relayed), 1)
+
+    def test_an_interrupted_uncertain_archive_checkpoint_keeps_other_replies_without_copying_the_archive(self) -> None:
+        self.session("verify-session", "verify")
+        at = send.now()
+        path = self.socket_queue(self.relay_record(42, "verify"), (at, "uncertain"), (at, "not attempted"))
+        with mock.patch.object(send, "log", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            _ = self.drain()
+        with interrupt_replacement(path), self.assertRaises(KeyboardInterrupt):
+            _ = self.drain()
+        self.assertEqual(len(send.read_queue(path)), 2)
+        self.assertEqual(self.drain()[0], 3)
+        self.assertEqual([message.text for message in self.relayed],
+                         [f"Stuck message from {at.isoformat()}:\nuncertain",
+                          f"Stuck message from {at.isoformat()}:\nnot attempted"])
+        archived = list((self.root / "socket-queue-archive").glob("*.jsonl"))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(send.read_queue(archived[0])[0]["text"], "uncertain")
+        self.assertFalse(path.exists())
+        self.assertEqual(self.drain(), (0, []))
+
+    def test_an_unconfirmed_reply_is_reported_before_its_queue_checkpoint_completes(self) -> None:
+        self.session("verify-session", "verify")
+        at = send.now()
+        path = self.socket_queue(self.relay_record(42, "verify"), (at, "uncertain"), (at, "next reply"))
+        with mock.patch.object(send, "log", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            _ = self.drain()
+        output = io.StringIO()
+        with redirect_stdout(output), interrupt_replacement(path, after=True), self.assertRaises(KeyboardInterrupt):
+            _ = send.main(["drain-sockets"])
+        self.assertEqual(output.getvalue(), f"UNCONFIRMED: stuck reply from {at.isoformat()} to verify may have arrived;"
+                         + " archived, not resent\n")
+        self.assertEqual([entry["text"] for entry in send.read_queue(path)], ["next reply"])
+        self.assertEqual(len(list((self.root / "socket-queue-archive").glob("*.jsonl"))), 1)
+        self.assertEqual(len(self.relayed), 1)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(send.main(["drain-sockets"]), 0)
+        self.assertEqual(output.getvalue(), f"SENT: stuck reply from {at.isoformat()} to verify\n")
+        self.assertEqual([message.text for message in self.relayed],
+                         [f"Stuck message from {at.isoformat()}:\nuncertain",
+                          f"Stuck message from {at.isoformat()}:\nnext reply"])
+        self.assertEqual(self.drain(), (0, []))
+
+    def test_a_sent_reply_is_reported_before_its_queue_checkpoint_completes(self) -> None:
+        self.session("verify-session", "verify")
+        at = send.now()
+        path = self.socket_queue(self.relay_record(42, "verify"), (at, "reply one"), (at, "reply two"))
+        output = io.StringIO()
+        with redirect_stdout(output), interrupt_replacement(path, after=True, skip=1), \
+                self.assertRaises(KeyboardInterrupt):
+            _ = send.main(["drain-sockets"])
+        self.assertEqual(output.getvalue(), f"SENT: stuck reply from {at.isoformat()} to verify\n")
+        self.assertEqual([entry["text"] for entry in send.read_queue(path)], ["reply two"])
+        self.assertEqual(self.drain(), (0, [f"SENT: stuck reply from {at.isoformat()} to verify"]))
+        self.assertEqual(len(self.relayed), 2)
+        self.assertEqual(self.drain(), (0, []))
+
+    def test_an_archive_summary_is_reported_before_any_old_file_is_moved(self) -> None:
+        at = send.now()
+        oldest, newest = at - timedelta(days=3), at - timedelta(hours=24)
+        first = self.socket_queue("uds:/fixture/cc-socks/42.sock", (oldest, "old reply"))
+        second = self.socket_queue("uds:/fixture/cc-socks/43.sock", (newest, "next old reply"))
+        output = io.StringIO()
+        with redirect_stdout(output), mock.patch.object(send, "now", return_value=at), \
+                interrupt_replacement(self.root / "socket-queue-archive" / first.name, after=True), \
+                self.assertRaises(KeyboardInterrupt):
+            _ = send.main(["drain-sockets"])
+        self.assertEqual(output.getvalue(), f"archiving 2 socket queue files: oldest {oldest.isoformat()},"
+                         + f" newest {newest.isoformat()}\n")
+        self.assertFalse(first.exists())
+        self.assertTrue(second.exists())
+        with mock.patch.object(send, "now", return_value=at):
+            self.assertEqual(self.drain(), (0, [f"archiving 1 socket queue files: oldest {newest.isoformat()},"
+                                               + f" newest {newest.isoformat()}"]))
+        self.assertEqual(len(list((self.root / "socket-queue-archive").iterdir())), 2)
+        self.assertEqual(self.drain(), (0, []))
+        self.assertEqual(self.relayed, [])
+
+    def test_a_socket_recovery_attempt_and_receipt_count_as_one_message_result(self) -> None:
+        self.session("verify-session", "verify")
+        _ = self.socket_queue(self.relay_record(42, "verify"), (send.now(), "reply"))
+        self.assertEqual(self.drain()[0], 0)
+        attempts = (self.root / "socket-recovery-attempts.jsonl").read_text().splitlines()
+        self.assertEqual(len(attempts), 1)
+        identity = send.as_dict(send.loads(attempts[0]))["key"]
+        self.assertEqual([(entry["key"], entry["outcome"]) for entry in self.log()], [(identity, "sent")])
+        self.assertEqual(len(self.relayed), 1)
+
+    def test_an_unfinished_retry_is_uncertain_even_when_its_time_matches_the_failed_attempt(self) -> None:
+        self.session("verify-session", "verify")
+        at = send.now()
+        path = self.socket_queue(self.relay_record(42, "verify"), (at, "reply"))
+        with mock.patch.object(send, "now", return_value=at):
+            self.outcome = send.Result("queued", "relay unavailable")
+            self.assertEqual(self.drain()[0], 3)
+            self.outcome = send.Result("sent", "ok")
+            with mock.patch.object(send, "log", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+                _ = self.drain()
+        code, lines = self.drain()
+        self.assertEqual(code, 3)
+        self.assertEqual(lines, [f"UNCONFIRMED: stuck reply from {at.isoformat()} to verify may have arrived;"
+                                 + " archived, not resent"])
+        self.assertFalse(path.exists())
+        self.assertEqual(len(self.relayed), 2)
+        self.assertEqual([entry["outcome"] for entry in self.log()], ["queued"])
+        self.assertEqual(self.drain(), (0, []))
+
+    def test_an_interrupted_attempt_write_does_not_start_delivery(self) -> None:
+        self.session("verify-session", "verify")
+        path = self.socket_queue(self.relay_record(42, "verify"), (send.now(), "reply"))
+        with mock.patch.object(os, "fsync", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            _ = self.drain()
+        self.assertEqual(self.relayed, [])
+        self.assertEqual(self.drain()[0], 3)
+        self.assertFalse(path.exists())
+        self.assertEqual(self.relayed, [])
+
+    def test_an_unreadable_socket_queue_does_not_stop_the_next_files_delivery(self) -> None:
+        self.session("verify-session", "verify")
+        first = self.socket_queue(self.relay_record(42, "verify"), (send.now(), "unreadable"))
+        _ = first.write_bytes(b"\xff\xfe\n")
+        second = self.socket_queue(self.relay_record(43, "verify"), (send.now(), "deliverable"))
+        code, lines = self.drain()
+        self.assertEqual(code, 3)
+        self.assertTrue(any(line.startswith(f"unresolved socket queue {first}: unreadable (")
+                            and line.endswith("); left in place") for line in lines))
+        self.assertEqual(first.read_bytes(), b"\xff\xfe\n")
+        self.assertFalse(second.exists())
+        self.assertEqual(len(self.relayed), 1)
+        self.assertTrue(self.relayed[0].text.endswith("\ndeliverable"))
+
+    def test_socket_drain_leaves_unresolved_files_in_place_and_names_each_file(self) -> None:
+        at = send.now()
+        paths = [self.socket_queue(self.relay_record(42, "verify"), (at, "known but offline")),
+                 self.socket_queue("uds:/fixture/cc-socks/43.sock", (at, "unknown"))]
+        before = [path.read_bytes() for path in paths]
+        for _ in range(2):
+            code, lines = self.drain()
+            self.assertEqual(code, 3)
+            for path in paths:
+                self.assertTrue(any(str(path) in line for line in lines))
+            self.assertEqual([path.read_bytes() for path in paths], before)
+
+    def test_socket_drain_retries_a_failed_delivery_without_an_extra_queued_copy(self) -> None:
+        self.session("verify-session", "verify")
+        path = self.socket_queue(self.relay_record(42, "verify"), (send.now(), "reply"))
+        self.outcome = send.Result("queued", "relay unavailable")
+        code, lines = self.drain()
+        self.assertEqual(code, 3)
+        self.assertIn("relay unavailable", lines[0])
+        self.assertTrue(path.exists())
+        self.assertEqual(list((self.root / "queue").iterdir()), [path])
+        self.assertEqual([entry["outcome"] for entry in self.log()], ["queued"])
+        self.outcome = send.Result("sent", "ok")
+        self.assertEqual(self.drain()[0], 0)
+        self.assertFalse(path.exists())
+        self.assertEqual(len(self.relayed), 2)
+        self.assertEqual([entry["outcome"] for entry in self.log()], ["queued", "sent"])
+        self.assertEqual(len((self.root / "socket-recovery-attempts.jsonl").read_text().splitlines()), 2)
+        self.assertEqual(self.drain(), (0, []))
+        self.assertEqual(len(self.relayed), 2)
+
     def test_live_session_id_relays_to_its_socket_and_logs_the_requested_address(self) -> None:
         self.session("id-1", "recipient")
 
@@ -799,7 +1421,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
         self.session("id-1", "recipient")
         recipient = roster.RosterEntry(
-            "machine", "claude", "top-level", "recipient", "running",
+            "machine", "claude", "freestanding", "recipient", "running",
             roster.Messageable("session:id-1"), "/work", roster.NoShowrunner(),
             roster.NoDirector(), roster.NotAWorker(),
         )
@@ -920,7 +1542,21 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         self.assertIn("latest stop result", pending)
 
     def test_real_cancel_and_restart_senders_retire_old_settle_instructions(self) -> None:
-        real_send = Path(__file__).resolve().parent / "send.py"
+        # The subprocess needs its own roster fixture; parent patches do not cross exec.
+        real_send = self.root / "real-send.py"
+        _ = real_send.write_text(
+            f"#!{sys.executable}\n"
+            + "import sys\n"
+            + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            + "import roster, send\n"
+            + "from scripts.lib import names\nfrom scripts.lib.test_names import fixture_names\n"
+            + "names.load_names = lambda: fixture_names()\n"
+            + "roster.roster = lambda environment, scope: roster.Roster([], [])\n"
+            + "roster.peer_roster = lambda environment: roster.Roster([], [])\n"
+            + "raise SystemExit(send.main(sys.argv[1:]))\n",
+            encoding="utf-8",
+        )
+        real_send.chmod(0o755)
         child_state = self.root / "child-state"
 
         def shutdown_fixture(session_id: str) -> shutdown_record.SessionShutdown:
@@ -984,7 +1620,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_unique_claude_roster_name_delivers_to_its_session_address(self) -> None:
         self.session("id-1", "recipient")
         recipient = roster.RosterEntry(
-            "machine", "claude", "top-level", "recipient", "running",
+            "machine", "claude", "freestanding", "recipient", "running",
             roster.Messageable("session:id-1"), "/work", roster.NoShowrunner(),
             roster.NoDirector(), roster.NotAWorker(),
         )
@@ -1127,7 +1763,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_ambiguous_name_describes_a_recipient_that_cannot_take_messages(self) -> None:
         entries = [
             roster.RosterEntry(
-                "machine", "claude", "top-level", "duplicate", "running",
+                "machine", "claude", "freestanding", "duplicate", "running",
                 roster.Messageable("session:messageable"), "/work", roster.NoShowrunner(),
                 roster.NoDirector(), roster.NotAWorker(),
             ),
@@ -1152,7 +1788,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ])
 
         self.assertEqual(raised.exception.code, 2)
-        self.assertIn("  session:messageable (top-level)\n", errors.getvalue())
+        self.assertIn("  session:messageable (freestanding)\n", errors.getvalue())
         self.assertIn(
             "  (cannot take messages: blind reviewer) (worker)\n",
             errors.getvalue(),
@@ -1332,7 +1968,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ("worker", 1),
             ("codex:thread-one", 1),
             ("session:claude-one", 1),
-            (f"uds:{self.root / 'claude.sock'}", 0),
+            (f"uds:{self.root / 'claude.sock'}", 1),
             ("user", 0),
         ):
             with self.subTest(recipient=recipient):
@@ -2447,11 +3083,13 @@ class PeerSendTests(ShutdownTestCase):
 
     def test_here_and_uds_never_ask_the_other_machine(self) -> None:
         self.peer([self.row("remote", "codex:peer")])
-        for target, flags in (("remote", ["--here"]), ("uds:/fixture/local.sock", []),
-                              ("uds:/fixture/local.sock", ["--machine", "mac"])):
-            with self.subTest(target=target):
-                status, output, errors = self.run_main(target, *flags)
-                self.assertEqual((status, errors), (0, ""), output)
+        with short_socket_directory() as directory, socket.socket(socket.AF_UNIX) as listener:
+            address = f"uds:{directory}/local.sock"
+            listener.bind(address.removeprefix("uds:"))
+            for target, flags in (("remote", ["--here"]), (address, []), (address, ["--machine", "mac"])):
+                with self.subTest(target=target):
+                    status, output, errors = self.run_main(target, *flags)
+                    self.assertEqual((status, errors), (0, ""), output)
         self.assertEqual(self.ssh_calls(), [])
         self.assertEqual(len(self.relayed), 3)
 
@@ -2565,7 +3203,7 @@ class PeerSendTests(ShutdownTestCase):
         ):
             for remote in (False, True):
                 with self.subTest(role=role, remote=remote):
-                    row = roster.RosterEntry("mac" if remote else "natedev", kind, role, "recipient", "waiting",
+                    row = roster.RosterEntry("mac" if remote else "natedev", kind, cast(roster.Role, role), "recipient", "waiting",
                         roster.CannotReceiveMessages(reason), "/fixture", roster.NoShowrunner(), relationship,
                         roster.WorkerAssignment("review", "/run") if role == "worker" else roster.NotAWorker())
                     self.local = roster.Roster([] if remote else [row], [])

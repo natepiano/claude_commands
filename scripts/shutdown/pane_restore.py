@@ -27,7 +27,7 @@ import herdr  # noqa: E402
 import pane_record  # noqa: E402
 import sessions  # noqa: E402
 from account import named_account_environment  # noqa: E402
-from record import all_session_records  # noqa: E402
+from shutdown_record import all_session_records  # noqa: E402
 
 START_TIMEOUT_MS = 90_000
 SERVER_TIMEOUT_MS = 60_000

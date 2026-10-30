@@ -6,6 +6,7 @@ from contextlib import nullcontext, redirect_stderr, redirect_stdout
 import io
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -22,13 +23,14 @@ for dependency in ("lib", "herdr", "production", "message", "shutdown", "notify"
 sys.path.insert(0, str(ROOT))
 if TYPE_CHECKING:
     from scripts.herdr import herdr, herdr_sessions
-    from scripts.production import add_unit, add_showrunner
+    from scripts.production import add_unit, add_showrunner, production_units
     from scripts.shutdown import restart, pane_restore, pane_record
     from scripts.notify import review
     from scripts.notify.user_action import NoActionRequired
 else:
     import herdr
     import add_unit
+    import production_units
     import add_showrunner
     import restart
     import pane_restore
@@ -76,8 +78,8 @@ class HerdrLaunchTests(NixFixture):
         started.assert_called_once()
         self.refusal(lambda: herdr.launch_agent("host", "space", "title", str(self.work), {}, "claude", [], herdr.NoOpeningPrompt(), 100, agent="fixture"))
 
-    def production(self) -> add_unit.Production:
-        return add_unit.Production(self.root / "child-production.md", "child", "merge", self.root / "checkout", self.root / "log", ZoneInfo("UTC"))
+    def production(self) -> production_units.Production:
+        return production_units.Production(self.root / "child-production.md", "child", "merge", self.root / "checkout", self.root / "log", ZoneInfo("UTC"))
 
     def test_choke_point_closes_the_new_tab_when_agent_start_fails(self) -> None:
         with (patch.object(nix_env, "ensure", return_value=nix_env.NoEnvrc(self.env)),
@@ -350,6 +352,82 @@ print('{"type":"result","result":"fixture completed"}')
         directory = self.home / "rust/berth-fix"
         directory.mkdir(parents=True)
         self.launch_contract("berth_fix/launch.sh", ["--here"], directory)
+
+    def test_berth_fix_reuses_reserved_id_until_its_account_transcript_exists(self) -> None:
+        home = self.home.rename(self.root / "home.with_under score")
+        self.scripts = home / ".claude/scripts"
+        self.env["HOME"] = str(home)
+        directory = home / "rust/berth-fix"
+        _ = self.envrc(directory)
+        config = home / ".claude3"
+        self.env["CLAUDE_CONFIG_DIR"] = str(config)
+        self.env["DIRENV_DIFF"] = "{}"
+        failed = self.run_script("berth_fix/launch.sh", ["--here"], directory)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertFalse(self.started.exists())
+        record = home / ".claude/state/berth-fix/session.json"
+        reserved = cast(dict[str, str], json.loads(record.read_text()))["session_id"]
+        del self.env["DIRENV_DIFF"]
+        project = re.sub(r"[^a-zA-Z0-9]", "-", str(directory))
+        # Another account's transcript must not turn the reserved id into a resume.
+        other_account = home / ".claude/projects" / project
+        other_account.mkdir(parents=True)
+        _ = (other_account / f"{reserved}.jsonl").write_text("fixture transcript\n")
+        recovered = self.run_script("berth_fix/launch.sh", ["--here"], directory)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        first = cast(dict[str, object], json.loads(self.started.read_text().splitlines()[0]))
+        arguments = cast(list[str], first["args"])
+        self.assertEqual(arguments[arguments.index("--session-id") + 1], reserved)
+        self.assertNotIn("-r", arguments)
+        own_history = config / "projects" / project
+        own_history.mkdir(parents=True)
+        _ = (own_history / f"{reserved}.jsonl").write_text("fixture transcript\n")
+        resumed = self.run_script("berth_fix/launch.sh", ["--here"], directory)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        last = cast(dict[str, object], json.loads(self.started.read_text().splitlines()[-1]))
+        arguments = cast(list[str], last["args"])
+        self.assertEqual(arguments[arguments.index("-r") + 1], reserved)
+        self.assertNotIn("--session-id", arguments)
+
+    def test_berth_fix_rerun_moves_account_history_after_an_interrupted_worktree_move(self) -> None:
+        repository = self.home / "rust/cargo-liner"
+        _ = self.envrc(repository)
+        legacy = self.home / "rust/cargo-liner-berth-fix"
+        directory = self.home / "rust/berth-fix"
+        for arguments in (["init"], ["add", ".envrc"], ["commit", "-m", "fixture"],
+                          ["worktree", "add", "-b", "fix/berth", str(legacy)]):
+            result = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
+                                    cwd=repository, env=self.env, capture_output=True, text=True,
+                                    timeout=TEST_HANG_GUARD_SECS, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.home / ".claude3"
+        self.env["CLAUDE_CONFIG_DIR"] = str(config)
+        old_name = re.sub(r"[^a-zA-Z0-9]", "-", str(legacy))
+        new_name = re.sub(r"[^a-zA-Z0-9]", "-", str(directory))
+        old_history, new_history = config / "projects" / old_name, config / "projects" / new_name
+        old_history.mkdir(parents=True)
+        _ = (old_history / "fixture.jsonl").write_text("conversation survives\n")
+        default_history = self.home / ".claude/projects" / old_name
+        default_history.mkdir(parents=True)
+        _ = (default_history / "other-account.jsonl").write_text("other account\n")
+        self.script(self.bin / "mv", 'import sys\nprint("fixture stopped before history move", file=sys.stderr)\nraise SystemExit(19)\n')
+        interrupted = self.run_script("berth_fix/launch.sh", ["--here"], self.work)
+        self.assertNotEqual(interrupted.returncode, 0)
+        self.assertTrue(directory.is_dir())
+        self.assertFalse(legacy.exists())
+        self.assertTrue(old_history.is_dir())
+        self.assertFalse(new_history.exists())
+        self.assertFalse(self.started.exists())
+        (self.bin / "mv").unlink()
+        recovered = self.run_script("berth_fix/launch.sh", ["--here"], self.work)
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(old_history.exists())
+        self.assertEqual((new_history / "fixture.jsonl").read_text(), "conversation survives\n")
+        self.assertTrue(default_history.is_dir())
+        self.assertTrue(self.started.exists())
+        # Once repaired, another launch leaves the destination history intact.
+        self.assertEqual(self.run_script("berth_fix/launch.sh", ["--here"], self.work).returncode, 0)
+        self.assertEqual((new_history / "fixture.jsonl").read_text(), "conversation survives\n")
 
     def test_direnv_allow_is_a_failing_helper_call_not_a_warning(self) -> None:
         _ = self.envrc(self.work)

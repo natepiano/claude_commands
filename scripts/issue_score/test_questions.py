@@ -11,6 +11,29 @@ ADOPTED_WORDINGS = Path(__file__).with_name("fixtures") / "adopted_wordings_v3.j
 
 
 class QuestionTests(unittest.TestCase):
+    def test_adopted_area_definitions_fill_both_orders_without_changing_the_option_domain(self) -> None:
+        areas = ["rendering", "tooling"]
+        definitions = {"rendering": "Drawing scenes and managing render passes.",
+                       "not-in-vocabulary": "Must not add an option."}
+        original = questions.area_questions(areas, {})
+        defined = questions.area_questions(areas, definitions)
+        for name, order in (("area", areas), ("area_reverse", list(reversed(areas)))):
+            with self.subTest(question=name):
+                question = defined[name]
+                fallback = original[name]
+                assert question["type"] == "choice" and fallback["type"] == "choice"
+                self.assertEqual(list(question["criteria"]), order)
+                self.assertEqual(question["criteria"], {
+                    "rendering": "The work concerns rendering: Drawing scenes and managing render passes.",
+                    "tooling": "The work concerns the part named tooling.",
+                })
+                self.assertEqual(fallback["criteria"]["rendering"], "The work concerns the part named rendering.")
+                self.assertEqual(question["instructions"], fallback["instructions"])
+        self.assertEqual(defined["area_fits"], original["area_fits"])
+
+    def test_merged_area_definitions_invalidate_earlier_question_versions(self) -> None:
+        self.assertEqual(questions.QUESTION_SET_VERSION, "5")
+
     def test_jev_proposes_exactly_the_fields_approved_by_the_user(self) -> None:
         self.assertEqual(
             questions.JEV_FIELDS,
@@ -48,14 +71,14 @@ class QuestionTests(unittest.TestCase):
             self.assertEqual(questions.HISTORICAL_EFFORT_EXAMPLE_STEMS - {issue.path.stem for issue in loaded}, set())
 
     def test_instructions_identify_the_issue_state_path_in_both_requests(self) -> None:
-        for request in (questions.main_questions(), questions.area_questions(["rendering", "tooling"])):
+        for request in (questions.main_questions(), questions.area_questions(["rendering", "tooling"], {})):
             for name, question in request.items():
                 with self.subTest(question=name):
                     self.assertIn("`issue`", question["instructions"])
                     self.assertNotRegex(question["instructions"], r"(?<!`)\bissue\b(?!`)")
 
     def test_criteria_quote_issue_paths_and_area_questions_identify_the_vocabulary(self) -> None:
-        area = questions.area_questions(["rendering", "tooling"])
+        area = questions.area_questions(["rendering", "tooling"], {})
         adopted = experiment.load_variants(ADOPTED_WORDINGS)["category_deliverable"]
         for request in (questions.main_questions(), area):
             for name, question in request.items():

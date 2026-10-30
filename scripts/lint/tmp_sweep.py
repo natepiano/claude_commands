@@ -14,6 +14,11 @@ candidate with keep/remove and a reason, writes the plan, and removes nothing.
 Then use `tmp_sweep.py --apply <plan.json>` to recheck and remove only planned
 paths. Hand cleanup also requires end evidence: all recorded workers ended, a
 scratch task ended, or a recorded verify.sh run stopped. Age alone keeps a path.
+The timed sweep keeps top-level /tmp/claude entries and direct unit/delegate run
+folders without that end evidence until nothing in them changed for 7 days.
+Files and links at the top level also wait 7 days. Tempfile-named entries and
+invoke/verify logs keep their existing rules. Every process and ownership check
+still applies; the log distinguishes an ended owner from the 7-day fallback.
 
 An entry is one top-level file, folder or link under a root: /tmp/claude,
 /tmp/claude/delegate, /tmp/claude/unit, or a /tmp/claude-<uid>/-<project>/
@@ -83,8 +88,8 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
-from dataclasses import dataclass, field
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -172,6 +177,8 @@ IN_USE = "a process uses it"
 VERIFY_RUNS = "its verify.sh run is running"
 RECENT = "changed in the last 4 h"
 RECENT_WIDE = "changed in the last 7 days"
+NO_END_RECENT = "no record proves its owner ended, and it changed in the last 7 days"
+NO_END_OLD = "no record proves its owner ended; unchanged for 7 days and unused"
 TASK_OPEN = "its task is open and it changed in the last 7 days"
 SMALL_IN_LIVE_SESSION = "under 1 GiB in a running session's folder"
 UNLISTED_REASONS = (RECENT, RECENT_WIDE, SMALL_IN_LIVE_SESSION, TASK_OPEN)
@@ -187,6 +194,7 @@ class DeletedEntry(TypedDict):
     path: str
     gib: float
     last_change: str
+    reason: str
 
 
 class FailedEntry(TypedDict):
@@ -229,12 +237,11 @@ class Roots:
     def all(self) -> tuple[str, ...]:
         return self.plain + self.runs + self.projects + self.temp + self.scratch + self.sessions
 
-    def entries(self, root: str) -> list[os.DirEntry[str]]:
-        """The entries of root the sweep judges."""
-        found = listing(root)
-        if root not in self.temp:
-            return found
-        return [entry for entry in found if self.judged_temp(root, entry)]
+    def entries(self, root: str) -> Iterator[os.DirEntry[str]]:
+        """The entries of root the sweep judges, without retaining the directory."""
+        for entry in listing(root):
+            if root not in self.temp or self.judged_temp(root, entry):
+                yield entry
 
     def judged_temp(self, root: str, entry: os.DirEntry[str]) -> bool:
         try:
@@ -416,12 +423,12 @@ def verify_running(pid: int, made: float, now: float, proc: str = PROC_DIR) -> b
     return any(os.path.basename(argument) == VERIFY_SCRIPT for argument in arguments) and start <= made + START_SLACK_SECONDS
 
 
-def listing(directory: str) -> list[os.DirEntry[str]]:
+def listing(directory: str) -> Iterator[os.DirEntry[str]]:
     try:
         with os.scandir(directory) as entries:
-            return list(entries)
+            yield from entries
     except OSError:
-        return []
+        return
 
 
 def running_session_ids() -> frozenset[str] | None:
@@ -434,12 +441,23 @@ def running_session_ids() -> frozenset[str] | None:
                      if sessions.running_session(entry.record))
 
 
-def process_paths(proc: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]] | None:
+@dataclass(frozen=True)
+class ProcessUsesKnown:
+    """A completed scan of process paths, including a scan with no matches."""
+    paths: list[tuple[str, int, str]]
+
+
+@dataclass(frozen=True)
+class ProcessUsesUnavailable:
+    """Process use cannot be checked; candidates must stay."""
+
+
+def process_paths(proc: str, prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesUnavailable:
     """Each path under prefix that a process works in, holds open or maps, with its pid and how;
-    None when proc does not exist. A process that ends mid-scan, or one this user cannot read, is
+    unavailable when proc does not exist. A process that ends mid-scan, or one this user cannot read, is
     passed over: another user's process does not work in an agent's scratch."""
     if not os.path.isdir(proc):
-        return None
+        return ProcessUsesUnavailable()
     found: list[tuple[str, int, str]] = []
     for entry in listing(proc):
         if not entry.name.isdigit():
@@ -460,26 +478,25 @@ def process_paths(proc: str, prefix: str | tuple[str, ...]) -> list[tuple[str, i
             if target.startswith(prefix):
                 found.append((target.removesuffix(DELETED_SUFFIX), pid, "holds a file open in it"))
         try:
-            with open(os.path.join(entry.path, "maps"), "rb") as handle:
-                maps = handle.read()
+            with open(os.path.join(entry.path, "maps"), encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    parts = line.rstrip("\n").split(maxsplit=5)
+                    if len(parts) == 6 and parts[5].startswith(prefix):
+                        found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, "maps a file in it"))
         except OSError:
             continue
-        for line in maps.decode(errors="replace").splitlines():
-            parts = line.split(maxsplit=5)
-            if len(parts) == 6 and parts[5].startswith(prefix):
-                found.append((parts[5].removesuffix(DELETED_SUFFIX), pid, "maps a file in it"))
-    return found
+    return ProcessUsesKnown(found)
 
 
-def lsof_paths(prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]] | None:
-    """process_paths from one lsof scan; None when lsof cannot run or prints nothing."""
+def lsof_paths(prefix: str | tuple[str, ...]) -> ProcessUsesKnown | ProcessUsesUnavailable:
+    """Process paths from one lsof scan; unavailable when lsof cannot run or prints nothing."""
     try:
         completed = subprocess.run(LSOF, capture_output=True, text=True, errors="replace",
                                    timeout=LSOF_TIMEOUT_SECONDS, check=False)
     except (OSError, subprocess.TimeoutExpired):
-        return None
+        return ProcessUsesUnavailable()
     # lsof exits 1 when it cannot read some process; the lines it printed still hold.
-    return parse_lsof(completed.stdout, prefix) if completed.stdout else None
+    return ProcessUsesKnown(parse_lsof(completed.stdout, prefix)) if completed.stdout else ProcessUsesUnavailable()
 
 
 def parse_lsof(text: str, prefix: str | tuple[str, ...]) -> list[tuple[str, int, str]]:
@@ -530,18 +547,20 @@ def last_change(path: str, limit: Limit) -> tuple[float, int] | str:
     while frontier:
         try:
             with os.scandir(frontier.pop()) as entries:
-                listed = list(entries)
-            for entry in listed:
-                info = entry.stat(follow_symlinks=False)
-                folder = stat.S_ISDIR(info.st_mode)
-                newest = max(newest, info.st_mtime, info.st_ctime if limit.folder_ctime or not folder else 0.0)
-                if newest >= since:
-                    return recent
-                if folder:
-                    frontier.append(entry.path)
-                elif (info.st_dev, info.st_ino) not in seen:
-                    seen.add((info.st_dev, info.st_ino))
-                    total += info.st_blocks * 512
+                for entry in entries:
+                    info = entry.stat(follow_symlinks=False)
+                    folder = stat.S_ISDIR(info.st_mode)
+                    newest = max(newest, info.st_mtime, info.st_ctime if limit.folder_ctime or not folder else 0.0)
+                    if newest >= since:
+                        return recent
+                    if folder:
+                        frontier.append(entry.path)
+                    elif info.st_nlink <= 1:
+                        total += info.st_blocks * 512
+                    elif (info.st_dev, info.st_ino) not in seen:
+                        # Only hard links need an identity retained across the scan.
+                        seen.add((info.st_dev, info.st_ino))
+                        total += info.st_blocks * 512
         except OSError:
             return UNREADABLE
     if not newest:
@@ -920,23 +939,23 @@ class RemovableEntry:
     root: str
     newest: float
     size: int
+    reason: str = "idle and unused"
 
 
-def judge_entries(roots: Roots, now: float, proc: str) -> list[KeptEntry | RemovableEntry]:
+def judge_entries(roots: Roots, now: float, proc: str) -> Iterator[KeptEntry | RemovableEntry]:
     """Apply the ownership, use and idle checks shared by timed and hand cleanup."""
-    result: list[KeptEntry | RemovableEntry] = []
     if not roots.all():
-        return result
+        return
     # The scan keeps only paths under the roots' common folder (/tmp), which entry_uses then sorts.
     prefix = os.path.join(os.path.commonpath(roots.all()), "")
     paths = process_paths(proc, prefix)
-    if paths is None:
+    if isinstance(paths, ProcessUsesUnavailable):
         paths = lsof_paths(prefix)
-    if paths is None:
+    if isinstance(paths, ProcessUsesUnavailable):
         for root in roots.all():
             for entry in roots.entries(root):
-                result.append(KeptEntry(entry.path, NO_PROC))
-        return result
+                yield KeptEntry(entry.path, NO_PROC)
+        return
     live = running_session_ids()
     inner = session_folders(roots, live)
     try:
@@ -951,7 +970,7 @@ def judge_entries(roots: Roots, now: float, proc: str) -> list[KeptEntry | Remov
         print(f"tmp sweep: {path}: {UNREADABLE}; keeping scratch and top-level /tmp/claude entries", file=sys.stderr)
     temp_live = None if live is None else live | workers.threads
     judged = roots.all() + inner + temp_parents(roots, temp_live)
-    uses = entry_uses(paths, judged)
+    uses = entry_uses(paths.paths, judged)
     for root in judged:
         for entry in roots.entries(root):
             reason = owner_reason(entry, root, roots, temp_live, marked)
@@ -968,22 +987,21 @@ def judge_entries(roots: Roots, now: float, proc: str) -> list[KeptEntry | Remov
                 elif workers.unreadable_records and root in roots.scratch + roots.plain and reason is None:
                     reason = UNREADABLE
             if reason is None and entry.path in uses:
-                result.append(KeptEntry(entry.path, IN_USE, uses[entry.path]))
+                yield KeptEntry(entry.path, IN_USE, uses[entry.path])
                 continue
             change = last_change(entry.path, roots.limit(root, entry, now, proc)) if reason is None else reason
             if isinstance(change, str):
-                result.append(KeptEntry(entry.path, change))
+                yield KeptEntry(entry.path, change)
                 continue
             newest, size = change
             if root in inner and size < SESSION_ENTRY_MIN_BYTES:
-                result.append(KeptEntry(entry.path, SMALL_IN_LIVE_SESSION))
+                yield KeptEntry(entry.path, SMALL_IN_LIVE_SESSION)
                 continue
             git = git_work(Path(entry.path))
             if git is not GitWork.SAVED:
-                result.append(KeptEntry(entry.path, git.value))
+                yield KeptEntry(entry.path, git.value)
                 continue
-            result.append(RemovableEntry(entry.path, root, newest, size))
-    return result
+            yield RemovableEntry(entry.path, root, newest, size)
 
 
 def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool) -> bool:
@@ -996,7 +1014,7 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool) -> bool:
             return False
     result.freed += entry.size
     result.deleted.append(DeletedEntry(path=entry.path, gib=round(entry.size / GIB, 3),
-                                       last_change=when(entry.newest)))
+                                       last_change=when(entry.newest), reason=entry.reason))
     return True
 
 
@@ -1004,11 +1022,17 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
     """Delete every idle entry no process uses, and record why each other entry stays."""
     result = Sweep()
     emptied: set[str] = set()
-    for entry in judge_entries(roots, now, proc):
+    removals: list[RemovableEntry] = []
+    for entry in timed_entries(roots, now, proc):
         if isinstance(entry, KeptEntry):
             path = f"{entry.path}: {entry.use}" if entry.use else entry.path
             result.keep(path, entry.reason)
-        elif remove_entry(entry, result, dry_run) and not dry_run:
+        else:
+            removals.append(entry)
+    # A linked worktree can use another candidate's git metadata. Finish all
+    # checks before removing any candidate, retaining only removal decisions.
+    for entry in removals:
+        if remove_entry(entry, result, dry_run) and not dry_run:
             emptied.add(entry.root)
     for root in emptied.intersection(roots.projects):
         try:
@@ -1052,6 +1076,31 @@ def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: st
     except (OSError, UnicodeError, ValueError):
         return CleanupKeepReason.UNREADABLE
     return CleanupKeepReason.NO_END
+
+
+def timed_entries(roots: Roots, now: float, proc: str) -> Iterator[KeptEntry | RemovableEntry]:
+    """Keep unrecorded top-level work for seven days after all other checks pass."""
+    for entry in judge_entries(roots, now, proc):
+        if isinstance(entry, KeptEntry) or entry.root not in roots.plain + roots.runs:
+            yield entry
+            continue
+        name = Path(entry.path).name
+        if any(pattern.fullmatch(name) for pattern in (TEMPFILE_NAME, INVOKE_TEMP_NAME, VERIFY_TEMP_NAME)):
+            yield entry
+            continue
+        ended = cleanup_end_reason(entry, roots, now, proc)
+        if isinstance(ended, CleanupEndReason):
+            yield replace(entry, reason=ended.value)
+            continue
+        if ended is CleanupKeepReason.UNREADABLE:
+            yield KeptEntry(entry.path, ended.value)
+            continue
+        change = last_change(entry.path, Limit(now - WIDE_IDLE_SECONDS, NO_END_RECENT))
+        if isinstance(change, str):
+            yield KeptEntry(entry.path, change)
+            continue
+        newest, size = change
+        yield replace(entry, newest=newest, size=size, reason=NO_END_OLD)
 
 
 class PlanEntry(TypedDict):
@@ -1153,16 +1202,24 @@ def record(result: Sweep, dry_run: bool, now: float) -> RunRecord:
 
 def append_log(path: Path, entry: RunRecord, now: float) -> None:
     """Add entry to the log and drop each line older than LOG_KEEP_SECONDS."""
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        lines = []
-    kept = [line for line in lines if logged_at(line) >= now - LOG_KEEP_SECONDS]
-    kept.append(json.dumps(entry, sort_keys=True))
     path.parent.mkdir(parents=True, exist_ok=True)
     staged = path.with_name(f".{path.name}.{os.getpid()}")
-    _ = staged.write_text("\n".join(kept) + "\n", encoding="utf-8")
-    _ = staged.replace(path)
+    try:
+        with staged.open("w", encoding="utf-8") as output:
+            try:
+                with path.open(encoding="utf-8") as source:
+                    for line in source:
+                        if logged_at(line) >= now - LOG_KEEP_SECONDS:
+                            _ = output.write(line.rstrip("\n") + "\n")
+            except FileNotFoundError:
+                pass
+            # iterencode avoids a second full copy of a large run record.
+            for chunk in json.JSONEncoder(sort_keys=True).iterencode(entry):
+                _ = output.write(chunk)
+            _ = output.write("\n")
+        _ = staged.replace(path)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def logged_at(line: str) -> float:

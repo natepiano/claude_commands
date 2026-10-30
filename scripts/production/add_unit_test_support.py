@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 import argparse
 import io
 import json
@@ -28,7 +33,7 @@ import conversation_pause
 import unit_lookup
 import sessions
 import inventory
-import record as shutdown_store
+import shutdown_record as shutdown_store
 import restart
 from herdr import HerdrPlace
 from production_units import Refusal, cell_value
@@ -126,6 +131,7 @@ class AddUnitTestCase(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         # These CLI fixtures prove launcher plumbing; transcript proof is exercised
         # through the real submit method in PromptSubmissionTests.
         def submitted(client: herdr.Herdr, pane: str, opening: herdr.OpeningPrompt,
@@ -308,13 +314,13 @@ class AddUnitTestCase(ShutdownTestCase):
 
     def write_agent_config(self, *, family: str = "claude", director: str = "opus:xhigh",
                            claude_set: bool = True) -> None:
-        claude_section = f"[production.claude]\ndirector={director}\n\n" if claude_set else ""
-        codex_section = "[production.codex]\ndirector=gpt-test:high\n\n" if family == "codex" else ""
-        content = (f"[assignments]\nproduction={family}\n\n"
-                   f"{claude_section}{codex_section}"
-                   "[codex.agents]\ngpt-test=low,medium,high\n\n"
-                   "[claude.agents]\nopus=low,medium,high,xhigh\nsonnet=low,medium,high,xhigh\n")
-        _ = self.agent_config.write_text(content, encoding="utf-8")
+        overrides: dict[str, dict[str, str | None]] = {
+            "assignments": {"production": family},
+            "production.claude": {"director": director if claude_set else None},
+        }
+        if family == "codex":
+            overrides["production.codex"] = {"director": "gpt-test:high"}
+        _ = write_registry(self.agent_config, overrides)
 
     def production_doc(self, merge_branch: str = "build-followups", *, session_column: bool = False) -> str:
         columns = ["Unit", "Plan", "Worktree", "Branch", *(["Session"] if session_column else []), "Port", "Owns"]
@@ -619,7 +625,7 @@ class AddUnitTestCase(ShutdownTestCase):
         outcome: herdr.PromptSubmitOutcome = SUBMITTED_PROMPT,
     ) -> tuple[int, str, list[list[str]], int, int]:
         request = add_unit.UnitLaunch(
-            production=add_unit.read_production(self.doc),
+            production=production_units.read_production(self.doc),
             identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
             branch="build-followups-alpha",
             worktree=self.root / "project-alpha",
@@ -635,7 +641,10 @@ class AddUnitTestCase(ShutdownTestCase):
         launched = (marked if already_marked else unit_lookup.MarkedUnit("alpha-unit", claude, HerdrPlace(SHARED, "w1:p1")))
         ready = add_unit.ReadyToLaunch(
             request,
-            add_unit.NoUnitRow(),
+            # A rerun or restore reuses a row. Only a fresh launch has no row.
+            add_unit.ExistingUnitRow("docs/plans/given.md", str(request.worktree), request.branch,
+                                     "—", "—", add_unit.ActiveUnitRow())
+            if already_marked or isinstance(launch_kind, add_unit.UnitRestoreLaunch) else add_unit.NoUnitRow(),
             add_unit.DirectorAgent("opus", add_unit.DefaultEffort()),
         )
         commands: list[list[str]] = []
@@ -812,43 +821,43 @@ class AddUnitTestCase(ShutdownTestCase):
         return self.successful("trunk", "--plan", "docs/plans/other.md", "--resume", "session-trunk",
                                "--cwd", str(prior), "--autocompact", value, *flags)
 
-    def assert_guild_head_launch_and_restart(self, guild: str) -> None:
-        self.doc = self.checkout / "docs/plans/guilds-production.md"
-        row = self.unit_row(guild, branch="guilds-" + guild, worktree=self.root / ("project-" + guild))
-        row = row.replace(f"| {guild}-unit |", f"| `{guild}` |")
+    def assert_named_unit_launch_and_restart(self, unit: str) -> None:
+        self.doc = self.checkout / "docs/plans/sample-production.md"
+        row = self.unit_row(unit, branch="sample-" + unit, worktree=self.root / ("project-" + unit))
+        row = row.replace(f"| {unit}-unit |", f"| `{unit}` |")
         _ = self.doc.write_text(self.production_doc().replace("## Gates", row + "\n\n## Gates"), encoding="utf-8")
         _ = self.git("add", str(self.doc.relative_to(self.checkout)))
-        _ = self.git("commit", "-m", "Add guilds fixture production")
+        _ = self.git("commit", "-m", "Add sample fixture production")
         _ = self.git("push", "origin", "build-followups")
 
-        result = self.successful(guild, "--plan", "docs/plans/given.md")
-        self.assertIn(f"{guild} started", result.stdout)
+        result = self.successful(unit, "--plan", "docs/plans/given.md")
+        self.assertIn(f"{unit} started", result.stdout)
         rows = list(production_units.unit_table(self.doc.read_text().splitlines()))
-        self.assertEqual([cell_value(row["Unit"]) for row in rows], [guild])
-        self.assertEqual(self.pane_environment()["SHOWRUNNER_UNIT_ID"], guild)
-        self.assertEqual(self.pane_environment()["SHOWRUNNER_UNIT"], "guilds")
+        self.assertEqual([cell_value(row["Unit"]) for row in rows], [unit])
+        self.assertEqual(self.pane_environment()["SHOWRUNNER_UNIT_ID"], unit)
+        self.assertEqual(self.pane_environment()["SHOWRUNNER_UNIT"], "sample")
         with patch.dict(os.environ, self.env):
-            marked = unit_lookup.marked_unit("guilds", guild)
+            marked = unit_lookup.marked_unit("sample", unit)
             self.assertIsNotNone(marked)
             if marked is not None:
-                self.assertEqual(marked.unit, guild)
+                self.assertEqual(marked.unit, unit)
                 self.assertEqual(marked.place.session, "agents")
-            self.assertIsNone(unit_lookup.marked_unit("guilds", guild + "-unit"))
+            self.assertIsNone(unit_lookup.marked_unit("sample", unit + "-unit"))
 
-        note = self.root / "guild-restart.md"
-        _ = note.write_text("Resume the guild loop.\n", encoding="utf-8")
+        note = self.root / "unit-restart.md"
+        _ = note.write_text("Resume the unit work.\n", encoding="utf-8")
         request = add_unit.launch_request(argparse.Namespace(
-            production=str(self.doc), name=guild, plan="docs/plans/given.md", brief=None,
+            production=str(self.doc), name=unit, plan="docs/plans/given.md", brief=None,
             standby=False, permanent=False, port=None, owns=None, timeout=90.0, check=False,
-            resume="guild-session", cwd=str(self.root / ("project-" + guild)),
-            restart_note=str(note), session_name=guild, host_session="guilds-" + guild, probe=False,
+            resume="unit-session", cwd=str(self.root / ("project-" + unit)),
+            restart_note=str(note), session_name=unit, host_session="sample-" + unit, probe=False,
         ))
-        self.assertEqual(request.unit, guild)
+        self.assertEqual(request.unit, unit)
         self.assertIsInstance(request.launch_kind, add_unit.UnitRestoreLaunch)
         self.assertIsInstance(add_unit.row_is_present(request, self.doc.read_text().splitlines()),
                               add_unit.ExistingUnitRow)
         before = self.doc.read_bytes()
-        resumed = self.cli(guild, "--plan", "docs/plans/given.md")
+        resumed = self.cli(unit, "--plan", "docs/plans/given.md")
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertEqual(self.doc.read_bytes(), before)
         self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls()), 1)

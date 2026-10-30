@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 
+from scripts.lib.socket_test_support import short_socket_directory
 import session_pane
 from herdr import AgentBlocked, HerdrPlace, HerdrRefusal, SessionListResult
 from fake_herdr import CommandResponse, herdr_listener
@@ -71,7 +72,7 @@ class SessionPaneTests(unittest.TestCase):
 
     def record(self, environment: dict[str, str], parent: int = 0) -> SessionRecord:
         self.process(os.getpid(), parent, ["claude"], environment)
-        path = self.root / "session.sock"
+        path = Path(self.enterContext(short_socket_directory())) / "session.sock"
         held = socket.socket(socket.AF_UNIX)
         held.bind(str(path))
         self.addCleanup(held.close)

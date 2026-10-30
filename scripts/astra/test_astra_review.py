@@ -14,12 +14,9 @@ from pathlib import Path
 from typing import TypedDict, cast, override
 from unittest.mock import patch
 
-# Hang guards allow for load 136 on natedev (2026-10-29).
-TEST_HANG_GUARD_SECS = 300
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_review  # noqa: E402
-from scripts.guilds import astra_work, roles, tips  # noqa: E402
+from scripts.astra import astra_work, design_roles  # noqa: E402
 
 SCRIPT = Path(__file__).with_name("astra_review.py")
 # The stand-in for accounts.py: answers `role workers`, and for `exec` records its call and writes
@@ -55,18 +52,6 @@ if review:
         written.write(review)
 """
 
-REVIEWER_GUILD_BLOCK = (
-    "Your guild is `reviewers`. Your head is the `reviewers` unit director in the `guilds` "
-    "production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load "
-    "`guilds/common/` and `guilds/reviewers/`; a Codex holder does this for its worker. Report to your "
-    "head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat "
-    "rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send "
-    "one report of at most 100 words, with evidence and result. Resolve the head from "
-    "`message/roster.py --json` by production `guilds` and unit `reviewers`; send with `message/send.py` "
-    "or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to "
-    "the head. Never wake an idle Codex member for guild advice."
-)
-
 
 class Call(TypedDict):
     argv: list[str]
@@ -89,33 +74,13 @@ class AstraReviewTests(unittest.TestCase):
         _ = self.document.write_text("# Proposal\n", encoding="utf-8")
         self.environment = {**os.environ, "ASTRA_REVIEW_ACCOUNTS": str(stub),
                             "ASTRA_REVIEW_DIR": str(self.root / "runs"), "STUB_CALLS": str(self.root / "calls.json"),
-                            "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
-                            "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership"),
-                            "GUILD_ROLES_HOST": "fixture-host",
+                            "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
+                            "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership"),
+                            "DESIGN_ROLES_HOST": "fixture-host",
                             "ASTRA_ROLES_STATE": str(self.root / "roles"), "STUB_CODEX_HOME": str(self.root / "codex-home"),
                             "STUB_REVIEW": "Verdict: clear.\n\n1. Section Why: the cause is not shown."}
         _ = self.environment.pop("CLAUDE_CODE_SESSION_ID", None)
-        self.environment.update({"HOME": str(self.root), "GIT_CONFIG_GLOBAL": os.devnull,
-                                 "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
-                                 "GIT_AUTHOR_NAME": "Review fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
-                                 "GIT_COMMITTER_NAME": "Review fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
-                                 "GUILD_TIPS_REPO": str(self.root / "tips")})
-        self.git(self.root, "init", "--bare", "--initial-branch=main", str(self.root / "origin.git"))
-        self.git(self.root, "clone", str(self.root / "origin.git"), str(self.root / "tips"))
-        for guild, text in (("common", "Fixture common report evidence."),
-                            ("reviewers", "Fixture reviewer citation rule."),
-                            ("designers", "Private designer fixture tip.")):
-            folder = self.root / "tips/guilds" / guild
-            folder.mkdir(parents=True)
-            _ = (folder / "fixture.md").write_text(text + "\n", encoding="utf-8")
-        self.git(self.root / "tips", "add", ".")
-        self.git(self.root / "tips", "commit", "-m", "Fixture tips")
-        self.git(self.root / "tips", "push", "-u", "origin", "main")
-
-    def git(self, directory: Path, *arguments: str) -> None:
-        result = subprocess.run(["git", "-C", str(directory), *arguments], env=self.environment,
-                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.environment.update({"HOME": str(self.root)})
 
     def run_script(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run([sys.executable, str(SCRIPT), *arguments], env=self.environment, cwd=self.root,
@@ -128,15 +93,15 @@ class AstraReviewTests(unittest.TestCase):
         argv = self.call()["argv"]
         return Path(argv[argv.index("-o") + 1]).with_name("prompt.md")
 
-    def held_reviewer(self, status: str = "done") -> roles.HeldDesign:
+    def held_reviewer(self, status: str = "done") -> design_roles.HeldDesign:
         design_id = "00000000-0000-4000-8000-000000000016"
-        design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 1), "fixture-repo",
+        design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1), "fixture-repo",
                                   str(self.root), str(self.document), "proposal", "2026-10-21T12:00:00+00:00",
-                                  roles.UnitHolder("demo", "proposal-unit"), roles.DesignUnbound(),
-                                  (roles.RoleInstance("designer", "demo-proposal-astra-designer", roles.RoleNotOpened()),
-                                   roles.RoleInstance("reviewer", "demo-proposal-astra-reviewer", roles.RoleOpen("held-thread"))))
-        roles._save(design)  # pyright: ignore[reportPrivateUsage]
-        mesh = roles.mesh_directory(design_id)
+                                  design_roles.UnitHolder("demo", "proposal-unit"), design_roles.DesignUnbound(),
+                                  (design_roles.RoleInstance("designer", "demo-proposal-astra-designer", design_roles.RoleNotOpened()),
+                                   design_roles.RoleInstance("reviewer", "demo-proposal-astra-reviewer", design_roles.RoleOpen("held-thread"))))
+        design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        mesh = design_roles.mesh_directory(design_id)
         mesh.mkdir(parents=True)
         _ = (mesh / "mesh_roster.json").write_text(json.dumps({"demo-proposal-astra-reviewer": {
             "thread_id": "held-thread", "status": status, "held_design_id": design_id, "held_role": "reviewer"}}))
@@ -144,29 +109,28 @@ class AstraReviewTests(unittest.TestCase):
         return design
 
     def test_document_with_a_held_reviewer_resumes_that_thread_and_saves_each_reply(self) -> None:
-        assignments: list[tuple[str, roles.ThreadAccessPolicy]] = []
+        assignments: list[tuple[str, design_roles.ThreadAccessPolicy]] = []
 
-        def dispatch(design: roles.HeldDesign, role: roles.Role, prompt: Path, reply: Path,
+        def dispatch(design: design_roles.HeldDesign, role: design_roles.Role, prompt: Path, reply: Path,
                      model: str, effort: str) -> None:
             del model, effort
             instance = next(item for item in design.roles if item.role == role)
-            self.assertIsInstance(instance.lifecycle, roles.RoleOpen)
+            self.assertIsInstance(instance.lifecycle, design_roles.RoleOpen)
             self.assertTrue(prompt.is_file())
-            if isinstance(instance.lifecycle, roles.RoleOpen):
-                assignments.append((instance.lifecycle.thread_id, roles.access_policy(design, role)))
+            if isinstance(instance.lifecycle, design_roles.RoleOpen):
+                assignments.append((instance.lifecycle.thread_id, design_roles.access_policy(design, role)))
             _ = reply.write_text("Held reviewer evidence.\n")
 
         with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
-                patch.object(roles, "resolve_holder", return_value=roles.HolderReach("fixture-holder")), \
-                patch.object(roles, "resolve_model", return_value=("fixture-model", "xhigh")), \
-                patch.object(roles, "dispatch_turn", side_effect=dispatch), \
+                patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")), \
+                patch.object(design_roles, "resolve_model", return_value=("fixture-model", "xhigh")), \
+                patch.object(design_roles, "dispatch_turn", side_effect=dispatch), \
                 patch.object(astra_review, "workers_label", side_effect=AssertionError("held review started a fresh exec")), \
-                patch.object(tips, "load", return_value="Fixture reviewer tips"), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             design = self.held_reviewer()
             for focus in ("first round", "repair round"):
                 self.assertEqual(astra_review.main([str(self.document), focus]), 0)
-            prompts = sorted(roles.design_directory(design.placement.design_id).glob("prompts/*.md"))
+            prompts = sorted(design_roles.design_directory(design.placement.design_id).glob("prompts/*.md"))
             self.assertEqual(len(prompts), 2)
             replies: list[str] = []
             for prompt in prompts:
@@ -176,20 +140,20 @@ class AstraReviewTests(unittest.TestCase):
                     self.assertEqual((header.role, header.member), ("astra-reviewer", "demo-proposal-astra-reviewer"))
                     self.assertEqual(Path(header.reply_path).read_text(), "Held reviewer evidence.\n")
                     replies.append(header.reply_path)
-        self.assertEqual(assignments, [("held-thread", roles.ReadOnlyReviewer()), ("held-thread", roles.ReadOnlyReviewer())])
+        self.assertEqual(assignments, [("held-thread", design_roles.ReadOnlyReviewer()), ("held-thread", design_roles.ReadOnlyReviewer())])
         self.assertEqual(len(set(replies)), 2)
         self.assertIn("held reviewer", output.getvalue())
         self.assertFalse((self.root / "calls.json").exists())
 
     def test_busy_held_reviewer_is_reported_without_a_fresh_thread_or_prompt(self) -> None:
         with patch.dict(os.environ, {**self.environment, "CLAUDE_CODE_SESSION_ID": "fixture-holder"}), \
-                patch.object(roles, "resolve_holder", return_value=roles.HolderReach("fixture-holder")), \
-                patch.object(roles, "dispatch_turn", side_effect=AssertionError("busy role dispatched")), \
+                patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")), \
+                patch.object(design_roles, "dispatch_turn", side_effect=AssertionError("busy role dispatched")), \
                 patch.object(astra_review, "workers_label", side_effect=AssertionError("busy role used fresh exec")), \
                 contextlib.redirect_stderr(io.StringIO()) as errors:
             design = self.held_reviewer("running")
             self.assertEqual(astra_review.main([str(self.document)]), 1)
-            self.assertEqual(list(roles.design_directory(design.placement.design_id).glob("prompts/*.md")), [])
+            self.assertEqual(list(design_roles.design_directory(design.placement.design_id).glob("prompts/*.md")), [])
         self.assertIn("busy", errors.getvalue())
         self.assertFalse((self.root / "calls.json").exists())
 
@@ -239,18 +203,6 @@ class AstraReviewTests(unittest.TestCase):
                 self.assertEqual((result.returncode, result.stdout), (2, ""))
                 self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
                 self.assertFalse((self.root / "calls.json").exists())
-
-    def test_prompt_includes_the_exact_reviewers_block_and_committed_common_and_own_tips(self) -> None:
-        result = self.run_script(str(self.document))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        prompt = self.call()["stdin"]
-        self.assertIn(REVIEWER_GUILD_BLOCK, prompt)
-        self.assertIn("Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild reviewers", prompt)
-        self.assertIn("guilds/common/fixture.md", prompt)
-        self.assertIn("Fixture common report evidence.", prompt)
-        self.assertIn("guilds/reviewers/fixture.md", prompt)
-        self.assertIn("Fixture reviewer citation rule.", prompt)
-        self.assertNotIn("Private designer fixture tip.", prompt)
 
     def test_the_review_runs_astra_read_only_on_the_workers_account_and_is_printed(self) -> None:
         result = self.run_script(str(self.document), "the", "rollout order")

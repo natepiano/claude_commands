@@ -84,7 +84,11 @@ now_epoch() {
 # One line, no control characters, bounded length: the three properties that
 # keep a concurrent append atomic and the log parseable.
 flatten() {
-  printf '%s' "$*" | tr '\n\r\t' '   ' | tr -cd '[:print:]' | cut -c "1-${MAX_MESSAGE_CHARS}"
+  "${BASH_SOURCE[0]%/*}/../lib/py" -c '
+import sys
+text = sys.argv[2].translate(str.maketrans({"\n": " ", "\r": " ", "\t": " "}))
+print("".join(character for character in text if character.isprintable())[:int(sys.argv[1])], end="")
+' "$MAX_MESSAGE_CHARS" "$*"
 }
 
 # `ask` and `answer` are deliberately absent. A question to a peer is a message

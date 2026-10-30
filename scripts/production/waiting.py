@@ -14,10 +14,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, NamedTuple, TypeVar, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.atomic_file import write_text_atomic
+
 import unit_lookup
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from production_units import Refusal, cell_value, live_unit_table, retired_units
 from merge_checkpoint import MergeEntry, NoMerge, Stop, git, merge_branch_history, report as merge_report
 
@@ -204,17 +207,7 @@ def update_state(path: Path, change: Callable[[JsonMap], StateResult], *,
         result = change(content)
         if json.dumps(content, sort_keys=True) == before:
             return result
-        temporary_name = ""
-        try:
-            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                                             prefix=f".{path.name}.", suffix=".tmp",
-                                             delete=False) as temporary:
-                temporary_name = temporary.name
-                _ = temporary.write(json.dumps(content, indent=2) + "\n")
-            os.replace(temporary_name, path)
-        finally:
-            if temporary_name:
-                Path(temporary_name).unlink(missing_ok=True)
+        write_text_atomic(path, json.dumps(content, indent=2) + "\n")
         return result
 
 
@@ -233,12 +226,11 @@ def eta_request(production: Production, name: str, phase: str, state_dir: Path) 
     def request(seen: JsonMap) -> EtaRequested | EtaNotYetRequested:
         state = eta_requested(seen, key)
         if isinstance(state, EtaNotYetRequested):
+            print(f"request /unit:eta: {unit.name}", flush=True)
             seen[key] = {"requested": True}
         return state
 
     state = update_state(path, request)
-    if isinstance(state, EtaNotYetRequested):
-        print(f"request /unit:eta: {unit.name}")
     report("eta-request", "ok", "already requested" if isinstance(state, EtaRequested) else "requested")
 
 
@@ -546,12 +538,12 @@ def agenda(production: Production, state_dir: Path) -> None:
             if isinstance(state, AgendaOpen):
                 seen[f"{state.unit}|{state.phase}"] = True
                 opened.append(state)
+        report("agenda", "ok", f"{len(opened)} new items")
+        for item in opened:
+            print(f"agenda: ok — {item.unit}|{item.phase}", flush=True)
         return tuple(opened)
 
-    opened = update_state(state_dir / "agenda_seen.json", open_items)
-    report("agenda", "ok", f"{len(opened)} new items")
-    for item in opened:
-        print(f"agenda: ok — {item.unit}|{item.phase}")
+    _ = update_state(state_dir / "agenda_seen.json", open_items)
 
 
 def main() -> int:

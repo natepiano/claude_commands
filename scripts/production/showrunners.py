@@ -15,8 +15,12 @@ import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.atomic_file import write_text_atomic
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
 NOTIFIER_STATE_DIR = Path(os.environ.get("NOTIFIER_STATE_DIR") or Path.home() / ".local/state/notifier")
@@ -29,6 +33,8 @@ SEND = Path(os.environ.get("SHOWRUNNERS_SEND") or Path(__file__).resolve().paren
 PARENT_FILE = "parent"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from user_zone import user_zone_name  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
+from sessions import SessionRecord, messaging_socket_exists  # noqa: E402
 
 RULES = "Read the Nested showrunners rules in ~/.claude/commands/showrunner/produce.md."
 
@@ -189,27 +195,45 @@ def _timer(instance: Path) -> Timer:
     return Timer(instance.name.removeprefix("showrunner-"), target, doc.path, user_zone_name())
 
 
-def _registered(instance: Path) -> Showrunner:
+class DiscoverSessions(NamedTuple):
+    """No registry snapshot was supplied; resolve sessions from their current records."""
+
+
+DISCOVER_SESSIONS = DiscoverSessions()
+
+
+def _registered(instance: Path, *,
+                known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS) -> Showrunner:
     timer = _timer(instance)
-    socket = socket_for(timer.target)
-    name = _session_name(timer.target[8:]) if socket is not None else ""
+    if isinstance(known_sessions, DiscoverSessions):
+        socket = socket_for(timer.target) or ""
+        name = _session_name(timer.target[8:]) if socket else ""
+    else:
+        record = known_sessions.get(timer.target[8:])
+        live = record is not None and messaging_socket_exists(record)
+        socket = record["messagingSocketPath"] if record is not None and live else ""
+        name = record["name"] if record is not None and live else ""
     return Showrunner(session=name, socket=socket or "", slug=timer.slug, zone=timer.zone, doc=str(timer.doc))
 
 
-def registered_showrunners(state_dir: Path | None = None) -> list[Showrunner]:
+def registered_showrunners(
+    state_dir: Path | None = None, *,
+    known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS,
+) -> list[Showrunner]:
     """Every showrunner that has an update timer, running or not.
 
     The timer is addressed to the Claude session id and holds the production doc, so it is the one
     record of a showrunner and holds no name: the name is looked up here, at each call. Raises OSError
     when the session records cannot say whether a showrunner runs; a timer that is not a complete
-    showrunner's is left out, with the reason on stderr.
+    showrunner's is left out, with the reason on stderr. Supplied live session records avoid
+    rereading the registry or starting the sessions subprocess; an empty mapping means none are live.
     """
     found: list[Showrunner] = []
     for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
         if not instance.is_dir():
             continue
         try:
-            found.append(_registered(instance))
+            found.append(_registered(instance, known_sessions=known_sessions))
         except (KeyError, ValueError, UnicodeError) as error:
             print(f"showrunners: skipping {instance.name}: {error}", file=sys.stderr)
     return found
@@ -255,10 +279,16 @@ def copy_session_state(slug: str, scratch: Path) -> list[str]:
         source, destination = scratch / name, target / name
         if destination.exists() or not source.exists():
             continue
-        if source.is_dir():
-            _ = shutil.copytree(source, destination)
+        complete = target / f".{name}.copying"
+        if complete.is_dir():
+            shutil.rmtree(complete)
         else:
-            _ = shutil.copy2(source, destination)
+            complete.unlink(missing_ok=True)
+        if source.is_dir():
+            _ = shutil.copytree(source, complete)
+        else:
+            _ = shutil.copy2(source, complete)
+        os.replace(complete, destination)
         copied.append(name)
     return copied
 
@@ -289,6 +319,13 @@ def adopt_session_state(slug: str) -> list[str]:
     return copy_session_state(slug, scratch) if scratch is not None else []
 
 
+def former_slugs(text: str) -> tuple[str, ...]:
+    """Read former names only from the production's Production Context section."""
+    context = re.search(r"^## Production Context\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
+    formerly = re.search(r"^- \*\*Formerly:\*\*(.*)$", context[1] if context else "", re.MULTILINE)
+    return tuple(re.findall(r"`([^`]+)`", formerly[1])) if formerly else ()
+
+
 def canonical_slug(slug: str, state_dir: Path | None = None) -> str:
     """Map a former production name to its current slug; leave other slugs unchanged."""
     timers: list[Timer] = []
@@ -305,10 +342,7 @@ def canonical_slug(slug: str, state_dir: Path | None = None) -> str:
             text = timer.doc.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             continue
-        # Only Production Context carries the line; an example elsewhere in the doc claims nothing.
-        context = re.search(r"^## Production Context\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
-        formerly = re.search(r"^- \*\*Formerly:\*\*(.*)$", context[1] if context else "", re.MULTILINE)
-        if formerly and slug in re.findall(r"`([^`]+)`", formerly[1]):
+        if slug in former_slugs(text):
             return timer.slug
     return slug
 
@@ -514,7 +548,7 @@ def attach(child: str, parent: str) -> None:
         if runner["slug"] in (child, parent) and runner["socket"] and (why := name_refusal(runner["slug"], runner["session"])):
             raise ValueError(why)
     tree = edges(known)
-    if child in tree:
+    if child in tree and tree[child] != parent:
         raise ValueError(f"{child} already reports to {tree[child]}; detach it first")
     above = parent
     while above in tree:
@@ -523,10 +557,7 @@ def attach(child: str, parent: str) -> None:
             raise ValueError(f"{parent} already reports to {child}, directly or through others")
     path = SHOWRUNNER_STATE_DIR / child / PARENT_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Written beside the file and moved over it, so a reader never sees half a slug.
-    temporary = path.with_name(f".{PARENT_FILE}.{os.getpid()}")
-    _ = temporary.write_text(f"{parent}\n", encoding="utf-8")
-    _ = temporary.replace(path)
+    write_text_atomic(path, f"{parent}\n")
 
 
 def detach(child: str) -> str:

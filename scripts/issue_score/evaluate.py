@@ -164,13 +164,20 @@ def _object(value: object) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def load_run(path: Path) -> RunJudgments:
+def load_run(path: Path, *, allow_partial_last_line: bool = False) -> RunJudgments:
     scored: dict[str, ScoredIssue] = {}
     failed: dict[str, str] = {}
-    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    lines = path.read_bytes().splitlines(keepends=True)
+    for number, line in enumerate(lines, 1):
         if not line.strip():
             continue
-        record = _object(cast(object, json.loads(line)))
+        try:
+            value = cast(object, json.loads(line))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            if allow_partial_last_line and number == len(lines) and not line.endswith((b"\n", b"\r")):
+                break
+            raise
+        record = _object(value)
         issue_path = record.get("issue_path")
         if not isinstance(issue_path, str):
             raise ValueError(f"{path}:{number}: run line has no issue_path")
@@ -359,23 +366,38 @@ def _judgment_text(field: str, observations: list[FieldObservation], *, split: S
     return _outcome_text(_threshold_outcome(field, observations, complete=complete and split == "tune"))
 
 
+def _routing_summary(field: str, observations: list[FieldObservation]) -> str:
+    policy = questions.THRESHOLDS[field]
+    if isinstance(policy, decide.Supported):
+        configured = f"at configured threshold {policy.threshold:.2f}"
+    else:
+        configured = f"under configured {'unsupported' if isinstance(policy, decide.Unsupported) else 'report-only'} policy"
+    taken = _mean([float(decide.is_sure(field, item.decision)) for item in observations])
+    routed = 1.0 - taken if isinstance(taken, float) else taken
+    return (f"Routing {configured}: taken (sure): {_metric(taken)}; "
+            f"routed to the user (unsure): {_metric(routed)}.")
+
+
 def _risk_report(field: str, observations: list[FieldObservation], *, complete: bool, split: Split) -> list[str]:
     rows: list[list[object]] = []
     for threshold in questions.RISK_THRESHOLDS:
         covered = _covered(field, observations, threshold)
-        row: list[object] = [f"{threshold:.2f}", len(covered), _metric(float(len(covered) / len(observations))
-                                                                   if observations else UndefinedMetric("no observations")),
+        taken = float(len(covered) / len(observations)) if observations else UndefinedMetric("no observations")
+        routed = 1.0 - taken if isinstance(taken, float) else taken
+        row: list[object] = [f"{threshold:.2f}", len(covered), _metric(taken), _metric(routed),
                              _metric(_mean([float(item.actual != item.predicted) for item in covered]))]
         if field in ORDINAL_FIELDS:
             ordinal = [item for item in covered if isinstance(item.probabilities, dict)]
             row.append(_metric(_mean([float(abs(int(item.actual) - int(item.predicted)) > 1) for item in ordinal])))
         rows.append(row)
-    headers = ["Threshold", "Sure N", "Coverage", "Exact error"]
+    headers = ["Threshold", "Sure N", "Coverage", "Routed to user", "Exact error"]
     if field in ORDINAL_FIELDS:
         headers.append("Beyond-one error")
     recommendation = _judgment_text(field, observations, split=split, complete=complete)
     label = "Held-out validation" if split == "holdout" else "Threshold outcome"
-    return [f"### {field}", "", f"{label}: {recommendation}.", "", *_table(headers, rows)]
+    return [f"### {field}", "", f"{label}: {recommendation}.", "",
+            _routing_summary(field, observations), "",
+            "Coverage is the share taken (sure); Routed to user is the share unsure.", "", *_table(headers, rows)]
 
 
 def _goals(path: Path) -> dict[str, renumber.Goal]:

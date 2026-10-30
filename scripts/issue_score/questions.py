@@ -1,8 +1,9 @@
 """Auditable question wording, project context, and decision policy."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 
 @dataclass(frozen=True)
@@ -22,7 +23,7 @@ class ReportOnly:
 
 ThresholdOutcome = Supported | Unsupported | ReportOnly
 
-QUESTION_SET_VERSION = "3"
+QUESTION_SET_VERSION = "5"
 MODEL = "jev-1.14.0"
 BUDGET_USD = 20.0
 INPUT_USD_PER_MILLION = 0.042
@@ -34,9 +35,10 @@ THRESHOLDS: dict[str, ThresholdOutcome] = {
     "backlog_urgency": ReportOnly(),
     "backlog_effort": ReportOnly(),
     "category": Supported(0.90),
-    "area": Unsupported(),
+    # Defined-area options: tune error .083 with .38 taken (2026-10-29).
+    "area": Supported(0.90),
 }
-# The user's per-field verdict after the Phase 3 blind test (2026-10-29):
+# The user's per-field verdict after the blind preference test (2026-10-29):
 # Jev proposes these fields; the agent proposes every other field.
 JEV_FIELDS: frozenset[str] = frozenset({"backlog_goal", "backlog_impact", "backlog_alignment"})
 
@@ -175,11 +177,31 @@ class ScoreQuestion(TypedDict):
 Question = NoulQuestion | ChoiceQuestion | ScoreQuestion
 
 
+class AvailableRule(TypedDict):
+    name: str
+    summary: str
+    status: Literal["available"]
+
+
+class UnavailableRule(TypedDict):
+    name: str
+    status: Literal["missing"]
+
+
+class StyleState(TypedDict):
+    style_rules: list[AvailableRule | UnavailableRule]
+    style_crate: str
+    finding_count: int
+
+
 class IssueDescription(TypedDict):
     title: str
     project: str
     project_about: str
     body: str
+    style_rules: NotRequired[list[AvailableRule | UnavailableRule]]
+    style_crate: NotRequired[str]
+    finding_count: NotRequired[int]
 
 
 class IssueState(TypedDict):
@@ -214,9 +236,11 @@ def main_questions() -> dict[str, Question]:
     return result
 
 
-def area_questions(areas: list[str]) -> dict[str, Question]:
+def area_questions(areas: list[str], definitions: Mapping[str, str]) -> dict[str, Question]:
     # An empty vault still has a valid Choice and can explicitly propose unfiled.
-    options = {area: f"The work concerns the part named {area}." for area in areas} or {"unfiled": "The work has no established area."}
+    options = {area: (f"The work concerns {area}: {definitions[area]}" if area in definitions
+                      else f"The work concerns the part named {area}.")
+               for area in areas} or {"unfiled": "The work has no established area."}
     first, reverse = _choice_pair("Which area in `areas` names the part of the work `issue` is about?", options)
     return {
         "area": first, "area_reverse": reverse,

@@ -16,13 +16,14 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS / "production"))
 
 import showrunners
-from add_showrunner import herdr_tab_open
+from add_showrunner import NoEndingTab, herdr_tab_open
 import herdr
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
 
 import rules
 import style_ledger
+from atomic_file import write_text_atomic
 
 FAMILIES: tuple[rules.Family, ...] = ("names", "values", "types", "modules")
 PLAN_DIRECTORY = Path("docs/style-production/units")
@@ -233,7 +234,7 @@ def _plan_text(style: StyleProduction, family: rules.Family, catalog: tuple[rule
 def _write_missing(path: Path, text: str) -> None:
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(text)
+        write_text_atomic(path, text)
 
 
 def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
@@ -269,7 +270,7 @@ def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
         rows[last_row + 1:last_row + 1] = additions
     updated = "".join([*lines[:start], *rows, *lines[end:]])
     if updated != previous:
-        _ = style.doc.write_text(updated)
+        write_text_atomic(style.doc, updated)
     for family in FAMILIES:
         if family in launched:
             continue
@@ -288,7 +289,7 @@ def _configure_pilot(style: StyleProduction, pilot: PilotUnits) -> None:
             plan.insert(insertion, "- **Pilot scope:** " + ", ".join(unit.packages) + "\n")
         text = "".join(plan)
         if text != original:
-            _ = path.write_text(text)
+            write_text_atomic(path, text)
 
 
 def _pilot_steps(steps: tuple[str, ...], pilot: AllStyleUnits | PilotUnits, slug: str) -> tuple[str, ...]:
@@ -311,7 +312,7 @@ def _exclude(style: StyleProduction) -> None:
     missing = [pattern for pattern in patterns if pattern not in previous.splitlines()]
     if missing:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(previous + ("\n" if previous and not previous.endswith("\n") else "") + "\n".join(missing) + "\n")
+        write_text_atomic(path, previous + ("\n" if previous and not previous.endswith("\n") else "") + "\n".join(missing) + "\n")
 
 
 def _run_script(script: Path, *arguments: str) -> None:
@@ -355,7 +356,7 @@ def _update_destination(style: StyleProduction) -> None:
             lines.insert(lines.index("## Production Context") + 1, prefix + value)
     updated = "\n".join(lines) + "\n"
     if updated != previous:
-        _ = style.doc.write_text(updated)
+        write_text_atomic(style.doc, updated)
 
 
 def _steps(style: StyleProduction, existing: bool) -> tuple[str, ...]:
@@ -404,7 +405,7 @@ def main(argv: list[str]) -> int:
         if existing:
             _attach(style)
             return 0
-        if style.slug not in showrunners.timer_slugs() and herdr_tab_open(style.slug):
+        if style.slug not in showrunners.timer_slugs() and herdr_tab_open(style.slug, NoEndingTab()):
             raise Refusal(_open_session_guidance(style, "live session without an update timer"))
         if not (style.checkout / ".git").exists():
             present = subprocess.run(

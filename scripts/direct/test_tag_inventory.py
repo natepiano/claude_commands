@@ -116,15 +116,15 @@ class TagInventoryTests(unittest.TestCase):
         self.write("docs/direct/other.md", "<Step>\nDefined in `docs/direct/step.md`.\n</Step>\n")
         self.assertTrue(any(issue.startswith("ForwardingCycle: <Step/>") for issue in inventory(self.root).issues))
 
-    def test_examples_plans_and_other_commands_guild_are_not_definitions(self) -> None:
+    def test_examples_plans_and_other_commands_contracts_are_not_definitions(self) -> None:
         self.write("commands/unit/direct.md", self.route("Step", "docs/direct/step.md") +
-                   "<Guild>\nThis command.\n</Guild>\n<Core>\nApply <External/>.\n"
+                   "<Local>\nThis command.\n</Local>\n<Core>\nApply <External/>.\n"
                    + "Read `commands/other/run.md` and `docs/plans/example.md`.\n</Core>\n")
-        self.write("docs/direct/step.md", "<Step>\nUse <Guild/> and read `commands/other/run.md`.\n</Step>\n"
-                   + "```xml\n<Guild>\nFenced example.\n</Guild>\n```\n"
-                   + "> <Guild>\n> Quoted example.\n> </Guild>\n")
-        self.write("commands/other/run.md", "<External>\nThis step.\n</External>\n<Guild>\nOther command.\n</Guild>\n")
-        self.write("docs/plans/example.md", "<Guild>\nPlanned contract.\n</Guild>\n")
+        self.write("docs/direct/step.md", "<Step>\nUse <Local/> and read `commands/other/run.md`.\n</Step>\n"
+                   + "```xml\n<Local>\nFenced example.\n</Local>\n```\n"
+                   + "> <Local>\n> Quoted example.\n> </Local>\n")
+        self.write("commands/other/run.md", "<External>\nThis step.\n</External>\n<Local>\nOther command.\n</Local>\n")
+        self.write("docs/plans/example.md", "<Local>\nPlanned contract.\n</Local>\n")
         self.assertEqual(inventory(self.root).issues, ())
 
 

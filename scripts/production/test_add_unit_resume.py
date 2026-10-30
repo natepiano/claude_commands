@@ -12,7 +12,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import TypedDict, cast, final, override
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
@@ -21,8 +21,9 @@ import production_units
 import launch_permission
 import unit_lookup
 import sessions
-import record as shutdown_store
+import shutdown_record as shutdown_store
 import restart
+import herdr
 from herdr import HerdrPlace
 from production_units import cell_value, live_unit_table, plan_cell_is_retired, retired_units
 from test_support import ShutdownTestCase
@@ -37,6 +38,44 @@ def setUpModule() -> None:
 
 @final
 class AddUnitResumeTests(AddUnitTestCase):
+    def test_new_row_resume_closes_the_stopped_marked_tab_then_launches(self) -> None:
+        prior = self.root / "prior-session"
+        prior.mkdir()
+        old_head = self.git("rev-parse", "build-followups")
+        stopped = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.ClaudeNotRunning(),
+                                        HerdrPlace("old-host", "w2:p3"))
+        running = unit_lookup.MarkedUnit("alpha-unit",
+            unit_lookup.LiveClaude("alpha", "session-123", "/fixture/socket", 4242),
+            HerdrPlace("agents", "w1:p1"))
+        order = Mock()
+        with (patch.object(add_unit, "launched_unit", return_value=add_unit.MarkedUnitFound(stopped)),
+              patch.object(sessions, "session_liveness", return_value=sessions.SessionNotLive()),
+              patch.object(herdr, "close_agent") as closed,
+              patch.object(herdr, "start_agent", wraps=herdr.start_agent) as started,
+              patch.object(add_unit, "wait_for_remote_control", return_value=running) as waited):
+            order.attach_mock(closed, "close")
+            order.attach_mock(started, "start")
+            result = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
+                                     "--cwd", str(prior))
+
+        closed.assert_called_once_with("old-host", "w2:p3")
+        started.assert_called_once()
+        self.assertEqual(order.mock_calls[0][0], "close")
+        self.assertEqual(order.mock_calls[1][0], "start")
+        waited.assert_called_once()
+        self.assertIn("alpha-unit started:", result.stdout)
+        self.assertIn("| alpha-unit |", self.doc.read_text().replace("`", ""))
+        self.assertNotEqual(self.git("rev-parse", "build-followups"), old_head)
+        self.assertEqual(self.git("log", "-1", "--format=%s", "build-followups"),
+                         "production(build-followups): add unit alpha-unit (plan)")
+        self.assertTrue((self.root / "project-alpha").is_dir())
+        self.assertEqual(self.git("rev-parse", "build-followups-alpha"),
+                         self.git("rev-parse", "build-followups"))
+        self.assertEqual(self.opened()[7], str(prior))
+        arguments = self.agent_arguments()
+        self.assertEqual(arguments[arguments.index("--resume") + 1], "session-123")
+        self.assertIn("Run /unit:direct", self.opening_prompt())
+
     def test_resume_checks_session_cwd_instead_of_worktree(self) -> None:
         prior = self.root / "untrusted-session"
         prior.mkdir()

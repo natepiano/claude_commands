@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from difflib import get_close_matches
 from enum import StrEnum
 import http.client
+import importlib.util
 import json
 import math
 import os
@@ -470,6 +471,24 @@ class LaunchState(TypedDict):
     binary: str
     started: str
     uncommitted_paths: NotRequired[list[str]]
+
+
+@dataclass(frozen=True)
+class AbsentLaunchRecord:
+    """No launch metadata exists at the requested path."""
+
+
+@dataclass(frozen=True)
+class UnreadableLaunchRecord:
+    reason: str
+
+
+@dataclass(frozen=True)
+class WholeLaunchRecord:
+    state: LaunchState
+
+
+LaunchRecord = AbsentLaunchRecord | UnreadableLaunchRecord | WholeLaunchRecord
 
 
 Vec3 = tuple[float, float, float]
@@ -1957,6 +1976,48 @@ def launch_state_path(port: int) -> Path:
     return cache_directory() / "launches" / f"{port}.json"
 
 
+def _write_launch_state(state_path: Path, state: LaunchState) -> None:
+    temporary = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=state_path.parent,
+        prefix=f".{state_path.name}.", suffix=".tmp", delete=False,
+    )
+    temporary_path = Path(temporary.name)
+    try:
+        with temporary:
+            json.dump(state, temporary)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, state_path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _read_launch_state(state_path: Path) -> LaunchRecord:
+    """Distinguish absent, unreadable and whole shutdown metadata."""
+    try:
+        value = cast(object, json.loads(state_path.read_text()))
+    except FileNotFoundError:
+        return AbsentLaunchRecord()
+    except json.JSONDecodeError as error:
+        return UnreadableLaunchRecord(f"invalid JSON: {error}")
+    except (OSError, ValueError) as error:
+        return UnreadableLaunchRecord(str(error))
+    if not isinstance(value, dict):
+        return UnreadableLaunchRecord("expected a JSON object")
+    fields = cast(dict[str, object], value)
+    missing = [key for key in ("pid", "binary", "log", "scratch") if key not in fields]
+    if missing:
+        return UnreadableLaunchRecord(f"missing {', '.join(missing)}")
+    pid = fields["pid"]
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return UnreadableLaunchRecord("pid must be a positive integer")
+    for key in ("binary", "log", "scratch"):
+        if not isinstance(fields[key], str) or not fields[key]:
+            return UnreadableLaunchRecord(f"{key} must be a nonempty string")
+    return WholeLaunchRecord(cast(LaunchState, cast(object, fields)))
+
+
 def port_answers(port: int) -> bool:
     try:
         with socket.create_connection((HOST, port), timeout=0.5):
@@ -2075,9 +2136,29 @@ def launch(port: int, worktree: str | None, binary: str | None) -> tuple[LaunchS
         state["uncommitted_paths"] = uncommitted_paths
     state_path = launch_state_path(port)
     state_path.parent.mkdir(parents=True, exist_ok=True)
-    _ = state_path.write_text(json.dumps(state))
+    _write_launch_state(state_path, state)
     start = time.monotonic()
     try:
+        recorder_path = Path(__file__).resolve().parents[1] / "buildlog" / "record.py"
+        recorder = sys.modules.get("record")
+        if recorder is None or getattr(recorder, "__file__", "") != str(recorder_path):
+            module_name = "_hana_shot_buildlog_record"
+            recorder = sys.modules.get(module_name)
+            if recorder is None:
+                spec = importlib.util.spec_from_file_location(
+                    module_name, recorder_path, submodule_search_locations=[str(recorder_path.parent)],
+                )
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"cannot load launch recorder at {recorder_path}")
+                recorder = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = recorder
+                try:
+                    spec.loader.exec_module(recorder)
+                except BaseException:
+                    del sys.modules[module_name]
+                    raise
+        record_launch = cast(Callable[[Path, Path], bool], recorder.launch)
+        _ = record_launch(state_path, root)
         wait_ready(Brp(port), process, log)
     except BaseException:
         shutdown(port, process)
@@ -2130,14 +2211,28 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None) -> None:
     """Stop a launched Hana, show any panic lines from its log, and remove its scratch."""
     check_port(port)
     state_path = launch_state_path(port)
-    state: LaunchState | None = None
-    if state_path.exists():
-        state = cast(LaunchState, json.loads(state_path.read_text()))
+    record = _read_launch_state(state_path)
+    launch_record = record
+    if not isinstance(launch_record, WholeLaunchRecord):
+        temporary_records: list[tuple[int, Path]] = []
+        for temporary_path in state_path.parent.glob(f".{state_path.name}.*.tmp"):
+            try:
+                temporary_records.append((temporary_path.stat().st_mtime_ns, temporary_path))
+            except FileNotFoundError:
+                continue
+        for entry in sorted(temporary_records, key=lambda entry: entry[0], reverse=True):
+            candidate = _read_launch_state(entry[1])
+            if isinstance(candidate, WholeLaunchRecord):
+                launch_record = candidate
+                break
+    shutdown_answered = False
     try:
         _ = Brp(port).call("brp_extras/shutdown", timeout=5)
+        shutdown_answered = True
     except Failure:
         pass
-    if state is not None:
+    if isinstance(launch_record, WholeLaunchRecord):
+        state = launch_record.state
         pid = state["pid"]
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
@@ -2161,8 +2256,33 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None) -> None:
             for line in lines:
                 print(f"  {line}", file=sys.stderr)
         shutil.rmtree(state["scratch"], ignore_errors=True)
-        state_path.unlink(missing_ok=True)
-    print(f"hana_shot: Hana on port {port} shut down", file=sys.stderr)
+    else:
+        deadline = time.monotonic() + 20
+        while port_answers(port):
+            if time.monotonic() >= deadline:
+                raise Failure(
+                    f"Hana on port {port} still answers after 20 s without a whole launch record"
+                    + next_step(f"run shutdown again on port {port} after the launch finishes starting"),
+                )
+            time.sleep(0.1)
+    state_path.unlink(missing_ok=True)
+    for temporary_path in state_path.parent.glob(f".{state_path.name}.*.tmp"):
+        temporary_path.unlink(missing_ok=True)
+    if isinstance(record, UnreadableLaunchRecord):
+        print(
+            f"hana_shot: launch record {state_path} is unreadable ({record.reason}); "
+            + f"asked Hana on port {port} to stop and removed the record; "
+            + f"check scratch parent {tempfile.gettempdir()} for hana-shot-{port}-* folders",
+            file=sys.stderr,
+        )
+    if shutdown_answered or isinstance(launch_record, WholeLaunchRecord):
+        print(f"hana_shot: Hana on port {port} shut down", file=sys.stderr)
+    else:
+        print(
+            f"hana_shot: no Hana answered on port {port}; if a launch on this port is still starting, "
+            + "run shutdown again when the next launch reports the port in use",
+            file=sys.stderr,
+        )
 
 
 @contextmanager

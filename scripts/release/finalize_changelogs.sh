@@ -25,6 +25,11 @@ for FILE in "${FILES[@]}"; do
   fi
 
   if ! grep -q '## \[Unreleased\]' "$FILE"; then
+    if grep -qF "## [$VERSION] - " "$FILE"; then
+      [[ "$DRY_RUN" == "true" ]] || rm -f "$FILE".portbak
+      echo "  $FILE: [$VERSION] already finalized"
+      continue
+    fi
     echo "ERROR: No [Unreleased] section found in $FILE" >&2
     exit 1
   fi

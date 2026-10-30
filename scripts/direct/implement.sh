@@ -236,7 +236,7 @@ root = Path(root_text)
 compact_above = int(compact_above_text)
 claim_file = root / f"impl_claim_{slot}.json"
 sys.path.insert(0, str(Path(mesh_script).resolve().parents[2]))
-from scripts.guilds import roles as guild_roles
+from scripts.astra import design_roles
 sys.path.insert(0, str(Path(mesh_script).parent.parent / "direct"))
 from worker_state import worker_claim_lock, worker_ledger, worker_record_path
 
@@ -286,8 +286,8 @@ with worker_claim_lock(root):
     elif action == "claim":
         identity = read(identity_file)
         expected = {"name": name, "slot": slot, "family": family, "model": model, "worker_id": worker_id}
-        # A run from before the repair worker had its own record lost the fix worker's identity
-        # to the impl worker's, and a reopened worker keeps only its roster thread: record it from there.
+        # A worker with no identity record (an old run, or a reopened worker that keeps only its
+        # roster thread) records one from its roster thread.
         if not identity and worker_id:
             identity_file.write_text(json.dumps(expected))
             identity = expected
@@ -296,13 +296,13 @@ with worker_claim_lock(root):
         stored_model = identity.get("model")
         if isinstance(stored_model, str) and stored_model:
             expected["model"] = stored_model
-        # Earlier records included the opening assignment role; it is not part
-        # of durable identity. Keep compatibility without writing it again.
+        # Role is not durable identity. Older records may hold it, so drop it before the compare.
         identity.pop("role", None)
         # A worker recorded under another slot stays refused by this comparison.
         if identity != expected:
             fail(f"{name} has no matching durable worker identity for slot {slot}")
-        print(expected["model"])
+        # The identity check keeps the stored model; each turn runs at the current default.
+        print(model)
         status_path = root / f"impl_status_{slot}"
         claim = read(claim_file)
         pid = claim.get("pid", 0)
@@ -328,11 +328,11 @@ with worker_claim_lock(root):
         if family == "codex":
             if mesh != "1":
                 fail(f"{name} has mesh=none")
-            if entry.get("transferring_role") or entry.get("role_redirect") or guild_roles.transfer_route(
+            if entry.get("transferring_role") or entry.get("role_redirect") or design_roles.transfer_route(
                     str(entry.get("thread_id", "")), str(entry.get("held_design_id", ""))):
                 fail(f"{name}: TransferringRole; use its destination holder")
             if entry.get("held_design_id"):
-                fail(f"{name}: held roles resume through roles.py")
+                fail(f"{name}: held roles resume through design_roles.py")
             context_tokens = entry.get("context_tokens")
             if isinstance(context_tokens, int) and context_tokens > compact_above:
                 compact = subprocess.run(
@@ -526,7 +526,6 @@ if [[ -n "${FOLLOW_TO}" ]]; then
       --role "${PASS_KIND}" --cwd "${WORKING_DIR}" \
       --message-file "${FOLLOW_MESSAGE}" --summary-file "${SUMMARY_FILE}" \
       --reply-file "${REPLY_FILE}" --log-file "${LOG_FILE}" \
-      --model "${AGENT_MODEL}" --effort "${AGENT_EFFORT:-}" \
       --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
   else
     echo "ERROR: ${MESH_NAME} has mesh=none" >&2
@@ -550,8 +549,6 @@ elif [[ "${USE_CODEX_MESH}" == "1" ]]; then
     --summary-file "${SUMMARY_FILE}" \
     --reply-file "${REPLY_FILE}" \
     --log-file "${LOG_FILE}" \
-    --model "${AGENT_MODEL}" \
-    --effort "${AGENT_EFFORT:-}" \
     --task "${TASK}" --service-tier "${AGENT_SERVICE_TIER:-}" &
 else
   rm -f "${BG_ID_FILE}"

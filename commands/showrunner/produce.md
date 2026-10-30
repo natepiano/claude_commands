@@ -283,6 +283,8 @@ State:
   2026-10-06 rule that restated the user's items in every reply.
 - **Long commands** run in the background. The task notification is the wait;
   never poll.
+- A ruling that parks, stops or replaces work names the runs to cancel in
+  the same turn under <WorkerRuns/> in `/unit:direct`.
 - **Helpers.** Stop each named helper agent once its report is read.
 - **An auto-mode denial** is never retried or worked around. Tell the user what
   was denied and let them add a permission rule.
@@ -332,21 +334,11 @@ State:
 
 ---
 
-<Guild>
-Your guild is `showrunners`. Your head is the `showrunners` unit director in the `guilds` production on natedev. At skill start, use the Tips lock/pull rule for `~/rust/nate_style` and load `guilds/common/` and `guilds/showrunners/`; a Codex holder does this for its worker. Report to your head when the user corrects you, a phase needs repair round 4, a finding meets the Events repeat rule, you use a workaround for a tool fault or slow rule, or a method saves measured time. Send one report of at most 100 words, with evidence and result. Resolve the head from `message/roster.py --json` by production `guilds` and unit `showrunners`; send with `message/send.py` or SendMessage. A Codex worker puts the report in its reply for its holder to send. Send only to the head. Never wake an idle Codex member for guild advice.
-
-Load tips: ~/.claude/scripts/lib/py ~/.claude/scripts/guilds/tips.py load --guild showrunners
-
-Use Events in `~/.claude/docs/as-built/guilds.md` for report detection and form.
-Pass the user's guild feedback to that guild's head. A Codex holder includes the
-expanded block and loaded tip text in its worker prompt.
-</Guild>
-
 <HeldProductionDesign>
 The showrunner may hold one lasting Astra designer/reviewer pair for a production
-design through `roles.py`. It briefs, records cited rulings and acceptance, and
+design through `design_roles.py`. It briefs, records cited rulings and acceptance, and
 keeps the same threads across rounds, restarts and account moves. Configured
-`guild` models and explicit access policies apply. A writer needs an authorized
+`design_roles` models and explicit access policies apply. A writer needs an authorized
 production-design phase with exact output paths, baseline and reservation; until
 that phase exists, hold read-only roles only. New writing scope needs an idle
 rebind. Saved headed prompts and replies stay with the role; pending messages are
@@ -395,11 +387,9 @@ after a failed step; it resumes at the first unfinished step.
 ---
 
 <LaunchUnits>
-When the production doc has a **Review pool** line, no unit runs the pool:
-the first review of each type primes it. Each unit keeps one permanent reviewer per type, and every
-code review goes to it (`docs/production_format.md`, unit rule 16). Before
-you mark a unit `retired`, run `review_pool.py retire` for it
-(`docs/production_format.md`, Units).
+Each unit owns its read-only reviewers. `assign.sh --role review` resumes
+`review`, then `review2` when the first is busy. Their context lasts across
+phases and plans; unit pause, move and end apply to them too.
 
 For each unit without a live unit director, run
 `$HOME/.claude/scripts/lib/py $HOME/.claude/scripts/production/add_unit.py --production PRODUCTION_DOC <name> --plan <unit plan>`.
@@ -1129,7 +1119,9 @@ at once, in the turn it arrives:
 1. Stop mid-step and start nothing new: no merge, gate or launch that has not
    begun. Leave uncommitted work in place.
 2. Append a `### STATE` block to your LOG, and stop any build you started or name
-   it in the line below.
+   it in the line below. For a move, leave Codex workers running; the mover pauses
+   them after you exit. For a stop, if ready names a running Codex worker, retry
+   when its turn finishes; start no new turns.
 3. Run the `shutdown.py ready --where "<one line>"` command the message gives.
 4. End the turn.
 
@@ -1168,11 +1160,6 @@ condition: wrap neither waits on it nor retires its worktree or branch.
    - any other item that cannot be undone gets the user's OK first;
    - back up user data before migrating it.
    Finish each item before passing its exact text as `--close-out-done "<item>"`.
-   With a **Review pool** line, run
-   `~/.claude/scripts/lib/py ~/.claude/scripts/direct/review_pool.py stop --production <slug>`.
-   On failure, report its reason and run `stop` again; do not finish wrap
-   until it succeeds. `<slug>` is the production doc's file name without
-   `-production.md`.
 3. Run `python3 ~/.claude/scripts/production/production_lifecycle.py wrap
    --production PRODUCTION_DOC --ci-green <sha> --smoke-passed <sha>
    --close-out-done "<item>"` (repeat the last flag for every item), or pass

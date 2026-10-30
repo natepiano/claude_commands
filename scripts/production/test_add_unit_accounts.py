@@ -551,11 +551,11 @@ class AddUnitAccountsTests(AddUnitTestCase):
             f"add_unit: ERROR: [production.director] missing set section [production.claude] in {self.agent_config}."])
         self.assert_no_launch_change(document, head)
 
-    def test_head_names_in_other_productions_and_other_names_in_guilds_keep_suffix(self) -> None:
-        guilds_doc = self.doc.with_name("guilds-production.md")
-        _ = guilds_doc.write_text(self.production_doc(), encoding="utf-8")
+    def test_names_without_table_rows_keep_suffix_across_productions(self) -> None:
+        sample_doc = self.doc.with_name("sample-production.md")
+        _ = sample_doc.write_text(self.production_doc(), encoding="utf-8")
         for document, names in ((self.doc, ("designers", "reviewers", "showrunners", "units")),
-                                (guilds_doc, ("reports", "designers-helper"))):
+                                (sample_doc, ("reports", "designers-helper"))):
             for name in names:
                 with self.subTest(production=document.name, name=name):
                     request = add_unit.launch_request(argparse.Namespace(

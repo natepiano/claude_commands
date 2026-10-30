@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
+
 from scripts.whoami.note_file import note_name
 
 import io
@@ -9,6 +11,7 @@ import base64
 import json
 import os
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -16,7 +19,7 @@ from collections.abc import Callable
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast, override
+from typing import ClassVar, cast, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -42,36 +45,20 @@ from user_action import ActionRequired, UserAction, parse_user_action
 
 Notes = list[quota_alert.AgentNote]
 
-REGISTRY = """\
-[assignments]
-direct=codex
-cli=claude
-module_review=codex   # a trailing comment
-ask_a_friend=caller
-
-[direct.codex]
-impl=gpt-6-sol:high
-[direct.claude]
-impl=opus:high
-[cli.codex]
-commit_prep=gpt-6-sol:high
-[cli.claude]
-commit_prep=sonnet:high
-[module_review.codex]
-review=gpt-6-sol:xhigh
-[module_review.claude]
-review=opus:max
-[ask_a_friend.codex]
-consultation=gpt-6-sol:max
-[ask_a_friend.claude]
-consultation=opus:max
-
-[codex.agents]
-gpt-6-sol=low,medium,high,xhigh,max
-[claude.agents]
-opus=low,medium,high,xhigh,max
-sonnet=low,medium,high
-"""
+REGISTRY = registry_text({
+    'assignments': ExactRows({'direct': 'codex', 'cli': 'claude',
+                              'module_review': 'codex   # a trailing comment', 'ask_a_friend': 'caller'}),
+    'direct.codex': ExactRows({'impl': 'gpt-6-sol:high'}),
+    'direct.claude': ExactRows({'impl': 'opus:high'}),
+    'cli.codex': ExactRows({'commit_prep': 'gpt-6-sol:high'}),
+    'cli.claude': ExactRows({'commit_prep': 'sonnet:high'}),
+    'module_review.codex': ExactRows({'review': 'gpt-6-sol:xhigh'}),
+    'module_review.claude': ExactRows({'review': 'opus:max'}),
+    'ask_a_friend.codex': ExactRows({'consultation': 'gpt-6-sol:max'}),
+    'ask_a_friend.claude': ExactRows({'consultation': 'opus:max'}),
+    'codex.agents': ExactRows({'gpt-6-sol': 'low,medium,high,xhigh,max'}),
+    'claude.agents': ExactRows({'opus': 'low,medium,high,xhigh,max', 'sonnet': 'low,medium,high'}),
+})
 
 REAL_RECIPIENTS = quota_alert.recipients
 REAL_TELL_USER = quota_alert.tell_user
@@ -112,29 +99,17 @@ class QuotaReminderFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name).resolve()
+        self.root = self.fixture_root()
         _ = self.enterContext(mock.patch.object(session_table, "live_sessions", return_value=session_table.ReadSessions({}, frozenset())))
         environment_context = cast(object, self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(self.root), "AGENT_NOTES_DIR": str(self.root),
         })))
         del environment_context
-        (self.root / ".claude/config").mkdir(parents=True)
-        _ = (self.root / ".claude/config/accounts.json").write_text(
-            json.dumps({"workers": "codex1"}))
-        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "someone@example.com"}}))
-        codex_home = self.root / ".codex"
-        codex_home.mkdir()
-        claims = base64.urlsafe_b64encode(json.dumps({"email": "someone@example.com"}).encode()).decode().rstrip("=")
-        _ = (codex_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        self.prepare_files()
         _ = self.enterContext(mock.patch.object(note_file, "AGENTS_DIR", self.root))
         _ = self.enterContext(mock.patch.object(agent_notes, "READINGS_LOG", self.root / "readings.jsonl"))
         config = self.root / "showrunners.json"
-        _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
-                                          "stall_minutes": 5, "faults_to": "natedev", "always": ["natedev"]}))
         registry = self.root / "agents.conf"
-        _ = registry.write_text(REGISTRY)
         for name, value in (("CONFIG", config), ("STATE", self.root / "state.json"), ("relay", self.relay),
                             ("tell_user", self.tell_user), ("REGISTRY", registry)):
             patcher = mock.patch.object(quota_alert, name, value)
@@ -145,11 +120,31 @@ class QuotaReminderFixture(unittest.TestCase):
         self.addCleanup(recipients_patch.stop)
         # A fresh sync stamp and no Codex config keep agents_config.sh from syncing the catalog into the fixture.
         synced = self.root / "catalog synced"
-        synced.touch()
         for key, value in (("CODEX_CATALOG_SYNC_STATE_FILE", synced), ("CODEX_CONFIG_FILE", self.root / "absent"),
                            ("CODEX_MODELS_CACHE_FILE", self.root / "absent")):
             self.addCleanup(self.restore_environment, key, os.environ.get(key))
             os.environ[key] = str(value)
+
+    def fixture_root(self) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return Path(directory.name).resolve()
+
+    def prepare_files(self) -> None:
+        """Write the immutable starting account and registry documents."""
+        (self.root / ".claude/config").mkdir(parents=True)
+        _ = (self.root / ".claude/config/accounts.json").write_text(
+            json.dumps({"workers": "codex1"}))
+        _ = (self.root / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "someone@example.com"}}))
+        codex_home = self.root / ".codex"
+        codex_home.mkdir()
+        claims = base64.urlsafe_b64encode(json.dumps({"email": "someone@example.com"}).encode()).decode().rstrip("=")
+        _ = (codex_home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
+        _ = (self.root / "showrunners.json").write_text(json.dumps({
+            "threshold_percent": 1, "repeat_minutes": 30, "stall_minutes": 5,
+            "faults_to": "natedev", "always": ["natedev"]}))
+        _ = write_registry((self.root / "agents.conf"), base_text=REGISTRY)
+        (self.root / "catalog synced").touch()
 
     @staticmethod
     def restore_environment(key: str, value: str | None) -> None:
@@ -311,6 +306,41 @@ class QuotaReminderFixture(unittest.TestCase):
         return [entry for entry in entries if entry.get("kind") in
                 ("routed to claude", "routed back", "routing not restored")]
 
+class SeededQuotaReminderFixture(QuotaReminderFixture):
+    """Copy a class's account and registry seed to the same private path per test.
+
+    Python alert logic and the real Bash registry editor remain unchanged. Other
+    users of QuotaReminderFixture keep their original per-test construction.
+    """
+
+    seed: ClassVar[Path]
+    case: ClassVar[Path]
+
+    @classmethod
+    @override
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        directory = tempfile.TemporaryDirectory(prefix="quota-reminder-test-")
+        cls.addClassCleanup(directory.cleanup)
+        root = Path(directory.name).resolve()
+        cls.seed, cls.case = root / "seed", root / "case"
+        cls.seed.mkdir()
+        builder = cls()
+        builder.root = cls.seed
+        QuotaReminderFixture.prepare_files(builder)
+
+    @override
+    def fixture_root(self) -> Path:
+        _ = shutil.copytree(self.seed, self.case)
+        self.addCleanup(shutil.rmtree, self.case)
+        return self.case
+
+    @override
+    def prepare_files(self) -> None:
+        # fixture_root has restored the class seed, including its sync stamp.
+        pass
+
+
 class CodexZeroEpisodeFixture(unittest.TestCase):
     root: Path = Path()
 
@@ -339,7 +369,7 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
             "stall_minutes": 5, "faults_to": "director", "always": ["director"]}))
         registry = self.root / "agents.conf"
-        _ = registry.write_text(REGISTRY)
+        _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(mock.patch.object(quota_alert, "CONFIG", config))
         _ = self.enterContext(mock.patch.object(quota_alert, "REGISTRY", registry))
         _ = self.enterContext(mock.patch.object(quota_alert, "STATE", self.root / "alerts.json"))
@@ -451,3 +481,32 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         self.assertFalse(any(row["kind"] == "requested" for row in moves.read_moves()))
         self.assertEqual(accounts.role_account("workers").label, "codex1")
         self.assertEqual(next_moves.read_next_moves(), (head,))
+
+
+class CodexRerunFixture(CodexZeroEpisodeFixture):
+    """Persist fake assignments while the real alert state and journal survive a stop."""
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = (self.root / "rerun-assignments.json").write_text(json.dumps({
+            "direct": "codex", "module_review": "codex", "cli": "claude", "ask_a_friend": "caller"}))
+        _ = self.enterContext(mock.patch.object(quota_alert, "registry_assignments", side_effect=self.read_assignments))
+        _ = self.enterContext(mock.patch.object(quota_alert, "edit_registry", side_effect=self.edit_assignments))
+        _ = self.enterContext(mock.patch.object(accounts, "check_codex_target", return_value=
+            accounts.SelectableCodexAccount(self.root / ".codex3", "account3@example.invalid", "codex3")))
+
+    def read_assignments(self) -> dict[str, str]:
+        return cast(dict[str, str], json.loads((self.root / "rerun-assignments.json").read_text()))
+
+    def edit_assignments(self, editor: str, *arguments: str) -> str | None:
+        assignments = self.read_assignments()
+        if editor == "agents_set_all_assignments":
+            assignments = {key: arguments[0] if family in ("codex", "claude") else family
+                           for key, family in assignments.items()}
+        elif editor == "agents_set_assignment":
+            assignments[arguments[0]] = arguments[1]
+        else:
+            raise AssertionError("unexpected registry editor")
+        _ = (self.root / "rerun-assignments.json").write_text(json.dumps(assignments))
+        return None

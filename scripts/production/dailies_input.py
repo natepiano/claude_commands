@@ -11,11 +11,14 @@ import sys
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import NamedTuple, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.atomic_file import write_text_atomic
 from zoneinfo import ZoneInfo
 
 import showrunners
 import unit_lookup
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from production_units import Refusal, cell_value, live_unit_table, production_field, unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
@@ -813,10 +816,7 @@ def is_style_production(production: Production) -> bool:
 def save_last_report(slug: str, saved: JsonMap) -> Path:
     path = last_report_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Written beside the file and renamed, so the showrunner above never reads half of one.
-    scratch = path.with_name(f".{path.name}.{os.getpid()}")
-    _ = scratch.write_text(json.dumps(saved, indent=2) + "\n", encoding="utf-8")
-    _ = scratch.replace(path)
+    write_text_atomic(path, json.dumps(saved, indent=2) + "\n")
     return path
 
 
@@ -1090,13 +1090,13 @@ def run(args: argparse.Namespace) -> int:
             fresh[key] = fields
             if key in eta_request_candidates and isinstance(fresh_state, EtaNotYetRequested):
                 requests.append(eta_request_candidates[key])
+        for session in requests:
+            print(f"request /unit:eta: {session}", flush=True)
         return tuple(requests)
 
-    eta_requests = update_state(seen_path, merge_eta_records)
-    for session in eta_requests:
-        print(f"request /unit:eta: {session}")
+    _ = update_state(seen_path, merge_eta_records)
     out.parent.mkdir(parents=True, exist_ok=True)
-    _ = out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    write_text_atomic(out, json.dumps(result, indent=2) + "\n")
     report("input", "ok", f"wrote {out}")
     # What the showrunner above this one shows of it. Failing to save it never costs this report.
     cadence = ReportsOnDemand() if isinstance(schedule, UpdatesOnDemand) else ReportsEvery(schedule.minutes)

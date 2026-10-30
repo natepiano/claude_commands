@@ -7,14 +7,14 @@ import json
 from collections.abc import Iterator
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
-from zoneinfo import ZoneInfo
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -29,26 +29,17 @@ import showrunners
 import sessions
 import unit_lookup
 import unit_names
-from production_units import Refusal, cell_value, plan_cell_is_retired, production_field, unit_rows, unit_headings, unit_table
+from production_units import Production, Refusal, cell_value, plan_cell_is_retired, read_production, unit_rows, unit_headings, unit_table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-from user_zone import user_zone  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
+from atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     import herdr
     import launch_permission
     from scripts.accounts.accounts import ClaudeLaunchAccount
-    from record import SessionShutdown
-
-
-class Production(NamedTuple):
-    doc: Path
-    slug: str
-    merge_branch: str
-    checkout: Path
-    log: Path
-    zone: ZoneInfo
+    from shutdown_record import SessionShutdown
 
 
 class ProductionPlanRequired(NamedTuple):
@@ -279,11 +270,20 @@ class UnitLaunch(UnitLaunchConfiguration):
         return self.identity.unit
 
 
+class NoPlanTransition(NamedTuple):
+    """The launch keeps its mode or adopts an existing conversation."""
+
+
+class BriefToPlanTransition(NamedTuple):
+    """The launch replaces a brief and must record plan mode."""
+
+
 class ReadyToLaunch(NamedTuple):
     launch: UnitLaunch
     row: NoUnitRow | ExistingUnitRow
     director: DirectorAgent
     handoff: NoSessionHandoff | RunningSessionHandoff = NoSessionHandoff()
+    plan_transition: NoPlanTransition | BriefToPlanTransition = NoPlanTransition()
 
 
 @dataclass(frozen=True)
@@ -296,27 +296,6 @@ class MarkedUnitFound:
 @dataclass(frozen=True)
 class NoMarkedUnit:
     """No session carries the requested unit's marks."""
-
-
-def read_production(path: Path) -> Production:
-    """Read the production fields shared with merge_checkpoint.py."""
-    try:
-        doc = path.resolve(strict=True)
-        lines = doc.read_text(encoding="utf-8").splitlines()
-        merge_branch = production_field(lines, "Merge branch")
-        checkout = Path(production_field(lines, "Showrunner checkout")).expanduser().resolve()
-        log = Path(production_field(lines, "Log"))
-        zone = user_zone()
-        slug = doc.name.removesuffix("-production.md")
-        if slug == doc.name:
-            raise Refusal("production doc name must end in -production.md")
-        if log.is_absolute():
-            raise Refusal("production Log must be relative to Showrunner checkout")
-        if "## Units" not in lines:
-            raise Refusal("production doc lacks Units table")
-        return Production(doc, slug, merge_branch, checkout, checkout / log, zone)
-    except (OSError, UnicodeError, KeyError, ValueError) as error:
-        raise Refusal(f"cannot read production doc: {error}") from error
 
 
 def git(production: Production, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -474,7 +453,7 @@ def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow 
     existing = matching[0]
     pattern_cells = () if row_names_place else (("Worktree", existing.worktree, str(request.worktree)),
                                           ("Branch", existing.branch, request.branch))
-    for cell, actual, expected in (("Plan", existing.plan, request.plan_cell), *pattern_cells):
+    for cell, actual, expected in pattern_cells:
         if actual != expected:
             raise Refusal(f"unit {request.unit} {cell} is {actual!r}; expected {expected!r}")
     for cell, actual, supplied in (("Port", existing.port, request.port),
@@ -486,8 +465,8 @@ def row_is_present(request: RequestedUnitLaunch, lines: list[str]) -> NoUnitRow 
 
 def recorded_mode(request: UnitLaunch, row: ExistingUnitRow) -> str:
     subject_prefix = f"production({request.production.slug}): add unit {request.identity.unit} ("
-    subjects = git(request.production, "log", "--format=%s", "--", str(
-        request.production.doc.relative_to(request.production.checkout))).stdout.splitlines()
+    subjects = git(request.production, "log", "--format=%s", "--fixed-strings",
+                   f"--grep={subject_prefix}", request.production.merge_branch).stdout.splitlines()
     for subject in subjects:
         if subject in (subject_prefix + "plan)", subject_prefix + "brief)", subject_prefix + "standby)",
                        subject_prefix + "permanent)"):
@@ -495,7 +474,7 @@ def recorded_mode(request: UnitLaunch, row: ExistingUnitRow) -> str:
     if row.plan in ("standby", "permanent"):
         return row.plan
     stub = request.production.checkout / stub_plan(request.production, request.branch)
-    if stub.exists() and request.plan_path == stub.relative_to(request.production.checkout):
+    if stub.exists() and row.plan == stub.relative_to(request.production.checkout).as_posix():
         if "## Source\n\n" in stub.read_text(encoding="utf-8"):
             return "brief"
     return "plan"
@@ -558,6 +537,8 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust, repository_trust_key
 
     handoff: NoSessionHandoff | RunningSessionHandoff = NoSessionHandoff()
+    resuming_opening = (isinstance(request.session, ResumedSession)
+                        and pending_opening(request.production, request.unit, request.session.session_id))
     if isinstance(request.session, ResumedSession):
         session_id = request.session.session_id
         observed = sessions.session_liveness(session_id)
@@ -567,7 +548,8 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
             if isinstance(observed, sessions.SessionNotLive):
                 raise Refusal(f"session {session_id} does not run; use --resume")
             handoff = attach_source(session_id, observed.pid)
-        elif isinstance(observed, sessions.LiveSessionProcess):
+        elif (isinstance(observed, sessions.LiveSessionProcess)
+              and not resuming_opening):
             raise Refusal(f"session {session_id} already runs as pid {observed.pid}; "
                           + f"to make it this unit, run add_unit with --attach {session_id}")
     production = request.production
@@ -586,7 +568,8 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
     plan_context: ProductionPlanRequired | ExistingConversationPlan = ProductionPlanRequired()
     if (not restoring and isinstance(existing, ExistingUnitRow)
             and isinstance(request.session, ResumedSession)
-            and isinstance(request.session.handoff, ResumeStoppedSession)):
+            and isinstance(request.session.handoff, ResumeStoppedSession)
+            and request.plan_cell == existing.plan):
         plan_context = ExistingConversationPlan()
     if restoring:
         if isinstance(existing, NoUnitRow):
@@ -598,7 +581,7 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
             if (isinstance(existing.state, RetiredUnitRow)
                     and isinstance(request.session.handoff, ResumeStoppedSession)):
                 request = replace(request, launch_kind=ResumeInStartFolderLaunch())
-            else:
+            elif not resuming_opening:
                 raise Refusal(f"unit {request.unit} resumes in {request.session.cwd}; its Units row names {existing.worktree}")
         request = replace(request, worktree=Path(existing.worktree), branch=existing.branch)
     launch = UnitLaunch(
@@ -628,9 +611,24 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
         # These launches adopt the row and need no worktree: how the unit was first added, whether
         # its Plan cell still names a live plan, and whether its worktree and branch are free
         # describe new work, not the session it resumes.
-        return ReadyToLaunch(launch, existing, director_agent(launch), handoff)
-    if isinstance(existing, ExistingUnitRow) and recorded_mode(launch, existing) != launch.mode_name:
-        raise Refusal(f"unit name {launch.identity.unit} is already taken in Units table")
+        if isinstance(existing, ExistingUnitRow) and existing.plan != launch.plan_cell:
+            raise Refusal(f"unit {request.unit} Plan is {existing.plan!r}; expected {launch.plan_cell!r}")
+        return ReadyToLaunch(launch, existing, director_agent(launch), handoff, NoPlanTransition())
+    plan_transition: NoPlanTransition | BriefToPlanTransition = NoPlanTransition()
+    if isinstance(existing, ExistingUnitRow):
+        mode = recorded_mode(launch, existing)
+        if mode != launch.mode_name and not (mode == "brief" and isinstance(launch.plan, PlanGiven)):
+            retry = ["add_unit.py", "--production", str(production.doc), launch.identity.unit, f"--{mode}"]
+            if mode == "plan":
+                retry.append(existing.plan)
+            elif mode == "brief":
+                retry.append("<original words>")
+            raise Refusal(f"unit {launch.identity.unit} was added in {mode} mode; "
+                          + f"{launch.mode_name} mode cannot reuse its row; run {shlex.join(retry)}")
+        if mode == launch.mode_name and existing.plan != launch.plan_cell:
+            raise Refusal(f"unit {request.unit} Plan is {existing.plan!r}; expected {launch.plan_cell!r}")
+        if mode == "brief" and isinstance(launch.plan, PlanGiven):
+            plan_transition = BriefToPlanTransition()
     has_worktree = worktree_on_branch(launch)
     if has_worktree and isinstance(existing, NoUnitRow):
         raise Refusal(f"worktree path {request.worktree} is already in use")
@@ -653,13 +651,13 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
         if (not any(line.startswith("> **Production:") for line in content.splitlines())
                 or len(saved_words) != 2 or saved_words[1] != launch.plan.words + "\n"):
             raise Refusal(f"stub plan {launch.plan.stub} already exists with different content")
-    return ReadyToLaunch(launch, existing, director_agent(launch), handoff)
+    return ReadyToLaunch(launch, existing, director_agent(launch), handoff, plan_transition)
 
 
 def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
     """Require one live, attributed inventory identity before requesting its safe stop."""
     import inventory
-    from record import session_records
+    from shutdown_record import session_records
 
     processes = sessions.session_processes(session_id)
     if isinstance(processes, sessions.SessionLivenessUnknown):
@@ -687,7 +685,7 @@ def run_attach_shutdown(arguments: list[str], timeout: float) -> subprocess.Comp
 def stop_for_attach(handoff: RunningSessionHandoff) -> SessionShutdown:
     import restart
     import settle
-    from record import session_records
+    from shutdown_record import session_records
 
     identity = str(uuid4())
     cancel = settle.shutdown_command("cancel", handoff.login, "--here", "--only", handoff.session_id)
@@ -755,17 +753,28 @@ def write_stub(request: UnitLaunch) -> None:
     stamp = datetime.now(request.production.zone).strftime("%Y-%m-%d %H:%M %Z")
     header = f"# {request.identity.session}\n\n> **Production: {request.production.slug}** — unit "
     source = f"`{request.identity.unit}`; production doc `{doc}`\n\n## Source\n\n{stamp}\n\n{request.plan.words}\n"
-    _ = path.write_text(header + source, encoding="utf-8")
+    write_text_atomic(path, header + source)
 
 
 def append_row(request: UnitLaunch, existing: NoUnitRow | ExistingUnitRow) -> None:
-    if isinstance(existing, ExistingUnitRow):
+    if isinstance(existing, ExistingUnitRow) and existing.plan == request.plan_cell:
         return
     doc = request.production.doc
     lines = doc.read_text(encoding="utf-8").splitlines()
-    insert_at, _ = unit_rows(lines)
-    lines.insert(insert_at, desired_row(request, unit_headings(lines)))
-    _ = doc.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    insert_at, rows = unit_rows(lines)
+    headings = unit_headings(lines)
+    if isinstance(existing, ExistingUnitRow):
+        for index, line in enumerate(lines):
+            if line not in rows:
+                continue
+            cells = line.split("|")
+            if cell_value(cells[headings.index("Unit") + 1]) == request.identity.unit:
+                cells[headings.index("Plan") + 1] = f" {request.plan_cell} "
+                lines[index] = "|".join(cells)
+                break
+    else:
+        lines.insert(insert_at, desired_row(request, headings))
+    write_text_atomic(doc, "\n".join(lines) + "\n")
 
 
 def remote_head(production: Production, branch: str) -> str:
@@ -773,7 +782,7 @@ def remote_head(production: Production, branch: str) -> str:
     return result.stdout.split()[0] if result.stdout.strip() else ""
 
 
-def commit_paths(production: Production, paths: list[Path], message: str) -> None:
+def commit_paths(production: Production, paths: list[Path], message: str, *, allow_empty: bool = False) -> None:
     """Commit `paths` on the merge branch and push nothing of it.
 
     The commit goes out with the showrunner's next merge push: a push here would carry every
@@ -785,9 +794,12 @@ def commit_paths(production: Production, paths: list[Path], message: str) -> Non
     if status:
         _ = git(production, "add", "--", *relative_paths)
         _ = git(production, "commit", "--only", "-m", message, "--", *relative_paths)
+    elif allow_empty:
+        _ = git(production, "commit", "--allow-empty", "--only", "-m", message)
 
 
-def commit_unit(request: UnitLaunch) -> None:
+def commit_unit(request: UnitLaunch,
+                plan_transition: NoPlanTransition | BriefToPlanTransition) -> None:
     paths = [request.production.doc]
     if isinstance(request.plan, BriefGiven):
         paths.append(request.production.checkout / request.plan.stub)
@@ -795,6 +807,7 @@ def commit_unit(request: UnitLaunch) -> None:
         request.production,
         paths,
         f"production({request.production.slug}): add unit {request.identity.unit} ({request.mode_name})",
+        allow_empty=isinstance(plan_transition, BriefToPlanTransition),
     )
 
 
@@ -813,9 +826,13 @@ def ensure_worktree(request: UnitLaunch) -> None:
                 production.merge_branch)
     if isinstance(request.plan, PlanGiven):
         destination = worktree / request.plan.path
-        if not destination.exists() and _is_excluded_standing_plan(production, request.plan.path):
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            _ = destination.write_bytes((production.checkout / request.plan.path).read_bytes())
+        if not destination.exists():
+            if _is_excluded_standing_plan(production, request.plan.path):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                write_text_atomic(destination, (production.checkout / request.plan.path).read_text(encoding="utf-8"))
+            else:
+                _ = git(production, "-C", str(worktree), "restore", f"--source={production.merge_branch}",
+                        "--worktree", "--", request.plan.path.as_posix())
     if (production.checkout / ".claude/config/berth.toml").exists():
         key = f"branch.{request.branch}.cargoBerthTarget"
         current = git(production, "config", "--get", key, check=False).stdout.strip()
@@ -939,6 +956,12 @@ def launch_session(
         environment[PROBE_ENV] = "1"
     arguments.extend(["--remote-control", session_name, "-n", session_name, *flags])
     timeout_ms = int(request.timeout * 1000)
+    pending = opening_record(request.production, request.unit_id)
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(pending, json.dumps({
+        "session_id": session_id, "config_dir": str(selected.dir),
+        "prompt": prompt, "launched_at": datetime.now(UTC).isoformat(),
+    }) + "\n")
     host = herdr.shared_session()
     _ = herdr.start_server(host, timeout_ms)
     production = request.production
@@ -949,7 +972,62 @@ def launch_session(
     if isinstance(launched, herdr.nix_env.Refused):
         raise Refusal(launched.reason)
     outcome = launched.outcome
+    if isinstance(outcome, herdr.PromptSubmitted):
+        pending.unlink(missing_ok=True)
     return outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted)) else herdr.PromptNotSubmitted("launcher returned no submit proof")
+
+
+def opening_record(production: Production, unit: str) -> Path:
+    """Keep pending prompt work in the checkout's Git directory, outside tracked files."""
+    checkout = production.checkout
+    directory = checkout / ".git"
+    if directory.is_file():
+        pointer = directory.read_text(encoding="utf-8").strip()
+        if not pointer.startswith("gitdir: "):
+            raise Refusal(f"invalid Git directory pointer: {directory}")
+        directory = (checkout / pointer.removeprefix("gitdir: ")).resolve()
+    return directory / "add-unit-openings" / f"{unit}.json"
+
+
+def pending_opening(production: Production, unit: str, session_id: str) -> bool:
+    """Whether this unit still owes an opening to the named conversation."""
+    path = opening_record(production, unit)
+    if not path.exists():
+        return False
+    fields = cast(dict[str, str], json.loads(path.read_text(encoding="utf-8")))
+    return fields["session_id"] == session_id
+
+
+class NoPendingOpening(NamedTuple):
+    """No live conversation still needs this saved opening."""
+
+
+def finish_opening(request: UnitLaunch, marked: MarkedUnitFound) -> herdr.PromptSubmitOutcome | NoPendingOpening:
+    """Finish the opening for this live session, without starting a second session."""
+    import herdr
+
+    pending = opening_record(request.production, request.unit_id)
+    if not pending.exists():
+        return NoPendingOpening()
+    fields = cast(dict[str, str], json.loads(pending.read_text(encoding="utf-8")))
+    claude = marked.unit.claude
+    if not isinstance(claude, unit_lookup.LiveClaude) or claude.session_id != fields["session_id"]:
+        observed = sessions.session_liveness(fields["session_id"])
+        if isinstance(observed, sessions.SessionNotLive):
+            pending.unlink()
+            return NoPendingOpening()
+        if isinstance(observed, sessions.SessionLivenessUnknown):
+            raise Refusal(f"cannot tell whether pending session {fields['session_id']} runs: {observed.reason}")
+        raise Refusal("pending opening does not name the marked unit's live session")
+    transcript = herdr.SessionTranscript(Path(fields["config_dir"]), fields["session_id"])
+    at = datetime.fromisoformat(fields["launched_at"])
+    outcome = herdr.submitted_prompt(transcript, fields["prompt"], at)
+    if not isinstance(outcome, herdr.PromptSubmitted):
+        outcome = herdr.Herdr(marked.unit.place.session).submit_opening_prompt(
+            marked.unit.place.pane, herdr.OpeningPrompt(fields["prompt"], transcript), at, int(request.timeout * 1000))
+    if isinstance(outcome, herdr.PromptSubmitted):
+        pending.unlink(missing_ok=True)
+    return outcome
 
 
 def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted) -> str:
@@ -1079,7 +1157,7 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
     from scripts.accounts import accounts
     try:
         if source_fallback:
-            from record import all_session_records
+            from shutdown_record import all_session_records
 
             if not isinstance(request.launch_kind, UnitRestoreLaunch):
                 raise Refusal("--source-fallback requires a recorded unit restore")
@@ -1156,7 +1234,7 @@ def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
         return ""
     if explicit:
         return explicit
-    import record as shutdown_record
+    import shutdown_record
     try:
         saved = [item for item in shutdown_record.all_session_records()
                  if item["session"]["session_id"] == request.session.session_id]
@@ -1232,7 +1310,8 @@ def main(argv: list[str]) -> int:
         explicit_autocompact = cast(str, args.autocompact)
         if (explicit_autocompact and isinstance(request.session, ResumedSession)
                 and isinstance(request.session.handoff, ResumeStoppedSession)
-                and isinstance(request.launch_kind, NewWorkLaunch) and registered_unit(request)):
+                and isinstance(request.launch_kind, NewWorkLaunch) and registered_unit(request)
+                and not pending_opening(request.production, request.unit, request.session.session_id)):
             # Setting a registered unit's window is not new work: no new-work check or launch applies.
             set_autocompact(request, request.session.session_id, explicit_autocompact, cast(bool, args.check))
             return 0
@@ -1266,32 +1345,24 @@ def main(argv: list[str]) -> int:
             handoff = StoppedSessionHandoff(source, saved)
             request = replace(request, session=request.session._replace(handoff=ResumeStoppedSession()))
 
-        barrier = launch_permission.launch_barrier()
-        try:
-            _ = barrier.__enter__()
-        except OSError as error:
-            raise Refusal(
-                f"shutdown state unreadable: launch barrier: {error}"
-            ) from error
         outcome = herdr.PromptNotSubmitted("restore reused a session without submit proof")
-        try:
-            purpose: launch_permission.LaunchPurpose = (
-                launch_permission.RecordedSessionRestoreLaunchPurpose(
-                    request.launch_kind.session_id
-                )
-                if isinstance(request.launch_kind, UnitRestoreLaunch)
-                else launch_permission.RecordedSessionRestoreLaunchPurpose(handoff.session_id)
-                if isinstance(handoff, StoppedSessionHandoff)
-                else launch_permission.NewWorkLaunchPurpose()
+        purpose: launch_permission.LaunchPurpose = (
+            launch_permission.RecordedSessionRestoreLaunchPurpose(
+                request.launch_kind.session_id
             )
-            require_shutdown_launch_permission(unit_account, purpose)
-
+            if isinstance(request.launch_kind, UnitRestoreLaunch)
+            else launch_permission.RecordedSessionRestoreLaunchPurpose(handoff.session_id)
+            if isinstance(handoff, StoppedSessionHandoff)
+            else launch_permission.NewWorkLaunchPurpose()
+        )
+        from scripts.whoami.account import named_claude_account
+        with launch_permission.admitted_launch(named_claude_account(unit_account.label).login,
+                request.session.session_id if isinstance(request.session, ResumedSession) else "",
+                request.unit_id, lambda: require_shutdown_launch_permission(unit_account, purpose)):
             ready = preflight(request, unit_account)
             request = ready.launch
             if cast(bool, args.check):
                 return 0
-            if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
-                autocompact.record(request.session.session_id, cast(str, args.autocompact))
             marked_unit = launched_unit(request)
             if (
                 isinstance(request.session, ResumedSession)
@@ -1311,10 +1382,20 @@ def main(argv: list[str]) -> int:
                     marked_unit = NoMarkedUnit()
             if isinstance(handoff, StoppedSessionHandoff) and isinstance(marked_unit, MarkedUnitFound):
                 raise Refusal(f"cannot attach {handoff.session_id}: unit tab already runs")
+            if isinstance(marked_unit, MarkedUnitFound):
+                retry = shlex.join(["add_unit.py", *argv])
+                if isinstance(ready.row, NoUnitRow):
+                    raise Refusal(f"unit {request.identity.unit} already runs in session {marked_unit.unit.place.session} "
+                                  + f"but has no Units row; end that session, then run {retry}")
+                if isinstance(ready.plan_transition, BriefToPlanTransition):
+                    raise Refusal(f"unit {request.identity.unit} runs its brief in session {marked_unit.unit.place.session}; "
+                                  + f"end that session, then run {retry}")
+            if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
+                autocompact.record(request.session.session_id, cast(str, args.autocompact))
             if not isinstance(request.launch_kind, ResumeInStartFolderLaunch):
                 write_stub(request)
                 append_row(request, ready.row)
-                commit_unit(request)
+                commit_unit(request, ready.plan_transition)
             # A restore or a retired unit's external start folder needs no worktree or branch.
             if not isinstance(request.launch_kind, (UnitRestoreLaunch, ResumeInStartFolderLaunch)):
                 ensure_worktree(request)
@@ -1327,8 +1408,12 @@ def main(argv: list[str]) -> int:
                 outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
                                if isinstance(request.session, ResumedSession) else "", model=resume_model,
                                autocompact_window=resume_autocompact)
-        finally:
-            _ = barrier.__exit__(None, None, None)
+            elif opening_record(request.production, request.unit_id).exists():
+                recovered = finish_opening(request, marked_unit)
+                if not isinstance(recovered, NoPendingOpening):
+                    outcome = recovered
+                if isinstance(recovered, herdr.PromptNotSubmitted):
+                    raise Refusal(f"{request.identity.unit}: opening prompt not submitted: {recovered.reason}")
         if isinstance(request.launch_kind, UnitRestoreLaunch):
             print("restart-prompt-outcome: " + herdr.encode_prompt_outcome(outcome))
             if isinstance(outcome, herdr.PromptNotSubmitted):

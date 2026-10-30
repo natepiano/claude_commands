@@ -12,15 +12,17 @@ from typing import NamedTuple, cast
 import showrunners
 import tidy_wrapped
 import unit_lookup
-from add_unit import Production, read_production
+from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
-from merge_checkpoint import (CodeCheckpoint, MacCheckout, MergeEntry, NoMerge, NoPromotion,
+from merge_checkpoint import (CodeCheckpoint, MergeEntry, NoMerge,
                               PromotionAlreadyAtTip, PromotionOriginPushed, PromotionNotPushed,
-                              PromoteTo, Stop,
+                              Stop,
                               git, good, merge_branch_history, promote_local_checkout,
-                              promotion_from_doc, pull_mac_checkout, report)
+                              pull_mac_checkout, report)
+from scripts.production import production_doc
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from atomic_file import write_text_atomic
 import berth_board
 
 PHASE_TABLE = Path(__file__).resolve().parent.parent / "direct" / "phase_table.py"
@@ -103,10 +105,10 @@ def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | Prod
 
 
 def production_name(lines: list[str]) -> str:
-    heading = next((line for line in lines if line.startswith("# Production — ")), "")
-    if not heading:
-        raise LifecycleStop("input", "failed", "production doc lacks its name")
-    return heading.removeprefix("# Production — ").strip()
+    name = production_doc.production_name(lines)
+    if isinstance(name, production_doc.ProductionNameNotRecorded):
+        raise LifecycleStop("input", "failed", name.reason)
+    return name.value
 
 
 def units(lines: list[str], production: Production) -> tuple[UnitRow, ...]:
@@ -203,14 +205,19 @@ def open_production(production: Production, lines: list[str]) -> None:
         updated = [line.replace("**Status: PRODUCTION — planned.**", "**Status: PRODUCTION — running.**")
                    for line in updated]
     if updated != lines:
-        _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")
+        write_text_atomic(production.doc, "\n".join(updated) + "\n")
     report("doc", "ok", "running")
     rows = units(updated, production)
     paths = [doc_path_in_checkout(production, production.doc)]
-    paths.extend(doc_path_in_checkout(production, unit.plan) for unit in rows)
+    for unit in rows:
+        if unit.plan.exists():
+            paths.append(doc_path_in_checkout(production, unit.plan))
+        else:
+            report("plan", "ok", f"{unit.name}: no plan yet at {unit.plan}; not committed")
     subject = f"production({production_name(updated)}): plans for {len(rows)} units"
     subjects = checked(production.checkout, "commit", "log", "--format=%s", production.merge_branch)
-    if subject in subjects.splitlines():
+    committed_paths = checked(production.checkout, "commit", "ls-tree", "-r", "--name-only", "HEAD", "--", *paths)
+    if subject in subjects.splitlines() and set(paths).issubset(committed_paths.splitlines()):
         report("commit", "ok", "plans already committed")
     else:
         _ = checked(production.checkout, "commit", "add", "--", *paths)
@@ -242,7 +249,7 @@ def open_production(production: Production, lines: list[str]) -> None:
             _ = stream.write(("" if not existing or existing.endswith("\n") else "\n") + log_name + "\n")
     if not production.log.exists():
         production.log.parent.mkdir(parents=True, exist_ok=True)
-        _ = production.log.write_text(f"# Production log — {production_name(updated)}\n", encoding="utf-8")
+        write_text_atomic(production.log, f"# Production log — {production_name(updated)}\n")
     report("log", "ok", f"excluded and initialized {log_name}")
 
 
@@ -284,8 +291,8 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
     if git(production.checkout, "merge-base", "--is-ancestor", "origin/main", tip).returncode:
         raise LifecycleStop("main", "held", f"origin/main has commits absent from {tip}")
     report("main", "ok", f"origin/main is behind {tip}")
-    promotion = promotion_from_doc(lines)
-    if isinstance(promotion, NoPromotion) or not promotion.checkouts:
+    promotion = production_doc.promotion_from_doc(lines)
+    if isinstance(promotion, production_doc.NoPromotion) or not promotion.checkouts:
         remote = checked(production.checkout, "promote", "rev-parse", "origin/main")
         if remote != tip:
             _ = checked(production.checkout, "push", "push", "origin", f"{tip}:refs/heads/main")
@@ -304,7 +311,7 @@ def promote_main(production: Production, lines: list[str], no_ci: bool,
             else:
                 detail = f"{destination}: advanced to {tip}"
             report("promote", "ok", detail)
-    if isinstance(promotion, PromoteTo) and isinstance(promotion.mac, MacCheckout):
+    if isinstance(promotion, production_doc.PromoteTo) and isinstance(promotion.mac, production_doc.MacCheckout):
         source = promotion.checkouts[0] if promotion.checkouts else production.checkout
         pull_mac_checkout(promotion.mac.path, source)
         report("promote", "ok", f"mac {promotion.mac.path} main pulled")
@@ -325,6 +332,20 @@ def archived_doc(production: Production) -> Path | None:
         return None
     common = Path(checked(production.checkout, "wrap", "rev-parse", "--path-format=absolute", "--git-common-dir"))
     return production.doc.parent.parent / "archive" / common.parent.name / production.slug / production.doc.name
+
+
+def wrap_production(doc: Path) -> Production:
+    """Find a doc that an earlier wrap moved into the archive."""
+    doc = doc.expanduser().absolute()
+    if doc.exists() or doc.parent.name != "productions":
+        return read_production(doc)
+    common = Path(checked(doc.parent, "wrap", "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    slug = doc.name.removesuffix("-production.md")
+    archive = doc.parent.parent / "archive" / common.parent.name / slug / doc.name
+    tracked = git(doc.parent, "ls-files", "--error-unmatch", "--", str(archive))
+    if tracked.returncode != 0:
+        return read_production(doc)
+    return read_production(archive)
 
 
 def retire_reservations(worktree: Path) -> None:
@@ -405,7 +426,8 @@ def tidy_state(slug: str) -> None:
 
 def wrap(production: Production, lines: list[str], no_ci: bool,
          ci_green: CommitVerdict | VerdictMissing,
-         smoke_passed: CommitVerdict | VerdictMissing, done: tuple[str, ...]) -> None:
+         smoke_passed: CommitVerdict | VerdictMissing, done: tuple[str, ...],
+         moved_from: tuple[Path, ...] = ()) -> None:
     status = doc_status(lines)
     if isinstance(status, ProductionPlanned):
         raise LifecycleStop("wrap", "held", "production must be running")
@@ -492,8 +514,8 @@ def wrap(production: Production, lines: list[str], no_ci: bool,
         )
         updated = [line.replace("**Status: PRODUCTION — running.**", "**Status: PRODUCTION — wrapped.**")
                    for line in lines]
-        _ = production.doc.write_text("\n".join(updated) + "\n", encoding="utf-8")
-    doc_paths = [doc_path_in_checkout(production, production.doc)]
+        write_text_atomic(production.doc, "\n".join(updated) + "\n")
+    doc_paths = [doc_path_in_checkout(production, path) for path in (*moved_from, production.doc)]
     archive = archived_doc(production)
     if archive is not None:
         archive.parent.mkdir(parents=True, exist_ok=True)
@@ -561,7 +583,8 @@ def main() -> int:
             raise LifecycleStop("input", "failed", "--no-ci excludes the verdict flags")
         ci_green = CommitVerdict(ci_sha) if ci_sha is not None else VerdictMissing()
         smoke_passed = CommitVerdict(smoke_sha) if smoke_sha is not None else VerdictMissing()
-        production = read_production(cast(Path, args.production))
+        given_doc = cast(Path, args.production)
+        production = wrap_production(given_doc) if action == "wrap" else read_production(given_doc)
         lines = doc_lines(production)
         if action == "load":
             load(production, lines, cast(bool, args.resume), cast(Path | None, args.scratch))
@@ -571,7 +594,8 @@ def main() -> int:
             _ = promote_main(production, lines, no_ci, ci_green, smoke_passed)
         else:
             wrap(production, lines, no_ci, ci_green, smoke_passed,
-                 tuple(cast(list[str], args.close_out_done)))
+                 tuple(cast(list[str], args.close_out_done)),
+                 (given_doc.expanduser().absolute(),) if production.doc != given_doc.expanduser().resolve() else ())
         return 0
     except LifecycleStop as error:
         report(error.step, error.state, error.detail.replace("\n", "; "))

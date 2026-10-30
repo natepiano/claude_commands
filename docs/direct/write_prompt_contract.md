@@ -58,6 +58,13 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    (pass or fail, exit code, log path, last lines) arrives as your next
    message, also after an account move or a stop. Never poll, sleep, call
    `wait`, loop on a status file, or post a waiting status.
+   Status 77 means cancelled because the tree changed: resubmit after your
+   edits are done; it is not a test failure.
+   When a later edit or result makes a run of yours useless, cancel it in
+   the same turn: take `pid` from the run's record (the `.json` beside its
+   log), check that `ps -p <pid> -o args=` still shows
+   `mesh_runs.py supervise` with that record's path, then run
+   `kill -TERM -- -<pid>`.
    ```
 
    Every model call resends the worker's whole context, and on 2026-10-15
@@ -101,6 +108,8 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
 
 5. `## Project Context`.
 6. `## Work Specification`.
+   Every implementation, test and repair prompt carries verbatim: "Do not weaken, delete or turn off an existing assertion or test to make a test pass. If one must change, post blocked with the test, the old assertion, the new assertion and why." The unit director answers a blocked post in the next work order: it rejects the change, or it adds the ruling line `Assertion-Change: <path>::<test> — <why>`, which `assertion_guard.py` reads from the run's work orders and from the commit message. Without that line, `verify.sh lint` and the checkpoint commit refuse a removed, weaker or turned-off assertion or test. In cargo-liner-tile checkpoint e21d5b93 a worker changed an `assert_eq!` to a bound `assert!` to make its change pass, and no review saw it (user, 2026-10-28).
+
    For workers writing tests, carry: "Do not write trivial tests that cannot fail for a real defect: assertions of a constant, literal or default against itself, implementation repetition, tests of the standard library or a mock they configure, name-existence or import-only checks, or duplicates of another test; a test that pins behaviour a user or another script depends on is not trivial."
 
    Every repair prompt's Work Specification also carries these fixing rules inline:
@@ -141,8 +150,9 @@ them. Command-list order must not make lint a precondition for test. It must
 also say: run only its listed commands, never raw Cargo; run each
 with the sandbox disabled; do not report until every command has exited and its
 output has been read. For a Codex worker, the final report waits for the
-results item 3's runs send. A run that prints `PASS (recorded)` is that gate's result,
-and the log it names is the output to read; add `--no-cache` only to re-run a
+results item 3's runs send. Status 77 means cancelled because the tree changed:
+resubmit after your edits are done; it is not a test failure. A run that prints
+`PASS (recorded)` is that gate's result, and the log it names is the output to read; add `--no-cache` only to re-run a
 passing gate on purpose, as in a flake hunt. If an edited package has no listed `test` line, add that
 package's scoped `verify.sh test` and report it. Omit plan **Style** metadata.
 </WritePromptContract>

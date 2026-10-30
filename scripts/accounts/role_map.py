@@ -14,7 +14,7 @@ import tempfile
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -109,10 +109,30 @@ class WorkersClaudeRouteChange:
 
 
 @dataclass(frozen=True)
+class CurrentRoleMap:
+    """The authority supplied this map during this command."""
+
+
+@dataclass(frozen=True)
+class CachedAfterFetchFailure:
+    at: datetime
+    failure: str
+
+
+@dataclass(frozen=True)
+class ExplicitStoredRoleMap:
+    at: datetime
+
+
+RoleMapProvenance = CurrentRoleMap | CachedAfterFetchFailure | ExplicitStoredRoleMap
+
+
+@dataclass(frozen=True)
 class RoleMap:
     groups: StoredGroupSelections
     workers: str
     workers_claude: WorkersClaudeAccount = DEFAULT_WORKERS_CLAUDE_ACCOUNT
+    provenance: RoleMapProvenance = field(default_factory=CurrentRoleMap, compare=False)
 
 
 @dataclass(frozen=True)
@@ -418,14 +438,16 @@ def read_role_map() -> RoleMap:
         if is_role_map_host():
             result = _local_role_map()
         elif isinstance(_role_map_source.get(), StoredRoleMap):
-            result, _ = _cached_role_map()
+            result, stamp = _cached_role_map()
+            result = replace(result, provenance=ExplicitStoredRoleMap(stamp))
         else:
             try:
                 result = decode_role_map(ssh_role_map(("role-map-read",)))
-            except (OSError, ValueError, subprocess.SubprocessError):
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
                 result, stamp = _cached_role_map()
-                print(f"role map from {stamp.astimezone(user_zone()).strftime('%Y-%m-%d %H:%M %Z')}; "
-                      + f"{ROLE_MAP_HOST} unreachable", file=sys.stderr)
+                provenance = CachedAfterFetchFailure(stamp, str(error))
+                result = replace(result, provenance=provenance)
+                print(cached_map_warning(provenance), file=sys.stderr)
             else:
                 saved_map = CachedRoleMap(at=datetime.now(timezone.utc).isoformat(),
                     map=_map_document(result))
@@ -438,6 +460,17 @@ def read_role_map() -> RoleMap:
     if isinstance(scope, CommandRoleMap):
         scope.value = result
     return result
+
+
+def observed_map_provenance() -> RoleMapProvenance:
+    """Return the provenance of the same memoized read used by this command."""
+    scope = _command_map.get()
+    return scope.value.provenance if isinstance(scope, CommandRoleMap) and isinstance(scope.value, RoleMap) else CurrentRoleMap()
+
+
+def cached_map_warning(provenance: CachedAfterFetchFailure) -> str:
+    stamp = provenance.at.astimezone(user_zone()).strftime('%Y-%m-%d %H:%M %Z')
+    return f"role map from {stamp}; {ROLE_MAP_HOST} fetch failed: {provenance.failure}"
 
 
 def decode_role_map_change(text: str) -> RoleMapChange | WorkersClaudeRouteChange:
@@ -504,6 +537,10 @@ def write_role_map(change: RoleMapChange | WorkersClaudeRouteChange) -> None:
                 try:
                     previous = path.read_text(encoding="utf-8") if path.exists() else ""
                     values = _object(path) if previous else {}
+                    if history.with_name(f".{history.name}.workers").exists():
+                        with history.open("r+", encoding="utf-8") as source:
+                            fcntl.flock(source.fileno(), fcntl.LOCK_EX)
+                            _ = worker_names.migrate_locked_journal(source, history)
                     size = history.stat().st_size if history.exists() else -1
                     if change.role == "workers":
                         values = worker_names.configuration(values)
@@ -624,11 +661,12 @@ class RecordedAutoMoves:
 def recorded_auto_moves(path: Path) -> RecordedAutoMoves | UnreadableAutoMoveHistory:
     """Recorded choices consume their entries even if log removal was interrupted."""
     try:
+        worker_names.recover_pending_journal(path, role_history=True)
         text = path.read_bytes()
         lines = text.splitlines(keepends=True)
     except FileNotFoundError:
         return RecordedAutoMoves(frozenset())
-    except OSError as error:
+    except (OSError, ValueError) as error:
         print(f"account moves: cannot read recorded auto moves: {error}")
         return UnreadableAutoMoveHistory()
     consumed: set[str] = set()

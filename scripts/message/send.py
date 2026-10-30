@@ -15,6 +15,7 @@ every message follows are /message (~/.claude/commands/message.md).
   send.py ack KEY       later sends with KEY are skipped
   send.py reopen KEY    forget KEY: acknowledgement and repeat window
   send.py pending [NAME]  print and clear what is kept for this session, or for NAME's
+  send.py drain-sockets   deliver recent stuck socket replies; archive files at least 24 h old
   send.py retire --to ADDRESS --from SENDER --key KEY
                           remove obsolete queued messages for ADDRESS; for --to user,
                           also stop the emergency push sent with KEY (see below)
@@ -115,7 +116,7 @@ import sys
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
@@ -206,6 +207,18 @@ PERMISSION_MODE = "auto"
 # One relay took 9 s when measured; quota_alert.py's budget is built on this.
 TIMEOUT = 40
 KILL_GRACE = 10
+# Exec preserves this PID: Claude's cc-socks/<pid>.sock belongs to the recorded process.
+# Publish before Claude starts, so even an immediate reply can resolve its sender.
+RELAY_EXEC = """import os, sys
+from pathlib import Path
+directory = Path(sys.argv[1])
+directory.mkdir(parents=True, exist_ok=True)
+path = directory / str(os.getpid())
+temporary = path.with_name('.' + path.name + '.tmp')
+temporary.write_text(sys.argv[2], encoding='utf-8')
+os.replace(temporary, path)
+os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
+"""
 # Above pushover.TIMEOUT_S, so Pushover's own timeout reports first.
 USER_CANCEL_TIMEOUT = 30
 # A --clears-when check that runs longer is stopped, and its push is kept.
@@ -227,6 +240,13 @@ LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to"
                                   "via": NotRequired[Literal["postmaster", "relay", "queue"]],
                                   "postmaster": NotRequired[Literal["delivered", "unresolved"] | postmaster.PostmasterMiss],
                                   "seconds": NotRequired[float]})
+
+
+class SocketRecoveryAttempt(TypedDict):
+    key: str
+    time: str
+
+
 KeyedMessage = TypedDict(
     "KeyedMessage",
     {
@@ -237,6 +257,8 @@ KeyedMessage = TypedDict(
         "summary": str,
         "text": str,
         "reason": str,
+        "shown_sender": NotRequired[str],
+        "socket_recovery": NotRequired[str],
     },
 )
 UnkeyedMessage = TypedDict(
@@ -249,6 +271,8 @@ UnkeyedMessage = TypedDict(
         "summary": str,
         "text": str,
         "reason": str,
+        "shown_sender": NotRequired[str],
+        "socket_recovery": NotRequired[str],
     },
 )
 
@@ -265,12 +289,29 @@ class KeyState(TypedDict):
 KeyStates = dict[str, KeyState]
 
 
-class Message(NamedTuple):
+@dataclass(frozen=True)
+class Message:
+    """Routing identity and body with sending-machine display text, or the raw sender for legacy callers."""
     to: str
     sender: str
     summary: str
     text: str
     key: str | None
+    shown_sender: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.shown_sender:
+            object.__setattr__(self, "shown_sender", self.sender)
+
+
+@dataclass(frozen=True)
+class SenderNotResolved:
+    pass
+
+
+@dataclass(frozen=True)
+class ShownSender:
+    text: str
 
 
 @dataclass(frozen=True)
@@ -463,7 +504,6 @@ class NamedMachine:
 
 
 RecipientResolutionScope = LocalOnly | LocalThenPeer | NamedMachine
-LOCAL_THEN_PEER = LocalThenPeer()
 
 
 @dataclass(frozen=True)
@@ -501,6 +541,7 @@ class Options(NamedTuple):
     clears_when: str = ""
     # The sending script retires its own emergency push.
     self_clearing: bool = False
+    shown_sender: ShownSender | SenderNotResolved = SenderNotResolved()
 
     @property
     def to(self) -> str:
@@ -591,6 +632,8 @@ def queue_for(to: str) -> Path:
     if to.startswith("session:") and len(to) > len("session:"):
         return queue_path(f"session-{to.removeprefix('session:')}")
     session = sessions.addressed(to, sessions.live_sessions())
+    if session is None and to.startswith("uds:"):
+        raise ValueError(dead_socket_reason(to))
     return queue_path(session_key(session) if session is not None else to)
 
 
@@ -600,6 +643,8 @@ def _queued_message(value: object) -> QueuedMessage | None:
     if not all(isinstance(values.get(field), str) for field in string_fields):
         return None
     key = values.get("key")
+    if "shown_sender" in values and not isinstance(values["shown_sender"], str):
+        return None
     if key is None:
         return cast(UnkeyedMessage, cast(object, values))
     if isinstance(key, str):
@@ -627,6 +672,7 @@ def enqueue(message: Message, reason: str, at: datetime) -> None:
             summary=message.summary,
             text=message.text,
             reason=reason,
+            shown_sender=message.shown_sender,
             **{"from": message.sender},
         )
     else:
@@ -637,6 +683,7 @@ def enqueue(message: Message, reason: str, at: datetime) -> None:
             summary=message.summary,
             text=message.text,
             reason=reason,
+            shown_sender=message.shown_sender,
             **{"from": message.sender},
         )
     with locked():
@@ -653,7 +700,12 @@ def _rewrite_queue(path: Path, kept: list[QueuedMessage]) -> None:
 
 
 def _queue_paths_for_address(to: str) -> list[Path]:
-    return list(dict.fromkeys((queue_for(to), queue_path(to))))
+    try:
+        destination = queue_for(to)
+    except ValueError:
+        # Cleanup may still remove legacy raw socket queues; enqueue never creates one.
+        return [queue_path(to)]
+    return list(dict.fromkeys((destination, queue_path(to))))
 
 
 def remove_queued_key(to: str, key: str) -> int:
@@ -850,6 +902,15 @@ def clear_check(timeout: float = CHECK_TIMEOUT_S) -> tuple[int, list[str]]:
         return code, lines
 
 
+def append_record(path: Path, entry: LogEntry | SocketRecoveryAttempt, *, durable: bool = False) -> None:
+    """Append under the state lock; recovery records must survive a stopped drain."""
+    with locked(), path.open("a", encoding="utf-8") as handle:
+        _ = handle.write(json.dumps(entry) + "\n")
+        if durable:
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
 def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE_ROUTE) -> None:
     entry: LogEntry = {"time": at.isoformat(), "machine": machine(), "from": message.sender, "to": message.to,
                        "key": message.key, "summary": message.text.strip().splitlines()[0] if message.text.strip()
@@ -858,9 +919,8 @@ def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE
         entry["via"] = route.via
         entry["postmaster"] = route.postmaster
         entry["seconds"] = round(route.seconds, 3)
-    STATE.mkdir(parents=True, exist_ok=True)
-    with locked(), open(STATE / "log.jsonl", "a", encoding="utf-8") as handle:
-        _ = handle.write(json.dumps(entry) + "\n")
+    append_record(STATE / "log.jsonl", entry,
+                  durable=message.key is not None and message.key.startswith("socket-recovery:"))
 
 
 # ---------------------------------------------------------------------------
@@ -940,6 +1000,193 @@ def reopen(key: str) -> str:
     return f"{key}: reopened; its next send goes out"
 
 
+def relay_sender(address: str) -> str:
+    """The name published by the process that owned this relay socket, if known."""
+    path = Path(address.removeprefix("uds:"))
+    if path.parent.name != "cc-socks" or path.suffix != ".sock" or not path.stem.isdecimal():
+        return ""
+    try:
+        return (STATE / "relay_senders" / path.stem).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return ""
+
+
+def socket_sender(address: str, metadata: dict[str, object]) -> str:
+    """Prefer the relay's saved identity, then the legacy queue's recipient metadata."""
+    return (relay_sender(address)
+            or next((as_str(metadata.get(field)) for field in ("to_name", "to-name", "recipient_name")
+                     if as_str(metadata.get(field))), "")
+            or (as_str(metadata.get("to")) if not as_str(metadata.get("to")).startswith("uds:") else ""))
+
+
+def dead_socket_reason(address: str, name: str = "") -> str:
+    name = name or socket_sender(address, {})
+    return (f"dead socket {address}; relay sender {name or '(unknown)'} has no live session; message not queued")
+
+
+def socket_recipient(address: str, records: list[sessions.SessionRecord], metadata: dict[str, object], *,
+                     disconnected: bool = False) -> ClaudeRecipient | RecipientLookupFailed:
+    """Keep direct sockets until their one delivery connect fails, then resolve the saved name."""
+    if not disconnected and Path(address.removeprefix("uds:")).is_socket():
+        return ClaudeRecipient(address)
+    name = socket_sender(address, metadata)
+    session = sessions.addressed(name, records) if name else None
+    if session is not None and (not disconnected or f"uds:{session['messagingSocketPath']}" != address):
+        return ClaudeRecipient(f"uds:{session['messagingSocketPath']}")
+    return RecipientLookupFailed(dead_socket_reason(address, name))
+
+
+def relay_socket(message: Message, timeout: float, records: list[sessions.SessionRecord],
+                 metadata: dict[str, object]) -> Result:
+    """Reuse the delivery connect: only a definite missing/refused socket permits a name retry."""
+    started = time.monotonic()
+    result = relay(message, timeout)
+    if message.to.startswith("uds:") and result.outcome == "queued" and re.search(
+            r"\b(?:ENOENT|ECONNREFUSED)\b", result.detail):
+        recipient = socket_recipient(message.to, records, metadata, disconnected=True)
+        if isinstance(recipient, RecipientLookupFailed):
+            return Result("failed", f"{result.detail}; {recipient.reason}")
+        return relay(replace(message, to=recipient.address), max(1.0, timeout - (time.monotonic() - started)))
+    return result
+
+
+def socket_reply_outcomes() -> dict[str, Literal["attempt", "sent", "failed"]]:
+    """Each attempt needs a result; counts also distinguish retries with equal timestamps."""
+    outcomes: dict[str, Literal["attempt", "sent", "failed"]] = {}
+    attempts: dict[str, int] = {}
+    results: dict[str, int] = {}
+    for filename, counts in (("socket-recovery-attempts.jsonl", attempts), ("log.jsonl", results)):
+        try:
+            with (STATE / filename).open(encoding="utf-8") as handle:
+                for line in handle:
+                    entry = as_dict(loads(line))
+                    key = as_str(entry.get("key"))
+                    if key.startswith("socket-recovery:"):
+                        counts[key] = counts.get(key, 0) + 1
+                        if filename == "log.jsonl":
+                            outcomes[key] = "sent" if entry.get("outcome") == "sent" else "failed"
+        except FileNotFoundError:
+            pass
+    for key, count in attempts.items():
+        if count > results.get(key, 0):
+            outcomes[key] = "attempt"
+    return outcomes
+
+
+def socket_archive_path(name: str, content: str = "") -> Path:
+    """Never replace an archive; an identical entry is a completed earlier checkpoint."""
+    archive = STATE / "socket-queue-archive"
+    archive.mkdir(parents=True, exist_ok=True)
+    target = archive / name
+    while target.exists():
+        if content and target.read_text(encoding="utf-8") == content:
+            return target
+        target = archive / ("_" + target.name)
+    return target
+
+
+def drain_socket_queues() -> tuple[int, list[str]]:
+    """Only the explicit drain holds this lock; normal messages do not wait for its relays."""
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / ".drain-sockets.lock").open("w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return recover_socket_queues(sessions.live_sessions(), now())
+
+
+def finish_socket_reply(path: Path, remaining: list[QueuedMessage], entry: QueuedMessage, line: str) -> None:
+    """Report and flush before the checkpoint removes the evidence a rerun needs."""
+    print(line, flush=True)
+    remaining.remove(entry)
+    _rewrite_queue(path, remaining)
+
+
+def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -> tuple[int, list[str]]:
+    """With the drain lock held, retry known failures and archive uncertain deliveries."""
+    outcomes = socket_reply_outcomes()
+    old_files: list[tuple[Path, list[datetime]]] = []
+    lines: list[str] = []
+    code = 0
+    for path in sorted((STATE / "queue").glob("uds__*.sock.jsonl")):
+        # Do not discard malformed evidence while moving the valid lines.
+        try:
+            raw = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as error:
+            lines.append(f"unresolved socket queue {path}: unreadable ({error}); left in place")
+            code = EXIT["failed"]
+            continue
+        entries = [entry for line in raw if (entry := _queued_message(loads(line))) is not None]
+        if not entries or len(entries) != len(raw):
+            lines.append(f"unresolved socket queue {path}: unreadable messages; left in place")
+            code = EXIT["failed"]
+            continue
+        try:
+            stamps = [datetime.fromisoformat(entry["time"]).astimezone(timezone.utc) for entry in entries]
+        except ValueError:
+            lines.append(f"unresolved socket queue {path}: unreadable time; left in place")
+            code = EXIT["failed"]
+            continue
+        # Assign stable IDs before any send; indexes may change as delivered entries are removed.
+        for index, entry in enumerate(entries):
+            if not entry.get("socket_recovery"):
+                entry["socket_recovery"] = "socket-recovery:" + hashlib.sha256(
+                    f"{path.name}:{index}:{raw[index]}".encode()).hexdigest()
+        remaining = entries.copy()
+        # Finish interrupted receipts before considering age or recipient liveness.
+        for entry in entries:
+            identity = entry.get("socket_recovery", "")
+            outcome = outcomes.get(identity)
+            metadata = cast("dict[str, object]", cast(object, entry))
+            name = socket_sender(entry["to"], metadata) or entry["to"]
+            if outcome == "attempt":
+                content = json.dumps(entry) + "\n"
+                target = socket_archive_path(f"{file_name(identity)}.jsonl", content)
+                if not target.exists():
+                    write_atomic(target, content)
+                finish_socket_reply(path, remaining, entry,
+                    f"UNCONFIRMED: stuck reply from {entry['time']} to {name} may have arrived; archived, not resent")
+                code = EXIT["failed"]
+            elif outcome == "sent":
+                finish_socket_reply(path, remaining, entry, f"SENT: stuck reply from {entry['time']} to {name}")
+        if not remaining:
+            continue
+        if at - max(stamps) >= timedelta(hours=24):
+            old_files.append((path, stamps))
+            continue
+        saved = False
+        for entry in remaining.copy():
+            identity = entry.get("socket_recovery", "")
+            metadata = cast("dict[str, object]", cast(object, entry))
+            recipient = socket_recipient(entry["to"], records, metadata)
+            if isinstance(recipient, RecipientLookupFailed):
+                lines.append(f"unresolved socket queue {path}: {recipient.reason}; left in place")
+                code = EXIT["failed"]
+                continue
+            message = Message(recipient.address, entry["from"], entry["summary"],
+                              f"Stuck message from {entry['time']}:\n" + entry["text"], identity,
+                              entry.get("shown_sender", entry["from"]))
+            if not saved:
+                _rewrite_queue(path, remaining)
+                saved = True
+            started = now()
+            append_record(STATE / "socket-recovery-attempts.jsonl",
+                          SocketRecoveryAttempt(key=identity, time=started.isoformat()), durable=True)
+            result = relay_socket(message, TIMEOUT, records, metadata)
+            log(message, result, started)
+            if result.outcome != "sent":
+                lines.append(f"FAILED: socket queue {path}: {result.detail}; kept for retry")
+                code = EXIT["failed"]
+                continue
+            finish_socket_reply(path, remaining, entry,
+                f"SENT: stuck reply from {entry['time']} to {socket_sender(entry['to'], metadata) or recipient.address}")
+    if old_files:
+        stamps = [stamp for _, file_stamps in old_files for stamp in file_stamps]
+        print(f"archiving {len(old_files)} socket queue files: oldest {min(stamps).isoformat()},"
+              + f" newest {max(stamps).isoformat()}", flush=True)
+        for path, _ in old_files:
+            os.replace(path, socket_archive_path(path.name))
+    return code, lines
+
+
 def pending(to: str | None) -> str:
     """Print and clear what is kept for a session: the one `to` means, or the caller's own.
 
@@ -964,7 +1211,8 @@ def pending(to: str | None) -> str:
         entries = sorted((entry for path in paths for entry in read_queue(path)), key=lambda entry: entry["time"])
         for path in paths:
             path.unlink(missing_ok=True)
-    return "\n\n".join(f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:\n"
+    return "\n\n".join(f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
+                       + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])) + "\n"
                        + entry["text"].rstrip() for index, entry in enumerate(entries, 1))
 
 
@@ -1038,21 +1286,20 @@ def _matched_recipient(to: str, matches: list[roster.RosterEntry]) -> SessionRec
 
 
 def resolve_recipient(
-    to: str, scope: RecipientResolutionScope = LOCAL_THEN_PEER,
+    to: str, scope: RecipientResolutionScope, observed: roster.Roster,
 ) -> DeliveryRoute:
     """Resolve locally first; a remote row supplies the address sent to its machine."""
     if to.startswith("uds:"):
-        return ClaudeRecipient(to)
+        return socket_recipient(to, sessions.live_sessions(), {})
     if isinstance(scope, NamedMachine):
         return RemoteDelivery(scope.host, to)
     if to.startswith("codex:"):
         thread_id = to.removeprefix("codex:")
         if not thread_id:
             usage_error("codex: needs a thread id")
-    # Acknowledgements, explicit sockets and named-machine sends need no local roster.
     import roster
 
-    result = roster.roster(os.environ, roster.ThisMachine())
+    result = observed
     _print_roster_problems(result.problems)
     matches = _recipient_matches(to, result.entries)
     if matches:
@@ -1115,7 +1362,7 @@ def relay_prompt(message: Message) -> str:
                      + f"then make the call once more with `to` set to the row whose name is exactly "
                      + f"{json.dumps(message.to)}, followed by its [ref]. If no row has that name, stop.")
     lines += ["Then stop: reply with one line, the SendMessage result. Call no other tool.",
-              "----- BEGIN MESSAGE -----", message.text, "----- END MESSAGE -----"]
+              "----- BEGIN MESSAGE -----", agent_text(message), "----- END MESSAGE -----"]
     return "\n".join(lines)
 
 
@@ -1210,13 +1457,14 @@ def relay(message: Message, timeout: float) -> Result:
         if token.returncode != 0:
             return Result("queued", f"gpg-agent is cold on {machine()}: run github-warmup there")
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token.stdout.strip()
+    command = [sys.executable, "-c", RELAY_EXEC, str(STATE / "relay_senders"), message.sender, *command]
     code, out, err = run(command, relay_prompt(message), timeout, env, Path.home())
     raw = STATE / "relay" / f"{file_name(message.to)}.jsonl"
     raw.parent.mkdir(parents=True, exist_ok=True)
     write_atomic(raw, out + err)
     if code is None:
         return Result("queued", f"relay timed out after {timeout:g} s")
-    result = read_relay(out, message.text)
+    result = read_relay(out, agent_text(message))
     if result.outcome == "queued" and code != 0:
         return Result("queued", f"relay exit {code}: {result.detail}; {one_line(err, 200)}")
     return result
@@ -1236,13 +1484,14 @@ def relay_plan(message: Message) -> RelayPlan:
             message.summary,
             message.text,
             message.key,
+            message.shown_sender,
         )
     )
 
 
 def codex(message: Message, session_dir: str, timeout: float) -> Result:
     command = [sys.executable, str(CODEX_MESH), "send", "--session-dir", session_dir, "--to", message.to,
-               "--message", message.text]
+               "--message", agent_text(message)]
     code, out, err = run(command, "", timeout)
     if code == 0:
         return Result("sent", one_line(out) or "queued on the codex thread")
@@ -1255,7 +1504,7 @@ def codex_session(
     recipient: CodexSessionRecipient,
     timeout: float,
 ) -> Result:
-    queued = codex_daemon.queue(recipient.thread_id, message.text, timeout=timeout)
+    queued = codex_daemon.queue(recipient.thread_id, agent_text(message), timeout=timeout)
     if isinstance(queued, codex_daemon.Queued):
         return Result("sent", f"queued on Codex session {recipient.name}")
     if isinstance(queued, codex_daemon.QueueTimedOut):
@@ -1407,6 +1656,8 @@ def remote(message: Message, host: str, options: Options) -> Result:
     """Run this script on host; its own log and queue record the attempt there."""
     forwarded = ["--here", "--to", message.to, "--from", message.sender, "--summary", message.summary,
                  "--timeout", f"{options.timeout:g}"]
+    if message.to != USER:
+        forwarded += ["--forwarded-shown-sender", message.shown_sender]
     if message.key is not None:
         forwarded += ["--key", message.key]
     if message.to == USER:
@@ -1643,6 +1894,7 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--value", action="append", default=[], help="registry template key=value")
     _ = parser.add_argument("--answerable", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--from", dest="sender", help="the sender name the recipient sees")
+    _ = parser.add_argument("--forwarded-shown-sender", help=argparse.SUPPRESS)
     _ = parser.add_argument("--summary", help="SendMessage's short label, default the first line; the title to `user`")
     _ = parser.add_argument("--priority", choices=("0", "1", "2"), help=argparse.SUPPRESS)
     _ = parser.add_argument("--need", choices=list(CHANNEL_PRIORITY), default="note",
@@ -1736,19 +1988,23 @@ def parse(argv: list[str]) -> Options:
         parser.error("--codex and --session-dir go together")
     selection: RecipientSelection = MeshWorker(session_dir, to) if session_dir is not None else RosterLookup(to)
     host = optional_str(attr(args, "machine"))
+    forwarded_sender = optional_str(attr(args, "forwarded_shown_sender"))
+    if forwarded_sender is not None and (attr(args, "here") is not True or not forwarded_sender):
+        parser.error("--forwarded-shown-sender needs --here and nonempty sending-machine display text")
     scope: RecipientResolutionScope = (
         NamedMachine(host) if host is not None else
         LocalOnly() if attr(args, "here") is True else LocalThenPeer()
     )
     get = {name: attr(args, name) for name in Options._fields
-           if name not in {"action", "selection", "scope", "values", "commands"}}
+           if name not in {"action", "selection", "scope", "values", "commands", "shown_sender"}}
     options = Options(selection=selection, sender=optional_str(get["sender"]), summary=optional_str(get["summary"]),
                       key=optional_str(get["key"]), repeat_minutes=optional_float(get["repeat_minutes"]),
                       scope=scope, timeout=optional_float(get["timeout"]) or TIMEOUT,
                       need=cast(Need, get["need"]), action=action, text=optional_str(get["text"]),
                       file=optional_str(get["file"]), answerable=get["answerable"] is True, text_id=text_id, values=tuple(raw_values),
                       commands=tuple(commands), clears_when=optional_str(get["clears_when"]) or "",
-                      self_clearing=get["self_clearing"] is True)
+                      self_clearing=get["self_clearing"] is True,
+                      shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved())
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
     if options.to != USER and options.need != "note":
@@ -1801,11 +2057,35 @@ def body_text(options: Options) -> str:
     return sys.stdin.read()
 
 
+def sender_shown_name(sender: str, observed: roster.Roster) -> str:
+    """Resolve display text without changing sender keys or reply addresses."""
+    import roster
+
+    matches = _recipient_matches(sender, observed.entries)
+    if len(matches) == 1:
+        return roster.shown_name(matches[0]).render()
+    return sender
+
+
+def shown_sender_line(sender: str, display: str) -> str:
+    return f"\nShown sender: {display}" if display != sender else ""
+
+
+def agent_text(message: Message) -> str:
+    """Keep the body preview intact and add the sending machine's display text."""
+    first, separator, rest = message.text.partition("\n")
+    return first + shown_sender_line(message.sender, message.shown_sender) + separator + rest
+
+
 def delivered_text(message: Message, entry_id: str) -> str:
-    return f"Message from {message.sender} via postmaster: {message.summary} [{entry_id[:8]}]\n\n{message.text}"
+    shown = shown_sender_line(message.sender, message.shown_sender)
+    return (f"Message from {message.sender} via postmaster: {message.summary} [{entry_id[:8]}]"
+            + f"{shown}\n\n{message.text}")
 
 
 def send(options: Options) -> Result:
+    import roster
+
     if options.to == USER:
         options = options._replace(timeout=max(options.timeout, review.user_send_seconds()))
     if options.text_id == AUTO_MODE_TEXT:
@@ -1815,6 +2095,12 @@ def send(options: Options) -> Result:
         usage_error("the message is empty")
     first = text.strip().splitlines()[0]
     summary = options.summary or (first if len(first) <= 60 else first[:59] + "…")
+    # A forwarded display is authoritative; only recipient lookup may read the receiver's roster.
+    needs_recipient_roster = (isinstance(options.selection, RosterLookup) and options.to != USER
+                              and not options.to.startswith("uds:") and not isinstance(options.scope, NamedMachine))
+    needs_sender_roster = options.to != USER and isinstance(options.shown_sender, SenderNotResolved)
+    observed = (roster.roster(os.environ, roster.ThisMachine()) if needs_recipient_roster or needs_sender_roster
+                else roster.Roster([], []))
     if isinstance(options.selection, MeshWorker):
         route: DeliveryRoute = (
             RemoteDelivery(options.scope.host, options.to) if isinstance(options.scope, NamedMachine)
@@ -1824,14 +2110,16 @@ def send(options: Options) -> Result:
         route = (RemoteDelivery(options.scope.host, USER) if isinstance(options.scope, NamedMachine)
                  else UserDelivery())
     else:
-        route = resolve_recipient(options.to, options.scope)
+        route = resolve_recipient(options.to, options.scope, observed)
     destination = route.address if isinstance(route, SessionRecipient | RemoteDelivery) else options.to
     sender = options.sender or default_sender()
     if options.to == USER and options.sender is None and sender != "send.py":
         options = options._replace(answerable=True)
     emergency = options.to == USER and options.need == "blocked"
     key = user_emergency_key(sender, summary) if emergency and options.key is None else options.key
-    message = Message(destination, sender, summary, text, key)
+    display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
+               else sender_shown_name(sender, observed) if options.to != USER else sender)
+    message = Message(destination, sender, summary, text, key, display)
     started = now()
     # An emergency push repeats on the phone until the user acknowledges it, it is retired, or it
     # expires: with no --repeat-minutes, a send with its key inside that lifetime is skipped.
@@ -1868,6 +2156,7 @@ def send(options: Options) -> Result:
             message.summary,
             message.text,
             message.key,
+            message.shown_sender,
         )
         result = codex(transport, route.session_dir, options.timeout)
     elif isinstance(route, CodexSessionRecipient):
@@ -1875,10 +2164,14 @@ def send(options: Options) -> Result:
     else:
         claude_started = time.monotonic()
         def relay_and_queue(relay_message: Message, timeout: float) -> Result:
-            relayed_result = relay(relay_message, timeout)
+            relayed_result = relay_socket(relay_message, timeout, sessions.live_sessions(), {})
             if relayed_result.outcome == "queued":
-                enqueue(message, relayed_result.detail, started)
-                if sessions.addressed(message.to, sessions.live_sessions()) is None:
+                recipient = sessions.addressed(message.to, sessions.live_sessions())
+                if message.to.startswith("uds:") and recipient is None:
+                    return Result("failed", f"{relayed_result.detail}; {dead_socket_reason(message.to)}")
+                queued = replace(message, to=f"session:{recipient['sessionId']}") if recipient is not None else message
+                enqueue(queued, relayed_result.detail, started)
+                if recipient is None:
                     return Result("queued", f"{relayed_result.detail}; no live session answers to {message.to},"
                                   + " so it is kept under that name")
             return relayed_result
@@ -1947,6 +2240,15 @@ def main(argv: list[str]) -> int:
             if lines:
                 print("\n".join(lines))
             return code
+        case ["drain-sockets"]:
+            try:
+                code, lines = drain_socket_queues()
+            except (OSError, UnicodeError) as error:
+                print(f"send.py: socket drain failed: {error}", file=sys.stderr)
+                return EXIT["failed"]
+            if lines:
+                print("\n".join(lines))
+            return code
         case ["ack", key]:
             print(acknowledge(key))
         case ["reopen", key]:
@@ -1958,8 +2260,9 @@ def main(argv: list[str]) -> int:
                 usage_error(str(error))
             if text:
                 print(text)
-        case ["ack" | "reopen" | "pending" | "clear-check", *_]:
-            usage_error(f"usage: send.py {argv[0]}" + {"pending": " [NAME]", "clear-check": ""}.get(argv[0], " KEY"))
+        case ["ack" | "reopen" | "pending" | "clear-check" | "drain-sockets", *_]:
+            usage_error(f"usage: send.py {argv[0]}" + {"pending": " [NAME]", "clear-check": "",
+                         "drain-sockets": ""}.get(argv[0], " KEY"))
         case _:
             options = parse(argv)
             if options.to == USER and os.environ.get(PROBE_ENV) == "1":
@@ -1967,6 +2270,8 @@ def main(argv: list[str]) -> int:
                 return 0
             result = send(options)
             print(f"{result.outcome.upper()}: {result.detail}")
+            if result.outcome == "failed" and options.to.startswith("uds:"):
+                print(f"send.py: {result.detail}", file=sys.stderr)
             if isinstance(result.failure, FailedPush):
                 failed = result.failure
                 record: FailedPushTransportRecord = {"title": failed.title,

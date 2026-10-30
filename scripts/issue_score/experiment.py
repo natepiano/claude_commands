@@ -18,7 +18,7 @@ def load_variants(path: Path) -> VariantSets:
     if not isinstance(raw, dict) or not raw:
         raise ValueError("Variant file must map variant-set names to question replacements")
     result: VariantSets = {}
-    known = questions.main_questions() | questions.area_questions([])
+    known = questions.main_questions() | questions.area_questions([], {})
     for variant, replacements in cast(dict[object, object], raw).items():
         if (not isinstance(variant, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", variant)
                 or "__" in variant or variant == "production"):

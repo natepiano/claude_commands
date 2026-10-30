@@ -18,14 +18,17 @@ import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import cast, final, override
+from typing import TextIO, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.lib.socket_test_support import short_socket_directory
 import add_unit
+import production_units
 import dailies_render
 import merge_checkpoint
+from scripts.production import production_doc
 import update_registration
 import waiting
 from cli_fixture import invoke_cli
@@ -221,7 +224,7 @@ class WaitingTests(unittest.TestCase):
 
     def claude(self, name: str, pane: str) -> None:
         """Record a live Claude called `name` in the fixture pane."""
-        path = self.root / f"claude-{pane.removeprefix("w").split(":")[0]}.sock"
+        path = Path(self.enterContext(short_socket_directory())) / f"claude-{pane.removeprefix("w").split(":")[0]}.sock"
         if not path.exists():
             held = socket.socket(socket.AF_UNIX)
             held.bind(str(path))
@@ -293,7 +296,7 @@ class WaitingTests(unittest.TestCase):
     def test_named_unit_refuses_retired_row(self) -> None:
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "(retired by the user)", 1))
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         with self.assertRaisesRegex(waiting.WaitingFailure, f"unknown unit {ALPHA}"):
             _ = waiting.named_unit(production, ALPHA)
 
@@ -310,7 +313,7 @@ class WaitingTests(unittest.TestCase):
         return path
 
     def producer_launch_line(self, moment: datetime, *, session: str = ALPHA) -> str:
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         producer_log = self.root / "launch-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         request = add_unit.UnitLaunch(
@@ -332,7 +335,7 @@ class WaitingTests(unittest.TestCase):
 
     def producer_merge_line(self, moment: datetime, unit_tip: str, merge_tip: str,
                             phase: str = "1") -> str:
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         producer_log = self.root / "merge-producer.log"
         _ = producer_log.unlink(missing_ok=True)
         unit = merge_checkpoint.Unit(ALPHA, self.root / "alpha-plan.md", self.alpha,
@@ -340,7 +343,7 @@ class WaitingTests(unittest.TestCase):
         request = merge_checkpoint.MergeRequest(
             production._replace(log=producer_log), unit, phase, unit_tip, (),
             merge_checkpoint.ShrinkCommit(), merge_checkpoint.ValidateAndPush(),
-            merge_checkpoint.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
+            production_doc.NoPromotion(), (), frozenset(), frozenset(), (unit,), (), self.root,
             (), merge_checkpoint.NoReviewTrial(), "", False, "", "", 0, 0, "",
         )
         with redirect_stdout(io.StringIO()):
@@ -349,7 +352,7 @@ class WaitingTests(unittest.TestCase):
         return f"- {moment:%H:%M %Z}: {produced}"
 
     def producer_state_block(self, moment: datetime, phases: dict[str, str]) -> str:
-        production = add_unit.read_production(self.doc)
+        production = production_units.read_production(self.doc)
         judgments = tuple(update_registration.UnitJudgment(session, phase, "none")
                           for session, phase in phases.items())
         state = update_registration.ShowrunnerState(judgments, (), update_registration.KeepOutstanding())
@@ -549,6 +552,49 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         self.assertIn("src/beta.py:1", result.stdout)
         self.assertIn("src/draft.py:1", result.stdout)
         self.assertIn(BETA, result.stdout)
+
+    def test_eta_request_is_retried_when_output_stops_before_the_seen_mark(self) -> None:
+        arguments = ("eta-request", ALPHA, "--phase", PHASE, "--state-dir", str(self.state))
+        expected = self.run_waiting(*arguments)
+        path = self.state / "eta_seen.json"
+        expected_state = path.read_bytes()
+        path.unlink()
+        real_print = print
+
+        def stop_request(*values: object, sep: str | None = None, end: str | None = "\n",
+                         file: TextIO | None = None, flush: bool = False) -> None:
+            if values and str(values[0]).startswith("request /unit:eta:"):
+                raise RuntimeError("output stopped")
+            real_print(*values, sep=sep, end=end, file=file, flush=flush)
+
+        with mock.patch("builtins.print", side_effect=stop_request), self.assertRaises(RuntimeError):
+            _ = self.run_waiting(*arguments)
+        retried = self.run_waiting(*arguments)
+        self.assertEqual(retried.stdout, expected.stdout)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(path.read_bytes(), expected_state)
+
+    def test_agenda_retries_items_when_output_stops_before_the_seen_mark(self) -> None:
+        start = datetime.now(ZoneInfo("America/Los_Angeles")) - timedelta(hours=9)
+        self.agenda_log(start, PHASE)
+        expected = self.run_waiting("agenda", "--state-dir", str(self.state))
+        path = self.state / "agenda_seen.json"
+        expected_state = path.read_bytes()
+        path.unlink()
+        real_print = print
+
+        def stop_item(*values: object, sep: str | None = None, end: str | None = "\n",
+                         file: TextIO | None = None, flush: bool = False) -> None:
+            if values and str(values[0]).startswith(f"agenda: ok — {ALPHA}|"):
+                raise RuntimeError("output stopped")
+            real_print(*values, sep=sep, end=end, file=file, flush=flush)
+
+        with mock.patch("builtins.print", side_effect=stop_item), self.assertRaises(RuntimeError):
+            _ = self.run_waiting("agenda", "--state-dir", str(self.state))
+        retried = self.run_waiting("agenda", "--state-dir", str(self.state))
+        self.assertEqual(retried.stdout, expected.stdout)
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertEqual(path.read_bytes(), expected_state)
 
     def test_eta_request_records_requested_alone_once_per_phase(self) -> None:
         seen_path = self.state / "eta_seen.json"
@@ -873,7 +919,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
 
         output = io.StringIO()
         with mock.patch.object(waiting, "datetime", AgendaClock), redirect_stdout(output):
-            waiting.agenda(add_unit.read_production(self.doc), self.state)
+            waiting.agenda(production_units.read_production(self.doc), self.state)
         self.assertIn("agenda: ok — 0 new items", output.getvalue())
         self.assertFalse((self.state / "agenda_seen.json").exists())
 
@@ -904,7 +950,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         output = io.StringIO()
         clock = mock.Mock(wraps=datetime, now=mock.Mock(return_value=now))
         with mock.patch.dict(os.environ, self.env), mock.patch.object(waiting, "datetime", clock), redirect_stdout(output):
-            waiting.waits(add_unit.read_production(self.doc))
+            waiting.waits(production_units.read_production(self.doc))
         found = re.search(r"open (\d+) minutes", output.getvalue())
         self.assertIsNotNone(found, output.getvalue())
         age = int(found.group(1)) if found else 0

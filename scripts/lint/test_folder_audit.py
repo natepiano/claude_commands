@@ -6,16 +6,21 @@ the tmp sweep owns empty temp folders."""
 from __future__ import annotations
 
 import os
-import shutil
 import socket
 import subprocess
-import tempfile
 import time
 import unittest
+from collections.abc import Generator, Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import override
+from typing import TYPE_CHECKING, cast, override
 
 import unittest.mock
+
+if TYPE_CHECKING:
+    from ..lib.socket_test_support import short_socket_directory
+else:
+    from scripts.lib.socket_test_support import short_socket_directory
 
 import folder_audit
 import scratch
@@ -57,18 +62,90 @@ class FolderAuditTests(unittest.TestCase):
     root: Path = Path()
     rust: Path = Path()
     temp: Path = Path()
+    recorded_ctimes: dict[str, float] = {}
 
     @override
     def setUp(self) -> None:
-        self.root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.root)
+        self.root = Path(self.enterContext(short_socket_directory()))
         self.rust = self.root / "rust"
         self.temp = self.root / "tmp"
         self.rust.mkdir()
         self.temp.mkdir()
+        self.recorded_ctimes = {}
+        scan = os.scandir
+
+        @contextmanager
+        def recorded_scan(path: str | int | os.PathLike[str]) -> Generator[Iterator[os.DirEntry[str]]]:
+            with scan(path) as entries:
+                if isinstance(path, int):
+                    yield entries
+                    return
+                recorded: list[os.DirEntry[str]] = []
+                for entry in entries:
+                    info = entry.stat(follow_symlinks=False)
+                    fields = list(info)
+                    fields[9] = self.recorded_ctimes.get(entry.path, info.st_mtime)
+                    fake = unittest.mock.Mock(wraps=entry)
+                    fake.configure_mock(**{"stat.return_value": os.stat_result(fields, {"st_blocks": info.st_blocks})})
+                    fake.name = entry.name
+                    fake.path = entry.path
+                    recorded.append(cast(os.DirEntry[str], fake))
+                yield iter(recorded)
+
+        _ = self.enterContext(unittest.mock.patch.object(os, "scandir", side_effect=recorded_scan))
         state = self.root / "state"
         self.enterContext(unittest.mock.patch.dict(os.environ, {"FOLDER_SWEEP_STATE_DIR": str(state),
                                                                 "SCRATCH_HOLDS": str(state / "holds.json")}))
+
+    def test_copied_folder_needs_seven_days_since_its_last_metadata_change(self) -> None:
+        now = time.time()
+        proc = self.root / "proc"
+        proc.mkdir()
+        copied = folder(self.temp / "copied-backup", 8)
+        old = folder(self.temp / "old-backup", 8)
+        self.recorded_ctimes[str(copied / "file")] = now - 5 * 3600
+        self.recorded_ctimes[str(old / "file")] = now - 8 * DAY
+        found = folder_audit.audit(self.rust, [self.temp], frozenset[str](), now, files=[],
+                                   removing=True, proc=str(proc), sockets=str(self.root / "unix"))
+        self.assertTrue(copied.is_dir())
+        self.assertFalse(old.exists())
+        self.assertIn((old, folder_audit.REMOVED), [(entry.path, entry.outcome) for entry in found])
+
+    def test_process_uses_distinguishes_known_empty_from_unavailable(self) -> None:
+        proc = self.root / "proc"
+        proc.mkdir()
+        candidate = self.temp / "candidate"
+        for paths in ([], [candidate]):
+            with self.subTest(paths=paths):
+                with unittest.mock.patch.object(tmp_sweep, "lsof_paths", side_effect=AssertionError("unexpected fallback")):
+                    known = folder_audit.process_uses(paths, str(proc))
+                self.assertIsInstance(known, tmp_sweep.ProcessUsesKnown)
+                assert isinstance(known, tmp_sweep.ProcessUsesKnown)
+                self.assertEqual(known.paths, [])
+        with unittest.mock.patch.object(tmp_sweep, "LSOF", (str(self.root / "no-lsof"),)):
+            unavailable = folder_audit.process_uses([candidate], str(self.root / "no-proc"))
+        self.assertIsInstance(unavailable, tmp_sweep.ProcessUsesUnavailable)
+
+    def test_unavailable_process_uses_keeps_due_folders(self) -> None:
+        candidate = folder(self.temp / "candidate", 8)
+        now = time.time()
+        with (unittest.mock.patch.object(tmp_sweep, "LSOF", (str(self.root / "no-lsof"),)),
+              unittest.mock.patch.object(folder_audit, "remove", side_effect=AssertionError("removed without a process scan"))):
+            outcomes = folder_audit.judge([(candidate, now - 8 * DAY)], now, True,
+                                         proc=str(self.root / "no-proc"), sockets=str(self.root / "no-sockets"))
+        self.assertEqual(outcomes[candidate], tmp_sweep.NO_PROC)
+        self.assertTrue(candidate.exists())
+
+    def test_lsof_fallback_keeps_used_folders_and_judges_unused_folders(self) -> None:
+        used = folder(self.temp / "used", 8)
+        idle = folder(self.temp / "idle", 8)
+        now = time.time()
+        output = f"p42\nfcwd\nn{used}\n"
+        completed = subprocess.CompletedProcess(tmp_sweep.LSOF, 1, output, "")
+        with unittest.mock.patch.object(subprocess, "run", return_value=completed):
+            outcomes = folder_audit.judge([(used, now - 8 * DAY), (idle, now - 8 * DAY)], now, False,
+                                         proc=str(self.root / "no-proc"), sockets=str(self.root / "no-sockets"))
+        self.assertEqual(outcomes, {used: "pid 42 works in it", idle: folder_audit.WOULD_REMOVE})
 
     def test_the_roots_file_ignores_comments_and_blank_lines(self) -> None:
         roots = self.root / "rust_roots.txt"

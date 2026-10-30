@@ -17,30 +17,7 @@ $ARGUMENTS contains: `<project-shorthand> <issue title on first line>\n<optional
 
 ## Project mapping
 
-Look up the project shorthand from the base files in the vault's home-base/ folder (`~/rust/hanadocs/home-base/issues - <short>.base`). The mapping is:
-
-| Shorthand | Project link | Base file |
-|-----------|-------------|-----------|
-| bei | bevy_enhanced_input | issues - bei.base |
-| biz | biz | issues - biz.base |
-| brp | bevy_brp_mcp | issues - brp.base |
-| bwm | bevy_window_manager | issues - bwm.base |
-| cargo-berth | cargo-berth | issues - cargo-berth.base |
-| cargo-liner | cargo-liner | issues - cargo-liner.base |
-| cargo-mend | cargo-mend | issues - cargo-mend.base |
-| cargo-port | cargo-port | issues - cargo-port.base |
-| conduit | hana_conduit | issues - conduit.base |
-| diegetic | hana_diegetic | issues - diegetic.base |
-| fairy_dust | fairy_dust | issues - fairy_dust.base |
-| hana | hana | issues - hana.base |
-| lading | hana_lading | issues - lading.base |
-| lagrange | bevy_lagrange | issues - lagrange.base |
-| liminal | hana_liminal | issues - liminal.base |
-| nateroids | nateroids | issues - nateroids.base |
-| panorbit | bevy_panorbit_camera | issues - panorbit.base |
-| rust-template | rust-template | issues - rust-template.base |
-
-If the shorthand doesn't match any of these, tell the user and stop.
+Read the canonical project from `~/rust/hanadocs/home-base/issues - <short>.base` (`vault.load_project_names()` in `scripts/issue_score/vault.py`). These base files are the only shorthand source. If the base file is missing, tell the user and stop.
 
 ## Process
 
@@ -52,7 +29,9 @@ If the shorthand doesn't match any of these, tell the user and stop.
 
 4. Before creating the file, propose the metadata in one reply, combined with step 3's filename choice when the title is too long. The user confirms or changes it in their reply; write the file only after that. Never ask field by field, and never through a form.
 
-   - **Area**: freeform (e.g. cursor, networking, ui, rendering, animation, testing, tooling), or "unfiled".
+   Run `with-typesafe ~/.claude/scripts/lib/py ~/.claude/scripts/issue_score/score_issues.py propose --project <short> --title <title>`; when there is body content, save it to a temporary UTF-8 file and add `--body-file <path>`. Quote each argument. The first output line has one top value per field; the separate `Alternatives:` line holds unsure choices. Use the returned values for the fields in `~/.claude/scripts/issue_score/questions.py`'s `JEV_FIELDS`; propose the fields marked `(agent proposes)` using the rubric below. Keep the flags and show the unsure Jev alternatives so the user picks in the same reply. When goal is unsure, keep each candidate's alignment and use the alignment belonging to the goal the user picks. On exit 2, say the call failed and propose every field using the rubric below.
+
+   - **Area**: one area from the `area` column of `~/rust/hanadocs/conf/issue-areas.md`, or "unfiled"; when `area` is in `JEV_FIELDS`, use the `propose` value as the proposal.
    - **Category**: one of bug, feature, enhancement, docs, example, refactor, idea, research, business, or "unfiled".
    - **Ranking (required — every new issue is fully rated at creation).** All five values in one plain-text line, each with the value you propose from the definitions below (urgency defaults to one star), for example `goal 1 - Ship Hana · alignment ⭐⭐⭐ · impact ⭐⭐⭐ · urgency ⭐ · effort ⭐⭐`. Store `backlog_goal` as a scalar (e.g. `1 - Ship Hana`) and each rating as a double-quoted YAML text scalar of one-to-five `⭐` characters. Do NOT collect or write `backlog_score` / `backlog_rank`; the vault's background watcher computes those from these inputs.
    - **Dependencies (optional).** The existing open issues, if any, you propose must rank ahead of this issue. Record each as a wikilink in `depends_on`; use `[]` when there are none. Before creating the issue, resolve every supplied wikilink to an issue file. Closed targets are satisfied and are ignored by ranking. An unresolved link, duplicate target, self-reference, or open dependency missing prioritization metadata is invalid; a dependency cycle prevents ranking.
@@ -91,7 +70,7 @@ If the shorthand doesn't match any of these, tell the user and stop.
      - `⭐⭐⭐⭐` — L: broad work requiring substantial coordination or integration
      - `⭐⭐⭐⭐⭐` — XL: a multi-phase initiative or epic, likely a decomposition candidate
 
-   A proposal filed from a session with no user in it, such as a unit's, leaves the five ranking fields empty and puts its proposed values on a `Proposed ranking:` line at the top of the body; they are written when the user confirms them on review (`/showrunner:proposal`).
+   A proposal filed from a session with no user in it, such as a unit's, leaves the five ranking fields empty and puts the single-valued first line on a `Proposed ranking:` line at the top of the body, with unsure alternatives on a separate `Alternatives:` line. Never put alternative values on `Proposed ranking:`. The fields are written when the user confirms them on review (`/showrunner:proposal`).
 
 5. Read the template at `~/rust/hanadocs/.claude/templates/issue.yaml` and fill in:
    - `{{PROJECT}}` — the full project link name
