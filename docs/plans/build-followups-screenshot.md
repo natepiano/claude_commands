@@ -39,7 +39,7 @@ The user, via natedev, 2026-10-06 13:1x PDT: "create a long running unit directo
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan builds the screenshot episode report (Phase 1), counts screenshot scripts run in later calls (Phase 2), records every `/hana_shot` call with failures and the kept shot (Phase 3), runs the report hourly with each change's effect (Phase 4), brings the Mac's transcripts up to date in a few hourly runs and fixes two report types (Phase 5), then proposes improvements (Phase 6). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-screenshot` on branch `build-followups-screenshot` (unit `screenshot-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan builds the screenshot episode report (Phase 1), counts screenshot scripts run in later calls (Phase 2), records every `/hana_shot` call with failures and the kept shot (Phase 3), runs the report hourly with each change's effect (Phase 4), brings the Mac's transcripts up to date in a few hourly runs and fixes two report types (Phase 5), then proposes improvements (Phase 6). Work in the worktree `/home/natepiano/worktrees/claude-natedev-screenshot` on branch `natedev-screenshot` (unit `screenshot-unit` of production `natedev`).
 - **Project started:** 2026-10-06T20:30:00+00:00
 - **Stack:** Python 3.13, standard library only.
 - **Layout:**
@@ -525,3 +525,23 @@ Unpriced (below every priced one):
 - A test that patches `port_answers` while a fake server listens does not prove relaunch; close the fake listener instead.
 
 **Ruled out:** `LaunchState | None` plus a reason as the reader result (a three-state union instead); deleting temp records without reading them first (it can destroy the only pid record); killing a process group that no whole record identifies.
+
+### Phase 15 — The screenshot report's transcript tests pass in any temp folder · status: done
+
+#### As-built
+
+- `scan_calls(..., scratchpad_roots: tuple[Path, ...] = DEFAULT_SCRATCHPAD_ROOTS)`, with `DEFAULT_SCRATCHPAD_ROOTS = (Path("/tmp"), Path("/private/tmp"))`, the parents of Claude's per-user temp folders. `shot_report.py` uses the default. Only `scan_calls` has a default: `_project`, `_claude_calls` and `_codex_calls` take `scratchpad_roots` as a required keyword-only argument, and the cached scan path passes it through.
+- `_scratchpad_project(cwd, known_cwds, scratchpad_roots)` decodes a cwd only when it is under a root as `<root>/claude-<name>/<encoded project>/…/scratchpad…`. Part 0 starts with `claude-` and has a name after it, part 1 starts with `-`, and `scratchpad` comes after part 1. A cwd outside every root goes to the git lookup.
+- `_repository_project(cwd) -> tuple[str, ProjectAttribution]` is the one git lookup (`repository` or `last_path`). `_project` calls it for a cwd that is not a scratchpad. A decoded scratchpad target also goes to it, so a target is never decoded a second time.
+- `CachedScanEvidence` has a `scratchpad_roots` field. `_load_cache` rebuilds the cache when the saved roots differ. A saved cache with no field counts as `DEFAULT_SCRATCHPAD_ROOTS` and is reused. `CACHE_FORMAT_VERSION` stays 7. Record fields, report text and `ProjectAttribution` members do not change.
+
+**Files:**
+- `scripts/shot_report/transcripts.py` — root-bound scratchpad decode, the shared git lookup, scratchpad roots in the cache identity.
+- `scripts/shot_report/test_transcripts.py` — scratchpad fixtures under each test's own temp root with explicit roots; `_claude_encoded` names; the `_project_cases` helper; tests for a repository under a scratchpad-shaped folder outside the roots, a nested scratchpad decode, a roots change on a warm cache and a saved cache without the field.
+
+**Binds later work:** live attribution is the same before and after this change (28,112 calls), so it has no `changes.json` entry and no report measurement.
+
+**Gotchas:**
+- A test that builds a scratchpad cwd puts it under its own temp root and passes that root as `scratchpad_roots`. Never encode a Claude project path by hand: use `_claude_encoded` (every non-alphanumeric character becomes `-`).
+
+**Ruled out:** matching a `claude-*` segment anywhere in the cwd (a fixture under a scratchpad `TMPDIR` decoded to the live repository); a second scratchpad decode of a decoded target; forcing a re-parse of saved caches that lack the roots field.
