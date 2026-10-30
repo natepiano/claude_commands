@@ -342,16 +342,11 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         identity = read_object(identity_path)
         slot = text(identity.get("slot")) or dispatch.worker
         model = text(identity.get("model")) or text(record.get("model")) or dispatch.model
-        effort = text(record.get("effort")) or dispatch.effort
         expected = {"name": dispatch.worker, "slot": slot, "family": dispatch.family,
                     "model": model, "worker_id": record.get("thread_id")}
         _ = identity.pop("role", None)
         if (identity and identity != expected) or not record.get("thread_id"):
             refuse(f"{dispatch.worker} has no matching durable worker identity for slot {slot}")
-        if (args.model and model != dispatch.model
-                or (args.effort or ":" in args.model) and effort != dispatch.effort):
-            refuse(f"{dispatch.worker}: requested {dispatch.model}:{dispatch.effort}, "
-                   + f"worker identity is {model}:{effort}")
         if not identity:
             _ = identity_path.write_text(json.dumps(expected))
         claim_path = dispatch.run / f"impl_claim_{slot}.json"
@@ -403,7 +398,8 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
             _ = dispatch.mesh_call("reopen", capture=True)
         dispatch.claim_follow()
         _ = claim_path.write_text(json.dumps({"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}))
-        return WorkerClaim(identity_path, slot, model, effort)
+        # Each turn runs at the caller's model:effort (agents.conf default or explicit override).
+        return WorkerClaim(identity_path, slot, dispatch.model, dispatch.effort)
 
 
 def stage_two_submitted(receipts: Path, message: str) -> bool:

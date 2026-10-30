@@ -301,7 +301,8 @@ with worker_claim_lock(root):
         # A worker recorded under another slot stays refused by this comparison.
         if identity != expected:
             fail(f"{name} has no matching durable worker identity for slot {slot}")
-        print(expected["model"])
+        # The identity check keeps the stored model; each turn runs at the current default.
+        print(model)
         status_path = root / f"impl_status_{slot}"
         claim = read(claim_file)
         pid = claim.get("pid", 0)
