@@ -20,6 +20,10 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 
 **Production lifecycle tests.** `test_production_lifecycle.py` restores a private Git origin, checkout and tool seed at the same paths for each test. `production_lifecycle_test_support.py` invokes the real lifecycle CLI in-process with its environment, working directory and import-time state restored for each call. Git pushes, rejection hooks, linked worktrees and external commands still run as real processes; a CLI parity case compares subprocess status and output. No production behavior, timing bound or original assertion is replaced.
 
+**Offload cleanup tests.** `test_offload_cleanup.py` keeps the real sh/zsh cleanup and selector protocols; the results, leftovers and takeover modules cover the command outcomes. `offload_cleanup_test_support.py` copies a private Git and tool seed at the original paths for each case and creates fresh FIFO descriptors. Ordinary calls reuse the existing in-process CLI helper; claim-owner exit, streaming and timeout cases retain real subprocesses and the two-second timeout assertion.
+
+**Merge gate suite tests.** `test_merge_gate_suites.py` covers discovery, isolation and reporting; the resources, tripwires, reruns, types, signals and admission modules keep each subject independently runnable. `merge_gate_suites_test_support.py` reuses the committed class seed and private copies, launches Python directly for real module jobs, and uses directory events and process descriptors for fixture barriers and cleanup. Admission arithmetic needs no Git fixture. Signal, process-group, memory-growth and timeout contracts retain real children; the controlled timeout clock and memory-growth pacing are unchanged.
+
 ## How it works
 
 ### The gate: `scripts/production/merge_gate.py`
@@ -264,4 +268,17 @@ Lint cache checks run by subject in `test_verify_lint_cache.py` (fixed and forma
 
 Usage collector tests use `collect_test_support.py`, which builds one source fixture per class and restores private copies at the same paths per test. `test_collect.py` covers local collection; the Mac reader, role evidence, stream recovery and process lifetime checks run in `test_collect_mac.py`, `test_collect_mac_roles.py`, `test_collect_mac_recovery.py` and `test_collect_processes.py`. Ordinary CLI calls and their empty watcher fixture run in-process; explicit watcher handoff, durability tracing, pass-lock children, fake SSH and the real remote reader retain their process boundaries. Socket readiness and release events replace the Mac lock test’s marker polling. A pipe signals when the local record iterator resumes after processing attribution; the fake SSH then checks the committed role snapshot through its own SQLite connection. Existing assertions and timing bounds remain; 300-second deadlines only guard hangs.
 
+`test_verify_tree_cancel.py` keeps source and external-document coverage; lint,
+progress-history, token reacquisition and Mac cancellation live in
+`test_verify_tree_cancel_{lint,history,reacquire,mac}.py`.
+`verify_tree_cancel_test_support.py` seeds the full Git workspace once per class
+and restores private copies at the same absolute path. The real verifier,
+watcher, Git edits, process descendants, cancellation signals and original
+completion bounds stay in use. Fake lint rewrites wait for parent acknowledgments,
+which also check that judgment watching has not begun; memory transitions use
+file events. Simple tool replies use shell builtins, and session cleanup reuses
+the token ownership fixture's process metadata observer.
+
 Lint repair ordering runs in `test_verify_lint_fixes.py` (successive fixes before judgment, with cache off and on) and `test_verify_lint_fix_failures.py` (formatting after failed repair and preservation of the final judgment status). Both reuse the committed lint-scope fixture, which builds once per class and restores private copies at the same paths. The convergence test inherits `VerifyLintCacheFixture`, enabling pass records through `UNIT_RUN_DIR` without an unrelated director token or progress window. Real Bash verification, source hashing, fake Cargo/Taplo/Git processes and every original assertion remain. There are no fixture sleeps or polling intervals; the existing 300-second deadline only guards hangs.
+
+Tree watcher scope coverage remains in `scripts/direct/test_tree_watch.py`, with `tree_watch_test_support.py` owning one Git fixture seed per class, including the two nested Cargo workspace layouts, and private copies restored at the same paths per test. Key CLI calls run in-process; scope tests run the real watcher loop with an event-controlled sleep, completing explicit snapshot iterations instead of waiting through fixed intervals. All Git snapshots and file publication stay real, and the parent-exit test keeps a real watcher process. Negative checks require two completed observations and a live watcher, followed by the original positive-change proof; the original 2.5-second change and parent-exit bounds remain. Only non-speed setup and cleanup waits use the named 300-second hang guard.
