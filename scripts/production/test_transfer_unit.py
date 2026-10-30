@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import tempfile
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 from typing import cast, final
 from unittest import mock
 
@@ -14,12 +17,62 @@ from scripts.direct import workers
 from scripts.production.transfer_unit_test_support import (
     UnitTransferFixture, SCRIPT, TEST_HANG_GUARD_SECS,
 )
+import transfer_unit
+from rename_state import write_text
 import fake_showrunner
 import fake_unit_host
 
 
 @final
 class UnitTransferTests(UnitTransferFixture):
+    def test_rerun_finishes_each_uncommitted_document_write(self) -> None:
+        snapshot = Path(self.enterContext(tempfile.TemporaryDirectory())) / "before"
+        _ = shutil.copytree(self.root, snapshot)
+        self.assert_ok(self.transfer("apply"))
+        checkouts = (self.giving, self.receiving, self.unit)
+        expected_trees = [self.git("rev-parse", "HEAD^{tree}", cwd=path) for path in checkouts]
+        documents = (self.receiving / "docs/plans/other-production.md",
+                     self.giving / "docs/plans/demo-production.md")
+        expected_docs = [path.read_text() for path in documents]
+        for document in documents:
+            with self.subTest(document=document.name):
+                shutil.rmtree(self.root)
+                _ = shutil.copytree(snapshot, self.root)
+
+                def stop_after_write(path: Path, text: str) -> None:
+                    write_text(path, text)
+                    if path == document:
+                        raise OSError("fixture stop after document write")
+
+                with mock.patch.object(transfer_unit, "write_text", wraps=stop_after_write) as writes:
+                    self.assert_refused(self.transfer("apply"), "fixture stop after document write")
+                self.assertEqual(sum(call.args[0] == document for call in writes.call_args_list), 1)
+                self.assertNotEqual(self.git("status", "--porcelain", "--", str(document),
+                                             cwd=document.parents[2]), "")
+                # Recovery must not absorb an unrelated worktree or index edit.
+                expected = document.read_text()
+                head = self.git("rev-parse", "HEAD", cwd=document.parents[2])
+                self.write(document, expected + "unrelated edit\n")
+                self.assert_refused(self.transfer("apply"), f"{document} has uncommitted changes")
+                _ = self.git("add", str(document), cwd=document.parents[2])
+                self.write(document, expected)
+                self.assert_refused(self.transfer("apply"), f"{document} has uncommitted changes")
+                self.assertEqual(self.git("rev-parse", "HEAD", cwd=document.parents[2]), head)
+                self.assertIn("unrelated edit", self.git("diff", "--cached", cwd=document.parents[2]))
+                _ = self.git("reset", "HEAD", "--", str(document), cwd=document.parents[2])
+                if document == documents[0]:
+                    # A failed commit may already have staged the intended edit.
+                    _ = self.git("add", str(document), cwd=document.parents[2])
+                self.assert_transfer_resumed(self.root / "state/showrunner/demo/transfer_unit.json")
+                self.assertEqual([self.git("rev-parse", "HEAD^{tree}", cwd=path) for path in checkouts],
+                                 expected_trees)
+                self.assertEqual([path.read_text() for path in documents], expected_docs)
+                for checkout in checkouts:
+                    self.assertEqual(self.git("status", "--porcelain", cwd=checkout), "")
+                tips = [self.git("rev-parse", "HEAD", cwd=path) for path in checkouts]
+                self.assert_ok(self.transfer("verify"))
+                self.assertEqual([self.git("rev-parse", "HEAD", cwd=path) for path in checkouts], tips)
+
     def test_verify_ignores_leftover_process_marks(self) -> None:
         self.moved_unit_with_leftover_marks()
         self.assert_ok(self.transfer("verify"))

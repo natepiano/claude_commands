@@ -1652,6 +1652,22 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
                 if isinstance(result.reservation, gate.Reserved):
                     gate.release(result.reservation.path, 0, self.root)
 
+    def test_missing_near_peak_record_uses_peak_publication_time(self) -> None:
+        for age, expected_charge, expected_state in ((0, 13, "hold"), (1499, 13, "hold"), (1500, 2, "admit")):
+            with self.subTest(age=age):
+                self.readings_for()
+                reservation = self.running(100, 12)
+                maximum = reservation.with_suffix(".max")
+                _ = maximum.write_text(str(13 * GIB))
+                published_at = NOW.timestamp() - age
+                os.utime(maximum, (published_at, published_at))
+                self.readings[100] = gate.MeasuredMemory(2 * GIB)
+                result = self.admit_at()
+                self.assertEqual((result.decision.state, result.decision.charged),
+                                 (expected_state, expected_charge * GIB))
+                if isinstance(result.reservation, gate.Reserved):
+                    gate.release(result.reservation.path, 0, self.root)
+
     def test_recent_near_peak_use_renews_an_old_peak_charge(self) -> None:
         self.readings_for()
         reservation = self.running(100, 12, age=4000)
@@ -1667,6 +1683,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         self.readings_for()
         reservation = self.running(100, 12)
         _ = reservation.with_suffix(".max").write_text(str(13 * GIB))
+        os.utime(reservation.with_suffix(".max"), (NOW.timestamp(), NOW.timestamp()))
         near_peak = reservation.with_suffix(".wave")
         self.readings[100] = gate.MeasuredMemory(2 * GIB)
         for contents in (None, "", "bad", "-1", str(int(NOW.timestamp()) - 2000),

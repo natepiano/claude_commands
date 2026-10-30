@@ -992,12 +992,22 @@ def reservation_memory(path: Path, row: Reservation, now: datetime,
         if isinstance(reading, MeasuredMemory):
             return replace(reading, unknown_peak_promise=row["need"])
         return reading
+    last_near_peak_at = now.timestamp()  # Unknown times retain the peak charge.
     try:
-        near_peak_bytes, last_near_peak_at = map(int, path.with_suffix(".wave").read_text().split())
-        if near_peak_bytes == peak and last_near_peak_at >= 0 and now.timestamp() - last_near_peak_at >= PEAK_DECAY_SECONDS:
-            peak = 0
+        near_peak_bytes, recorded_at = map(int, path.with_suffix(".wave").read_text().split())
+        if near_peak_bytes == peak and recorded_at >= 0:
+            last_near_peak_at = recorded_at
+    except FileNotFoundError:
+        # Samplers from before patch B write no .wave; use the last peak publication.
+        if peak > 0:
+            try:
+                last_near_peak_at = path.with_suffix(".max").stat().st_mtime
+            except OSError:
+                pass
     except (OSError, ValueError):
-        pass  # Old samplers and unknown times retain the peak charge.
+        pass
+    if now.timestamp() - last_near_peak_at >= PEAK_DECAY_SECONDS:
+        peak = 0
     if isinstance(reading, MeasuredMemory):
         return replace(reading, observed_peak=peak)
     if isinstance(reading, PromisedMemory):
