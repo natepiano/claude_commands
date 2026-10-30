@@ -408,7 +408,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Ruled out:** answer replay across a rename in this plan — rare, and the refusal is safe; it is a next item.
 
-### Phase 15 — The push audit report and the full baseline measure read on a phone  · status: todo
+### Phase 15 — The push audit report and the full baseline measure read on a phone  · status: done
 **Depends on:** Phase 13 (done; it changed `measure.py`). Its files do not overlap Phase 14's, so the two can run in either order. It runs before Phase 6, which prints `compare` in the same form.
 
 #### Work Order
