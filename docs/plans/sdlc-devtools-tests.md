@@ -60,68 +60,72 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
 ### Phase 2 — Every test uses the one hang guard  · status: done
 **Depends on:** Phase 1; models' dc80ee4c (`scripts/lib/test_hang_guard.py`, `scripts/agents` on it), on origin/sdlc and merged here at d721ac43
 
-#### Work Order
+#### As-built
 
-**Goal:** every test that needs a hang guard imports the one guard from `scripts/lib/test_hang_guard.py`; a short real-time wait for an expected event uses that guard; and a test refuses a new local copy.
-
-**Spec:**
-- Source: the sdlc showrunner, 2026-10-30. Short real-time limits fail under load; that caused the `agents/test_codex_mesh.py` red in Phase 1's gate.
-- The one place: `scripts/lib/test_hang_guard.py` (`TEST_HANG_GUARD_SECS = 600`, `LauncherHangGuard`). Its value and behavior do not change. Import it as `scripts/agents/test_heartbeat.py:16` (`from scripts.lib.test_hang_guard import LauncherHangGuard`) and `scripts/direct/recorder_fixture.py:5` (`from scripts.lib import test_hang_guard`) do.
-- **Copies.** 104 files assign `TEST_HANG_GUARD_SECS` themselves (103 at 300 s): `grep -rlE '^\s*TEST_HANG_GUARD_SECS\s*[:=]' scripts --include='*.py'`, without `scripts/lib/test_hang_guard.py`. Each deletes its assignment and imports the name. A file that takes the name from a sibling support module (`test_verify_hold_mac.py`, `test_verify_hold_events.py`, `usage/test_collect.py` and others) imports it from `scripts.lib.test_hang_guard` directly; no support module passes it on. The fixture script text in `scripts/production/merge_gate_test_support.py` (lines 40 and 101, written into a fixture repo with no `scripts.lib`) keeps its `__TEST_HANG_GUARD_SECS__` placeholder; the value put in comes from the imported name.
-- The copies were 300 s and the guard is 600 s. A test that asserts on the 300 value, or uses it as a pass or fail limit, is not changed: report it.
-- **Short waits.** A literal timeout under 120 s on a wait for something the test expects to happen (`Event.wait`, `Thread.join`, `Future.result`, `Queue.get`, `subprocess` `timeout=`, `communicate`, `wait_until`) becomes the guard: `timeout=TEST_HANG_GUARD_SECS` or a `LauncherHangGuard`. Keep a wait that proves something does not happen in a window, a sleep that is the behavior under test, and a timeout given to product code as its own setting. Do not change an assertion on elapsed wall time: list each with `path:line` in the summary. The stub named a shared `LifecycleTestClock` for those, but it lives only in `scripts/agents/test_codex_mesh.py` and retires with the mesh, so a shared test clock is follow-up work. An AST count on d721ac43 found 176 literal waits under 120 s in 75 test files.
-- **Out of scope.** `scripts/agents/` (models moved it in dc80ee4c). Code held for a user decision (sdlc showrunner, 2026-10-30: a natedev proposal may delete it): `scripts/shutdown/` and the tests of `transfer_unit`, `rename`, `rename_unit` and `lib/relaunch`. Their four copies (`production/transfer_unit_test_support.py`, `production/rename_test_support.py`, `production/rename_unit_test_support.py`, `lib/test_relaunch.py`) get only the import change; no other edit goes in held code.
-- `scripts/production/test_merge_gate_suites_resources.py` keeps its CPU workloads, which burn real CPU and sleep in real time so `os.wait4` can tell them apart, and their assertions; only its hang guard moves.
-- **The check.** New `scripts/lib/test_one_hang_guard.py` parses every `scripts/**/*.py`. It refuses (1) an assignment to `TEST_HANG_GUARD_SECS` (plain or annotated, at any level) outside `scripts/lib/test_hang_guard.py`, and (2) an import of `TEST_HANG_GUARD_SECS` or `LauncherHangGuard` from any module but `scripts.lib.test_hang_guard`. Each refusal names `path:line` and says "import it from scripts/lib/test_hang_guard.py". Text in a string is not code, so fixture script text passes. A second test runs the same check on a temporary tree with one copy and expects that refusal. The merge gate finds the module itself (Phase 1).
-- `docs/as-built/merge-gate-and-test-speed.md`: each "300-second hang guard" names the one 600-second guard in `scripts/lib/test_hang_guard.py`.
+- Every test module and test support module imports its hang limit from `scripts/lib/test_hang_guard.py` (`TEST_HANG_GUARD_SECS = 600`, `LauncherHangGuard`). No local copy or alias stays, `HANG_GUARD_S` included. The change spans every `scripts/` folder except `scripts/agents/`, which already used the guard.
+- `scripts/lib/test_one_hang_guard.py` parses every `scripts/**/*.py`. It refuses an assignment to `TEST_HANG_GUARD_SECS` outside the guard module, a module-level alias, and an import of either name from any other module. Each refusal names `path:line`. A second test runs the check on a temporary tree with one copy and expects the refusal.
+- A literal timeout under 120 s on a wait for an expected event now uses the guard, because short real-time limits fail under load. A wait that proves an event does not occur in a window stays. A sleep that is the behavior under test stays. A timeout given to product code as its own setting stays.
+- The fixture script text in `scripts/production/merge_gate_test_support.py` keeps its `__TEST_HANG_GUARD_SECS__` placeholder, because the fixture repo has no `scripts.lib`. The value put in comes from the imported name. Text in a string is not code, so the check passes it.
 
 **Files:**
-- `scripts/lib/test_one_hang_guard.py` — new: the copy check
-- `scripts/direct/` — its copies and short waits (the copy grep and the short-wait rule above pick the files)
-- `scripts/accounts/` — its copies and short waits
-- `scripts/astra/` — its copies and short waits
-- `scripts/bevy_migration_plan/` — its copies and short waits
-- `scripts/bevy_upgrade/` — its copies and short waits
-- `scripts/build_hold/` — its copies and short waits
-- `scripts/build_queue/` — its copies and short waits
-- `scripts/build_targets/` — its copies and short waits
-- `scripts/buildlog/` — its copies and short waits
-- `scripts/feature_log/` — its copies and short waits
-- `scripts/hana_shot/` — its copies and short waits
-- `scripts/herdr/` — its copies and short waits
-- `scripts/hierarchies/` — its copies and short waits
-- `scripts/history/` — its copies and short waits
-- `scripts/hooks/` — its copies and short waits
-- `scripts/issue_score/` — its copies and short waits
-- `scripts/lib/` — its copies and short waits
-- `scripts/lint/` — its copies and short waits
-- `scripts/mac_test/` — its copies and short waits
-- `scripts/message/` — its copies and short waits
-- `scripts/nightly_review/` — its copies and short waits
-- `scripts/notify/` — its copies and short waits
-- `scripts/prioritize/` — its copies and short waits
-- `scripts/production/` — its copies and short waits
-- `scripts/review_links/` — its copies and short waits
-- `scripts/settings/` — its copies and short waits
-- `scripts/shot_report/` — its copies and short waits
-- `scripts/style/` — its copies and short waits
-- `scripts/usage/` — its copies and short waits
-- `scripts/whoami/` — its copies and short waits
-- `docs/as-built/merge-gate-and-test-speed.md` — the guard's value and place
+- `scripts/lib/test_one_hang_guard.py` — the copy check and its temporary-tree test
+- `scripts/**/test_*.py`, `scripts/**/*_test_support.py` — take the guard from the one place
+- `docs/as-built/merge-gate-and-test-speed.md` — names the one 600-second guard
 
-**Workers:** `2 writers` — split by folder; nothing is a hub file.
-- `impl` — `scripts/direct/`
-- `test` (opens as impl) — `scripts/lib/test_one_hang_guard.py` first, then every other folder, and the as-built doc
+**Binds later work:** Every test hang limit comes from `scripts/lib/test_hang_guard.py` and the check refuses a copy. The merge gate finds the check by itself. `scripts/production/test_merge_gate_suites_resources.py` keeps its real CPU workloads and their assertions, so `os.wait4` can tell the workloads apart.
 
-**State:** none
+**Gotchas:**
+- Assertions on elapsed wall time keep their literal limits. No shared test clock exists.
+- Code from a merge can add a copy. The check then goes red in the gate, and the merge must move the copy to the guard.
+- A commit message with `Assertion-Change` lines must come from a file (`git commit -F`), because the commit hook reads `-m` text badly.
 
-**Constraints from prior phases:** the merge gate finds every `scripts/**/test_*.py` itself (Phase 1). The merge gate CPU tests keep their real CPU workloads (Phase 4).
+**Ruled out:** A support module that passes the guard name on: each file imports it directly. `LifecycleTestClock` as the shared clock: it lives only in `scripts/agents/test_codex_mesh.py` and retires with the mesh.
+
+### Phase 2b — A user's bump merges first and gates the pushed tip  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `merge_checkpoint.py --bump` merges and pushes a code checkpoint first, then runs the gate on the pushed tip in the background and sends a red result to the unit. `commands/showrunner/bump.md` matches the tool.
+
+**Spec:**
+- Source: the sdlc showrunner, 2026-10-30: "commands/showrunner/bump.md:21-25 says a bumped checkpoint merges on lint and related tests, and the full suite runs on the pushed tip after the merge. merge_checkpoint.py has no such path: every merge runs the full gate. Natedev merged the instant move by hand today for that reason. Add one flag to merge_checkpoint.py for the bump path: merge and push first, then run the gate on the pushed tip, in the background, and send a red result to the unit. Only a user's bump uses it. Keep bump.md matching the tool."
+- **The flag.** `--bump` is valid only for a code checkpoint. With `--shrink`, `--as-built` or `--from-child`, `request_from` refuses it, as it refuses `--cancel-prior` today (`merge_checkpoint.py:318`). The help text says only a user's bump uses it.
+- **Before the push.** `run` (`merge_checkpoint.py:1134`) keeps scope, conflicts, other units, merge, push, records and promotion in their order. With `--bump`, `tests()` does not run, and `report("test", "ok", ...)` says the gate runs on the pushed tip. The merge record names that the gate comes after the push. Without `--bump`, nothing changes. A rerun after a stop between merge and push takes the same path with no tests.
+- **After the push.** `merge_checkpoint.py` starts a new script, `scripts/production/bump_gate.py`, as a detached process (its own session, stdin closed, output in a log file), and does not wait for it. It starts the process after `push` and before `promote`; promotion runs as for any merge, because the user wants the work now.
+- **The gate run.** `bump_gate.py` makes a `git clone --shared` of the production checkout at the pushed tip, detached (never the production checkout: a merge may start there; a copied `.git` pointer moves the real branch, and an export with no git fails a shutdown test). It runs in the clone the same steps a normal merge runs: `test_steps` over the checkpoint's paths and the production's Merge tests. It uses the same pass rule (`test_passed`), flake rule and rerun of named failures as `checkpoint_tests`. Share that code; a second copy of any of them is a defect. It never resets or changes the merge branch, and it removes its clone at the end. The log stays after the clone goes.
+- **The result.** A red result goes through `scripts/message/send.py` to the unit and to the showrunner: the step that failed, the failing test names when known, the tip, and the log path. A green result goes to the showrunner only, as one line. The showrunner needs it because bump.md keeps the work top priority until the tip is green. A run that cannot start or that fails before its first step counts as red. A failed send is written to the log and retried once; it never stays silent. The unit's address comes from the lookup production code already uses; do not add a second one. (Decision: the showrunner also gets the result, which is one extra send, so bump.md's "until the tip is green" has a source. Revert: one line.)
+- **Rerun.** A rerun of the command for the same tip starts no second gate while the first lives. When the first is gone with no result, the rerun starts it again. Keep this record through `checkpoint_step_record`, and use the repo's existing process identity check; add no new one.
+- **bump.md.** Step 3's <MergeCheckpoint/> line names `--bump`. Step 4 says what the flag does: the gate on the pushed tip, in the background, red to the owning unit and the showrunner. The merge unit's full run stays for a production with a merge unit. The Rules line "It skips only the full suite before the merge" stays true. `commands/showrunner/produce.md` and `docs/as-built/showrunner-automation.md` name the flag where they list `merge_checkpoint.py`'s options.
+
+**Files:**
+- `scripts/production/merge_checkpoint.py` — the flag, the path with no tests, the start of the background gate; any shared test-step code
+- `scripts/production/bump_gate.py` — new: the background gate on the pushed tip
+- `scripts/production/test_merge_checkpoint_bump.py` — new: tests through the real merge path
+- `scripts/production/merge_checkpoint_test_support.py` — fixture additions, if needed
+- `commands/showrunner/bump.md` — matches the tool
+- `commands/showrunner/produce.md` — names the flag
+- `docs/as-built/showrunner-automation.md` — names the flag
+
+**Workers:** `1 writer + 1 tester` — `merge_checkpoint.py` is the hub, owned by `impl`.
+- `impl` — `scripts/production/merge_checkpoint.py`, `scripts/production/bump_gate.py`, the three docs
+- `test` — `scripts/production/test_merge_checkpoint_bump.py`, `scripts/production/merge_checkpoint_test_support.py`
+
+**State:** `bump_gate.py` writes one per-merge step record (started, process identity, result) through `checkpoint_step_record`, and one log. Both stay until the normal cleanup of those records.
+
+**Constraints from prior phases:** every hang limit comes from `scripts/lib/test_hang_guard.py` (Phase 2). `test_merge_checkpoint_rerun.py` (3 tests) and `test_merge_checkpoint_validation.py` `test_a_merge_adds_a_row_per_visible_change_to_the_named_list` fail on origin/sdlc 7a18d704 before this phase, and they pass on main 6c319087, which changes `merge_checkpoint_test_support.py`. They are not this phase's to fix. Do not port main's change here; the sdlc merge of main brings it.
 
 **Acceptance gate:**
-- `python3 -m unittest scripts.lib.test_one_hang_guard` green, and its temporary-tree test sees the refusal.
-- The AST check in `scripts/lib/test_one_hang_guard.py` is the copy acceptance: it finds no local assignment, module-level alias or indirect import of the guard. The text copy grep also prints `scripts/production/merge_gate_test_support.py`, for its two fixture-text lines (40 and 101), which are a string and not an assignment (review pass 1).
+- `python3 -m unittest discover -s scripts/production -p 'test_merge_checkpoint*.py'`, from the worktree root: green, except the four tests named above.
+- `scripts/production/test_merge_checkpoint_bump.py`, through the real `run` path on a fixture repo with a real origin, shows each of these:
+  - A merge test that fails: with `--bump`, the merge is on origin and the command exits 0. A fake `send.py` (`MERGE_CHECKPOINT_SEND`) receives the failed step, the tip and the log path, for the unit and the showrunner.
+  - A merge test that passes: the showrunner gets one line, and the unit gets nothing.
+  - The gate ran in a clone at the pushed tip: the fixture's test command writes `git rev-parse HEAD` and its cwd to a file, the HEAD equals the tip, and the cwd is not the checkout. The production checkout's HEAD and status do not change during the gate, and the clone is gone at the end.
+  - `--bump` with `--shrink`, `--as-built` or `--from-child` is refused, with no merge.
+  - A rerun for the same tip while the gate lives starts no second gate; a rerun after the gate died with no result starts one.
+  - Without `--bump`, the same failing test stops the merge, as today.
 - basedpyright prints `0 errors, 0 warnings, 0 notes` on each slot's changed files.
-- The full merge gate is green (`--tests-only --full`), the merge gate CPU tests included.
+- The director runs the full merge gate (`--tests-only --full`) on the phase tree.
 
 ### Phase 3 — Close-route closes a route made before its phase record  · status: done
 **Depends on:** none
