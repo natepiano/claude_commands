@@ -227,12 +227,24 @@ buildlog_wait_for_memory() {
                 printf 'still waiting for memory after %d min: this step is now first in line, and no build starts without memory\n' "$(( BUILDLOG_MEM_WAIT_S / 60 ))" >&2
             fi
         fi
+        # Only observers request the final blocker field. Other callers keep
+        # the checker's existing output and environment unchanged.
+        local blocker='{}' blocker_hook=0
+        if declare -F buildlog_memory_poll_hook >/dev/null; then
+            blocker_hook=1
+            local -x BUILDLOG_MEM_BLOCKER=1
+        fi
         if ! result="$(BUILDLOG_MEM_DETAIL=1 buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" check "$meminfo" "$caller_pid" "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" "$BUILDLOG_MEM_WAIT_FROM" "$cached_repo" "$cached_step" "$cached_worktree" "$cached_need" "$cached_source" "$cached_count" "$@" 2>&1)"; then
             error_line=${result##*$'\n'}
             buildlog_memory_refuse "${error_line:-checker returned an error}"
             return 2
         fi
         fields=${result//[^|]/}
+        if (( blocker_hook != 0 )) && [[ "$result" != *$'\n'* && ( ${#fields} == 15 || ${#fields} == 18 ) ]]; then
+            blocker=${result##*|}
+            result=${result%|*}
+            fields=${result//[^|]/}
+        fi
         if [[ "$result" == *$'\n'* || ( ${#fields} != 14 && ${#fields} != 17 ) ]]; then
             buildlog_memory_refuse 'invalid checker output'
             return 2
@@ -256,6 +268,9 @@ buildlog_wait_for_memory() {
         if [[ "$state" == admit && $# -gt 0 && ( "$reason" != reserved || -z "$reservation" ) ]]; then
             buildlog_memory_refuse 'step has no memory reservation'
             return 2
+        fi
+        if (( blocker_hook != 0 )); then
+            buildlog_memory_poll_hook "$state" "$blocker" || true
         fi
         available=$fresh
         # A refreshed estimate replaces the shell cache on every answer.

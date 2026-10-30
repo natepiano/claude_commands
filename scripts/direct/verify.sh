@@ -1070,12 +1070,158 @@ ROUTING_WAIT_STARTED=""
 # step subshells to the parent cleanup, which also ends interrupted waits.
 PHASE_WAIT_SESSION="${UNIT_RUN_DIR:-${UNIT_SESSION_DIR:-}}"
 PHASE_WAIT_RECORDER="$(cd "${BASH_SOURCE[0]%/*}" && pwd)/progress_history.py"
+PHASE_MEMORY_PREVIOUS=""
+phase_wait_holder_flags() {
+    # The hold observer is a single long-lived Python process, so its recorded
+    # pid can be stopped and reaped before the wait is closed.
+    local launch=()
+    [[ "$1" != hold-watch ]] || launch=(exec)
+    "${launch[@]}" "$PY" - "$1" "${BOARD_DIR:-$PHASE_WAIT_SESSION}" \
+        "${BUILD_HOLD_DIR-$HOME/.local/state/build-hold}" "${2:-}" "${@:3}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+def text(value):
+    return value.strip() if isinstance(value, str) and not any(c in value for c in "\r\n\0") else ""
+
+def read(path):
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return ""
+
+def fields(raw):
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+def holder_flags(kind, board_name, hold_name, blocker):
+    owner_flag = "--holder-session"
+    owner = ""
+    resource_kind, resource = "slot", "cargo"
+    if kind == "token":
+        board = Path(board_name)
+        slot = text(read(board / "locks/cargo.d/holder"))
+        if slot == "director":
+            owner = text(read(board / "director"))
+        elif slot and slot != "unknown":
+            named_sessions, slot_sessions = set(), set()
+            for path in board.glob("impl_worker_*.json"):
+                worker = fields(read(path))
+                session = text(worker.get("worker_id"))
+                if text(worker.get("name")) == slot and session:
+                    named_sessions.add(session)
+                if text(worker.get("slot")) == slot and session:
+                    slot_sessions.add(session)
+            sessions = named_sessions or slot_sessions
+            if len(sessions) == 1:
+                owner = sessions.pop()
+        if slot and slot != "unknown" and not owner:
+            owner_flag = "--holder-unit"
+            owner = text(fields(read(board / "progress_history_state.json")).get("unit"))
+    elif kind == "hold":
+        from datetime import datetime
+        from uuid import UUID
+
+        resource = "natedev"
+        ordered = []
+        try:
+            for path in Path(hold_name).iterdir():
+                if not path.is_file():
+                    continue
+                record = fields(read(path))
+                try:
+                    since = datetime.fromisoformat(text(record.get("since")).replace("Z", "+00:00"))
+                    stamp = since.timestamp() if since.utcoffset() is not None else path.stat().st_mtime
+                except ValueError:
+                    stamp = path.stat().st_mtime
+                ordered.append((stamp, text(record.get("holder")) or path.name, path.name))
+        except OSError:
+            ordered = []
+        if ordered:
+            _, name, key = min(ordered)
+            try:
+                UUID(key)
+                owner = key
+            except ValueError:
+                owner_flag, owner = "--holder-unit", text(name)
+    elif kind == "memory":
+        resource_kind, resource = "memory", "memory"
+        record = fields(blocker)
+        owner = text(record.get("session_id"))
+        if not owner:
+            owner_flag, owner = "--holder-unit", text(record.get("unit"))
+    if owner:
+        return ["--holder-resource-kind", resource_kind, "--holder-resource", resource, owner_flag, owner]
+    return []
+
+kind, board_name, hold_name, blocker = sys.argv[1:5]
+if kind != "hold-watch":
+    flags = holder_flags(kind, board_name, hold_name, blocker)
+    if flags:
+        print("\n".join(flags))
+else:
+    import os
+    import signal
+    import subprocess
+    import threading
+
+    wait_file, holder_file, session_dir, recorder, parent = sys.argv[5:]
+    wait_file, holder_file = Path(wait_file), Path(holder_file)
+    interval = max(0.001, float(os.environ.get("BUILD_TARGETS_POLL_S", "15")))
+    stopped = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+    while not stopped.is_set() and wait_file.is_file():
+        try:
+            os.kill(int(parent), 0)
+        except ProcessLookupError:
+            break
+        previous = read(holder_file)
+        flags = holder_flags("hold", board_name, hold_name, "")
+        current = "\n".join(flags)
+        wait_id = read(wait_file)
+        if not wait_id:
+            break
+        if previous != current:
+            result = subprocess.run([sys.executable, recorder, "wait-holder", "--session-dir", session_dir,
+                                     "--wait-id", wait_id, *flags], check=False)
+            if result.returncode == 0:
+                holder_file.write_text(current, encoding="utf-8")
+            else:
+                print("verify.sh: wait history NotRecorded: cannot update build hold holder", file=sys.stderr)
+        stopped.wait(interval)
+PY
+}
 phase_wait_start() {
-    local key=$1 reason=$2 id file
+    local key=$1 reason=$2 id file holder holder_file previous="" flag
     [[ "${CLAUDE_PROBE_SESSION:-}" != 1 && -n "$PHASE_WAIT_SESSION" \
         && -f "$PHASE_WAIT_SESSION/progress_history_state.json" && -n "$HOLD_WAIT_DIR" ]] || return 0
     file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$key"
-    [[ ! -s "$file" ]] || return 0
+    holder_file="$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$key"
+    # A blocking wait-local call cannot refresh in this shell. Its observer
+    # owns hold changes until finish stops it, avoiding competing updates.
+    [[ "$key" != hold || ! -s "$holder_file.watcher" ]] || return 0
+    holder="$(phase_wait_holder_flags "$key" "${3:-}")" || holder=""
+    local holder_args=()
+    if [[ -n "$holder" ]]; then
+        while IFS= read -r flag; do holder_args+=("$flag"); done <<< "$holder"
+    fi
+    if [[ -s "$file" ]]; then
+        IFS= read -r -d '' previous < "$holder_file" 2>/dev/null || true
+        [[ "$previous" != "$holder" ]] || return 0
+        read -r id < "$file"
+        if "$PY" "$PHASE_WAIT_RECORDER" wait-holder --session-dir "$PHASE_WAIT_SESSION" \
+            --wait-id "$id" "${holder_args[@]}"; then
+            printf '%s' "$holder" > "$holder_file"
+        else
+            printf 'verify.sh: wait history NotRecorded: cannot update %s holder\n' "$id" >&2
+            return 1
+        fi
+        return 0
+    fi
     local args=(start-wait --session-dir "$PHASE_WAIT_SESSION"
         --kind WaitingForMemoryOrSlot --reason "$reason")
     local owner="${CODEX_THREAD_ID:-}"
@@ -1084,38 +1230,77 @@ phase_wait_start() {
     else
         args+=(--director --owner-session "${CLAUDE_CODE_SESSION_ID:-}")
     fi
-    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}")" && [[ -n "$id" ]]; then
+    if id="$("$PY" "$PHASE_WAIT_RECORDER" "${args[@]}" "${holder_args[@]}")" && [[ -n "$id" ]]; then
+        printf '%s' "$holder" > "$holder_file"
         printf '%s\n' "$id" > "$file"
+        if [[ "$key" == hold ]]; then
+            phase_wait_holder_flags hold-watch "" "$file" "$holder_file" \
+                "$PHASE_WAIT_SESSION" "$PHASE_WAIT_RECORDER" "$$" &
+            printf '%s\n' "$!" > "$holder_file.watcher"
+        fi
     else
         printf 'verify.sh: wait history NotRecorded: %s\n' "$reason" >&2
+        return 1
+    fi
+}
+phase_wait_stop_holder_watch() {
+    local holder_file=$1 watcher=""
+    if [[ -s "$holder_file.watcher" ]]; then
+        read -r watcher < "$holder_file.watcher"
+        if [[ "$watcher" =~ ^[1-9][0-9]*$ ]]; then
+            kill "$watcher" 2>/dev/null || true
+            wait "$watcher" 2>/dev/null || true
+        fi
+        rm -f "$holder_file.watcher"
     fi
 }
 phase_wait_finish() {
+    [[ "$1" != memory ]] || PHASE_MEMORY_PREVIOUS=""
     local file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$1" id
+    local holder_file="$HOLD_WAIT_DIR/phase-holder.${BASHPID:-$$}.$1"
     [[ -s "$file" ]] || return 0
+    phase_wait_stop_holder_watch "$holder_file"
     read -r id < "$file"
     if "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
-        rm -f "$file"
+        rm -f "$file" "$holder_file"
     else
         printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
     fi
 }
 phase_wait_finish_all() {
-    local file id
+    local file id holder_file
     [[ -n "$HOLD_WAIT_DIR" ]] || return 0
     for file in "$HOLD_WAIT_DIR"/phase-wait.*; do
         [[ -s "$file" ]] || continue
+        holder_file="${file/phase-wait./phase-holder.}"
+        phase_wait_stop_holder_watch "$holder_file"
         read -r id < "$file"
-        "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
-            || printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
+        if "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
+            rm -f "$file" "$holder_file"
+        else
+            printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
+        fi
     done
 }
 
-# The memory gate announces only blocked admission. A granted first check
-# emits no line and therefore creates no zero-length wait.
+# The gate calls this after each validated poll. Unchanged blockers need no
+# lookup process; failed recordings keep the old cache so the next poll retries.
+buildlog_memory_poll_hook() {
+    if [[ "$1" != hold ]]; then
+        PHASE_MEMORY_PREVIOUS=""
+        return 0
+    fi
+    [[ "$PHASE_MEMORY_PREVIOUS" != "$2" ]] || return 0
+    if phase_wait_start memory "memory admission" "$2"; then
+        PHASE_MEMORY_PREVIOUS=$2
+    fi
+    return 0
+}
+
+# The poll hook opens only blocked admission, after validation. A granted
+# first check therefore creates no zero-length wait.
 buildlog_memory_line() {
     case "$1" in
-        first) phase_wait_start memory "memory admission" ;;
         done|left) phase_wait_finish memory ;;
     esac
     buildlog_memory_line_inner "$@"
@@ -1813,7 +1998,7 @@ route_test() {
             echo "verify.sh: waiting for the Mac ($BUILDLOG_MAC_REASON) or natedev's release." >&2
             announced_reason="$BUILDLOG_MAC_REASON"
         fi
-        phase_wait_start hold "build hold"
+        phase_wait_start hold "build hold" || true
         if [[ -z "$ROUTING_WAIT_STARTED" ]]; then
             ROUTING_WAIT_STARTED="$("$PY" -c 'import time; print(time.monotonic())')"
         fi
@@ -2183,7 +2368,7 @@ while ! build_hold_nothing_held; do
             *) exit "$HOLD_WAIT_STATUS" ;;
         esac
     fi
-    phase_wait_start hold "build hold"
+    phase_wait_start hold "build hold" || true
     HOLD_WAIT_ARGS=(wait-local --call-id "$BUILDLOG_CALL_ID" --pid $$)
     if [[ "$CMD" == test && -n "$MAC_LEAVE_SETTINGS" ]]; then
         HOLD_WAIT_ARGS+=(--leave-hook "$(mac_retry_hook "$MAC_LEAVE_SETTINGS" "$MAC_RETRY_AFTER")")
@@ -2427,9 +2612,10 @@ acquire_token() {
         fi
         kill -0 "$$" 2>/dev/null || token_wait_orphaned
         count_token_waiters_ahead
+        if (( noted >= 0 )); then phase_wait_start token "cargo token" || true; fi
         # The line goes out before the first try when the token is not free.
         if (( noted < 0 )) && { (( TOKEN_WAITERS_AHEAD > 0 )) || [[ -d "${BOARD_DIR}/locks/cargo.d" ]]; }; then
-            phase_wait_start token "cargo token"
+            phase_wait_start token "cargo token" || true
             token_wait_note first 0
             noted=0
         fi
@@ -2468,7 +2654,7 @@ acquire_token() {
         token_wait_clock
         waited=$(( (TOKEN_CLOCK_NOW - started) / 60 ))
         if (( noted < 0 )); then
-            phase_wait_start token "cargo token"
+            phase_wait_start token "cargo token" || true
             token_wait_note first 0
             noted=0
         elif (( waited >= noted + TOKEN_WAIT_NOTE_MIN )); then
@@ -2673,7 +2859,7 @@ build_hold_wait_local() {
         return 0
     fi
     step_state waiting_hold
-    phase_wait_start hold "build hold"
+    phase_wait_start hold "build hold" || true
     # A step without the token (before the first take, or after a Mac trip) only waits.
     if [[ "${TOKEN_HELD:-0}" -ne 1 ]]; then
         build_hold_wait_local_only "$@" || status=$?
