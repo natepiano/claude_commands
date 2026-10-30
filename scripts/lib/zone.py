@@ -108,12 +108,7 @@ def describe(zone: str) -> str:
 
 def stored(conf: Path) -> str:
     """The file's zone= value, or the default when the file or the line is missing."""
-    try:
-        lines = conf.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return user_zone.DEFAULT_ZONE
-    return next((line.split("=", 1)[1].strip() for line in lines if line.startswith("zone=")),
-                user_zone.DEFAULT_ZONE)
+    return user_zone.stored_zone(str(conf)) or user_zone.DEFAULT_ZONE
 
 
 def write_zone(conf: Path, zone: str) -> None:
@@ -290,7 +285,7 @@ def set_zone(name: str) -> int:
     if platform.system() == "Darwin":
         raise Refusal("run /zone on natedev: the Mac pulls ~/.claude main from there")
     zone = resolve(name)
-    conf = user_zone.CONF
+    conf = Path(user_zone.CONF)
     checkout = checkout_of(conf)
     _ready(checkout)
     before = stored(conf)
@@ -326,7 +321,7 @@ def set_zone(name: str) -> int:
 
 def show() -> int:
     print(f"zone: {describe(user_zone.user_zone_name())}")
-    checkout = None if platform.system() == "Darwin" else checkout_of(user_zone.CONF)
+    checkout = None if platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
     for line in drain(checkout, pulled=False):
         print(line)
     return 0
@@ -340,7 +335,7 @@ def main(arguments: list[str]) -> int:
             case ["set", name]:
                 return set_zone(name)
             case ["drain", *pulled] if pulled in ([], ["--pulled"]):
-                checkout = None if pulled or platform.system() == "Darwin" else checkout_of(user_zone.CONF)
+                checkout = None if pulled or platform.system() == "Darwin" else checkout_of(Path(user_zone.CONF))
                 for line in drain(checkout, pulled=bool(pulled)):
                     print(line)
                 return 0
