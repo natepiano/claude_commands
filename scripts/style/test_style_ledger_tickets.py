@@ -1808,6 +1808,121 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             with self.assertRaisesRegex(style_ledger.LedgerError, "ticket read-1 checkpoint: git rev-parse failed"):
                 ledger.ticket_checkpoint("read-1", "missing-commit")
 
+    def repaired_read_checkpoint(self) -> tuple[style_ledger.Ledger, str]:
+        ledger = self.checkpointed_read_transition()
+        self.write(self.sources[0], "pub fn value() -> u32 { 2 }\nmod a; mod b; mod c; mod other;\n")
+        repair = self.commit("Repair the checkpointed ticket")
+        _ = self.cli("ticket", "checkpoint", "--id", "read-1", "--commit", repair)
+        return ledger, repair
+
+    def test_recheckpoint_racing_merge_rechecks_repair_containment_before_writing(self) -> None:
+        ledger = self.checkpointed_read_transition()
+        _ = self.git("branch", "style/main", self.initial_tip)
+        ledger.set_tip(self.initial_tip, "style/main")
+        self.write(self.sources[0], "pub fn value() -> u32 { 2 }\nmod a; mod b; mod c; mod other;\n")
+        repair = self.commit("Repair while the previous checkpoint merges")
+        style_tip = ledger._style_branch_tip  # pyright: ignore[reportPrivateUsage]
+        repaired = False
+
+        def repair_after_branch_read() -> tuple[str, str]:
+            nonlocal repaired
+            with closing(sqlite3.connect(ledger.database)) as connection:
+                # A second writer must be able to take the lock during the Git proof.
+                _ = connection.execute("BEGIN IMMEDIATE")
+            tip = style_tip()
+            if not repaired:
+                repaired = True
+                ledger.ticket_checkpoint("read-1", repair)
+            return tip
+
+        with mock.patch.object(ledger, "_style_branch_tip", side_effect=repair_after_branch_read):
+            with self.assertRaisesRegex(style_ledger.LedgerError,
+                                        f"read-1: checkpoint {repair[:7]} is not on refs/heads/style/main"):
+                _ = ledger.ticket_merge("read-1")
+        ticket, = ledger.ticket_open("read")
+        self.assertEqual((ticket["state"], ticket["checkpoint"]), ("checkpointed", repair))
+        _ = self.git("branch", "-f", "style/main", repair)
+        _ = ledger.ticket_merge("read-1")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT state,checkpoint FROM tickets WHERE id='read-1'").fetchone(),
+                             ("merged", repair))
+
+    def test_recheckpoint_descendant_repair_moves_checkpoint_and_restamps(self) -> None:
+        ledger, repair = self.repaired_read_checkpoint()
+        self.assertEqual(ledger.ticket_open("read")[0]["checkpoint"], repair)
+        latest = ledger.latest_ticket_judgments("read-1")
+        self.assertEqual({(judgment.path, judgment.commit) for judgment in latest},
+                         {(path, repair) for path in self.sources[:2]})
+        ledger.set_tip(repair, "main")
+        self.assertEqual(self.states(self.rule("read"))[self.sources[0]], "current")
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            commits = cast(list[tuple[str, int]], connection.execute(
+                'SELECT "commit",COUNT(*) FROM judgments WHERE ticket=? GROUP BY "commit"',
+                ("read-1",)).fetchall())
+        self.assertEqual(dict(commits), {self.initial_tip: 2, repair: 2})
+
+    def test_recheckpoint_non_descendant_keeps_checkpoint_and_restamps(self) -> None:
+        ledger, repair = self.repaired_read_checkpoint()
+        _ = self.git("checkout", "-q", "-b", "other", self.initial_tip)
+        self.write(self.sources[0], "pub fn unrelated() {}\n")
+        unrelated = self.commit("An unrelated checkpoint")
+        before = self.ledger_contents(ledger)
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"read-1: checkpointed at {repair}"):
+            ledger.ticket_checkpoint("read-1", unrelated)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_recheckpoint_repair_must_be_on_the_assigned_branch(self) -> None:
+        ledger, repair = self.repaired_read_checkpoint()
+        _ = self.git("checkout", "-q", "-b", "other")
+        self.write("README.md", "Repair on another branch\n")
+        other = self.commit("A descendant outside the ticket branch")
+        before = self.ledger_contents(ledger)
+        with self.assertRaisesRegex(style_ledger.LedgerError, f"checkpoint {other[:7]} is not on refs/heads/main"):
+            ledger.ticket_checkpoint("read-1", other)
+        self.assertEqual(self.ledger_contents(ledger), before)
+        self.assertEqual(ledger.ticket_open("read")[0]["checkpoint"], repair)
+        _ = self.git("branch", "-f", "main", other)
+        ledger.ticket_checkpoint("read-1", other)
+        self.assertEqual(ledger.ticket_open("read")[0]["checkpoint"], other)
+
+    def test_recheckpoint_merged_repair_refuses_a_later_descendant(self) -> None:
+        ledger, repair = self.repaired_read_checkpoint()
+        _ = ledger.ticket_merge("read-1")
+        self.write("README.md", "Too late for a repair\n")
+        later = self.commit("After merge")
+        before = self.ledger_contents(ledger)
+        with self.assertRaisesRegex(style_ledger.LedgerError, "cannot become checkpointed from merged"):
+            ledger.ticket_checkpoint("read-1", later)
+        self.assertEqual(self.ledger_contents(ledger), before)
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            stored = cast(tuple[str], connection.execute("SELECT checkpoint FROM tickets WHERE id='read-1'").fetchone())
+        self.assertEqual(stored, (repair,))
+
+    def test_recheckpoint_same_repair_is_an_exact_no_op_without_git_or_restamps(self) -> None:
+        ledger, repair = self.repaired_read_checkpoint()
+        before = self.ledger_contents(ledger)
+        with (mock.patch.object(subprocess, "run", side_effect=AssertionError("repeat reads Git")),
+              mock.patch.object(ledger, "checkpoint_restamps", side_effect=AssertionError("repeat restamps"))):
+            ledger.ticket_checkpoint("read-1", repair)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_recheckpoint_repair_preserves_adds_and_refuses_reservations(self) -> None:
+        ledger, repair = self.repaired_read_checkpoint()
+        ledger.ticket_checkpoint("read-1", repair, "held-run", "7")
+        self.write("README.md", "Another repair\n")
+        later = self.commit("Repair with the reservation still held")
+        before = self.ledger_contents(ledger)
+        with self.assertRaisesRegex(style_ledger.LedgerError, "checkpointed holding the reservation of phase 7 in held-run"):
+            ledger.ticket_checkpoint("read-1", later, "held-run", "8")
+        self.assertEqual(self.ledger_contents(ledger), before)
+        ledger.ticket_checkpoint("read-1", later)
+        self.assertEqual(self.ticket_row("read-1"), ("checkpointed", "held-run", "7"))
+        self.write("README.md", "Last repair\n")
+        last = self.commit("Repair naming the same reservation")
+        ledger.ticket_checkpoint("read-1", last, "held-run", "7")
+        self.assertEqual(ledger.ticket_open("read")[0]["checkpoint"], last)
+        self.assertEqual(self.ticket_row("read-1"), ("checkpointed", "held-run", "7"))
+
     def test_transition_audit_exact_checkpoint_repeat_counts_zero_git_calls(self) -> None:
         ledger = self.checkpointed_read_transition()
         with mock.patch.object(style_ledger, "_git", return_value=self.initial_tip) as git:

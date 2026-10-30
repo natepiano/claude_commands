@@ -19,6 +19,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+# Sibling imports need this folder. Append it so a caller's own modules
+# (buildlog's record) keep precedence over shutdown's.
+if str(SCRIPTS / "shutdown") not in sys.path:
+    sys.path.append(str(SCRIPTS / "shutdown"))
 for dependency in ("whoami", "message", "production", "herdr", "direct", "lib", "hooks"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
