@@ -31,8 +31,8 @@ class QuestionTests(unittest.TestCase):
                 self.assertEqual(question["instructions"], fallback["instructions"])
         self.assertEqual(defined["area_fits"], original["area_fits"])
 
-    def test_defined_area_adoption_invalidates_earlier_question_versions(self) -> None:
-        self.assertEqual(questions.QUESTION_SET_VERSION, "4")
+    def test_merged_area_definitions_invalidate_earlier_question_versions(self) -> None:
+        self.assertEqual(questions.QUESTION_SET_VERSION, "5")
 
     def test_jev_proposes_exactly_the_fields_approved_by_the_user(self) -> None:
         self.assertEqual(
