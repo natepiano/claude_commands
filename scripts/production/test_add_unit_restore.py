@@ -468,7 +468,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(writes, 0)
         self.assertEqual(self.recorded_prompts("session-123"), ())
 
-    def test_launch_barrier_covers_preflight_through_spawn(self) -> None:
+    def test_launch_claim_releases_global_barrier_before_spawn(self) -> None:
         note = self.root / "restart-note"
         _ = note.write_text("Resume this unit.", encoding="utf-8")
         request = add_unit.UnitLaunch(
@@ -540,13 +540,13 @@ class AddUnitRestoreTests(AddUnitTestCase):
             self.assertIsNotNone(creator)
             if creator is None:
                 self.fail("shutdown creator did not start")
-            self.assertIsNone(creator.poll(), "shutdown record appeared before spawn")
+            creator_stdout, creator_stderr = creator.communicate(timeout=30)
+            self.assertEqual(creator.returncode, 0, (creator_stdout, creator_stderr))
+            self.assertEqual(len(launch_permission.pending_launches()), 1)
             lock_path = Path(self.env["SHUTDOWN_STATE_DIR"]) / "launch.lock"
             with lock_path.open("a+", encoding="utf-8") as contender:
-                with self.assertRaises(BlockingIOError):
-                    fcntl.flock(
-                        contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                    )
+                fcntl.flock(contender.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(contender.fileno(), fcntl.LOCK_UN)
 
             return SUBMITTED_PROMPT
 

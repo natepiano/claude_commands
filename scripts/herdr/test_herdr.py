@@ -3568,11 +3568,18 @@ class LayoutHerdr(herdr.Herdr):
                 raise AssertionError(f"unexpected herdr call {words}")
 
     @override
+    def pane_activity(self, pane: str) -> herdr.PaneAtShell | herdr.PaneRunning:
+        return herdr.PaneAtShell()
+
+    @override
     def run(self, *arguments: str) -> str:
         words = list(arguments)
         match words[:2]:
             case ["tab", "rename"]:
                 next(tab for tab in self.tabs if tab["tab_id"] == words[2])["label"] = words[3]
+            case ["workspace", "close"]:
+                self.spaces = [space for space in self.spaces if space[0] != words[2]]
+                self.tabs = [tab for tab in self.tabs if tab["workspace_id"] != words[2]]
             case ["tab", "close"]:
                 self.tabs = [tab for tab in self.tabs if tab["tab_id"] != words[2]]
             case ["pane", "rename"] | ["tab", "focus"] | ["workspace", "focus"]:
@@ -3622,6 +3629,7 @@ class SavedLayoutTests(unittest.TestCase):
                 import random
                 random.Random(seed).shuffle(launches)
                 fresh = LayoutHerdr()
+                fresh.prepare_restore_workspaces(frozenset(space for space, _ in self.BEFORE))
                 for space, title in launches:
                     _ = fresh.open_tab(space, title, "/repo", {})
                 self.assertEqual(fresh.layout(), self.BEFORE)
@@ -3629,14 +3637,43 @@ class SavedLayoutTests(unittest.TestCase):
     def test_a_partial_restart_keeps_the_place_of_the_sessions_still_to_come(self) -> None:
         _ = self.running()
         fresh = LayoutHerdr()
+        fresh.prepare_restore_workspaces(frozenset({"natedev", "hana"}))
         for space, title in (("natedev", "herdr"), ("hana", "widget"), ("natedev", "natedev")):
             _ = fresh.open_tab(space, title, "/repo", {})
-        self.assertIn(("ad-hoc", [herdr.LAYOUT_PLACEHOLDER]), fresh.layout())
+        self.assertEqual([space for space, _ in fresh.layout()], ["hana", "natedev"])
         again = LayoutHerdr()
+        again.prepare_restore_workspaces(frozenset(space for space, _ in self.BEFORE))
         for space, titles in reversed(self.BEFORE):
             for title in reversed(titles):
                 _ = again.open_tab(space, title, "/repo", {})
         self.assertEqual(again.layout(), self.BEFORE)
+
+    def test_failed_restore_removes_only_unfilled_shell_placeholders(self) -> None:
+        _ = self.running()
+        fresh = LayoutHerdr()
+        fresh.prepare_restore_workspaces(frozenset({"hana", "natedev"}))
+        _ = fresh.open_tab("natedev", "herdr", "/repo", {})
+        fresh.close_restore_placeholders()
+        self.assertEqual(fresh.layout(), [("natedev", ["herdr"])])
+
+    def test_placeholder_with_a_running_program_survives_cleanup(self) -> None:
+        _ = self.running()
+        fresh = LayoutHerdr()
+        fresh.prepare_restore_workspaces(frozenset({"hana"}))
+        with patch.object(fresh, "pane_activity", return_value=herdr.PaneRunning(("editor",))):
+            fresh.close_restore_placeholders()
+        self.assertEqual(fresh.layout(), [("hana", [herdr.LAYOUT_PLACEHOLDER])])
+
+    def test_late_session_renaming_a_placeholder_survives_cleanup(self) -> None:
+        _ = self.running()
+        fresh = LayoutHerdr()
+        fresh.prepare_restore_workspaces(frozenset({"hana"}))
+        def landed(_pane: str) -> herdr.PaneAtShell:
+            fresh.tabs[0]["label"] = "late-session"
+            return herdr.PaneAtShell()
+        with patch.object(fresh, "pane_activity", side_effect=landed):
+            fresh.close_restore_placeholders()
+        self.assertEqual(fresh.layout(), [("hana", ["late-session"])])
 
     def test_a_new_tab_takes_its_a_to_z_place_and_never_passes_the_first_tab(self) -> None:
         client = self.running()

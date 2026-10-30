@@ -77,3 +77,15 @@ The user asks any session, on natedev or on the Mac, for a link to an output (a 
 
 - `tailscale serve`, HTTPS, and access from outside the tailnet.
 - A live view of a file that changes. Each link is a snapshot; a new version gets a new link.
+
+## Phase 4 — The stop deadline covers record locks
+
+Follow-up routed from the fast shutdown and restore phase (repair round 4, finding F032; design: Astra review /tmp/claude/astra/20261029T233410Z-3175188/review.md items 1, 4 and 5). Today the bounded stop's record operations (initial updates, reads, claim, final write, and the account-hold release after `bounded_stop` returns) take blocking locks outside the absolute 66 s deadline, so a lock holder can push a correct result past it (probe: `stopped` at 80 s).
+
+- Pass the absolute deadline through both lock layers (directory lock, then account-file lock) and the post-stop hold release, recomputing the time left at each acquisition. An acquisition timeout happens only before the mutation callback, releases any outer lock, and keeps the temporary-file replace protocol.
+- Define the commit boundary: recheck the deadline before publishing the prepared record; a timeout before publishing is failure with "record not updated".
+- Define the recovery for an attempt that timed out without persistence, so `next_step()` does not hold its record and account hold forever.
+- Acceptance: fake-lock tests (a holder for 80 s returns failure by 66 s, no record published after the failure result; a later retry resolves the abandoned attempt). Files: scripts/shutdown/stop.py, record.py, settle.py and their tests.
+- Also routed (round 5, showrunner ruling): restart.py:1458 stale timer compensation disables a newer completed restore; restart.py:2397 failed timer compensation is invisible after claim loss (phases/3/review_findings_5.txt items 6-7). Acceptance: tests for both.
+- Also routed (round 5 owner check, item N3): restart.py:1470 the F038 timer recheck reads `record["login"]`; a move restore's stop writes under the target login, so the window stays open for moves. Acceptance: a move test where a takeover under the target login prevents the timer restore.
+- Also routed (round 8 Astra design check, /tmp/claude/astra/20261030T014232Z-1618645/review.md items 1-3): down --all skips records whose directors left the live inventory while their workers or builds survive (settle.py:932); a marker-free child that detaches into a new scope before discovery is not attributable (stop.py:995); the identity check and kill() are separate, so a Linux signal should go through a verified pidfd (stop.py:1554). Acceptance: a test for each.

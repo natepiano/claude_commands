@@ -1279,26 +1279,20 @@ def main(argv: list[str]) -> int:
             handoff = StoppedSessionHandoff(source, saved)
             request = replace(request, session=request.session._replace(handoff=ResumeStoppedSession()))
 
-        barrier = launch_permission.launch_barrier()
-        try:
-            _ = barrier.__enter__()
-        except OSError as error:
-            raise Refusal(
-                f"shutdown state unreadable: launch barrier: {error}"
-            ) from error
         outcome = herdr.PromptNotSubmitted("restore reused a session without submit proof")
-        try:
-            purpose: launch_permission.LaunchPurpose = (
-                launch_permission.RecordedSessionRestoreLaunchPurpose(
-                    request.launch_kind.session_id
-                )
-                if isinstance(request.launch_kind, UnitRestoreLaunch)
-                else launch_permission.RecordedSessionRestoreLaunchPurpose(handoff.session_id)
-                if isinstance(handoff, StoppedSessionHandoff)
-                else launch_permission.NewWorkLaunchPurpose()
+        purpose: launch_permission.LaunchPurpose = (
+            launch_permission.RecordedSessionRestoreLaunchPurpose(
+                request.launch_kind.session_id
             )
-            require_shutdown_launch_permission(unit_account, purpose)
-
+            if isinstance(request.launch_kind, UnitRestoreLaunch)
+            else launch_permission.RecordedSessionRestoreLaunchPurpose(handoff.session_id)
+            if isinstance(handoff, StoppedSessionHandoff)
+            else launch_permission.NewWorkLaunchPurpose()
+        )
+        from scripts.whoami.account import named_claude_account
+        with launch_permission.admitted_launch(named_claude_account(unit_account.label).login,
+                request.session.session_id if isinstance(request.session, ResumedSession) else "",
+                request.unit_id, lambda: require_shutdown_launch_permission(unit_account, purpose)):
             ready = preflight(request, unit_account)
             request = ready.launch
             if cast(bool, args.check):
@@ -1348,8 +1342,6 @@ def main(argv: list[str]) -> int:
                 outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
                                if isinstance(request.session, ResumedSession) else "", model=resume_model,
                                autocompact_window=resume_autocompact)
-        finally:
-            _ = barrier.__exit__(None, None, None)
         if isinstance(request.launch_kind, UnitRestoreLaunch):
             print("restart-prompt-outcome: " + herdr.encode_prompt_outcome(outcome))
             if isinstance(outcome, herdr.PromptNotSubmitted):
