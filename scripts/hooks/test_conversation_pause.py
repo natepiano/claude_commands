@@ -79,7 +79,8 @@ class ConversationPauseTests(ConversationPauseFixture):
             patch.object(conversation_pause, "sessions_command", return_value=[str(blocked)]),
             patch.object(test_hang_guard, "TEST_HANG_GUARD_SECS", 1),
             self.assertRaisesRegex(
-                AssertionError, r"synchronous fixture hang guard expired.*blocked_lookup\.py",
+                test_hang_guard.FixtureHang,
+                r"synchronous fixture hang guard expired.*blocked_lookup\.py",
             ),
         ):
             _ = self.invoke([sys.executable, str(lookup)], env=self.environment)
