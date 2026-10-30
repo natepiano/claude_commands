@@ -549,7 +549,7 @@ The user approved this work through the showrunner (2026-10-29, ranked before Ph
 
 **Acceptance gate:** every row names path:line, a question 1-5, the rerun result and an owner; the unit director has checked each row against the tip; the list is sent. A wait whose holder is `[]`, or a named holder with an unknown field, comes back from `waits` (its output is JSON) as `MalformedHolder` with the raw value, and an absent holder key still reads as recorded before holders; a phase whose plan header names a production doc path reports that doc's production name; basedpyright over the whole `scripts/` tree reports no import cycle; the `progress_history` suite stays green; basedpyright 0/0/0.
 
-### Phase 14 — A plan's Depends line counts only this plan's own phases  · status: todo
+### Phase 14 — A plan's Depends line counts only this plan's own phases  · status: done
 **Depends on:** Phase 15 (order only: the showrunner ranks the rerun lens first)
 
 The showrunner sent a wrong result (2026-10-29): hierarchies-unit's phase 9 notice printed "Phase 6 needs Phase 2026 (not in the plan)". `phase_table.py parallel` reads each phase's `**Depends on:**` list from `plan_history.py`, which takes every number in the line (`re.findall(r"\b\d+[a-z]?\b", ...)`, near line 117). So a date (`2026-11-12`), a time (`19:00`), a commit hash with leading digits, another unit's phase (`phases-unit Phase 11`), and other numbered things (`Steps 1 and 4`) all count as this plan's phases.
@@ -566,6 +566,7 @@ The showrunner sent a wrong result (2026-10-29): hierarchies-unit's phase 9 noti
 **Files:**
 - `scripts/direct/plan_history.py`
 - `scripts/direct/test_progress_history.py` — the plan-parse tests
+- `scripts/direct/test_plan_history.py` — the dependency-parser tests
 
 **Workers:** `1 impl`.
 

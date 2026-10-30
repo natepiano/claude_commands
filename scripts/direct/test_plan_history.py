@@ -76,6 +76,70 @@ class PlanDependencyTests(unittest.TestCase):
     def test_a_missing_dependency_line_stays_distinct_from_no_dependencies(self) -> None:
         self.assertIsNone(self.read_dependencies("Run after Phase 3; no dependency line is set."))
 
+    def test_phase_lists_stop_before_numbered_word_tokens(self) -> None:
+        for token in ("2-week", "3-day", "4.x", "2:weeks", "3/days"):
+            with self.subTest(token=token):
+                self.assertEqual(
+                    self.read_dependencies("**Depends on:** Phases 3 and 4, " + token + " soak"),
+                    ["3", "4"],
+                )
+
+    def read_unit_dependencies(self, header: str, depends: str) -> list[str] | None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as directory:
+            plan = Path(directory) / "plan.md"
+            _ = plan.write_text(
+                "# Plan\n" + header + "\n### Phase 100 — Delivery · status: todo\n"
+                + "**Depends on:** " + depends + "\n",
+                encoding="utf-8",
+            )
+            phases = plan_history.plan_phases(plan)
+        self.assertEqual(len(phases), 1)
+        return phases[0]["depends_on"]
+
+    def test_own_unit_qualified_phases_are_local_dependencies(self) -> None:
+        for header in (
+            "> **Production: sdlc** — unit `phases-unit`",
+            "> **Production:** sdlc — unit `phases-unit`",
+        ):
+            with self.subTest(header=header):
+                self.assertEqual(
+                    self.read_unit_dependencies(
+                        header, "phases-unit Phase 15; models-unit's Phase 4; phases-unit's Phase 16"
+                    ),
+                    ["15", "16"],
+                )
+        self.assertEqual(
+            self.read_unit_dependencies("", "phases-unit Phase 15; Phase 7"), ["7"]
+        )
+
+    def test_quoted_unit_qualifiers_preserve_dependency_ownership(self) -> None:
+        header = "> **Production: sdlc** — unit `phases-unit`"
+        for quote in ("`", "'", '"', "**"):
+            for possessive in ("", "'s", "’s"):
+                with self.subTest(quote=quote, possessive=possessive):
+                    self.assertEqual(
+                        self.read_unit_dependencies(
+                            header,
+                            f"{quote}models-unit{quote}{possessive} Phases 11 and 12; "
+                            + f"{quote}phases-unit{quote}{possessive} Phase 15; Phase 7",
+                        ),
+                        ["15", "7"],
+                    )
+                    self.assertEqual(
+                        self.read_unit_dependencies(
+                            "", f"{quote}models-unit{quote}{possessive} Phase 11"
+                        ),
+                        [],
+                    )
+
+    def test_phase_keyword_case_does_not_relax_identifier_suffix_case(self) -> None:
+        self.assertEqual(
+            self.read_dependencies(
+                "**Depends on:** phase 9B; PHASES 8B and 7; phase 9b; PHASES 3 and 4"
+            ),
+            ["9b", "3", "4"],
+        )
+
 
 if __name__ == "__main__":
     _ = unittest.main()
