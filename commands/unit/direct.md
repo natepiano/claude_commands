@@ -414,7 +414,9 @@ at once, in the turn it arrives; it never waits for a better moment:
 1. Stop mid-step. Do not finish the step, dispatch, review or gate in progress,
    and start nothing new. Leave uncommitted work in place.
 2. Stop any build you started outside `verify.sh`, or name it in the line below.
-   Leave Codex workers running: the mover pauses them with this session.
+   For a move, leave Codex workers running; the mover pauses them after you exit.
+   For a stop, if ready names a running Codex worker, retry when its turn finishes;
+   start no new turns.
 3. Run the `shutdown.py ready --where "<phase N: the step you stopped in and what
    comes next>"` command the message gives.
 4. End the turn with `— blocked: shutdown requested by the user`.

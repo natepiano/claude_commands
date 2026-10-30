@@ -31,7 +31,7 @@ import conversation_pause
 import unit_lookup
 import sessions
 import inventory
-import record as shutdown_store
+import shutdown_record as shutdown_store
 import restart
 from herdr import HerdrPlace
 from production_units import Refusal, cell_value

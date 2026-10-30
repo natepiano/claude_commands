@@ -26,7 +26,7 @@ for directory in ("production", "shutdown"):
 if TYPE_CHECKING:
     from scripts.production import live_units, production_units, unit_lookup
     from scripts.herdr import herdr
-    from scripts.shutdown import inventory, launch_permission, record, restart
+    from scripts.shutdown import inventory, launch_permission, shutdown_record, restart
 else:
     herdr = import_module("herdr")
     live_units = import_module("live_units")
@@ -34,7 +34,7 @@ else:
     unit_lookup = import_module("unit_lookup")
     inventory = import_module("inventory")
     launch_permission = import_module("launch_permission")
-    record = import_module("record")
+    shutdown_record = import_module("shutdown_record")
     restart = import_module("restart")
 import quota_alert
 from scripts.notify.push_texts import render
@@ -58,7 +58,7 @@ class DownOutage(TypedDict):
     first_seen: str
     alerted: bool
     job: NotRequired[RecoveryJob]
-    recovery: NotRequired[record.RecoverySnapshot]
+    recovery: NotRequired[shutdown_record.RecoverySnapshot]
     dropped: NotRequired[str]
     alert_context: NotRequired[RecoveryAlertContext]
 
@@ -132,7 +132,7 @@ def _read_state() -> dict[str, DownOutage]:
                 if isinstance(identity, str):
                     outage["job"]["source"] = identity
             if "recovery" in fields:
-                outage["recovery"] = record.parse_snapshot(fields["recovery"])
+                outage["recovery"] = shutdown_record.parse_snapshot(fields["recovery"])
             result[key] = outage
         return result
     except FileNotFoundError:
@@ -155,7 +155,7 @@ def _write_state(state: dict[str, DownOutage]) -> None:
 def _sources(state: dict[str, DownOutage]) -> dict[tuple[str, str], RecoverySource]:
     # Pick the newest session identity first. A record can hold only that identity.
     sessions_by_id: dict[str, tuple[str, RecoverySource]] = {}
-    stored = sorted(record.all_snapshots(), key=lambda item: datetime.fromisoformat(item["taken_at"]))
+    stored = sorted(shutdown_record.all_snapshots(), key=lambda item: datetime.fromisoformat(item["taken_at"]))
     stored_ids = {entry["session"]["session_id"] for snapshot in stored
                   if snapshot["machine"] == "natedev" for entry in snapshot["sessions"]}
     # The store is authoritative while it still holds the session.
@@ -183,7 +183,7 @@ def _sources(state: dict[str, DownOutage]) -> dict[tuple[str, str], RecoverySour
                 sessions_by_id[owner["session_id"]] = (entry["last_seen"], RecoverySource(
                     owner, snapshot["label"], snapshot["login"], False, False,
                     json.dumps({"kind": "snapshot", "session": owner, "last_seen": entry["last_seen"]})))
-    for saved in sorted(record.all_session_records(), key=lambda item: datetime.fromisoformat(item["requested_at"])):
+    for saved in sorted(shutdown_record.all_session_records(), key=lambda item: datetime.fromisoformat(item["requested_at"])):
         owner = saved["session"]
         if saved["machine"] != "natedev" or owner["kind"] != "unit":
             continue
@@ -206,8 +206,8 @@ def _sources(state: dict[str, DownOutage]) -> dict[tuple[str, str], RecoverySour
 
 
 def _held(source: RecoverySource, *, dry_run: bool) -> bool:
-    hold = record.lookup_account_hold(source.login)
-    if not isinstance(hold, record.AccountHeld) or hold.hold["then"] != "stop":
+    hold = shutdown_record.lookup_account_hold(source.login)
+    if not isinstance(hold, shutdown_record.AccountHeld) or hold.hold["then"] != "stop":
         return False
     if dry_run:
         return True
@@ -300,21 +300,21 @@ def _alert_without_record(session_id: str, context: RecoveryAlertContext, outage
 
 
 def _alert_failure(source: RecoverySource, outage: DownOutage, cause: str) -> None:
-    saved = record.find_session(source.login, source.session["session_id"]) if source.move_record else None
+    saved = shutdown_record.find_session(source.login, source.session["session_id"]) if source.move_record else None
     if saved is not None:
         claimed = outage_alerts.claim(source.session["session_id"])
         outage["alerted"] = isinstance(claimed, outage_alerts.AlertDelivered)
         if not isinstance(claimed, outage_alerts.AlertClaim):
             return
         try:
-            _ = record.claim_restore_alert(saved, restart.settle.not_back_text(saved))
+            _ = shutdown_record.claim_restore_alert(saved, restart.settle.not_back_text(saved))
             if isinstance(quota_alert.tell_user(restart.move_failed_push(saved)), quota_alert.PushSent):
                 outage_alerts.delivered(claimed)
                 outage["alerted"] = True
         finally:
             if not outage["alerted"]:
                 outage_alerts.release(claimed)
-                record.clear_restore_alert(saved)
+                shutdown_record.clear_restore_alert(saved)
     else:
         host = source.session["host"]
         assert host["kind"] == "unit"
@@ -370,10 +370,10 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                         if isinstance(claude, unit_lookup.LiveClaude):
                             if not dry_run:
                                 if outage_alerts.clear(claude.session_id, observed_at):
-                                    for saved in record.all_session_records():
+                                    for saved in shutdown_record.all_session_records():
                                         if (saved["session"]["session_id"] == claude.session_id
                                                 and "restore_alerted" in saved):
-                                            record.clear_restore_alert(saved)
+                                            shutdown_record.clear_restore_alert(saved)
                             if outage is not None and "job" in outage and not dry_run:
                                 Path(outage["job"]["result"]).unlink(missing_ok=True)
                                 since = datetime.fromisoformat(outage["first_seen"]).astimezone(user_zone()).strftime("%H:%M %Z")
@@ -418,7 +418,7 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                         if source.blocked or _held(source, dry_run=dry_run):
                             continue
                         outage = DownOutage(first_seen=now.isoformat(), alerted=False)
-                        for snapshot in record.all_snapshots():
+                        for snapshot in shutdown_record.all_snapshots():
                             for candidate in snapshot["sessions"]:
                                 if candidate["agent"] == "claude" and candidate["session"] == source.session:
                                     recovery = snapshot.copy()
@@ -429,7 +429,7 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                             evidence = restart.watchdog_crash_signal(source.session)
                             if isinstance(evidence, restart.AgentCrashConfirmed):
                                 candidate = outage["recovery"]["sessions"][0]
-                                record.mark_snapshot_agent_exited(source.login, key, candidate["last_seen"])
+                                shutdown_record.mark_snapshot_agent_exited(source.login, key, candidate["last_seen"])
                                 if candidate["agent"] == "claude":
                                     candidate["crash"] = "agent exited"
                         continue
@@ -485,7 +485,7 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                             if not isinstance(evidence, restart.AgentCrashConfirmed):
                                 lines.append(f"watchdog: {unit}: waiting for readable crash evidence")
                                 continue
-                            if not record.restore_snapshot_agent_exited(recovery, candidate):
+                            if not shutdown_record.restore_snapshot_agent_exited(recovery, candidate):
                                 continue
                             candidate["crash"] = "agent exited"
                     remaining = dispatch_deadline - time.monotonic()
