@@ -282,8 +282,9 @@ class DailiesInputFixture(unittest.TestCase):
                         self.root / "bin/review_regime.py", self.root / "race-review.py",
                         self.home / ".claude/scripts/message/send.py"}
             production_commands = {CI_POINTS, WAITING, SCRIPT.with_name("review_regime.py"),
-                                   SCRIPT.parent.parent / "direct/phase_table.py",
-                                   SCRIPT.parent.parent / "style/style_ledger.py"}
+                                   SCRIPT.parent.parent / "direct/phase_table.py"}
+            # The ledger's imported catalog freezes environment paths; it needs
+            # a real child interpreter, even if another test imported it first.
             if script.exists() and (script in fixtures or script in production_commands):
                 module = ModuleType("dailies_fixture_command")
                 module.__file__ = str(script)

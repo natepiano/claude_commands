@@ -29,6 +29,7 @@ sys.path.insert(0, str(SCRIPTS.parent))
 from scripts.shutdown import launch_permission  # noqa: E402
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402
+from scripts.production import staff  # noqa: E402
 
 USAGE = "usage: herdr_sessions.py list [--on <host>] | sort-tabs | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
 REMOTE_LIST_TIMEOUT = 15
@@ -253,15 +254,20 @@ def claude_names() -> dict[str, str]:
     return {pane: record["name"] for pane, record in newest.items()}
 
 
-def unit_roles() -> dict[str, str]:
-    """Unit roles of the shared session's panes, from the marks inherited by processes in them."""
-    shared = herdr.shared_session()
+def unit_roles(client: herdr.Herdr, panes: list[herdr.PaneIdentity]) -> dict[str, str]:
+    """Classify live unit panes using the same staff join as tab ordering."""
+    classifier = herdr.UnitTabClassifier(client.session, herdr.herdr_processes(), staff.initial_snapshot())
+    spaces: dict[str, str] = {}
+    if any(classifier.has_unit_title(pane.get("label") or "") for pane in panes):
+        for item in herdr.json_items(client.result("workspace", "list").get("workspaces"), "herdr workspace list"):
+            space = herdr.json_object(item, "herdr workspace")
+            spaces[herdr.json_text(space.get("workspace_id"), "herdr workspace id")] = (
+                herdr.json_text(space.get("label"), "herdr workspace label"))
     roles: dict[str, str] = {}
-    for process in herdr.herdr_processes():
-        slug = process.marks.get("SHOWRUNNER_UNIT", "")
-        unit = process.marks.get("SHOWRUNNER_UNIT_ID", "")
-        if process.place.session == shared and herdr.has_unit_marks(process.marks):
-            _ = roles.setdefault(process.place.pane, f"unit {slug}/{unit}")
+    for pane in panes:
+        unit = classifier.classify(spaces.get(pane["workspace_id"], ""), pane.get("label") or "", [pane["pane_id"]])
+        if isinstance(unit, herdr.UnitTab):
+            roles[pane["pane_id"]] = f"unit {unit.parent.name}/{unit.row.name}"
     return roles
 
 
@@ -321,7 +327,7 @@ def _main(argv: list[str]) -> int:
                 return 0
             _attach(pane)
         names = claude_names()
-        roles = unit_roles()
+        roles = unit_roles(herdr.Herdr(shared), panes)
         showrunner_names = {runner["session"] for runner in registered_showrunners() if runner["session"]}
         for row in panes:
             pane = row["pane_id"]

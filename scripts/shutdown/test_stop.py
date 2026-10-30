@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from unit_staff_test_support import unit_host
 import copy
 import io
@@ -9,19 +14,17 @@ import json
 import os
 import signal
 import subprocess
-import sys
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from collections.abc import Callable
 from typing import Literal, cast, final, override
 from unittest.mock import call, patch
 
 from test_support import linux_process_fixture, ShutdownTestCase, empty_session_registry
-from account import Account
+from scripts.whoami.account import Account
 import inventory
 import herdr
 from fake_herdr import CommandResponse
