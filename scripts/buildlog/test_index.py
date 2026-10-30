@@ -18,7 +18,8 @@ from unittest import mock
 
 import index
 import parse
-from record import TARGET_DIR_UNSET, UNKNOWN_IDENTITY
+from record import TARGET_DIR_UNSET
+from store import UNKNOWN_IDENTITY
 
 CLI = Path(__file__).with_name("cli.py")
 TESTDATA = Path(__file__).with_name("testdata")

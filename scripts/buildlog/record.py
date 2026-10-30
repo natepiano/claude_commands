@@ -83,7 +83,6 @@ if TYPE_CHECKING:
 
 RECORD_VERSION = 1
 TARGET_DIR_UNSET = "unset"
-UNKNOWN_IDENTITY = "unknown"
 GIT_TIMEOUT_S = 5
 RUSTC_TIMEOUT_S = 10
 LEDGER = Path.home() / ".local/state/verify/events.jsonl"
@@ -818,9 +817,13 @@ def step(args: list[str]) -> None:
             "cwd": cwd,
             "target_dir": str((Path(cwd) / os.environ["CARGO_TARGET_DIR"]).resolve())
                           if "CARGO_TARGET_DIR" in os.environ else TARGET_DIR_UNSET,
-            "repo_identity": repository.key if isinstance(repository, memory_admit.RepositoryIdentity) else UNKNOWN_IDENTITY,
+            "repo_identity": repository.key if isinstance(repository, memory_admit.RepositoryIdentity) else store.UNKNOWN_IDENTITY,
             **git_facts(directory),
             **tree,
+            # A reusable test build needs verify's Cargo inputs as well as
+            # unchanged sources. Older callers leave this unknown.
+            "test_build_key": (os.environ.get("BUILDLOG_TEST_BUILD_KEY") or None)
+            if name == "nextest" and tree["tree_changed"] is False else None,
             "caller": step_caller,
             **who(),
             "call_id": os.environ.get("BUILDLOG_CALL_ID") or None,

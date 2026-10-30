@@ -2,6 +2,7 @@
 """Add one unit to a running production, with restartable launch steps."""
 from __future__ import annotations
 
+
 import argparse
 import json
 from collections.abc import Iterator
@@ -16,6 +17,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 from uuid import uuid4
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import staff, staff_sources
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS.parent))
@@ -1055,7 +1059,7 @@ def launch_environment() -> dict[str, str]:
     return {
         key: value
         for key, value in os.environ.items()
-        if not key.startswith("CLAUDE_")
+        if not key.startswith(("CLAUDE_", "STAFF_OPERATION_"))
     }
 
 
@@ -1278,7 +1282,19 @@ def set_autocompact(request: RequestedUnitLaunch, session_id: str, value: str, c
     print(f"{request.unit}: {setting} {verb} to session {session_id} at its next restart")
 
 
-def main(argv: list[str]) -> int:
+
+def ensure_staff_unit(production: Production, unit: str) -> staff.StaffRow:
+    """Keep member identities, ensuring missing rows on first add or resume."""
+    record = staff.initial_snapshot()
+    found = staff_sources.member(staff_sources.UnitMember(production.slug, unit), record)
+    if isinstance(found, staff_sources.MemberFound):
+        return found.row
+    parent = staff_sources.member(staff_sources.ShowrunnerMember(production.slug), record)
+    runner = (parent.row if isinstance(parent, staff_sources.MemberFound)
+              else staff.ensure("showrunner", name=showrunners.herdr_space(production.slug, str(production.doc))))
+    return staff.ensure("unit", name=unit_names.name(unit), parent=runner.id)
+
+def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     _ = parser.add_argument("--production", required=True)
     _ = parser.add_argument("name")
@@ -1340,6 +1356,7 @@ def main(argv: list[str]) -> int:
             if cast(bool, args.check):
                 return 0
             assert isinstance(source, RunningSessionHandoff)
+            _ = ensure_staff_unit(request.production, request.unit_id)
             saved = stop_for_attach(source)
             require_stopped_session(source)
             handoff = StoppedSessionHandoff(source, saved)
@@ -1364,6 +1381,7 @@ def main(argv: list[str]) -> int:
             if cast(bool, args.check):
                 return 0
             marked_unit = launched_unit(request)
+            stopped_tab: MarkedUnitFound | NoMarkedUnit = NoMarkedUnit()
             if (
                 isinstance(request.session, ResumedSession)
                 and isinstance(marked_unit, MarkedUnitFound)
@@ -1375,10 +1393,7 @@ def main(argv: list[str]) -> int:
                         + unit.claude.reason
                     )
                 if isinstance(unit.claude, unit_lookup.ClaudeNotRunning):
-                    try:
-                        herdr.close_agent(unit.place.session, unit.place.pane)
-                    except herdr.HerdrFailure as error:
-                        raise Refusal(f"cannot end session {unit.place.session}: {error}") from error
+                    stopped_tab = marked_unit
                     marked_unit = NoMarkedUnit()
             if isinstance(handoff, StoppedSessionHandoff) and isinstance(marked_unit, MarkedUnitFound):
                 raise Refusal(f"cannot attach {handoff.session_id}: unit tab already runs")
@@ -1390,6 +1405,13 @@ def main(argv: list[str]) -> int:
                 if isinstance(ready.plan_transition, BriefToPlanTransition):
                     raise Refusal(f"unit {request.identity.unit} runs its brief in session {marked_unit.unit.place.session}; "
                                   + f"end that session, then run {retry}")
+            _ = ensure_staff_unit(request.production, request.unit_id)
+            if isinstance(stopped_tab, MarkedUnitFound):
+                place = stopped_tab.unit.place
+                try:
+                    herdr.close_agent(place.session, place.pane)
+                except herdr.HerdrFailure as error:
+                    raise Refusal(f"cannot end session {place.session}: {error}") from error
             if cast(str, args.autocompact) and isinstance(request.session, ResumedSession):
                 autocompact.record(request.session.session_id, cast(str, args.autocompact))
             if not isinstance(request.launch_kind, ResumeInStartFolderLaunch):
@@ -1438,6 +1460,8 @@ def main(argv: list[str]) -> int:
     except herdr.AgentNotReady as error:
         print(f"add_unit: the session is not ready:\n{error.screen}", file=sys.stderr)
         return 1
+    except (staff.StaffRefused, staff.StaffUnreadable):
+        raise
     except Refusal as error:
         print(f"add_unit: {error}", file=sys.stderr)
         return 2
@@ -1445,6 +1469,13 @@ def main(argv: list[str]) -> int:
         detail = str(error)
         print(f"add_unit: {detail}", file=sys.stderr)
         return 1
+
+
+def main(argv: list[str]) -> int:
+    def run() -> int:
+        with staff.operation():
+            return _main(argv)
+    return staff.cli_result(run)
 
 
 if __name__ == "__main__":

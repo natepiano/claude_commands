@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts import accounts
 from scripts.production import add_showrunner
+import showrunners
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
 
@@ -62,7 +63,10 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 '''
 
 
+from scripts.production.staff_test_support import StaffTestCase
+
 class AddShowrunnerFixture(unittest.TestCase):
+    staff: StaffTestCase = StaffTestCase()
     root: Path = Path()
     state: Path = Path()
     env: dict[str, str] = {}
@@ -91,6 +95,11 @@ class AddShowrunnerFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        socket_for = showrunners.socket_for
+        self.staff = StaffTestCase()
+        self.staff.setUp()
+        self.addCleanup(self.staff.doCleanups)
+        _ = self.enterContext(patch.object(showrunners, "socket_for", socket_for))
         # Account links, trust entries and timer records embed absolute paths.
         # Restore private files and symlinks at the seed's original path.
         self.root = self.fixture_root
@@ -98,6 +107,8 @@ class AddShowrunnerFixture(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         self.state = self.root / "stub"
         self.env = self.fixture_env.copy()
+        self.env["STAFF_FILE"] = str(self.staff.staff_file)
+        self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
         self.on_start = {}
         self.herdr_overrides = {}
         self.processes = []
@@ -134,8 +145,9 @@ class AddShowrunnerFixture(unittest.TestCase):
                       if row[:2] == argv[:2] and value.startswith("CLAUDE_CONFIG_DIR="))
         path = Path(config) / "projects/fixture" / (session_id + ".jsonl")
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
-                                   "message": {"role": "user", "content": argv[-1]}}) + "\n")
+        with path.open("a", encoding="utf-8") as transcript:
+            transcript.write(json.dumps({"type": "user", "timestamp": datetime.now(timezone.utc).isoformat(),
+                                        "message": {"role": "user", "content": argv[-1]}}) + "\n")
     return result
 
 '''
@@ -261,7 +273,7 @@ class AddShowrunnerFixture(unittest.TestCase):
 
     def run_command(self, slug: str, *extra: str, cwd: Path | None = None,
                     subprocess_cli: bool = False) -> subprocess.CompletedProcess[str]:
-        self.prepare_herdr(slug, *extra)
+        self.prepare_herdr(slug)
         return self.invoke(["--production", str(self.doc(slug)), "--model", "opus", "--effort", "high", *extra],
                            cwd=cwd, subprocess_cli=subprocess_cli)
 
@@ -316,7 +328,7 @@ class AddShowrunnerFixture(unittest.TestCase):
             return invoke_cli(add_showrunner, lambda: add_showrunner.main(arguments), arguments,
                               self.env, cwd or Path.cwd(), production_state=True)
 
-    def prepare_herdr(self, slug: str, *extra: str) -> None:
+    def prepare_herdr(self, slug: str) -> None:
         """Fake herdr answers a launch of `slug`'s showrunner as a tab of the shared session, which has
         a boot unit; the agent prompt brings the session up. While the shared session is live, it holds
         a tab named `slug`."""
@@ -340,9 +352,10 @@ class AddShowrunnerFixture(unittest.TestCase):
             "result": {"agent": {"agent_status": "idle", "interactive_ready": True}}}))
         responses[f"--session {SHARED} pane read w1:p1 --source visible --format ansi"] = CommandResponse(
             code=0, stdout="────────\n❯ \n────────")
-        prompt = f"/showrunner:produce {self.doc(slug)}" + (" resume" if "--resume" in extra else "")
-        responses[f"--session {SHARED} agent prompt w1:p1 {prompt}"] = CommandResponse(
-            code=0, stdout="", write_files={**self.on_start, str(self.state / f"live-{SHARED}"): ""})
+        for suffix in ("", " resume"):
+            prompt = f"/showrunner:produce {self.doc(slug)}{suffix}"
+            responses[f"--session {SHARED} agent prompt w1:p1 {prompt}"] = CommandResponse(
+                code=0, stdout="", write_files={**self.on_start, str(self.state / f"live-{SHARED}"): ""})
         responses.update(self.herdr_overrides)
         _ = Path(self.env["FAKE_HERDR_RESPONSES"]).write_text(json.dumps(responses))
 

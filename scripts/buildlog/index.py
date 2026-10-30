@@ -31,9 +31,8 @@ from urllib.parse import quote
 
 import store
 import parse
-from record import UNKNOWN_IDENTITY
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 # Step and call fields under a former name, read as the current name.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
@@ -114,6 +113,7 @@ STEP_COLUMNS: list[Column] = [
     ("sweep_freed_bytes", "INTEGER", "bytes lint sweep removed"),
     ("log", "TEXT", "gzipped output of a failed step, relative to the root"),
     ("started_at_us", "INTEGER", "UTC epoch microseconds; strict instant order for build history"),
+    ("test_build_key", "TEXT", "verify test Cargo build-input key, excluding nextest run-only selection; NULL for older or changed builds"),
 ]
 
 TEST_COLUMNS: list[Column] = [
@@ -635,8 +635,8 @@ def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str
         "started_at_us": epoch_microseconds(record.get("started_at")),
         "repo": folder_name(record.get("repo_path")),
         "worktree_name": folder_name(record.get("worktree")),
-        "target_dir": target_dir or UNKNOWN_IDENTITY,
-        "repo_identity": record.get("repo_identity") or UNKNOWN_IDENTITY,
+        "target_dir": target_dir or store.UNKNOWN_IDENTITY,
+        "repo_identity": record.get("repo_identity") or store.UNKNOWN_IDENTITY,
         "target_folder": (target_dir if isinstance(target_dir, str) and Path(target_dir).is_absolute()
                           else record.get("worktree") or record.get("cwd")),
         "build_base": key.base if isinstance(key, CargoBuildKey) else None,

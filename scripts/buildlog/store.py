@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 INDEX_NAME = "index.sqlite"
+UNKNOWN_IDENTITY = "unknown"
 CI_DIR = "ci"
 LOGS_DIR = "logs"
 ERRORS_NAME = "errors.log"

@@ -165,7 +165,7 @@ Install on natedev from the repo root with `scripts/build_hold/install_cargo_wra
 
 ### Build log: records and schema
 
-Index `SCHEMA_VERSION = 23` (`scripts/buildlog/index.py`; `open_for_update` rebuilds on a mismatch). Memory and coordination columns:
+Index `SCHEMA_VERSION = 25` (`scripts/buildlog/index.py`; `open_for_update` rebuilds on a mismatch). Memory and coordination columns:
 
 | Table | Column | Meaning |
 | --- | --- | --- |

@@ -19,7 +19,8 @@ from unittest import mock
 import index
 import parse
 import test_record as record_tests
-from record import TARGET_DIR_UNSET, UNKNOWN_IDENTITY
+from record import TARGET_DIR_UNSET
+from store import UNKNOWN_IDENTITY
 from test_index import use_test_log
 
 use_test_log()
