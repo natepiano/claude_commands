@@ -2832,7 +2832,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - A refusal reads the registry before it treats work as already on Claude. A workers queue entry is consumed only when the workers role names its target or a later row of its move exists; the role is read once per pass. `state_file()` only reads and saves state.
 - Tests: `scripts/whoami/test_quota_alert.py` (stop-and-rerun cases on `CodexRerunFixture` in `quota_alert_test_support.py`); `test_codex_alert_accounts.py::test_failed_restoration_is_attempted_and_reported_once` follows the retry (Assertion-Change); `test_quota_zero_episode.py` isolates state per subtest.
 
-### Phase 98 — A notice marked before it is sent is retried until it is sent  · status: todo
+### Phase 98 — A notice marked before it is sent is retried until it is sent  · status: done
 
 **Depends on:** Phase 95 (order only)
 
