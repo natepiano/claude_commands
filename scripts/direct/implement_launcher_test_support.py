@@ -9,6 +9,8 @@ refusing every progress call while two agents were still working.
 
 from __future__ import annotations
 
+from scripts.lib import test_hang_guard
+
 from scripts.lib.test_agents_registry import registry_text, write_registry
 
 import json
@@ -18,16 +20,7 @@ import subprocess
 from pathlib import Path
 from typing import TypedDict, cast, override
 
-from scripts.direct.recorder_fixture import (
-    LauncherFixture,
-    STUB_ATOMIC_JSON_WRITER,
-    TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS,
-    communicate_launcher,
-    configure_launcher_fixture,
-    launcher_environment,
-    launcher_registry,
-    prepare_launcher_runtime,
-)
+from scripts.direct.recorder_fixture import LauncherFixture, STUB_ATOMIC_JSON_WRITER, communicate_launcher, configure_launcher_fixture, launcher_environment, launcher_registry, prepare_launcher_runtime
 
 
 DIRECT_DIR = Path(__file__).parent
@@ -334,7 +327,7 @@ class ImplementLauncherFixture(LauncherFixture):
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=TEST_HANG_GUARD_SECS,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def checked_launch(
@@ -346,7 +339,7 @@ class ImplementLauncherFixture(LauncherFixture):
         return subprocess.run(
             ["bash", str(self.implement_script), *options, str(session), str(self.working_dir),
              str(self.prompt_file), kind, "the retry path", kind, "writing the retry path", "0", "impl"],
-            check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
+            check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def launch_records(self, session: Path, kind: str) -> list[dict[str, object]]:
@@ -387,7 +380,7 @@ printf '%s\\n' '{answer}'
         return environment
 
     def finish_default_launcher(self, process: subprocess.Popen[str], release: Path,
-                                mesh: Path, timeout: float = TEST_HANG_GUARD_SECS) -> tuple[str, str]:
+                                mesh: Path, timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS) -> tuple[str, str]:
         try:
             release.touch()
             return communicate_launcher(process, timeout)
@@ -420,7 +413,7 @@ printf '%s\\n' '{answer}'
             environment["UNIT_RESOLVES_ROUND"] = "1"
         return subprocess.run(
             arguments, check=False, capture_output=True, text=True,
-            env=environment, timeout=TEST_HANG_GUARD_SECS,
+            env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def set_mesh_context(self, session_dir: Path, name: str, tokens: int) -> None:
@@ -538,7 +531,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
                 ["bash", str(self.implement_script), "--to", "fixture-impl",
                  str(session_dir), str(self.working_dir), str(self.prompt_file),
                  "impl", "the retry path", "impl", "writing the retry path", "0", "impl"],
-                check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
+                check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
             )
         except subprocess.TimeoutExpired as error:
             delivered = self.root / "delivered_message.txt"
@@ -572,7 +565,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
             ["bash", str(self.implement_script), str(session_dir), str(self.working_dir),
              str(self.prompt_file), "impl", "the retry path", kind,
              "writing the retry path", "0", "impl"],
-            check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
+            check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def open_passes(self, session_dir: Path) -> dict[str, OpenPass]:

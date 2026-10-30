@@ -710,7 +710,7 @@ def _saved_restore(record: dict[str, object]) -> UnitRestore:
                               session_id=_string(restore, "session_id"))
 
 
-def _repoint_unit_restore(plan: RenamePlan, name: str, record: dict[str, object],
+def _repoint_unit_restore(_plan: RenamePlan, name: str, record: dict[str, object],
                           restore: StoppedUnitRestore) -> None:
     import herdr
 
@@ -723,12 +723,9 @@ def _repoint_unit_restore(plan: RenamePlan, name: str, record: dict[str, object]
 
     def change(saved: SessionShutdown) -> None:
         host = saved["session"]["host"]
-        if host["kind"] != "unit" or host["unit"] != name or host["production"] not in (plan.old, plan.new):
+        if host["kind"] != "unit" or host["unit"] != name:
             raise RenameRefused(f"shutdown record {restore['session_id']} is not {name}'s")
         rename_unit.repoint_shutdown_worktree(saved, old, new, host_names, note)
-        host["production"] = plan.new
-        if host["doc"] == str(plan.old_doc):
-            host["doc"] = str(plan.new_doc)
 
     try:
         _ = shutdown_record.update_session(restore["login"], restore["session_id"], change)

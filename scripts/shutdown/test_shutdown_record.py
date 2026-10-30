@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from unit_staff_test_support import unit_host
 import fcntl
 import json
 import os
@@ -563,8 +564,7 @@ class SessionRecordTests(ShutdownTestCase):
                     document = cast(dict[str, object], json.loads(json.dumps(saved)))
                     wire_session = cast(dict[str, object], document["session"])
                     wire_session.update(kind="unit", host=host)
-                    expected = {"kind": "legacy tmux unit", "production": "build", "unit": "one",
-                        "doc": "/tmp/build.md", "session_name": "unit-session"}
+                    expected = {"kind": "legacy tmux unit", "unit": "one", "session_name": "unit-session"}
                     parsed = shutdown_store.parse_session_records(json.dumps([document]))[0]
                     self.assertEqual(parsed["session"]["host"], expected)
                     snapshot = shutdown_store.parse_snapshot(dict[str, object]({"machine": "natedev", "login": saved["login"],
@@ -605,7 +605,7 @@ class SessionRecordTests(ShutdownTestCase):
     def test_herdr_unit_transport_round_trips_through_the_record_store(self) -> None:
         saved = session_shutdown()
         saved["session"] = cast(inventory.UnitSession, cast(object, {
-            **session(), "kind": "unit", "host": inventory.UnitHost(kind="unit", production="build", unit="one",
+            **session(), "kind": "unit", "host": unit_host(kind="unit", production="build", unit="one",
                 doc="/tmp/build.md", session_name="herdr-unit", session_host="herdr",
                 plan=inventory.NoRunRecord(kind="no run record")),
         }))
@@ -974,8 +974,11 @@ class SessionRecordTests(ShutdownTestCase):
         self.assertEqual(shutdown_store.release_finished_account_hold(held["login"], conducting=True), shutdown_store.HoldReleased(held))
 
     def test_a_registering_or_old_record_hold_is_never_released(self) -> None:
+        _ = self.enterContext(patch.object(shutdown_store, "registration_process_start", return_value="fixture-process-start"))
         held = account_hold()
         held["registration"] = "in progress"
+        held["registration_owners"] = {held["request_id"]:
+            shutdown_store.RegistrationOwner(pid=4242, proc_start="fixture-process-start")}
         shutdown_store.set_account_hold(held)
         self.assertEqual(shutdown_store.release_finished_account_hold(held["login"]), shutdown_store.HoldInUse(held))
         shutdown_store.clear_account_hold(held["login"])
