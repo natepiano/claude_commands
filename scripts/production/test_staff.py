@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
-from scripts.lib import durable
 from scripts.production import staff
 
 
@@ -477,7 +476,7 @@ class StaffTests(unittest.TestCase):
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertIsNone(staff.by_path("interrupted"))
         self.assertIsNotNone(staff.by_path("sdlc/models/impl1"))
-        self.assertEqual(list(self.staff_file.parent.glob(".staff.json.*.tmp")), [])
+        self.assertEqual(list(self.staff_file.parent.glob(".staff.json.*")), [])
 
     def test_unchanged_rerun_syncs_folder_after_replace_sync_failure(self) -> None:
         _ = self.tree()
@@ -492,7 +491,7 @@ class StaffTests(unittest.TestCase):
                     raise OSError("injected folder sync failure")
             sync(descriptor)
 
-        with mock.patch("scripts.lib.durable.os.fsync", side_effect=fail_first_folder_sync):
+        with mock.patch("scripts.lib.atomic_file.os.fsync", side_effect=fail_first_folder_sync):
             with self.assertRaisesRegex(staff.StaffUnreadable, "injected folder sync failure"):
                 _ = staff.ensure("showrunner", name="recovered")
             after = self.staff_file.read_bytes()
@@ -505,20 +504,7 @@ class StaffTests(unittest.TestCase):
             self.assertIn("unchanged", errors.getvalue())
             self.assertEqual(synced_versions, [after, after])
         self.assertEqual(self.staff_file.read_bytes(), after)
-        self.assertEqual(list(self.staff_file.parent.glob(".staff.json.*.tmp")), [])
-
-    def test_durable_text_write_preserves_previous_file_when_content_sync_fails(self) -> None:
-        path = self.root / "shared" / "note.txt"
-        durable.write_text(path, "old text\n")
-        before = path.read_bytes()
-        with mock.patch("scripts.lib.durable.os.fsync", side_effect=OSError("injected content sync failure")):
-            with self.assertRaisesRegex(OSError, "injected content sync failure"):
-                durable.write_text(path, "replacement \N{SNOWMAN}\n")
-        self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(list(path.parent.glob(".note.txt.*.tmp")), [])
-        durable.write_text(path, "replacement \N{SNOWMAN}\n")
-        self.assertEqual(path.read_text(encoding="utf-8"), "replacement \N{SNOWMAN}\n")
-        self.assertEqual(list(path.parent.glob(".note.txt.*.tmp")), [])
+        self.assertEqual(list(self.staff_file.parent.glob(".staff.json.*")), [])
 
     def test_next_write_removes_temp_left_by_a_killed_writer(self) -> None:
         _ = self.tree()
@@ -529,7 +515,7 @@ class StaffTests(unittest.TestCase):
         )
         self.assertEqual(killed.returncode, 73, killed.stderr)
         self.assertEqual(self.staff_file.read_bytes(), before)
-        orphans = list(self.staff_file.parent.glob(".staff.json.*.tmp"))
+        orphans = list(self.staff_file.parent.glob(".staff.json.*"))
         self.assertTrue(orphans, "writer did not leave a temp file before os.replace")
         unrelated = self.staff_file.parent / "keep.tmp"
         _ = unrelated.write_text("unrelated")

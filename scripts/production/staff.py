@@ -19,7 +19,7 @@ from typing import Literal, NewType, cast
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import durable  # noqa: E402
+from scripts.lib import atomic_file  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
 
 OWNER_MACHINE = "natedev"
@@ -262,7 +262,7 @@ def find(*, kind: Kind | None = None, parent: StaffId | None = None) -> list[Sta
 def _store(rows: list[StaffRow]) -> None:
     content = json.dumps({"schema": 1, "rows": [row.to_json() for row in rows]},
                          indent=2, sort_keys=True) + "\n"
-    durable.write_text(_file(), content)
+    atomic_file.write_text_atomic(_file(), content)
 
 
 def _transaction(edit: Callable[[list[StaffRow]], StaffRow | None]) -> StaffRow | None:
@@ -271,7 +271,7 @@ def _transaction(edit: Callable[[list[StaffRow]], StaffRow | None]) -> StaffRow 
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.with_name(path.name + ".lock").open("a", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            for temporary in path.parent.glob(f".{path.name}.*.tmp"):
+            for temporary in path.parent.glob(f".{path.name}.*"):
                 temporary.unlink()
             original = _load(initial=True)
             proposed = list(original)
@@ -280,7 +280,7 @@ def _transaction(edit: Callable[[list[StaffRow]], StaffRow | None]) -> StaffRow 
             proposed.sort(key=lambda row: row.id)
             if proposed == original:
                 # A prior replace may have succeeded before its folder sync failed.
-                durable.sync_folder(path.parent)
+                atomic_file.sync_folder(path.parent)
                 print("unchanged", file=sys.stderr)
             else:
                 _store(proposed)

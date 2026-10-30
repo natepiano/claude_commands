@@ -149,7 +149,7 @@ Each item is my call under the decision criteria unless it names the user. A one
 **Files:**
 - `scripts/production/staff.py` — new: the row, `WorkerName`, `WorkerRole`, the rules, the read and write API, `OWNER_MACHINE`, the exceptions, the CLI.
 - `scripts/production/test_staff.py` — new: the tests in the Acceptance gate, with a fake `ssh` on `PATH` for the Mac path.
-- `scripts/lib/durable.py` — new: `write_text` (temp file in the same folder, `fsync`, `os.replace`, folder `fsync`) and `sync_folder`, the one durable text writer.
+- `scripts/lib/atomic_file.py` — the shared text writer: `write_text_atomic` now syncs the folder after `os.replace`, and the new `sync_folder` does that step alone; `scripts/lib/test_atomic_file.py` pins both.
 - `scripts/shutdown/remote.py` — read only: `other_machine()` (:25).
 
 **Workers:** `2 writers` — no test lane; the tests split from the module.
