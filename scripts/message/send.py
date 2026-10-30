@@ -42,8 +42,9 @@ it reaches them is `user()`'s business: no caller names the channel.
 
 `--key` names a message. With `--repeat-minutes`, a send with the same key to the
 same recipient inside the window is skipped; `ack` skips every later send with
-the key until `reopen`. The window counts from the last attempt, delivered or
-not, as the queue keeps what did not arrive. While the user's silence is on, a
+the key until `reopen`. A failed send does not count. A delivered send or a
+message kept for later delivery holds the window, so a retry cannot deliver a
+queued copy twice. While the user's silence is on, a
 kept push with the same key from the same sender replaces the older kept one.
 
 One event sends one emergency push. An emergency push (`--to user --need blocked`)
@@ -234,6 +235,41 @@ Outcome = Literal["sent", "skipped", "queued", "failed", "refused", "held", "rep
 Need = Literal["note", "decision", "blocked"]
 CHANNEL_PRIORITY: dict[Need, str] = {"note": "0", "decision": "1", "blocked": "2"}
 EXIT: dict[Outcome, int] = {"sent": 0, "skipped": 0, "queued": 1, "failed": 3, "refused": 2, "held": 4, "replaced": 0, "kept": 0}
+OUTCOME_HEADERS: dict[str, Outcome] = {outcome.upper(): outcome for outcome in EXIT}
+_ACKNOWLEDGED_AT = " acknowledged at "
+
+
+@dataclass(frozen=True)
+class OutcomeHeader:
+    """The first send result and the payload that follows it."""
+    outcome: Outcome
+    detail: str
+    payload: str
+
+
+@dataclass(frozen=True)
+class NoOutcomeHeader:
+    """The command output contains no send result."""
+
+
+def parse_outcome(stdout: str) -> OutcomeHeader | NoOutcomeHeader:
+    """Read the first outcome header; later headers are payload text."""
+    lines = stdout.removesuffix("\n").split("\n")
+    for index, line in enumerate(lines):
+        word, _, detail = line.partition(": ")
+        if word in OUTCOME_HEADERS:
+            return OutcomeHeader(OUTCOME_HEADERS[word], detail, "\n".join(lines[index + 1:]))
+    return NoOutcomeHeader()
+
+
+def acknowledged_skip_reason(key: str, at: str) -> str:
+    """Name the acknowledgement that prevents a keyed send."""
+    return f"key {key!r}{_ACKNOWLEDGED_AT}{at}; `send.py reopen` to resume"
+
+
+def is_acknowledged_skip(reason: str) -> bool:
+    """Distinguish an acknowledged skip from a repeat-window skip."""
+    return _ACKNOWLEDGED_AT in reason
 
 LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to": str, "key": str | None,
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
@@ -281,7 +317,7 @@ QueuedMessage = KeyedMessage | UnkeyedMessage
 
 
 class KeyState(TypedDict):
-    # Recipient -> UTC ISO time of the last attempt, delivered or not; for a user emergency push, the last one sent.
+    # Recipient -> UTC ISO time of the claimed send; a failed send releases its claim.
     last: dict[str, str]
     acknowledged: NotRequired[str]
 
@@ -940,7 +976,7 @@ def claim(message: Message, repeat: timedelta | None, at: datetime, *, live: boo
     with key_states() as states:
         state = states.setdefault(message.key, {"last": {}})
         if "acknowledged" in state:
-            return f"key {message.key!r} acknowledged at {state['acknowledged']}; `send.py reopen` to resume"
+            return acknowledged_skip_reason(message.key, state["acknowledged"])
         last = state["last"].get(message.to)
         if repeat is not None and last is not None and at - datetime.fromisoformat(last) < repeat:
             if live:
@@ -1702,17 +1738,14 @@ def remote(message: Message, host: str, options: Options) -> Result:
             raise AssertionError("a user message must state its action")
         failure = reviewed_failure(err, FailedPush(message.summary, options.action, message.text, need=options.need),
                                    prefix="send.py: failed push JSON: ", machine=host, remote_record=True)
-    lines = out.removesuffix("\n").split("\n")
-    headers = [(index, line.partition(": ")) for index, line in enumerate(lines)
-               if line.partition(": ")[0] in ("SENT", "HELD", "SKIPPED", "QUEUED", "FAILED", "REFUSED", "REPLACED", "KEPT")]
-    if not headers:
+    parsed = parse_outcome(out)
+    if isinstance(parsed, NoOutcomeHeader):
         why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
         return Result("held" if isinstance(failure, FailedPush) and failure.held else "failed", f"ssh {host}: {why}", failure)
-    index, (word, _, detail) = headers[0]
-    payload = "\n".join(lines[index + 1:])
-    if payload:
-        detail += "\n" + payload
-    return Result(cast(Outcome, word.lower()), f"on {host}: {detail}", failure)
+    detail = parsed.detail
+    if parsed.payload:
+        detail += "\n" + parsed.payload
+    return Result(parsed.outcome, f"on {host}: {detail}", failure)
 
 
 # ---------------------------------------------------------------------------
@@ -1921,7 +1954,8 @@ def parse(argv: list[str]) -> Options:
     _ = clears.add_argument("--self-clearing", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--key", help=("names the message for --repeat-minutes, ack and the queue; a kept push to"
                                            + " the user replaces an older kept one with this key from the same sender"))
-    _ = parser.add_argument("--repeat-minutes", type=float, help="skip a send with --key inside this window")
+    _ = parser.add_argument("--repeat-minutes", type=float,
+                           help="skip a delivered or kept send with --key inside this window; failed sends do not count")
     location = parser.add_mutually_exclusive_group()
     _ = location.add_argument("--machine", help="deliver from this ssh host instead (mac)")
     _ = location.add_argument("--here", action="store_true", help="resolve and deliver only here")
@@ -2221,8 +2255,9 @@ def send(options: Options) -> Result:
     if result.outcome == "sent" and message.key is not None:
         for recipient in dict.fromkeys((message.to, options.to)):
             _ = remove_queued_key(recipient, message.key)
-    # An emergency push that did not go out is not live: its resend goes out.
-    if live and key is not None and not refused and held is None and skip is None and result.outcome != "sent":
+    # A failed send can retry. A queue or kept push owns its copy until delivery.
+    if (key is not None and not refused and held is None and skip is None
+            and result.outcome in {"failed", "refused", "held"}):
         forget_sent(key, message.to, started)
     if emergency and options.clears_when and key is not None and result.outcome == "sent":
         posted_on = options.scope.host if isinstance(options.scope, NamedMachine) else machine()

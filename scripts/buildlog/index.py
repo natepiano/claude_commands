@@ -22,15 +22,17 @@ import os
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import BinaryIO, cast
 from urllib.parse import quote
 
 import store
+import parse
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 25
 # Step and call fields under a former name, read as the current name.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
@@ -64,7 +66,12 @@ STEP_COLUMNS: list[Column] = [
     ("slice", "TEXT", "builds when the scope ran, fallback when it failed, none when no scope was tried"),
     ("step", "TEXT", "clippy, mend, doc, fmt, nextest, check, sweep, or the program run"),
     ("argv", "TEXT", "the command as a JSON array"),
+    ("build_base", "TEXT", "normalized cargo command, profile, target, package scope and features; NULL for non-cargo"),
+    ("build_items", "TEXT", "sorted JSON target selectors; [] for cargo's default selection, NULL for non-cargo"),
     ("cwd", "TEXT", "where it ran"),
+    ("target_dir", "TEXT NOT NULL", "absolute CARGO_TARGET_DIR, unset when absent, unknown for older records"),
+    ("target_folder", "TEXT", "target_dir when an absolute path, else worktree, else cwd"),
+    ("repo_identity", "TEXT NOT NULL", "admission's repository key, or unknown"),
     ("repo_path", "TEXT", "the repo every worktree shares (parent of the git common dir)"),
     ("repo", "TEXT", "repo_path's folder name: hana, cargo-port, ..."),
     ("worktree", "TEXT", "the worktree's top folder"),
@@ -91,6 +98,7 @@ STEP_COLUMNS: list[Column] = [
     ("mem_stall_full_s", "REAL", "seconds every task waited on memory; natedev only"),
     ("finished_s", "REAL", "cargo's own 'Finished ... in' build time (mend: its check time)"),
     ("crates_compiled", "INTEGER", "Compiling/Checking/Documenting lines"),
+    ("compiled_crate_names", "TEXT", "JSON crate names in counted log order; NULL when unmeasured"),
     ("warnings", "INTEGER", "distinct warning diagnostics"),
     ("errors", "INTEGER", "distinct error diagnostics"),
     ("tests_run", "INTEGER", "nextest Summary: tests run"),
@@ -104,6 +112,8 @@ STEP_COLUMNS: list[Column] = [
     ("mend_s", "REAL", "mend's own analysis time"),
     ("sweep_freed_bytes", "INTEGER", "bytes lint sweep removed"),
     ("log", "TEXT", "gzipped output of a failed step, relative to the root"),
+    ("started_at_us", "INTEGER", "UTC epoch microseconds; strict instant order for build history"),
+    ("test_build_key", "TEXT", "verify test Cargo build-input key, excluding nextest run-only selection; NULL for older or changed builds"),
 ]
 
 TEST_COLUMNS: list[Column] = [
@@ -449,6 +459,7 @@ def create_schema(connection: sqlite3.Connection) -> None:
     statements.append("CREATE INDEX hold_events_target_at ON hold_events (target, at)")
     statements.append("CREATE INDEX steps_started ON steps (started_at)")
     statements.append("CREATE INDEX steps_host_started ON steps (host, started_at)")
+    statements.append("CREATE INDEX steps_build_history ON steps (host, target_folder, build_base, started_at_us)")
     statements.append("CREATE INDEX steps_tree ON steps (worktree, step, tree_key)")
     statements.append("CREATE INDEX steps_call ON steps (call_id)")
     statements.append("CREATE INDEX tests_step ON tests (step_id)")
@@ -495,6 +506,20 @@ def seconds_between(start: object, end: object) -> float | None:
     return round(elapsed, 3) if elapsed is not None else None
 
 
+def epoch_microseconds(value: object) -> int | None:
+    """Normalize a recorded UTC timestamp once at the SQLite boundary."""
+    if not isinstance(value, str):
+        return None
+    try:
+        instant = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=UTC)
+    elapsed = instant - datetime(1970, 1, 1, tzinfo=UTC)
+    return (elapsed.days * 86400 + elapsed.seconds) * 1_000_000 + elapsed.microseconds
+
+
 def folder_name(path: object) -> str | None:
     return Path(path).name if isinstance(path, str) and path else None
 
@@ -515,12 +540,107 @@ def pick(record: dict[str, object], columns: list[Column]) -> dict[str, object]:
     return row
 
 
+@dataclass(frozen=True)
+class CargoBuildKey:
+    base: str
+    items: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NonCargoBuild:
+    pass
+
+
+def build_keys(argv: list[str]) -> CargoBuildKey | NonCargoBuild:
+    """The cargo build inputs, excluding test filters and execution-only options."""
+    words = parse.command_words(argv)
+    if not words or PurePath(words[0]).name != "cargo":
+        return NonCargoBuild()
+    position = 1
+    if position < len(words) and words[position].startswith("+"):
+        position += 1
+    if position >= len(words) or words[position].startswith("-"):
+        return NonCargoBuild()
+    command = words[position]
+    position += 1
+    if command == "nextest" and position < len(words) and words[position] == "run":
+        command = "test"
+        position += 1
+    value_options = {
+        "--profile": "profile", "--cargo-profile": "profile", "--target": "target",
+        "-p": "packages", "--package": "packages", "--exclude": "exclude",
+        "-F": "features", "--features": "features",
+        "--bin": "--bin", "--test": "--test", "--example": "--example", "--bench": "--bench",
+    }
+    item_flags = {"--lib", "--bins", "--tests", "--examples", "--benches", "--all-targets", "--doc"}
+    base_flags = {"--workspace", "--all", "--release", "--all-features", "--no-default-features"}
+    ignored_values = {
+        "-E", "--filter-expr", "--test-threads", "--retries", "-j", "--jobs", "--message-format",
+        "--manifest-path", "--target-dir", "--config", "--color", "--failure-output", "--success-output",
+        "--status-level", "--final-status-level",
+    }
+    values: dict[str, list[str]] = {}
+    flags: set[str] = set()
+    items: set[str] = set()
+    while position < len(words):
+        word = words[position]
+        position += 1
+        if word == "--":
+            break
+        name, equals, value = word.partition("=")
+        if not equals and word[:2] in ("-p", "-F") and len(word) > 2:
+            name, value, equals = word[:2], word[2:], "="
+        if name in ignored_values:
+            if not equals:
+                position += 1
+            continue
+        if name in value_options:
+            if not equals:
+                if position >= len(words):
+                    continue
+                value = words[position]
+                position += 1
+            key = value_options[name]
+            if key.startswith("--"):
+                items.add(f"{key} {value}")
+            else:
+                values.setdefault(key, []).extend(value.replace(",", " ").split() if key == "features" else [value])
+        elif word in item_flags:
+            items.add(word)
+        elif word in base_flags:
+            flags.add(word)
+    base = {
+        "command": command,
+        "profile": values.get("profile", ["release" if "--release" in flags else "test" if command == "test" else "dev"])[-1],
+        "target": sorted(set(values.get("target", []))),
+        "workspace": bool(flags & {"--workspace", "--all"}),
+        "packages": sorted(set(values.get("packages", []))),
+        "exclude": sorted(set(values.get("exclude", []))),
+        "features": sorted(set(values.get("features", []))),
+        "all_features": "--all-features" in flags,
+        "no_default_features": "--no-default-features" in flags,
+    }
+    return CargoBuildKey(json.dumps(base, sort_keys=True, separators=(",", ":")), tuple(sorted(items)))
+
+
 def add_step(connection: sqlite3.Connection, record: dict[str, object], src: str) -> None:
+    argv = record.get("argv")
+    target_dir = record.get("target_dir")
+    key = (build_keys(cast(list[str], argv))
+           if isinstance(argv, list) and all(isinstance(word, str) for word in cast(list[object], argv))
+           else NonCargoBuild())
     record = {
         **record,
         "src": src,
+        "started_at_us": epoch_microseconds(record.get("started_at")),
         "repo": folder_name(record.get("repo_path")),
         "worktree_name": folder_name(record.get("worktree")),
+        "target_dir": target_dir or store.UNKNOWN_IDENTITY,
+        "repo_identity": record.get("repo_identity") or store.UNKNOWN_IDENTITY,
+        "target_folder": (target_dir if isinstance(target_dir, str) and Path(target_dir).is_absolute()
+                          else record.get("worktree") or record.get("cwd")),
+        "build_base": key.base if isinstance(key, CargoBuildKey) else None,
+        "build_items": list(key.items) if isinstance(key, CargoBuildKey) else None,
     }
     insert(connection, "steps", pick(record, STEP_COLUMNS))
     _ = connection.execute("DELETE FROM tests WHERE step_id = ?", (record.get("id"),))

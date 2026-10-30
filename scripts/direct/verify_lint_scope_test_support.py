@@ -204,7 +204,22 @@ class VerifyLintScopeFixture(unittest.TestCase):
         targets = self.root / "build-targets.py"
         self.write_executable(targets, 'import sys\nif sys.argv[1] == "eligible": print("natedev_only test target\\nnatedev\\teligible\\t-\\t-")\n')
         assertion_guard = self.root / "assertion-guard.py"
-        self.write_executable(assertion_guard, "raise SystemExit(0)\n")
+        self.write_executable(assertion_guard, '''
+class GuardError(Exception):
+    pass
+
+def default_base(repo, explicit_base=""):
+    return "fixture-base"
+
+def git(repo, *arguments):
+    return "fixture-head\\n" if arguments[0] == "rev-parse" else ""
+
+def read_rulings(sources, messages):
+    return {}
+
+if __name__ == "__main__":
+    raise SystemExit(0)
+''')
         for name in ("ssh", "rsync", "scp", "gh", "systemd-run"):
             self.write_shell(bin_directory / name, "exit 99\n")
         for directory in ("tmp", "state", "cache", "runtime", "target", "cargo-home", ".git", "cgroup"):

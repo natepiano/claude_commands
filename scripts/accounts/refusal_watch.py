@@ -12,7 +12,7 @@ import socket
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
@@ -77,17 +77,9 @@ class ContinuationNotDelivered:
     reason: str
 
 
-class LiveMessageSent(TypedDict):
-    kind: Literal["sent"]
-
-
-class LiveMessageQueued(TypedDict):
-    kind: Literal["queued"]
-    reason: str
-
-
 class LiveSessionMessenger(Protocol):
-    def send_message(self, recipient: str, summary: str, text: str, *, key: str = "") -> LiveMessageSent | LiveMessageQueued: ...
+    def send_message(self, recipient: str, summary: str, text: str, *, key: str = "") -> Mapping[str, str]: ...
+    def message_was_delivered(self, outcome: Mapping[str, object]) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -772,9 +764,9 @@ def _continue_session(session_id: str, entry_id: str) -> ContinuationDelivered |
             key=f"quota-continue-{session_id}-{entry_id}")
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         return ContinuationNotDelivered(str(error).splitlines()[0] if str(error) else type(error).__name__)
-    if delivery["kind"] == "sent":
+    if messenger.message_was_delivered(delivery):
         return ContinuationDelivered()
-    return ContinuationNotDelivered((delivery["reason"].splitlines() or ["queued"])[0])
+    return ContinuationNotDelivered((delivery.get("reason", "send not delivered").splitlines() or ["queued"])[0])
 
 
 def _reading_values_fingerprint() -> str:
@@ -833,6 +825,28 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
         if isinstance(identity := accounts.account_identity(Path(session.get("config_dir", str(accounts.main_config_dir())))),
                       agent_accounts.NumberedAccount))
     tick_excluded = accounts.account_labels_for_logins(tick_logins)
+    journaled_waits: dict[str, moves.WaitedMove] = {}
+    for session in owners:
+        session_id = session["session_id"]
+        refusal = detected[session_id]
+        previous = state["sessions"].get(session_id)
+        if (isinstance(refusal, NoSessionRefusal) or not previous or previous["entry_id"] != refusal.entry_id
+                or previous["state"] not in ("retry", "no room", "waited")):
+            continue
+        wait_reset = refusal.reset
+        if isinstance(wait_reset, refusals.NoResetKnown) and "refusal" in previous and "reset" in previous["refusal"]:
+            wait_reset = refusals.KnownReset(datetime.fromisoformat(previous["refusal"]["reset"]))
+        if not isinstance(wait_reset, refusals.KnownReset):
+            continue
+        journaled_wait = next((entry for entry in entries if entry["tool"] == "claude"
+            and entry["kind"] == "waited" and entry["subject"].split(": ", 1)[0] == session_id
+            and entry["reset"] == wait_reset.at.isoformat()
+            and datetime.fromisoformat(entry["at"]) >= refusal.refused_at.at), None)
+        if journaled_wait is not None:
+            journaled_waits[session_id] = journaled_wait
+            if previous["state"] in ("retry", "no room") and not dry_run:
+                # Restore the saved wait before destination preparation can block its continuation.
+                _set_transition(state, session_id, refusal.entry_id, "waited", journaled_wait["move_id"])
     # Preview preparation judges repairs without changing any account content.
     for session in owners:
         group_name = accounts.session_group(session)
@@ -882,13 +896,16 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 lines.append(f"{group_name}: move refused: {prepared.reason}")
     for session in owners:
         session_id = session["session_id"]
-        if session_id in open_ids or accounts.session_group(session) in blocked_groups | unconfigured:
+        if session_id in open_ids:
             continue
         refusal = detected[session_id]
         if isinstance(refusal, NoSessionRefusal):
             continue
         previous = state["sessions"].get(session_id)
         if previous and previous["entry_id"] == refusal.entry_id and previous["state"] in ("requested", "cancelled", "continued", "group selected"):
+            continue
+        if (accounts.session_group(session) in blocked_groups | unconfigured
+                and not (previous and previous["entry_id"] == refusal.entry_id and previous["state"] == "waited")):
             continue
         identity = accounts.account_identity(Path(session.get("config_dir", str(accounts.main_config_dir()))))
         if not isinstance(identity, agent_accounts.NumberedAccount):
@@ -920,6 +937,8 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 state["sessions"][session_id]["refusal"] = observation
                 _save_state(state)
         window, reset = account_refusal.window, account_refusal.reset
+        wait_reset = refusal.reset if isinstance(refusal.reset, refusals.KnownReset) else reset
+        journaled_wait = journaled_waits.get(session_id)
         if previous and previous["entry_id"] == refusal.entry_id and previous["state"] == "waited":
             waited = next((entry for entry in entries if entry["kind"] == "waited" and entry["move_id"] == previous["move_id"]), None)
             if waited is not None and datetime.fromisoformat(waited["reset"]) <= now:
@@ -936,15 +955,13 @@ def _run(now: datetime, dry_run: bool, proof_group: frozenset[str] = NO_SESSION_
                 continue
         if isinstance(refusal, TranscriptRefusal):
             refusing_logins.add(identity.login.casefold())
-        wait_reset = refusal.reset if isinstance(refusal.reset, refusals.KnownReset) else reset
         subject = session_id + ": " + session["name"]
         pending_head = accounts.session_group(session) in pending_groups
         if (isinstance(wait_reset, refusals.KnownReset) and (pending_head
                 or isinstance(window, refusals.KnownWindow) and window.name == "five_hour"
                 and timedelta(0) < wait_reset.at - now < timedelta(minutes=20))):
             lines.append(f"{session['name']}: refused; wait until {wait_reset.at.astimezone(agent_accounts.user_zone()).isoformat()}")
-            if not dry_run and not any(entry["tool"] == "claude" and entry["subject"].split(": ", 1)[0] == session_id
-                    and entry["kind"] == "waited" and entry["reset"] == wait_reset.at.isoformat() for entry in entries):
+            if not dry_run and journaled_wait is None:
                 move_id = uuid4().hex
                 moves.append_move(moves.WaitedMove(kind="waited", at=now.isoformat(), tool="claude",
                     subject=subject, move_id=move_id,
@@ -1168,10 +1185,6 @@ def recorded_auto_moves() -> RecordedAutoMoves | UnreadableAutoMoveHistory:
     return role_map.recorded_auto_moves(accounts.roles_history_file())
 
 
-def _recorded_auto_move_ids() -> RecordedAutoMoves | UnreadableAutoMoveHistory:
-    return recorded_auto_moves()
-
-
 def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
                    moved_groups: frozenset[accounts.ClaudeGroup] = NO_MOVED_GROUPS) -> list[str]:
     """Apply log entries after the refusal pass while holding the log lock."""
@@ -1194,7 +1207,8 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         del holds[entry_id]
     for entry_id in set(notices) - head_ids:
         del notices[entry_id]
-    recorded = _recorded_auto_move_ids()
+    recorded = role_map.repair_selected_auto_moves(tuple(role_map.AutoMoveTarget(rule.entry_id, rule.group, rule.to)
+        for rule in rules), now, dry_run=dry_run)
     if isinstance(recorded, UnreadableAutoMoveHistory):
         if not dry_run and state != original:
             _save_state(state)

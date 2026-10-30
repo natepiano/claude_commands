@@ -28,8 +28,23 @@ import holds
 from user_zone import user_zone
 import rust_release
 import sync
+from record import TARGET_DIR_UNSET
 from test_holds import timed_hold_events, write_holder, write_mac_block
 from test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
+from test_record_rerun import refresh_machine_health
+
+HISTORY_STAMP = "2026-09-30T12:00:00Z"
+
+
+def cargo_build(record_id: str, **fields: object) -> Record:
+    return step(record_id, **{
+        "step": "nextest",
+        "argv": ["cargo", "nextest", "run", "--workspace", "--bin", "hana"],
+        "duration_s": 20.0,
+        "finished_s": 10.0,
+        "crates_compiled": 1,
+        **fields,
+    })
 
 
 class CliWork(TypedDict):
@@ -236,6 +251,8 @@ class ReportTests(unittest.TestCase):
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
         point_root_at(self, self.root)
+        for host in ("natedev", "Mac"):
+            _ = refresh_machine_health(self, host, self.root, self.root)
         self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary}))
         _ = self.enterContext(mock.patch.object(subprocess, "run"))
         _ = self.enterContext(mock.patch.object(ci, "gh_get"))
@@ -922,12 +939,231 @@ class ReportTests(unittest.TestCase):
         self.assertIn("| cold (50+ crates) | 1 | 40.0 s | 50.0 s | 1.5 min | 40% | 43% |", section)
         self.assertFalse(any(line.startswith("nextest:") for line in section))
         self.assertNotIn("Edited-crate rebuilds by package (nextest):", section)
-        self.assertIn(
-            "Source: steps with a known crate count; compile is cargo's own \"Finished … in\" time, other is the rest of the step.",
-            section,
+        source = next(line for line in section if line.startswith("Source:"))
+        self.assertIn("steps with a known crate count", source)
+        self.assertIn("compile is cargo's own \"Finished … in\" time, other is the rest of the step", source)
+        for requirement in ("folder", "same target", "same features", "before"):
+            self.assertIn(requirement, source)
+
+    def test_first_build_row_includes_one_to_forty_nine_crates_but_zero_and_cold_keep_their_bins(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            *(cargo_build(f"first-{crates}", target_dir=f"/fresh/{crates}", crates_compiled=crates)
+              for crates in (0, 1, 3, 4, 49, 50)),
         )
+        section = self.rebuilds_lines()
+        for expected in (
+            "| none | 1 |", "| first build here (1–49 crates) | 4 |", "| cold (50+ crates) | 1 |",
+            "| edited crate (1–3 crates) | 0 |", "| cascade (4–49 crates) | 0 |",
+        ):
+            self.assertTrue(any(line.startswith(expected) for line in section), section)
+        self.assertNotIn("Edited-crate rebuilds by package (nextest):", section)
+
+    def test_finished_history_in_an_earlier_month_warms_the_same_target_folder_across_worktrees(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-09.jsonl",
+            cargo_build("previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                        target_dir="/shared/target", worktree="/old/checkout", finished_s=0.0, status=1,
+                        argv=["cargo", "test", "--workspace", "--bin", "hana", "--features", "trace,hana/dynamic_linking"]),
+        )
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            cargo_build("warm", target_dir="/shared/target", worktree="/new/checkout", branch="new", sha="newsha",
+                        argv=["cargo", "nextest", "run", "--all", "--bin=hana", "-F", "hana/dynamic_linking trace"]),
+        )
+        section = self.rebuilds_lines()
+        self.assertIn("| edited crate (1–3 crates) | 1 | 10.0 s | 10.0 s | 20.0 s | 100% | 100% |", section)
+        self.assertIn("| first build here (1–49 crates) | 0 | — | — | — | — | — |", section)
+
+    def test_other_folder_host_features_profile_or_unfinished_history_cannot_make_a_build_warm(self) -> None:
+        command = ["cargo", "nextest", "run", "--workspace", "--bin", "hana"]
+        cases: tuple[tuple[str, Record], ...] = (
+            ("other folder", {"target_dir": "/different/target"}),
+            ("other host", {"host": "Mac"}),
+            ("other features", {"argv": [*command, "--features", "hana/dynamic_linking"]}),
+            ("other profile", {"argv": [*command, "--release"]}),
+            ("other target", {"argv": [*command, "--target", "aarch64-unknown-linux-gnu"]}),
+            ("other package scope", {"argv": ["cargo", "nextest", "run", "-p", "hana", "--bin", "hana"]}),
+            ("other command", {"argv": ["cargo", "check", "--workspace", "--bin", "hana"]}),
+            ("unfinished", {"finished_s": None}),
+            ("same timestamp", {"started_at": STAMP, "ended_at": STAMP}),
+            ("future", {"started_at": "2026-10-03T12:00:00Z", "ended_at": "2026-10-03T12:00:00Z"}),
+            ("non cargo", {"argv": ["python3", "checker.py", "--workspace", "--bin", "hana"]}),
+        )
+        for name, changes in cases:
+            with self.subTest(history=name):
+                previous = cargo_build("previous", **{
+                    "started_at": HISTORY_STAMP, "ended_at": HISTORY_STAMP,
+                    "target_dir": "/shared/target", **changes,
+                })
+                for host in ("natedev", "Mac"):
+                    self.write(self.root / host / "history.jsonl", *([previous] if previous["host"] == host else []))
+                self.write(self.root / "natedev" / "2026-10.jsonl", cargo_build("current", target_dir="/shared/target"))
+                section = self.rebuilds_lines()
+                expected_count = 2 if name == "same timestamp" else 1
+                self.assertTrue(any(line.startswith(f"| first build here (1–49 crates) | {expected_count} |") for line in section), section)
+                self.assertIn("| edited crate (1–3 crates) | 0 | — | — | — | — | — |", section)
+
+    def test_target_coverage_combines_finished_history_and_group_selectors(self) -> None:
+        prefix = ["cargo", "nextest", "run", "--workspace"]
+        cases: tuple[tuple[str, list[list[str]], list[str], bool], ...] = (
+            ("union", [["--lib", "--test", "a"], ["--test", "b"]], ["--lib", "--test", "a", "--test", "b"], True),
+            ("uncovered", [["--lib", "--test", "a"]], ["--lib", "--test", "a", "--test", "b"], False),
+            ("default", [[]], [], True),
+            ("explicit does not cover default", [["--bin", "hana"]], [], False),
+            ("default does not cover explicit", [[]], ["--bin", "hana"], False),
+            ("bins covers named binary", [["--bins"]], ["--bin", "hana"], True),
+            ("tests covers named test", [["--tests"]], ["--test", "a"], True),
+            ("examples covers named example", [["--examples"]], ["--example", "demo"], True),
+            ("benches covers named bench", [["--benches"]], ["--bench", "speed"], True),
+            ("bins does not cover tests", [["--bins"]], ["--test", "a"], False),
+            ("named binary does not cover bins", [["--bin", "hana"]], ["--bins"], False),
+            ("named test does not cover tests", [["--test", "a"]], ["--tests"], False),
+            ("named example does not cover examples", [["--example", "demo"]], ["--examples"], False),
+            ("named bench does not cover benches", [["--bench", "speed"]], ["--benches"], False),
+            ("all targets covers default", [["--all-targets"]], [], True),
+            ("all targets covers every non-doc item", [["--all-targets"]],
+             ["--lib", "--bin", "hana", "--bins", "--test", "a", "--tests", "--example", "demo",
+              "--examples", "--bench", "speed", "--benches", "--all-targets"], True),
+            ("all targets does not cover docs", [["--all-targets"]], ["--doc"], False),
+            ("all targets plus docs covers docs", [["--all-targets"], ["--doc"]], ["--bin", "hana", "--doc"], True),
+        )
+        for name, prior_items, requested, warm in cases:
+            with self.subTest(coverage=name):
+                history = [cargo_build(f"previous-{number}", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                                       argv=[*prefix, *items]) for number, items in enumerate(prior_items)]
+                self.write(self.root / "natedev" / "2026-09.jsonl", *history)
+                self.write(self.root / "natedev" / "2026-10.jsonl", cargo_build("current", argv=[*prefix, *requested]))
+                section = self.rebuilds_lines()
+                label = "edited crate (1–3 crates)" if warm else "first build here (1–49 crates)"
+                self.assertTrue(any(line.startswith(f"| {label} | 1 |") for line in section), section)
+
+    def test_multi_target_history_warms_only_the_same_complete_target_set(self) -> None:
+        prefix = ["cargo", "nextest", "run", "--workspace", "--bin", "hana"]
+        cases: tuple[tuple[str, list[str], bool], ...] = (
+            ("same order", ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"], True),
+            ("reordered with duplicate", ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+                                           "x86_64-unknown-linux-gnu"], True),
+            ("last target alone", ["x86_64-unknown-linux-gnu"], False),
+            ("different pair with same last target", ["wasm32-unknown-unknown", "x86_64-unknown-linux-gnu"], False),
+            ("default target", [], False),
+        )
+        for name, targets, warm in cases:
+            with self.subTest(targets=name):
+                self.write(
+                    self.root / "natedev" / "2026-09.jsonl",
+                    cargo_build("previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                                argv=[*prefix, "--target", "aarch64-unknown-linux-gnu",
+                                      "--target", "x86_64-unknown-linux-gnu"]),
+                )
+                self.write(
+                    self.root / "natedev" / "2026-10.jsonl",
+                    cargo_build("current", argv=[*prefix, *(f"--target={target}" for target in targets)]),
+                )
+                section = self.rebuilds_lines()
+                warm_count, first_count = (1, 0) if warm else (0, 1)
+                self.assertTrue(any(line.startswith(f"| edited crate (1–3 crates) | {warm_count} |") for line in section), section)
+                self.assertTrue(any(line.startswith(f"| first build here (1–49 crates) | {first_count} |") for line in section), section)
+
+    def test_warm_history_compares_instants_instead_of_fractional_timestamp_spelling(self) -> None:
+        prefix = "2026-10-02T12:08:45"
+        cases = (
+            ("earlier whole second", "Z", ".123Z", True),
+            ("later fractional second", ".123Z", "Z", False),
+            ("equal instant fractional history", ".000Z", "Z", False),
+            ("equal instant whole-second history", "Z", ".000Z", False),
+            ("equal instant longer history fraction", ".123000Z", ".123Z", False),
+            ("equal instant shorter history fraction", ".123Z", ".123000Z", False),
+            ("earlier microsecond", ".123000Z", ".123001Z", True),
+            ("later microsecond", ".123001Z", ".123000Z", False),
+        )
+        for name, previous_suffix, current_suffix, warm in cases:
+            with self.subTest(history=name):
+                previous_at, current_at = prefix + previous_suffix, prefix + current_suffix
+                self.write(
+                    self.root / "natedev" / "2026-10.jsonl",
+                    cargo_build("previous", started_at=previous_at, ended_at=previous_at, crates_compiled=None),
+                    cargo_build("current", started_at=current_at, ended_at=current_at, caller="verify"),
+                )
+                section = self.rebuilds_lines(local_day(current_at))
+                label = "edited crate (1–3 crates)" if warm else "first build here (1–49 crates)"
+                other_label = "first build here (1–49 crates)" if warm else "edited crate (1–3 crates)"
+                self.assertTrue(any(line.startswith(f"| {label} | 1 |") for line in section), section)
+                self.assertTrue(any(line.startswith(f"| {other_label} | 0 |") for line in section), section)
+                with closing(index.read_only()) as connection:
+                    groups = report.profile_step_durations(connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC))
+                self.assertEqual(groups[("nextest", "verify", label)], [20.0])
+                self.assertNotIn(("nextest", "verify", other_label), groups)
+
+    def test_hana_group_history_warms_filtered_binary_in_all_rebuild_callers(self) -> None:
+        prefix = ["cargo", "nextest", "run", "--workspace"]
+        self.write(
+            self.root / "natedev" / "2026-09.jsonl",
+            cargo_build("previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                        target_dir=TARGET_DIR_UNSET, worktree="/worktrees/hana", cwd="/worktrees/hana",
+                        argv=[*prefix, "--lib", "--bins", "--tests", "--features", "hana/dynamic_linking"]),
+        )
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            cargo_build("current", caller="verify", target_dir=TARGET_DIR_UNSET, worktree="/worktrees/hana", cwd="/worktrees/hana",
+                        argv=[*prefix, "--bin", "hana", "-E", "package(hana)", "--features", "hana/dynamic_linking"]),
+        )
+        section = self.rebuilds_lines()
+        self.assertIn("| edited crate (1–3 crates) | 1 | 10.0 s | 10.0 s | 20.0 s | 100% | 100% |", section)
+        self.assertIn("| first build here (1–49 crates) | 0 | — | — | — | — | — |", section)
+        self.assertIn("| hana | 1 | 10.0 s | 10.0 s | 10.0 s |", section)
+        with closing(index.read_only()) as connection:
+            groups = report.profile_step_durations(connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC))
+        self.assertEqual(groups[("nextest", "verify", "edited crate (1–3 crates)")], [20.0])
+        self.assertNotIn(("nextest", "verify", "first build here (1–49 crates)"), groups)
+
+    def test_rebuild_package_and_profile_callers_use_the_same_warm_classification(self) -> None:
+        self.write(
+            self.root / "natedev" / "2026-09.jsonl",
+            cargo_build("previous-bin", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP),
+            cargo_build("previous-tests", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                        argv=["cargo", "nextest", "run", "--workspace", "--tests"]),
+        )
+        self.write(
+            self.root / "natedev" / "2026-10.jsonl",
+            cargo_build("warm-edited", caller="verify", argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana", "-E", "package(warm)"]),
+            cargo_build("warm-cascade", caller="verify", crates_compiled=4, duration_s=40.0, finished_s=20.0,
+                        argv=["cargo", "nextest", "run", "--workspace", "--tests"]),
+            cargo_build("first-edited", caller="verify", target_dir="/fresh/one", duration_s=338.0, finished_s=300.0,
+                        argv=["cargo", "nextest", "run", "--workspace", "--bin", "hana", "-E", "package(first)"]),
+            cargo_build("first-cascade", caller="verify", target_dir="/fresh/two", crates_compiled=4, duration_s=711.0, finished_s=700.0),
+        )
+        section = self.rebuilds_lines()
+        for prefix in ("| edited crate (1–3 crates) | 1 |", "| cascade (4–49 crates) | 1 |", "| first build here (1–49 crates) | 2 |"):
+            self.assertTrue(any(line.startswith(prefix) for line in section), section)
+        title = section.index("Edited-crate rebuilds by package (nextest):")
+        packages = [line for line in section[title + 1:] if line.startswith("|")]
+        self.assertEqual(packages[2:], ["| warm | 1 | 10.0 s | 10.0 s | 10.0 s |"])
+        with closing(index.read_only()) as connection:
+            groups = report.profile_step_durations(connection, datetime(2026, 10, 2, tzinfo=UTC), datetime(2026, 10, 3, tzinfo=UTC))
+        self.assertEqual(groups[("nextest", "verify", "edited crate (1–3 crates)")], [20.0])
+        self.assertEqual(groups[("nextest", "verify", "cascade (4–49 crates)")], [40.0])
+        self.assertCountEqual(groups[("nextest", "verify", "first build here (1–49 crates)")], [338.0, 711.0])
+
+    def test_unfinished_and_future_items_cannot_complete_the_historical_union(self) -> None:
+        prefix = ["cargo", "nextest", "run", "--workspace"]
+        self.write(
+            self.root / "natedev" / "history.jsonl",
+            cargo_build("finished-a", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP, argv=[*prefix, "--test", "a"]),
+            cargo_build("unfinished-b", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP, finished_s=None,
+                        argv=[*prefix, "--test", "b"]),
+            cargo_build("future-b", started_at="2026-10-03T12:00:00Z", ended_at="2026-10-03T12:00:00Z",
+                        argv=[*prefix, "--test", "b"]),
+        )
+        self.write(self.root / "natedev" / "2026-10.jsonl", cargo_build("current", argv=[*prefix, "--test", "a", "--test", "b"]))
+        section = self.rebuilds_lines()
+        self.assertTrue(any(line.startswith("| first build here (1–49 crates) | 1 |") for line in section), section)
+        self.assertIn("| edited crate (1–3 crates) | 0 | — | — | — | — | — |", section)
 
     def test_nextest_rebuilds_show_packages_top_five_and_empty_cold_bin(self) -> None:
+        self.write(self.root / "natedev" / "2026-09.jsonl", cargo_build(
+            "previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP, argv=["cargo", "nextest", "run"],
+        ))
         package_steps = [
             ("hana-short", "package(hana)", 10.0, 1),
             ("hana-complex", "package(hana) & (test(a) | test(b))", 30.0, 3),
@@ -967,6 +1203,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(section[3], "")
         self.assertEqual(section[4], "| Rebuild | Steps | Compile | Other | Total | Share of compile | Share of time |")
         title = section.index("Edited-crate rebuilds by package (nextest):")
+        package_source = next(line for line in section[title + 1:] if line.startswith("Source:"))
+        self.assertTrue(package_source.startswith("Source: warm nextest steps"), package_source)
         package_table = [line for line in section[title + 1:] if line.startswith("|")]
         self.assertEqual(package_table[0], "| Package | Steps | p50 | p95 | Compile |")
         self.assertEqual(package_table[2:], [
@@ -979,9 +1217,12 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(any("delta" in line or "epsilon" in line or "zeta" in line for line in package_table))
 
     def test_each_rebuild_table_is_followed_immediately_by_its_source_and_a_blank_line(self) -> None:
+        self.write(self.root / "natedev" / "2026-09.jsonl", cargo_build(
+            "previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP, argv=["cargo", "nextest", "run"],
+        ))
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
-            step("edited", step="nextest", argv=["package(hana)"], duration_s=20.0, finished_s=10.0, crates_compiled=1),
+            step("edited", step="nextest", argv=["cargo", "nextest", "run", "-E", "package(hana)"], duration_s=20.0, finished_s=10.0, crates_compiled=1),
         )
 
         section = self.rebuilds_lines()
@@ -1742,6 +1983,9 @@ class ReportTests(unittest.TestCase):
         )
 
     def test_offloaded_steps_stay_out_of_every_natedev_query(self) -> None:
+        self.write(self.root / "natedev" / "2026-09.jsonl", cargo_build(
+            "previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP, argv=["cargo", "nextest", "run"],
+        ))
         self.write(
             self.root / "natedev" / "2026-10.jsonl",
             call(
@@ -2803,7 +3047,8 @@ class PowerProfileTests(unittest.TestCase):
     def test_rows_match_kind_caller_and_rebuild_class_with_counts_and_busiest_first(self) -> None:
         before = "2026-10-12T12:00:00.000Z"
         after = "2026-10-13T12:00:00.000Z"
-        records = [self.profiled(after)]
+        records = [self.profiled(after), cargo_build("previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                                                  argv=["cargo", "clippy", "--workspace"])]
         groups = (
             ("nextest", "verify", 1, 10, 12),
             ("nextest", "verify", 4, 2, 3),
@@ -2875,7 +3120,9 @@ class PowerProfileTests(unittest.TestCase):
         self.assertEqual(self.rows(self.section())[0][3:], ["4", "20.0 s", "4", "50.0 s", "—"])
 
     def test_mac_failed_and_sweep_steps_do_not_enter_comparisons(self) -> None:
-        records = [self.profiled("2026-10-13T12:00:00.000Z")]
+        records = [self.profiled("2026-10-13T12:00:00.000Z"),
+                   cargo_build("previous", started_at=HISTORY_STAMP, ended_at=HISTORY_STAMP,
+                               argv=["cargo", "clippy", "--workspace"])]
         for side, at in (("before", "2026-10-12T12:00:00.000Z"), ("after", "2026-10-13T12:00:00.000Z")):
             records.extend(self.runs(side, at, 1, 20))
             records.extend((step(f"mac-{side}", started_at=at, host="macbook", step="nextest",

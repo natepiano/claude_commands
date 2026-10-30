@@ -95,11 +95,41 @@ def member(selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound
     return _member_sources().member(selector, record)
 
 
-def _initial_snapshot() -> staff.StaffSnapshot:
-    try:
-        return staff.snapshot()
-    except staff.StaffAbsent:
-        return staff.StaffSnapshot(())
+@dataclass(frozen=True)
+class UnitProduction:
+    """The current parent and its source document, resolved from the staff edge."""
+
+    slug: str
+    doc: str
+
+
+def _unit_member(unit: str, session_id: str, record: staff.StaffSnapshot,
+                 sources: _MemberSources) -> staff.StaffRow:
+    launches = [launch for launch in sources.launches
+                if session_id and launch["session_id"] == session_id]
+    if launches:
+        environment = max(launches, key=lambda launch: launch["written_at"])["environment"]
+        found = sources.member(UnitMember(environment.get("SHOWRUNNER_UNIT", ""),
+                                          environment.get("SHOWRUNNER_UNIT_ID", unit)), record)
+        members = [found.row] if isinstance(found, MemberFound) else []
+    else:
+        members = list({found.row.id: found.row for slug in sources.productions
+                        if isinstance(found := sources.member(UnitMember(slug, unit), record), MemberFound)}.values())
+    if len(members) != 1:
+        raise staff.StaffUnreadable(f"{unit}: no unique staff entry")
+    return members[0]
+
+
+def unit_parent(unit: str, session_id: str = "") -> UnitProduction:
+    """Resolve the current staff edge; old launch marks supply identity only."""
+    record, sources = staff.snapshot(), _member_sources()
+    parent = _unit_member(unit, session_id, record, sources).parent
+    parents = [source for slug, source in sources.productions.items()
+               if isinstance(found := sources.member(ShowrunnerMember(slug), record), MemberFound)
+               and found.row.id == parent]
+    if len(parents) != 1:
+        raise staff.StaffUnreadable(f"{unit}: staff parent has no unique production document")
+    return UnitProduction(parents[0].timer.slug, str(parents[0].timer.doc))
 
 
 def _showrunner_key(slug: str) -> str:
@@ -231,7 +261,7 @@ def _print_plan(seed_input: staff.SeedInput, record: staff.StaffSnapshot, *, dry
 def seed(*, dry_run: bool = False) -> None:
     """Read local evidence under the operation lock and apply it in one owner write."""
     with staff.operation():
-        record = _initial_snapshot()
+        record = staff.initial_snapshot()
         sources = _member_sources()
         seed_input = _collect(record, sources)
         changed = _print_plan(seed_input, record, dry_run=dry_run)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+from contextlib import closing
 import importlib
 import io
 import json
@@ -19,7 +20,7 @@ from contextlib import redirect_stderr
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, NoReturn, NotRequired, Protocol, TypedDict, cast
+from typing import BinaryIO, Literal, NoReturn, NotRequired, Protocol, TypedDict, cast
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -27,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
 from user_zone import user_zone
+from atomic_file import write_text_atomic
 
 
 class GitFacts(TypedDict):
@@ -45,6 +47,9 @@ class GitIdentityReader(Protocol):
     def git_facts(self, directory: str) -> GitFacts: ...
     def queue_bump(self, actor: str, session: str, step: str, folder: str,
                    old_position: int, at: float) -> None: ...
+    def head_admission(self, action: Literal["set", "admitted", "lapsed"], unit: str,
+                       step: str, need: int, free: int, reserve: int, why: str,
+                       set_by: str, at: float) -> None: ...
 
 
 class BuildLogStore(Protocol):
@@ -57,9 +62,14 @@ class BuildLogStore(Protocol):
     def host_file(self, host: str, epoch: float) -> Path: ...
 
 
+class BuildLogFileMarks(Protocol):
+    def marks(self, handle: BinaryIO, offset: int) -> str: ...
+
+
 parse: StepParser = cast(StepParser, cast(object, importlib.import_module("parse")))
 record: GitIdentityReader = cast(GitIdentityReader, cast(object, importlib.import_module("record")))
 store: BuildLogStore = cast(BuildLogStore, cast(object, importlib.import_module("store")))
+file_marks: BuildLogFileMarks = cast(BuildLogFileMarks, cast(object, importlib.import_module("index")))
 
 GIB = 1 << 30
 FALLBACK = 12 * GIB
@@ -271,6 +281,7 @@ class Waiter(TypedDict):
     holds_younger: NotRequired[bool]
     priority_since: NotRequired[float]
     estimated_at: NotRequired[float]
+    fresh_test: NotRequired[bool]
     repo_identity: NotRequired[str]
     repository_name: NotRequired[str]
     legacy_name: NotRequired[str]
@@ -280,6 +291,110 @@ class Waiter(TypedDict):
     need_source: NotRequired[NeedSource]
     need_runs: NotRequired[int]
     test_threads: NotRequired[int | None]
+
+
+class HeadAdmissionOverride(TypedDict):
+    waiter: str
+    pid: int
+    start_time: str
+    unit: str
+    step: str
+    need: int
+    free: int
+    reserve: int
+    why: str
+    set_by: str
+
+
+@dataclass(frozen=True)
+class NoHeadAdmissionOverride:
+    pass
+
+
+class AdmitHeadRefused(ValueError):
+    """The requested head override cannot be set."""
+
+
+class ShowrunnerRegistry(Protocol):
+    def production_of(self, session_id: str) -> Path | None: ...
+
+
+def showrunner_is_registered(session_id: str) -> bool:
+    # This path runs only for a privileged command, never on a check poll.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
+    showrunners = cast(ShowrunnerRegistry, cast(object, importlib.import_module("showrunners")))
+    return showrunners.production_of(session_id) is not None
+
+
+def require_showrunner() -> str:
+    """Return the registered Claude showrunner id or refuse the caller."""
+    if os.environ.get("CODEX_THREAD_ID"):
+        raise AdmitHeadRefused("only a registered showrunner session may run this command")
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not session or not showrunner_is_registered(session):
+        raise AdmitHeadRefused("only a registered showrunner session may run this command")
+    return session
+
+
+def head_override_path(directory: Path) -> Path:
+    return directory / "admit-head.json"
+
+
+def head_override_matches(override: HeadAdmissionOverride, path: Path, waiter: Waiter) -> bool:
+    return (path.name == override["waiter"] and waiter["pid"] == override["pid"]
+            and waiter["start_time"] == override["start_time"])
+
+
+def read_head_override(directory: Path) -> HeadAdmissionOverride | NoHeadAdmissionOverride:
+    try:
+        value = cast(object, json.loads(head_override_path(directory).read_text()))
+    except FileNotFoundError:
+        return NoHeadAdmissionOverride()
+    if not isinstance(value, dict):
+        raise ValueError("invalid admit-head record")
+    row = cast(dict[str, object], value)
+    if (any(not isinstance(row.get(key), str) for key in ("waiter", "start_time", "unit", "step", "why", "set_by"))
+            or any(not isinstance(row.get(key), int) or isinstance(row.get(key), bool)
+                   for key in ("pid", "need", "free", "reserve"))):
+        raise ValueError("invalid admit-head record")
+    return cast(HeadAdmissionOverride, cast(object, row))
+
+
+def head_override_event(action: Literal["set", "admitted", "lapsed"], override: HeadAdmissionOverride,
+                        need: int, free: int, reserve: int, at: float) -> None:
+    record.head_admission(action, override["unit"], override["step"], need, free,
+                          reserve, override["why"], override["set_by"], at)
+
+
+def end_head_override(directory: Path, action: Literal["admitted", "lapsed"], override: HeadAdmissionOverride,
+                      need: int, free: int, reserve: int, at: float) -> None:
+    head_override_event(action, override, need, free, reserve, at)
+    head_override_path(directory).unlink()
+
+
+def admit_head(why: str = "") -> str:
+    actor = require_showrunner()
+    directory = admission_dir(store.root())
+    with (directory / "lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        ordered = sorted(live_waiters(directory), key=lambda item: waiter_order(item[1]))
+        if not ordered:
+            raise AdmitHeadRefused("nothing waits; no head to admit")
+        path, row = ordered[0]
+        proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
+        identities = QueueIdentityReader(process_table(proc), proc)
+        identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
+        host = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
+        reserve = decide(host.available, host.total, row["need"], []).reserve
+        override: HeadAdmissionOverride = {
+            "waiter": path.name, "pid": row["pid"], "start_time": row["start_time"],
+            "unit": waiter_unit_name(identity, row["pid"]),
+            "step": row.get("step", ""), "need": row["need"], "free": host.available,
+            "reserve": reserve, "why": why, "set_by": actor,
+        }
+        write_text_atomic(head_override_path(directory), json.dumps(override, separators=(",", ":")))
+        head_override_event("set", override, row["need"], host.available, reserve, time.time())
+        return f"head admission set for {override['unit']} {override['step']}"
 
 
 @dataclass(frozen=True)
@@ -772,7 +887,8 @@ def test_threads(argv: list[str]) -> int | None:
 
 def expected_peak(repository: Repository, step: str, host: str, now: datetime, root: Path,
                   test_threads: int | None = None, *, scope: TestScope = "full",
-                  filters: tuple[str, ...] = (), package: str = "") -> ExpectedPeak:
+                  filters: tuple[str, ...] = (), package: str = "",
+                  fresh: bool = False) -> ExpectedPeak:
     """The p90 process-memory peak of a step over HISTORY_DAYS.
 
     The gate pools every test width: one width's history is thin and rebuild-heavy, and the
@@ -781,6 +897,11 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
     """
     if isinstance(repository, UnknownRepository):
         return ExpectedPeak(FALLBACK, "fallback", 0)
+    if fresh and step == "nextest" and package:
+        compile_peak = expected_peak(repository, step, host, now, root, test_threads,
+                                     scope=scope, filters=filters, package=package)
+        return fresh_test_peak(repository, step, host, now, root, test_threads,
+                               scope, tuple(sorted(set(filters))), package, compile_peak)
     if scope == "filtered" and package:
         filtered = filtered_peak(repository, step, host, now, root, test_threads,
                                  tuple(sorted(set(filters))), package)
@@ -856,7 +977,9 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
 
 
 def history_arguments(raw: object) -> list[str]:
-    """Decode argv from the build-log index; absent arguments prove no selection."""
+    """Decode indexed or canonical argv; absent arguments prove no selection."""
+    if isinstance(raw, list):
+        return [word for word in cast(list[object], raw) if isinstance(word, str)]
     if not isinstance(raw, str):
         return []
     try:
@@ -963,6 +1086,195 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
         return ExpectedPeak(max(FILTERED_FLOOR, int(percentile(compile_index) * ANON_SHARE)),
                             "buildlog", len(compile_index))
     return ExpectedPeak(FILTERED_FLOOR, "fallback", 0)
+
+
+def current_worktree_steps(root: Path, host: str, worktree: str,
+                          now: datetime) -> list[dict[str, object]]:
+    """Use a validated indexed prefix plus every newly appended recorder line.
+
+    The index is only an acceleration: missing, replaced or incompatible data
+    makes us read the canonical file instead. Partial or corrupt tails refuse
+    freshness rather than hiding a more recent build.
+    """
+    prefixes: dict[str, tuple[int, str]] = {}
+    indexed: dict[str, list[dict[str, object]]] = {}
+    try:
+        with closing(sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)) as connection:
+            _ = connection.execute("BEGIN")
+            prefixes = {path: (offset, marks) for path, offset, marks in cast(
+                list[tuple[str, int, str]], connection.execute("SELECT path, offset, marks FROM files").fetchall())}
+            columns = ("src", "started_at", "ended_at", "step", "argv", "test_build_key",
+                       "status", "tests_run", "sweep_freed_bytes")
+            cutoff = store.utc_iso((now - timedelta(days=1)).timestamp())
+            result = connection.execute(
+                "SELECT " + ", ".join(columns) + " FROM steps WHERE host = ? AND worktree = ? "
+                + "AND (ended_at >= ? OR started_at >= ?)", (host, worktree, cutoff, cutoff))
+            for values in cast(list[tuple[object, ...]], result.fetchall()):
+                row: dict[str, object] = dict(zip(columns, values))
+                indexed.setdefault(str(row["src"]), []).append(row)
+    except sqlite3.Error:
+        prefixes = {}
+    rows: list[dict[str, object]] = []
+    months = {now.strftime("%Y-%m"), (now - timedelta(days=1)).strftime("%Y-%m")}
+    for month in sorted(months):
+        path = root / host / f"{month}.jsonl"
+        try:
+            handle = path.open("rb")
+        except FileNotFoundError:
+            continue
+        with handle:
+            fcntl.flock(handle, fcntl.LOCK_SH)
+            source = path.relative_to(root).as_posix()
+            offset, marks = prefixes.get(source, (0, ""))
+            if (offset <= os.fstat(handle.fileno()).st_size
+                    and marks == file_marks.marks(handle, offset)):
+                rows.extend(indexed.get(source, []))
+            else:
+                offset = 0
+            _ = handle.seek(offset)
+            for line in handle:
+                if not line.endswith(b"\n"):
+                    raise ValueError("incomplete build-log tail")
+                raw = cast(object, json.loads(line))
+                if not isinstance(raw, dict):
+                    raise ValueError("invalid build-log record")
+                row = cast(dict[str, object], raw)
+                if (row.get("kind") == "step" and row.get("host") == host
+                        and row.get("worktree") == worktree):
+                    rows.append(row)
+    return rows
+
+
+def is_fresh_test(root: Path, host: str, worktree: str, package: str,
+                  scope: TestScope, tree_key: str, now: datetime,
+                  target_dir: str = "") -> bool:
+    """Only the last completed matching test build can prove the targets fresh.
+
+    The key covers Cargo build inputs, not nextest's run-only selection. Read
+    the recorder's current JSONL, since the derived index can lag a finished step.
+    """
+    if not tree_key or not package or not worktree or not target_dir:
+        return False
+    before = store.utc_iso(now.timestamp())
+    try:
+        rows = current_worktree_steps(root, host, worktree, now)
+        rows.sort(key=lambda row: (str(row.get("ended_at") or ""),
+                                   str(row.get("started_at") or "")), reverse=True)
+        for row in rows:
+            ended = str(row.get("ended_at") or "")
+            if row.get("step") != "nextest" or not ended or ended >= before:
+                continue
+            arguments = history_arguments(row.get("argv"))
+            if test_package(arguments) != package or test_scope(arguments) != scope:
+                continue
+            tests_run = row.get("tests_run")
+            if row.get("test_build_key") != tree_key or not (
+                    row.get("status") == 0 or isinstance(tests_run, int) and tests_run > 0):
+                return False
+            finished = _epoch(ended)
+            # Sweep deletion records are retained for one day. Older builds
+            # cannot prove that their target survived an intervening sweep.
+            if now.timestamp() - finished >= 24 * 60 * 60:
+                return False
+            target = Path(target_dir)
+            if not target.is_absolute():
+                target = Path(worktree) / target
+            target = target.resolve()
+            if not target.is_dir():
+                return False
+            state = Path(os.environ.get("LINT_SWEEP_STATE_DIR", "~/.local/state/lint-sweep")).expanduser()
+            try:
+                deleted = cast(object, json.loads((state / "target-deletes.json").read_text()))
+            except FileNotFoundError:
+                deleted = {}
+            if not isinstance(deleted, dict):
+                return False
+            for path, timestamp in cast(dict[str, object], deleted).items():
+                if Path(path).resolve() == target:
+                    if (not isinstance(timestamp, (float, int)) or not math.isfinite(timestamp)
+                            or timestamp >= finished):
+                        return False
+            for sweep in rows:
+                started = str(sweep.get("started_at") or "")
+                freed = sweep.get("sweep_freed_bytes")
+                if (sweep.get("step") == "sweep" and ended <= started < before
+                        and (not isinstance(freed, (int, float)) or freed > 0)):
+                    return False
+            return True
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        pass
+    return False
+
+
+def fresh_test_peak(repository: RepositoryIdentity, step: str, host: str, now: datetime,
+                    root: Path, width: int | None, scope: TestScope,
+                    filters: tuple[str, ...], package: str,
+                    compile_peak: ExpectedPeak) -> ExpectedPeak:
+    """Use only completed zero-compile measurements of this package and scope."""
+    cutoff = store.utc_iso((now - timedelta(days=HISTORY_DAYS)).timestamp())
+    before = store.utc_iso(now.timestamp())
+    try:
+        with closing(sqlite3.connect(f"file:{root / store.INDEX_NAME}?mode=ro", uri=True)) as connection:
+            rows = cast(list[tuple[str | None, str, int | None, str]], connection.execute(
+                "SELECT call_id, argv, peak_mem_bytes, repo FROM steps WHERE host = ? "
+                + "AND step = ? AND started_at >= ? AND started_at < ? AND ended_at < ? "
+                + "AND crates_compiled = 0 AND (status = 0 OR tests_run > 0)",
+                (host, step, cutoff, before, before),
+            ).fetchall())
+    except (OSError, sqlite3.Error):
+        return compile_peak
+    calls: dict[str, bool] = {}
+    indexed: list[int] = []
+    indexed_exact: list[int] = []
+    for call_id, raw_argv, peak, sample_repo in rows:
+        arguments = history_arguments(raw_argv)
+        if (test_package(arguments) != package or test_scope(arguments) != scope
+                or (width is not None and test_threads(arguments) != width)):
+            continue
+        exact = bool(filters) and test_filters(arguments) == filters
+        if call_id:
+            calls[call_id] = exact
+        if (repository.legacy_name and sample_repo == repository.legacy_name
+                and isinstance(peak, int) and peak > 0):
+            indexed.append(peak)
+            if exact:
+                indexed_exact.append(peak)
+    measured: list[int] = []
+    measured_exact: list[int] = []
+    try:
+        with (root / "admission/anon_peaks.jsonl").open() as lines:
+            for line in lines:
+                try:
+                    item = cast(dict[str, object], json.loads(line))
+                    call_id = item.get("call_id")
+                    own = (item.get("repo_identity") == repository.key
+                           or (not item.get("repo_identity") and repository.legacy_name
+                               and item.get("repo") == repository.legacy_name))
+                    if (not own or item.get("host") != host or item.get("step") != step
+                            or not cutoff <= str(item.get("ended_at", "")) < before
+                            or not isinstance(call_id, str) or call_id not in calls
+                            or item.get("test_scope", scope) != scope
+                            or item.get("package", package) != package
+                            or (width is not None and item.get("test_threads") != width)):
+                        continue
+                    peak = item.get("anon_peak_bytes")
+                    if isinstance(peak, int) and peak > 0:
+                        measured.append(peak)
+                        if calls[call_id]:
+                            measured_exact.append(peak)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+    except OSError:
+        pass
+    for values, source in ((measured_exact, "measured"), (indexed_exact, "buildlog"),
+                           (measured, "measured"), (indexed, "buildlog")):
+        if values:
+            peak = percentile(values)
+            if source == "buildlog":
+                peak = int(peak * ANON_SHARE)
+            return ExpectedPeak(max(FILTERED_FLOOR, peak),
+                                cast(Literal["measured", "buildlog"], source), len(values))
+    return compile_peak
 
 
 def process_start_time(pid: int) -> str | None:
@@ -1462,6 +1774,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
     step that gave its reservation back for the cargo token keeps its place."""
     root = root if root is not None else store.root()
     estimate_time = now if now is not None else datetime.now(UTC)
+    fresh = False
     width = test_threads(argv)
     package, filters = test_package(argv), test_filters(argv)
     if profile is not None and profile.estimated_at and estimate_time.timestamp() - profile.estimated_at >= HEAD_SECONDS:
@@ -1472,8 +1785,20 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         scope = test_scope(argv)
         step = parse.step_name(argv) if argv else "build"
         host = store.host_name()
-        peak = expected_peak(repository, step, host, estimate_time, root, scope=scope,
-                             package=package, filters=filters)
+        worktree_path = ""
+        if step == "nextest" and package and os.environ.get("BUILDLOG_TEST_BUILD_KEY"):
+            directory = record.git_directory(argv, os.getcwd())
+            worktree_path = record.git_facts(directory)["worktree"] or ""
+        target_dir = os.environ.get("BUILDLOG_TEST_TARGET_DIR", "")
+        fresh = (step == "nextest" and is_fresh_test(
+            root, host, worktree_path, package, scope,
+            os.environ.get("BUILDLOG_TEST_BUILD_KEY", ""), estimate_time, target_dir))
+        if fresh:
+            peak = expected_peak(repository, step, host, estimate_time, root, scope=scope,
+                                 package=package, filters=filters, fresh=True)
+        else:
+            peak = expected_peak(repository, step, host, estimate_time, root, scope=scope,
+                                 package=package, filters=filters)
         profile = StepProfile(repo, step, worktree, peak, repository, scope, estimate_time.timestamp())
     elif not profile.estimated_at:
         profile = replace(profile, estimated_at=estimate_time.timestamp())
@@ -1519,6 +1844,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         waiter["package"] = package
         waiter["filters"] = list(filters)
         waiter["estimated_at"] = profile.estimated_at
+        waiter["fresh_test"] = fresh
         waiter["need_source"] = peak.source
         waiter["need_runs"] = peak.count
         waiter["test_threads"] = width
@@ -1548,6 +1874,12 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             (directory / "pressure-recovery").unlink()
             recovery = NoRecoverySpacing()
         pressure = pressure_with_recovery(recovery, pressure, now.timestamp())
+        override = read_head_override(directory)
+        if not isinstance(override, NoHeadAdmissionOverride) and not any(
+                head_override_matches(override, path, row) for path, row in waiting):
+            reserve = decide(available, total, 0, []).reserve
+            end_head_override(directory, "lapsed", override, override["need"], available, reserve, now.timestamp())
+            override = NoHeadAdmissionOverride()
         candidates = sorted([row for path, row in waiting if path != mine] + ([waiter] if argv else []),
                             key=waiter_order)
         head = head_priority(candidates, available, total, running, now.timestamp())
@@ -1562,6 +1894,16 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 and waiter_order(head.waiter) < waiter_order(waiter)):
             head_need, head_label = head.waiter["need"], waiter_label(head.waiter)
         decision = queue_decision(available, total, waiter, running, head, pressure)
+        waiter_override: HeadAdmissionOverride | NoHeadAdmissionOverride = (
+            override if (not isinstance(override, NoHeadAdmissionOverride) and bool(argv)
+                         and head_override_matches(override, mine, waiter)
+                         and bool(candidates) and candidates[0] is waiter)
+            else NoHeadAdmissionOverride())
+        if not isinstance(waiter_override, NoHeadAdmissionOverride):
+            threshold = peak.bytes + decision.reserve
+            fits_free = available >= threshold
+            decision = replace(decision, state="admit" if fits_free and isinstance(pressure, NoPressureHold) else "hold",
+                               threshold=threshold, free_passes=fits_free)
         # History lookup stays outside the lock. If contention outlives the
         # estimate, keep its timestamp so the next shell poll refreshes it.
         if now.timestamp() - profile.estimated_at >= HEAD_SECONDS:
@@ -1595,6 +1937,9 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 reservation = Reserved(path)
             else:
                 reservation = NotReserved("untracked")
+            if not isinstance(waiter_override, NoHeadAdmissionOverride):
+                end_head_override(directory, "admitted", waiter_override, peak.bytes, available,
+                                  decision.reserve, now.timestamp())
         head_reason = (head_wait_reason(decision, peak.bytes, available, waiter, now.timestamp())
                        if candidates and candidates[0] is waiter else ReadyForAdmission())
         return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile,
@@ -1612,6 +1957,10 @@ class WaiterIdentity(TypedDict):
     session_name: str
     step: str
     folder: str
+
+
+def waiter_unit_name(identity: WaiterIdentity, pid: int) -> str:
+    return identity["session_name"] or Path(identity["folder"]).name or str(pid)
 
 
 class QueueIdentityReader:
@@ -1806,7 +2155,7 @@ def read_queue_pass(directory: Path, processes: dict[int, ProcessIdentity], now:
         elif (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
               and waiter_order(head.waiter) < waiter_order(row)):
             head_identity = identities.identity(head.waiter["pid"], cast(dict[str, object], cast(object, head.waiter)))
-            reason = BehindHead(head_identity["session_name"] or Path(head_identity["folder"]).name or str(head.waiter["pid"]),
+            reason = BehindHead(waiter_unit_name(head_identity, head.waiter["pid"]),
                                 head.waiter["since"], head_identity["session_id"])
         elif row is ordered[0][1]:
             reason = head_wait_reason(own, row["need"], available, row, now)
@@ -2085,6 +2434,11 @@ def clean_field(value: str) -> str:
 
 def run_action() -> None:
     action = sys.argv[1]
+    if action == "admit-head":
+        if len(sys.argv) != 2 and not (len(sys.argv) == 4 and sys.argv[2] == "--why"):
+            raise AdmitHeadRefused('usage: memory_admit.py admit-head [--why "<text>"]')
+        print(admit_head(sys.argv[3] if len(sys.argv) == 4 else ""))
+        return
     if action == "blocker":
         if len(sys.argv) != 4 or sys.argv[2] != "--waiter":
             raise ValueError("usage: memory_admit.py blocker --waiter <waiter file>")
@@ -2111,7 +2465,8 @@ def run_action() -> None:
         try:
             row = cast(Waiter, json.loads((store.root() / "admission" / f"{pid}-{start}.waiting").read_text()))
             # An empty key is the explicit unknown identity. Old rows must refresh.
-            if ("repo_identity" in row and "test_scope" in row and "estimated_at" in row
+            if (not row.get("fresh_test", False)
+                    and "repo_identity" in row and "test_scope" in row and "estimated_at" in row
                     and (row["test_scope"] == "full"
                          or (row.get("package") == test_package(argv)
                              and row.get("filters") == list(test_filters(argv))))
@@ -2161,7 +2516,7 @@ def run_action() -> None:
 def main() -> None:
     try:
         run_action()
-    except LiveMemoryReading as error:
+    except (LiveMemoryReading, AdmitHeadRefused) as error:
         print(str(error), file=sys.stderr)
         sys.exit(2)
 

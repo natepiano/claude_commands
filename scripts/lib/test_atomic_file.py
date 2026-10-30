@@ -6,10 +6,49 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from scripts.lib import atomic_file
 from scripts.lib.atomic_file import write_text_atomic
 
 
 class AtomicFileTests(unittest.TestCase):
+    def test_create_only_publication_keeps_existing_and_concurrent_files_without_temporary_files(self) -> None:
+        for already_exists in (False, True):
+            with self.subTest(already_exists=already_exists), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "private.json"
+                original = '{"login": "fixture@example.invalid"}\n'
+                if already_exists:
+                    _ = path.write_text(original, encoding="utf-8")
+                link = os.link
+
+                def publish(temporary: Path, destination: Path) -> None:
+                    self.assertEqual(temporary.read_text(encoding="utf-8"), '{"seed": true}\n')
+                    self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o600)
+                    if not already_exists:
+                        _ = destination.write_text(original, encoding="utf-8")
+                    link(temporary, destination)
+
+                with patch("scripts.lib.atomic_file.os.link", side_effect=publish):
+                    self.assertFalse(atomic_file.create_text_atomic(path, '{"seed": true}\n'))
+                self.assertEqual(path.read_text(encoding="utf-8"), original)
+                self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_create_only_publication_is_private_and_synced_before_and_after_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing" / "private.json"
+            sync = os.fsync
+            synced_versions: list[tuple[bool, bool]] = []
+
+            def record_sync(descriptor: int) -> None:
+                synced_versions.append((stat.S_ISDIR(os.fstat(descriptor).st_mode), path.exists()))
+                sync(descriptor)
+
+            with patch("scripts.lib.atomic_file.os.fsync", side_effect=record_sync):
+                self.assertTrue(atomic_file.create_text_atomic(path, '{"seed": true}\n'))
+            self.assertEqual(synced_versions, [(False, False), (True, True)])
+            self.assertEqual(path.read_text(encoding="utf-8"), '{"seed": true}\n')
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(list(path.parent.iterdir()), [path])
+
     def test_next_write_removes_dead_process_temporary_files_and_keeps_live_ones(self) -> None:
         for permission_denied in (False, True):
             with self.subTest(permission_denied=permission_denied), tempfile.TemporaryDirectory() as directory:

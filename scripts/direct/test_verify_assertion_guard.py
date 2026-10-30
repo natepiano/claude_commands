@@ -31,6 +31,8 @@ class VerifyAssertionGuardTests(GitRepositoryFixture):
         # Use the real lint case; stub only the unrelated build tools and their setup.
         source = VERIFY.read_text(encoding="utf-8")
         case = source.split("\n    lint)\n", 1)[1].split("\n    doc)\n", 1)[0]
+        rulings_setup = "assertion_rulings_args() {" + source.split(
+            "assertion_rulings_args() {", 1)[1].split("# A Codex mesh worker", 1)[0]
         script = r'''
 set -euo pipefail
 FEATURE_FLAGS=()
@@ -53,10 +55,8 @@ tree_key() { echo fixed-tree; }
 taplo() { :; }
 run() { "$@"; }
 cargo() { printf '{"workspace_root":"%s"}\n' "$TEST_REPO"; }
-case lint in
-    lint)
 '''
-        script += case + "\nesac\n"
+        script += rulings_setup + "\ncase lint in\n    lint)\n" + case + "\nesac\n"
         environment = {**self.environment, "HOME": str(self.home), "PY": sys.executable, "TEST_REPO": str(self.repo),
                        "ASSERTION_GUARD_SCRIPT": str(VERIFY.with_name("assertion_guard.py"))}
         for name in ("UNIT_SESSION_DIR", "WORKSPACE_ROOT"):

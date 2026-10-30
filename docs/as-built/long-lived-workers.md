@@ -449,7 +449,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 - Account-move recovery checks the saved header before it claims the roster entry.
 - The first `register` for a repository must carry every host's checkout: a later `register` with a different mapping refuses. The `register` CLI takes one host; use `register_repository` for two, or the authority `checkout` operation to move one. `alias` and `legacy` are reached only through `design_roles.py authority <op>`.
 - Scripts import as `from scripts.<folder> import <module>` after `sys.path.insert(0, <repo root>)`. `design_roles.py` imports `codex_mesh` and `astra_roles` through `importlib` at the call to avoid an import cycle; do not name a module function `open`.
-- A new script folder runs in the merge gate only when listed in `scripts/production/merge_gate.py` `TEST_SUITES`; `test_merge_gate.py` `EXPECTED_SUITES` changes with it. `pyrightconfig.json` gives `scripts/astra` its extraPaths.
+- The merge gate finds every `scripts/**/test_*.py` module outside `__pycache__`, including nested test folders. Each module belongs to its first folder under `scripts/`. A new test folder needs no registration. `pyrightconfig.json` gives `scripts/astra` its extraPaths.
 
 ### Why roles outlive runs
 
