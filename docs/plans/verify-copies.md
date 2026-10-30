@@ -1,7 +1,7 @@
 # Frozen copies: one helper makes every build copy
 
 > **Production: builds** — unit `verify-unit`; production doc `docs/plans/builds-production.md`
-> **Status:** approved by the user 2026-10-29 (via builds). Phase 1 takes the build hold after 00:00 EDT tonight, with resources-unit's case D. Unit-director survey of the path format closes 23:00 EDT; answers land here before Phase 3.
+> **Status:** approved by the user 2026-10-29 (via builds). Phase 1 takes the build hold tonight on builds' go after natedev's Secure Boot sitting (see Phase 1), with resources-unit's case D. Unit-director survey of the path format closed 23:00 EDT; its answers are in Survey changes.
 
 One helper, `scripts/copies/copies.py` (verify-unit), makes every frozen copy we build in: gate, review, merge and land copies on natedev, and the Mac test mirrors. It names each copy `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, gives it its own git, fills its target by the measured best option, and registers it with the cleanup that already exists.
 
@@ -49,9 +49,9 @@ Expected (unverified): rule 1 fails on the lock (`sweep.py:123`), and seeding wi
 
 - Path: `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, e.g. `/tmp/claude/copies/hana-lfo/54b-gate`. Purpose is one word: `gate`, `review`, `merge`, `land`, `before`, `after`, `test`. A second copy of one phase and purpose gets `-2`, `-3`.
 - Names come only from `roster.unit_labels_for` / `roster.unit_labels` (`scripts/message/roster.py`). Session names are short (`hana`, `lfo`, `builds`, `resources`; read from `~/.claude/sessions/*.json`), never `-unit`, slugs or ids.
-- **Status of `unit_labels`: not landed.** It is uncommitted work in `/home/natepiano/worktrees/claude-natedev-builds-report/scripts/message/roster.py:241-272` (report-unit Phase 3, `builds-report.md:142`, status todo). It is not on any branch (`git log --all -S unit_labels` is empty) and not in `~/.claude/scripts/message/roster.py`. Phase 3 below waits for it.
+- **Status of `unit_labels`: landed.** report-unit Phase 3 (`e4f5e836`) added `unit_labels` / `unit_labels_for`, and its Phase 4 (`2c96f13a`) added `UnitLabels.folder_name()`. Both are on origin/builds and in `~/.claude/scripts/message/roster.py`.
 - The caller's session: `build_hold.owning_session()` (`build_hold.py:291`: the unit director first, then `CLAUDE_CODE_SESSION_ID`), the same lookup Mac claims use. A Codex worker so resolves to its director.
-- Two gaps go to report-unit, in `roster.py`, never in the helper: (a) the join `<showrunner>-<unit>` as one function, which drops a unit name's leading showrunner name (`cargo-liner-style` + `cargo-liner-style-types` must not double); (b) a missing part (`—`) is dropped, so a showrunner alone names `builds/…`.
+- The join lives in `roster.py`, never in the helper: `UnitLabels.folder_name()` gives `<showrunner>-<unit>` (hana + lfo gives `hana-lfo`), drops a unit name's leading showrunner name (`cargo-liner-style` + `cargo-liner-style-types` gives `cargo-liner-style-types`), and drops a missing part (`—`), so a showrunner alone names `builds`.
 
 ## Cleanup
 
@@ -65,7 +65,7 @@ Each copy is known to cleanup at birth. The helper does not add a cleaner.
 
 ## Survey changes
 
-Survey of every unit director, sent 14:05 EDT 2026-10-29, closes 23:00 EDT; 42 units answered by 19:05 EDT (each answer, with its unit, in `.claude/handoff/copies-survey-answers.md` of this worktree). Most said the format suits them. These changes go into Phase 3; the unit that asked is in brackets.
+Survey of every unit director, sent 14:05 EDT 2026-10-29 to 45 units, closed 23:00 EDT. 44 answered: 42 by 19:05 EDT, and two (phases, cargo-liner-style-values) whose 14:05 answers sat unread in the send.py queue until the close. resources-unit sent no answer; it owns the Lifetime and cleanup items. security-unit started after the survey. Each answer, with its unit, is in `.claude/handoff/copies-survey-answers.md` of this worktree. Most said the format suits them. These changes go into Phase 3; the unit that asked is in brackets.
 
 **Name.**
 - The phase part is a slug, `[a-z0-9-]`: `54b`, `94b`, `adhoc` for ad hoc work. A slash is refused. Where no phase exists, a free label takes its place: `sync-test`, `demo27-fastest4`, `adhoc-stallcpu-gate` [unit-board, merge-gate, messaging, fix-rounds, models].
@@ -83,7 +83,7 @@ Survey of every unit director, sent 14:05 EDT 2026-10-29, closes 23:00 EDT; 42 u
 - The helper never writes into the source worktree (`review.sh` fails on a worktree change) [models].
 
 **Target.**
-- Mode `none` when the source has no `Cargo.toml`: no seed, no shared build-dir, no cargo lock [roles, hierarchies, fix-rounds, screenshot, report, style-unit, models].
+- Mode `none` when the source has no `Cargo.toml`: no seed, no shared build-dir, no cargo lock. `merge_gate.py --checkout <copy>` then runs in the copy [roles, hierarchies, fix-rounds, screenshot, report, style-unit, models, phases].
 - A seed comes only from a target built with the same `Cargo.lock` and toolchain [hana-migration]. The newest landed gate copy of the repository is the first seed choice [merge-gate].
 - A before/after pair gets the same fill from the same base build [fastest].
 
@@ -155,7 +155,7 @@ Busy day: in-scope clones run about 78 a week (12 gate/merge + 31 phase + 22 oth
 
 **Acceptance gate:** a table of cases A-E with every metric, each build's load, and the floor sweep's trimmed total for the hold; the rule's verdict written into the Decision section; cargo version named.
 
-Hold: 00:05-03:05 EDT (builds, 2026-10-29), taken with `/build:hold` with its reason and until time, released the moment the last case ends. Every trial folder (source worktree, seeds, clones, shared build-dir) lives under `~/copies-trial/`, on the same file system as `/tmp` but outside the floor sweep's roots (`FLOOR_ROOTS` in `scripts/lint/sweep.py`), so an idle seed target is never trimmed between two builds of a case. The sweep has no hold of its own today, and it does not read `scratch.py` holds. Each case's copies are deleted as soon as its numbers are recorded; peak extra disk is one case at a time, about 55 GiB (case D: one shared build-dir plus two clones' final output), with E removing clone 1's target before clone 2 builds. Each build records `/proc/loadavg` and `/proc/pressure/cpu` sampled every 10 s (start, mean, max), so a quiet-machine number is told apart from a busy one. `~/copies-trial/` is removed on every exit path: a trap in the trial script, and a check at 03:07 EDT, because the floor sweep cannot reclaim it. The 300 GiB floor stays (user rule); the results table carries the floor sweep's trimmed total for the hold window, so the morning cost is counted (builds, 2026-10-29).
+Hold: 3 h from its real start, not 00:05 by the clock (re-timed by builds, 21:5x EDT 2026-10-29). It starts on the builds showrunner's go after natedev's Secure Boot sitting ('sitting 1 restored'), or at 00:05 EDT after 'no sitting tonight'; a reboot in the sitting would kill the runs. Taken with `/build:hold` with its reason and until time, released the moment the last case ends. Every trial folder (source worktree, seeds, clones, shared build-dir) lives under `~/copies-trial/`, on the same file system as `/tmp` but outside the floor sweep's roots (`FLOOR_ROOTS` in `scripts/lint/sweep.py`), so an idle seed target is never trimmed between two builds of a case. The sweep has no hold of its own today, and it does not read `scratch.py` holds. Each case's copies are deleted as soon as its numbers are recorded; peak extra disk is one case at a time, about 55 GiB (case D: one shared build-dir plus two clones' final output), with E removing clone 1's target before clone 2 builds. Each build records `/proc/loadavg` and `/proc/pressure/cpu` sampled every 10 s (start, mean, max), so a quiet-machine number is told apart from a busy one. `~/copies-trial/` is removed on every exit path: a trap in the trial script, and a check 3 h after the real start, because the floor sweep cannot reclaim it. The 300 GiB floor stays (user rule); the results table carries the floor sweep's trimmed total for the hold window, so the morning cost is counted (builds, 2026-10-29).
 
 Hold length: 3 h. Count: about 17 hana builds — A 2, B 4, C 4, D 5 (one pair at once), E 2 — plus 4 seed copies. Basis: a 603-crate hana build took 928 s on a busy natedev today (build log, 10:35 EDT); a quiet machine is assumed at about 12 min cold and 2 min for C+1. If every seed compiles fully it is about 2 h 40 min; if the seeds work it is about 1 h 45 min. The Bevy dylib change (13:50 EDT) is in C, so it is in every case. If the hold ends before E, E moves to the next hold; A-D never split.
 
@@ -165,11 +165,11 @@ Hold length: 3 h. Count: about 17 hana builds — A 2, B 4, C 4, D 5 (one pair a
 
 **Goal:** names and cleanup support exist where they live.
 
-**Spec:** report-unit lands `unit_labels` / `unit_labels_for` (its Phase 3) plus the join function and dropped-part rule (Naming). resources-unit adds the copies root to `scratch.py` (two-level name, provenance fields), `tmp_sweep.py` and the scratch guard; its Phase 3 in-use marking covers `/tmp/claude/copies`. If Phase 1 picks the shared build-dir, resources-unit owns its budget and hold. efficiency-unit changes `scripts/lib/nix_env.py` to trust a copy's `.envrc` only when the copy's copies.py/scratch.py record names a source repo under `~/rust`, `~/worktrees` or `~/.claude*`, and the copy's `.envrc` equals the source's `.envrc` blob at the copy commit (approved by builds). Today it refuses (`direnv: .envrc is blocked`), so verify.sh and style_sync lint fail in a copy. verify-unit sends efficiency the record's path and fields (source path, source commit, copy commit) when Phase 3 fixes them. Due before Phase 4. resources-unit also gets the Lifetime and cleanup items of Survey changes (task `landed:`, busy copy during a queued or running run, open-phase copies not idle, child before parent, a target busy lock file hana can set); report-unit's `UnitLabels.folder_name()` (its Phase 4, hana + lfo gives `hana-lfo`) is the join function.
+**Spec:** report-unit lands `unit_labels` / `unit_labels_for` (its Phase 3, `e4f5e836`, done) plus the join function and dropped-part rule (Naming). resources-unit adds the copies root to `scratch.py` (two-level name, provenance fields), `tmp_sweep.py` and the scratch guard; its Phase 3 in-use marking covers `/tmp/claude/copies`. If Phase 1 picks the shared build-dir, resources-unit owns its budget and hold. efficiency-unit changes `scripts/lib/nix_env.py` to trust a copy's `.envrc` only when the copy's copies.py/scratch.py record names a source repo under `~/rust`, `~/worktrees` or `~/.claude*`, and the copy's `.envrc` equals the source's `.envrc` blob at the copy commit (approved by builds). Today it refuses (`direnv: .envrc is blocked`), so verify.sh and style_sync lint fail in a copy. verify-unit sends efficiency the record's path and fields (source path, source commit, copy commit) when Phase 3 fixes them. Due before Phase 4. resources-unit also gets the Lifetime and cleanup items of Survey changes (task `landed:`, busy copy during a queued or running run, open-phase copies not idle, child before parent, a target busy lock file hana can set); report-unit's share is done: `UnitLabels.folder_name()` (its Phase 4, `2c96f13a`, on origin/builds; hana + lfo gives `hana-lfo`) gives the copies folder name.
 
 **Files:** owned by report-unit, resources-unit and efficiency-unit; verify-unit sends the requests.
 
-**Acceptance gate:** all three merged on builds.
+**Acceptance gate:** all three merged on builds (report-unit's merged).
 
 Rough duration: half a day each, in parallel with Phase 1.
 
@@ -179,7 +179,7 @@ Rough duration: half a day each, in parallel with Phase 1.
 
 **Goal:** `copies.py make|list|remove` makes a named, registered copy with the chosen target mode.
 
-**Spec:** `copies.py make --source <worktree> --commit <sha> --phase <id> --purpose <word> [--task <task>]` prints the path. Steps: name from roster via `owning_session`; folder through `scratch.py`; own git (`clone --shared --no-checkout`, origin = source's origin URL, check `git rev-parse --absolute-git-dir` names the copy); target per Phase 1 verdict (seed: `cp -a` under the three source locks, skip `incremental/` unless the rule kept it; shared: set `CARGO_BUILD_BUILD_DIR` in the copy's `.cargo/config.toml`; neither: empty). `list` shows copies, task, source, size. `remove` ends one copy through scratch.py. Python API `make_copy(...)` for callers. Every item of Survey changes under Name, Source and Target, and `hand-over`.
+**Spec:** `copies.py make --source <worktree> --commit <sha> --phase <id> --purpose <word> [--task <task>]` prints the path. Steps: folder name from `unit_labels_for([build_hold.owning_session()], env)[…].folder_name()` (report-unit, hana + lfo gives `hana-lfo`); folder through `scratch.py`; own git (`clone --shared --no-checkout`, origin = source's origin URL, check `git rev-parse --absolute-git-dir` names the copy); target per Phase 1 verdict (seed: `cp -a` under the three source locks, skip `incremental/` unless the rule kept it; shared: set `CARGO_BUILD_BUILD_DIR` in the copy's `.cargo/config.toml`; neither: empty). `list` shows copies, task, source, size. `remove` ends one copy through scratch.py. Python API `make_copy(...)` for callers. Every item of Survey changes under Name, Source and Target, and `hand-over`.
 
 **Files:** `scripts/copies/copies.py`, `scripts/copies/test_copies.py`, `docs/as-built/frozen-copies.md`.
 
