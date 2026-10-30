@@ -2714,35 +2714,25 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Depends on:** Phase 94b (order only)
 
-#### Work Order
+#### As-built
 
-**Goal:** A unit watchdog pass never loses a finished recovery's result before it knows whether the unit is live. The Phase 94b closure review found: on the recovery-result path (`scripts/accounts/unit_watchdog.py`, the `job = outage.get("job")` branch), `_recovery_result` deletes the result file and the job is removed before `_live_account` reads; when that read is unreadable and raises, the result and the job are gone and the next pass cannot report the restart. The order is the same at `ed98b7dc` (before Phase 94b). Phase 94b fixed the same order on the observed-live branch.
-
-**Spec:**
-- On the recovery-result path, read the result without deleting it, confirm liveness fresh with `_live_account`, then delete the result and remove the job. A confirmed live unit: success cleanup and the `restarted on` line. An absent unit: delete the result and remove the job, then the existing retry line and recovery handling. An unreadable read: keep the result file, the job and the outage; no `restarted on` or retry line. The existing error path still writes its `watchdog: <production>: <error>` line.
-- The held or blocked branch between the result read and `_live_account` (`(source.blocked and not owns_claim) or _held(source, dry_run=False)`, which drops the outage with `del retained[key]`) relies today on `_recovery_result` having deleted the file. After the reorder it deletes the result file itself, so no file stays in `unit-watchdog-results`.
-- `scripts/whoami/test_profile_notes_pass.py` `test_child_launch_options_cannot_substitute_executable_or_run_hooks`: use an argv form the policy permits, for example `("ps", "-eo", "pid=,ppid=,comm=,args=")`, and add a positive control: the same argv with no launch option starts once. Then the test fails only when the launch-option check is missing (today `ps -c 'touch …'` fails `ps_read`, so argument rejection alone makes it pass). Assertion-Change: `scripts/whoami/test_profile_notes_pass.py::test_child_launch_options_cannot_substitute_executable_or_run_hooks` — the rejected-call input is the ps listing form, so the test pins the launch-option check; a successful-launch control is added.
-- No other behavior changes.
+- `RecoveryFinished(failure, result_path)` in `scripts/accounts/unit_watchdog.py` is a finished recovery result that is read but not yet deleted. `_recovery_result` does not delete the result file; each branch of `run()` that uses up the result deletes it.
+- Recovery-result branch: the result is deleted and the job is popped only after a fresh `_live_account` read answers. A live unit gets `restarted on <account>`. An absent unit gets the retry line and the recovery. An unreadable read (`OSError`) keeps the result file, the job and the outage, and the error path writes `watchdog: <production>: <error>`; the next pass reports the restart or the retry.
+- Held or blocked branch (`(source.blocked and not owns_claim) or _held(source, dry_run=False)`): deletes the result file, then `del retained[key]`. No file stays in `unit-watchdog-results`.
+- No-recovery-source branch: deletes the result, then sets `dropped`, then pops the job. A failed delete keeps the job and writes no `dropped`, so a later pass retries cleanup and recovery when a source returns.
+- `test_child_launch_options_cannot_substitute_executable_or_run_hooks` rejects the ps listing form `("ps", "-eo", "pid=,ppid=,comm=,args=")` with a launch option, and a positive control starts the same argv once with no launch option. The test fails only when the launch-option check is missing.
+- Checkpoint `182c9f80`. Its commit body holds the Assertion-Change line for `scripts/whoami/test_profile_notes_pass.py::test_child_launch_options_cannot_substitute_executable_or_run_hooks`.
 
 **Files:**
-- `scripts/accounts/unit_watchdog.py` — the recovery-result order; the held or blocked branch deletes the result.
-- `scripts/accounts/test_unit_watchdog.py` — live, absent and unreadable after a finished result; the file and job stay for unreadable; the held or blocked branch leaves no result file.
-- `scripts/whoami/test_profile_notes_pass.py` — the launch-options test.
+- `scripts/accounts/unit_watchdog.py` — `RecoveryFinished.result_path`, `_recovery_result`, the three branches of `run()` that use up a finished result.
+- `scripts/accounts/test_unit_watchdog.py` — seven tests: the unreadable second fresh read, live and absent confirmation, held, blocked, no recovery source, and the failed-cleanup retry (`test_failed_result_cleanup_retries_when_a_recovery_source_returns`).
+- `scripts/whoami/test_profile_notes_pass.py` — the launch-options test and its positive control.
 
-**Workers:** 1 writer, no split.
-- `impl` — all files.
+**Gotchas:**
+- Each branch that uses up a finished result deletes the result file before it writes a final mark (`dropped`, `del retained[key]`, the job pop). A failed delete is a third outcome next to live and absent: it must leave the job retryable. A saved `dropped` together with a job makes every later pass skip cleanup and recovery.
 
-**Constraints from prior phases:** Phase 94b's one-scan idle pass and fresh reads before acts stay. Tests use a scratch `HOME` and state dirs; they never touch live dirs, `~/.local/state`, ssh or real sessions.
-- `_live_account(doc, unit) -> str` is wrapped in `@herdr.process_action()`: each call scans processes fresh and retires the pass's shared snapshot. It returns the account name, `""` for an absent unit, and raises `OSError` when liveness or the account is unreadable.
-- Phase 94b already reordered the observed-live branch (`if outage is not None and "job" in outage and not dry_run: restored = _live_account(doc, unit)`, before `outage_alerts.clear` and the result delete). When that read finds the unit absent, `claude` becomes `ClaudeNotRunning()` and the pass falls through to the recovery-result branch, which reads `_live_account` a second time.
-- The failing sequence the tests must cover: the report sees the unit live, the observed-live branch's fresh read finds it absent, a finished result file exists, and the recovery-result branch's fresh read raises. Do not patch `_recovery_result` in these tests; 94b's `test_live_report_without_fresh_confirmation_keeps_recovery_evidence` patches it to `RecoveryStillRunning` and so never reaches this path.
-- Fixture helpers in `test_unit_watchdog.py`: `add_unit`, `die`, `revive`, `marked`, `pass_at`, `finish_jobs` (set `False` to keep a job unfinished), `notices` and `pending`. 94b's `test_unreadable_fresh_confirmation_preserves_recovery_result_and_job` shows the pattern (write the result, revive, patch `_live_account` with `OSError`).
-- The profile test's setUp puts fake `ps`, `git`, `herdr`, `lsof`, `ssh` and `security` scripts on `PATH` (`self.bin`); `child_policy` pins only programs that `shutil.which` finds. `readonly_launch_options` refuses more than two positional arguments.
-- Type Design Contract: a finished result that is read but not yet deleted needs a name that says so (for example, `RecoveryFinished` carrying its result path), not a flag.
-- `_recovery_result` has two callers: the no-recovery-record branch (`job = outage.get("job")` near line 393, which records `dropped`) and the recovery-result branch (line 448). When it stops deleting, the first caller deletes the result after it records `dropped`.
-- Merge timing: no checkpoint merge during the natedev build hold, 00:05–03:05 EDT (showrunner, 2026-10-29). While any natedev build hold is in force, run no tests, gates or type checks unless this unit holds it; check `build_hold.py status` first.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` and the same for `scripts/whoami` pass; `basedpyright` on the changed files reads `0 errors, 0 warnings, 0 notes`.
+**Ruled out:**
+- Delete the result after `dropped` is recorded in the no-recovery-source branch: a failed delete then stops recovery for good.
 
 ### Phase 94e — Each derived account problem names the cause it comes from  · status: todo
 
