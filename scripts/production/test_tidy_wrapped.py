@@ -65,6 +65,15 @@ class TidyWrappedTests(unittest.TestCase):
         self.assertIn("live-production.md: not wrapped", result.stderr)
         self.assertTrue(all(path.exists() for path in own))
 
+    def test_wrap_removes_its_answered_history_and_keeps_another_productions(self) -> None:
+        answered = self.write(self.state / "outstanding/done.answered.jsonl", '{"text":"answered question"}\n')
+        other = self.write(self.state / "outstanding/live.answered.jsonl", '{"text":"keep this answer"}\n')
+        before = other.read_bytes()
+        result = self.run_tidy(self.doc("done", "wrapped"))
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "done: removed 1 state file\n", ""))
+        self.assertFalse(answered.exists())
+        self.assertEqual(other.read_bytes(), before)
+
     def test_a_wrapped_doc_whose_timer_remains_keeps_every_file(self) -> None:
         own = self.state_files("done")
         (self.notifier / "showrunner-done").mkdir()

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from difflib import get_close_matches
 from enum import StrEnum
 import http.client
+import importlib.util
 import json
 import math
 import os
@@ -2138,6 +2139,26 @@ def launch(port: int, worktree: str | None, binary: str | None) -> tuple[LaunchS
     _write_launch_state(state_path, state)
     start = time.monotonic()
     try:
+        recorder_path = Path(__file__).resolve().parents[1] / "buildlog" / "record.py"
+        recorder = sys.modules.get("record")
+        if recorder is None or getattr(recorder, "__file__", "") != str(recorder_path):
+            module_name = "_hana_shot_buildlog_record"
+            recorder = sys.modules.get(module_name)
+            if recorder is None:
+                spec = importlib.util.spec_from_file_location(
+                    module_name, recorder_path, submodule_search_locations=[str(recorder_path.parent)],
+                )
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"cannot load launch recorder at {recorder_path}")
+                recorder = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = recorder
+                try:
+                    spec.loader.exec_module(recorder)
+                except BaseException:
+                    del sys.modules[module_name]
+                    raise
+        record_launch = cast(Callable[[Path, Path], bool], recorder.launch)
+        _ = record_launch(state_path, root)
         wait_ready(Brp(port), process, log)
     except BaseException:
         shutdown(port, process)
