@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -147,6 +148,32 @@ class StyleProposalsTests(unittest.TestCase):
 
     def ledger(self) -> style_ledger.Ledger:
         return style_ledger.open_ledger(self.repo)
+
+    def test_rank_source_git_failures_are_not_cached_as_absence(self) -> None:
+        with self.ledger() as ledger:
+            reader = style_proposals.RankExemptions(ledger, self.tip)
+            for code in (errno.EMFILE, errno.ENOENT):
+                with self.subTest(errno=code):
+                    failure = OSError(code, "PRIVATE launch failure")
+                    with mock.patch.object(subprocess, "run", side_effect=failure):
+                        with self.assertRaises(style_ledger.GitReadFailed) as refused:
+                            _ = reader.source("src/missing.rs")
+                    self.assertIs(refused.exception.__cause__, failure)
+                    self.assertEqual(reader.sources, {})
+            self.assertEqual(reader.source("src/missing.rs"), "")
+            self.assertEqual(reader.sources, {"src/missing.rs": ""})
+
+    def test_proposal_blob_git_failures_are_not_absence(self) -> None:
+        with self.ledger() as ledger:
+            reader = style_proposals.GitProposalReader(ledger)
+            for code in (errno.EMFILE, errno.ENOENT):
+                with self.subTest(errno=code):
+                    failure = OSError(code, "PRIVATE launch failure")
+                    with mock.patch.object(subprocess, "run", side_effect=failure):
+                        with self.assertRaises(style_ledger.GitReadFailed) as refused:
+                            _ = reader.blob(self.tip, "src/missing.rs")
+                    self.assertIs(refused.exception.__cause__, failure)
+            self.assertEqual(reader.blob(self.tip, "src/missing.rs"), "")
 
     def git(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True).stdout.strip()

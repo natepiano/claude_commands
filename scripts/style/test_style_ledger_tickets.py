@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import errno
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import style_ledger
 import style_plan
 import berth_board
 import coverage_report
+import unit_files
 
 
 from ledger_test_support import (LedgerTestCase, LedgerStatus)
@@ -27,6 +29,40 @@ from ledger_test_support import (LedgerTestCase, LedgerStatus)
 
 @final
 class StyleLedgerTicketsTests(LedgerTestCase):
+    def test_rule_hash_launch_failures_keep_ticket_context_and_cause(self) -> None:
+        rule = self.rule("probe")
+        ledger = self.ledger()
+        before = self.ledger_contents(ledger)
+        original = mock.Mock(wraps=subprocess.run)
+        for code in (errno.EMFILE, errno.ENOENT):
+            with self.subTest(errno=code):
+                failure = OSError(code, "PRIVATE launch diagnostic")
+
+                def fail_hash(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                    if tuple(command) == ("git", "hash-object", "--stdin"):
+                        raise failure
+                    return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+                with mock.patch.object(subprocess, "run", side_effect=fail_hash):
+                    with self.assertRaisesRegex(style_ledger.LedgerError, "ticket probe-1 add:") as refused:
+                        ledger.ticket_add("probe-1", "probe", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+                cause = refused.exception.__cause__
+                self.assertIsInstance(cause, style_ledger.GitReadFailed)
+                assert isinstance(cause, style_ledger.GitReadFailed)
+                self.assertEqual(cause.command, ("git", "hash-object", "--stdin"))
+                self.assertIs(cause.__cause__, failure)
+                self.assertNotIn("PRIVATE", str(refused.exception))
+                self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_widen_callback_file_failure_is_not_a_git_failure(self) -> None:
+        ledger, _ = self.widen_ticket()
+        before = self.ledger_contents(ledger)
+        failure = PermissionError("decision file unreadable")
+        with self.assertRaises(PermissionError) as refused:
+            _ = ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", mock.Mock(side_effect=failure))
+        self.assertIs(refused.exception, failure)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
     def git_read_failure(self) -> style_ledger.GitReadFailed:
         return style_ledger.GitReadFailed(("git", "-C", str(self.repo), "rev-parse"), 128, "fatal: PRIVATE GIT STDERR")
 
@@ -112,11 +148,20 @@ class StyleLedgerTicketsTests(LedgerTestCase):
 
     def test_git_boundary_widen_callback_and_pending_writes_keep_reservations(self) -> None:
         ledger, _ = self.widen_ticket()
-        for failure in (subprocess.CalledProcessError(128, ["git", "show", "HEAD:x"], stderr="fatal: PRIVATE GIT STDERR"),
-                        style_ledger.CheckCouldNotRun("fatal: PRIVATE GIT STDERR")):
-            with self.subTest(failure=type(failure).__name__):
-                self.assert_git_refusal(ledger, "ticket names-1 widen:",
-                    lambda: ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", mock.Mock(side_effect=failure)))
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_callback(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "cat-file" in command:
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        def approved() -> frozenset[str]:
+            _ = unit_files.file_text(self.repo, "HEAD", "decision.md")
+            return frozenset()
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_callback):
+            self.assert_git_refusal(ledger, "ticket names-1 widen:",
+                lambda: ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", approved))
         with mock.patch.object(ledger, "_check_ticket_pipelines", side_effect=self.git_read_failure()):
             self.assert_git_refusal(ledger, "ticket names-1 widen:",
                 lambda: ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", lambda: frozenset()))
@@ -124,8 +169,14 @@ class StyleLedgerTicketsTests(LedgerTestCase):
     def test_git_boundary_all_public_operations_keep_typed_failure_context(self) -> None:
         ledger = self.checkpointed_read_transition()
         rule = self.rule("new")
-        with mock.patch.object(rules, "load_rules", side_effect=subprocess.CalledProcessError(
-                128, ["git", "hash-object", "rule"], stderr="fatal: PRIVATE GIT STDERR")):
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_hash(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if tuple(command) == ("git", "hash-object", "--stdin"):
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_hash):
             self.assert_git_refusal(ledger, "ticket new-1 add:",
                 lambda: ledger.ticket_add("new-1", "new", "read", "names", "crates/alpha", [self.sources[0]], [rule]))
         self.add_ticket("new-1", [rule], unit="new")

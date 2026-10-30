@@ -21,7 +21,7 @@ import retire_unit
 import unit_lookup
 import unit_move
 from production_units import Production, read_production
-from record import SessionShutdown
+from shutdown_record import SessionShutdown
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
 

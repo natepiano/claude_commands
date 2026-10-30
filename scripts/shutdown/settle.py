@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
@@ -32,8 +33,9 @@ import herdr
 import note_file
 from inventory import Inventory, Session, inventory, last_tool_call
 from launch_permission import shutdown_state_root
-import record as store
-from record import CheckoutMove, SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
+import launch_permission
+import shutdown_record as store
+from shutdown_record import CheckoutMove, SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
 import showrunners
 import sessions
@@ -440,7 +442,7 @@ def merge_in_progress(session: Session) -> bool:
 def blocker(session: Session, *, moving: bool = False) -> ReadinessCheck:
     """Check whether outstanding work prevents this session from stopping.
 
-    A move keeps the checkout on this machine, so commits not yet pushed never hold it.
+    A move keeps the checkout and pauses Codex workers during owner cleanup.
     """
     checkout = session["checkout"]
     if (
@@ -453,7 +455,7 @@ def blocker(session: Session, *, moving: bool = False) -> ReadinessCheck:
         branch = head["name"] if head["kind"] == "branch" else head["commit"]
         return {"kind": "blocked", "reason": f"push {branch} first"}
     for server in session["codex_servers"]:
-        if server["busy_workers"]:
+        if not moving and server["busy_workers"]:
             return {
                 "kind": "blocked",
                 "reason": f"Codex worker {server['busy_workers'][0]} is still running",
@@ -673,7 +675,7 @@ def _settle_text(record: SessionShutdown, session: Session) -> str:
     )
     if session["kind"] == "unit":
         where = '"<phase N: the step you stopped in and what comes next>"'
-        started = "stop or end any worker or build you started, or name it in that line"
+        started = "stop any build you started, or name it in that line"
         ending = " and end your turn with `— blocked: shutdown requested by the user`"
     elif session["kind"] == "showrunner":
         where = '"<one line>"'
@@ -681,11 +683,13 @@ def _settle_text(record: SessionShutdown, session: Session) -> str:
         ending = " and end your turn"
     else:
         where = '"<what you were doing and what comes next>"'
-        started = "stop or name anything you started that keeps running"
+        started = "stop or name any build you started"
         ending = " and end your turn"
+    codex = ("Leave Codex workers running; the mover pauses them after this session exits." if target
+             else "If ready reports a running Codex worker, retry it when that turn finishes; start no new turns.")
     return first_line + "\n" + pause_confirmation_line(record) + "\n\n" + (
         f"Stop now, without finishing the step you are in, and start nothing new. Leave uncommitted work in place, "
-        f"{started}, then in this terminal run {command}{where}`{ending}. "
+        f"{started}. {codex} In this terminal run {command}{where}`{ending}. "
         f"You will be resumed {'on ' + target + ' ' if target else ''}with that line and continue from it."
     )
 
@@ -773,6 +777,7 @@ def begin(
     request_id: str,
     target: str = "", why: str = "", move_id: str = "", checkout_move: CheckoutMove | None = None,
     report: Inventory | InventoryNeeded = _INVENTORY_NEEDED,
+    stop_deadline: str = "",
 ) -> list[SessionShutdown]:
     """Add independent owners, leaving every existing request intact."""
     for line in store.migrate(login):
@@ -806,6 +811,8 @@ def begin(
             settle_message={"kind": "not sent"}, where={"kind": "not said"},
             progress=progress, trail=[], stop_issues=[],
         )
+        if stop_deadline:
+            saved["stop_deadline"] = stop_deadline
         if move_id:
             saved["move_id"] = move_id
         if checkout_move is not None:
@@ -819,7 +826,11 @@ def begin(
         if not store.create_session(saved):
             taken = _take_over_for_move(saved) if target else None
             if taken is None:
-                print(f"{session['name']}: already in progress")
+                previous = store.find_session(login, session["session_id"])
+                if previous is not None and not store.request_matches_process(previous, session):
+                    print(f"{session['name']}: shutdown is in flight for another process; retained its record", flush=True)
+                else:
+                    print(f"{session['name']}: already in progress")
             else:
                 added.append(taken)
                 print(f"{session['name']}: the move replaces its waiting stop")
@@ -847,6 +858,113 @@ def begin(
         print(f"{session['name']}: added")
     store.complete_account_hold_registration(login, request_id)
     return added
+
+
+def _revoke_launches(login: str, only: tuple[str, ...] = ()) -> None:
+    # Revocation owns its short launch barrier. Never nest that flock here.
+    for claim in launch_permission.revoke_pending_launches(login, only):
+        if claim.pane:
+            herdr.close_agent(claim.herdr_session, claim.pane)
+
+
+def down_all() -> int:
+    with launch_permission.block_launches_during_shutdown():
+        return _down_all()
+
+
+def _down_all() -> int:
+    """Request every local account together, then enforce their one shared deadline."""
+    from inventory import all_live_accounts
+
+    started = time.monotonic()
+    deadline = (now_utc() + timedelta(seconds=stop_work.SHUTDOWN_GRACE_SECONDS)).isoformat()
+    request_id = str(uuid4())
+    reports = all_live_accounts()
+    with launch_permission.launch_barrier():
+        pending = launch_permission.pending_launches()
+    known = {report["login"] for report in reports}
+    for login in sorted({claim.login for claim in pending} - known):
+        reports.append(run_inventory(login))
+    # Admit the account holds before revocation, so no later launch can slip past.
+    for report in reports:
+        empty = report.copy()
+        empty["sessions"] = []
+        _ = begin(report["login"], request_id=request_id, alerts="none", report=empty)
+        _revoke_launches(report["login"])
+    final = {report["login"]: report for report in all_live_accounts()}
+    for login in final.keys() - {report["login"] for report in reports}:
+        report = final[login]
+        empty = report.copy()
+        empty["sessions"] = []
+        _ = begin(login, request_id=request_id, alerts="none", report=empty)
+        _revoke_launches(login)
+        reports.append(report)
+    selected: list[SessionShutdown] = []
+    kept_sessions: list[Session] = []
+    refused = False
+    requester = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    for initial in reports:
+        report = final.get(initial["login"], initial).copy()
+        kept = [owner for owner in report["sessions"] if owner["kind"] != "worker"
+                and stop_work.keep_infrastructure(owner)]
+        kept_sessions.extend(kept)
+        for owner in kept:
+            previous = store.find_session(report["login"], owner["session_id"])
+            if previous is not None:
+                stop_work.retire_kept_request(previous)
+            print(f"{owner['name']}: kept (protected infrastructure)", flush=True)
+        kept_ids = {owner["session_id"] for owner in kept}
+        report["sessions"] = [owner for owner in report["sessions"] if owner["session_id"] not in kept_ids]
+        for owner in report["sessions"]:
+            if owner["kind"] == "worker":
+                continue
+            previous = store.find_session(report["login"], owner["session_id"])
+            if (previous is not None and not store.finished_stop_request(previous)
+                    and not store.request_matches_process(previous, owner)):
+                def adopt(current: SessionShutdown) -> None:
+                    current["session"] = owner
+                    current["workers"] = _owned_workers(report, owner["session_id"])
+                    # Revoke the old restore's progress claim before it can confirm
+                    # and archive the record while this process is being stopped.
+                    current["progress"] = {"kind": "waiting"}
+                _ = store.update_session(report["login"], owner["session_id"], adopt)
+                print(f"{owner['name']}: stopping current process under its existing shutdown request", flush=True)
+        _ = begin(report["login"], requester or None, request_id=request_id, alerts="none", report=report,
+                  stop_deadline=deadline)
+        live = {session["session_id"]: session for session in report["sessions"] if session["kind"] != "worker"}
+        for saved in store.session_records(report["login"]):
+            session_id = saved["session"]["session_id"]
+            if session_id not in live:
+                continue
+            if not store.request_matches_process(saved, live[session_id]):
+                refused = True
+                continue
+            def bound(current: SessionShutdown) -> None:
+                if current["progress"]["kind"] == "restarting":
+                    current["progress"] = {"kind": "waiting"}
+                current["stop_deadline"] = deadline
+                current["then"] = "stop"
+            selected.append(store.update_session(saved["login"], session_id, bound))
+
+    def tell(saved: SessionShutdown) -> None:
+        try:
+            _send_settle_message(saved)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            print(f"shutdown: {saved['session']['name']}: pause delivery: {error}", file=sys.stderr, flush=True)
+
+    def request_exit(saved: SessionShutdown) -> None:
+        threading.Thread(target=tell, args=(saved,), daemon=True).start()
+    deferred = [saved for saved in selected if saved["session"]["session_id"] == requester]
+    stopped = stop_work.bounded_stop([saved for saved in selected if saved not in deferred],
+        started=started, machine_wide=True, request_exit=request_exit,
+        keep=tuple([*kept_sessions, *(saved["session"] for saved in deferred)]))
+    for saved in deferred:
+        stop_work.defer_requester(saved)
+    for report in reports:
+        _ = store.release_finished_account_hold(report["login"])
+    return 0 if not refused and len(stopped) == len(selected) - len(deferred) and all(
+        saved["progress"]["kind"] == "stopped" and not saved["stop_issues"] for saved in stopped
+    ) else 1
 
 
 def _carry_trust(saved: SessionShutdown, target: str) -> None:
@@ -878,7 +996,8 @@ def _take_over_for_move(move: SessionShutdown) -> SessionShutdown | None:
     taken = False
     def change(current: SessionShutdown) -> None:
         nonlocal taken
-        if current.get("target") or current["progress"]["kind"] not in {"waiting", "ready", "held by usage limit"}:
+        if (current.get("target") or current["progress"]["kind"] not in {"waiting", "ready", "held by usage limit"}
+                or not store.request_matches_process(current, move["session"])):
             return
         current["then"] = move["then"]
         current["target"], current["source_label"], current["why"] = target, source_label, why
@@ -913,7 +1032,7 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
     details: list[str] = []
     if session["status"] not in _STOPPABLE_STATUSES:
         details.append(session["status"])
-    if session["status"] != "busy" and any(server["busy_workers"] for server in session["codex_servers"]):
+    if not moving and session["status"] != "busy" and any(server["busy_workers"] for server in session["codex_servers"]):
         details.append("busy")
     if local_observation and progress != "held by usage limit" and _showing_form(session):
         details.append(SHOWING_FORM)
@@ -926,8 +1045,9 @@ def _hold_details(owner: stop_work.FreshSession, progress: str, *, local_observa
             details.append(f"ahead {ahead} on {branch}")
     if local_observation and merge_in_progress(session):
         details.append("merge in progress")
-    for server in session["codex_servers"]:
-        details.extend(f"Codex worker {name} is still running" for name in server["busy_workers"])
+    if not moving:
+        for server in session["codex_servers"]:
+            details.extend(f"Codex worker {name} is still running" for name in server["busy_workers"])
     details.extend(f"Codex worker {worker['name']} is still running" for worker in owner["workers"]
                    if worker["status"] != "idle")
     return details
@@ -959,6 +1079,12 @@ def next_step(saved: SessionShutdown, owner: stop_work.FreshSession,
               others: list[SessionShutdown], now: datetime) -> Step:
     """Choose only this owner's next action from a single machine observation."""
     progress = saved["progress"]["kind"]
+    if "stop_deadline" in saved:
+        if store.bounded_attempt_finished(saved):
+            return Finished()
+        if progress in {"stopped", "already gone", "process identity lost"} and saved["then"] == "restart":
+            return RelaunchSession()
+        return Hold("bounded shutdown owns this stop")
     if progress == "restarted":
         return Finished()
     if progress in {"stopped", "already gone", "process identity lost"} and saved["then"] == "stop" and not _stop_retry_pending(saved):
@@ -1045,17 +1171,27 @@ def _send_settle_message(saved: SessionShutdown) -> None:
     _ = store.update_session(saved["login"], session["session_id"], save)
 
 
+def request_pause(saved: SessionShutdown) -> None:
+    """Ask a recorded owner to checkpoint before its bounded stop."""
+    _send_settle_message(saved)
+
+
 def ready(where: str) -> int:
     """Record this owner's next step without replacing its process identity."""
     session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     for saved in store.all_session_records():
-        if saved["session"]["session_id"] != session_id or saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit"}:
+        if saved["session"]["session_id"] != session_id:
             continue
+        if saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit"}:
+            print(f"ready has nothing to check: this session's shutdown is {saved['progress']['kind']}; "
+                  + f"in this terminal: {shutdown_command('status', saved['label'], '--here')}", file=sys.stderr)
+            return 1
         owner = stop_work.fresh_session(saved["session"], run_inventory(saved["login"]))
         if owner["kind"] != "matching session":
             print(f"this session is not in a fresh inventory of {saved['label']}: {owner['kind']}", file=sys.stderr)
             return 2
-        check = blocker(owner["session"], moving=bool(saved.get("target")))
+        check = (store.ReadinessClear(kind="clear") if "stop_deadline" in saved
+                 else blocker(owner["session"], moving=bool(saved.get("target"))))
         if check["kind"] == "blocked":
             print(check["reason"], file=sys.stderr)
             return 2
@@ -1068,6 +1204,9 @@ def ready(where: str) -> int:
                 accepted = True
         _ = store.update_session(saved["login"], session_id, mark)
         if accepted:
+            if "stop_deadline" in saved:
+                print(f"ready for shutdown: {where}", flush=True)
+                return 0
             try:
                 _launch_conductor(saved["login"], saved["label"])
             except (OSError, RuntimeError, subprocess.SubprocessError):
@@ -1076,7 +1215,9 @@ def ready(where: str) -> int:
                 return 2
             print(f"ready for shutdown: {where}")
             return 0
-    print("no shutdown in progress for this session", file=sys.stderr)
+    print("no shutdown in progress for this session: no stop or move request is open; "
+          + "ready only answers a request, it does not start one. "
+          + f"In this terminal: {shutdown_command('status', '--here')}", file=sys.stderr)
     return 1
 
 
@@ -1204,14 +1345,77 @@ def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
         print(line)
     changed = False
     refused = False
+    restart_pending = False
     ids = tuple(only)
     records = store.session_records(account.login)
+    live = run_inventory(account.login, ids)
+    recorded_ids = {saved["session"]["session_id"] for saved in records}
+    live_owners = [owner for owner in live["sessions"] if owner["kind"] != "worker"
+                   and owner["session_id"] in recorded_ids and (not ids or owner["session_id"] in ids)]
+    kept_ids = {owner["session_id"] for owner in live_owners if stop_work.keep_infrastructure(owner)}
+    for saved in records:
+        if saved["session"]["session_id"] in kept_ids:
+            stop_work.retire_kept_request(saved)
+            print(f"{saved['session']['name']}: kept (protected infrastructure)", flush=True)
+    if kept_ids:
+        _ = store.release_finished_account_hold(account.login)
+    live_owners = [owner for owner in live_owners if owner["session_id"] not in kept_ids]
+    protected_ids: set[str] = kept_ids.copy()
+    changed = bool(kept_ids)
+    for owner in live_owners:
+        previous = next(saved for saved in records if saved["session"]["session_id"] == owner["session_id"])
+        if not store.finished_stop_request(previous) and not store.request_matches_process(previous, owner):
+            protected_ids.add(owner["session_id"])
+            print(f"{owner['name']}: shutdown is in flight for another process; retained its record", flush=True)
+            refused = True
+    live_owners = [owner for owner in live_owners if owner["session_id"] not in protected_ids]
+    bounded_ids = {owner["session_id"] for owner in live_owners}
+    retries = [saved for saved in records if "stop_deadline" in saved
+               and saved["session"]["session_id"] not in bounded_ids | protected_ids
+               and (not ids or saved["session"]["session_id"] in ids)
+               and store.stop_incomplete(saved)]
+    bounded_ids.update(saved["session"]["session_id"] for saved in retries)
+    if live_owners or retries:
+        started = time.monotonic()
+        selected_report = live.copy()
+        selected_report["sessions"] = [owner for owner in live["sessions"]
+            if owner["session_id"] in bounded_ids or (owner["kind"] == "worker"
+                and owner["owner"]["kind"] == "director" and owner["owner"]["session_id"] in bounded_ids)]
+        if live_owners:
+            fresh = begin(account.login, only=bounded_ids, request_id=str(uuid4()),
+                          alerts="none", report=selected_report, stop_deadline=record_time())
+            del fresh
+        _revoke_launches(account.login, tuple(bounded_ids))
+        active = [saved for saved in store.session_records(account.login)
+                  if saved["session"]["session_id"] in bounded_ids]
+        for saved in active:
+            def bounded(current: SessionShutdown) -> None:
+                current["force"] = "now"
+                current["stop_deadline"] = record_time()
+                if store.stop_incomplete(current):
+                    current["progress"] = {"kind": "waiting"}
+            _ = store.update_session(account.login, saved["session"]["session_id"], bounded)
+        active = [current for saved in active
+                  if (current := store.find_session(saved["login"], saved["session"]["session_id"])) is not None]
+        if ids:
+            for saved in active:
+                print(f"{saved['session']['name']}: stopping now", flush=True)
+        stopped = stop_work.bounded_stop(active, started=started, grace_seconds=0)
+        refused = refused or len(stopped) != sum(not stop_work.keep_infrastructure(saved["session"]) for saved in active) or any(
+            saved["progress"]["kind"] != "stopped" or saved["stop_issues"] for saved in stopped
+        )
+        restart_pending = any(saved["then"] == "restart" and saved["progress"]["kind"] == "stopped"
+                              and not saved["stop_issues"] for saved in stopped)
+        _ = store.release_finished_account_hold(account.login)
+        changed = True
     missing = unrecorded_local_sessions(account.login, ids, records)
     local_ids = {saved["session"]["session_id"] for saved in records} | missing.keys()
     for name in missing.values():
         print(f"{name}: no shutdown in progress")
         refused = True
     for saved in records:
+        if saved["session"]["session_id"] in bounded_ids | protected_ids:
+            continue
         if ids and saved["session"]["session_id"] not in ids:
             continue
         if (not ids and saved["progress"]["kind"] not in {"waiting", "ready", "held by usage limit", "reaping"}
@@ -1245,7 +1449,7 @@ def now(account: Account, here: bool = False, only: Iterable[str] = ()) -> int:
             else:
                 print(f"{current['session']['name']} is {_progress_text(current)}; nothing to stop")
                 refused = True
-    if changed:
+    if restart_pending or changed and any(saved["session"]["session_id"] not in bounded_ids | kept_ids for saved in records):
         _launch_conductor(account.login, account.label)
     if not ids:
         print(f"{local_machine()}: stopping now" if changed else f"{local_machine()}: no shutdown in progress")
@@ -1322,10 +1526,31 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
     identity = request_id or str(uuid4())
     if isinstance(report, InventoryNeeded):
         report = run_inventory(account.login, ids)
+    conflicts = [owner for owner in report["sessions"] if owner["kind"] != "worker"
+                 and (previous := store.find_session(account.login, owner["session_id"])) is not None
+                 and not store.finished_stop_request(previous) and not store.request_matches_process(previous, owner)]
+    if conflicts:
+        for owner in conflicts:
+            print(f"{owner['name']}: shutdown is in flight for another process; retained its record", flush=True)
+        return 1
     local_ids: set[str] = ({saved["session"]["session_id"] for saved in store.session_records(account.login)}
                  | {session["session_id"] for session in report["sessions"]}) if ids else set()
+    # Keep admission closed while cancelling launches admitted before this request.
+    empty = report.copy()
+    empty["sessions"] = []
+    _ = begin(account.login, request_origin, ids, then=then, alerts=alerts,
+              request_id=identity, report=empty)
+    _revoke_launches(account.login, ids)
+    # A launch can finish and remove its claim after the initial inventory.
+    refreshed = run_inventory(account.login, ids)
+    report = report.copy()
+    report["sessions"] = list({owner["session_id"]: owner for owner in
+        [*report["sessions"], *refreshed["sessions"]]}.values())
     added = begin(account.login, request_origin, ids, then=then, alerts=alerts, request_id=identity, target=target, why=why, move_id=move_id,
                   checkout_move=checkout_move, report=report)
+    conflicts = [owner for owner in report["sessions"] if owner["kind"] != "worker"
+                 and (previous := store.find_session(account.login, owner["session_id"])) is not None
+                 and not store.request_matches_process(previous, owner)]
     if target:
         for saved in added:
             _carry_trust(saved, target)
@@ -1391,7 +1616,7 @@ def down(account: Account, here: bool = False, only: Iterable[str] = (), *,
         print(f"shutdown of {account.label} started for {len(records)} sessions. To follow it, in a terminal on {report['machine']}: {follow_command}. To {action}, in a terminal on {report['machine']}: {cancel_command}.")
     if not requests:
         print(f"shutdown of {account.label}: no local sessions selected")
-    return 0
+    return 1 if conflicts else 0
 
 def _stop_retry_pending(saved: SessionShutdown) -> bool:
     return saved["force"] == "now" and store.stop_incomplete(saved)
@@ -1830,7 +2055,7 @@ class _ModuleFingerprint:
 def _module_fingerprint() -> _ModuleFingerprint:
     directory = Path(__file__).parent
     modules: list[tuple[str, int, int]] = []
-    for name in ("shutdown.py", "settle.py", "stop.py", "record.py", "inventory.py", "restart.py"):
+    for name in ("shutdown.py", "settle.py", "stop.py", "shutdown_record.py", "inventory.py", "restart.py"):
         metadata = (directory / name).stat()
         modules.append((name, metadata.st_mtime_ns, metadata.st_size))
     return _ModuleFingerprint(tuple(modules))

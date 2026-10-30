@@ -64,10 +64,10 @@ from production_units import Production, read_production  # noqa: E402
 if TYPE_CHECKING:
     from scripts.message import sessions
     from scripts.message.sessions import SessionRecord
-    from scripts.shutdown import record as shutdown_record
+    from scripts.shutdown import shutdown_record
     from scripts.shutdown import settle as shutdown_settle
 else:
-    import record as shutdown_record
+    import shutdown_record
     import settle as shutdown_settle
     import sessions
     from sessions import SessionRecord

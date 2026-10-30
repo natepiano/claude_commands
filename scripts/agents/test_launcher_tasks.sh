@@ -2,6 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/../lib/test_agents_registry.sh"
 REPO="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
@@ -12,6 +13,8 @@ unset CLAUDE_CONFIG_DIR CLAUDE_CODE_OAUTH_TOKEN CODEX_HOME
 export PYTHONDONTWRITEBYTECODE=1 HERDR_BIN=/nonexistent/herdr
 mkdir -p "$HOME" "${TEST_DIR}/scripts/ask_a_friend" "${TEST_DIR}/scripts/agents" \
   "${TEST_DIR}/scripts/lib" "${TEST_DIR}/session"
+
+write_test_registry "$AGENTS_CONFIG_FILE"
 
 # Run the real direct launchers with their fake mesh. Check start and follow.
 cd "$REPO"

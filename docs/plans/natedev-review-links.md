@@ -77,3 +77,12 @@ The user asks any session, on natedev or on the Mac, for a link to an output (a 
 
 - `tailscale serve`, HTTPS, and access from outside the tailnet.
 - A live view of a file that changes. Each link is a snapshot; a new version gets a new link.
+
+## Phase 4 — Rerun-safe detection rules and review-links start  · status: done
+
+The shutdown items first routed here (record locks F032, restore timers at restart.py 1458, 2397 and 1470, the round 8 Astra items 1-3, owner items F2 and F3) moved to shutdown-unit on 2026-10-29 (showrunner, on the user's call). Handover files: ~/.local/state/herdr-unit/handover-2026-10-29/.
+
+- First work: findings F065-F067 landed in round 8 (commit 85f1cc94) and passed closure 9. Record close-route for F066 and F067 with that evidence.
+- From the rerun sweep (docs/plans/sdlc-rerun-sweep.md, section herdr-unit; showrunner 2026-10-29):
+  - scripts/herdr/detection_rules.py:131: a stop after the override replace and before every live session reloads (or a failed reload) leaves sessions on the old rules, and the next refresh returns early because the file already matches. Acceptance: a test that fails the reload once and shows that the next refresh reloads every session.
+  - scripts/review_links/serve.py:62: one expired snapshot that cannot be deleted fails the start-up sweep before bind, so every restart serves no link. Acceptance: a test with an undeletable expired snapshot where the server still binds and serves the other links.
