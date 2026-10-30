@@ -469,7 +469,7 @@ def apply_constants(path: Path, relative: str, source: str, findings: Sequence[C
 class CrateSources:
     """Complete original Rust source snapshot for one Cargo target, keyed by repo path.
 
-    entry is its lib.rs or main.rs. Missing sources are never read from disk.
+    entry is its configured Cargo target root. Missing sources are never read from disk.
     Call separately for different targets; the caller merges only compatible edits.
     """
     entry: str
@@ -633,10 +633,16 @@ def _route_start(parsed: Source, index: int) -> int:
     return start
 
 
-def _module_files(snapshot: CrateSources, parsed_files: Mapping[str, Source]) -> dict[str, tuple[str, ...]]:
+class ModuleCoverage(Enum):
+    ORDINARY_ROUTES = "prove only ordinary routes for the crate applier"
+    EVERY_INSTANCE = "refuse unless every module instance is covered"
+
+
+def _module_files(snapshot: CrateSources, parsed_files: Mapping[str, Source],
+                  coverage: ModuleCoverage = ModuleCoverage.ORDINARY_ROUTES) -> dict[str, tuple[str, ...]]:
     """Resolve only ordinary external modules; no cfg/path attributes or expansion."""
     root = Path(snapshot.entry).parent
-    if Path(snapshot.entry).name not in {"lib.rs", "main.rs"} or snapshot.entry not in snapshot.files:
+    if snapshot.entry not in snapshot.files:
         raise ValueError("crate entry unavailable")
     for path in snapshot.files:
         if Path(path).is_absolute() or ".." in Path(path).parts or str(Path(path)) != path or not Path(path).is_relative_to(root):
@@ -649,12 +655,17 @@ def _module_files(snapshot: CrateSources, parsed_files: Mapping[str, Source]) ->
             raise ValueError("ambiguous module graph")
         parsed = parsed_files[path]
         normalized = {word.removeprefix('r#') for word in parsed.words}
+        if coverage is ModuleCoverage.EVERY_INSTANCE and any(
+                parsed.words[index:index + 2] == ('include', '!') for index in range(len(parsed.words))):
+            raise ValueError(f"include loader leaves module instances unproved: {path}")
         opaque = bool(normalized & {'macro', 'macro_rules', 'macro_use'})
         for index, word in enumerate(parsed.words):
             if word == 'use':
                 end = next((i for i in range(index, len(parsed.words)) if parsed.words[i] == ';'), len(parsed.words))
                 opaque |= '*' in parsed.words[index:end]
         if opaque:
+            if coverage is ModuleCoverage.EVERY_INSTANCE:
+                raise ValueError(f"opaque module source leaves module instances unproved: {path}")
             continue
         modules[path] = module
         directory = root if path == snapshot.entry else (Path(path).parent if Path(path).name == "mod.rs" else Path(path).with_suffix(""))
@@ -662,11 +673,15 @@ def _module_files(snapshot: CrateSources, parsed_files: Mapping[str, Source]) ->
             if word != "mod":
                 continue
             if parsed.parents[index] != -1 or parsed.words[index + 2:index + 3] != (";",):
+                if coverage is ModuleCoverage.EVERY_INSTANCE:
+                    raise ValueError(f"nonordinary module route leaves module instances unproved: {path}")
                 continue
             # Attribute spans are half-open. Skip an attributed route entirely;
             # cfg/path/custom attributes may make it absent or point elsewhere.
             start = _route_start(parsed, index)
             if start in parsed.attribute_ends:
+                if coverage is ModuleCoverage.EVERY_INSTANCE:
+                    raise ValueError(f"attributed module route leaves module instances unproved: {path}")
                 continue
             name = parsed.words[index + 1]
             if not re.fullmatch(r"[a-z_][a-z_0-9]*", name):
@@ -677,6 +692,12 @@ def _module_files(snapshot: CrateSources, parsed_files: Mapping[str, Source]) ->
                 raise ValueError("module source missing or ambiguous")
             pending.append((present[0], (*module, name)))
     return modules
+
+
+def crate_module_paths(snapshot: CrateSources) -> frozenset[str]:
+    """Complete target coverage; never return a partial graph to a shared-edit caller."""
+    return frozenset(_module_files(snapshot, {path: Source(text) for path, text in snapshot.files.items()},
+                                   ModuleCoverage.EVERY_INSTANCE))
 
 
 def _destination(snapshot: CrateSources, modules: Mapping[str, tuple[str, ...]],
