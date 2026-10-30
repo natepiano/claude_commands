@@ -24,6 +24,8 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 
 **Merge gate suite tests.** `test_merge_gate_suites.py` covers discovery, isolation and reporting; the resources, tripwires, reruns, types, signals and admission modules keep each subject independently runnable. `merge_gate_suites_test_support.py` reuses the committed class seed and private copies, launches Python directly for real module jobs, and uses directory events and process descriptors for fixture barriers and cleanup. Admission arithmetic needs no Git fixture. Signal, process-group, memory-growth and timeout contracts retain real children; the controlled timeout clock and memory-growth pacing are unchanged.
 
+**Launcher follow tests.** `test_implement_launcher_follow.py` reuses the existing completed-worker fixture: one real initial launch per class, copied to private files at the same paths for each test. Follow-up, repair, identity migration and refusal checks still run the real Bash launcher and recorder processes. Initial-launch results and all follow-up assertions are preserved.
+
 ## How it works
 
 ### The gate: `scripts/production/merge_gate.py`
