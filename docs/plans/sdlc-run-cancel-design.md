@@ -237,7 +237,12 @@ as every target is confirmed empty. No per-host reset. After committing the stop
 4. Confirm owned execution is empty before releasing its admitted memory charge
    or execution slot. A dead wrapper is insufficient. Unknown or unreachable
    execution retains its charge. Never release another command's resource or a
-   user's build hold.
+   user's build hold. One exception, accepted by its owner (answer (c) below):
+   a step with no scope (the legacy no-scope fallback) releases its charge when
+   its wrapper dies, so admission never starves. That release does not prove
+   its execution is empty and never allows a complete cleanup receipt;
+   scope-backed accounting keeps the rule above. A future stop-command Work
+   Order carries this distinction and a wrapper-death acceptance case for it.
 5. Commit cleanup evidence, close waits for the exact commands, and publish the
    receipt and cancellation result. Unknown legacy links or escaped children
    remain pending; they cannot produce a false complete receipt.
@@ -391,8 +396,8 @@ projection. Managed CONTROL is `<session>/run_control`; standalone CONTROL is
    `lint_failure_is_the_tree` excludes 77 as its Phase 7 excludes 125.
 5. **Copy path: the user's rule.** This design defines no copy path. Copies
    follow the user's rule of 2026-10-29: `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`
-   (example `/tmp/claude/copies/hana-lfo/54b-gate`), with names only from
-   `roster.py unit_labels`, never run or session ids. verify-unit's plan
+   (example `/tmp/claude/copies/hana-lfo/54b-gate`), with the folder name only from
+   `roster.UnitLabels.folder_name()` (labels from `roster.unit_labels_for`), never run or session ids. verify-unit's plan
    `docs/plans/verify-copies.md` owns it, and each copy is a `scratch.py` record
    made at birth with its task and provenance. The run-stop fields go in a
    provenance file inside that folder, written before execution: command id,

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple, cast, override
@@ -85,6 +86,41 @@ class MeshRunsTests(unittest.TestCase):
         pending = cast(object, json.loads((mesh / "lasting-designer.pending.json").read_text()))
         self.assertIn("durable result", str(pending))
         self.assertEqual(self.sent, [])
+
+    def test_an_adopted_unit_reviewer_starts_detached_runs_without_opening_the_archive(self) -> None:
+        archive = self.root / "pool"
+        _ = (self.session / codex_mesh.ROSTER_FILE).write_text(json.dumps({"unit-review": {
+            "thread_id": "adopted-thread", "status": "running", "role": "review",
+            "launcher_pid": os.getpid(), "unit_ledger": str(self.root / "unit-workers/ledger.json"),
+        }}))
+        original_glob = Path.glob
+
+        def refuse_archive(path: Path, pattern: str, *, case_sensitive: bool | None = None,
+                           recurse_symlinks: bool = False) -> Iterator[Path]:
+            if path.is_relative_to(archive):
+                raise AssertionError(f"detached run inspected the archive: {path}")
+            return original_glob(path, pattern, case_sensitive=case_sensitive, recurse_symlinks=recurse_symlinks)
+
+        with patch.object(Path, "glob", refuse_archive):
+            caller = mesh_runs.caller_from_environment({"CODEX_THREAD_ID": "adopted-thread"})
+        self.assertEqual(caller, mesh_runs.MeshCaller(str(self.session), "unit-review", "adopted-thread"))
+
+    def test_detached_run_caller_uses_the_current_owner_instead_of_an_earlier_adopted_entry(self) -> None:
+        previous = self.session.parent / "a-former-owner"
+        previous.mkdir()
+        ledger = str(self.root / "unit-workers/ledger.json")
+        _ = (previous / codex_mesh.ROSTER_FILE).write_text(json.dumps({"old-review": {
+            "thread_id": "shared-thread", "status": "adopted", "unit_ledger": ledger,
+            "adopted_to": str(self.session), "launcher_pid": 0,
+        }}))
+        _ = (self.session / codex_mesh.ROSTER_FILE).write_text(json.dumps({"current-review": {
+            "thread_id": "shared-thread", "status": "running", "unit_ledger": ledger,
+            "launcher_pid": os.getpid(),
+        }}))
+
+        caller = mesh_runs.caller_from_environment({"CODEX_THREAD_ID": "shared-thread"})
+
+        self.assertEqual(caller, mesh_runs.MeshCaller(str(self.session), "current-review", "shared-thread"))
 
     def test_detached_result_stays_pending_for_the_held_roles_next_authorized_turn(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000076"

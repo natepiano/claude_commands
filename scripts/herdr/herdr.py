@@ -37,6 +37,7 @@ from typing import NamedTuple, NotRequired, TypedDict, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import nix_env as nix_env
 
@@ -1079,7 +1080,7 @@ class Herdr:
         return found.pane_id
 
     def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
-        """Open a tab and its pane, both named `title`, in the workspace named `space`, creating the workspace first.
+        """Open a tab and pane named `title` in the workspace named `space`, creating the workspace first.
 
         A server that holds none of the saved workspaces gets them all first, in their saved order,
         each holding a placeholder tab until its first session's tab arrives.
@@ -1174,7 +1175,7 @@ class Herdr:
         _ = staged.replace(path)
 
     def retitle(self, pane: str, title: str) -> bool:
-        """Give the pane and its tab the name `title`, then order the workspace's tabs again.
+        """Give the tab and pane the session's current name.
 
         False when both already carry it, after two reads and no change.
         """
@@ -1194,9 +1195,9 @@ class Herdr:
             _ = self.run("pane", "rename", pane, title)
         if shown != title:
             _ = self.run("tab", "rename", tab, title)
-            with _LayoutLock(self.session):
-                _ = self.order_tabs(workspace, saved_layout(self.session))
-                self.save_layout()
+        with _LayoutLock(self.session):
+            _ = self.order_tabs(workspace, saved_layout(self.session))
+            self.save_layout()
         return True
 
     def order_tabs(self, workspace: str, saved: SavedLayout,
@@ -3099,7 +3100,8 @@ def launch_agent(name: str, space: str, title: str, cwd: str, environment: dict[
         prepared = prepare_agent_environment(cwd, environment, unset_environment)
     if isinstance(prepared, nix_env.Refused):
         return prepared
-    return launch_prepared_agent(name, space, title, prepared, kind, agent_arguments, opening, timeout_ms, agent=agent)
+    return launch_prepared_agent(name, space, title, prepared, kind, agent_arguments, opening, timeout_ms,
+                                 agent=agent)
 
 
 def agent_base_environment(environment: dict[str, str], unset_environment: frozenset[str]) -> dict[str, str]:
@@ -3159,7 +3161,7 @@ def start_agent(name: str, pane: str, kind: str, agent_arguments: list[str],
                 opening: OpeningPrompt | NoOpeningPrompt, timeout_ms: int, *, agent: str) -> PromptSubmitOutcome | PromptSubmissionNotRequired:
     """Start the agent named `agent` in the named session.
 
-    `agent` is the full session name: a pane carries only the short tab title.
+    `agent` is the full agent name, which can include the production prefix.
     """
     _check_agent_arguments(kind, agent_arguments)
     return Herdr(name).start_agent(agent, pane, kind=kind, agent_arguments=agent_arguments,

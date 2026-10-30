@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import unittest
 from scripts.direct import review_launcher_test_support as support
+from scripts.direct.test_review_launcher_pool import own_review_with_legacy_flags
+from typing import override
 from pathlib import Path
 from scripts.direct.review_launcher_test_support import ProgressState as ProgressState
 from scripts.direct.review_launcher_test_support import TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS
@@ -14,12 +16,17 @@ import select
 import signal
 import subprocess
 import sys
-from scripts.direct.wait_for_test_state import wait_for_file
-from scripts.direct.wait_for_test_state import wait_for_pid
+from scripts.direct.wait_for_test_state import wait_for_file, wait_for_pid
 from scripts.direct.wait_for_test_state import wait_until
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
+    @override
+    def pool_command(self, session_dir: Path, *, lens: str = "contract", phase: str = "3",
+                     early: str = "", reviewer_type: str = "code", pass_index: int = 1) -> list[str]:
+        return own_review_with_legacy_flags(self, session_dir, lens=lens, phase=phase, early=early,
+                                           reviewer_type=reviewer_type, pass_index=pass_index)
+
     def test_ux_launch_checks_identity_before_the_worker_and_records_valid_checks(self) -> None:
         stale = self.start_implementation("ux-stale-identity")
         self.finish_implementation(stale)
@@ -331,8 +338,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         done = self.root / "done"
         environment["STUB_REVIEW_FINISH_FILE"] = str(finish)
         environment["STUB_REVIEW_DONE_FILE"] = str(done)
-        # The own arm retains its existing child behavior. Files keep the
-        # child's inherited output pipes from hiding the launcher's exit.
+        # File output lets the launcher exit without an inherited pipe hiding it.
         with (self.root / "signal-output.txt").open("w+") as output:
             process = subprocess.Popen(self.review_command(session, "", "", worker), env=environment,
                                        stdout=output, stderr=output, text=True)
@@ -372,7 +378,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             timeout=TEST_HANG_GUARD_SECS,
         )
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("unknown review lens 'style' (adversary, contract, craft, ux)", result.stderr)
+        self.assertIn("unknown review lens 'style' (adversary, contract, craft, ux, rerun)", result.stderr)
         self.assertFalse((session_dir / "review_status_style").exists())
         self.assertEqual(
             [event["event_type"] for event in self.pass_events("unknown-lens")],
