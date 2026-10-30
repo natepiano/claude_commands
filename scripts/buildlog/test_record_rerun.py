@@ -7,6 +7,7 @@ import fcntl
 import gzip
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -19,6 +20,7 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 import index
+import health
 import launches
 import record
 import report
@@ -51,6 +53,23 @@ class StepRecordingFault(Enum):
 class PendingRecordKind(Enum):
     STEP = "step"
     LAUNCH = "launch"
+
+
+def refresh_machine_health(
+    test: unittest.TestCase, host: str, machine_root: Path, report_root: Path,
+) -> Path:
+    """Produce real health on its machine and transfer only its host snapshot."""
+    with (
+        mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(machine_root)}),
+        mock.patch.object(store, "host_name", return_value=host),
+    ):
+        test.assertTrue(health.write_snapshot())
+        source = health.snapshot_path(host)
+    destination = report_root / host / health.SNAPSHOT_NAME
+    if source != destination:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _ = shutil.copyfile(source, destination)
+    return destination
 
 
 class RecordRerunTests(unittest.TestCase):
@@ -125,6 +144,11 @@ class RecordRerunTests(unittest.TestCase):
         _ = index.update()
         with closing(index.read_only()) as connection:
             return report.report(connection, "2026-10-02")
+
+    def health_lines(self) -> list[str]:
+        _ = refresh_machine_health(self, "Mac", self.fixture.base / "clean-Mac", self.fixture.root)
+        _ = refresh_machine_health(self, "natedev", self.fixture.root, self.fixture.root)
+        return report.recorder_health_lines("2026-10-02")
 
     def saved_logs(self) -> list[Path]:
         return sorted(self.fixture.root.glob("*/logs/**/*.log.gz"))
@@ -556,7 +580,7 @@ class RecordRerunTests(unittest.TestCase):
         completed = list(record.pending_steps_root().glob("*.done"))
         self.assertEqual(len(completed), 1)
         self.assertEqual(list(record.pending_steps_root().glob("*.json")), [])
-        self.assertEqual(report.recorder_health_lines("2026-10-02"), [])
+        self.assertEqual(self.health_lines(), [])
         month = store.host_file("original-host", record_tests.START)
         original_bytes = month.read_bytes()
         self.assertEqual(self.run_step(status=0, with_held_log=False), 0)
@@ -581,7 +605,7 @@ class RecordRerunTests(unittest.TestCase):
         os.utime(recent, (recent_time, recent_time))
         rows = self.step_records()
         self.assertEqual(len(rows), 2)
-        self.assertEqual(report.recorder_health_lines("2026-10-02"), [])
+        self.assertEqual(self.health_lines(), [])
 
         with mock.patch.object(time, "time", return_value=now):
             for attempt in range(2):
@@ -591,7 +615,7 @@ class RecordRerunTests(unittest.TestCase):
                     self.assertFalse(old.exists())
                     self.assertTrue(recent.is_file())
                     self.assertEqual(self.step_records(), rows)
-                    self.assertEqual(report.recorder_health_lines("2026-10-02"), [])
+                    self.assertEqual(self.health_lines(), [])
 
     def test_steps_without_named_sources_are_new_events_despite_identical_arguments(self) -> None:
         self.assertEqual(self.run_step(status=0, with_sources=False), 0)
@@ -621,13 +645,15 @@ class RecordRerunTests(unittest.TestCase):
         self.assertEqual(sum(" record.py step " in line for line in errors.splitlines()), 3)
         self.assertIn("invalid-recorder-number", errors)
 
-    def assert_health_line(self, pending: int, errors_pattern: str = "[1-9][0-9]*") -> str:
-        lines = [line for line in report.recorder_health_lines("2026-10-02") if line]
+    def assert_health_line(self, pending: int, errors: int) -> str:
+        lines = [line for line in self.health_lines() if line]
         self.assertEqual(len(lines), 1)
+        record_word = "record" if pending == 1 else "records"
+        error_word = "error" if errors == 1 else "errors"
         self.assertRegex(lines[0],
-                         rf"^{pending} records not published yet; {errors_pattern} recorder errors since .+$")
+                         rf"^natedev: {pending} {record_word} the recorder has not finished; {errors} recorder {error_word} since .+ — run buildlog launches on natedev$")
         rendered = self.report_text()
-        self.assertEqual([line for line in rendered.splitlines() if "records not published yet" in line], lines)
+        self.assertEqual([line for line in rendered.splitlines() if "the recorder has not finished" in line], lines)
         return lines[0]
 
     def test_launch_pending_save_failure_reaches_the_report_without_losing_its_source(self) -> None:
@@ -648,8 +674,8 @@ class RecordRerunTests(unittest.TestCase):
         self.assertEqual(list(record.pending_launches_root().glob("*.json")), [])
         errors = self.fixture.root / store.ERRORS_NAME
         self.assertIn("fixture pending save was refused", errors.read_text())
-        first_line = self.assert_health_line(0, "1")
-        self.assertEqual(self.assert_health_line(0, "1"), first_line)
+        first_line = self.assert_health_line(0, 1)
+        self.assertEqual(self.assert_health_line(0, 1), first_line)
         self.assertEqual(source.read_bytes(), original_source)
 
     def assert_persistent_publish_error_recovers(self, kind: PendingRecordKind) -> None:
@@ -675,7 +701,7 @@ class RecordRerunTests(unittest.TestCase):
                     self.assertEqual((still_failing.added, still_failing.steps_added), (0, 0))
                     self.assertEqual(self.step_records() if kind is PendingRecordKind.STEP else self.fixture.records(), [])
                     self.assertEqual(len(list(pending.glob("*.json"))), 1)
-                    _ = self.assert_health_line(1)
+                    _ = self.assert_health_line(1, attempt + 2)
             if kind is PendingRecordKind.STEP:
                 self.assertEqual(self.held.read_bytes(), self.output)
                 self.assertEqual(self.peak.read_bytes(), self.peak_contents)
@@ -697,11 +723,11 @@ class RecordRerunTests(unittest.TestCase):
             self.assertEqual(gzip.decompress(self.saved_logs()[0].read_bytes()), self.output)
         # Resolving a pending record must not erase the recorder's error history.
         self.assertEqual(errors.read_bytes(), error_history)
-        self.assertEqual(report.recorder_health_lines("2026-10-02"), [])
-        self.assertNotIn("records not published yet", self.report_text())
+        self.assertEqual(self.health_lines(), [])
+        self.assertNotIn("records the recorder has not finished", self.report_text())
         _ = self.fresh_cli("launches")
         self.assertEqual(self.fixture.records(), rows)
-        self.assertEqual(report.recorder_health_lines("2026-10-02"), [])
+        self.assertEqual(self.health_lines(), [])
 
     def test_step_publication_stays_visible_until_collect_recovers(self) -> None:
         self.assert_persistent_publish_error_recovers(PendingRecordKind.STEP)
@@ -710,10 +736,10 @@ class RecordRerunTests(unittest.TestCase):
         self.assert_persistent_publish_error_recovers(PendingRecordKind.LAUNCH)
 
     def test_clean_log_adds_no_recorder_health_line(self) -> None:
-        self.assertEqual(report.recorder_health_lines("2026-10-02"), [])
-        self.assertNotIn("records not published yet", self.report_text())
+        self.assertEqual(self.health_lines(), [])
+        self.assertNotIn("records the recorder has not finished", self.report_text())
         rendered = self.fresh_cli("report", "2026-10-02")
-        self.assertNotIn("records not published yet", rendered.stdout)
+        self.assertNotIn("records the recorder has not finished", rendered.stdout)
         self.assertFalse((self.fixture.root / store.ERRORS_NAME).exists())
         self.assertEqual(self.fixture.records(), [])
 
@@ -724,9 +750,9 @@ class RecordRerunTests(unittest.TestCase):
             "2026-10-02T04:00:00.000Z within the local report day", "",
         ]))
         with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
-            line = self.assert_health_line(0, "1")
+            line = self.assert_health_line(0, 1)
         self.assertEqual(line,
-                         "0 records not published yet; 1 recorder errors since 2026-10-02 00:00:00 EDT")
+                         "natedev: 0 records the recorder has not finished; 1 recorder error since 2026-10-02 00:00:00 EDT — run buildlog launches on natedev")
 
     def test_successful_step_removes_its_sources_without_saving_a_failure_log(self) -> None:
         self.assertEqual(self.run_step(status=0), 0)

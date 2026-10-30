@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TypedDict, cast
 
+import health
 import record
 import store
 
@@ -204,7 +205,10 @@ def _sync_locked() -> int:
     root = store.root()
     host = store.host_name()
     root.mkdir(parents=True, exist_ok=True)
-    reach = run(["ssh", *SSH_OPTIONS, peer, "mkdir -p " + REMOTE_ROOT + '; echo "rc=$?"'], REACH_TIMEOUT_S)
+    _ = health.write_snapshot()
+    remote_refresh = ("mkdir -p " + REMOTE_ROOT + '; echo "rc=$?"; '
+                      + "~/.claude/scripts/lib/py ~/.claude/scripts/buildlog/health.py")
+    reach = run(["ssh", *SSH_OPTIONS, peer, remote_refresh], REACH_TIMEOUT_S)
     if reach is None or reach.returncode == 255:
         # ssh's own 255: no connection. One mkdir stands in for a separate
         # `ssh true` reachability probe and saves a connection each hour.

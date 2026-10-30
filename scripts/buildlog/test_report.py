@@ -30,6 +30,7 @@ import rust_release
 import sync
 from test_holds import timed_hold_events, write_holder, write_mac_block
 from test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
+from test_record_rerun import refresh_machine_health
 
 
 class CliWork(TypedDict):
@@ -236,6 +237,8 @@ class ReportTests(unittest.TestCase):
         temporary = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(temporary) / "buildlog"
         point_root_at(self, self.root)
+        for host in ("natedev", "Mac"):
+            _ = refresh_machine_health(self, host, self.root, self.root)
         self.enterContext(mock.patch.dict(os.environ, {"HOME": temporary}))
         _ = self.enterContext(mock.patch.object(subprocess, "run"))
         _ = self.enterContext(mock.patch.object(ci, "gh_get"))

@@ -20,8 +20,8 @@ import ci
 import holds
 import index
 import disk
+import health
 import memory
-import record
 import store
 import sync
 import rust_release
@@ -1865,31 +1865,30 @@ def launches_section(connection: sqlite3.Connection, day: str) -> list[str]:
 
 
 def recorder_health_lines(day: str) -> list[str]:
-    """Show outstanding retries and errors; recovered pending errors stay only in the audit log."""
+    """Render both machines through their snapshots, using this reader's report day."""
     since = datetime.combine(date.fromisoformat(day), datetime.min.time(), user_zone())
-    pending = sum(1 for root in (record.pending_launches_root(), record.pending_steps_root())
-                  for path in root.glob("*.json") if path.is_file())
-    errors = 0
-    try:
-        with (store.root() / store.ERRORS_NAME).open() as handle:
-            for line in handle:
-                timestamp, separator, context = line.rstrip("\n").partition(" ")
-                if not separator:
+    lines: list[str] = []
+    for state in health.read_snapshots():
+        if isinstance(state, health.RecorderHealthUnavailable):
+            machine = state.machine
+            detail = "recorder health unknown (snapshot unavailable)"
+        else:
+            snapshot = state.snapshot
+            machine = snapshot.machine
+            if isinstance(state, health.StaleRecorderHealth):
+                generated = local_time(store.utc_iso(snapshot.generated_at))
+                detail = f"recorder health unknown (snapshot stale; last updated {generated})"
+            else:
+                errors = snapshot.errors_since(since.timestamp())
+                if not snapshot.unfinished_records and not errors:
                     continue
-                try:
-                    instant = datetime.fromisoformat(timestamp)
-                except ValueError:
-                    continue
-                if instant.tzinfo is None or instant < since:
-                    continue
-                if context.startswith("pending record ") and not Path(context.removeprefix("pending record ")).is_file():
-                    continue
-                errors += 1
-    except FileNotFoundError:
-        pass
-    if not pending and not errors:
-        return []
-    return [f"{pending} records not published yet; {errors} recorder errors since {local_time(since.isoformat())}"]
+                record_word = "record" if snapshot.unfinished_records == 1 else "records"
+                error_word = "error" if errors == 1 else "errors"
+                detail = (f"{snapshot.unfinished_records} {record_word} the recorder has not finished; "
+                          f"{errors} recorder {error_word} since {local_time(since.isoformat())}")
+        location = "the Mac" if machine is health.Machine.MAC else "natedev"
+        lines.append(f"{machine.value}: {detail} — run buildlog launches on {location}")
+    return lines
 
 
 def report(connection: sqlite3.Connection, day: str) -> str:

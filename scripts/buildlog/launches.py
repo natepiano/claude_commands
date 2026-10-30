@@ -17,6 +17,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import cast
 
+import health
 import record
 import store
 
@@ -318,6 +319,7 @@ def collect() -> LaunchCounts:
         temporary = state_path.with_name(state_path.name + f".{os.getpid()}.tmp")
         _ = temporary.write_text(json.dumps(state, separators=(",", ":")))
         _ = temporary.replace(state_path)
+        _ = health.write_snapshot()
         return LaunchCounts(
             recorded=counts[LaunchOutcome.RECORDED],
             not_a_launch=counts[LaunchOutcome.NOT_A_LAUNCH],
