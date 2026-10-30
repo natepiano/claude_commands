@@ -27,6 +27,7 @@ from scripts.direct import phase_reservation, phase_table, plan_history, progres
 # These regressions check the private verifier's semantic result before wait closure.
 from scripts.direct.progress_history import _supplier_message  # pyright: ignore[reportPrivateUsage]
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 from scripts.history.rounds import load_phases
 from scripts.history import history as stage_history
 
@@ -1814,11 +1815,88 @@ print('two homes isolated; recorder lock retained; caller restored')
         self.assertEqual(load_phases(old), phases)
         self.assertEqual((phases[0]["started_at"], phases[0]["finished_at"]), (1010, 1060))
 
+    def test_start_phase_rerun_repairs_the_event_after_state_was_saved(self) -> None:
+        name = "stopped-phase-start"
+        session = self.start_run(name, 1000)
+        arguments = ("start-phase", "--session-dir", str(session), "--phase-id", "6", "--phase-title", "Stop recovery")
+        with stop_once(progress_history, "_append_event", when="before", argument=1, matches=lambda event:
+                       isinstance(event, dict) and cast(dict[str, object], event).get("event_type") == "phase_started"), self.assertRaises(InjectedStop):
+            _ = self.run_command(*arguments, at=1010)
+        state = self.read_state(session)
+        instance = cast(dict[str, object], state["phase"])["instance_id"]
+        _ = self.run_command(*arguments, at=1020)
+        _ = self.run_command(*arguments, at=1030)
+        events = [event for event in self.read_events(name) if event["event_type"] == "phase_started"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["phase_instance_id"], instance)
+        self.assertEqual(cast(dict[str, object], self.read_state(session)["phase"])["instance_id"], instance)
+
+    def test_turn_wait_rerun_after_event_before_marker_keeps_one_observable_wait(self) -> None:
+        name = "stopped-turn-wait"
+        session = self.covered_wait_phase(name)
+        with patch.dict(os.environ, {"HOME": str(self.root), "XDG_STATE_HOME": str(self.root / "state"),
+                                     "UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            with stop_once(progress_history, "_record_wait"), self.assertRaises(InjectedStop):
+                _ = progress_history.record_turn_wait(session, "director", "decision: Choose the next step.")
+            self.assertTrue(progress_history.record_turn_wait(session, "director", "decision: Choose the next step."))
+            self.assertTrue(progress_history.record_turn_wait(session, "director", "decision: Choose the next step."))
+        events = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+        self.assertEqual(len(events), 1)
+        marker = cast(dict[str, object], json.loads((session / "turn_wait.json").read_text()))
+        self.assertEqual(marker["wait_id"], events[0]["wait_id"])
+        self.assertEqual(marker["owner_session"], "director")
+
     def covered_wait_phase(self, name: str) -> Path:
         session = self.start_run(name, 1000)
         _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "6",
                              "--phase-title", "Wait coverage", at=1010)
         return session
+
+    def test_turn_wait_rerun_with_a_stale_marker_recovers_the_replacement_wait(self) -> None:
+        name = "stopped-replacement-wait"
+        session = self.covered_wait_phase(name)
+        replacement = "blocked: waiting on uds:/replacement-supplier.sock"
+        with patch.dict(os.environ, {"HOME": str(self.root), "XDG_STATE_HOME": str(self.root / "state"),
+                                     "UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            self.assertTrue(progress_history.record_turn_wait(session, "director", "decision: Choose a supplier."))
+            original = next(event for event in self.read_events(name) if event["event_type"] == "wait_started")
+            with stop_once(progress_history, "_record_wait"), self.assertRaises(InjectedStop):
+                _ = progress_history.record_turn_wait(session, "director", replacement)
+            recorded = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+            self.assertEqual(len(recorded), 2)
+            replacement_id = recorded[-1]["wait_id"]
+            self.assertNotEqual(replacement_id, original["wait_id"])
+            self.assertTrue(progress_history.record_turn_wait(session, "director", replacement))
+            self.assertTrue(progress_history.record_turn_wait(session, "director", replacement))
+        starts = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+        self.assertEqual([event["wait_id"] for event in starts], [original["wait_id"], replacement_id])
+        marker = cast(dict[str, object], json.loads((session / "turn_wait.json").read_text()))
+        self.assertEqual(marker["wait_id"], replacement_id)
+        closed = [event for event in self.read_events(name) if event["event_type"] == "wait_unclosed"]
+        self.assertEqual([event["wait_id"] for event in closed], [original["wait_id"]])
+
+    def test_turn_wait_recovery_does_not_adopt_another_phases_orphan(self) -> None:
+        name = "cross-phase-orphan-wait"
+        session = self.covered_wait_phase(name)
+        declaration = "decision: Choose the next step."
+        with patch.dict(os.environ, {"HOME": str(self.root), "XDG_STATE_HOME": str(self.root / "state"),
+                                     "UNIT_NOW_EPOCH": "1020", "CLAUDE_PROBE_SESSION": "0"}):
+            with stop_once(progress_history, "_record_wait"), self.assertRaises(InjectedStop):
+                _ = progress_history.record_turn_wait(session, "director", declaration)
+            orphan = next(event for event in self.read_events(name) if event["event_type"] == "wait_started")
+            _ = self.run_command("start-phase", "--session-dir", str(session), "--phase-id", "7",
+                                 "--phase-title", "A different phase", at=1040)
+            current_phase = cast(dict[str, object], self.read_state(session)["phase"])["instance_id"]
+            os.environ["UNIT_NOW_EPOCH"] = "1050"
+            self.assertTrue(progress_history.record_turn_wait(session, "director", declaration))
+            self.assertTrue(progress_history.record_turn_wait(session, "director", declaration))
+        starts = [event for event in self.read_events(name) if event["event_type"] == "wait_started"]
+        self.assertEqual(len(starts), 2, "the current phase must get its own wait instead of inheriting an orphan")
+        self.assertNotEqual(starts[-1]["wait_id"], orphan["wait_id"])
+        self.assertEqual(starts[-1]["phase_instance_id"], current_phase)
+        self.assertNotEqual(starts[-1]["phase_instance_id"], orphan["phase_instance_id"])
+        marker = cast(dict[str, object], json.loads((session / "turn_wait.json").read_text()))
+        self.assertEqual(marker["wait_id"], starts[-1]["wait_id"])
 
     def forwarded_supplier_wait(self, name: str, body: str = "The checkpoint is merged.") -> tuple[Path, Path, str]:
         session = self.covered_wait_phase(name)

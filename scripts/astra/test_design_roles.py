@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.accounts import role_map  # noqa: E402
 from scripts.agents import codex_mesh  # noqa: E402
+from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 from scripts.lib.code_kind import is_test_code  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.astra.design_roles import resolve_holder as resolve_current_holder  # noqa: E402
@@ -178,6 +179,153 @@ class DurableRolesTests(unittest.TestCase):
         _ = prompt.write_text(text)
         return design_roles.resume(design.placement.design_id + "/" + role, prompt)
 
+    def test_open_rerun_after_reserved_claim_before_launch_finishes_one_thread(self) -> None:
+        with stop_once(design_roles, "_mesh_context"), self.assertRaises(InjectedStop):
+            _ = self.open_designer()
+        self.assertEqual(self.launches, [])
+        retried = self.open_designer()
+        self.assertEqual(self.instance(retried, "designer").lifecycle, design_roles.RoleOpen("thread-designer"))
+        self.assertEqual(self.launches, [("designer", "thread-designer")])
+
+    def test_open_rerun_after_creation_succeeds_keeps_the_thread_or_names_recovery(self) -> None:
+        with stop_once(design_roles, "launch_thread"), self.assertRaises(InjectedStop):
+            _ = self.open_designer()
+        self.assertEqual(self.launches, [("designer", "thread-designer")])
+        try:
+            retried = self.open_designer()
+        except design_roles.RoleRefused as error:
+            self.assertRegex(str(error), "(?i)recover|unknown")
+        else:
+            lifecycle = self.instance(retried, "designer").lifecycle
+            self.assertIsInstance(lifecycle, (design_roles.RoleOpen, design_roles.RoleNeedsRecovery))
+            if isinstance(lifecycle, (design_roles.RoleOpen, design_roles.RoleNeedsRecovery)):
+                self.assertEqual(lifecycle.thread_id, "thread-designer")
+        self.assertEqual(self.launches, [("designer", "thread-designer")])
+
+    def test_rebind_rerun_after_generation_save_finishes_context_and_keeps_thread(self) -> None:
+        design = self.open_designer()
+        identifier = design.placement.design_id
+        def rebind() -> design_roles.HeldDesign:
+            return design_roles.rebind(identifier, expected_generation=1, reason="next phase", binding=self.binding(self.run_b))
+        with stop_once(design_roles, "_save", matches=lambda value: isinstance(value, design_roles.HeldDesign) and value.placement.generation == 2), \
+                self.assertRaises(InjectedStop):
+            _ = rebind()
+        updated = rebind()
+        self.assertEqual(updated.placement.generation, 2)
+        self.assertEqual(updated.binding, self.binding(self.run_b))
+        self.assertFalse((design_roles.design_directory(identifier) / "transition.json").exists())
+        context = cast(dict[str, object], json.loads((design_roles.mesh_directory(identifier) / "design_context.json").read_text()))
+        self.assertEqual(context["generation"], 2)
+        _ = self.resume(updated, "designer")
+        self.assertEqual(self.dispatches[-1][1], "thread-designer")
+        self.assertEqual(self.launches, [("designer", "thread-designer")])
+
+    def test_end_rerun_after_terminal_save_clears_transition_and_releases_hold(self) -> None:
+        design = self.open_designer()
+        identifier = design.placement.design_id
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), \
+                patch.object(codex_mesh, "held_thread_end_confirmed", return_value=True):
+            with stop_once(design_roles, "_save", matches=lambda value: isinstance(value, design_roles.HeldDesign) and isinstance(
+                    self.instance(value, "designer").lifecycle, design_roles.RoleEnded)), self.assertRaises(InjectedStop):
+                _ = design_roles.end(identifier + "/designer")
+            ended = design_roles.end(identifier + "/designer")
+        self.assertEqual(self.instance(ended, "designer").lifecycle, design_roles.RoleEnded("thread-designer"))
+        self.assertFalse((design_roles.design_directory(identifier) / "transition.json").exists())
+        self.assertFalse((self.root / "holds/thread-designer.json").exists())
+        self.assertEqual(len(self.launches), 1)
+
+    def test_unbind_run_rerun_finishes_the_transition_after_the_binding_was_saved(self) -> None:
+        design = self.open_designer()
+        identifier = design.placement.design_id
+        transition = design_roles.design_directory(identifier) / "transition.json"
+        context = design_roles.mesh_directory(identifier) / "design_context.json"
+        with stop_once(design_roles, "_save", matches=lambda value: isinstance(value, design_roles.HeldDesign)
+                       and isinstance(value.binding, design_roles.DesignUnbound)), self.assertRaises(InjectedStop):
+            _ = design_roles.main(["unbind-run", str(self.run_a)])
+        self.assertIsInstance(design_roles.read_design(identifier).binding, design_roles.DesignUnbound)
+        self.assertTrue(transition.exists())
+        self.assertEqual(design_roles.main(["unbind-run", str(self.run_a)]), 0)
+        self.assertFalse(transition.exists(), "unbind-run must recover committed unbinds before filtering bound designs")
+        updated = design_roles.read_design(identifier)
+        self.assertEqual(updated.placement.generation, 2)
+        self.assertEqual(cast(dict[str, object], json.loads(context.read_text()))["generation"], 2)
+        self.assertEqual(self.instance(updated, "designer").lifecycle, design_roles.RoleOpen("thread-designer"))
+        self.assertEqual(design_roles.main(["unbind-run", str(self.run_a)]), 0)
+        self.assertEqual(design_roles.read_design(identifier), updated)
+        self.assertEqual(self.launches, [("designer", "thread-designer")])
+
+    def test_unbind_run_ignores_another_holders_legacy_committed_unbind(self) -> None:
+        design = self.open_designer()
+        identifier = design.placement.design_id
+        transition = design_roles.design_directory(identifier) / "transition.json"
+        context = design_roles.mesh_directory(identifier) / "design_context.json"
+        with stop_once(design_roles, "_save", matches=lambda value: isinstance(value, design_roles.HeldDesign)
+                       and isinstance(value.binding, design_roles.DesignUnbound)), self.assertRaises(InjectedStop):
+            _ = design_roles.main(["unbind-run", str(self.run_a)])
+        legacy = cast(dict[str, object], json.loads(transition.read_text()))
+        _ = legacy.pop("unbinding_run", None)
+        _ = transition.write_text(json.dumps(legacy))
+        pending = transition.read_bytes()
+        stale_context = context.read_bytes()
+        committed = design_roles.read_design(identifier)
+        with patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "holder-two"}):
+            self.assertEqual(design_roles.main(["unbind-run", str(self.run_b)]), 0)
+            self.assertEqual(design_roles.main(["unbind-run", str(self.run_b)]), 0)
+        self.assertEqual(transition.read_bytes(), pending, "B must leave A's legacy transition for A")
+        self.assertEqual(context.read_bytes(), stale_context)
+        self.assertEqual(design_roles.read_design(identifier), committed)
+        self.assertEqual(design_roles.main(["unbind-run", str(self.run_a)]), 0)
+        self.assertFalse(transition.exists())
+        self.assertEqual(design_roles.read_design(identifier), committed)
+        self.assertEqual(self.launches, [("designer", "thread-designer")])
+
+    def test_ending_the_designer_again_preserves_the_reviewers_pending_end_transition(self) -> None:
+        design = self.open_designer()
+        design = design_roles.open_role("fixture-repo", "design.md", "reviewer", design.holder, "design",
+                                        binding=self.binding(self.run_a))
+        identifier = design.placement.design_id
+        transition = design_roles.design_directory(identifier) / "transition.json"
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), \
+                patch.object(codex_mesh, "held_thread_end_confirmed", return_value=True):
+            _ = design_roles.end(identifier + "/designer")
+            with stop_once(design_roles, "_save", matches=lambda value: isinstance(value, design_roles.HeldDesign)
+                           and isinstance(self.instance(value, "reviewer").lifecycle, design_roles.RoleEnded)), \
+                    self.assertRaises(InjectedStop):
+                _ = design_roles.end(identifier + "/reviewer")
+            pending = transition.read_bytes()
+            _ = design_roles.end(identifier + "/designer")
+            self.assertTrue(transition.exists(), "only the reviewer may finish its pending end transition")
+            self.assertEqual(transition.read_bytes(), pending)
+            self.assertTrue((self.root / "holds/thread-reviewer.json").exists())
+            ended = design_roles.end(identifier + "/reviewer")
+        self.assertFalse(transition.exists())
+        self.assertFalse((self.root / "holds/thread-reviewer.json").exists())
+        self.assertEqual(self.instance(ended, "reviewer").lifecycle, design_roles.RoleEnded("thread-reviewer"))
+        self.assertEqual(self.launches, [("designer", "thread-designer"), ("reviewer", "thread-reviewer")])
+
+    def test_holder_move_rerun_after_holder_save_finishes_routes_without_advancing_twice(self) -> None:
+        design = self.open_designer()
+        identifier = design.placement.design_id
+        new_holder = design_roles.UnitHolder("receiving", "design-unit")
+        mesh = design_roles.mesh_directory(identifier)
+        path = mesh / "mesh_roster.json"
+        roster = cast(dict[str, dict[str, object]], json.loads(path.read_text()))
+        roster[design.roles[0].name].update({"authorized_prompt": "old", "authorized_holder": "old", "authorized_generation": 1})
+        _ = path.write_text(json.dumps(roster))
+        with stop_once(design_roles, "_save", matches=lambda value: isinstance(value, design_roles.HeldDesign) and value.holder == new_holder), \
+                self.assertRaises(InjectedStop):
+            design_roles.move_holder(design.holder, new_holder, reason="unit transfer")
+        design_roles.move_holder(design.holder, new_holder, reason="unit transfer")
+        updated = design_roles.read_design(identifier)
+        self.assertEqual(updated.holder, new_holder)
+        self.assertEqual(updated.placement.generation, 2)
+        self.assertFalse((design_roles.design_directory(identifier) / "transition.json").exists())
+        self.assertEqual(design_roles.holder_failures(design.holder), [])
+        entry = cast(dict[str, dict[str, object]], json.loads(path.read_text()))[design.roles[0].name]
+        self.assertTrue({"authorized_prompt", "authorized_holder", "authorized_generation"}.isdisjoint(entry))
+        self.assertEqual(entry["thread_id"], "thread-designer")
+        self.assertEqual(self.launches, [("designer", "thread-designer")])
+
     def test_open_retry_and_normalized_document_alias_keep_one_pair_and_thread(self) -> None:
         design = self.open_designer()
         retried = self.open_designer(document=str(self.repository / "sub/../design.md"), request_id="retry")
@@ -206,6 +354,38 @@ class DurableRolesTests(unittest.TestCase):
         if isinstance(lifecycle, design_roles.RoleNotOpened):
             self.assertTrue(lifecycle.claim)
         self.assertEqual(len(list((self.root / "roles").glob("*/design.json"))), 1)
+
+    def test_legacy_unopened_roles_preserve_uncertain_claims_and_allow_an_unclaimed_role_to_open(self) -> None:
+        with stop_once(design_roles, "_mesh_context"), self.assertRaises(InjectedStop):
+            _ = self.open_designer()
+        path = next((self.root / "roles").glob("*/design.json"))
+        fields = cast(dict[str, object], json.loads(path.read_text()))
+        for role in cast(list[dict[str, object]], fields["roles"]):
+            _ = cast(dict[str, object], role["lifecycle"]).pop("creation")
+        _ = path.write_text(json.dumps(fields))
+        saved = design_roles.read_design(path.parent.name)
+        designer = self.instance(saved, "designer").lifecycle
+        reviewer = self.instance(saved, "reviewer").lifecycle
+        self.assertIsInstance(designer, design_roles.RoleNotOpened)
+        self.assertIsInstance(reviewer, design_roles.RoleNotOpened)
+        if isinstance(designer, design_roles.RoleNotOpened) and isinstance(reviewer, design_roles.RoleNotOpened):
+            self.assertTrue(designer.claim)
+            self.assertIsInstance(designer.creation, design_roles.CreationOutcomeUnknown)
+            self.assertIsInstance(reviewer.creation, design_roles.CreationNotStarted)
+        retry = self.open_designer()
+        self.assertEqual(self.instance(retry, "designer").lifecycle, designer)
+        self.assertEqual(self.launches, [])
+        for _attempt in range(2):
+            with self.assertRaisesRegex(design_roles.RoleRefused,
+                    "RoleNeedsRecovery: thread creation outcome unknown; no recorded thread to recover; replacement refused"):
+                _ = design_roles.recover(saved.placement.design_id + "/designer")
+            recovered = design_roles.read_design(saved.placement.design_id)
+            self.assertEqual(self.instance(recovered, "designer").lifecycle, designer)
+            self.assertEqual(self.launches, [])
+        opened = design_roles.open_role("fixture-repo", "design.md", "reviewer", saved.holder, "design",
+                                        binding=self.binding(self.run_a), request_id="legacy-reviewer")
+        self.assertEqual(self.instance(opened, "reviewer").lifecycle, design_roles.RoleOpen("thread-reviewer"))
+        self.assertEqual(self.launches, [("reviewer", "thread-reviewer")])
 
     def test_incomplete_inventory_and_inventoried_legacy_source_refuse_new_threads(self) -> None:
         design_roles.register_repository("unresolved-repo", {"natedev": str(self.repository)}, inventory_complete=False)

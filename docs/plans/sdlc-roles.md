@@ -382,24 +382,58 @@ For active process redesigns, as we are currently undergoing with promotions and
 
 **Gotchas:** `~/.claude` main's `merge_gate.py` refuses a tree without `scripts/guilds` until this phase is on main; gate such a tree with its own `merge_gate.py`. `~/.local/state/guilds/` is removed only after this phase is on main.
 
-### Phase 13 — Our scripts are safe to run again after a stop  · status: todo
+### Phase 13 — Our scripts are safe to run again after a stop  · status: done
 **Depends on:** Phase 11
 
-**Why:** The rerun sweep (`docs/plans/sdlc-rerun-sweep.md`, sections `roles-unit` (14 rows) and `guild-process-unit` (6 rows); showrunner, 2026-10-29) found places where a stop at one line leaves state that a rerun cannot repair. Runs after Phase 11.
+#### Work Order
+
+**Goal:** each of the 17 live rerun-sweep rows owned by this unit is fixed: after a stop or failure at the named place, running the same command again finishes the work or reports a clear cause, and a test proves it.
 
 **Spec:**
-- Fix each row so a rerun after a stop at the named line finishes the work or reports a clear cause. Each fix has a test that stops at the named line and then reruns.
-- Path map after Phase 12: `scripts/guilds/roles.py` is `scripts/astra/design_roles.py`, `scripts/guilds/astra_work.py` is `scripts/astra/astra_work.py`. Find each named line again by its code, because line numbers moved.
-- The three `scripts/direct/review_pool.py` rows (144, 358, 439) are closed: Phase 11 (a116f29e) deleted that file. Check them off with that reason. The other 17 rows are live after Phase 11 (architect check, 2026-10-29): `codex_mesh.py` 1443, 2006, 8169 (now `command_prime` ~8141); `mesh_runs.py` 258; `send.py` 912, 989, 1389; `progress_history.py` 1480, 5634; `workers.py` 553 (generic `_write_roster`), 1604 (`end_unit` skips mesh end for an `ended` entry); `astra_roles.py` 276; `astra_work.py` 167; `design_roles.py` 744, 918, 1000, 1427.
-- One storage and lock contract: `codex_mesh.py`, `workers.py` and `design_roles.py` all lock and rewrite the roster file. An atomic replace while a writer holds a lock on the old inode can lose updates, so the fixes share one write-and-lock rule. Tests cover a stop mid-write and two writers at once, and keep other thread identities, accepted messages and generic adoption receipts.
-- Thread creation keeps "creation not started" apart from "creation outcome unknown" (`design_roles.RoleNotOpened`, `codex_mesh.command_prime` claim). An unknown outcome gives the holder a clear recovery result and never starts a second thread. Keep `test_unknown_thread_creation_retains_the_claim_instead_of_launching_again` and `test_lost_creation_acknowledgement_never_launches_a_second_thread`; add stops before launch and after creation succeeds.
-- Name the absence states the fixes touch: the `design_roles` rebind `Holder | None` / `Binding | None` ("keep the current value") and `mesh_runs.deliver`'s `int | None` (exit status vs lost supervisor) become semantic types, converted at the CLI or subprocess boundary. The `astra_roles.ExecProcess` liveness fix names the original process lifetime, not a PID that can be reused.
-- Work Order to be written at phase start (ComposeWorkOrder), from the sweep rows. Merge origin/sdlc first.
+- Source: `docs/plans/sdlc-rerun-sweep.md`, sections `roles-unit` (14 rows) and `guild-process-unit` (6 rows); showrunner, 2026-10-29. Each row's "On a rerun" text is the failure to remove. Line numbers moved: find each place again by its code. Path map after Phase 12: `scripts/guilds/roles.py` is `scripts/astra/design_roles.py`, `scripts/guilds/astra_work.py` is `scripts/astra/astra_work.py`.
+- Closed rows: the three `scripts/direct/review_pool.py` rows (144, 358, 439). Phase 11 deleted that file. Record them as closed with that reason; no code.
+- Live rows, with the place as found after Phase 11:
+  - `codex_mesh.py` 1443 — `_write_roster_record` truncates the roster before it writes the new JSON.
+  - `codex_mesh.py` 2006 — `_write_pending` truncates the pending inbox before it writes the JSON.
+  - `codex_mesh.py` 8169 — `command_prime` (~8141) saves the held-role creation claim before it records a thread.
+  - `mesh_runs.py` 258 — `reap_orphans` makes the exclusive `.reap` claim (~254) with no owner, expiry or clear.
+  - `send.py` 912 — `claim` records the emergency attempt before delivery; `still_live` does not check delivery.
+  - `send.py` 989 — `pending` deletes queue files before their text is printed.
+  - `send.py` 1389 — the daily template-fix stamp is written before the delivery child starts.
+  - `progress_history.py` 1480 — `_start_phase` saves state (~1481) before it appends `phase_started` (~1493).
+  - `progress_history.py` 5634 — `record_turn_wait` records the wait (~5672) before it writes its marker (~5673).
+  - `workers.py` 553 — generic `_write_roster` (~493) truncates before it writes; adoption recovery then cannot parse the roster.
+  - `workers.py` 1604 — `end_unit` skips mesh end for an `ended` entry (~1201) and removes the ledger while server cleanup is unfinished.
+  - `astra_roles.py` 276 — exec-role liveness checks only the saved PID.
+  - `astra_work.py` 167 — exclusive brief creation comes before the brief text is written.
+  - `design_roles.py` 744 — the opening claim is saved before the thread launches.
+  - `design_roles.py` 918 — the new binding generation is saved before `transition.json` is cleared and context updated.
+  - `design_roles.py` 1000 — `RoleEnded` is saved before transition cleanup and census release.
+  - `design_roles.py` 1427 — the new holder and generation are saved before transition cleanup and route updates.
+- Each fix has one test that stops at the named place (inject the stop or the failure there), runs the same command again, and checks that the work finished or that a clear cause was reported. No existing assertion is removed or weakened.
+- One storage and lock rule for the roster: `codex_mesh.py`, `workers.py` and `design_roles.py` all lock and rewrite the roster file. An atomic replace while a writer holds a lock on the old inode can lose updates, so all three use one shared write-and-lock rule (write a temp file, replace it under a lock that does not live on the replaced file). Tests cover a stop mid-write and two writers at once, and keep other thread identities, accepted messages and generic adoption receipts.
+- Thread creation keeps "creation not started" apart from "creation outcome unknown" (`design_roles.RoleNotOpened`, the `codex_mesh.command_prime` claim). An unknown outcome gives the holder a clear recovery result and never starts a second thread. Keep `test_unknown_thread_creation_retains_the_claim_instead_of_launching_again` and `test_lost_creation_acknowledgement_never_launches_a_second_thread`; add stops before launch and after creation succeeds.
+- Name the absence states the fixes touch: the `design_roles` rebind `Holder | None` / `Binding | None` ("keep the current value") and `mesh_runs.deliver`'s `int | None` (exit status vs lost supervisor) become semantic types, converted at the CLI or subprocess boundary. The `astra_roles.ExecProcess` liveness fix names the original process lifetime (pid plus process start time), not a PID that can be reused.
+- Every mark a fix adds has an owner check and an expiry, or a command that clears it (rerun lens question 5).
+- One place for each mechanism (user standard, 2026-10-30): the atomic write, the lock, and the process-lifetime check are one helper each, called by every fix that needs it; the stop-then-rerun tests share one stop-injection helper, not a copy per test file. Before adding a helper, look for one that already exists in `scripts/lib` or the touched module and use it.
 
-**Constraints from prior phases:** Phase 11: no reader of the archived pool state or pool meshes; generic inbox validation, ordinary reviewer thread identity and read-only behavior stay; `rename.py` reads the old pool step as `legacy_review_pool_retired`, refuses malformed or duplicate progress, and keeps unknown named steps (`test_apply_rerun_keeps_unit_moves_and_other_journal_keys`). Phase 12 path map above. main 7e85a74b renamed `scripts/shutdown/record.py` to `scripts/shutdown/shutdown_record.py` with no alias: any new import uses `shutdown_record`.
+**Files:**
+- `scripts/agents/codex_mesh.py` — roster and inbox writes, held-role creation claim
+- `scripts/agents/mesh_runs.py` — reap claim owner and expiry, delivery outcome type
+- `scripts/message/send.py` — emergency claim, pending queue, template-fix stamp
+- `scripts/direct/progress_history.py` — phase start and turn wait ordering
+- `scripts/direct/workers.py` — roster write, unit retirement cleanup
+- `scripts/astra/astra_roles.py` — exec-role process lifetime
+- `scripts/astra/astra_work.py` — brief creation
+- `scripts/astra/design_roles.py` — open, rebind, end and holder move
+- `scripts/agents/test_codex_mesh.py`, `scripts/agents/test_mesh_runs.py`, `scripts/message/test_send.py`, `scripts/direct/test_progress_history.py`, `scripts/direct/test_workers.py`, `scripts/astra/test_astra_roles.py`, `scripts/astra/test_astra_work.py`, `scripts/astra/test_design_roles.py` — stop-then-rerun tests
 
 **Workers:** `1 writer + 1 tester`.
 - `impl` — `codex_mesh.py`, `mesh_runs.py`, `send.py`, `workers.py`, `progress_history.py`, `astra_roles.py`, `astra_work.py`, `design_roles.py`; owns the shared storage and recovery rules
-- `test` — the matching fixture tests: one stop-then-rerun test per row, the concurrent-writer tests, and the kept adoption, uncertain-creation, archive and legacy-journal assertions
+- `test` — the matching test files: one stop-then-rerun test per live row, the concurrent-writer tests, and the kept adoption, uncertain-creation, archive and legacy-journal assertions
 
-**Acceptance gate:** each live row has its stop-then-rerun test passing; the `astra`, `agents`, `message`, `direct` and `production` suites pass; basedpyright on the `agents`, `message`, `astra`, `direct` and `production` roots reports 0 errors, 0 warnings, 0 notes; then the full merge gate.
+**State:** roster, inbox, claim, stamp and role-state files under the run and state folders; formats stay readable by the old code where a file already exists.
+
+**Constraints from prior phases:** Phase 11: no reader of the archived pool state or pool meshes (`test_retired_review_pool.py` refuses one); generic inbox validation, ordinary reviewer thread identity and read-only behavior stay; `rename.py` reads the old pool step as `legacy_review_pool_retired`, refuses malformed or duplicate progress, and keeps unknown named steps (`test_apply_rerun_keeps_unit_moves_and_other_journal_keys`). Phase 12 path map above. main 7e85a74b renamed `scripts/shutdown/record.py` to `scripts/shutdown/shutdown_record.py` with no alias: any new import uses `shutdown_record` (the branch gets it from origin/sdlc).
+
+**Acceptance gate:** each live row has its stop-then-rerun test passing; the `astra`, `agents`, `message`, `direct` and `production` suites pass; basedpyright on the changed files and their caller modules reports 0 errors, 0 warnings, 0 notes; then the full merge gate.

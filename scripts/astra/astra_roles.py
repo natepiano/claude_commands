@@ -10,11 +10,13 @@ import argparse
 import json
 import os
 import sys
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import durable_state
 
 AstraRole = Literal["designer", "reviewer"]
 RoleState = Literal["busy", "idle"]
@@ -48,6 +50,11 @@ class ExecProcess:
     """A hold that lasts while this local exec process runs."""
 
     pid: int
+    started: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.started:
+            object.__setattr__(self, "started", durable_state.ProcessLifetime.current(self.pid).started)
 
 
 @dataclass(frozen=True)
@@ -143,32 +150,21 @@ def hold(role: AstraRole, thread_id: str = "", codex_home: str = "", *,
     if design_id:
         record.update(design_id=design_id, role_id=role_id)
     path = _record_path(thread_id)
+    if pid is not None:
+        lifetime = ExecProcess(pid)
+        # Keep the role's existing JSON shape readable by an older installation.
+        durable_state.atomic_write_text(path.with_suffix(".process"), json.dumps({
+            "pid": lifetime.pid, "started": lifetime.started}))
     held = _parse_record(record, path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as output:
-        temporary = Path(output.name)
-        try:
-            json.dump(record, output)
-            output.flush()
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+    durable_state.atomic_write_text(path, json.dumps(record))
     return held
 
 
 def release(thread_id: str) -> None:
     """Remove a hold, including one whose thread has already stopped."""
-    _record_path(thread_id).unlink(missing_ok=True)
-
-
-def _pid_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except PermissionError:
-        return True
-    except (OSError, OverflowError):
-        return False
-    return True
+    path = _record_path(thread_id)
+    path.unlink(missing_ok=True)
+    path.with_suffix(".process").unlink(missing_ok=True)
 
 
 def _record_text(record: dict[str, object], key: str) -> str:
@@ -203,7 +199,14 @@ def _parse_record(record: dict[str, object] | RoleRecord, path: Path) -> HeldRol
     elif isinstance(session_dir, str) and session_dir.strip() and isinstance(worker, str) and worker.strip() and pid is None:
         lifetime = MeshWorker(session_dir, worker)
     elif session_dir is None and worker is None and isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
-        lifetime = ExecProcess(pid)
+        try:
+            process = _json_object(path.with_suffix(".process"))
+        except FileNotFoundError as error:
+            raise ValueError("original exec process lifetime is unrecorded; hold it again from its launcher") from error
+        started = process.get("started")
+        if process.get("pid") != pid or not isinstance(started, str) or not started:
+            raise ValueError("original exec process lifetime differs from the hold")
+        lifetime = ExecProcess(pid, started)
     else:
         raise ValueError("record needs a mesh worker or an exec pid")
     return HeldRole(role=role, thread_id=thread_id, codex_home=codex_home,
@@ -273,8 +276,8 @@ def live_roles() -> list[LiveRole]:
                     continue
                 state = "busy" if status in ("starting", "running", "waiting_capacity") else "idle"
             else:
-                if not _pid_running(lifetime.pid):
-                    path.unlink(missing_ok=True)
+                if not durable_state.ProcessLifetime(lifetime.pid, lifetime.started).is_live():
+                    release(record["thread_id"])
                     continue
                 state = "busy"
             roles.append(LiveRole(role=record["role"], thread_id=record["thread_id"],

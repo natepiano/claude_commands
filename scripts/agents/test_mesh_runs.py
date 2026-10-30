@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import inspect
 import json
 import os
 import select
@@ -16,12 +17,13 @@ import unittest
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NamedTuple, cast, override
+from typing import NamedTuple, cast, get_type_hints, override
 from unittest.mock import MagicMock, patch
 
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.buildlog import treekey
 from scripts.astra import design_roles
+from scripts.lib.stop_injection_test_support import stop_in_child
 from scripts.lib.socket_test_support import short_socket_directory
 
 WORKER = "unit-impl"
@@ -138,7 +140,7 @@ class MeshRunsTests(unittest.TestCase):
                 patch.object(codex_mesh, "command_send", side_effect=AssertionError("result sent a turn")), \
                 patch.object(design_roles, "dispatch_turn", side_effect=AssertionError("result dispatched a role")):
             record = self.supervise(path)
-            repeated = mesh_runs.deliver(record, 0)
+            repeated = mesh_runs.deliver(record, mesh_runs.CommandExit(0))
         messages = design_roles.pending_messages(design_id, "reviewer")
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0].source, "mesh_runs:r1")
@@ -158,16 +160,16 @@ class MeshRunsTests(unittest.TestCase):
         text = path.read_text(encoding="utf-8") if path.exists() else ""
         return cast(dict[str, object], json.loads(text)) if text.strip() else {}
 
-    def record(self, command: list[str], **extra: str) -> Path:
+    def record(self, command: list[str], *, run_id: str = "r1", **extra: str) -> Path:
         runs = self.session / codex_mesh.DETACHED_RUNS_DIR
         runs.mkdir(exist_ok=True)
         record: mesh_runs.RunRecord = {
-            "run_id": "r1", "status": "running", "session_dir": str(self.session), "worker": WORKER,
+            "run_id": run_id, "status": "running", "session_dir": str(self.session), "worker": WORKER,
             "thread_id": "thread-1", "label": "verify.sh check", "command": command, "cwd": str(self.root),
-            "log": str(runs / "r1.log"), "started_at": time.time(), "pid": os.getpid(),
+            "log": str(runs / f"{run_id}.log"), "started_at": time.time(), "pid": os.getpid(),
             "director_dir": str(self.session), "done_message_file": extra.get("done", ""),
         }
-        path = runs / "r1.json"
+        path = runs / f"{run_id}.json"
         _ = path.write_text(json.dumps(record), encoding="utf-8")
         return path
 
@@ -291,6 +293,56 @@ class MeshRunsTests(unittest.TestCase):
         self.assertEqual(mesh_runs.reap_orphans(str(self.session)), [])
         self.assertEqual(len(cast(list[str], self.pending()["messages"])), 1)
 
+    def test_reap_rerun_reclaims_a_dead_owner_after_the_exclusive_claim(self) -> None:
+        path = self.record(["bash", "verify.sh", "test", "fixture"])
+        self.update_record(path, pid=DEAD_PID)
+        stop_in_child(lambda: mesh_runs.reap_orphans(str(self.session), WORKER), mesh_runs, "_read_record", when="before")
+        self.assertEqual(mesh_runs.reap_orphans(str(self.session), WORKER), ["r1"])
+        record = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertEqual((record["status"], record["ended"]), ("finished", "supervisor gone"))
+        messages = cast(list[str], self.pending()["messages"])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("no exit status", messages[0])
+        self.assertEqual(mesh_runs.reap_orphans(str(self.session), WORKER), [])
+        self.assertEqual(cast(list[str], self.pending()["messages"]), messages)
+        self.assertFalse(path.with_suffix(".reap").exists())
+
+    def test_result_formatting_keeps_exit_and_lost_supervisor_as_named_outcomes(self) -> None:
+        path = self.record(["echo", "result"])
+        record = cast(mesh_runs.RunRecord, json.loads(path.read_text()))
+        functions = ((mesh_runs.result_text, 1), (mesh_runs._exit_words, 0))  # pyright: ignore[reportPrivateUsage]
+        for function, index in functions:
+            with self.subTest(function=function.__name__):
+                parameter = list(inspect.signature(function).parameters)[index]
+                self.assertEqual(get_type_hints(function)[parameter], mesh_runs.RunOutcome)
+        self.assertIn("Result: PASS (exit 0)", mesh_runs.result_text(record, mesh_runs.CommandExit(0)))
+        self.assertIn("Result: FAIL (exit 7)", mesh_runs.result_text(record, mesh_runs.CommandExit(7)))
+        lost = mesh_runs.result_text(record, mesh_runs.SupervisorLost())
+        self.assertIn("Run ended with no result:", lost)
+        self.assertIn("Result: FAIL (no exit status)", lost)
+        self.assertEqual(mesh_runs._exit_words(mesh_runs.CommandExit(7)), "exit 7")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(mesh_runs._exit_words(mesh_runs.SupervisorLost()), "no exit status")  # pyright: ignore[reportPrivateUsage]
+
+    def test_reap_rerun_after_delivery_before_finished_record_queues_one_result(self) -> None:
+        path = self.record(["echo", "result"])
+        self.update_record(path, pid=DEAD_PID)
+        stop_in_child(lambda: mesh_runs.reap_orphans(str(self.session), WORKER), mesh_runs, "deliver")
+        first = cast(list[str], self.pending()["messages"])
+        self.assertEqual(len(first), 1)
+        self.assertEqual(cast(dict[str, object], json.loads(path.read_text()))["status"], "running")
+        self.assertEqual(mesh_runs.reap_orphans(str(self.session), WORKER), ["r1"])
+        self.assertEqual(cast(list[str], self.pending()["messages"]), first,
+                         "the run's stable identity must deduplicate a delivery whose record commit was interrupted")
+        self.assertEqual(cast(dict[str, object], json.loads(path.read_text()))["status"], "finished")
+        self.assertEqual(mesh_runs.reap_orphans(str(self.session), WORKER), [])
+        self.assertEqual(cast(list[str], self.pending()["messages"]), first)
+        other = cast(dict[str, object], json.loads(path.read_text()))
+        other.update(run_id="r2", status="running", pid=DEAD_PID)
+        _ = path.with_name("r2.json").write_text(json.dumps(other))
+        self.assertEqual(mesh_runs.reap_orphans(str(self.session), WORKER), ["r2"])
+        self.assertEqual(cast(list[str], self.pending()["messages"]), first + first,
+                         "different runs with identical result text must both be delivered")
+
     def test_a_dead_run_that_a_newer_run_of_its_command_answers_delivers_nothing(self) -> None:
         command = ["bash", "verify.sh", "lint", "hana"]
         older = self.record(command)
@@ -344,10 +396,11 @@ class MeshRunsTests(unittest.TestCase):
         hold = codex_mesh.hold_message
         statuses: list[object] = []
 
-        def watched(session_dir: str, name: str, text: str, *, without_launcher: bool) -> codex_mesh.HoldOutcome:
+        def watched(session_dir: str, name: str, text: str, *, without_launcher: bool,
+                    message_id: str = "") -> codex_mesh.HoldOutcome:
             stored = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
             statuses.append(stored["status"])
-            return hold(session_dir, name, text, without_launcher=without_launcher)
+            return hold(session_dir, name, text, without_launcher=without_launcher, message_id=message_id)
 
         with patch.object(codex_mesh, "hold_message", watched):
             record = self.supervise(path)
@@ -424,7 +477,7 @@ class MeshRunsTests(unittest.TestCase):
         self.assertLess(len(message), mesh_runs.RESULT_TAIL_CHARS + 1_000)
         self.assertIn(f"{'29' * 1_000} [cut: 8000 more characters]", message)
         self.assertTrue(message.endswith("\nlast line"))
-        _ = self.supervise(self.record([sys.executable, "-c", "print('x' * 1_100_000)"]))
+        _ = self.supervise(self.record([sys.executable, "-c", "print('x' * 1_100_000)"], run_id="r2"))
         message = cast(list[str], self.pending()["messages"])[-1]
         self.assertIn(f"{'x' * mesh_runs.RESULT_LINE_CHARS} [cut: 1098000 more characters]", message)
         self.assertLess(len(message), mesh_runs.RESULT_TAIL_CHARS)

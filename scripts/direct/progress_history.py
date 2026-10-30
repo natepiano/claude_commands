@@ -12,7 +12,6 @@ import re
 import statistics
 import subprocess
 import sys
-import tempfile
 import uuid
 from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable, Mapping
@@ -29,7 +28,7 @@ if not __package__:
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
-from scripts.lib import agents_registry, unit_runs  # noqa: E402
+from scripts.lib import agents_registry, durable_state, unit_runs  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
 from scripts.production import production_doc  # noqa: E402
@@ -455,19 +454,7 @@ def _read_state(session_dir: Path) -> dict[str, object]:
 
 
 def _write_state(session_dir: Path, state: dict[str, object]) -> None:
-    session_dir.mkdir(parents=True, exist_ok=True)
-    target = _state_path(session_dir)
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        dir=session_dir,
-        prefix=f".{plan_history.STATE_FILENAME}.",
-        delete=False,
-    ) as handle:
-        json.dump(state, handle, indent=2, sort_keys=True)
-        _ = handle.write("\n")
-        temporary = Path(handle.name)
-    os.replace(temporary, target)
+    durable_state.atomic_write_text(_state_path(session_dir), json.dumps(state, indent=2, sort_keys=True) + "\n")
 
 
 SESSION_ROOTS = tuple(
@@ -1425,7 +1412,10 @@ def _start_phase(args: argparse.Namespace) -> None:
     phase_id = _arg_string(args, "phase_id", "ad hoc")
     # Starting a phase that is already open does nothing. Starting any other
     # leaves every open phase open: each closes only by its own finish-phase.
-    if _open_phase_named(state, phase_id) is not None:
+    opened = _open_phase_named(state, phase_id)
+    if opened is not None:
+        _ensure_phase_started(state, opened, args, now)
+        _refresh_phase_table(session_dir)
         return
     # A finished phase reopened for repair rounds gets its reservation state back from its kept
     # /sync board answer, so its edits pass the berth hook with no hand-written state.
@@ -1479,7 +1469,18 @@ def _start_phase(args: argparse.Namespace) -> None:
     state["percent_started_at"] = None
     state["pending_calibration"] = None
     _write_state(session_dir, state)
-    event = _event(state, "phase_started", started_at)
+    _ensure_phase_started(state, phase, args, now)
+    _refresh_phase_table(session_dir)
+
+
+def _ensure_phase_started(state: dict[str, object], phase: dict[str, object],
+                          args: argparse.Namespace, now: float) -> None:
+    """Repair the history half of a saved phase without recording it twice."""
+    if any(event.get("event_type") == "phase_started" and event.get("phase_instance_id") == phase.get("instance_id")
+           for event in _run_events(state)):
+        return
+    started_at = _number(phase.get("started_at"))
+    event = _event(state, "phase_started", started_at, phase_record=phase)
     source = _phase_source_identity(state)
     event.update(production=_phase_metadata_fields(source.production),
                  unit=_phase_metadata_fields(source.unit),
@@ -1491,7 +1492,6 @@ def _start_phase(args: argparse.Namespace) -> None:
         event["backfilled"] = True
     event.update(_work_order_metrics(_arg_string(args, "work_order_file")))
     _append_event(state, event)
-    _refresh_phase_table(session_dir)
 
 
 class LedgerRepairCause(TypedDict):
@@ -5254,6 +5254,8 @@ def _record_wait(state: dict[str, object], args: argparse.Namespace) -> str:
                   "holder": _holder_fields(holder)})
     if hasattr(args, "expected_supplier"):
         event["expected_supplier"] = cast(object, args.expected_supplier)
+    if hasattr(args, "turn_wait_declaration"):
+        event["turn_wait_declaration"] = cast(object, args.turn_wait_declaration)
     if isinstance(resolution, ResolvedWorkerPass):
         event.update(pass_instance_id=resolution.pass_instance_id, worker_name=resolution.worker_name,
                      team_slot=resolution.team_slot, wait_attribution={"state": "WorkerPass"})
@@ -5661,17 +5663,44 @@ def record_turn_wait(session_dir: Path, owner_session: str, final_message: str) 
             marker = _json_object(marker_path.read_text(encoding="utf-8")) or {}
         except FileNotFoundError:
             marker = {}
-        previous = _waits_by_id(_run_events(state)).get(_string(marker.get("wait_id")))
-        if previous is not None and previous.get("event_type") == "wait_started":
-            if (previous.get("owner_session") == owner_session and previous.get("wait_kind") == kind
-                    and previous.get("expected_supplier") == supplier_fields):
-                return True
-            _end_wait(state, previous, plan_history.now_epoch(), unclosed=True)
+        waits = _waits_by_id(_run_events(state))
+        previous = waits.get(_string(marker.get("wait_id")))
         args = argparse.Namespace(missing_reason="", kind=kind, reason=reason,
                                   owner_session=owner_session, unit="", expected_supplier=supplier_fields)
+        resolution = _wait_phase(state, args)
+        phase = resolution.phase if isinstance(resolution, (WaitPhaseResolved, ResolvedWorkerPass)) else {}
+        scope: dict[str, object] = {"phase_instance_id": _string(phase.get('instance_id')),
+                                    "phase_id": _string(phase.get('id')), "owner_session": owner_session,
+                                    "wait_kind": kind, "expected_supplier": supplier_fields}
+        declaration_path = session_dir / 'turn_wait_declaration.json'
+        try:
+            declaration = _json_object(declaration_path.read_text(encoding='utf-8')) or {}
+        except FileNotFoundError:
+            declaration = {}
+        same_scope = all(declaration.get(key) == value for key, value in scope.items())
+        correlated = next((wait for wait in reversed(list(waits.values()))
+                           if same_scope and declaration.get('declaration_id')
+                           and wait.get('turn_wait_declaration') == declaration), None)
+        if correlated is not None and correlated.get('event_type') == 'wait_started':
+            durable_state.atomic_write_text(marker_path, json.dumps({
+                "wait_id": correlated["wait_id"], "owner_session": owner_session}) + "\n")
+            return True
+        # A declaration is durable before its wait event. A closed declaration
+        # starts a new identity; a stopped declaration with no event resumes it.
+        if not same_scope or not declaration.get('declaration_id') or correlated is not None:
+            declaration = {**scope, 'declaration_id': str(uuid.uuid4())}
+            durable_state.atomic_write_text(declaration_path, json.dumps(declaration) + '\n')
+        if previous is not None and previous.get('event_type') == 'wait_started':
+            # Retain a legacy marker's open wait only within its recorded phase.
+            if (not previous.get('turn_wait_declaration')
+                    and previous.get('phase_instance_id') == scope['phase_instance_id']
+                    and previous.get('owner_session') == owner_session and previous.get('wait_kind') == kind
+                    and previous.get('expected_supplier') == supplier_fields):
+                return True
+            _end_wait(state, previous, plan_history.now_epoch(), unclosed=True)
+        args.turn_wait_declaration = declaration
         wait_id = _record_wait(state, args)
-        _ = marker_path.write_text(json.dumps({"wait_id": wait_id, "owner_session": owner_session}) + "\n",
-                                   encoding="utf-8")
+        durable_state.atomic_write_text(marker_path, json.dumps({"wait_id": wait_id, "owner_session": owner_session}) + "\n")
     return True
 
 

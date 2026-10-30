@@ -20,6 +20,8 @@ TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
+from scripts.message import sessions
+from scripts.lib.stop_injection_test_support import stop_in_child
 from scripts.astra import design_roles  # noqa: E402
 
 SCRIPT = Path(__file__).with_name("astra_roles.py")
@@ -189,6 +191,18 @@ class AstraRolesTests(unittest.TestCase):
         for path in paths:
             self.assertEqual(sum(str(path) in line for line in lines), 1)
             self.assertTrue(path.exists())
+
+    def test_exec_hold_after_stop_does_not_attach_to_a_reused_pid(self) -> None:
+        with mock.patch.dict(os.environ, self.environment):
+            stop_in_child(lambda: astra_roles.hold("reviewer", "stopped-exec", str(self.home),
+                          pid=os.getpid(), manager="sid-runner"), os, "replace", argument=1,
+                          matches=lambda destination: destination == self.state / "stopped-exec.json")
+            self.assertTrue((self.state / "stopped-exec.json").exists())
+            with mock.patch.object(os, "kill", return_value=None), \
+                    mock.patch.object(sessions, "process_start", return_value="different-process-start"):
+                self.assertEqual(astra_roles.live_roles(), [])
+            self.assertFalse((self.state / "stopped-exec.json").exists())
+            self.assertEqual(astra_roles.live_roles(), [])
 
     def test_live_roles_name_the_mesh_worker_and_exec_process_lifetimes(self) -> None:
         self.assertEqual(self.hold_mesh("--manager", "sid-director").returncode, 0)

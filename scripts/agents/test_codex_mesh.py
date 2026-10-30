@@ -52,7 +52,8 @@ from unittest.mock import MagicMock, patch
 from scripts.agents import codex_mesh
 from scripts.direct import plan_history, workers as unit_workers
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.lib import nix_env, unit_runs
+from scripts.lib import durable_state, nix_env, unit_runs
+from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 from scripts.message import process_table, sessions, roster as message_roster
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
@@ -1127,8 +1128,7 @@ class MeshCommandFixture(unittest.TestCase):
         )
 
     def roster(self) -> dict[str, object]:
-        with (self.session_dir / codex_mesh.ROSTER_FILE).open(encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
+        with durable_state.locked_text(self.session_dir / codex_mesh.ROSTER_FILE) as handle:
             return cast("dict[str, object]", json.load(handle))
 
     def worker_record(self) -> dict[str, object]:
@@ -1189,9 +1189,8 @@ class MeshCommandFixture(unittest.TestCase):
         return code, output.getvalue(), errors.getvalue()
 
     def write_pool_roster(self, entries: dict[str, object]) -> None:
-        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(
-            json.dumps(entries), encoding="utf-8"
-        )
+        with durable_state.locked_text(self.session_dir / codex_mesh.ROSTER_FILE) as handle:
+            durable_state.rewrite_text(handle, json.dumps(entries))
 
     def prime_cli(self, *options: str) -> list[str]:
         instructions_file = self.session_dir / "review-instructions.txt"
@@ -2082,20 +2081,16 @@ class MeshCommandTests(MeshCommandFixture):
                 armed[0] = True
             return frames
         path = self.session_dir / codex_mesh.ROSTER_FILE
+        lock_path = path.with_name(path.name + ".lock")
         def acquire(descriptor: int, operation: int) -> None:
             # Matched by inode, not /proc/self/fd, which macOS lacks.
-            locks_roster = path.exists() and os.path.samestat(os.fstat(descriptor), path.stat())
+            locks_roster = lock_path.exists() and os.path.samestat(os.fstat(descriptor), lock_path.stat())
             if armed[0] and operation == fcntl.LOCK_EX and locks_roster:
                 armed[0] = False
-                with path.open("r+") as other:
-                    flock(other.fileno(), fcntl.LOCK_EX)
+                with durable_state.locked_text(path) as other:
                     entries = cast(dict[str, object], json.loads(other.read()))
                     entries["worker"] = replacement
-                    _ = other.seek(0)
-                    _ = other.truncate()
-                    _ = other.write(json.dumps(entries))
-                    other.flush()
-                    flock(other.fileno(), fcntl.LOCK_UN)
+                    durable_state.rewrite_text(other, json.dumps(entries))
                 writes[0] += 1
             flock(descriptor, operation)
         self.server.respond = reply
@@ -2216,6 +2211,102 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(_as_test_dict(self.roster()["template"]).get("context_tokens"), 0)
         self.assertEqual(_as_test_dict(self.roster()["template"]).get("task"), "delegate.review")
         self.assertEqual(self.methods("turn/start"), [])
+
+    def test_roster_rerun_after_serialization_stop_preserves_other_threads_and_adoption_receipts(self) -> None:
+        kept = {"thread_id": "other-thread", "status": "done", "adoption_id": "kept-adoption", "adopted_from": "previous-run"}
+        self.write_pool_roster({"other": kept})
+        record: codex_mesh.FollowableRecord = {"thread_id": "new-thread", "status": "done", "role": "impl"}
+        with stop_once(json, "dumps", when="before", matches=lambda value: "new-thread" in str(value)), \
+                self.assertRaises(InjectedStop):
+            codex_mesh._update_roster(str(self.session_dir), "new", record)  # pyright: ignore[reportPrivateUsage]
+        codex_mesh._update_roster(str(self.session_dir), "new", record)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.roster()["other"], kept)
+        self.assertEqual(_as_test_dict(self.roster()["new"])["thread_id"], "new-thread")
+
+    def test_pending_rerun_after_serialization_stop_keeps_previously_accepted_messages(self) -> None:
+        path = self.session_dir / "worker.pending.json"
+        _ = path.write_text(json.dumps({"thread_id": "thread-one", "messages": ["accepted message"],
+                                        "accepting_messages": True, "adoption_id": "kept-adoption"}))
+        with stop_once(json, "dumps", when="before", matches=lambda value: "retry message" in str(value)), \
+                self.assertRaises(InjectedStop):
+            codex_mesh._add_pending(str(self.session_dir), "worker", "thread-one", "retry message")  # pyright: ignore[reportPrivateUsage]
+        codex_mesh._add_pending(str(self.session_dir), "worker", "thread-one", "retry message")  # pyright: ignore[reportPrivateUsage]
+        pending = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertEqual(pending["messages"], ["accepted message", "retry message"])
+        self.assertEqual(pending["adoption_id"], "kept-adoption")
+
+    def test_publication_stop_before_replace_keeps_roster_and_inbox_readable_for_rerun(self) -> None:
+        for index, writer in enumerate(("mesh", "workers", "design", "inbox")):
+            with self.subTest(writer=writer):
+                identifier = f"00000000-0000-4000-8000-00000000008{index + 4}"
+                folder = design_roles.mesh_directory(identifier)
+                folder.mkdir(parents=True)
+                path = folder / ("worker.pending.json" if writer == "inbox" else codex_mesh.ROSTER_FILE)
+                kept = ({"thread_id": "worker-thread", "messages": ["accepted message"], "accepting_messages": True,
+                         "adoption_id": "accepted-adoption"} if writer == "inbox" else
+                        {"kept": {"thread_id": "kept-thread", "status": "done", "adoption_id": "accepted-adoption"}})
+                _ = path.write_text(json.dumps(kept))
+                before = path.read_bytes()
+
+                def update() -> None:
+                    record: codex_mesh.FollowableRecord = {"thread_id": "new-thread", "status": "done"}
+                    if writer == "mesh":
+                        codex_mesh._update_roster(str(folder), "new", record)  # pyright: ignore[reportPrivateUsage]
+                    elif writer == "workers":
+                        with unit_workers._roster_locked(folder) as (handle, roster):  # pyright: ignore[reportPrivateUsage]
+                            roster["new"] = dict(record)
+                            unit_workers._write_roster(handle, roster)  # pyright: ignore[reportPrivateUsage]
+                    elif writer == "design":
+                        with design_roles._edit_roster(identifier) as roster:  # pyright: ignore[reportPrivateUsage]
+                            roster["new"] = dict(record)
+                    else:
+                        codex_mesh._add_pending(str(folder), "worker", "worker-thread", "retry message")  # pyright: ignore[reportPrivateUsage]
+
+                with stop_once(os, "replace", when="before", argument=1, matches=lambda destination: destination == path), self.assertRaises(InjectedStop):
+                    update()
+                self.assertEqual(path.read_bytes(), before)
+                update()
+                saved = cast(dict[str, object], json.loads(path.read_text()))
+                if writer == "inbox":
+                    self.assertEqual(saved["messages"], ["accepted message", "retry message"])
+                    self.assertEqual(saved["adoption_id"], "accepted-adoption")
+                else:
+                    self.assertEqual(saved["kept"], kept["kept"])
+                    self.assertEqual(cast(dict[str, object], saved["new"])["thread_id"], "new-thread")
+
+    def test_all_roster_writers_serialize_updates_without_losing_other_thread_identities(self) -> None:
+        design_id = "00000000-0000-4000-8000-000000000081"
+        mesh = design_roles.mesh_directory(design_id)
+        mesh.mkdir(parents=True)
+        kept = {"thread_id": "kept-thread", "status": "done", "adoption_id": "accepted-adoption"}
+        _ = (mesh / codex_mesh.ROSTER_FILE).write_text(json.dumps({"kept": kept}))
+        ready = threading.Barrier(3)
+
+        def update(writer: str) -> None:
+            _ = ready.wait(timeout=10)
+            for index in range(8):
+                name = f"{writer}-{index}"
+                record: codex_mesh.FollowableRecord = {"thread_id": name + "-thread", "status": "done"}
+                if writer == "mesh":
+                    codex_mesh._update_roster(str(mesh), name, record)  # pyright: ignore[reportPrivateUsage]
+                elif writer == "workers":
+                    with unit_workers._roster_locked(mesh) as (handle, roster):  # pyright: ignore[reportPrivateUsage]
+                        roster[name] = dict(record)
+                        unit_workers._write_roster(handle, roster)  # pyright: ignore[reportPrivateUsage]
+                else:
+                    with design_roles._edit_roster(design_id) as roster:  # pyright: ignore[reportPrivateUsage]
+                        roster[name] = dict(record)
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            results = [pool.submit(update, writer) for writer in ("mesh", "workers", "design")]
+            for result in results:
+                result.result(timeout=30)
+        roster = cast(dict[str, dict[str, object]], json.loads((mesh / codex_mesh.ROSTER_FILE).read_text()))
+        self.assertEqual(roster["kept"], kept)
+        self.assertEqual(len(roster), 25)
+        for writer in ("mesh", "workers", "design"):
+            for index in range(8):
+                self.assertEqual(roster[f"{writer}-{index}"]["thread_id"], f"{writer}-{index}-thread")
 
     def test_prime_accepts_omitted_model_and_service_tier(self) -> None:
         code, output, errors = self.run_mesh(self.prime_cli())
@@ -3640,6 +3731,42 @@ class MeshCommandTests(MeshCommandFixture):
         self.assert_review_record("reviewer", self.fork_thread_id)
         self.assertEqual(set(self.roster()), {"template", "reviewer"})
 
+    def held_prime_design(self, design_id: str, holder: design_roles.Holder, role: Literal["designer", "reviewer"]) -> None:
+        design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
+            "fixture-repo", str(self.session_dir), str(self.session_dir / "design.md"), "design",
+            "2026-10-21T12:00:00+00:00", holder, design_roles.DesignUnbound(),
+            (design_roles.RoleInstance("designer", "template" if role == "designer" else "other-designer",
+                                design_roles.RoleNotOpened("claim")),
+             design_roles.RoleInstance("reviewer", "template" if role == "reviewer" else "other-reviewer",
+                                design_roles.RoleNotOpened("claim"))))
+        design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+
+    def test_prime_rerun_after_claim_before_server_start_can_create_the_reserved_thread(self) -> None:
+        identifier = "00000000-0000-4000-8000-000000000082"
+        self.held_prime_design(identifier, design_roles.ShowrunnerHolder("sdlc"), "reviewer")
+        arguments = self.prime_cli("--held-design", identifier, "--held-role", "reviewer")
+        with patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")), \
+                patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-holder"}):
+            with stop_once(codex_mesh, "ensure_server", when="before"), self.assertRaises(InjectedStop):
+                _ = self.run_mesh(arguments)
+            code, output, errors = self.run_mesh(arguments)
+        self.assertEqual((code, output, errors), (0, f"{THREAD_ID}\n", ""))
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(_as_test_dict(self.roster()["template"])["thread_id"], THREAD_ID)
+
+    def test_prime_rerun_after_thread_creation_reports_uncertainty_without_a_second_thread(self) -> None:
+        identifier = "00000000-0000-4000-8000-000000000083"
+        self.held_prime_design(identifier, design_roles.ShowrunnerHolder("sdlc"), "reviewer")
+        arguments = self.prime_cli("--held-design", identifier, "--held-role", "reviewer")
+        with patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")), \
+                patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "fixture-holder"}):
+            with stop_once(codex_mesh, "_serving_request", argument=1, matches=lambda method: method == "thread/start"), self.assertRaises(InjectedStop):
+                _ = self.run_mesh(arguments)
+            code, _output, errors = self.run_mesh(arguments)
+        self.assertNotEqual(code, 0)
+        self.assertRegex(errors, "(?i)recover|unknown")
+        self.assertEqual(len(self.methods("thread/start")), 1)
+
     def test_prime_held_titles_use_the_design_holder_before_the_mesh_record_exists(self) -> None:
         for index, (holder, prefix) in enumerate((
                 (design_roles.UnitHolder("sdlc", "roles-unit"), "sdlc · roles"),
@@ -3650,14 +3777,7 @@ class MeshCommandTests(MeshCommandFixture):
                     directory = design_roles.design_directory(design_id)
                     claim = directory / f"{role}.creation-claimed"
                     claim.unlink(missing_ok=True)
-                    design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1),
-                        "fixture-repo", str(self.session_dir), str(self.session_dir / "design.md"), "design",
-                        "2026-10-21T12:00:00+00:00", holder, design_roles.DesignUnbound(),
-                        (design_roles.RoleInstance("designer", "template" if role == "designer" else "other-designer",
-                                            design_roles.RoleNotOpened("claim")),
-                         design_roles.RoleInstance("reviewer", "template" if role == "reviewer" else "other-reviewer",
-                                            design_roles.RoleNotOpened("claim"))))
-                    design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+                    self.held_prime_design(design_id, holder, cast(Literal["designer", "reviewer"], role))
                     self.write_pool_roster({})
                     self.server.requests.clear()
                     with patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach("fixture-holder")), \

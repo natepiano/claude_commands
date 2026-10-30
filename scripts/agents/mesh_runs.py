@@ -59,7 +59,7 @@ from uuid import NAMESPACE_URL, uuid5
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.agents import codex_mesh
 from scripts.buildlog import treekey
-from scripts.lib import unit_runs
+from scripts.lib import durable_state, unit_runs
 
 # Exit status of `start` when the caller is not a mesh worker: run the command attached.
 NOT_A_MESH_WORKER = 3
@@ -173,9 +173,7 @@ def _runs_dir(session_dir: str) -> Path:
 
 
 def _write_record(path: Path, record: RunRecord) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}")
-    _ = temporary.write_text(json.dumps(record, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(temporary, path)
+    durable_state.atomic_write_text(path, json.dumps(record, indent=2, sort_keys=True))
 
 
 def _read_record(path: Path) -> RunRecord:
@@ -251,28 +249,29 @@ def reap_orphans(session_dir: str, worker: str = "") -> list[str]:
             continue
         claim = path.with_suffix(".reap")
         try:
-            os.close(os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-        except FileExistsError:
+            with durable_state.file_lock(claim.with_name(claim.name + ".lock"), blocking=False):
+                # The advisory lock is the owner. It expires automatically when
+                # that process exits, including a stop before this record is saved.
+                claim.unlink(missing_ok=True)
+                record = _read_record(path)
+                if record["status"] != "running":
+                    continue
+                newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
+                            and other.get("cwd") == record["cwd"]
+                            and codex_mesh._as_float(other.get("started_at"), 0.0) > record["started_at"]  # pyright: ignore[reportPrivateUsage]
+                            for _, other in records)
+                delivery = ("nothing delivered: the supervisor is gone and a newer run of the same command answers"
+                            if newer else deliver(record, SupervisorLost()))
+                record = _read_record(path)
+                record.update({
+                    "status": "finished", "ended": "supervisor gone", "delivery": delivery,
+                    "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                })
+                _write_record(path, record)
+                reaped.append(record["run_id"])
+        except BlockingIOError:
             continue
-        try:
-            record = _read_record(path)
-            if record["status"] != "running":
-                continue
-            newer = any(other.get("worker") == record["worker"] and other.get("command") == record["command"]
-                        and other.get("cwd") == record["cwd"]
-                        and codex_mesh._as_float(other.get("started_at"), 0.0) > record["started_at"]  # pyright: ignore[reportPrivateUsage]
-                        for _, other in records)
-            delivery = ("nothing delivered: the supervisor is gone and a newer run of the same command answers"
-                        if newer else deliver(record, None))
-            record = _read_record(path)
-            record.update({
-                "status": "finished", "ended": "supervisor gone", "delivery": delivery,
-                "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            })
-            _write_record(path, record)
-            reaped.append(record["run_id"])
-        finally:
-            claim.unlink(missing_ok=True)
+
     return reaped
 
 
@@ -373,19 +372,19 @@ def _tail(path: Path, count: int) -> list[str]:
     return kept[::-1]
 
 
-def _exit_words(exit_code: int | None) -> str:
+def _exit_words(outcome: RunOutcome) -> str:
     """`exit N`, or `no exit status` for a run whose supervisor is gone."""
-    return "no exit status" if exit_code is None else f"exit {exit_code}"
+    return "no exit status" if isinstance(outcome, SupervisorLost) else f"exit {outcome.status}"
 
 
-def result_text(record: RunRecord, exit_code: int | None) -> str:
-    verdict = (ORPHAN_VERDICT if exit_code is None else "PASS (exit 0)" if exit_code == 0
-               else SUPERSEDED_VERDICT if exit_code == SUPERSEDED_STATUS
-               else TREE_CHANGED_VERDICT if exit_code == TREE_CHANGED_STATUS else f"FAIL (exit {exit_code})")
-    heading = "Run ended with no result" if exit_code is None else "Run finished"
+def result_text(record: RunRecord, outcome: RunOutcome) -> str:
+    verdict = (ORPHAN_VERDICT if isinstance(outcome, SupervisorLost) else "PASS (exit 0)" if outcome.status == 0
+               else SUPERSEDED_VERDICT if outcome.status == SUPERSEDED_STATUS
+               else TREE_CHANGED_VERDICT if outcome.status == TREE_CHANGED_STATUS else f"FAIL (exit {outcome.status})")
+    heading = "Run ended with no result" if isinstance(outcome, SupervisorLost) else "Run finished"
     lines = [f"{heading}: {record['label']}", f"Result: {verdict}", f"Log: {record['log']}"]
     tail = _tail(Path(record["log"]), RESULT_TAIL_LINES)
-    if exit_code == TREE_CHANGED_STATUS:
+    if isinstance(outcome, CommandExit) and outcome.status == TREE_CHANGED_STATUS:
         # Keep verify's resubmit instruction verbatim even if cleanup pushed it
         # out of the bounded tail. Delivery queues this same text for the worker.
         try:
@@ -428,21 +427,34 @@ def _director_sessions(record: RunRecord) -> list[str]:
     return [*marked, recorded] if recorded and recorded not in marked else marked
 
 
-def deliver(record: RunRecord, exit_code: int | None) -> str:
+@dataclass(frozen=True)
+class CommandExit:
+    status: int
+
+
+@dataclass(frozen=True)
+class SupervisorLost:
+    """The supervisor exited without recording the command's exit status."""
+
+
+RunOutcome = CommandExit | SupervisorLost
+
+
+def deliver(record: RunRecord, outcome: RunOutcome) -> str:
     """Hand the result to the worker's attached launcher, else to its unit director.
 
-    exit_code is None for a run whose supervisor is gone. Returns the delivery outcome the record keeps.
+    Returns the delivery outcome the record keeps.
     """
     done_file = record["done_message_file"]
-    if done_file and exit_code not in (0, SUPERSEDED_STATUS, TREE_CHANGED_STATUS):
-        return f"nothing delivered: {_exit_words(exit_code)} with a done message"
-    if done_file and exit_code == 0:
+    if done_file and (isinstance(outcome, SupervisorLost) or outcome.status not in (0, SUPERSEDED_STATUS, TREE_CHANGED_STATUS)):
+        return f"nothing delivered: {_exit_words(outcome)} with a done message"
+    if done_file and isinstance(outcome, CommandExit) and outcome.status == 0:
         try:
             text = Path(done_file).read_text(encoding="utf-8")
         except OSError as exc:
             text = f"Run finished: {record['label']}\nResult: PASS (exit 0)\n(done message {done_file} unreadable: {exc})"
     else:
-        text = result_text(record, exit_code)
+        text = result_text(record, outcome)
     session_dir, name = record["session_dir"], record["worker"]
     roster = codex_mesh._read_json_object(Path(session_dir) / codex_mesh.ROSTER_FILE)  # pyright: ignore[reportPrivateUsage]
     entry = codex_mesh._as_dict(roster.get(name))  # pyright: ignore[reportPrivateUsage]
@@ -456,29 +468,29 @@ def deliver(record: RunRecord, exit_code: int | None) -> str:
                 entry = candidate
                 break
     design_id, role = entry.get("held_design_id"), entry.get("held_role")
+    message_id = str(uuid5(NAMESPACE_URL, str(Path(session_dir).resolve()) + "/" + record["run_id"]))
     if isinstance(design_id, str) and design_id and role in ("designer", "reviewer"):
-        message_id = str(uuid5(NAMESPACE_URL, str(Path(session_dir).resolve()) + "/" + record["run_id"]))
         _ = design_roles.queue_message(design_id, role, "mesh_runs:" + record["run_id"],
                                 text, message_id=message_id)
         return f"queued for held role {name}; its holder controls the next assignment"
-    held = codex_mesh.hold_message(session_dir, name, text, without_launcher=False)
+    held = codex_mesh.hold_message(session_dir, name, text, without_launcher=False, message_id=message_id)
     if isinstance(held, codex_mesh.HeldForLauncher):
         return f"held for {name}'s attached launcher on thread {held.thread_id}"
     if isinstance(held, codex_mesh.HeldForNextDispatch):
         return f"held for {name}'s next dispatch on thread {held.thread_id}"
     state = held.reason if isinstance(held, codex_mesh.WorkerEnded) else f"{name} is {held.status or 'unknown'}"
-    note = (f"Worker {name}'s run {record['label']} finished ({_exit_words(exit_code)}); no launcher is attached "
+    note = (f"Worker {name}'s run {record['label']} finished ({_exit_words(outcome)}); no launcher is attached "
             + f"({state}), so the result comes to you. Dispatch the worker (implement.sh --to {name}) "
             + "when it should act on it.")
     message = "\n".join([note, f"Worker: {name}", f"Command: {' '.join(record['command'])}", "", text])
     told = [session for session in _director_sessions(record)
-            if send_to_director(session, f"{name}: run {record['label']} finished ({_exit_words(exit_code)})", message)]
+            if send_to_director(session, f"{name}: run {record['label']} finished ({_exit_words(outcome)})", message)]
     if told:
         return "sent to director " + ", ".join(told)
     if isinstance(held, codex_mesh.WorkerEnded):
         return f"nothing delivered: {held.reason} and no director was found"
     # No director to tell: hold the result so the worker's next dispatch still reads it.
-    kept = codex_mesh.hold_message(session_dir, name, text, without_launcher=True)
+    kept = codex_mesh.hold_message(session_dir, name, text, without_launcher=True, message_id=message_id)
     if isinstance(kept, codex_mesh.WorkerEnded):
         return f"nothing delivered: {kept.reason} and no director was found"
     return f"held for {name}'s next dispatch: no director was found"
@@ -532,7 +544,7 @@ def command_supervise(args: argparse.Namespace) -> int:
     marker.unlink(missing_ok=True)
     # Deliver before marking finished: a launcher that reads the run as finished closes its inbox
     # unless the result is already held.
-    delivery = deliver(record, exit_code)
+    delivery = deliver(record, CommandExit(exit_code))
     record = _read_record(record_path)
     record.update({
         "status": "finished", "exit_code": exit_code,

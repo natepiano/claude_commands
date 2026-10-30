@@ -121,6 +121,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import durable_state
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -207,6 +210,16 @@ PERMISSION_MODE = "auto"
 # One relay took 9 s when measured; quota_alert.py's budget is built on this.
 TIMEOUT = 40
 KILL_GRACE = 10
+EMERGENCY_SSH_ALLOWANCE_SECONDS = 30
+
+
+def emergency_attempt_seconds(timeout: float) -> float:
+    return timeout + KILL_GRACE + EMERGENCY_SSH_ALLOWANCE_SECONDS
+
+
+# The review/revision and push budget comes from the channel's single budget reader.
+# A remote delivery also needs its SSH allowance and process shutdown grace.
+EMERGENCY_ATTEMPT_SECONDS = emergency_attempt_seconds(review.user_send_seconds())
 # Exec preserves this PID: Claude's cc-socks/<pid>.sock belongs to the recorded process.
 # Publish before Claude starts, so even an immediate reply can resolve its sender.
 RELAY_EXEC = """import os, sys
@@ -284,6 +297,9 @@ class KeyState(TypedDict):
     # Recipient -> UTC ISO time of the last attempt, delivered or not; for a user emergency push, the last one sent.
     last: dict[str, str]
     acknowledged: NotRequired[str]
+    delivering: NotRequired[dict[str, dict[str, object]]]
+    delivered: NotRequired[dict[str, str]]
+    clearing_pending: NotRequired[Emergency]
 
 
 KeyStates = dict[str, KeyState]
@@ -587,16 +603,13 @@ def as_str(value: object) -> str:
 
 
 def write_atomic(path: Path, text: str) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    _ = tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    durable_state.atomic_write_text(path, text)
 
 
 @contextmanager
 def locked() -> Generator[None]:
     STATE.mkdir(parents=True, exist_ok=True)
-    with open(STATE / ".lock", "w", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with durable_state.file_lock(STATE / ".lock"):
         yield
 
 
@@ -809,9 +822,16 @@ def write_emergencies(records: list[Emergency]) -> None:
 
 def record_emergency(record: Emergency) -> None:
     """Keep a sent emergency push for clear-check; it replaces an older record with its sender and key."""
-    with locked():
-        kept = [old for old in read_emergencies() if (old["sender"], old["key"]) != (record["sender"], record["key"])]
-        write_emergencies([*kept, record])
+    with key_states() as states:
+        _record_emergency_locked(record)
+        state = states.get(record['key'])
+        if state is not None and state.get('clearing_pending') == record:
+            _ = state.pop('clearing_pending', None)
+
+
+def _record_emergency_locked(record: Emergency) -> None:
+    kept = [old for old in read_emergencies() if (old["sender"], old["key"]) != (record["sender"], record["key"])]
+    write_emergencies([*kept, record])
 
 
 def check_exit(command: str, timeout: float) -> int | None:
@@ -928,7 +948,8 @@ def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE
 # ---------------------------------------------------------------------------
 
 
-def claim(message: Message, repeat: timedelta | None, at: datetime, *, live: bool = False) -> str | None:
+def claim(message: Message, repeat: timedelta | None, at: datetime, *, live: bool = False,
+          emergency: bool = False, delivery_seconds: float = EMERGENCY_ATTEMPT_SECONDS) -> str | None:
     """Why this send is skipped, or None after recording it as the key's latest attempt.
 
     Recording before delivery, under the lock, keeps two overlapping runs with
@@ -938,16 +959,64 @@ def claim(message: Message, repeat: timedelta | None, at: datetime, *, live: boo
         return None
     with key_states() as states:
         state = states.setdefault(message.key, {"last": {}})
+        clearing = state.get('clearing_pending')
+        if clearing is not None:
+            _record_emergency_locked(clearing)
+            _ = state.pop('clearing_pending', None)
         if "acknowledged" in state:
             return f"key {message.key!r} acknowledged at {state['acknowledged']}; `send.py reopen` to resume"
         last = state["last"].get(message.to)
         if repeat is not None and last is not None and at - datetime.fromisoformat(last) < repeat:
             if live:
-                return still_live(message.key, message.sender, datetime.fromisoformat(last), repeat)
+                if state.get('delivered', {}).get(message.to) == last:
+                    return still_live(message.key, message.sender, datetime.fromisoformat(last), repeat)
+                return (f"emergency delivery outcome for key {message.key!r} is unknown; "
+                        + f"check the earlier send, then use send.py reopen {message.key} to retry")
             minutes = repeat.total_seconds() / 60
             return f"key {message.key!r} last sent to {message.to} at {last}, inside its {minutes:g}-minute window"
-        state["last"][message.to] = at.isoformat()
+        if live or emergency:
+            attempts = state.setdefault("delivering", {})
+            attempt = attempts.get(message.to, {})
+            pid, started = attempt.get("pid"), attempt.get("started")
+            if (isinstance(pid, int) and isinstance(started, str)
+                    and durable_state.ProcessLifetime(pid, started).is_live()):
+                return "emergency delivery is in progress; retry after it finishes or use send.py reopen " + message.key
+            owner = durable_state.ProcessLifetime.current(os.getpid())
+            attempts[message.to] = {"pid": owner.pid, "started": owner.started,
+                                    "expires": at.timestamp() + delivery_seconds, "at": at.isoformat()}
+        else:
+            state["last"][message.to] = at.isoformat()
     return None
+
+
+@dataclass(frozen=True)
+class SelfClearingEmergency:
+    """The sender retires its own push; no clear-check record is needed."""
+
+
+SELF_CLEARING_EMERGENCY = SelfClearingEmergency()
+
+
+def finish_emergency_attempt(message: Message, at: datetime, *, delivered: bool,
+                             clearing: Emergency | SelfClearingEmergency = SELF_CLEARING_EMERGENCY) -> None:
+    if message.key is None:
+        return
+    with key_states() as states:
+        state = states.get(message.key)
+        if state is None:
+            return
+        attempts = state.get("delivering", {})
+        attempt = attempts.get(message.to, {})
+        owner = durable_state.ProcessLifetime.current(os.getpid())
+        if (attempt.get("at") != at.isoformat() or attempt.get("pid") != owner.pid
+                or attempt.get('started') != owner.started):
+            return
+        _ = attempts.pop(message.to, None)
+        if delivered:
+            state["last"][message.to] = at.isoformat()
+            state.setdefault("delivered", {})[message.to] = at.isoformat()
+            if not isinstance(clearing, SelfClearingEmergency):
+                state['clearing_pending'] = clearing
 
 
 def user_emergency_key(sender: str, title: str) -> str:
@@ -1164,12 +1233,15 @@ def recover_socket_queues(records: list[sessions.SessionRecord], at: datetime) -
             message = Message(recipient.address, entry["from"], entry["summary"],
                               f"Stuck message from {entry['time']}:\n" + entry["text"], identity,
                               entry.get("shown_sender", entry["from"]))
+            started = now()
+            # Record intent before any durable queue checkpoint. If either
+            # write stops, its stable ID lets a rerun report uncertainty rather
+            # than resend; no delivery starts until both writes have finished.
+            append_record(STATE / "socket-recovery-attempts.jsonl",
+                          SocketRecoveryAttempt(key=identity, time=started.isoformat()), durable=True)
             if not saved:
                 _rewrite_queue(path, remaining)
                 saved = True
-            started = now()
-            append_record(STATE / "socket-recovery-attempts.jsonl",
-                          SocketRecoveryAttempt(key=identity, time=started.isoformat()), durable=True)
             result = relay_socket(message, TIMEOUT, records, metadata)
             log(message, result, started)
             if result.outcome != "sent":
@@ -1209,11 +1281,14 @@ def pending(to: str | None) -> str:
     paths = list(dict.fromkeys(queue_path(key) for key in keys if key))
     with locked():
         entries = sorted((entry for path in paths for entry in read_queue(path)), key=lambda entry: entry["time"])
+        text = "\n\n".join(f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
+                              + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])) + "\n"
+                              + entry["text"].rstrip() for index, entry in enumerate(entries, 1))
+        if text:
+            print(text, flush=True)
         for path in paths:
             path.unlink(missing_ok=True)
-    return "\n\n".join(f"Queued message {index} of {len(entries)}, from {entry['from']} at {entry['time']}:"
-                       + shown_sender_line(entry["from"], entry.get("shown_sender", entry["from"])) + "\n"
-                       + entry["text"].rstrip() for index, entry in enumerate(entries, 1))
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -1604,27 +1679,25 @@ def template_fix_notice(record: dict[str, object]) -> None:
         text_key = hashlib.sha256(text_id.encode()).hexdigest()
         key = now().astimezone(user_zone()).date().isoformat() + "-" + text_key
         stamp = directory / key
-        with (directory / (text_key + ".lock")).open("a") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return
+        with durable_state.file_lock(directory / (text_key + ".lock"), blocking=False):
             if stamp.exists():
                 return
-            _ = stamp.write_text(text_id, encoding="utf-8")
-        recipient = "natedev"
-        try:
-            for line in review.NOTIFY_CONFIG.read_text(encoding="utf-8").splitlines():
-                name, separator, value = line.partition("#")[0].partition("=")
-                if separator and name.strip() == "TEMPLATE_FIX_SESSION" and value.strip():
-                    recipient = value.strip()
-        except OSError:
-            pass
-        text = "Fix registry push " + text_id + " today: it was sent despite failed review.\n" + json.dumps(record, ensure_ascii=False)
-        command = [sys.executable, str(Path(__file__).resolve()), "template-fix-deliver", text_id, recipient, text]
-        # Delivery and its error record run in the detached child.
-        _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+            recipient = "natedev"
+            try:
+                for line in review.NOTIFY_CONFIG.read_text(encoding="utf-8").splitlines():
+                    name, separator, value = line.partition("#")[0].partition("=")
+                    if separator and name.strip() == "TEMPLATE_FIX_SESSION" and value.strip():
+                        recipient = value.strip()
+            except OSError:
+                pass
+            text = "Fix registry push " + text_id + " today: it was sent despite failed review.\n" + json.dumps(record, ensure_ascii=False)
+            command = [sys.executable, str(Path(__file__).resolve()), "template-fix-deliver", text_id, recipient, text]
+            # Delivery and its error record run in the detached child.
+            _ = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+            write_atomic(stamp, text_id)
+    except BlockingIOError:
+        return
     except OSError as error:
         print(f"send.py: template fix notice failed for {text_id}: {error}", file=sys.stderr)
         log_template_fix_error(text_id, str(error))
@@ -2131,7 +2204,9 @@ def send(options: Options) -> Result:
     # An emergency push with no clear step would repeat after its cause is fixed: refused, not claimed.
     refused = emergency and not options.clears_when and not options.self_clearing
     held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
-    skip = None if refused or held is not None else claim(message, window, started, live=live)
+    skip = None if refused or held is not None else claim(
+        message, window, started, live=live, emergency=emergency,
+        delivery_seconds=max(EMERGENCY_ATTEMPT_SECONDS, emergency_attempt_seconds(options.timeout)))
     log_route: Route = NO_CLAUDE_ROUTE
     if refused:
         result = Result("refused", NO_CLEAR_STEP)
@@ -2209,12 +2284,15 @@ def send(options: Options) -> Result:
         for recipient in dict.fromkeys((message.to, options.to)):
             _ = remove_queued_key(recipient, message.key)
     # An emergency push that did not go out is not live: its resend goes out.
-    if live and key is not None and not refused and held is None and skip is None and result.outcome != "sent":
-        forget_sent(key, message.to, started)
-    if emergency and options.clears_when and key is not None and result.outcome == "sent":
+    clearing: Emergency | SelfClearingEmergency = SELF_CLEARING_EMERGENCY
+    if emergency and options.clears_when and key is not None:
         posted_on = options.scope.host if isinstance(options.scope, NamedMachine) else machine()
-        record_emergency(Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,
-                                   sent=started.isoformat(), expires=(started + emergency_lifetime()).isoformat()))
+        clearing = Emergency(key=key, sender=sender, check=options.clears_when, machine=posted_on,
+                             sent=started.isoformat(), expires=(started + emergency_lifetime()).isoformat())
+    if emergency and key is not None and not refused and held is None and skip is None:
+        finish_emergency_attempt(message, started, delivered=result.outcome == "sent", clearing=clearing)
+    if not isinstance(clearing, SelfClearingEmergency) and result.outcome == "sent":
+        record_emergency(clearing)
     if message.to == USER and (result.outcome == "failed" or (result.outcome == "held" and isinstance(result.failure, FailedPush))):
         result = user_failure(message, options.action, result, options.need)
     log(message, result, started, log_route)
@@ -2255,11 +2333,9 @@ def main(argv: list[str]) -> int:
             print(reopen(key))
         case ["pending", *named] if len(named) <= 1:
             try:
-                text = pending(named[0] if named else None)
+                _ = pending(named[0] if named else None)
             except ValueError as error:
                 usage_error(str(error))
-            if text:
-                print(text)
         case ["ack" | "reopen" | "pending" | "clear-check" | "drain-sockets", *_]:
             usage_error(f"usage: send.py {argv[0]}" + {"pending": " [NAME]", "clear-check": "",
                          "drain-sockets": ""}.get(argv[0], " KEY"))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import builtins
 import fcntl
 import hashlib
 import json
@@ -26,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.socket_test_support import short_socket_directory
 import send
+from scripts.lib.stop_injection_test_support import InjectedStop, stop_once, stop_in_child
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 import rca
@@ -750,6 +752,61 @@ class SendTests(ShutdownTestCase):
                              "sent")
         # Two pushes, the retire's cancel, and the push after the lifetime.
         self.assertEqual(channel.call_count, 4)
+
+    def test_emergency_rerun_after_claim_without_delivery_does_not_report_a_live_push(self) -> None:
+        sent = send.now()
+        stop_in_child(lambda: self.emergency_at(sent, "--key", "stopped-emergency"), send, "claim")
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+            result = self.emergency_at(sent + timedelta(seconds=23), "--key", "stopped-emergency")
+        self.assertEqual(result.outcome, "sent", result.detail)
+        channel.assert_called_once()
+
+    def test_emergency_retry_during_the_full_delivery_budget_keeps_the_live_owners_claim(self) -> None:
+        sent = send.now()
+        for elapsed in (101, 125, 145, 1000):
+            with self.subTest(elapsed=elapsed):
+                key = f"live-sender-{elapsed}"
+                with stop_once(send, "user", when="before"), self.assertRaises(InjectedStop):
+                    _ = self.emergency_at(sent, "--key", key)
+                with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+                    retried = self.emergency_at(sent + timedelta(seconds=elapsed), "--key", key)
+                self.assertEqual(retried.outcome, "skipped", retried.detail)
+                self.assertIn("in progress", retried.detail)
+                channel.assert_not_called()
+
+    def test_emergency_rerun_after_delivery_commit_repairs_the_clearing_record_without_another_push(self) -> None:
+        sent = send.now()
+        key = "delivered-before-clear-record"
+        with mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")) as channel:
+            with stop_once(send, "record_emergency", when="before"), self.assertRaises(InjectedStop):
+                _ = self.emergency_at(sent, "--key", key)
+            self.assertEqual(self.emergency_at(sent + timedelta(seconds=23), "--key", key).outcome, "skipped")
+            self.assertEqual(self.emergency_at(sent + timedelta(seconds=24), "--key", key).outcome, "skipped")
+        channel.assert_called_once()
+        with send.locked():
+            records = [record for record in send.read_emergencies() if record["key"] == key]
+        self.assertEqual(len(records), 1, "a committed delivery must retain or repair its --clears-when record")
+        self.assertEqual((records[0]["sender"], records[0]["check"], records[0]["sent"]),
+                         ("hana", "true", sent.isoformat()))
+        self.assertEqual(records[0]["expires"], (sent + send.emergency_lifetime()).isoformat())
+
+    def test_pending_rerun_after_output_failure_keeps_the_queued_text(self) -> None:
+        self.outcome = send.Result("queued", "recipient unavailable")
+        _ = self.send("--key", "stopped-queue", "--text", "Keep the accepted message.")
+        with stop_once(builtins, "print", when="before", matches=lambda value: "Queued message" in str(value)), self.assertRaises(InjectedStop):
+            _ = send.main(["pending", "bogus"])
+        with redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(send.main(["pending", "bogus"]), 0)
+        self.assertIn("Keep the accepted message.", output.getvalue())
+        self.assertEqual(send.pending("bogus"), "")
+
+    def test_template_notice_rerun_after_stamp_before_spawn_launches_the_notice(self) -> None:
+        record: dict[str, object] = {"text_id": "quota", "title": "Choose an account", "sent_despite_failed_review": True}
+        stop_in_child(lambda: send.template_fix_notice(record), subprocess, "Popen", when="before")
+        with mock.patch.object(subprocess, "Popen") as launch:
+            send.template_fix_notice(record)
+        launch.assert_called_once()
+        self.assertEqual(cast(list[str], launch.call_args.args[0])[2:4], ["template-fix-deliver", "quota"])
 
     def test_an_emergency_push_that_did_not_go_out_does_not_skip_its_resend(self) -> None:
         sent = send.now()

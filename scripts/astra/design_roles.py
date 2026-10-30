@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import configparser
-import fcntl
 import hashlib
 import importlib
 import json
@@ -27,6 +26,7 @@ from uuid import UUID, uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work
+from scripts.lib import durable_state
 
 ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
@@ -119,8 +119,25 @@ ThreadAccessPolicy = PhaseBoundDesigner | ReadOnlyReviewer
 
 
 @dataclass(frozen=True)
+class CreationNotStarted:
+    prompt: str = ''
+    model: str = ''
+    effort: str = ''
+    kind: Literal['not_started'] = 'not_started'
+
+
+@dataclass(frozen=True)
+class CreationOutcomeUnknown:
+    kind: Literal['outcome_unknown'] = 'outcome_unknown'
+
+
+CREATION_NOT_STARTED = CreationNotStarted()
+
+
+@dataclass(frozen=True)
 class RoleNotOpened:
     claim: str = ''
+    creation: CreationNotStarted | CreationOutcomeUnknown = CREATION_NOT_STARTED
 
 
 @dataclass(frozen=True)
@@ -239,24 +256,13 @@ def _integer(fields: dict[str, object], key: str) -> int:
 
 
 def _atomic(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f'.{path.name}.{uuid4()}.tmp')
-    try:
-        _ = temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + '\n', encoding='utf-8')
-        _ = temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    durable_state.atomic_write_text(path, json.dumps(value, indent=2, sort_keys=True) + '\n')
 
 
 @contextmanager
 def _lock(directory: Path) -> Generator[None]:
-    directory.mkdir(parents=True, exist_ok=True)
-    with (directory / 'lock').open('a', encoding='utf-8') as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+    with durable_state.file_lock(directory / 'lock'):
+        yield
 
 
 def _tag(value: Holder | Binding | Lifecycle | ThreadAccessPolicy | HolderReach | HolderUnavailable) -> dict[str, object]:
@@ -290,7 +296,11 @@ def _lifecycle(fields: dict[str, object]) -> Lifecycle:
         claim = fields.get('claim', '')
         if not isinstance(claim, str):
             raise RoleRefused('invalid launch claim')
-        return RoleNotOpened(claim)
+        creation = _object(fields.get('creation', {}))
+        if creation.get('kind') == 'not_started':
+            return RoleNotOpened(claim, CreationNotStarted(str(creation.get('prompt', '')),
+                                 str(creation.get('model', '')), str(creation.get('effort', ''))))
+        return RoleNotOpened(claim, CreationOutcomeUnknown() if claim else CREATION_NOT_STARTED)
     thread = fields.get('thread_id') if kind == 'RoleEnded' else _text(fields, 'thread_id')
     if not isinstance(thread, str):
         raise RoleRefused('invalid thread id')
@@ -569,16 +579,12 @@ def durable_meshes() -> tuple[Path, ...]:
 def _edit_roster(design_id: str) -> Generator[dict[str, object]]:
     path = mesh_directory(design_id) / 'mesh_roster.json'
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open('a+', encoding='utf-8') as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+    with durable_state.locked_text(path) as handle:
         _ = handle.seek(0)
         text = handle.read()
         roster = _object(cast(object, json.loads(text))) if text else {}
         yield roster
-        _ = handle.seek(0)
-        _ = handle.truncate()
-        json.dump(roster, handle, indent=2, sort_keys=True)
-        handle.flush()
+        durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
 
 
 def _roster(design: HeldDesign) -> dict[str, object]:
@@ -725,29 +731,54 @@ def open_role(repository: str, document: str, role: Role, holder: Holder, area: 
         instance = _instance(design, role)
         if isinstance(instance.lifecycle, RoleEnded):
             raise RoleRefused('role ended; this design identity cannot be reopened.')
-        if not isinstance(instance.lifecycle, RoleNotOpened) or instance.lifecycle.claim:
-            if not isinstance(instance.lifecycle, RoleNotOpened):
-                _project_hold(design, role, reach)
+        if not isinstance(instance.lifecycle, RoleNotOpened):
+            _project_hold(design, role, reach)
+            return design
+        if instance.lifecycle.claim and isinstance(instance.lifecycle.creation, CreationOutcomeUnknown):
+            entry = _object(_roster(design).get(instance.name, {}))
+            thread = entry.get('thread_id')
+            if isinstance(thread, str) and thread:
+                design = _set_lifecycle(design, role, RoleNeedsRecovery(thread, 'creation outcome unknown; run recover'))
+                _save(design)
+            print('design_roles: creation outcome unknown; run recover for ' + design_id + '/' + role,
+                  file=sys.stderr)
             return design
         _validate_binding(design.binding, design.repository, role)
-    model, effort = resolve_model(role)
-    prompt, _ = _prompt(design, role, '')
+    if instance.lifecycle.claim:
+        creation = instance.lifecycle.creation
+        assert isinstance(creation, CreationNotStarted)
+        prompt, model, effort = Path(creation.prompt), creation.model, creation.effort
+        claim = instance.lifecycle.claim
+    else:
+        model, effort = resolve_model(role)
+        prompt, _ = _prompt(design, role, '')
+        with _lock(directory):
+            current = read_design(design_id)
+            instance = _instance(current, role)
+            if not isinstance(instance.lifecycle, RoleNotOpened) or instance.lifecycle.claim:
+                return current
+            if current.placement != design.placement or current.binding != design.binding:
+                raise RoleRefused('binding changed before thread creation')
+            claim = str(uuid4())
+            design = _set_lifecycle(current, role, RoleNotOpened(claim, CreationNotStarted(str(prompt), model, effort)))
+            _save(design)
+            _mesh_context(design, reach)
+    # Persist uncertainty before entering the launcher. A stop before this save
+    # can retry the prepared assignment; a stop after it must prove the identity.
     with _lock(directory):
         current = read_design(design_id)
-        instance = _instance(current, role)
-        if not isinstance(instance.lifecycle, RoleNotOpened) or instance.lifecycle.claim:
-            return current
-        if current.placement != design.placement or current.binding != design.binding:
-            raise RoleRefused('binding changed before thread creation')
-        claim = str(uuid4())
-        design = _set_lifecycle(current, role, RoleNotOpened(claim))
+        lifecycle = _instance(current, role).lifecycle
+        if not isinstance(lifecycle, RoleNotOpened) or lifecycle.claim != claim:
+            raise RoleRefused('RoleNeedsRecovery: thread creation claim changed')
+        if isinstance(lifecycle.creation, CreationOutcomeUnknown):
+            raise RoleRefused('RoleNeedsRecovery: creation outcome unknown; run recover')
+        design = _set_lifecycle(current, role, RoleNotOpened(claim, CreationOutcomeUnknown()))
         _save(design)
         _mesh_context(design, reach)
-    # A failed or uncertain launch keeps its reserved claim; it cannot authorize replacement.
     thread = launch_thread(design, role, prompt, model, effort)
     with _lock(directory):
         current = read_design(design_id)
-        if _instance(current, role).lifecycle != RoleNotOpened(claim):
+        if _instance(current, role).lifecycle != RoleNotOpened(claim, CreationOutcomeUnknown()):
             raise RoleRefused('RoleNeedsRecovery: thread creation claim changed')
         design = _set_lifecycle(current, role, RoleOpen(thread))
         _save(design)
@@ -767,9 +798,11 @@ def recover(instance_id: str) -> HeldDesign:
     instance = _instance(design, role)
     if isinstance(instance.lifecycle, RoleEnded):
         raise RoleRefused('role ended; this design identity cannot be reopened.')
-    entry = _object(_roster(design).get(instance.name))
+    entry = _object(_roster(design).get(instance.name, {}))
     if entry.get('transferring_role') or entry.get('role_redirect'):
         raise RoleRefused('role transfer is fenced; use the destination holder')
+    if not entry.get('thread_id') and isinstance(instance.lifecycle, RoleNotOpened):
+        raise RoleRefused('RoleNeedsRecovery: thread creation outcome unknown; no recorded thread to recover; replacement refused')
     thread = _text(entry, 'thread_id')
     if not isinstance(instance.lifecycle, RoleNotOpened) and instance.lifecycle.thread_id != thread:
         raise RoleRefused('RoleNeedsRecovery: recorded thread differs; replacement refused')
@@ -882,15 +915,63 @@ def release_servers(design: HeldDesign) -> None:
     codex_mesh._release_held_server(str(mesh_directory(design.placement.design_id)))  # pyright: ignore[reportPrivateUsage]
 
 
+@dataclass(frozen=True)
+class KeepHolder:
+    """Retain the role's current holder when rebinding."""
+
+
+@dataclass(frozen=True)
+class KeepBinding:
+    """Retain the role's current binding when rebinding."""
+
+
+KEEP_HOLDER = KeepHolder()
+KEEP_BINDING = KeepBinding()
+
+
+def _finish_binding_transition(design: HeldDesign, *, refresh_hold: bool = False) -> None:
+    """Rebuild every launch route before removing the transition fence."""
+    reach = resolve_holder(design.holder)
+    _mesh_context(design, reach if isinstance(reach, HolderReach) else HolderReach('HolderRestartPending'))
+    with _edit_roster(design.placement.design_id) as roster:
+        for value in roster.values():
+            entry = _object(value)
+            entry['cwd'] = design.repository
+            for key in ('authorized_prompt', 'authorized_holder', 'authorized_generation'):
+                _ = entry.pop(key, None)
+    if refresh_hold and isinstance(reach, HolderReach):
+        for instance in design.roles:
+            _project_hold(design, instance.role, reach)
+    (design_directory(design.placement.design_id) / 'transition.json').unlink(missing_ok=True)
+
+
 def rebind(design_id: str, *, expected_generation: int, reason: str,
-           holder: Holder | None = None, binding: Binding | None = None,
+           holder: Holder | KeepHolder = KEEP_HOLDER, binding: Binding | KeepBinding = KEEP_BINDING,
            repository: str = '', document: str = '') -> HeldDesign:
     if not reason.strip():
         raise RoleRefused('rebind needs a reason')
     directory = design_directory(design_id)
     design = read_design(design_id)
-    _ = _authorize(design)
-    if holder is not None:
+    transition = directory / 'transition.json'
+    if transition.exists():
+        saved = _read(transition)
+        if saved.get('reason') == reason and saved.get('generation') == expected_generation and design.placement.generation == expected_generation + 1:
+            # The original holder can finish its committed handoff. A different
+            # caller still needs the current holder's authorization.
+            if (design.placement.host != local_host() or not saved.get('holder_session')
+                    or saved.get('holder_session') != os.environ.get('CLAUDE_CODE_SESSION_ID')):
+                _ = _authorize(design)
+            if ((isinstance(holder, KeepHolder) or holder == design.holder)
+                    and (isinstance(binding, KeepBinding) or binding == design.binding)
+                    and (not repository or repository == design.repository) and (not document or document == design.document)):
+                with _lock(directory):
+                    if read_design(design_id) != design:
+                        raise RoleRefused('binding changed during transition recovery')
+                    _finish_binding_transition(design, refresh_hold=True)
+                return design
+            raise RoleRefused('rebind retry differs from the saved transition')
+    authorized_holder = _authorize(design)
+    if not isinstance(holder, KeepHolder):
         reach = resolve_holder(holder)
         if isinstance(reach, HolderUnavailable):
             raise RoleRefused(reach.reason)
@@ -904,7 +985,11 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
         if transition.exists() and _read(transition).get('reason') != reason:
             raise RoleRefused('another lifecycle transition is incomplete')
         _idle(design)
-        _atomic(directory / 'transition.json', {'generation': expected_generation, 'reason': reason})
+        transition_record: dict[str, object] = {'generation': expected_generation, 'reason': reason,
+                                                'holder_session': authorized_holder.session_id}
+        if isinstance(design.binding, DesignBoundToPhase) and isinstance(binding, DesignUnbound):
+            transition_record['unbinding_run'] = design.binding.run_directory
+        _atomic(directory / 'transition.json', transition_record)
     release_servers(design)
     _ = authority_request('advance', {'repository_id': design.repository_id, 'document': design.document,
                                       'host': local_host(), 'expected_generation': expected_generation})
@@ -912,17 +997,12 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
         current = read_design(design_id)
         if current.placement.generation != expected_generation:
             raise RoleRefused('binding changed while releasing server')
-        updated = replace(current, holder=holder or current.holder, binding=binding if binding is not None else current.binding,
+        updated = replace(current, holder=current.holder if isinstance(holder, KeepHolder) else holder,
+                          binding=current.binding if isinstance(binding, KeepBinding) else binding,
                           repository=repository or current.repository, document=document or current.document,
                           placement=replace(current.placement, generation=expected_generation + 1))
         _save(updated)
-        (directory / 'transition.json').unlink(missing_ok=True)
-        reach = resolve_holder(updated.holder)
-        if isinstance(reach, HolderReach):
-            _mesh_context(updated, reach)
-    if isinstance(reach, HolderReach):
-        for instance in updated.roles:
-            _project_hold(updated, instance.role, reach)
+        _finish_binding_transition(updated, refresh_hold=True)
     return updated
 
 
@@ -958,6 +1038,14 @@ def end(instance_id: str) -> HeldDesign:
     _ = _authorize(design)
     instance = _instance(design, role)
     if isinstance(instance.lifecycle, RoleEnded):
+        directory = design_directory(design_id)
+        transition = directory / 'transition.json'
+        with _lock(directory):
+            if instance.lifecycle.thread_id:
+                astra_roles.release(instance.lifecycle.thread_id)
+            if (transition.exists() and _read(transition).get('reason') == 'explicit end'
+                    and _read(transition).get('role') == role):
+                transition.unlink(missing_ok=True)
         if all(isinstance(item.lifecycle, (RoleNotOpened, RoleEnded)) for item in design.roles):
             release_servers(design)
         return design
@@ -967,10 +1055,15 @@ def end(instance_id: str) -> HeldDesign:
         if current != design:
             raise RoleRefused('role changed before end')
         transition = directory / 'transition.json'
-        if transition.exists() and _read(transition).get('reason') == 'adoption':
-            raise RoleRefused('AdoptionNeedsRecovery: complete the fenced transfer before end')
+        if transition.exists():
+            saved = _read(transition)
+            if saved.get('reason') == 'adoption':
+                raise RoleRefused('AdoptionNeedsRecovery: complete the fenced transfer before end')
+            if saved.get('reason') != 'explicit end' or saved.get('role') != role:
+                raise RoleRefused('another role or lifecycle transition needs cleanup before end')
         _idle(current)
-        _atomic(directory / 'transition.json', {'generation': current.placement.generation, 'reason': 'explicit end'})
+        _atomic(directory / 'transition.json', {'generation': current.placement.generation,
+                                               'reason': 'explicit end', 'role': role})
     mesh = mesh_directory(design_id)
     result = subprocess.run([sys.executable, str(ROOT / 'scripts/agents/codex_mesh.py'), 'end',
                              '--session-dir', str(mesh), '--to', instance.name], capture_output=True, text=True, check=False)
@@ -998,9 +1091,9 @@ def end(instance_id: str) -> HeldDesign:
         current = read_design(design_id)
         updated = _set_lifecycle(current, role, RoleEnded(thread))
         _save(updated)
+        if thread:
+            astra_roles.release(thread)
         (directory / 'transition.json').unlink(missing_ok=True)
-    if thread:
-        astra_roles.release(thread)
     return updated
 
 
@@ -1148,8 +1241,7 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
     prompt, _ = _prompt(candidate, role, 'Continue the adopted design in the same thread when the holder assigns work.')
     _ = authority_request('adopt-reserve', {'repository_id': repository, 'document': document, 'host': host,
                                             'adoption_id': adoption_id})
-    with _lock(design_directory(design_id)), source_path.open('r+', encoding='utf-8') as source_lock:
-        fcntl.flock(source_lock, fcntl.LOCK_EX)
+    with _lock(design_directory(design_id)), durable_state.locked_text(source_path) as source_lock:
         roster = _object(cast(object, json.load(source_lock)))
         entry = _object(roster.get(name))
         _check_adoption_source(entry, thread_id)
@@ -1166,10 +1258,7 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
                 {**transfer, 'design_id': design_id, 'thread_id': thread_id, 'name': name, 'source_mesh': str(source)})
         entry['transferring_role'] = transfer
         roster[name] = entry
-        _ = source_lock.seek(0)
-        _ = source_lock.truncate()
-        json.dump(roster, source_lock)
-        source_lock.flush()
+        durable_state.rewrite_text(source_lock, json.dumps(roster))
     server = _read(source / 'mesh_server.json')
     port = _integer(server, 'port')
     client = codex_mesh.Client(port, 'design-role-adopt')
@@ -1205,7 +1294,6 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
         _validate_binding(binding, design.repository, role)
         mesh = mesh_directory(design_id)
         mesh.mkdir(parents=True, exist_ok=True)
-        destination_roster = _read(mesh / 'mesh_roster.json') if (mesh / 'mesh_roster.json').exists() else {}
         adopted = dict(entry)
         _ = adopted.pop('transferring_role', None)
         _ = adopted.pop('paused_from', None)
@@ -1213,24 +1301,21 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
         adopted.update({'held_design_id': design_id, 'held_role': role, 'access_policy': _tag(access_policy(design, role)),
                         'instructions_file': str(prompt), 'status': 'done', 'cwd': design.repository,
                         'model': source_model, 'effort': source_effort})
-        destination_roster[name] = adopted
-        _atomic(mesh / 'mesh_roster.json', destination_roster)
+        with _edit_roster(design_id) as destination_roster:
+            destination_roster[name] = adopted
         _atomic(mesh / 'serving_home.json', {'codex_home': _text(server, 'codex_home')})
         if pending_text:
-            _ = (mesh / f'{name}.pending.json').write_text(pending_text, encoding='utf-8')
+            with durable_state.locked_text(mesh / f'{name}.pending.json') as pending:
+                durable_state.rewrite_text(pending, pending_text)
         _save(design)
         _mesh_context(design, reach)
     confirm_adoption(design, role, thread_id)
-    with source_path.open('r+', encoding='utf-8') as source_lock:
-        fcntl.flock(source_lock, fcntl.LOCK_EX)
+    with durable_state.locked_text(source_path) as source_lock:
         roster = _object(cast(object, json.load(source_lock)))
         current = _object(roster.get(name))
         current['role_redirect'] = {'design_id': design_id, 'destination': str(mesh), 'adoption_id': adoption_id}
         roster[name] = current
-        _ = source_lock.seek(0)
-        _ = source_lock.truncate()
-        json.dump(roster, source_lock)
-        source_lock.flush()
+        durable_state.rewrite_text(source_lock, json.dumps(roster))
     _atomic(directory / 'adoption.json', {'adoption_id': adoption_id, 'source_mesh': str(source), 'name': name,
                                          'thread_id': thread_id, 'completed': True})
     _ = authority_request('adopt-commit', {'repository_id': repository, 'document': document, 'host': host,
@@ -1310,9 +1395,43 @@ def held_document(document: Path) -> HeldDesign | None:
     return found[0] if found else None
 
 
+def _legacy_unbind_matches(design: HeldDesign, saved: dict[str, object], run_directory: str) -> bool:
+    """Use the last bound context to identify an unbind predating unbinding_run."""
+    session = os.environ.get('CLAUDE_CODE_SESSION_ID', '')
+    if (not isinstance(design.binding, DesignUnbound) or not session
+            or saved.get('holder_session') != session):
+        return False
+    context_path = mesh_directory(design.placement.design_id) / 'design_context.json'
+    try:
+        context = _read(context_path)
+        binding = _binding(_object(context.get('binding')))
+    except (OSError, ValueError):
+        return False
+    return (context.get('design_id') == design.placement.design_id
+            and context.get('holder_session') == session
+            and isinstance(binding, DesignBoundToPhase)
+            and Path(binding.run_directory) == Path(run_directory))
+
+
 def unbind_run(run_directory: str) -> None:
     for path in state_root().glob('*/design.json'):
         design = read_design(path.parent.name)
+        transition = path.parent / 'transition.json'
+        if transition.exists():
+            saved = _read(transition)
+            saved_run = saved.get('unbinding_run')
+            if (saved.get('reason') == 'run ended after reservation release'
+                    and ((isinstance(saved_run, str) and Path(saved_run) == Path(run_directory))
+                         or (saved_run is None and _legacy_unbind_matches(design, saved, run_directory)))):
+                if saved_run is None:
+                    # Keep the recovered correlation if context refresh itself is interrupted.
+                    with _lock(path.parent):
+                        if _read(transition) != saved:
+                            raise RoleRefused('binding changed during transition recovery')
+                        _atomic(transition, {**saved, 'unbinding_run': run_directory})
+                _ = rebind(design.placement.design_id, expected_generation=int(str(saved['generation'])),
+                           reason='run ended after reservation release', binding=DesignUnbound())
+                design = read_design(path.parent.name)
         if isinstance(design.binding, DesignBoundToPhase) and Path(design.binding.run_directory) == Path(run_directory):
             _ = rebind(design.placement.design_id, expected_generation=design.placement.generation,
                        reason='run ended after reservation release', binding=DesignUnbound())
@@ -1392,6 +1511,13 @@ def move_holder(old_holder: Holder, new_holder: Holder, old_checkout: str = '', 
             continue
         _idle(design)
         if design.holder == new_holder and (not moves_checkout or design.repository == new_checkout):
+            transition = path.parent / 'transition.json'
+            if transition.exists():
+                saved = _read(transition)
+                if saved.get('reason') != reason or saved.get('generation') != design.placement.generation - 1:
+                    raise RoleRefused('another lifecycle transition is incomplete')
+                with _lock(path.parent):
+                    _finish_binding_transition(design)
             continue
         if moves_checkout:
             _ = authority_request('checkout', {'repository_id': design.repository_id, 'host': local_host(),
@@ -1425,17 +1551,7 @@ def move_holder(old_holder: Holder, new_holder: Holder, old_checkout: str = '', 
                               document=moved(current.document),
                               binding=binding, placement=replace(current.placement, generation=current.placement.generation + 1))
             _save(updated)
-            (path.parent / 'transition.json').unlink(missing_ok=True)
-            reach = resolve_holder(new_holder)
-            _mesh_context(updated, reach if isinstance(reach, HolderReach) else HolderReach('HolderRestartPending'))
-            with _edit_roster(path.parent.name) as roster:
-                for value in roster.values():
-                    entry = _object(value)
-                    if moves_checkout:
-                        entry['cwd'] = new_checkout
-                    _ = entry.pop('authorized_prompt', None)
-                    _ = entry.pop('authorized_holder', None)
-                    _ = entry.pop('authorized_generation', None)
+            _finish_binding_transition(updated)
 
 
 def rename_failures(production: str, old_unit: str, old_checkout: str) -> list[str]:

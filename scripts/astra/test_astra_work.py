@@ -16,6 +16,7 @@ TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work  # noqa: E402
+from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 
 SCRIPT = Path(__file__).with_name("astra_work.py")
 
@@ -82,6 +83,22 @@ class AstraWorkTests(unittest.TestCase):
         state.unlink()
         with self.assertRaises(ValueError):
             _ = astra_work.phase_work(self.run_directory, "4")
+
+    def test_brief_rerun_after_creation_before_body_writes_a_complete_assignment(self) -> None:
+        arguments = ["brief", "--run-directory", str(self.run_directory), "--phase", "4", "--member",
+                     "fixture-designer", "--document", str(self.document), "--round", "2", "--text-file", str(self.text_file)]
+        with stop_once(astra_work, "header_line", when="before"), self.assertRaises(InjectedStop):
+            _ = astra_work.main(arguments)
+        self.assertEqual(astra_work.main(arguments), 0)
+        path = self.run_directory / "design/phase4/round2_brief.md"
+        self.assertIsInstance(astra_work.read_header(path), astra_work.AstraWork)
+        self.assertEqual(path.read_text().split("\n", 1)[1], self.text_file.read_text())
+        saved = path.read_bytes()
+        self.assertEqual(astra_work.main(arguments), 0)
+        self.assertEqual(path.read_bytes(), saved)
+        _ = self.text_file.write_text("A different assignment must not replace the saved brief.\n")
+        self.assertEqual(astra_work.main(arguments), 2)
+        self.assertEqual(path.read_bytes(), saved)
 
     def test_brief_header_round_trip_keeps_assignment_and_body(self) -> None:
         result = self.brief()

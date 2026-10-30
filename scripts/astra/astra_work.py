@@ -10,6 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import durable_state
+
 AstraRole = Literal["astra-designer", "astra-reviewer"]
 
 
@@ -164,8 +167,16 @@ def main(arguments: list[str]) -> int:
         assignment = AstraWork("astra-designer", args.member, str(Path(args.document).expanduser().resolve()),
                                datetime.now(timezone.utc).isoformat(), str(reply), work)
         folder.mkdir(parents=True, exist_ok=True)
-        with destination.open("x", encoding="utf-8") as output:
-            _ = output.write(header_line(assignment) + "\n" + text)
+        with durable_state.file_lock(destination.with_name(destination.name + ".lock")):
+            if destination.exists():
+                saved = read_header(destination)
+                if (not isinstance(saved, AstraWork) or saved.role != assignment.role
+                        or saved.member != assignment.member or saved.document != assignment.document
+                        or saved.reply_path != assignment.reply_path or saved.work != assignment.work
+                        or destination.read_text(encoding="utf-8").split("\n", 1)[-1] != text):
+                    raise ValueError(f"brief already exists with different or incomplete content: {destination}")
+            else:
+                durable_state.atomic_write_text(destination, header_line(assignment) + "\n" + text)
         print(destination)
     except (OSError, UnicodeError, ValueError) as error:
         print(f"astra_work: {str(error).replace(chr(10), ' ')}", file=sys.stderr)

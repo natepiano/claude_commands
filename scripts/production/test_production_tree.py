@@ -23,6 +23,7 @@ import unit_lookup
 from herdr import HerdrPlace
 import unit_runs
 import roster
+from scripts.astra import astra_roles
 
 RUNNER, CHILD_RUNNER, GONE_RUNNER = "sid-runner", "sid-child-runner", "sid-gone-runner"
 DIRECTOR, OLD_DIRECTOR, ORPHAN = "sid-director", "sid-old-director", "sid-orphan"
@@ -83,7 +84,8 @@ class ProductionTreeTests(unittest.TestCase):
             {"history_file": str(history), "main_agent": {"family": "claude", "session_id": director}}))
         _ = (run / "mesh_roster.json").write_text(json.dumps(roster))
         if server:
-            _ = (run / "mesh_server.json").write_text(json.dumps({"pid": 1}))
+            _ = (run / "mesh_server.json").write_text(json.dumps({
+                "pid": 1, "codex_home": str(self.root / "codex-home")}))
         return run
 
     def tree(self, running: set[str], units: dict[str, dict[str, unit_lookup.MarkedUnit]]) -> list[production_tree.Edge]:
@@ -92,15 +94,13 @@ class ProductionTreeTests(unittest.TestCase):
                 mock.patch.object(unit_lookup, "every_marked_unit", return_value=marked):
             return production_tree.tree()
 
-    def astra_role(self, role: str, thread: str, manager: str, session_dir: str = "", worker: str = "") -> None:
-        roles = self.root / "astra-roles"
-        roles.mkdir(exist_ok=True)
-        _ = (roles / f"{thread}.json").write_text(json.dumps({
-            "role": role, "thread_id": thread, "codex_home": str(self.root / "codex-home"),
-            "manager": manager, "held_at": "2026-10-20T20:00:00+00:00",
-            "session_dir": session_dir or None, "worker": worker or None,
-            "pid": None if worker else os.getpid(),
-        }))
+    def astra_role(self, role: astra_roles.AstraRole, thread: str, manager: str,
+                   session_dir: str = "", worker: str = "") -> None:
+        if worker:
+            _ = astra_roles.hold(role, session_dir=session_dir, worker=worker, manager=manager)
+        else:
+            _ = astra_roles.hold(role, thread, str(self.root / "codex-home"),
+                                 pid=os.getpid(), manager=manager)
 
     def test_astra_designer_and_reviewer_edges_carry_their_account_and_live_state(self) -> None:
         run = self.run_folder("unit", DIRECTOR, {

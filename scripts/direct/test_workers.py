@@ -26,6 +26,7 @@ from unittest.mock import patch
 
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
 from scripts.direct import progress_history, workers
+from scripts.lib.stop_injection_test_support import InjectedStop, stop_once
 from scripts.direct.recorder_fixture import invoke_recorder
 
 
@@ -603,6 +604,38 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
             if child.poll() is None:
                 child.kill()
                 _ = child.communicate(timeout=4)
+
+    def test_retirement_rerun_after_mesh_end_marker_finishes_transport_cleanup(self) -> None:
+        store = self.lifecycle_worker()
+        self.live_turn: str = "turn-before-stop"
+        with bounded_worker_change():
+            with stop_once(codex_mesh, "_server_availability", when="before"), self.assertRaises(InjectedStop):
+                workers.end_unit("before", "builders")
+            self.assertTrue(store.path.exists())
+            self.assertEqual(cast(dict[str, object], json_object(self.session_dir / workers.ROSTER)["w7"])["status"], "ended")
+            self.assertEqual(self.live_turn, "turn-before-stop")
+            workers.end_unit("before", "builders")
+        self.assertEqual(self.live_turn, "", "retirement must interrupt the original turn even after its ended marker")
+        self.assertEqual(len(self.methods("turn/interrupt")), 1)
+        self.assertFalse(store.path.exists())
+        self.assertEqual(cast(dict[str, object], json_object(self.session_dir / workers.ROSTER)["w7"])["status"], "ended")
+
+    def test_worker_roster_rerun_after_interrupted_serialization_keeps_other_owners(self) -> None:
+        path = self.session_dir / workers.ROSTER
+        kept = {"thread_id": "kept-thread", "status": "idle", "adoption_id": "accepted-adoption"}
+        _ = path.write_text(json.dumps({"kept": kept}))
+
+        def update() -> None:
+            with workers._roster_locked(self.session_dir) as (handle, roster):  # pyright: ignore[reportPrivateUsage]
+                roster["new"] = {"thread_id": "new-thread", "status": "idle"}
+                workers._write_roster(handle, roster)  # pyright: ignore[reportPrivateUsage]
+
+        with stop_once(json.JSONEncoder, "iterencode", when="before", argument=1, matches=lambda value: "new-thread" in str(value)), \
+                self.assertRaises(InjectedStop):
+            update()
+        update()
+        self.assertEqual(json_object(path)["kept"], kept)
+        self.assertEqual(cast(dict[str, object], json_object(path)["new"])["thread_id"], "new-thread")
 
     def test_retirement_never_trusts_or_signals_a_reused_supervisor_pid(self) -> None:
         _ = self.lifecycle_worker()

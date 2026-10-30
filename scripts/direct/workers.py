@@ -15,7 +15,6 @@ import os
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from collections.abc import Generator, Mapping
@@ -28,6 +27,8 @@ from typing import TYPE_CHECKING, Literal, Protocol, TextIO, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.lib import durable_state
 
 if TYPE_CHECKING:
     from scripts.lib.names import JobKey
@@ -221,23 +222,7 @@ def _read_roster(run: Path) -> dict[str, object]:
 
 
 def _atomic(path: Path, data: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
-                                     prefix=f".{path.name}.", delete=False) as output:
-        temporary = Path(output.name)
-        try:
-            json.dump(data, output, indent=2, sort_keys=True)
-            _ = output.write("\n")
-            output.flush()
-            os.fsync(output.fileno())
-            os.replace(temporary, path)
-            directory = os.open(path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        finally:
-            temporary.unlink(missing_ok=True)
+    durable_state.atomic_write_text(path, json.dumps(dict(data), indent=2, sort_keys=True) + "\n")
 
 
 def _encode_worker(worker: UnitWorker) -> dict[str, object]:
@@ -480,8 +465,7 @@ def ledger_for_run(run: Path) -> UnitWorkerLedger:
 @contextmanager
 def _roster_locked(run: Path) -> Generator[tuple[TextIO, dict[str, object]], None, None]:
     run.mkdir(parents=True, exist_ok=True)
-    with (run / ROSTER).open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+    with durable_state.locked_text(run / ROSTER) as handle:
         _ = handle.seek(0)
         content = handle.read()
         roster = _object(cast(object, json.loads(content))) if content.strip() else {}
@@ -489,11 +473,7 @@ def _roster_locked(run: Path) -> Generator[tuple[TextIO, dict[str, object]], Non
 
 
 def _write_roster(handle: TextIO, roster: dict[str, object]) -> None:
-    _ = handle.seek(0)
-    _ = handle.truncate()
-    json.dump(roster, handle, indent=2, sort_keys=True)
-    handle.flush()
-    os.fsync(handle.fileno())
+    durable_state.rewrite_text(handle, json.dumps(roster, indent=2, sort_keys=True))
 
 
 def allocation_is_live(record: Mapping[str, object]) -> bool:
@@ -595,9 +575,8 @@ def _read_inbox(handle: TextIO) -> dict[str, object]:
 
 
 def _giving_inbox(locks: ExitStack, source: Path, name: str) -> tuple[TextIO, dict[str, object]]:
-    inbox = locks.enter_context((source / f"{name}.pending.json").open("a+", encoding="utf-8"))
     try:
-        fcntl.flock(inbox, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        inbox = locks.enter_context(durable_state.locked_text(source / f"{name}.pending.json", blocking=False))
     except BlockingIOError as error:
         raise WorkerUnavailable(f"{name}: pending inbox is in use; retry adoption recovery") from error
     return inbox, _read_inbox(inbox)
@@ -605,9 +584,8 @@ def _giving_inbox(locks: ExitStack, source: Path, name: str) -> tuple[TextIO, di
 
 def _transfer_pending(locks: ExitStack, inbox: TextIO, destination: Path, name: str,
                       after: dict[str, object], identity: str, messages: dict[str, object]) -> None:
-    target_inbox = locks.enter_context((destination / f"{name}.pending.json").open("a+", encoding="utf-8"))
     try:
-        fcntl.flock(target_inbox, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        target_inbox = locks.enter_context(durable_state.locked_text(destination / f"{name}.pending.json", blocking=False))
     except BlockingIOError as error:
         raise WorkerUnavailable(f"{name}: destination inbox in use; retry recovery") from error
     saved = _read_inbox(target_inbox)
@@ -616,10 +594,14 @@ def _transfer_pending(locks: ExitStack, inbox: TextIO, destination: Path, name: 
 
 def _merge_pending(inbox: TextIO, target_inbox: TextIO, after: dict[str, object],
                    identity: str, messages: dict[str, object], saved: dict[str, object]) -> None:
+    from scripts.agents import codex_mesh
     if saved.get("adoption_id") != identity:
         queue = cast(list[str], messages.get("messages", [])) + cast(list[str], saved.get("messages", []))
+        delivery_ids = list(dict.fromkeys([*codex_mesh.pending_delivery_ids(messages, _text(after["thread_id"])),
+                                          *codex_mesh.pending_delivery_ids(saved, _text(after["thread_id"]))]))
         _write_inbox(target_inbox, {"thread_id": after["thread_id"], "messages": queue,
-                                    "accepting_messages": True, "adoption_id": identity})
+                                    "accepting_messages": True, "adoption_id": identity,
+                                    **({"delivery_ids": delivery_ids} if delivery_ids else {})})
     _write_inbox(inbox, {"thread_id": after["thread_id"], "messages": [], "accepting_messages": False})
 
 
@@ -859,9 +841,9 @@ def _reserve(run: Path, name: str, store: UnitWorkerLedger, owner_pid: int, *, p
             raise WorkerUnavailable(f"{name}: launcher attached during resolution")
         if allocation_is_live(record) or (record.get("continuation_owed") and not paused):
             raise WorkerUnavailable(f"{name}: work already reserved or owed")
-        with (run / f"{name}.pending.json").open("a+", encoding="utf-8") as inbox:
+        with ExitStack() as locks:
             try:
-                fcntl.flock(inbox, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                inbox = locks.enter_context(durable_state.locked_text(run / f"{name}.pending.json", blocking=False))
             except BlockingIOError as error:
                 raise WorkerUnavailable(f"{name}: message delivery in progress") from error
             _ = inbox.seek(0)
@@ -1074,11 +1056,7 @@ def director_pid(run: Path) -> int:
 
 
 def _write_inbox(handle: TextIO, record: Mapping[str, object]) -> None:
-    _ = handle.seek(0)
-    _ = handle.truncate()
-    json.dump(record, handle)
-    handle.flush()
-    os.fsync(handle.fileno())
+    durable_state.rewrite_text(handle, json.dumps(dict(record)))
 
 
 def ledger_path(production: str, unit: str) -> Path:
@@ -1187,8 +1165,7 @@ def end_unit(production: str, unit: str) -> None:
             for run in histories:
                 if not run.is_dir():
                     continue
-                with (run / f"{name}.pending.json").open("a+", encoding="utf-8") as inbox:
-                    fcntl.flock(inbox, fcntl.LOCK_EX)
+                with durable_state.locked_text(run / f"{name}.pending.json") as inbox:
                     _ = inbox.seek(0)
                     content = inbox.read()
                     pending = _object(cast(object, json.loads(content))) if content.strip() else {}
@@ -1199,7 +1176,7 @@ def end_unit(production: str, unit: str) -> None:
                     _write_inbox(inbox, {})
                 current = _object(_read_roster(run).get(name))
                 if (isinstance(worker.backend, CodexThread) and current
-                        and not current.get("adopted_to") and current.get("status") != "ended"):
+                        and not current.get("adopted_to")):
                     result = codex_mesh.command_end(argparse.Namespace(session_dir=str(run), to=name))
                     if result:
                         raise WorkerUnavailable(f"cannot end worker {name} in {run}; retry retirement")
@@ -1539,27 +1516,34 @@ def _repoint_worktree_runs(production: str, unit: str, old: Path, new: Path, bra
             _move_ledger(source, target, tuple(sorted(runs)))
     # Lock order matches adoption: ledger, then roster, then progress state.
     # Dry reads take no ledger lock because locked() writes on exit.
+    def repoint_roster(run: Path, roster: dict[str, object]) -> bool:
+        changed = False
+        for name, raw in roster.items():
+            record = _object(raw)
+            cwd = _text(record.get("cwd"))
+            moved = _moved_path(cwd, old, new)
+            if moved != cwd or record.get("unit_ledger") != str(target):
+                changes.append(f"worker {run}/{name}: {moved or 'cwd unchanged'}; ledger {target}")
+                changed = True
+                if moved != cwd:
+                    record["cwd"] = moved
+                record["unit_ledger"] = str(target)
+                codex_mesh.advance_worker_roster_revision(record)
+        return changed
+
     def repoint_runs() -> None:
         for run in sorted(runs):
             if not run.is_dir():
                 continue
             if (run / ROSTER).exists():
-                with _roster_locked(run) as (handle, roster):
-                    changed = False
-                    for name, raw in roster.items():
-                        record = _object(raw)
-                        cwd = _text(record.get("cwd"))
-                        moved = _moved_path(cwd, old, new)
-                        if moved != cwd or record.get("unit_ledger") != str(target):
-                            changes.append(f"worker {run}/{name}: {moved or 'cwd unchanged'}; ledger {target}")
-                            if not dry_run:
-                                changed = True
-                                if moved != cwd:
-                                    record["cwd"] = moved
-                                record["unit_ledger"] = str(target)
-                                codex_mesh.advance_worker_roster_revision(record)
-                    if changed:
-                        _write_roster(handle, roster)
+                # An atomic snapshot is enough for a preview. Opening a
+                # writer would create its permanent lock during a dry run.
+                if dry_run:
+                    _ = repoint_roster(run, _read_roster(run))
+                else:
+                    with _roster_locked(run) as (handle, roster):
+                        if repoint_roster(run, roster):
+                            _write_roster(handle, roster)
             if not (run / STATE).exists():
                 continue
             with ExitStack() as locks:
