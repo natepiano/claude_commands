@@ -31,6 +31,10 @@ port_lint.py writes its own call records through write_call() here.
       AT is an ISO 8601 UTC instant with offset. UNTIL is empty when no end was planned.
   record.py hold-build KEY SINCE BOOT PID START CLASS SESSION COMMAND CWD
       Record an other_session or no_session build once per hold and process lifetime.
+  record.py launch STATE WORKTREE
+      Read hana_shot's existing atomic process-start state and record that
+      launch once. Launches take no memory admission; mem_wait_s is null.
+      A pending record in the build log survives failed publication.
   record.py backfill-verify [LEDGER]
       Copy verify.sh's old call ledger (~/.local/state/verify/events.jsonl)
       into call records, once: each line gets an id from its own hash, so a
@@ -51,21 +55,27 @@ import os
 import secrets
 import subprocess
 import sys
+import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, cast
 
-import parse
-import sample
-import store
-import treekey
+if __package__:
+    from . import store
+else:
+    import store
+
+if TYPE_CHECKING:
+    import sample
 
 RECORD_VERSION = 1
 GIT_TIMEOUT_S = 5
 RUSTC_TIMEOUT_S = 10
 LEDGER = Path.home() / ".local/state/verify/events.jsonl"
+LAUNCH_LOCK_NAME = "launches.lock"
 
 
 class GitFacts(TypedDict):
@@ -73,6 +83,169 @@ class GitFacts(TypedDict):
     worktree: str | None
     branch: str | None
     sha: str | None
+
+
+class LaunchStep(GitFacts):
+    kind: Literal["step"]
+    v: int
+    id: str
+    host: str
+    started_at: str
+    ended_at: str
+    duration_s: None
+    step: Literal["launch"]
+    argv: list[str]
+    cwd: str
+    caller: Literal["hana-shot"]
+    session: str | None
+    worker: str | None
+    unit_session: str | None
+    mem_wait_s: None
+    slice: Literal["none"]
+    tty: bool
+    status: int
+
+
+@dataclass(frozen=True)
+class InvalidLaunchState:
+    pass
+
+
+@dataclass(frozen=True)
+class PublishedLaunch:
+    added: bool
+    unknown_worktree: bool
+
+
+def hana_launch_record(fields: Mapping[str, object], directory: str) -> LaunchStep | InvalidLaunchState:
+    """Read process-start facts; launching an app takes no memory admission."""
+    pid, port, binary, started = (fields.get(key) for key in ("pid", "port", "binary", "started"))
+    if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+            or not isinstance(port, int) or isinstance(port, bool) or not 0 < port < 65536
+            or not isinstance(binary, str) or not binary or not isinstance(started, str)):
+        return InvalidLaunchState()
+    try:
+        instant = datetime.fromisoformat(started.replace("Z", "+00:00"))
+        if instant.tzinfo is None:
+            return InvalidLaunchState()
+        timestamp = store.utc_iso(instant.timestamp())
+    except (ValueError, OverflowError, OSError):
+        return InvalidLaunchState()
+    saved_directory = fields.get("worktree") or fields.get("cwd")
+    if not directory and isinstance(saved_directory, str):
+        directory = saved_directory
+    if not directory:
+        executable = Path(binary)
+        directory = str(next((parent for parent in executable.parents if (parent / ".git").exists()), executable.parent))
+    facts = git_facts(directory)
+    identity = who()
+    for key in ("worker", "unit_session", "session"):
+        value = fields.get(key)
+        if isinstance(value, str) and value:
+            identity[key] = value
+    host = fields.get("host")
+    host = host if isinstance(host, str) and host else store.host_name()
+    return LaunchStep(
+        kind="step", v=RECORD_VERSION, id=f"hana-shot:{host}:{pid}:{port}:{timestamp}", host=host,
+        started_at=started, ended_at=started, duration_s=None, step="launch", argv=[binary], cwd=directory,
+        **facts, caller="hana-shot", session=identity["session"], worker=identity["worker"],
+        unit_session=identity["unit_session"], mem_wait_s=None,
+        slice="none", tty=False, status=0,
+    )
+
+
+def _launch_row_path(record_data: Mapping[str, object]) -> Path:
+    digest = hashlib.sha256(str(record_data["id"]).encode()).hexdigest()
+    return store.root() / str(record_data["host"]) / f"launch-{digest}.jsonl"
+
+
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def write_launch_line(record_data: Mapping[str, object]) -> bool:
+    """Publish one whole immutable line; the source identity makes retries harmless."""
+    path = _launch_row_path(record_data)
+    if path.exists():
+        _sync_directory(path.parent)
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + f".{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    try:
+        with temporary.open("w") as handle:
+            _ = handle.write(json.dumps(dict(record_data), separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            _sync_directory(path.parent)
+            return False
+        _sync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
+
+
+def pending_launches_root() -> Path:
+    return store.root() / "pending-launches"
+
+
+def _save_pending_launch(row: LaunchStep) -> Path:
+    path = pending_launches_root() / _launch_row_path(row).with_suffix(".json").name
+    if path.exists():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False)
+    temporary_path = Path(temporary.name)
+    try:
+        with temporary:
+            json.dump(row, temporary, separators=(",", ":"))
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_path, path)
+        _sync_directory(path.parent)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return path
+
+
+def finish_pending_launch(path: Path) -> PublishedLaunch:
+    """Keep the retry source until its immutable row is durable or already present."""
+    loaded = cast(object, json.loads(path.read_text()))
+    if not isinstance(loaded, dict):
+        raise ValueError("pending launch is not an object")
+    row = cast(dict[str, object], loaded)
+    if row.get("step") != "launch" or row.get("caller") != "hana-shot" or not isinstance(row.get("id"), str):
+        raise ValueError("pending record is not a Hana launch")
+    added = write_launch_line(row)
+    if not _launch_row_path(row).is_file():
+        raise OSError("launch row was not published")
+    path.unlink(missing_ok=True)
+    _sync_directory(path.parent)
+    return PublishedLaunch(added, row.get("worktree") is None)
+
+
+def launch(state_path: Path, worktree: Path) -> bool:
+    """Record the existing atomic launch state without failing the launcher."""
+    try:
+        loaded = cast(object, json.loads(state_path.read_text()))
+        if not isinstance(loaded, dict):
+            return False
+        row = hana_launch_record(cast(dict[str, object], loaded), str(worktree))
+        if isinstance(row, InvalidLaunchState):
+            return False
+        store.root().mkdir(parents=True, exist_ok=True)
+        with (store.root() / LAUNCH_LOCK_NAME).open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return finish_pending_launch(_save_pending_launch(row)).added
+    except Exception:  # noqa: BLE001 -- a recorder never fails its caller
+        store.note_error(f"launch {state_path}")
+        return False
 
 
 class VerifyEvent(TypedDict):
@@ -147,6 +320,8 @@ def git_facts(directory: str) -> GitFacts:
 
 def git_directory(argv: list[str], cwd: str) -> str:
     """The manifest's folder when the step names one, so a cargo-port run from elsewhere still finds its repo."""
+    import parse
+
     manifest = parse.manifest_path(argv) or os.environ.get("MANIFEST_PATH")
     if manifest:
         folder = (Path(cwd) / manifest).parent
@@ -185,6 +360,8 @@ def new_id(host: str, epoch: float) -> str:
 
 
 def rustc_version(argv: list[str], cwd: str) -> str | None:
+    import parse
+
     words = ["rustc"]
     chosen = parse.toolchain(argv)
     if chosen:
@@ -200,6 +377,8 @@ class StepScopeMemory(NamedTuple):
 
 
 def peak_and_stall(path: str) -> StepScopeMemory:
+    import sample
+
     if not path:
         return StepScopeMemory(sample.Unmeasured.VALUE, sample.Unmeasured.VALUE, sample.Unmeasured.VALUE)
     try:
@@ -251,6 +430,9 @@ def keep_log(data: bytes, host: str, epoch: float, record_id: str) -> str:
 
 
 def step(args: list[str]) -> None:
+    import parse
+    import treekey
+
     status_text, start_text, end_text, tty_text, held, peak = args[:6]
     argv = args[6:]
     try:
@@ -554,6 +736,8 @@ def main(argv: list[str]) -> int:
             detach()
             step(rest)
         elif command == "key":
+            import treekey
+
             found = treekey.tree_key(git_directory(rest, os.getcwd()))
             if found:
                 print(found)
@@ -563,6 +747,10 @@ def main(argv: list[str]) -> int:
             hold_build(rest)
         elif command == "call":
             call(rest)
+        elif command == "launch":
+            if len(rest) != 2:
+                raise ValueError("usage: record.py launch STATE WORKTREE")
+            _ = launch(Path(rest[0]), Path(rest[1]))
         else:
             store.note_error(f"record.py: unknown command {command}")
     except Exception:  # noqa: BLE001 -- the recorder never fails the build it records

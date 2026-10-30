@@ -249,6 +249,7 @@ class DailiesInputFixture(unittest.TestCase):
         def run(argv: Sequence[str], *, capture_output: bool = False, text: bool = False, check: bool = False,
                 timeout: float | None = None, env: dict[str, str] | None = None,
                 cwd: str | Path | None = None, input: bytes | str | None = None,
+                stdin: int | IO[bytes] | None = None,
                 errors: str | None = None, stdout: int | IO[bytes] | None = None,
                 stderr: int | IO[bytes] | None = None,
                 ) -> subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes]:
@@ -286,9 +287,10 @@ class DailiesInputFixture(unittest.TestCase):
             if text:
                 return real_run(argv, capture_output=capture_output, text=True, check=check,
                                 timeout=timeout, env=env, cwd=cwd, input=cast(str | None, input), errors=errors,
-                                stdout=stdout, stderr=stderr)
+                                stdin=stdin, stdout=stdout, stderr=stderr)
             return real_run(argv, capture_output=capture_output, check=check,
-                            timeout=timeout, env=env, cwd=cwd, input=cast(bytes | None, input), stdout=stdout, stderr=stderr)
+                            timeout=timeout, env=env, cwd=cwd, input=cast(bytes | None, input),
+                            stdin=stdin, stdout=stdout, stderr=stderr)
 
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=run))
 

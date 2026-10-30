@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import registry_text, write_registry
+
 import base64
 import io
 import json
@@ -41,7 +43,7 @@ def registry_view() -> str:
 
 def reset_registry(text: str) -> None:
     """Make `text` the whole registry: the defaults, and no overlay over them."""
-    _ = quota_alert.REGISTRY.write_text(text)
+    _ = write_registry(quota_alert.REGISTRY, base_text=text)
     agents_registry.overlay_path(quota_alert.REGISTRY).unlink(missing_ok=True)
 
 
@@ -74,7 +76,7 @@ class CodexAccountAlertTests(unittest.TestCase):
         _ = config.write_text(json.dumps({"threshold_percent": 1, "repeat_minutes": 30,
             "stall_minutes": 5, "faults_to": "director", "always": ["director"]}))
         registry = self.root / "agents.conf"
-        _ = registry.write_text(REGISTRY)
+        _ = write_registry(registry, base_text=REGISTRY)
         _ = self.enterContext(patch.object(quota_alert, "CONFIG", config))
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "alerts.json"))
         _ = self.enterContext(patch.object(quota_alert, "REGISTRY", registry))
@@ -1277,7 +1279,7 @@ class CodexAccountAlertTests(unittest.TestCase):
     def test_missing_and_old_fallback_records_decode_named_states_and_recover(self) -> None:
         with quota_alert.state_file() as state:
             self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
-        reset_registry(REGISTRY.replace("direct=codex", "direct=claude"))
+        reset_registry(registry_text({"assignments": {"direct": "claude"}}, base_text=REGISTRY))
         _ = quota_alert.STATE.write_text(json.dumps({"episodes": {}, "switch": {
             "at": self.now.isoformat(), "moved": ["direct"],
         }}))
@@ -1387,14 +1389,18 @@ class CodexAccountAlertTests(unittest.TestCase):
         with patch.object(quota_alert, "edit_registry", return_value="editor refused") as edit:
             _ = quota_alert.alert([self.note(1, "active", 90)], self.now, codex_readings=funded)
             count = edit.call_count
+            self.assertEqual(count, 2)
             messages = len(self.sent)
             with quota_alert.state_file() as state:
                 unseen = list(state.get("unseen", []))
             _ = quota_alert.alert([self.note(1, "active", 90)], self.now, codex_readings=funded)
-            self.assertEqual(edit.call_count, count)
+            self.assertEqual(edit.call_count, count * 2)
             self.assertEqual(len(self.sent), messages)
         with quota_alert.state_file() as state:
-            self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
+            fallback = state["fallback"]
+            self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            self.assertEqual(fallback.moved, ("direct", "module_review"))
             self.assertEqual(state.get("unseen"), unseen)
 
     def test_unknown_refusal_logs_without_telling_any_session(self) -> None:

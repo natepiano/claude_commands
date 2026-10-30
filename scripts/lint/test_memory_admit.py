@@ -34,13 +34,8 @@ from memory_test_support import fake_memory_readings
 store = gate.store
 
 
-class SourceTreeKeyReader(Protocol):
-    def tree_key(self, directory: str) -> str | None: ...
-
-
 class BuildStepRecorder(Protocol):
     store: gate.BuildLogStore
-    treekey: SourceTreeKeyReader
 
     def step(self, arguments: list[str]) -> None: ...
 
@@ -733,7 +728,7 @@ class FreshTestPromiseTests(unittest.TestCase):
                     "BUILDLOG_TREE_START": "same-source", "BUILDLOG_TEST_BUILD_KEY": "current-key"}), \
                     patch.object(buildlog_record, "git_directory", return_value=str(self.worktree)), \
                     patch.object(buildlog_record, "git_facts", return_value={"worktree": str(self.worktree)}), \
-                    patch.object(buildlog_record.treekey, "tree_key", return_value=ending_source), \
+                    patch("treekey.tree_key", return_value=ending_source), \
                     patch.object(buildlog_record, "rustc_version", return_value="rustc fixture"), \
                     patch.object(buildlog_record.store, "host_name", return_value=self.host), \
                     patch.object(buildlog_record.store, "host_file", return_value=path):
@@ -1625,6 +1620,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
         self.readings_for()
         reservation = self.running(100, 12)
         _ = reservation.with_suffix(".max").write_text(str(13 * GIB))
+        os.utime(reservation.with_suffix(".max"), (NOW.timestamp(), NOW.timestamp()))
         self.readings[100] = gate.MeasuredMemory(2 * GIB)
         result = self.admit_at()
         self.assertEqual((result.decision.state, result.decision.charged, result.decision.measured),
@@ -1693,6 +1689,26 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
                     near_peak.unlink()
                     near_peak.mkdir()
                 elif contents is not None:
+                    _ = near_peak.write_text(contents)
+                result = self.admit_at()
+                self.assertEqual((result.decision.state, result.decision.charged), ("hold", 13 * GIB))
+
+    def test_invalid_near_peak_record_does_not_use_expired_peak_publication_time(self) -> None:
+        self.readings_for()
+        reservation = self.running(100, 12)
+        maximum = reservation.with_suffix(".max")
+        _ = maximum.write_text(str(13 * GIB))
+        published_at = NOW.timestamp() - 2000
+        os.utime(maximum, (published_at, published_at))
+        near_peak = reservation.with_suffix(".wave")
+        self.readings[100] = gate.MeasuredMemory(2 * GIB)
+        for contents in ("", "bad", f"{13 * GIB} -1", str(int(published_at)),
+                         f"{12 * GIB} {int(published_at)}", "directory"):
+            with self.subTest(contents=contents):
+                if contents == "directory":
+                    near_peak.unlink()
+                    near_peak.mkdir()
+                else:
                     _ = near_peak.write_text(contents)
                 result = self.admit_at()
                 self.assertEqual((result.decision.state, result.decision.charged), ("hold", 13 * GIB))
@@ -2091,6 +2107,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
             self.assertGreater(end, "18:47:54")
             reservation = self.running(pid, 1)
             _ = reservation.with_suffix(".max").write_text(str(peak))
+            os.utime(reservation.with_suffix(".max"), (NOW.timestamp(), NOW.timestamp()))
             # No per-step current snapshot exists; use zero to test peak alone.
             self.readings[pid] = gate.MeasuredMemory(0)
         service = self.builds / "sccache.service"
@@ -2108,6 +2125,8 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
                         self.readings[pid] = gate.MeasuredMemory(0)
                         reservation = self.running(pid, 3.14, age=-started)
                         _ = reservation.with_suffix(".max").write_text(str(peak))
+                        published_at = NOW.timestamp() + second
+                        os.utime(reservation.with_suffix(".max"), (published_at, published_at))
                         charged_peaks += max(peak, int(3.14 * GIB))
                 result = self.admit_at(seconds=second, need=need)
                 self.assertEqual(result.decision.state, "hold", f"recorded peaks at +{second}s")
@@ -3474,6 +3493,222 @@ class QueueLeaveTests(unittest.TestCase):
         self.assertEqual(ran_args.read_text().split()[:4], ["nextest", "run", "--test-threads", str(shared)])
         self.assertEqual(json.loads(reservation.read_text())["test_threads"], shared)
         self.assertEqual(sorted(path.name for path in markers.iterdir()), ["lock", "other.run"])
+
+
+class WaiterNeedSourceTests(MemoryQueueFixture):
+    def test_held_waiter_persists_the_estimate_source_count_and_requested_width(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: 0 kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        argv = ["cargo", "nextest", "run", "-E", "package(hana) & (test(one) | test(two))",
+                "--test-threads", "8"]
+        for peak in (gate.ExpectedPeak(12 * GIB, "measured", 7), gate.ExpectedPeak(12 * GIB, "buildlog", 12),
+                     gate.ExpectedPeak(12 * GIB, "pooled", 31), gate.ExpectedPeak(12 * GIB, "fallback", 0)):
+            with self.subTest(source=peak.source):
+                result = gate.check(self.meminfo, 400, "", argv, root=self.root, now=NOW,
+                                    profile=gate.StepProfile("hana", "nextest", "tree", peak, HANA, "filtered"))
+                self.assertEqual(result.decision.state, "hold")
+                row = cast(dict[str, object], json.loads(
+                    (self.root / "admission/400-warmup.waiting").read_text()))
+                self.assertEqual(row["need_source"], peak.source)
+                self.assertEqual(row["need_runs"], peak.count)
+                self.assertEqual(row["test_threads"], 8)
+                self.assertEqual(row["need"], peak.bytes)
+                self.assertEqual(row["test_scope"], "filtered")
+                self.assertEqual(row["package"], "hana")
+                self.assertEqual(row["filters"], ["one", "two"])
+                self.assertEqual(row["estimated_at"], NOW.timestamp())
+
+    def test_waiter_without_an_explicit_width_records_a_null_width(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: 0 kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        result = gate.check(self.meminfo, 400, "", ["cargo", "clippy"], root=self.root, now=NOW,
+                            profile=gate.StepProfile("hana", "clippy", "tree",
+                                                     gate.ExpectedPeak(GIB, "measured", 9), HANA))
+        self.assertEqual(result.decision.state, "hold")
+        row = cast(dict[str, object], json.loads((self.root / "admission/400-warmup.waiting").read_text()))
+        self.assertIn("test_threads", row)
+        self.assertIsNone(row["test_threads"])
+        self.assertEqual((row["need_source"], row["need_runs"]), ("measured", 9))
+
+
+class QueueExplanationTests(MemoryQueueFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.enterContext(patch.dict(os.environ, {
+            "BUILDLOG_MEMINFO": str(self.meminfo), "BUILDLOG_BUILD_BUDGET_GIB": "21",
+            "BUILDLOG_MEMORY_PRESSURE": str(self.root / "pressure"),
+        }))
+        _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
+        _ = self.meminfo.write_text(f"MemAvailable: {16 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        _ = (self.root / "pressure").write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+
+    def waiting(self, pid: int, need: int, minutes: int, **fields: object) -> Path:
+        row: dict[str, object] = {
+            "pid": pid, "start_time": self.processes[pid], "need": need,
+            "since": NOW.timestamp() - minutes * 60, "session_id": f"session-{pid}",
+            "session_name": f"worker-{pid}", "step": "nextest", "folder": f"/tmp/tree-{pid}",
+            **fields,
+        }
+        path = gate.admission_dir(self.root) / f"{pid}.waiting"
+        _ = path.write_text(json.dumps(row))
+        return path
+
+    def test_explain_matches_read_queue_and_admission_on_the_same_files(self) -> None:
+        _ = self.running(100, 6, age=30)
+        _ = self.running(200, 4, age=30)
+        _ = self.waiting(300, 12 * GIB, 20, need_source="measured", need_runs=7, test_threads=8,
+                         test_scope="filtered", package="hana", filters=["one", "two"],
+                         bump_order=-1, priority_since=NOW.timestamp() - 120)
+        _ = self.waiting(400, GIB, 5)
+        self.processes[500] = "fifth"
+        _ = self.waiting(500, 9 * GIB, 3)
+        directory = self.root / "admission"
+        _ = (directory / "lock").touch()
+        processes = gate.process_table(self.root / "proc")
+        view, ordered = gate.read_queue(directory, processes, NOW.timestamp())
+        reason = view.waiting[0].reason
+        if not isinstance(reason, gate.HeadAdmissionStatus):
+            self.fail(f"expected admission status, got {reason}")
+
+        before = {path.name: path.read_bytes() for path in directory.iterdir()}
+        with patch("sqlite3.connect", side_effect=AssertionError("SQLite is outside the explain read path")), \
+             patch.object(gate, "process_table", wraps=gate.process_table) as table, \
+             patch.object(gate, "read_meminfo", wraps=gate.read_meminfo) as host_read, \
+             patch.object(gate, "reservation_memory", wraps=gate.reservation_memory) as memory_read, \
+             patch.object(fcntl, "flock", wraps=fcntl.flock) as lock:
+            explanation = gate.explain_queue()
+        self.assertEqual(table.call_count, 1)
+        self.assertEqual(host_read.call_count, 1)
+        self.assertEqual(memory_read.call_count, 2)
+        self.assertEqual([call.args[1] for call in lock.call_args_list], [fcntl.LOCK_SH])
+        self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir()}, before)
+        head, host = explanation.head, explanation.host
+        if not isinstance(head, gate.HeadExplanation) or not isinstance(host, gate.HostAvailable):
+            self.fail(f"expected readable host and head, got {explanation}")
+        if not isinstance(host.total, int):
+            self.fail("fixture must have a total memory reading")
+        self.assertEqual(head.waiter, view.waiting[0])
+        self.assertEqual(head.decision, reason.decision)
+        memories = [step.measured for step in view.running]
+        priority = gate.head_priority([row for _, row in ordered], view.available, host.total, memories, NOW.timestamp())
+        self.assertEqual(head.decision, gate.queue_decision(
+            view.available, host.total, ordered[0][1], memories, priority, host.pressure))
+        self.assertEqual(head.decision.state, "hold")
+        self.assertEqual((host.available, host.total, host.reserve, host.budget),
+                         (16 * GIB, 60 * GIB, 3 * GIB, 21 * GIB))
+        self.assertEqual((explanation.totals.charged, explanation.totals.measured, explanation.totals.growth),
+                         (10 * GIB, 3 * GIB, 7 * GIB))
+        self.assertEqual((head.budget.charged, head.budget.need, head.budget.head_need, head.budget.budget,
+                          head.budget.starts_at, head.budget.passes),
+                         (10 * GIB, 12 * GIB, 0, 21 * GIB, 9 * GIB, False))
+        self.assertEqual((head.free.available, head.free.need, head.free.reserve, head.free.growth,
+                          head.free.head_need, head.free.threshold, head.free.passes),
+                         (16 * GIB, 12 * GIB, 3 * GIB, 7 * GIB, 0, 22 * GIB, False))
+        self.assertEqual(head.order, gate.head_window(ordered[0][1], NOW.timestamp()))
+        self.assertTrue(head.has_priority)
+        self.assertEqual(head.bump, gate.QueueBump(NOW.timestamp() - 120, True, False))
+        self.assertEqual(head.need_source, gate.RecordedNeed(
+            "measured", 7, gate.HISTORY_DAYS, "filtered", "hana", ("one", "two"), 8))
+        self.assertEqual((explanation.line.count, explanation.line.fitting, explanation.line.smallest_need,
+                          explanation.line.largest_need, explanation.line.oldest_since),
+                         (2, 1, GIB, 9 * GIB, NOW.timestamp() - 300))
+        self.assertEqual([step.waiter for step in explanation.line.steps], list(view.waiting[1:]))
+        for step in explanation.line.steps:
+            self.assertEqual(step.fits_now, gate.decide(host.available, 60 * GIB, step.waiter.need,
+                                                       memories, pressure=host.pressure).state == "admit")
+        self.assertEqual([(step.promise, step.measured, step.charged, step.admitted_at)
+                          for step in explanation.running],
+                         [(6 * GIB, GIB, 6 * GIB, NOW.timestamp() - 30),
+                          (4 * GIB, 2 * GIB, 4 * GIB, NOW.timestamp() - 30)])
+        self.assertTrue(all(isinstance(step.basis, gate.RampPromise) for step in explanation.running))
+
+    def test_old_waiter_without_source_has_an_explicit_unrecorded_variant(self) -> None:
+        path = self.waiting(300, 12 * GIB, 20)
+        before = path.read_bytes()
+        head = gate.explain_queue().head
+        if not isinstance(head, gate.HeadExplanation):
+            self.fail(f"expected head, got {head}")
+        self.assertIsInstance(head.need_source, gate.NeedSourceNotRecorded)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_missing_host_reading_and_empty_queue_use_their_domain_variants(self) -> None:
+        path = self.waiting(300, 12 * GIB, 20)
+        self.meminfo.unlink()
+        explanation = gate.explain_queue()
+        self.assertIsInstance(explanation.host, gate.ReadingUnavailable)
+        if not isinstance(explanation.head, gate.HeadExplanation):
+            self.fail(f"expected head, got {explanation.head}")
+        self.assertIsInstance(explanation.head.waiter.reason, gate.ReadingUnavailable)
+        path.unlink()
+        empty = gate.explain_queue()
+        self.assertIsInstance(empty.head, gate.NoWaiter)
+        self.assertEqual((empty.line.count, empty.line.steps), (0, ()))
+
+    def test_peak_charge_basis_uses_the_same_charge_as_admission_for_each_rule(self) -> None:
+        self.readings[100] = gate.MeasuredMemory(GIB)
+        path = self.running(100, 8, age=300)
+        cases = (
+            ("using", "", None, gate.UsingNow, GIB),
+            ("peak", str(5 * GIB), int(NOW.timestamp() - 30), gate.PeakSoFar, 5 * GIB),
+            ("decayed", str(5 * GIB), int(NOW.timestamp() - 1600), gate.PeakDecayed, GIB),
+            ("unreadable", "not a byte count", None, gate.PeakFileUnreadable, 8 * GIB),
+        )
+        for label, peak, recorded_at, expected_basis, expected_charge in cases:
+            with self.subTest(rule=label):
+                path.with_suffix(".max").unlink(missing_ok=True)
+                path.with_suffix(".wave").unlink(missing_ok=True)
+                if peak:
+                    _ = path.with_suffix(".max").write_text(peak)
+                if recorded_at is not None:
+                    _ = path.with_suffix(".wave").write_text(f"{peak} {recorded_at}")
+                explanation = gate.explain_queue()
+                self.assertEqual(len(explanation.running), 1)
+                running = explanation.running[0]
+                self.assertEqual(running.charged, expected_charge)
+                self.assertEqual(running.charged, gate.build_charge(running.step.measured))
+                self.assertIsInstance(running.basis, expected_basis)
+
+    def test_old_sampler_decay_uses_peak_file_publication_time(self) -> None:
+        path = self.running(100, 8, age=300)
+        _ = path.with_suffix(".max").write_text(str(5 * GIB))
+        old_peak_at = NOW.timestamp() - 1600
+        os.utime(path.with_suffix(".max"), (old_peak_at, old_peak_at))
+        running = gate.explain_queue().running[0]
+        if not isinstance(running.basis, gate.PeakDecayed):
+            self.fail(f"expected old-sampler decay, got {running.basis}")
+        self.assertTrue(running.basis.old_sampler)
+        self.assertEqual(running.basis.decayed_at, old_peak_at + gate.PEAK_DECAY_SECONDS)
+        self.assertEqual((running.promise, running.charged), (8 * GIB, GIB))
+
+    def test_no_reading_yet_names_the_promised_charge(self) -> None:
+        self.readings[100] = gate.MeasuredMemory(0)
+        _ = self.running(100, 8, age=30)
+        running = gate.explain_queue().running[0]
+        self.assertIsInstance(running.basis, gate.PromiseNoReading)
+        self.assertEqual((running.promise, running.measured, running.charged), (8 * GIB, 0, 8 * GIB))
+
+    def test_pressure_and_recovery_spacing_match_the_head_decision_without_writing(self) -> None:
+        _ = self.waiting(300, GIB, 20)
+        directory = self.root / "admission"
+        _ = (self.root / "pressure").write_text("full avg10=11.00 avg60=0.00 avg300=0.00 total=0\n")
+        explanation = gate.explain_queue()
+        if not isinstance(explanation.host, gate.HostAvailable) or not isinstance(explanation.head, gate.HeadExplanation):
+            self.fail(f"expected readable explanation, got {explanation}")
+        self.assertEqual(explanation.host.pressure, gate.MemoryPressure(11))
+        self.assertEqual(explanation.head.decision.state, "hold")
+        self.assertEqual(explanation.head.decision.pressure, explanation.host.pressure)
+        self.assertFalse((directory / "pressure-recovery").exists())
+
+        _ = (self.root / "pressure").write_text("full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n")
+        record = directory / "pressure-recovery"
+        _ = record.write_text(json.dumps({"state": "recovering", "ends_at": NOW.timestamp() + 100,
+                                         "next_start_at": NOW.timestamp() + 30}))
+        before = record.read_bytes()
+        recovery = gate.explain_queue()
+        if not isinstance(recovery.host, gate.HostAvailable) or not isinstance(recovery.head, gate.HeadExplanation):
+            self.fail(f"expected recovery explanation, got {recovery}")
+        self.assertEqual(recovery.host.pressure, gate.MemoryPressure(0, next_start_at=NOW.timestamp() + 30))
+        self.assertEqual(recovery.head.decision.state, "hold")
+        self.assertEqual(record.read_bytes(), before)
 
 
 if __name__ == "__main__":

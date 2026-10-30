@@ -61,7 +61,7 @@ class StylePlanTests(StylePlanFixture):
               mock.patch.object(style_proposals, "proposal_command")):
             code, output, errors = self.run_next()
         self.assertEqual(code, 0, errors)
-        self.assertEqual(output.count(f"waiting {issue}: {probe.finding_id} edits crates/alpha/src/render.rs, busy\n"), 1)
+        self.assertEqual(output.count(f"waiting {issue}: {probe.path} edits crates/alpha/src/render.rs, busy (1 finding)\n"), 1)
         self.assertNotIn(f"waiting {issue}: crates/alpha/src/probe.rs busy", output)
         ticket = self.ledger().ticket_open("names-unit")[0]
         self.assertEqual((ticket["files"], ticket["finding_ids"]), (["crates/alpha/src/gauge.rs"], [gauge.finding_id]))
@@ -87,7 +87,7 @@ class StylePlanTests(StylePlanFixture):
         with (mock.patch.object(berth_board, "read_board", return_value=self.board("crates/alpha/tests/probe_tests.rs")),
               mock.patch.object(style_proposals, "proposal_command")):
             _, output, _ = self.run_next()
-        self.assertIn(f"waiting {issue}: {finding.finding_id} edits crates/alpha/tests/probe_tests.rs, busy\n", output)
+        self.assertIn(f"waiting {issue}: {finding.path} edits crates/alpha/tests/probe_tests.rs, busy (1 finding)\n", output)
 
     def test_decision_refill_holds_a_qualified_rename_whose_markdown_reference_is_busy(self) -> None:
         rule = self.rule("read")
@@ -98,7 +98,7 @@ class StylePlanTests(StylePlanFixture):
         with (mock.patch.object(berth_board, "read_board", return_value=self.board("docs/notes.md")),
               mock.patch.object(style_proposals, "proposal_command")):
             _, output, _ = self.run_next()
-        self.assertIn(f"waiting {issue}: {finding.finding_id} edits docs/notes.md, busy\n", output)
+        self.assertIn(f"waiting {issue}: {finding.path} edits docs/notes.md, busy (1 finding)\n", output)
         # The decision has no free finding, so refill plans coverage work instead.
         self.assertEqual(self.ledger().ticket_open("names-unit")[0]["kind"], "read")
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
@@ -114,7 +114,7 @@ class StylePlanTests(StylePlanFixture):
               mock.patch.object(style_proposals, "proposal_command")):
             _, output, _ = self.run_next()
         self.assertIn("dropped names-unit-1: files busy\n", output)
-        self.assertIn(f"waiting {issue}: {finding.finding_id} edits crates/alpha/src/render.rs, busy\n", output)
+        self.assertIn(f"waiting {issue}: {finding.path} edits crates/alpha/src/render.rs, busy (1 finding)\n", output)
         self.assertEqual(ledger.ticket_open("names-unit")[0]["kind"], "read")
         self.assertIsInstance(ledger.proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
 
@@ -127,7 +127,7 @@ class StylePlanTests(StylePlanFixture):
         with (mock.patch.object(berth_board, "read_board", return_value=self.board("crates/alpha/src/gauge.rs")),
               mock.patch.object(style_proposals, "proposal_command")):
             _, output, _ = self.run_next()
-        self.assertIn(f"waiting {issue}: {finding.finding_id} edits crates/alpha/src/gauge.rs, busy\n", output)
+        self.assertIn(f"waiting {issue}: {finding.path} edits crates/alpha/src/gauge.rs, busy (1 finding)\n", output)
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
 
     def test_decision_refill_holds_a_file_rename_whose_busy_file_declares_it_by_a_raw_name(self) -> None:
@@ -135,7 +135,7 @@ class StylePlanTests(StylePlanFixture):
                                           (("crates/alpha/src/lib.rs", "mod gauge;\nmod r#probe;\nmod render;\n"),))
         finding = self.ledger().proposal_findings(issue)[0]
         output = self.refill_with_busy("crates/alpha/src/lib.rs")
-        self.assertIn(f"waiting {issue}: {finding.finding_id} edits crates/alpha/src/lib.rs, busy\n", output)
+        self.assertIn(f"waiting {issue}: {finding.path} edits crates/alpha/src/lib.rs, busy (1 finding)\n", output)
 
     def test_decision_refill_holds_a_file_rename_declared_by_a_path_attribute_in_an_inline_module(self) -> None:
         self.assert_rename_waits_for_an_uncertain_path(
@@ -168,7 +168,7 @@ class StylePlanTests(StylePlanFixture):
                           proposal=str(issue), finding_ids=(finding.finding_id,))
         output = self.refill_with_busy()
         self.assertIn(f"dropped names-unit-1: {lib} has a path attribute the rename gate cannot read\n", output)
-        self.assertIn(f"waiting {issue}: {finding.finding_id} {lib} has a path attribute the rename gate cannot read\n", output)
+        self.assertIn(f"waiting {issue}: {finding.path} {lib} has a path attribute the rename gate cannot read (1 finding)\n", output)
         self.assertIsInstance(ledger.proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
 
     def test_decision_refill_holds_a_file_rename_whose_own_file_has_an_uncertain_path(self) -> None:

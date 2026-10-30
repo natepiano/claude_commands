@@ -14,11 +14,12 @@ import tempfile
 import time
 from collections.abc import Callable, Generator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from importlib import import_module
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, NotRequired, Protocol, TypedDict, cast
+from typing import Literal, NotRequired, Protocol, TypedDict, cast, overload
 
 from session_types import Session, parse_session
 from session_types import (
@@ -478,7 +479,17 @@ class CheckoutMove(TypedDict):
     new: str
 
 
+class OwnerPaneScope(TypedDict):
+    """Pane membership verified while this recorded process identity was alive."""
+    pid: int
+    proc_start: str
+    cgroups: list[str]
+
+
 class SessionShutdown(TypedDict):
+    # A machine-wide bounded stop owns this request instead of the account conductor.
+    stop_deadline: NotRequired[str]
+    force_stop_note: NotRequired[str]
     move_id: NotRequired[str]
     login: str
     label: str
@@ -494,6 +505,7 @@ class SessionShutdown(TypedDict):
     session: Session
     workers: list[Session]
     codex_seats: NotRequired[list[PausedSeat]]
+    owner_pane_scopes: NotRequired[list[OwnerPaneScope]]
     timers: list[TimerRestore]
     settle_message: SettleMessage
     where: Where
@@ -537,6 +549,8 @@ class AccountHold(TypedDict):
     request_ids: NotRequired[list[str]]
     # A request stays here until its owner loop completes; exceptions leave it held.
     registering_request_ids: NotRequired[list[str]]
+    # Bounded registrations may be abandoned before their owner loop finishes.
+    registration_deadlines: NotRequired[dict[str, str]]
 
 
 def stop_incomplete(saved: SessionShutdown) -> bool:
@@ -552,8 +566,16 @@ _FINISHED_PROGRESS = frozenset({"restarted", "stop failed", "restart failed", "m
 _STOPPED_PROGRESS = frozenset({"stopped", "already gone", "process identity lost"})
 
 
+def bounded_attempt_finished(saved: SessionShutdown) -> bool:
+    """A bounded failure is terminal until explicitly retried, never a legacy stop."""
+    return "stop_deadline" in saved and (saved["progress"]["kind"] in _FINISHED_PROGRESS
+        or saved["progress"]["kind"] in _STOPPED_PROGRESS and saved["then"] == "stop")
+
+
 def shutdown_finished(saved: SessionShutdown) -> bool:
-    """The conductor's done rule: a forced stop still retries, and a restart request restarts its stopped session."""
+    """Bounded failures end their attempt; legacy force retries and restart continuations remain."""
+    if bounded_attempt_finished(saved):
+        return True
     if saved["force"] == "now" and stop_incomplete(saved):
         return False
     progress = saved["progress"]["kind"]
@@ -615,6 +637,52 @@ def _safe_login(login: str) -> str:
     return login
 
 
+class RecordDeadlineExpired(TimeoutError):
+    """The attempt could not acquire or publish a record before its deadline."""
+
+
+@dataclass(frozen=True)
+class RecordDeadline:
+    expires: float
+    monotonic: Callable[[], float] = time.monotonic
+    wait: Callable[[float], None] = time.sleep
+
+    def check(self) -> None:
+        if self.monotonic() >= self.expires:
+            raise RecordDeadlineExpired("shutdown deadline exhausted; record not updated")
+
+    def acquire(self, descriptor: int) -> None:
+        if self.expires == float("inf"):
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            return
+        while True:
+            self.check()
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.check()
+                return
+            except BlockingIOError:
+                self.wait(min(0.01, max(0, self.expires - self.monotonic())))
+
+
+_NO_RECORD_DEADLINE = RecordDeadline(float("inf"))
+_record_deadline: ContextVar[RecordDeadline] = ContextVar("record_deadline", default=_NO_RECORD_DEADLINE)
+
+
+@contextmanager
+def record_deadline(deadline: RecordDeadline) -> Generator[None, None, None]:
+    """Carry one absolute budget through synchronous reads and mutations.
+
+    A timed-out mutation never continues in a background writer. Both lock
+    layers and the publication boundary use the same clock and expiry.
+    """
+    token = _record_deadline.set(deadline)
+    try:
+        yield
+    finally:
+        _record_deadline.reset(token)
+
+
 def _account_directory(login: str) -> Path:
     return _state_root() / _safe_login(login).casefold()
 
@@ -623,7 +691,7 @@ def _account_directory(login: str) -> Path:
 def _directory_lock(directory: Path) -> Generator[None, None, None]:
     descriptor = os.open(directory, os.O_RDONLY)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _record_deadline.get().acquire(descriptor)
         yield
     finally:
         os.close(descriptor)
@@ -637,7 +705,7 @@ def _account_lock(login: str, *, create_directory: bool) -> Generator[Path, None
     with _directory_lock(directory):
         lock_path = directory / "lock"
         with lock_path.open("a+", encoding="utf-8") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            _record_deadline.get().acquire(lock_file.fileno())
             try:
                 yield directory
             finally:
@@ -1029,6 +1097,7 @@ def _lstat(path: Path) -> os.stat_result | None:
 
 
 def _write_record(path: Path, record: object) -> None:
+    _record_deadline.get().check()
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".record.", suffix=".tmp", dir=path.parent
     )
@@ -1039,6 +1108,7 @@ def _write_record(path: Path, record: object) -> None:
             _ = output.write("\n")
             output.flush()
             _ = os.fsync(output.fileno())
+        _record_deadline.get().check()
         os.replace(temporary, path)
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -1064,6 +1134,8 @@ def _reading_lock(login: str, directory: Path) -> Generator[None, None, None]:
     account_lock = _directory_lock(directory)
     try:
         _ = account_lock.__enter__()
+    except RecordDeadlineExpired:
+        raise
     except OSError as error:
         lock_path = directory / "lock"
         raise InvalidRecord(
@@ -1080,7 +1152,9 @@ def _reading_lock(login: str, directory: Path) -> Generator[None, None, None]:
                 raise InvalidRecord(f"{lock_path} cannot be opened or locked: {error}") from error
             with lock_file:
                 try:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                    _record_deadline.get().acquire(lock_file.fileno())
+                except RecordDeadlineExpired:
+                    raise
                 except OSError as error:
                     raise InvalidRecord(f"{lock_path} cannot be opened or locked: {error}") from error
                 try:
@@ -1202,6 +1276,19 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
             _paused_seat(seat, f"{place}.codex_seats[{index}]")
             for index, seat in enumerate(_items(values["codex_seats"], f"{place}.codex_seats"))
         ]
+    if "owner_pane_scopes" in values:
+        scopes: list[OwnerPaneScope] = []
+        for index, value in enumerate(_items(values["owner_pane_scopes"], f"{place}.owner_pane_scopes")):
+            where = f"{place}.owner_pane_scopes[{index}]"
+            scope = _mapping(value, where)
+            pid = _required(scope, "pid", where)
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                raise InvalidRecord(f"{where}.pid must be a positive integer")
+            scopes.append(OwnerPaneScope(
+                pid=pid,
+                proc_start=_string(_required(scope, "proc_start", where), f"{where}.proc_start"),
+                cgroups=_strings(_required(scope, "cgroups", where), f"{where}.cgroups")))
+        values["owner_pane_scopes"] = scopes
     _ = _required(values, "stop_issues", place)
     fields = _entry(values, place)
     values["progress"] = _progress(values["progress"], f"{place}.progress")
@@ -1235,10 +1322,10 @@ def _session_shutdown(value: object, place: str) -> SessionShutdown:
             raise InvalidRecord(f"{worker_place}.owner must identify this session")
         parsed_workers.append(parsed)
     values["workers"] = parsed_workers
-    for field in ("alerted_at", "form_alerted_at", "reasked_at"):
+    for field in ("alerted_at", "form_alerted_at", "reasked_at", "stop_deadline"):
         if field in values:
             _ = _utc_time(values[field], f"{place}.{field}")
-    for field in ("restore_alerted", "showrunner_told"):
+    for field in ("restore_alerted", "showrunner_told", "force_stop_note"):
         if field in values:
             _ = _string(values[field], f"{place}.{field}")
     return cast(SessionShutdown, cast(object, values))
@@ -1259,6 +1346,11 @@ def _account_hold(value: object, place: str) -> AccountHold:
         ids = _strings(values["registering_request_ids"], f"{place}.registering_request_ids")
         if len(set(ids)) != len(ids) or not set(ids).issubset(request_ids):
             raise InvalidRecord(f"{place}.registering_request_ids must be unique ids from request_ids")
+    if "registration_deadlines" in values:
+        for request_id, expires in _mapping(values["registration_deadlines"], f"{place}.registration_deadlines").items():
+            if request_id not in request_ids:
+                raise InvalidRecord(f"{place}.registration_deadlines must name covered requests")
+            _ = _utc_time(expires, f"{place}.registration_deadlines.{request_id}")
     return cast(AccountHold, cast(object, values))
 
 
@@ -1472,8 +1564,19 @@ def create_session(record: SessionShutdown) -> bool:
     with launch_barrier():
         with _session_store_lock(checked["login"], create=True) as directory:
             existing = _session_records_in_directory(directory, checked["login"])
-            if any(item["session"]["session_id"] == checked["session"]["session_id"] for item in existing):
-                return False
+            previous = next((item for item in existing
+                             if item["session"]["session_id"] == checked["session"]["session_id"]), None)
+            if previous is not None:
+                if not finished_stop_request(previous):
+                    return False
+                history = directory / "history"
+                _ = _record_directory(history, create=True)
+                old = directory / "sessions" / _session_filename(previous["session"]["session_id"])
+                target = history / f"{previous['requested_at']}-{previous['request_id']}-{old.name}"
+                # A repeated request id must not replace its earlier history either.
+                while _lstat(target) is not None:
+                    target = target.with_name("old-" + target.name)
+                os.replace(old, target)
             sessions = directory / "sessions"
             _ = _record_directory(sessions, create=True)
             path = sessions / _session_filename(checked["session"]["session_id"])
@@ -1481,6 +1584,20 @@ def create_session(record: SessionShutdown) -> bool:
                 raise InvalidRecord(f"{path} is used by a different session id")
             _write_record(path, checked)
     return True
+
+
+def finished_stop_request(saved: SessionShutdown) -> bool:
+    """Only completed shutdowns can be replaced by a fresh live-session snapshot."""
+    return saved["progress"]["kind"] in {
+        "stopped", "restarted", "restart failed", "already gone", "process identity lost",
+        "manual restart",
+    }
+
+
+def request_matches_process(saved: SessionShutdown, live: Session) -> bool:
+    stored = saved["session"]
+    return (stored["pid"] == live["pid"] and bool(stored["proc_start"])
+            and stored["proc_start"] == live["proc_start"])
 
 
 def update_session(
@@ -1501,6 +1618,7 @@ def update_session(
         identity = record["login"], record["machine"], record["session"]["session_id"]
         prior_progress = copy.deepcopy(record["progress"])
         trail = copy.deepcopy(record["trail"])
+        _record_deadline.get().check()
         change(record)
         record["trail"] = trail
         if record["progress"] != prior_progress:
@@ -1542,25 +1660,41 @@ def clear_restore_alert(saved: SessionShutdown) -> None:
         pass
 
 
-def archive_session(login: str, session_id: str) -> None:
-    """Move one session file into history under its request time and name."""
+@overload
+def archive_session(login: str, session_id: str, *, expected: None = None) -> None: ...
+
+
+@overload
+def archive_session(login: str, session_id: str, *, expected: SessionShutdown) -> bool: ...
+
+
+def archive_session(login: str, session_id: str, *, expected: SessionShutdown | None = None) -> bool | None:
+    """Archive under the lock, optionally only this completed request/attempt."""
     if _existing_account_directory(login) is None:
+        if expected is not None:
+            return False
         raise NoLiveRecord(f"no session shutdown for {login}/{session_id}")
     with _session_store_lock(login, write=True) as directory:
         _ = _record_directory(directory / "sessions")
         path = directory / "sessions" / _session_filename(session_id)
         if not _regular_record(path):
+            if expected is not None:
+                return False
             raise NoLiveRecord(f"no session shutdown for {login}/{session_id}")
         record = _session_shutdown(_read_json(path), str(path))
         _check_account(login, record["login"], path)
         if record["session"]["session_id"] != session_id:
             raise InvalidRecord(f"{path} is used by a different session id")
+        if expected is not None and (expected["progress"]["kind"] != "restarted"
+                or record["request_id"] != expected["request_id"] or record["progress"] != expected["progress"]):
+            return False
         history = directory / "history"
         _ = _record_directory(history, create=True)
         target = history / f"{record['requested_at']}-{path.name}"
         if _lstat(target) is not None:
             raise InvalidRecord(f"{target} already exists")
         os.replace(path, target)
+        return True if expected is not None else None
 
 
 def taken_over(saved: SessionShutdown) -> bool:
@@ -1696,10 +1830,13 @@ def _registering_request_ids(hold: AccountHold) -> set[str]:
     pending = set(hold.get("registering_request_ids", []))
     if hold.get("registration", "complete") == "in progress":
         pending.add(hold["request_id"])
-    return pending
+    deadlines = hold.get("registration_deadlines", {})
+    now = datetime.now(timezone.utc)
+    return {request for request in pending if request not in deadlines
+            or datetime.fromisoformat(deadlines[request]) > now}
 
 
-def register_account_hold_request(hold: AccountHold, *, account_wide: bool) -> None:
+def register_account_hold_request(hold: AccountHold, *, account_wide: bool, expires_at: str = "") -> None:
     """Join an existing hold, or create an account-wide hold, before adding records."""
     checked = _account_hold(copy.deepcopy(hold), "hold")
     login, request_id = checked["login"], checked["request_id"]
@@ -1718,6 +1855,8 @@ def register_account_hold_request(hold: AccountHold, *, account_wide: bool) -> N
             pending.add(request_id)
             checked["request_ids"] = sorted(requests)
             checked["registering_request_ids"] = sorted(pending)
+            if expires_at:
+                checked.setdefault("registration_deadlines", {})[request_id] = expires_at
             _write_record(path, checked)
 
 
@@ -1955,7 +2094,7 @@ def withdraw_failed_stop(
     login: str, session_id: str, identity_check: Callable[[SessionShutdown], bool],
     restore_and_notify: Callable[[SessionShutdown], None],
 ) -> SessionWithdrawn | SessionRetained:
-    """Withdraw a failed stop only when its original session is still live.
+    """Withdraw a failed stop when its session is live, including after resume.
 
     The identity check, resource restore, notification and archive share the
     account lock, so a competing stop claim cannot advance between them.
@@ -2072,6 +2211,7 @@ def release_finished_account_hold(login: str, *, conducting: bool = False) -> Ho
                 saved["progress"]["kind"] in _FINISHED_PROGRESS | _STOPPED_PROGRESS for saved in records)
         if not finished:
             return HoldInUse(held)
+        _record_deadline.get().check()
         path.unlink()
         return HoldReleased(held)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import errno
 import json
 import os
 import re
@@ -20,6 +21,7 @@ import style_ledger
 import style_plan
 import berth_board
 import coverage_report
+import unit_files
 
 
 from ledger_test_support import (LedgerTestCase, LedgerStatus)
@@ -27,6 +29,148 @@ from ledger_test_support import (LedgerTestCase, LedgerStatus)
 
 @final
 class StyleLedgerTicketsTests(LedgerTestCase):
+    def test_batch_owner_migration_reruns_after_process_loss_before_version_write(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        ledger.ticket_add("legacy-1", "legacy", "read", "names", ".", [finding.path], [rule])
+        with closing(sqlite3.connect(ledger.database)) as older_reader:
+            _ = older_reader.execute("DROP TABLE ticket_batch_owners")
+            _ = older_reader.execute("UPDATE schema_version SET version=27")
+            older_reader.commit()
+            before = list(older_reader.iterdump())
+            tickets = older_reader.execute("SELECT * FROM tickets").fetchall()
+            connect = sqlite3.connect
+
+            def migrating(database: Path, *, timeout: float) -> sqlite3.Connection:
+                connection = connect(database, timeout=timeout)
+
+                def stop(statement: str) -> None:
+                    # CREATE TABLE has executed, but neither it nor the version is committed.
+                    if statement == "DELETE FROM schema_version":
+                        os._exit(73)
+
+                connection.set_trace_callback(stop)
+                return connection
+
+            child = os.fork()
+            if child == 0:
+                try:
+                    with mock.patch.object(sqlite3, "connect", migrating):
+                        with style_ledger.Ledger(self.repo, ledger.database):
+                            pass
+                finally:
+                    os._exit(74)
+            _, status = os.waitpid(child, 0)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 73)
+            self.assertEqual(list(older_reader.iterdump()), before)
+            with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
+                self.assertEqual(upgraded.ticket_batch_owner("legacy-1"), style_ledger.UNBATCHED_TICKET)
+            # The pre-upgrade reader's queries still work; no existing table changed shape or data.
+            self.assertEqual(older_reader.execute("SELECT * FROM tickets").fetchall(), tickets)
+            self.assertEqual(older_reader.execute("SELECT version FROM schema_version").fetchone(),
+                             (max(style_ledger.MIGRATIONS),))
+
+    def test_batch_claim_owner_and_finding_claim_commit_or_roll_back_together(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        owner = style_ledger.BatchOwner("durable-intent")
+        for target in ("ticket_batch_owners", "held_findings"):
+            with self.subTest(fault=target):
+                event = "INSERT" if target == "ticket_batch_owners" else "UPDATE"
+                with closing(sqlite3.connect(ledger.database)) as connection:
+                    _ = connection.execute(
+                        f"CREATE TRIGGER stop_claim BEFORE {event} ON {target} "
+                        + "BEGIN SELECT RAISE(ABORT, 'claim fault'); END",
+                    )
+                    connection.commit()
+                before = self.ledger_contents(ledger)
+                with self.assertRaisesRegex(sqlite3.IntegrityError, "claim fault"):
+                    ledger.ticket_add("batch-1", "batch", "proposal", "names", ".", [finding.path], [rule],
+                                      proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,),
+                                      batch_owner=owner)
+                self.assertEqual(self.ledger_contents(ledger), before)
+                with closing(sqlite3.connect(ledger.database)) as connection:
+                    _ = connection.execute("DROP TRIGGER stop_claim")
+                    connection.commit()
+        ledger.ticket_add("batch-1", "batch", "proposal", "names", ".", [finding.path], [rule],
+                          proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,), batch_owner=owner)
+        with style_ledger.Ledger(self.repo, ledger.database) as reader:
+            self.assertEqual(reader.ticket_batch_owner("batch-1"), owner)
+            self.assertEqual(reader.named_held((finding.finding_id,))[0].build_ticket, style_ledger.BuildTicket("batch-1"))
+
+    def test_repeated_claim_cannot_replace_or_remove_its_batch_owner(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        owner = style_ledger.BatchOwner("original-intent")
+        for requested in (owner, owner, style_ledger.BatchOwner("another-intent"), style_ledger.UNBATCHED_TICKET):
+            with self.subTest(requested=requested):
+                before = self.ledger_contents(ledger)
+
+                def add() -> None:
+                    ledger.ticket_add("batch-1", "batch", "proposal", "names", ".", [finding.path], [rule],
+                                      proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,),
+                                      batch_owner=requested)
+
+                if requested == owner:
+                    add()
+                else:
+                    with self.assertRaisesRegex(style_ledger.LedgerError, "different batch owner"):
+                        add()
+                    self.assertEqual(self.ledger_contents(ledger), before)
+                self.assertEqual(ledger.ticket_batch_owner("batch-1"), owner)
+
+    def test_batch_recovery_keeps_unbatched_and_foreign_claims(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        recovery_owner = style_ledger.BatchOwner("recovering-intent")
+        for number, actual in enumerate((style_ledger.UNBATCHED_TICKET, style_ledger.BatchOwner("foreign-intent")), 1):
+            with self.subTest(owner=actual):
+                ticket = f"batch-{number}"
+                ledger.ticket_add(ticket, "batch", "proposal", "names", ".", [finding.path], [rule],
+                                  proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,),
+                                  batch_owner=actual)
+                before = self.ledger_contents(ledger)
+                with self.assertRaises(style_ledger.TicketBatchMismatch):
+                    ledger.ticket_drop_batch(ticket, recovery_owner)
+                self.assertEqual(self.ledger_contents(ledger), before)
+                ledger.ticket_drop(ticket)
+        ledger.ticket_add("batch-3", "batch", "proposal", "names", ".", [finding.path], [rule],
+                          proposal=str(self.root / "decision.md"), finding_ids=(finding.finding_id,),
+                          batch_owner=recovery_owner)
+        ledger.ticket_drop_batch("batch-3", recovery_owner)
+        self.assertEqual(ledger.proposal_tickets()[-1]["state"], "dropped")
+        self.assertEqual(ledger.named_held((finding.finding_id,))[0].build_ticket, style_ledger.NoBuildTicket())
+
+    def test_rule_hash_launch_failures_keep_ticket_context_and_cause(self) -> None:
+        rule = self.rule("probe")
+        ledger = self.ledger()
+        before = self.ledger_contents(ledger)
+        original = mock.Mock(wraps=subprocess.run)
+        for code in (errno.EMFILE, errno.ENOENT):
+            with self.subTest(errno=code):
+                failure = OSError(code, "PRIVATE launch diagnostic")
+
+                def fail_hash(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+                    if tuple(command) == ("git", "hash-object", "--stdin"):
+                        raise failure
+                    return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+                with mock.patch.object(subprocess, "run", side_effect=fail_hash):
+                    with self.assertRaisesRegex(style_ledger.LedgerError, "ticket probe-1 add:") as refused:
+                        ledger.ticket_add("probe-1", "probe", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+                cause = refused.exception.__cause__
+                self.assertIsInstance(cause, style_ledger.GitReadFailed)
+                assert isinstance(cause, style_ledger.GitReadFailed)
+                self.assertEqual(cause.command, ("git", "hash-object", "--stdin"))
+                self.assertIs(cause.__cause__, failure)
+                self.assertNotIn("PRIVATE", str(refused.exception))
+                self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_widen_callback_file_failure_is_not_a_git_failure(self) -> None:
+        ledger, _ = self.widen_ticket()
+        before = self.ledger_contents(ledger)
+        failure = PermissionError("decision file unreadable")
+        with self.assertRaises(PermissionError) as refused:
+            _ = ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", mock.Mock(side_effect=failure))
+        self.assertIs(refused.exception, failure)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
     def git_read_failure(self) -> style_ledger.GitReadFailed:
         return style_ledger.GitReadFailed(("git", "-C", str(self.repo), "rev-parse"), 128, "fatal: PRIVATE GIT STDERR")
 
@@ -112,11 +256,20 @@ class StyleLedgerTicketsTests(LedgerTestCase):
 
     def test_git_boundary_widen_callback_and_pending_writes_keep_reservations(self) -> None:
         ledger, _ = self.widen_ticket()
-        for failure in (subprocess.CalledProcessError(128, ["git", "show", "HEAD:x"], stderr="fatal: PRIVATE GIT STDERR"),
-                        style_ledger.CheckCouldNotRun("fatal: PRIVATE GIT STDERR")):
-            with self.subTest(failure=type(failure).__name__):
-                self.assert_git_refusal(ledger, "ticket names-1 widen:",
-                    lambda: ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", mock.Mock(side_effect=failure)))
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_callback(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "cat-file" in command:
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        def approved() -> frozenset[str]:
+            _ = unit_files.file_text(self.repo, "HEAD", "decision.md")
+            return frozenset()
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_callback):
+            self.assert_git_refusal(ledger, "ticket names-1 widen:",
+                lambda: ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", approved))
         with mock.patch.object(ledger, "_check_ticket_pipelines", side_effect=self.git_read_failure()):
             self.assert_git_refusal(ledger, "ticket names-1 widen:",
                 lambda: ledger.ticket_widen("names-1", ("extra.rs",), "reference", "worker", lambda: frozenset()))
@@ -124,8 +277,14 @@ class StyleLedgerTicketsTests(LedgerTestCase):
     def test_git_boundary_all_public_operations_keep_typed_failure_context(self) -> None:
         ledger = self.checkpointed_read_transition()
         rule = self.rule("new")
-        with mock.patch.object(rules, "load_rules", side_effect=subprocess.CalledProcessError(
-                128, ["git", "hash-object", "rule"], stderr="fatal: PRIVATE GIT STDERR")):
+        original = mock.Mock(wraps=subprocess.run)
+
+        def fail_hash(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if tuple(command) == ("git", "hash-object", "--stdin"):
+                return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
+            return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
+
+        with mock.patch.object(subprocess, "run", side_effect=fail_hash):
             self.assert_git_refusal(ledger, "ticket new-1 add:",
                 lambda: ledger.ticket_add("new-1", "new", "read", "names", "crates/alpha", [self.sources[0]], [rule]))
         self.add_ticket("new-1", [rule], unit="new")

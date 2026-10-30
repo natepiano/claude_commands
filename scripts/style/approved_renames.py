@@ -297,6 +297,120 @@ def binding_rename(kind: str, before: str, after: str, line: int, text: str) -> 
     return BindingRename(line, text, previous, replacement)
 
 
+
+@dataclass(frozen=True)
+class RenameDeclaration:
+    """The finding's declaration token, with lexical ranges for comment and capture guards."""
+
+    offset: int
+    scope: BindingScope
+
+
+def refactor_rename(kind: str, before: str, after: str, line: int, text: str) -> BindingRename | NoBindingRename:
+    """One identifier replacement, including qualified fields and raw identifiers; no type/restructure edits."""
+    old, new = style_footprint.tokens(before), style_footprint.tokens(after)
+    if kind != "rename" or len(old) != len(new):
+        return NoBindingRename()
+    pairs = {(a.value, b.value) for a, b in zip(old, new) if a != b}
+    if len(pairs) != 1:
+        return NoBindingRename()
+    previous, replacement = pairs.pop()
+    if not all(style_footprint.IDENTIFIER.fullmatch(name) and name not in style_footprint.RUST_KEYWORDS
+               for name in (previous, replacement)):
+        return NoBindingRename()
+    return BindingRename(line, text, previous, replacement)
+
+
+def rename_declaration(source: str, rename: BindingRename) -> RenameDeclaration | NoBindingScope:
+    """Locate syntax only. Rust-analyzer owns reference resolution and the rename edit."""
+    scan = _BindingScan(source)
+    lines = [i for i, text in enumerate(source.splitlines(), 1) if text.strip() == rename.text.strip()]
+    if not lines:
+        return NoBindingScope("finding text is absent")
+    distance = min(abs(line - rename.line) for line in lines)
+    nearest = [line for line in lines if abs(line - rename.line) == distance]
+    if len(nearest) != 1:
+        return NoBindingScope("finding location is tied")
+    indexes = {i for i, span in enumerate(scan.spans) if scan.tokenized.lines[i] == nearest[0]
+               and span.token.value.removeprefix("r#") == rename.old.removeprefix("r#")}
+    candidates: dict[int, BindingScope] = {}
+    for site in scan.sites:
+        for i in indexes:
+            if scan.binding_word(site, i, rename.old, raw=True):
+                candidates[i] = BindingScope(site.kind, i, site.ranges)
+    for start, word in enumerate(scan.words):
+        if word not in {"struct", "enum", "union"}:
+            continue
+        body = next((i for i in range(start + 2, len(scan.words)) if scan.words[i] in {"{", "(", ";"}), -1)
+        if body not in scan.ends or scan.words[body] != "{":
+            continue
+        for i in indexes:
+            if body < i < scan.ends[body] and (scan.words[i + 1:i + 2] == (":",)
+                    or word == "enum" and scan.parents.get(i) == body and scan.words[i - 1] in {"{", ","}):
+                candidates[i] = BindingScope("field" if scan.words[i + 1:i + 2] == (":",) else "variant",
+                                             i, ((start, scan.ends[body] + 1),))
+    for i in indexes:
+        if i and scan.words[i - 1] in {"fn", "struct", "enum", "union", "trait", "type", "const", "static", "mod"}:
+            candidates[i] = BindingScope("item", i, ((max(0, i - 1), len(scan.words)),))
+    if len(candidates) != 1:
+        return NoBindingScope("finding line has no unique declaration of " + repr(rename.old))
+    index, scope = next(iter(candidates.items()))
+    # Reuse precise shadowing ranges where available, without any file-wide refusal.
+    local = scan.locate(rename)
+    if isinstance(local, BindingScope) and local.declaration == index:
+        scope = local
+    return RenameDeclaration(scan.spans[index].start, scope)
+
+
+@dataclass(frozen=True)
+class DistinctPatternBindings:
+    """The proposed name duplicates no binding in this pattern or parameter list."""
+
+
+@dataclass(frozen=True)
+class PatternBindingCollision:
+    name: str
+    line: int
+
+    @property
+    def reason(self) -> str:
+        return f"new name {self.name!r} is already a binding in the same pattern or parameter list at line {self.line}"
+
+
+def pattern_binding_check(source: str, declaration: RenameDeclaration,
+                          rename: BindingRename) -> DistinctPatternBindings | PatternBindingCollision:
+    scan = _BindingScan(source)
+    scope = declaration.scope
+    owners = [site for site in scan.sites if site.start <= scope.declaration < site.end
+              and scan.binding_word(site, scope.declaration, rename.old, raw=True)]
+    siblings = [site for site in scan.sites if site in owners or any(
+        site.kind == owner.kind and owner.kind in {"fn parameter", "closure"}
+        and site.ranges[-1] == owner.ranges[-1] for owner in owners)]
+    for site in siblings:
+        for i in range(site.start, site.end):
+            if scan.binding_word(site, i, rename.new, raw=True):
+                return PatternBindingCollision(rename.new, scan.tokenized.lines[i])
+    return DistinctPatternBindings()
+
+
+def refactor_comments(source: str, declaration: RenameDeclaration, rename: BindingRename) -> BindingComments:
+    """Mechanical identifier mentions in the declaration's comments, including prose."""
+    scan = _BindingScan(source)
+    comments = scan.binding_comments(declaration.scope, rename)
+    if isinstance(comments, BindingComments):
+        return comments
+    indexes = {i for i, comment in enumerate(scan.comments)
+               if any(start <= comment.gap <= end for start, end in declaration.scope.ranges)}
+    if declaration.scope.kind in {"fn parameter", "field", "variant", "item"}:
+        start = min(a for a, _ in declaration.scope.ranges)
+        indexes.update(i for i, comment in enumerate(scan.comments)
+                       if style_footprint.outer_doc(comment.text) and start - 3 <= comment.gap <= declaration.scope.declaration)
+    edits = tuple(CommentRename(comment.start + a, comment.start + b, rename.new)
+                  for i, comment in enumerate(scan.comments) if i in indexes
+                  for a, b in identifier_mentions(comment.text, rename.old))
+    return BindingComments(edits, frozenset(indexes), ())
+
+
 def _contains(ranges: tuple[tuple[int, int], ...], index: int) -> bool:
     return any(start <= index < end for start, end in ranges)
 
@@ -448,10 +562,12 @@ class _BindingScan:
                     begin = arm_end + int(words[arm_end:arm_end + 1] == (",",))
         return tuple(sites)
 
-    def binding_word(self, site: PatternSite, index: int, name: str) -> bool:
+    def binding_word(self, site: PatternSite, index: int, name: str, *, raw: bool = False) -> bool:
         words = self.words
-        if (not site.start <= index < site.end or words[index] != name or name in style_footprint.RUST_KEYWORDS
-                or name.startswith("r#") or not style_footprint.IDENTIFIER.fullmatch(name)):
+        actual = words[index].removeprefix("r#") if raw else words[index]
+        expected = name.removeprefix("r#") if raw else name
+        if (not site.start <= index < site.end or actual != expected or name in style_footprint.RUST_KEYWORDS
+                or not raw and name.startswith("r#") or not style_footprint.IDENTIFIER.fullmatch(name)):
             return False
         previous = words[index - 1] if index else ""
         following = words[index + 1] if index + 1 < len(words) else ""
@@ -511,12 +627,14 @@ class _BindingScan:
                       ((start, min(end, begin)), (max(start, finish), end)) if a < b]
         return BindingScope(site.kind, declaration, tuple(ranges))
 
-    def file_refusal(self, rename: BindingRename) -> str:
+    def file_refusal(self, rename: BindingRename, *, resolve_names: bool = False) -> str:
         """Whole-file exclusions: local visibility cannot prove these names are safe to rename."""
-        if self.name_indexes.get(rename.new) or self.name_indexes.get("r#" + rename.new):
+        if not resolve_names and (self.name_indexes.get(rename.new) or self.name_indexes.get("r#" + rename.new)):
             return "new name already occurs in file"
         if style_footprint.holds_glob_use(self.words):
             return "file contains a glob import"
+        if resolve_names:
+            return ""
         binding_indexes = {i for site in self.sites for i in range(site.start, site.end)
                            if self.binding_word(site, i, rename.old)}
         old_names = {rename.old, "r#" + rename.old}
@@ -677,13 +795,42 @@ class _BindingScan:
         return frozenset(result)
 
 
+class BindingScopeReader:
+    """Binding locations and refusals sharing one immutable source scan."""
+
+    def __init__(self, source: str) -> None:
+        self._scan: _BindingScan | NoBindingScope
+        try:
+            self._scan = _BindingScan(source)
+        except style_footprint.UnreadableTokenSpans as error:
+            self._scan = NoBindingScope(str(error))
+
+    def scope(self, rename: BindingRename) -> BindingScope | NoBindingScope:
+        if isinstance(self._scan, NoBindingScope):
+            return self._scan
+        refusal = self._scan.file_refusal(rename)
+        return NoBindingScope(refusal) if refusal else self._scan.locate(rename)
+
+
 def binding_scope(source: str, rename: BindingRename) -> BindingScope | NoBindingScope:
     """Locate one binding and subtract each inner pattern and scope that shadows its old name."""
+    return BindingScopeReader(source).scope(rename)
+
+
+RESOLVABLE_NAME_REFUSALS = frozenset({"new name already occurs in file", "old name also occurs as an item or type"})
+
+
+def resolution_scope(source: str, rename: BindingRename) -> BindingScope | NoBindingScope:
+    """Locate a candidate for LSP proof; this is not evidence that its rename is safe.
+
+    Only the two whole-file name exclusions yield to resolution. Ledger callers continue using binding_scope
+    and binding_rename_check, whose text refusals are unchanged.
+    """
     try:
         scan = _BindingScan(source)
     except style_footprint.UnreadableTokenSpans as error:
         return NoBindingScope(str(error))
-    refusal = scan.file_refusal(rename)
+    refusal = scan.file_refusal(rename, resolve_names=True)
     return NoBindingScope(refusal) if refusal else scan.locate(rename)
 
 

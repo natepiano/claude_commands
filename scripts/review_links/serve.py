@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, TypeVar, cast
 from urllib.parse import unquote, urlsplit
 
+if __package__:
+    from .review_link import private_name
+else:
+    from review_link import private_name  # pyright: ignore[reportImplicitRelativeImport]
+
 if TYPE_CHECKING:
     from typing import override
 else:
@@ -45,24 +50,35 @@ def sweep_snapshots(root: Path, now: float) -> int:
     removed = 0
     if not root.exists():
         return removed
-    for entry in root.iterdir():
-        if entry.is_symlink() or not entry.is_dir():
-            continue
-        children = list(entry.iterdir())
-        # New snapshots contain regular files. A legacy session can contain
-        # only symlinks; preserve those even when its name is also a valid id.
-        flat = re.fullmatch(r"[a-z0-9]{6}", entry.name) is not None and not any(
-            child.is_dir() or child.is_symlink() for child in children
-        )
-        for folder in [entry] if flat else children:
-            if folder.is_symlink() or not folder.is_dir():
+    try:
+        entries = list(root.iterdir())
+    except OSError as error:
+        print(f"review-links sweep: {root}: {error}", file=sys.stderr)
+        return removed
+    for entry in entries:
+        try:
+            if entry.is_symlink() or not entry.is_dir():
                 continue
+            children = list(entry.iterdir())
+            # New snapshots contain regular files. Check symlinks before their
+            # targets; a legacy session may contain only inaccessible links.
+            flat = re.fullmatch(r"[a-z0-9]{6}", entry.name) is not None and not any(
+                child.is_symlink() or child.is_dir() for child in children
+            )
+        except OSError as error:
+            print(f"review-links sweep: {entry}: {error}", file=sys.stderr)
+            continue
+        for folder in [entry] if flat else children:
             try:
+                if folder.is_symlink() or not folder.is_dir():
+                    continue
                 if folder.stat().st_mtime < now - RETENTION_SECONDS:
                     shutil.rmtree(folder)
                     removed += 1
             except FileNotFoundError:
                 continue
+            except OSError as error:
+                print(f"review-links sweep: {folder}: {error}", file=sys.stderr)
     return removed
 
 
@@ -76,11 +92,13 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             decoded = unquote(urlsplit(self.path).path)
             if ".." in decoded.split("/"):
                 raise FileNotFoundError("parent traversal")
+            if any(private_name(part) for part in decoded.split("/")):
+                raise FileNotFoundError("private publisher file")
             file = (root / decoded.lstrip("/")).resolve()
-            if file == root / ".index.json" or file.name.startswith(".review-link-"):
-                raise FileNotFoundError("private index or unfinished write")
             if not file.is_relative_to(root) or not file.is_file():
                 raise FileNotFoundError("outside root or not a file")
+            if any(private_name(part) for part in file.relative_to(root).parts):
+                raise FileNotFoundError("private publisher file")
             stream = file.open("rb")
         except (OSError, ValueError, RuntimeError):
             self.send_error(404, "File not found")

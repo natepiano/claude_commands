@@ -153,6 +153,16 @@ units: older units first, then recent units. Within each group, whole days
 since last use come first, then oldest compile time. Orphaned
 copies and the separate rustdoc index limit keep their existing rules.
 
+The timed tmp sweep keeps top-level `/tmp/claude` entries and direct
+`unit`/`delegate` run folders without recorded end evidence until they are
+unchanged for 7 days; top-level files and links also wait 7 days. All process,
+ownership and saved-work checks still apply. Its log names removals based on end
+evidence separately from the 7-day fallback and lists paths kept for lack of end
+evidence. Tempfile-named entries, invoke/verify logs and other roots keep their
+existing rules; hand cleanup still requires end evidence. Folder audit also uses
+the shared tree change-time check (mtime and ctime) and waits 7 days without a
+change, so a recent copy with preserved mtimes stays.
+
 Run `python3 scripts/lint/sweep.py rebuilds --days 7` to see cold rebuild
 compile-hours by clone kind and cause: `floor take`, `budget take`, `tmp sweep`
 or `none`. The command reads natedev's monthly build-log JSON lines, the

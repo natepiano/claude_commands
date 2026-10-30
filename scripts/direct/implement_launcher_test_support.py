@@ -9,6 +9,8 @@ refusing every progress call while two agents were still working.
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import registry_text, write_registry
+
 import json
 import os
 import shutil
@@ -19,7 +21,7 @@ import unittest
 from pathlib import Path
 from typing import TypedDict, ClassVar, cast, override
 
-from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.direct.recorder_fixture import STUB_ATOMIC_JSON_WRITER, communicate_launcher, invoke_recorder
 
 
 TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
@@ -57,7 +59,7 @@ printf 'stub agent log\\n' > "$6"
 if [[ -n "${TEST_WORKER_STARTED:-}" ]]; then : > "$TEST_WORKER_STARTED"; fi
 """
 
-STUB_MESH = """#!/usr/bin/env python3
+STUB_MESH = "#!/usr/bin/env python3\n" + STUB_ATOMIC_JSON_WRITER + """
 import json
 import os
 import pathlib
@@ -94,7 +96,7 @@ elif verb == 'compact':
     after = int(os.environ.get('STUB_COMPACT_AFTER', '12000'))
     roster[name]['context_tokens'] = ('not_measured_since_compaction'
                                     if (session / 'compact_reports_zero').exists() else after)
-    roster_path.write_text(json.dumps(roster))
+    write_json(roster_path, roster)
     if (session / 'compact_reports_zero').exists():
         print(f'compacted {name}: {before} tokens, size not measured until its next turn')
     else:
@@ -124,7 +126,7 @@ elif verb == 'can-follow':
     entry['status'] = 'starting'
     entry['role'] = option('--role')
     entry['launcher_pid'] = int(option('--claim-pid'))
-    roster_path.write_text(json.dumps(roster))
+    write_json(roster_path, roster)
     sys.exit(0)
 elif verb == 'follow':
     name = option('--to')
@@ -133,7 +135,7 @@ elif verb == 'follow':
     if os.environ.get('STUB_FOLLOW_PEER_AFTER_CLAIM') == '1':
         roster[name] = {'thread_id': roster[name]['thread_id'], 'turn_id': 'peer-turn',
                         'status': 'running'}
-        roster_path.write_text(json.dumps(roster))
+        write_json(roster_path, roster)
         sys.exit(1)
     if os.environ.get('STUB_FOLLOW_HOLD') == 'before':
         signal.pause()
@@ -142,13 +144,13 @@ elif verb == 'follow':
     (session / 'follow_message.txt').write_text(pathlib.Path(option('--message-file')).read_text())
     if os.environ.get('STUB_FOLLOW_FAIL') == '1':
         roster[name]['status'] = 'failed'
-        roster_path.write_text(json.dumps(roster))
+        write_json(roster_path, roster)
         sys.exit(1)
     roster[name]['turn_id'] = 'turn-2'
     roster[name]['status'] = 'running' if os.environ.get('STUB_FOLLOW_HOLD') == 'after' else 'done'
     if os.environ.get('STUB_FOLLOW_HOLD') == 'after':
         roster[name]['launcher_pid'] = os.getpid()
-    roster_path.write_text(json.dumps(roster))
+    write_json(roster_path, roster)
     if os.environ.get('STUB_FOLLOW_HOLD') == 'after':
         if os.environ.get('STUB_LAUNCH_RELEASE'):
             import subprocess
@@ -165,22 +167,13 @@ elif verb == 'release-follow':
                         'status': entry.get('previous_status', 'failed')}
 else:
     sys.exit(2)
-roster_path.write_text(json.dumps(roster))
+write_json(roster_path, roster)
 if verb == 'start' and os.environ.get('STUB_LAUNCH_RELEASE'):
     import subprocess
     subprocess.run([sys.executable, os.environ['TEST_WAIT_HELPER'], os.environ['STUB_LAUNCH_RELEASE']], check=True)
 """
 
-CLAUDE_REGISTRY = """[assignments]
-direct=claude
-
-[direct.claude]
-impl=opus:high
-test=opus:high
-
-[claude.agents]
-opus=low,medium,high,xhigh,max
-"""
+CLAUDE_REGISTRY = registry_text({'assignments': {'direct': 'claude'}, 'direct.claude': {'impl': 'opus:high', 'test': 'opus:high'}, 'claude.agents': {'opus': 'low,medium,high,xhigh,max'}})
 
 STUB_CLAUDE = """#!/usr/bin/env python3
 import json
@@ -263,19 +256,7 @@ class OpenPass(TypedDict):
 ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
-AGENTS_REGISTRY = """[assignments]
-direct=codex
-
-[direct.codex]
-impl=gpt-called:xhigh
-test=gpt-called:xhigh
-fix=gpt-called:xhigh
-review=gpt-blind:max
-
-[codex.agents]
-gpt-called=low,medium,high,xhigh,max
-gpt-blind=low,medium,high,xhigh,max
-"""
+AGENTS_REGISTRY = registry_text({'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-called:xhigh', 'test': 'gpt-called:xhigh', 'fix': 'gpt-called:xhigh', 'review': 'gpt-blind:max'}, 'codex.agents': {'gpt-called': 'low,medium,high,xhigh,max', 'gpt-blind': 'low,medium,high,xhigh,max'}})
 
 
 class ImplementLauncherFixture(unittest.TestCase):
@@ -340,7 +321,7 @@ class ImplementLauncherFixture(unittest.TestCase):
         )
         registry = self.root / ".claude" / "config" / "agents.conf"
         registry.parent.mkdir(parents=True)
-        _ = registry.write_text(AGENTS_REGISTRY, encoding="utf-8")
+        _ = write_registry(registry, base_text=AGENTS_REGISTRY)
         notes = self.root / "notes"
         notes.mkdir()
         _ = (notes / "claude2.md").write_text("---\nlogin: worker@example.invalid\n---\n")
@@ -369,6 +350,7 @@ class ImplementLauncherFixture(unittest.TestCase):
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # location, so the copy needs the interpreter shim beside it too.
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "atomic_file.py", lib / "atomic_file.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "nix_env.py", lib / "nix_env.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
@@ -627,7 +609,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
 
     def claude_worker(self, session_dir: Path) -> Path:
         registry = self.root / ".claude" / "config" / "agents.conf"
-        _ = registry.write_text(CLAUDE_REGISTRY, encoding="utf-8")
+        _ = write_registry(registry, base_text=CLAUDE_REGISTRY)
         sessions = self.root / "sessions"
         sessions.mkdir()
         projects = self.root / "projects" / "fixture"
@@ -697,14 +679,7 @@ if len(_probe_sys.argv) > 1 and _probe_sys.argv[1] in {commands!r}:
         self, session_dir: Path, registry_row: str, *, inherited_effort: str = "", kind: str = "impl"
     ) -> subprocess.CompletedProcess[str]:
         registry = self.root / ".claude" / "config" / "agents.conf"
-        _ = registry.write_text(
-            CLAUDE_REGISTRY.replace("impl=opus:high", f"impl={registry_row}")
-            .replace(
-                "opus=low,medium,high,xhigh,max",
-                "opus=low,medium,high,xhigh,max\nsonnet=low,medium,high,xhigh,max",
-            ),
-            encoding="utf-8",
-        )
+        _ = write_registry(registry, {"direct.claude": {"impl": registry_row}}, base_text=CLAUDE_REGISTRY)
         stub = self.root / "claude"
         _ = stub.write_text(STUB_CLAUDE, encoding="utf-8")
         stub.chmod(0o755)

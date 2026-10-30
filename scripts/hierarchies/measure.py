@@ -27,7 +27,6 @@ import re
 import sqlite3
 import subprocess
 from statistics import median
-from textwrap import wrap
 import sys
 from typing import cast
 
@@ -309,6 +308,15 @@ class HolderNotNamed:
             raise ValueError("unnamed holder needs a reason")
 
 
+@dataclass(frozen=True)
+class MalformedHolder:
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not self.reason.strip():
+            raise ValueError("malformed holder needs a reason")
+
+
 class HolderResourceKind(Enum):
     ACCOUNT = "account"
     SLOT = "slot"
@@ -329,7 +337,7 @@ class NamedHolder:
 @dataclass(frozen=True)
 class HolderObservation:
     at: datetime
-    holder: NamedHolder | HolderNotNamed
+    holder: NamedHolder | HolderNotNamed | MalformedHolder
 
 
 @dataclass(frozen=True)
@@ -342,7 +350,7 @@ class HolderInterval:
     observed: datetime
     started: datetime
     end: CompletedWait | UnknownEndedWait
-    holder: NamedHolder | HolderNotNamed
+    holder: NamedHolder | HolderNotNamed | MalformedHolder
 
 
 class HolderCoverage(Enum):
@@ -624,14 +632,16 @@ def parse_holder_history(record: log_records.JsonObject, started: datetime) -> H
         at = log_records.required_time(item.get("epoch", item.get("at")))
         fields = log_records.object_record(item.get("holder"))
         state = log_records.field_text(fields, "state")
-        holder: NamedHolder | HolderNotNamed
+        holder: NamedHolder | HolderNotNamed | MalformedHolder
         if state == "HolderNotNamed":
             if set(fields) - {"state", "reason"}:
                 raise ValueError("unknown unnamed holder field")
             reason = log_records.field_text(fields, "reason")
-            if reason.startswith("invalid holder record:"):
-                raise ValueError(reason)
-            holder = HolderNotNamed(reason)
+            holder = MalformedHolder(reason) if reason.startswith("invalid holder record:") else HolderNotNamed(reason)
+        elif state == "MalformedHolder":
+            if set(fields) - {"state", "reason", "raw_value"}:
+                raise ValueError("unknown malformed holder field")
+            holder = MalformedHolder(log_records.field_text(fields, "reason"))
         elif state == "NamedHolder":
             if set(fields) - {"state", "resource_kind", "resource", "holder"}:
                 raise ValueError("unknown named holder field")
@@ -890,7 +900,7 @@ def holder_coverage(wait: HanaWait) -> HolderCoverage:
     intervals = tuple(interval for interval in holder_intervals(wait)
                       if isinstance(interval.end, UnknownEndedWait) or interval.end.at > interval.started)
     named = any(isinstance(interval.holder, NamedHolder) for interval in intervals)
-    unnamed = any(isinstance(interval.holder, HolderNotNamed) for interval in intervals)
+    unnamed = any(isinstance(interval.holder, (HolderNotNamed, MalformedHolder)) for interval in intervals)
     if not named:
         return HolderCoverage.UNNAMED
     if unnamed or isinstance(wait.end, UnknownEndedWait):
@@ -930,9 +940,10 @@ def holder_rows(
         observations = wait.holders.observations
         if observations and all(observation.holder == observations[0].holder for observation in observations):
             holder = observations[0].holder
-            if isinstance(holder, HolderNotNamed):
+            if isinstance(holder, (HolderNotNamed, MalformedHolder)):
+                reason = ("MalformedHolder: " if isinstance(holder, MalformedHolder) else "") + holder.reason
                 kind_label = wait.kind.value if isinstance(wait.kind, WaitKind) else "WaitKindNotRecorded"
-                unnamed_groups.setdefault((kind_label, holder.reason), []).append(wait)
+                unnamed_groups.setdefault((kind_label, reason), []).append(wait)
                 continue
         for interval in holder_intervals(wait):
             holder = interval.holder
@@ -941,7 +952,7 @@ def holder_rows(
                          else "unit:" + holder.holder.unit)
                 detail = f"{holder.resource_kind.value}:{holder.resource}; {owner}"
             else:
-                detail = "HolderNotNamed: " + holder.reason
+                detail = type(holder).__name__ + ": " + holder.reason
             start = interval.started.astimezone(timezone.utc).isoformat()
             observed = interval.observed.astimezone(timezone.utc).isoformat()
             if isinstance(interval.end, CompletedWait):
@@ -956,6 +967,13 @@ def holder_rows(
         rows.append(log_records.MeasureRow(f"Hana wait holders unnamed / {kind_label} / {reason}",
                                            partial_wait_total(holder_wait_duration(grouped, complete_coverage), partial), len(grouped), window.label, source))
     return rows
+
+
+def candidate_summary(candidates: Sequence[WaitCandidate]) -> str:
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        counts[candidate.label] = counts.get(candidate.label, 0) + 1
+    return " | ".join(label + (f" ({count} times)" if count > 1 else "") for label, count in counts.items())
 
 
 def hana_wait_rows(
@@ -1017,12 +1035,12 @@ def hana_wait_rows(
                                            window.label, source + "; phases: " + ", ".join(identities)))
     for phase in uncertain:
         if isinstance(phase.state, UncertainWaitCoverage):
-            detail = phase.state.reason + "; candidates: " + " | ".join(candidate.label for candidate in phase.state.candidates)
+            detail = phase.state.reason + "; candidates: " + candidate_summary(phase.state.candidates)
             rows.append(log_records.MeasureRow("Hana wait coverage / UncertainCoverage", detail, 1, window.label, f"{phase.run}/{phase.instance}"))
     if isinstance(history, HanaWaitHistory) and history.attribution_misses:
         misses = history.attribution_misses
         for miss in misses:
-            detail = miss.reason + "; candidates: " + " | ".join(candidate.label for candidate in miss.candidates)
+            detail = miss.reason + "; candidates: " + candidate_summary(miss.candidates)
             rows.append(log_records.MeasureRow("Hana wait attribution / Unresolved", detail, 1, window.label, miss.wait_id))
     if isinstance(history, HanaWaitHistory):
         for origin in history.unresolved_origins:
@@ -1689,7 +1707,7 @@ def baseline_summary(
     values = {row.measure: row.value for row in (*flow_rows, *attention_rows)}
     start, end = window.since.astimezone(user_zone()), window.until.astimezone(user_zone())
     start_format = "%Y-%m-%d %H:%M" if start.tzname() == end.tzname() else "%Y-%m-%d %H:%M %Z"
-    return "\n".join([
+    return "\n".join(log_records.wrap_text(line) for line in [
         f"Window: {start.strftime(start_format)} to {end:%Y-%m-%d %H:%M %Z} (end excluded).",
         f"Hana: {values['Hana merges / origin/init/catalyst']} merges to origin/init/catalyst; "
         + f"{values['goal 1 Hana-project issues closed']} Hana-project issues closed.",
@@ -1699,18 +1717,6 @@ def baseline_summary(
         + f"{values['phone pushes after failed review']} after a failed text check.",
         f"Source problems: {len(problem_rows)}." + ("" if full else " Use --full to print the tables."),
     ])
-
-
-def flow_table(rows: Sequence[log_records.MeasureRow]) -> str:
-    cells = [("Measure", "Value", "n", "Window", "Source")]
-    for row in rows:
-        values = wrap(row.value, width=60, break_on_hyphens=False) or [""]
-        cells.append((row.measure, values[0], str(row.n), row.window, row.source))
-        cells.extend(("", value, "", "", "") for value in values[1:])
-    widths = [max(len(cell[index]) for cell in cells) for index in range(5)]
-    lines = ["  ".join(value.ljust(widths[index]) for index, value in enumerate(cell)).rstrip() for cell in cells]
-    title = "Flow to Hana main (recorded phase/issue completion; local-ref merge commits)"
-    return title + "\n" + "\n".join(lines)
 
 
 def render(sources: BaselineSources, window: log_records.Window, now: datetime, full: bool = False) -> str:
@@ -1730,13 +1736,13 @@ def render(sources: BaselineSources, window: log_records.Window, now: datetime, 
     coverage_rows = rank_coverage(sources.issue_records, sources.rankings, sources.units, snapshot)
     groups = [
         summary,
-        log_records.table("Capacity on Hana", capacity_rows),
-        flow_table(flow_rows),
-        log_records.table("User attention", attention_rows),
-        log_records.table("Rank coverage", coverage_rows),
+        log_records.blocks("Capacity on Hana", capacity_rows),
+        log_records.blocks("Flow to Hana main (recorded phase/issue completion; local-ref merge commits)", flow_rows),
+        log_records.blocks("User attention", attention_rows),
+        log_records.blocks("Rank coverage", coverage_rows),
     ]
     if problem_rows:
-        groups.append(log_records.table("Source problems (dependent counts can be incomplete)", problem_rows))
+        groups.append(log_records.blocks("Source problems (dependent counts can be incomplete)", problem_rows))
     return "\n\n".join(groups)
 
 

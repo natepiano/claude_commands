@@ -1,6 +1,8 @@
 """Exercise durable design identity with local stores and a recording mesh transport."""
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import argparse
 import ast
 import io
@@ -85,9 +87,7 @@ class DurableRolesTests(unittest.TestCase):
         self.launches, self.dispatches, self.releases = [], [], []
         self.holder_session, self.lose_creation_ack, self.fail_dispatch = "holder-one", False, False
         config = self.root / "agents.conf"
-        _ = config.write_text("[assignments]\ndesign_roles=codex\n[design_roles.codex]\n" +
-                              "designer=gpt-fixture:xhigh\nreviewer=gpt-review-fixture:high\n" +
-                              "[codex.agents]\ngpt-fixture=xhigh\ngpt-review-fixture=high\n")
+        _ = write_registry(config, {'assignments': {'design_roles': 'codex'}, 'design_roles.codex': {'designer': 'gpt-fixture:xhigh', 'reviewer': 'gpt-review-fixture:high'}, 'codex.agents': {'gpt-fixture': 'xhigh', 'gpt-review-fixture': 'high'}})
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
             "HOME": str(self.root / "home"), "DESIGN_ROLES_STATE": str(self.root / "roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "ownership"), "DESIGN_ROLES_HOST": "natedev",
@@ -262,10 +262,10 @@ class DurableRolesTests(unittest.TestCase):
 
     def test_missing_or_disallowed_configured_model_never_uses_a_fallback(self) -> None:
         config = Path(os.environ["AGENTS_CONFIG_FILE"])
-        for row in ("", "designer=unlisted-model:xhigh", "designer=gpt-fixture:invalid-effort"):
-            with self.subTest(row=row):
-                _ = config.write_text("[assignments]\ndesign_roles=codex\n[design_roles.codex]\n" + row +
-                                      "\n[codex.agents]\ngpt-fixture=xhigh\n")
+        for model in (None, "unlisted-model:xhigh", "gpt-fixture:invalid-effort"):
+            with self.subTest(model=model):
+                _ = write_registry(config, {"design_roles.codex": {"designer": model},
+                                            "codex.agents": {"gpt-fixture": "xhigh"}})
                 with self.assertRaisesRegex(design_roles.RoleRefused, "model configuration"):
                     _ = self.open_designer()
         self.assertEqual(self.launches, [])

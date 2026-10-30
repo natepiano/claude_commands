@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Never, Protocol, cast, final, override
 from unittest.mock import patch
 
-import record
+import shutdown_record
 import remote
 import remote_control
 import restart
@@ -32,13 +32,13 @@ NOW = "2026-10-10T21:00:00+00:00"
 class RetireShutdownSession(Protocol):
     def __call__(
         self,
-        current: record.SessionShutdown,
+        current: shutdown_record.SessionShutdown,
         *,
         dry_run: bool,
     ) -> None: ...
 
 
-def restart_fixture() -> record.SessionShutdown:
+def restart_fixture() -> shutdown_record.SessionShutdown:
     from test_restart import entry, top_level
 
     return entry(top_level("x", name="fixture session"))

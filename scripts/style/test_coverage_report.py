@@ -47,6 +47,21 @@ class SavedReport(TypedDict):
 
 @final
 class CoverageReportTests(unittest.TestCase):
+    def test_undelivered_report_does_not_advance_baseline(self) -> None:
+        rule = self.rule("read")
+        self.sync()
+        _ = self.report()
+        with style_ledger.open_ledger(self.repo) as ledger:
+            snapshot = ledger.database.parent / "last_report.json"
+        before = snapshot.read_bytes()
+        for path in self.sources:
+            self.record(rule, path)
+        with mock.patch("builtins.print", side_effect=InterruptedError("stop before delivery")):
+            with self.assertRaises(InterruptedError):
+                _ = coverage_report.main(["--repo", str(self.repo)])
+        self.assertEqual(snapshot.read_bytes(), before)
+        self.assertIn("1 rule gained", self.report().stdout)
+
     root: Path = Path()
     repo: Path = Path()
     rule_dir: Path = Path()

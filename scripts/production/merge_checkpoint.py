@@ -524,11 +524,41 @@ def allowed(path: str, ownership: tuple[str, ...]) -> bool:
     return any(path == item or path.startswith(item.rstrip("/") + "/") for item in ownership)
 
 
+def _origin_merge_refs(request: MergeRequest) -> list[str]:
+    return list(dict.fromkeys([
+        f"origin/{request.production.merge_branch}",
+        *change_review.reviewed_merge_refs(request.production.checkout, change_review.registered_productions),
+    ]))
+
+
+def _unit_paths(request: MergeRequest, paths: tuple[str, ...]) -> tuple[str, ...]:
+    """Keep paths whose checkpoint content differs from every origin merge base."""
+    if not paths:
+        return ()
+    own = set(paths)
+    for ref in _origin_merge_refs(request):
+        try:
+            base = git(request.production.checkout, "merge-base", ref, request.commit)
+            if base.returncode:
+                continue
+            changed = git(request.production.checkout, "diff", "--name-only", "--no-renames", "-z",
+                          base.stdout.strip(), request.commit, "--", *paths)
+            if changed.returncode:
+                continue
+        except OSError:
+            continue
+        own.intersection_update(changed.stdout.split("\0"))
+    return tuple(path for path in paths if path in own)
+
+
 def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
     staged = good(git(request.production.checkout, "diff", "--cached", "--name-only"), "scope")
     if staged:
         raise Stop("scope", "held", f"staged paths in merge checkout: {staged.replace(chr(10), ', ')}",
                    "the showrunner will clear unrelated staged paths, then rerun the checkpoint")
+    own_paths = _unit_paths(request, paths)
+    imported = len(paths) - len(own_paths)
+    paths = own_paths
     if isinstance(request.kind, ShrinkCommit):
         plan = request.unit.plan.as_posix()
         next_items = str(Path(plan).with_name(Path(plan).stem + "-next.md"))
@@ -550,7 +580,8 @@ def scope(request: MergeRequest, paths: tuple[str, ...]) -> None:
         if unexpected:
             raise Stop("scope", "held", f"outside Owns: {', '.join(unexpected)}",
                        f"explain why these paths changed: {', '.join(unexpected)}")
-    report("scope", "ok", f"{len(paths)} changed paths are allowed")
+    report("scope", "ok", f"{len(paths)} changed paths are allowed"
+           + (f"; {imported} came from origin merge branches" if imported else ""))
 
 
 def hub_paths(lines: tuple[str, ...], unit: str) -> tuple[str, ...]:
@@ -971,6 +1002,8 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
     if request.production.log.exists() and recorded in request.production.log.read_text(encoding="utf-8"):
         report("record", "ok", "checkpoint already recorded")
         return
+    detail = ("review ledger and production log updated" if isinstance(request.kind, CodeCheckpoint)
+              else f"{'shrink' if isinstance(request.kind, ShrinkCommit) else 'as-built'} logged without review-ledger row")
     if isinstance(request.kind, CodeCheckpoint):
         numbers = request.review_trial
         if isinstance(numbers, NoReviewTrial):
@@ -991,13 +1024,14 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
         if result.returncode:
             raise Stop("record", "failed", result.stderr.strip() or result.stdout.strip(),
                        "the showrunner will repair the review record and rerun")
+        if result.stdout.startswith("kept "):
+            detail = result.stdout.strip() + "; " + detail
     request.production.log.parent.mkdir(parents=True, exist_ok=True)
     with request.production.log.open("a", encoding="utf-8") as log:
         suffix = "; promoted" if isinstance(request.promotion, production_doc.PromoteTo) else ""
         _ = log.write(f"- {datetime.now(request.production.zone):%H:%M %Z}: {request.unit.name} phase {request.phase} "
                       + f"({request.commit}) merged as {merge_head}; {tests_green} green; pushed{suffix}\n")
-    report("record", "ok", "review ledger and production log updated" if isinstance(request.kind, CodeCheckpoint)
-           else f"{'shrink' if isinstance(request.kind, ShrinkCommit) else 'as-built'} logged without review-ledger row")
+    report("record", "ok", detail)
 
 
 def end_phase_scratch(request: MergeRequest) -> None:

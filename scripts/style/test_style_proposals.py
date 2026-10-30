@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -147,6 +148,32 @@ class StyleProposalsTests(unittest.TestCase):
 
     def ledger(self) -> style_ledger.Ledger:
         return style_ledger.open_ledger(self.repo)
+
+    def test_rank_source_git_failures_are_not_cached_as_absence(self) -> None:
+        with self.ledger() as ledger:
+            reader = style_proposals.RankExemptions(ledger, self.tip)
+            for code in (errno.EMFILE, errno.ENOENT):
+                with self.subTest(errno=code):
+                    failure = OSError(code, "PRIVATE launch failure")
+                    with mock.patch.object(subprocess, "run", side_effect=failure):
+                        with self.assertRaises(style_ledger.GitReadFailed) as refused:
+                            _ = reader.source("src/missing.rs")
+                    self.assertIs(refused.exception.__cause__, failure)
+                    self.assertEqual(reader.sources, {})
+            self.assertEqual(reader.source("src/missing.rs"), "")
+            self.assertEqual(reader.sources, {"src/missing.rs": ""})
+
+    def test_proposal_blob_git_failures_are_not_absence(self) -> None:
+        with self.ledger() as ledger:
+            reader = style_proposals.GitProposalReader(ledger)
+            for code in (errno.EMFILE, errno.ENOENT):
+                with self.subTest(errno=code):
+                    failure = OSError(code, "PRIVATE launch failure")
+                    with mock.patch.object(subprocess, "run", side_effect=failure):
+                        with self.assertRaises(style_ledger.GitReadFailed) as refused:
+                            _ = reader.blob(self.tip, "src/missing.rs")
+                    self.assertIs(refused.exception.__cause__, failure)
+            self.assertEqual(reader.blob(self.tip, "src/missing.rs"), "")
 
     def git(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True).stdout.strip()
@@ -2176,6 +2203,17 @@ class StyleProposalsTests(unittest.TestCase):
                              + "totals: withdraw 0, kept 0, close 0\n" + f"held for open ticket {ticket}: 1 findings\n")
             self.assertEqual(self.calls, [])
             self.assertEqual(ledger.held_findings(style_ledger.HeldFindingsInState("unfiled")), (finding,))
+
+    def test_issue_examples_define_after_as_the_whole_before_span_replacement(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.hold(ledger)
+            issue, = self.file(ledger)
+        body = issue.read_text()
+        self.assertIn("The After text replaces the whole Before span.", body)
+        self.assertIn("never the old wording with a new line added", body)
+        self.assertIn("Rewrite a comment to name the constructs and keep every reason.", body)
+        self.assertIn("Before:\n```\n" + finding.before + "\n```", body)
+        self.assertIn("After:\n```\n" + finding.after + "\n```", body)
 
     def test_decisions_group_by_rule_and_crate_with_ledger_sites_and_issue_fields(self) -> None:
         with self.ledger() as ledger:

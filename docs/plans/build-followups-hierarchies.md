@@ -174,7 +174,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Ruled out:** ending a named worker of a live director; ending OwnerUnknown before recovery fails; editing `codex_mesh.py` or `end_session.sh` from this unit.
 
 ### Phase 6 — The four-week review: which waits slow Hana, which links helped, and which trial steps stay  · status: todo
-**Depends on:** the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), and four weeks from the experiment start in design doc Step 2: the first day on which each holder producer (builds' `verify.sh`, models-unit's `codex_mesh.py`) has recorded a `NamedHolder`, read live from `progress_history.py waits`. At Phase 10's checkpoint (bece20e1) neither had, and Step 2 says `start not set`; the unit director sets the start and the review date when both have. The phase starts on the latest of these dates, never before.
+**Depends on:** the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), Phase 15's checkpoint (`compare` prints through its `blocks`), and four weeks from the experiment start in design doc Step 2: the first day on which each holder producer (builds' `verify.sh`, models-unit's `codex_mesh.py`) has recorded a `NamedHolder`, read live from `progress_history.py waits`. At Phase 10's checkpoint (bece20e1) neither had, and Step 2 says `start not set`; the unit director sets the start and the review date when both have. The phase starts on the latest of these dates, never before.
 
 #### Work Order
 
@@ -184,7 +184,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Spec:**
 - `measure.py compare --before <Baseline window> --after <the four-week window>`: the same rows for both windows, each with before, after and the change; `not recorded` rows stay `not recorded`. The windows differ in length (7 days and 28 days), so each count row (merges, closures, pushes, waits) prints a rate per week, never a raw total, and the change is between the two rates. A row whose source covers only part of a window prints its covered days beside the rate and is marked partial.
-- Set quota and memory waits beside same-hour non-Hana tokens on the same role account and non-Hana build memory on natedev. If the records show non-Hana work slowing Hana, bring a new proposal (HI10); there is no size threshold. Records show it only when a record names a non-Hana cause for a Hana wait: a `WaitingForSupplier` wait whose record names non-Hana work, or a quota or memory wait whose record, or the slot or hold record that covers the whole wait, names a non-Hana holder of that account, slot or memory. Load in the same hour is context, never proof. A wait with no named cause is reported as cause not recorded, with its minutes and n, and does not count. Report each wait with a named non-Hana cause with its minutes and n. The holder comes from Phase 10's holder history: a wait counts as non-Hana-caused only for the minutes a named non-Hana holder covers; a wait whose holder is named for part of its time reports the named and not-named minutes apart.
+- Set quota and memory waits beside same-hour non-Hana tokens on the same role account and non-Hana build memory on natedev. If the records show non-Hana work slowing Hana, bring a new proposal (HI10); there is no size threshold. Records show it only when a record names a non-Hana cause for a Hana wait: a `WaitingForSupplier` wait whose record names non-Hana work, or a quota or memory wait whose record, or the slot or hold record that covers the whole wait, names a non-Hana holder of that account, slot or memory. Load in the same hour is context, never proof. Holder fixtures: a wait whose holder is `MalformedHolder` for its whole time, and one named for part of its time and then `MalformedHolder`; each keeps its wait count, reports exact named and not-named minutes, and its malformed minutes never count toward non-Hana cause. A wait with no named cause is reported as cause not recorded, with its minutes and n, and does not count. Report each wait with a named non-Hana cause with its minutes and n. The holder comes from Phase 10's holder history: a wait counts as non-Hana-caused only for the minutes a named non-Hana holder covers; a wait whose holder is named for part of its time reports the named and not-named minutes apart.
 - Design doc section **Results**: per step, the measure, its change, keep or drop. The link records (Step 3) set beside Hana merges and closures.
 
 **Files:**
@@ -206,9 +206,9 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - `impl` — `measure.py`, `push_audit.py` and the doc
 - `test` — `test_measure.py` and `test_push_audit.py`: `compare` on fixtures with known before and after values, and the fixtures above
 
-**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2; holder and origin fields from 49fd1b0f) through the Phase 4 loader and types. Phase 11's repair reads origin fields into `RecordedOrigin` / `OriginNotRecorded`; Phase 10 adds the unresolved-origin row and the holder history, and this review keeps that uncertainty visible. From Phase 8: `measure.py baseline` and `push_audit.py report` print a short summary by default and their tables under `--full`; `compare` prints the same way. From Phase 12 (c60f1809): `push_audit.py` classifies a delivery by the exception in force at its delivery time, so a `nate.adhoc` delivery after a failed check from 2026-10-29T03:05:59Z on is `Unapproved` and every other exception stays; the wait share is the union of completed known-kind waits of the Hana phases that finished in the window, divided by those phases' exact intervals, with waits matched by run id and phase instance id; production hand-offs with no phase print as their own row with n, outside the share; the `Hana wait` and `Hana wait holders` coverage rows count the same phase population.
+**Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2; holder and origin fields from 49fd1b0f) through the Phase 4 loader and types. Phase 11's repair reads origin fields into `RecordedOrigin` / `OriginNotRecorded`; Phase 10 adds the unresolved-origin row and the holder history, and this review keeps that uncertainty visible. From Phase 8: `measure.py baseline` and `push_audit.py report` print a short summary by default and their tables under `--full`; `compare` prints the same way. From Phase 12 (c60f1809): `push_audit.py` classifies a delivery by the exception in force at its delivery time, so a `nate.adhoc` delivery after a failed check from 2026-10-29T03:05:59Z on is `Unapproved` and every other exception stays; the wait share is the union of completed known-kind waits of the Hana phases that finished in the window, divided by those phases' exact intervals, with waits matched by run id and phase instance id; production hand-offs with no phase print as their own row with n, outside the share; the `Hana wait` and `Hana wait holders` coverage rows count the same phase population. From Phase 13: `progress_history.py waits` reports a bad holder record as `MalformedHolder` with its reason; `measure.py` reads it as a holder not named and keeps the wait, and a `MalformedHolder` never counts as a named non-Hana holder. From Phase 15: `compare` prints its tables through `log_records.blocks`, so no line is wider than `PHONE_WIDTH` except a line that holds one word longer than it (a path, a hash), which stays whole. From Phase 13: `worker_owners.py end` keeps a pending cleanup record (`end-cleanup.json`) for each worker whose end saved `ended` but whose server cleanup did not finish; `report` counts them as `end_cleanup_pending`, and `end` output and `ends.jsonl` carry each outcome (`end cleanup finished`, `failed: exit N`, `kept: roster unreadable: …`, `dropped: …`). Live cleanup needs models-unit's `codex_mesh.py end --cleanup-only`. From Phase 14 (97aa0200): `update_registration.py answer` keeps an answered record per item in `outstanding/<slug>.answered.jsonl` for 48 hours only; a later answer with the same text replaces the earlier record, a wrap removes the file, and a record holds the answer time but not the time the question was opened. So `pending_attention`'s "no answer history or answered_at" reason is now wrong: rewrite it to say the answer history kept is a 48-hour replay record, and add a fixture where recent answered records exist and the row still reports no 7-day or 28-day answer rate and no answer latency.
 
-**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
+**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. Step 4's keep-or-drop reads `worker_owners.py report` `end_cleanup_pending` and the cleanup outcomes in `ends.jsonl` beside the ownerless-worker count: a worker ended with its cleanup still pending is not released capacity. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
 
 ### Phase 7 — The baseline measure and the push audit count failed checks by one rule, and session names come from config  · status: done
 
@@ -332,3 +332,108 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Binds later work:** the four-week review compares push counts and the wait share by these rules: a `nate.adhoc` delivery after a failed check from 2026-10-29T03:05:59Z on is `Unapproved`, and the share is the per-phase union of completed known-kind waits over exact phase intervals, with hand-offs on their own row.
 
 **Gotchas:** the supplier selects waits by start time and does not copy origin fields to `phase_finished`. This is why the second read and the start-record join exist. Both supplier reads scan the same files, so `ignored_n` and `wait_without_id_n` take the larger value of the two, never the sum.
+
+### Phase 13 — The measure reads a malformed holder as a holder not named, and a worker end whose cleanup failed finishes on the next run  · status: done
+
+#### As-built
+
+- `measure.py` reads the holder states that `progress_history.py waits` reports: `NamedHolder`, `HolderNotNamed` and `MalformedHolder(reason)`. An older `HolderNotNamed` whose reason starts `invalid holder record:` reads as `MalformedHolder`. A malformed holder keeps its wait in the rows, counts as not named in the holder coverage, and never counts as a named non-Hana holder. Before, an unknown holder form made the whole wait row a source problem.
+- `candidate_summary` lists each candidate once with ` (N times)` when it repeats, in the `UncertainCoverage` and attribution Unresolved cells. The reason text before it is the supplier's (`progress_history.py` joins one reason per uncertain wait).
+- `worker_owners.py end` writes a `PendingEndCleanup` record to `end-cleanup.json` in its state folder for each worker end it starts. When `codex_mesh.py end` saved the worker `ended` but its server cleanup failed, `finish_pending_ends` runs on the next `end`: it checks the route (`RouteEnded | RouteGone(reason) | RouteUnreadable(problem)`), runs `codex_mesh.py end --cleanup-only` (timeout 45 s) for an ended route, and records `EndCleanupFinished | EndCleanupFailed(exit) | EndCleanupDropped(reason) | EndCleanupKept(problem)`. A gone route drops the record; an unreadable roster keeps it and calls no cleanup. Each outcome goes to `ends.jsonl` before the journal rewrite. `report` adds `end_cleanup_pending` to its Totals line and JSON.
+
+**Files:**
+- `scripts/hierarchies/measure.py` — holder states, `candidate_summary`
+- `scripts/hierarchies/worker_owners.py` — `PendingEndCleanup`, the route and outcome types, `finish_pending_ends`, `end_workers`, the report count
+- `scripts/hierarchies/test_measure.py`, `scripts/hierarchies/test_worker_owners.py` — real-supplier malformed holder, candidate counts, stop-and-rerun, unreadable roster, log-before-rewrite
+
+**Binds later work:** Phase 6 reads a `MalformedHolder` as not named, never as a named non-Hana holder; a worker ended with its cleanup still pending is not released capacity.
+
+**Gotchas:** `codex_mesh.py end --cleanup-only` is models-unit's and was queued, not shipped, at this checkpoint; until it lands, the cleanup exits 1 and the record stays and is counted. A rerun after a stop between the log append and the journal rewrite logs the outcome twice; that is accepted.
+
+### Phase 13a — The change review check skips commits already on another production's merge branch  · status: done
+
+#### As-built
+
+- `change_review.unit_commits(..., *, productions=registered_productions)` leaves out the commits on `origin/<merge branch>` of every production in the same repository whose doc has a Change review line, beside the unit's own merge branch. `reviewed_merge_refs` matches repositories by their resolved `git rev-parse --git-common-dir`, so a checkout in a worktree matches its repository. A doc that cannot be read, lacks a field or names a repository missing here is skipped on its own; its commits stay checked. A failure to read the checkout or the registry keeps the own-branch-only check.
+- `merge_checkpoint.py` and `merge_gate.py` get it through `unit_commits`, unchanged.
+
+**Files:**
+- `scripts/production/change_review.py` — `registered_productions`, `reviewed_merge_refs`, `unit_commits`
+- `scripts/production/test_change_review.py`, `scripts/production/test_merge_checkpoint.py` — imported production branch, linked worktree, missing repository, incomplete doc, no Change review line, rerun of a held merge
+
+**Gotchas:** the default reads `showrunners.timer_docs()`, so a production with no registered timer is not known and its commits stay checked.
+
+### Phase 13b — The scope check leaves out paths that came from an origin merge branch  · status: done
+
+#### As-built
+
+- The scope check in `merge_checkpoint.py` holds only the unit's own outside paths. `_origin_merge_refs` gives `origin/<merge branch>`, then every `change_review.reviewed_merge_refs` branch, without duplicates. This is the same list `unit_commits` uses.
+- `_unit_paths` leaves out a path when its content at the checkpoint equals its content at the merge base with one of those refs. A ref with no merge base, or a git failure for one ref, leaves out nothing for that ref. A branch whose production doc has no Change review line stays checked.
+- The filter runs before the kind rules, so code, shrink and as-built commits all use it. A path the unit changed after the merge stays its own and is held. `--also` still lets a named path through.
+- The `scope` ok line adds `; <M> came from origin merge branches` when M > 0. `other_units` keeps the full list.
+
+**Files:**
+- `scripts/production/merge_checkpoint.py` — `_origin_merge_refs`, `_unit_paths`, the scope filter and the ok line count.
+- `scripts/production/test_merge_checkpoint.py` — five tests: a rerun of a held merge of another production's branch passes; an own outside path is held and `--also` passes it; a path changed after the merge is held; an own-origin path is left out; a branch with no Change review line stays checked.
+
+**Gotchas:** One `git diff --no-renames -z` runs per ref. `--no-renames` keeps a rename from hiding a path, and `-z` lets odd file names parse.
+
+### Phase 14 — The change review list and the open-question list survive a stopped write, and a rerun of verdict or answer finishes its work  · status: done
+
+#### As-built
+
+- `atomic_file.replace_text(path: Path, text: str) -> None` writes `.<path.name>.<pid>.tmp` in `path.parent`, fsyncs it, keeps the mode of the existing file (0o644 when new), and `os.replace`s it onto `path`. On an exception it removes its own temporary file and raises again. Before each write it removes temporary files whose pid is not a live process. The name matches no reader glob. Older private copies (`style_plan.atomic_write`, `review_pause.write_record`, `worker_owners.write_json`, `scratch.write_holds`) stay.
+- `change_review._edit` writes through `replace_text` under the directory lock. When `write` changes no line, it writes nothing and stamps no date; it commits only a list that an earlier stopped run left uncommitted.
+- The Reviewed table has a `Merged` column; a new Reviewed row keeps the To review row's Merged cell, and older rows have an empty cell. `record_verdict` returns `VerdictRecorded | VerdictAlreadyRecorded | VerdictConflict` (frozen dataclasses); `merged` is `RecordedMerge(text) | MergeNotRecorded()`. A same-words rerun on a Reviewed row prints `already has this verdict (<day>)`, the first run's line, and the `end_row_scratch` lines, exit 0. Other words print the recorded verdict on stderr, still end the row's scratch, exit 1. A row in neither table is refused.
+- `update_registration.py` writes the list, the history and the reports file whole through `replace_text`; `append_log` stays an append. `record_question_history` adds no second registration for retained text and question.
+- `answer`, under the list's lock, writes `outstanding/<slug>.answered.jsonl` (`AnsweredItem`: `time`, `slug`, `text`, `question?`, `asked_by?`; 48 hours; a new record for the same text replaces the older one), then removes the item, then prints the relay line after the lock. `asked_by` becomes `UnitAsker | ShowrunnerAsker | AskerNotRecorded` at the JSON boundary; one `relay_line(production, slug, asker)` makes the line, and a below-production line reads the showrunner name from `config/names.toml`. Match order: exact open, exact answered, partial open, partial answered. An answered match prints `already answered <%a %b %d %H:%M>` and the relay line, exit 0.
+- `scratch.remove` keeps `.scratch-removing-<name>.json` beside the folder until the folder is gone; `folders()` and `task_of` read it, so verdict cleanup finds a folder whose removal stopped.
+
+**Files:**
+- `scripts/lib/atomic_file.py` — `replace_text`
+- `scripts/lib/scratch.py` — removal record beside the folder
+- `scripts/production/change_review.py` — `_edit`, Reviewed `Merged` column, `record_verdict` result types, `verdict` output
+- `scripts/production/update_registration.py` — atomic writes, `AnsweredItem`, asker union, `relay_line`, `answer` replay
+- `scripts/production/tidy_wrapped.py` — `outstanding_path`; `owned_paths` includes `<slug>.answered.jsonl`
+- `scripts/production/rename_state.py` — `rename_outstanding` takes the list path from `tidy_wrapped.outstanding_path`
+- `commands/change_review.md` — verdict rerun, conflict and Merged cell
+- tests beside each script (`test_atomic_file`, `test_scratch`, `test_change_review`, `test_update_registration_answers`, `test_update_registration_questions`, `test_tidy_wrapped`, `test_rename_state`)
+
+**Binds later work:** `outstanding/<slug>.answered.jsonl` is a 48-hour replay record for `answer`, not answer history; the four-week review must not read it as history.
+
+**Gotchas:**
+- Callers index `tidy_wrapped.owned_paths` by position; take the list path from `outstanding_path`, never an index.
+- `roles_audit` refuses a fixed role display name in printed text; read shown names from `config/names.toml`.
+- A production or unit rename leaves `<slug>.answered.jsonl` under the old slug, so a rerun after a rename refuses.
+
+**Ruled out:** answer replay across a rename in this plan — rare, and the refusal is safe; it is a next item.
+
+### Phase 15 — The push audit report and the full baseline measure read on a phone  · status: done
+
+#### As-built
+
+- `log_records.py` holds `PHONE_WIDTH = 50`, the one place the width is set, and `blocks(title: str, rows: Sequence[MeasureRow]) -> str`. `table` is gone. Output: the wrapped title; then `Window: …` and `Source: …` once when every row shares that field; then one block per row, a blank line between blocks: the measure name, then `  value: …`, `  n: …`, `  window: …`, `  source: …` for the fields that differ. No rows prints the title and `none`.
+- One wrap helper wraps every line at spaces to `PHONE_WIDTH`. A continued line is indented four spaces under its field. A word that fits the width but not beside the indent prints alone without the indent; a word longer than the width is never split and stands alone.
+- `measure.flow_table` is gone; the flow rows print through `blocks`. The summary lines of both commands and the note line in `push_audit.render` wrap the same way. `--json` does not change; there is no `--wide`.
+- Live on 2026-10-30: `push_audit.py report --full` and `measure.py baseline --full` print 0 lines over 50 characters that hold more than one word.
+
+**Files:**
+- `scripts/hierarchies/log_records.py` — `PHONE_WIDTH`, `blocks`, the wrap helper.
+- `scripts/hierarchies/measure.py`, `scripts/hierarchies/push_audit.py` — `render` and the summaries call `blocks` and the wrap helper.
+- `scripts/hierarchies/test_log_records.py` (new) — the one shared test parser: `read_report_blocks`, `displayed_fields`, `summary_lines(output, prefixes)`, `phone_overflow_lines`; tests for `blocks`, word lengths 46 to 50 beside the indent included.
+- `scripts/hierarchies/test_measure.py`, `scripts/hierarchies/test_push_audit.py` — 24 tests read blocks instead of padded columns and keep the same values, counts, windows and sources (24 `Assertion-Change:` lines in ff9c92a5).
+
+**Gotchas:** a test that searches the output for a cell's text must search for words, because a cell can wrap. Read rows with `read_report_blocks`; never write a second parser in a test file.
+
+### Phase 16 — A second merge of the same phase keeps its review row, and the record step reports ok  · status: done
+
+#### As-built
+
+- `review_regime.add`: when a row with the same `(unit, plan, phase)` exists, it writes nothing, prints `kept <unit> phase <N> of <plan>: a row exists from the merge at <existing merged>; nothing added` and returns (exit 0). The first row is the one the regime trial counts. The UTC-offset and `--merged` before `--started` refusals stay. A planless old row still matches no row that has a plan.
+- `merge_checkpoint.record`: when `add` prints a `kept …` line, the `record: ok` detail starts with it, then `; review ledger and production log updated`. The production log line is written for the second merge as for any merge. A non-zero `add` still stops with `record: failed`; the "checkpoint already recorded" check is unchanged.
+
+**Files:**
+- `scripts/production/review_regime.py`, `scripts/production/merge_checkpoint.py`.
+- `scripts/production/test_review_regime.py` — a second add keeps the first row byte for byte and exits 0 (was `test_the_same_unit_plan_and_phase_is_refused`).
+- `scripts/production/test_merge_checkpoint_history.py` — a merge, then a repair merge of the same phase with the real `review_regime.py` and a test `HOME`: `record: ok` with the kept line, one ledger row, two log lines; a rerun prints "checkpoint already recorded".
+- `scripts/production/test_merge_checkpoint.py` — a failing add after a first merge stops record and keeps the first log line; a retry records the repair once.

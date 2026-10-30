@@ -11,12 +11,21 @@ import unittest
 import json
 import io
 import os
-import re
 import subprocess
 from unittest.mock import patch
 
 from scripts.hierarchies import measure as m, log_records, push_audit as audit
+from scripts.hierarchies.test_log_records import phone_overflow_lines, read_report_blocks, summary_lines
+from scripts.lib.user_zone import user_zone
 from scripts.production.issues import Issue
+
+
+def row_cells(output: str) -> dict[str, list[str]]:
+    return {row.measure: [row.measure, row.value, str(row.n), row.window, row.source]
+            for row in read_report_blocks(output)}
+
+
+BASELINE_SUMMARY_PREFIXES = ("Window:", "Hana:", "Goal 1:", "User attention:", "Source problems:")
 
 
 def push_fixture(at: datetime, title: str, outcome: str = "sent") -> log_records.JsonObject:
@@ -728,7 +737,7 @@ class WaitRecordsTest(unittest.TestCase):
                 history = m.read_source(str(external), lambda: m.read_wait_history(root, self.window, problems, (), ()),
                                         m.HistoryNotRecorded(), problems)
                 self.assertIsInstance(history, m.HanaWaitHistory)
-                output = log_records.table("Wait rows", m.hana_wait_rows(history, self.window, ()))
+                output = log_records.blocks("Wait rows", m.hana_wait_rows(history, self.window, ()))
                 self.assertIn("source problem", output)
                 self.assertIn("wait_id", output)
                 rows = {row.measure: row for row in m.hana_wait_rows(history, self.window, ())}
@@ -857,7 +866,7 @@ class WaitRecordsTest(unittest.TestCase):
             phases.append(phase)
         history = m.parse_wait_report(wait_report_fixture(self.window, [], phases, [missing]))
         rows = m.hana_wait_rows(history, self.window, ())
-        output = log_records.table("Wait fixtures", rows)
+        output = log_records.blocks("Wait fixtures", rows)
         self.assertIn("coverage / UncertainCoverage", output)
         self.assertIn("attribution_miss_n", output)
         self.assertIn(reason, output)
@@ -873,6 +882,27 @@ class WaitRecordsTest(unittest.TestCase):
         self.assertEqual([(row.value, row.n) for row in rows if row.measure == "Hana wait / coverage / attribution_miss_n"], [("1", 1)])
         self.assertTrue(all(isinstance(phase.state, m.UncertainWaitCoverage) for phase in history.phases))
         self.assertNotIn("wait_n=0", output)
+
+    def test_candidate_cells_count_distinct_notes_in_first_seen_order(self) -> None:
+        first: log_records.JsonObject = {"run_id": "hana-run", "phase_id": "4", "phase_instance_id": "hana-phase"}
+        second: log_records.JsonObject = {"run_id": "hana-run", "phase_id": "5", "phase_instance_id": "hana-next"}
+        first_label = "run=hana-run; phase=4; instance=hana-phase; cwd="
+        second_label = "run=hana-run; phase=5; instance=hana-next; cwd="
+        for candidates, expected in (([first] * 6, first_label + " (6 times)"),
+                                     ([first, second, first], first_label + " (2 times) | " + second_label)):
+            with self.subTest(expected=expected):
+                phase = wait_phase_fixture("UncertainCoverage")
+                phase.update(reason="ambiguous coverage", candidates=candidates, recorded_wait_n=0)
+                missing = wait_fixture("ambiguous-candidates", "WaitingForUser", self.start)
+                missing["wait_attribution"] = {"state": "UnresolvedAttribution", "reason": "ambiguous attribution",
+                                                "candidates": candidates}
+                history = m.parse_wait_report(wait_report_fixture(self.window, [missing], [phase]))
+                rows = m.hana_wait_rows(history, self.window, ())
+                for label, reason in (("Hana wait coverage / UncertainCoverage", "ambiguous coverage"),
+                                      ("Hana wait attribution / Unresolved", "ambiguous attribution")):
+                    cells = [row for row in rows if row.measure == label]
+                    self.assertEqual([(row.value, row.n) for row in cells],
+                                     [(reason + "; candidates: " + expected, 1)])
 
     def test_completed_wait_with_unresolved_supplier_adds_no_hana_minutes(self) -> None:
         reason = "supplier address is not recorded"
@@ -897,7 +927,7 @@ class WaitRecordsTest(unittest.TestCase):
         self.assertIn("not recorded", rows["Hana wait / WaitingForUser"].value)
         self.assertEqual((rows["Hana wait / coverage / attribution_miss_n"].value,
                           rows["Hana wait / coverage / attribution_miss_n"].n), ("1", 1))
-        output = log_records.table("Wait fixtures", list(rows.values()))
+        output = log_records.blocks("Wait fixtures", list(rows.values()))
         self.assertIn(reason, output)
         self.assertIn("instance=hana-phase", output)
 
@@ -938,7 +968,7 @@ class WaitRecordsTest(unittest.TestCase):
         rows = {row.measure: row for row in m.hana_wait_rows(history, self.window, ())}
         self.assertEqual((rows["Hana wait / WaitingForMergeGate"].value,
                           rows["Hana wait / WaitingForMergeGate"].n), ("7.0 min", 1))
-        output = log_records.table("Wait fixtures", list(rows.values()))
+        output = log_records.blocks("Wait fixtures", list(rows.values()))
         self.assertEqual((rows["Hana wait / production handoff"].value,
                           rows["Hana wait / production handoff"].n), ("no phase; owner=hana-director", 1))
         self.assertIn("handoff", output)
@@ -1088,7 +1118,7 @@ class WaitRecordsTest(unittest.TestCase):
             self.assertIsInstance(history, m.HistoryNotRecorded)
             self.assertEqual(len(problems), 1)
             self.assertIn("invalid JSON or field rows", problems[0].reason)
-            self.assertIn("source unavailable", log_records.table(
+            self.assertIn("source unavailable", log_records.blocks(
                 "Source problems", log_records.source_problem_rows(problems, self.window)))
             self.assertEqual(external.read_bytes(), before)
 
@@ -1131,7 +1161,7 @@ class WaitRecordsTest(unittest.TestCase):
                 rows = {row.measure: row for row in m.hana_wait_rows(history, self.window, ())}
                 self.assertEqual((rows["Hana wait / WaitingForUser"].value,
                                   rows["Hana wait / WaitingForUser"].n), ("2.0 min (partial)", 1))
-                output = log_records.table("Wait rows", list(rows.values()))
+                output = log_records.blocks("Wait rows", list(rows.values()))
                 self.assertIn(identity, output)
                 self.assertIn(reason, output)
                 self.assertTrue(history.problems)
@@ -1148,6 +1178,64 @@ class HolderHistoryTest(unittest.TestCase):
             self.assertEqual(m.main(["baseline", "--full", "--since", self.start.isoformat(),
                                      "--until", self.window.until.isoformat()]), 0)
         return captured.getvalue()
+
+    def test_named_then_malformed_holder_keeps_partial_holder_coverage_and_phase_minutes(self) -> None:
+        wait = wait_fixture("holder-became-malformed", "WaitingForMemoryOrSlot", self.start, 10)
+        wait["holders"] = [holder_observation(self.start, named_holder_fixture()), holder_observation(
+            self.start + timedelta(minutes=4), {"state": "MalformedHolder", "reason": "holder schema changed",
+                                               "raw_value": {"private-resource": "never-print-this"}})]
+        history = m.parse_wait_report(wait_report_fixture(self.window, [wait], [wait_phase_fixture(wait_n=1)]))
+        self.assertEqual(history.problems, ())
+        self.assertEqual(m.holder_coverage(history.waits[0]), m.HolderCoverage.PART)
+        event = m.PhaseCompletion("holder-phase-finished", self.start + timedelta(minutes=10), True, 600,
+                                  phase=m.WaitPhaseInstance("hana-run", "hana-phase"), started=self.start)
+        rows = m.phase_flow([event], self.window, history)
+        by_name = {row.measure: row for row in rows}
+        for label, expected in (("Hana wait / WaitingForMemoryOrSlot", "10.0 min"),
+                                ("Hana wait holders / WaitingForMemoryOrSlot / part of wait", "10.0 min"),
+                                ("Hana wait / share of phase time with a recorded kind", "100.0%")):
+            self.assertEqual((by_name[label].value, by_name[label].n), (expected, 1))
+        details = [row for row in rows if row.measure == "Hana wait holder / holder-became-malformed"]
+        self.assertEqual(len(details), 2)
+        self.assertIn("MalformedHolder: holder schema changed", details[1].value)
+        self.assertIn("6.0 min", details[1].value)
+        self.assertFalse(any("coverage / source_problem_n" in row.measure for row in rows))
+        output = log_records.blocks("Flow to Hana main", rows)
+        for raw in ("private-resource", "never-print-this", "raw_value"):
+            self.assertNotIn(raw, output)
+
+    def test_legacy_invalid_holder_reason_becomes_malformed_without_a_source_problem(self) -> None:
+        wait = wait_fixture("legacy-holder", "WaitingForUser", self.start, 3)
+        wait["holders"] = [holder_observation(
+            self.start, {"state": "HolderNotNamed", "reason": "invalid holder record: x"})]
+        history = m.parse_wait_report(wait_report_fixture(self.window, [wait], [wait_phase_fixture(wait_n=1)]))
+        self.assertEqual(history.problems, ())
+        self.assertEqual(history.waits[0].holders.observations[0].holder, m.MalformedHolder("invalid holder record: x"))
+        rows = {row.measure: row for row in m.holder_rows(history, self.window, ())}
+        row = rows["Hana wait holders unnamed / WaitingForUser / MalformedHolder: invalid holder record: x"]
+        self.assertEqual((row.value, row.n), ("3.0 min", 1))
+
+    def test_malformed_holder_invalid_metadata_rejects_only_its_wait(self) -> None:
+        invalid_records: tuple[log_records.JsonObject, ...] = (
+            {"state": "MalformedHolder", "reason": "invalid holder", "unknown": "never-print-this"},
+            {"state": "MalformedHolder", "reason": "   ", "raw_value": "never-print-this"},
+        )
+        for fields in invalid_records:
+            with self.subTest(fields=fields):
+                valid = wait_fixture("valid", "WaitingForUser", self.start, 2)
+                broken = wait_fixture("bad-malformed-holder", "WaitingForUser", self.start, 90)
+                broken["holders"] = [holder_observation(self.start, fields)]
+                history = m.parse_wait_report(wait_report_fixture(self.window, [valid, broken], [wait_phase_fixture(wait_n=2)]))
+                self.assertEqual([wait.identity for wait in history.waits], ["valid"])
+                self.assertEqual(len(history.problems), 1)
+                rows = {row.measure: row for row in m.hana_wait_rows(history, self.window, ())}
+                self.assertEqual((rows["Hana wait / WaitingForUser"].value, rows["Hana wait / WaitingForUser"].n),
+                                 ("2.0 min (partial)", 1))
+                self.assertEqual((rows["Hana wait / coverage / source_problem_n"].value,
+                                  rows["Hana wait / coverage / source_problem_n"].n), ("1", 1))
+                output = log_records.blocks("Flow to Hana main", list(rows.values()))
+                self.assertIn("bad-malformed-holder", output)
+                self.assertNotIn("never-print-this", output)
 
     def test_full_cli_coverage_counts_are_separate_and_values_fit_a_phone(self) -> None:
         named = wait_fixture("named", "WaitingForMemoryOrSlot", self.start, 4)
@@ -1177,8 +1265,7 @@ class HolderHistoryTest(unittest.TestCase):
         history = m.parse_wait_report(wait_report_fixture(
             self.window, [named, missing_kind, unresolved, broken], phases))
         output = self.full_output(history)
-        rows = [re.split(r"\s{2,}", line) for line in output.splitlines()
-                if len(re.split(r"\s{2,}", line)) == 5]
+        rows = [[row.measure, row.value, str(row.n), row.window, row.source] for row in read_report_blocks(output)]
         expected = {"HistoryNotRecorded": 2, "UncertainCoverage": 1, "WaitKindNotRecorded": 1,
                     "attribution_miss_n": 1, "source_problem_n": 1, "unresolved_origin_n": 1}
         for table in ("Hana wait", "Hana wait holders"):
@@ -1189,7 +1276,7 @@ class HolderHistoryTest(unittest.TestCase):
         values = [cells[1] for cells in rows if cells[0].startswith(("Hana wait /", "Hana wait holders /",
                                                                                 "Hana wait holders unnamed /"))]
         self.assertTrue(values)
-        self.assertTrue(all(len(value) <= 60 for value in values), values)
+        self.assertTrue(all(len(value) <= log_records.PHONE_WIDTH for value in values), values)
         self.assertTrue(all("partial coverage" not in value for value in values), values)
         by_label = {cells[0]: cells for cells in rows}
         self.assertEqual(by_label["Hana wait / WaitingForMemoryOrSlot"][1:3], ["4.0 min (partial)", "1"])
@@ -1197,13 +1284,8 @@ class HolderHistoryTest(unittest.TestCase):
                          ["4.0 min (partial)", "1"])
         self.assertEqual(by_label["Hana wait / WaitingForSupplier"][1], "not recorded (HistoryNotRecorded)")
 
-        flow = output.split("Flow to Hana main (recorded phase/issue completion; local-ref merge commits)\n", 1)[1].split("\n\n", 1)[0]
-        lines = flow.splitlines()
-        columns = [match.start() for match in re.finditer(r"\S+", lines[0])]
-        self.assertEqual(len(columns), 5)
-        displayed_values = [line[columns[1]:columns[2]].strip() for line in lines[1:]]
-        self.assertTrue(all(len(value) <= 60 for value in displayed_values), displayed_values)
-        retained = "".join(displayed_values).replace(" ", "")
+        self.assertEqual(phone_overflow_lines(output), [])
+        retained = "".join(row.value for row in read_report_blocks(output)).replace(" ", "")
         for evidence in (missing_reason, candidate_path, "candidate-run", "candidate-phase"):
             self.assertIn(evidence.replace(" ", ""), retained)
 
@@ -1224,8 +1306,7 @@ class HolderHistoryTest(unittest.TestCase):
             self.assertIn("invalid-identity", history.problems[0].source)
             self.assertIn("run_id", history.problems[0].reason)
         output = self.full_output(history)
-        rows = {cells[0]: cells for line in output.splitlines()
-                if len(cells := re.split(r"\s{2,}", line)) == 5}
+        rows = row_cells(output)
         self.assertEqual(rows["Hana wait / WaitingForUser"][1], "2.0 min (partial)")
         self.assertEqual(rows["Hana wait / WaitingForUser"][2], "1")
         self.assertIn("invalid-identity", output)
@@ -1239,17 +1320,21 @@ class HolderHistoryTest(unittest.TestCase):
         history = m.parse_wait_report(wait_report_fixture(
             self.window, [wait], [wait_phase_fixture(wait_n=1), missing]))
         output = self.full_output(history)
-        holder_lines = [line for line in output.splitlines() if line.startswith("Hana wait holders /")]
-        self.assertTrue(all("partial coverage" not in line for line in holder_lines))
-        coverage = [line for line in holder_lines if line.startswith("Hana wait holders / coverage /")]
+        holder_rows = [row for row in read_report_blocks(output) if row.measure.startswith("Hana wait holders /")]
+        self.assertNotIn("partial coverage", repr(holder_rows))
+        coverage = [row for row in holder_rows if row.measure.startswith("Hana wait holders / coverage /")]
         self.assertEqual(len(coverage), 1)
-        self.assertEqual(re.split(r"\s{2,}", coverage[0])[:3],
-                         ["Hana wait holders / coverage / HistoryNotRecorded", "1", "1"])
-        totals = [line for line in holder_lines if not line.startswith("Hana wait holders / coverage /")]
+        self.assertEqual((coverage[0].measure, coverage[0].value, coverage[0].n),
+                         ("Hana wait holders / coverage / HistoryNotRecorded", "1", 1))
+        totals = [row for row in holder_rows if not row.measure.startswith("Hana wait holders / coverage /")]
         self.assertEqual(len(totals), 18)
-        self.assertTrue(all("partial coverage" not in line for line in totals))
-        named = next(line for line in totals if "WaitingForMemoryOrSlot / whole wait" in line)
-        self.assertEqual(re.split(r"\s{2,}", named)[1:3], ["3.0 min (partial)", "1"])
+        self.assertNotIn("partial coverage", repr(totals))
+        self.assertTrue(all(row.window == self.window.label for row in holder_rows))
+        self.assertEqual(coverage[0].source, "progress_history.py waits; incomplete coverage counts")
+        self.assertTrue(all(row.source == "progress_history.py waits holders; total completed wait minutes by holder coverage; unknown ends excluded"
+                            for row in totals))
+        named = next(row for row in totals if "WaitingForMemoryOrSlot / whole wait" in row.measure)
+        self.assertEqual((named.value, named.n), ("3.0 min (partial)", 1))
 
     def test_full_holder_totals_separate_completed_waits_from_open_waits(self) -> None:
         completed = [wait_fixture("finished-four", "WaitingForUser", self.start, 4),
@@ -1259,8 +1344,7 @@ class HolderHistoryTest(unittest.TestCase):
         history = m.parse_wait_report(wait_report_fixture(
             self.window, [*completed, opened], [wait_phase_fixture(wait_n=3)]))
         output = self.full_output(history)
-        rows = {cells[0]: cells for line in output.splitlines()
-                if len(cells := re.split(r"\s{2,}", line)) == 5}
+        rows = row_cells(output)
         label = "Hana wait holders / WaitingForUser / HolderNotNamed"
         self.assertEqual(rows[label][1:3], ["10.0 min; 2 done; 1 open, duration unknown", "3"])
         self.assertNotIn("100.0 min", output)
@@ -1289,8 +1373,8 @@ class HolderHistoryTest(unittest.TestCase):
         waits.extend([changed, named])
         output = self.full_output(m.parse_wait_report(wait_report_fixture(
             self.window, waits, [wait_phase_fixture(wait_n=6)])))
-        groups = [re.split(r"\s{2,}", line) for line in output.splitlines()
-                  if line.startswith("Hana wait holders unnamed /")]
+        groups = [[row.measure, row.value, str(row.n), row.window, row.source] for row in read_report_blocks(output)
+                  if row.measure.startswith("Hana wait holders unnamed /")]
         self.assertEqual(len(groups), 3)
         self.assertEqual({cells[0]: cells[1:3] for cells in groups}, {
             "Hana wait holders unnamed / WaitingForUser / producer named no holder": ["5.0 min", "2"],
@@ -1299,12 +1383,13 @@ class HolderHistoryTest(unittest.TestCase):
         })
         for identity in ("unnamed-first", "unnamed-repeat", "unnamed-old", "unnamed-other-kind"):
             self.assertNotIn(identity, output)
-        details = [line for line in output.splitlines() if line.startswith("Hana wait holder /")]
+        details = [row for row in read_report_blocks(output) if row.measure.startswith("Hana wait holder /")]
         self.assertEqual(len(details), 3)
-        self.assertEqual(sum("changed-unnamed" in line for line in details), 2)
+        self.assertEqual(sum("changed-unnamed" in row.measure for row in details), 2)
         self.assertIn("initial holder absent", output)
         self.assertIn("later holder absent", output)
-        self.assertTrue(any("named-detail" in line and "session:other-project-director" in line for line in details))
+        self.assertTrue(any("named-detail" in row.measure and "session:other-project-director" in row.value
+                            for row in details))
 
     def test_each_kind_counts_whole_partial_and_unnamed_holder_waits(self) -> None:
         waits: list[log_records.JsonObject] = []
@@ -1347,7 +1432,7 @@ class HolderHistoryTest(unittest.TestCase):
             self.assertIn(text, details[0].value)
         for text in ("unit:other-unit", "00:04:00", "00:10:00", "6.0 min"):
             self.assertIn(text, details[1].value)
-        output = log_records.table("Holders", details)
+        output = log_records.blocks("Holders", details)
         for text in ("slot", "natedev/slot-1", "session:other-project-director", "memory", "natedev/ram",
                      "unit:other-unit", "00:00:00", "00:04:00", "00:10:00"):
             self.assertIn(text, output)
@@ -1389,7 +1474,7 @@ class HolderHistoryTest(unittest.TestCase):
         rows = m.holder_rows(history, self.window, completions=())
         total = next(row for row in rows if row.measure.endswith("WaitingForQuotaRefusal / HolderNotNamed"))
         self.assertEqual((total.value, total.n), ("6.0 min", 3))
-        output = log_records.table("Holders", rows)
+        output = log_records.blocks("Holders", rows)
         self.assertIn("recorded before holders", output)
         self.assertIn("producer named no holder", output)
 
@@ -1440,7 +1525,7 @@ class HolderHistoryTest(unittest.TestCase):
         self.assertEqual(len(history.unresolved_origins), 1)
         self.assertIsInstance(history.unresolved_origins[0], m.UnresolvedPhaseOrigin)
         rows = m.hana_wait_rows(history, self.window, ())
-        output = log_records.table("Waits", rows)
+        output = log_records.blocks("Waits", rows)
         for text in ("UnresolvedPhaseOrigin", "lost-run", "lost-phase", "was not saved", "retired-run", "retired-phase"):
             self.assertIn(text, output)
         valid = next(row for row in rows if row.measure == "Hana wait / WaitingForUser")
@@ -1471,38 +1556,59 @@ class HolderHistoryTest(unittest.TestCase):
                 rows = m.hana_wait_rows(history, self.window, ())
                 total = next(row for row in rows if row.measure == "Hana wait / WaitingForUser")
                 self.assertEqual((total.value, total.n), ("2.0 min (partial)", 1))
-                output = log_records.table("Waits", rows)
+                output = log_records.blocks("Waits", rows)
                 self.assertIn("source problem", output)
                 self.assertIn("bad-origin" if defect == "origin" else "bad-holder", output)
 
     def test_real_supplier_invalid_holder_is_named_without_losing_other_waits(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            runs = root / "runs"
-            runs.mkdir()
-            good = wait_fixture("valid", "WaitingForUser", self.start, 2)
-            bad = wait_fixture("bad-holder", "WaitingForMemoryOrSlot", self.start, 90)
-            opened = {**bad, "event_type": "wait_started", "event_id": "bad-holder-start",
-                      "timestamp": self.start.isoformat(), "timestamp_epoch": self.start.timestamp(),
-                      "holder": {"state": "NamedHolder", "resource_kind": "disk", "resource": "disk-1",
-                                 "holder": {"state": "SessionHolder", "session_id": "other"}}}
-            path = runs / "hana-run.jsonl"
-            self.assertGreater(path.write_text("\n".join(json.dumps(event) for event in (
-                WaitRecordsTest().phase_started(), good, opened, bad)) + "\n"), 0)
-            before = path.read_bytes()
-            problems: list[log_records.SourceProblem] = []
-            history = m.read_wait_history(root, self.window, problems, (), ())
-            self.assertIsInstance(history, m.HanaWaitHistory)
-            if isinstance(history, m.HanaWaitHistory):
-                self.assertEqual([wait.identity for wait in history.waits], ["valid"])
-            self.assertTrue(problems)
-            output = log_records.table("Waits", m.hana_wait_rows(history, self.window, ()))
-            self.assertIn("source problem", output)
-            self.assertIn("bad-holder", output)
-            rows = {row.measure: row for row in m.hana_wait_rows(history, self.window, ())}
-            self.assertEqual((rows["Hana wait / WaitingForUser"].value,
-                              rows["Hana wait / WaitingForUser"].n), ("2.0 min (partial)", 1))
-            self.assertEqual(path.read_bytes(), before)
+        invalid_object: log_records.JsonObject = {
+            "state": "NamedHolder", "resource_kind": "disk", "resource": "disk-1",
+            "holder": {"state": "SessionHolder", "session_id": "other"},
+        }
+        for holder in (invalid_object, "slot-7"):
+            with self.subTest(holder=holder), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                runs = root / "runs"
+                runs.mkdir()
+                good = wait_fixture("valid", "WaitingForUser", self.start, 2)
+                bad = wait_fixture("bad-holder", "WaitingForMemoryOrSlot", self.start, 90)
+                opened: log_records.JsonObject = {
+                    **bad, "event_type": "wait_started", "event_id": "bad-holder-start",
+                    "timestamp": self.start.isoformat(), "timestamp_epoch": self.start.timestamp(), "holder": holder,
+                }
+                path = runs / "hana-run.jsonl"
+                self.assertGreater(path.write_text("\n".join(json.dumps(event) for event in (
+                    WaitRecordsTest().phase_started(), good, opened, bad)) + "\n"), 0)
+                before = path.read_bytes()
+                problems: list[log_records.SourceProblem] = []
+                history = m.read_wait_history(root, self.window, problems, (), ())
+                self.assertIsInstance(history, m.HanaWaitHistory)
+                if isinstance(history, m.HanaWaitHistory):
+                    self.assertEqual({wait.identity for wait in history.waits}, {"valid", "bad-holder"})
+                    malformed = next(wait for wait in history.waits if wait.identity == "bad-holder")
+                    self.assertIsInstance(malformed.holders.observations[0].holder, m.MalformedHolder)
+                    self.assertEqual(history.problems, ())
+                self.assertEqual(problems, [])
+                rows = m.phase_flow([], self.window, history)
+                by_name = {row.measure: row for row in rows}
+                for label, minutes in (("Hana wait / WaitingForUser", "2.0 min"),
+                                       ("Hana wait / WaitingForMemoryOrSlot", "90.0 min"),
+                                       ("Hana wait holders / WaitingForMemoryOrSlot / HolderNotNamed", "90.0 min")):
+                    self.assertEqual((by_name[label].value, by_name[label].n), (minutes, 1))
+                groups = [row for row in rows if row.measure.startswith(
+                    "Hana wait holders unnamed / WaitingForMemoryOrSlot / MalformedHolder: ")]
+                self.assertEqual(len(groups), 1)
+                self.assertEqual((groups[0].value, groups[0].n), ("90.0 min", 1))
+                if isinstance(holder, str):
+                    self.assertEqual(groups[0].measure,
+                                     "Hana wait holders unnamed / WaitingForMemoryOrSlot / MalformedHolder: holder must be an object")
+                else:
+                    self.assertIn("invalid holder record:", groups[0].measure)
+                output = log_records.blocks("Flow to Hana main", rows)
+                self.assertNotIn("source problem", output)
+                for raw in ("disk-1", "other", "slot-7", "raw_value"):
+                    self.assertNotIn(raw, output)
+                self.assertEqual(path.read_bytes(), before)
 
     def test_missing_id_count_is_a_problem_beside_valid_waits(self) -> None:
         wait = wait_fixture("valid", "WaitingForUser", self.start, 2)
@@ -1513,10 +1619,10 @@ class HolderHistoryTest(unittest.TestCase):
         total = next(row for row in rows if row.measure == "Hana wait / WaitingForUser")
         self.assertEqual((total.value, total.n), ("2.0 min (partial)", 1))
         self.assertTrue(history.problems)
-        output = log_records.table("Waits", rows)
+        output = log_records.blocks("Waits", rows)
         problem = next(problem for problem in history.problems if "wait_id" in problem.reason)
         self.assertIn("3 wait events without wait_id", problem.reason)
-        self.assertIn(problem.reason, output)
+        self.assertIn(problem.reason, [row.value for row in read_report_blocks(output)])
 
     def test_real_supplier_holder_history_reaches_full_baseline_without_writes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1554,8 +1660,8 @@ class HolderHistoryTest(unittest.TestCase):
             for text in ("producer-named", "Hana wait holders unnamed / WaitingForQuotaRefusal / producer named no holder", "account-a", "account-b",
                          "session:other-project-director", "unit:models-unit", "producer named no holder",
                          "00:00:00", "00:04:00", "00:10:00"):
-                self.assertIn(text, output)
-            rows = {cells[0]: cells for line in output.splitlines() if len(cells := re.split(r"\s{2,}", line)) == 5}
+                self.assertIn(text, " ".join(output.split()))
+            rows = row_cells(output)
             self.assertEqual(rows["Hana wait holders / WaitingForQuotaRefusal / whole wait"][1:3], ["10.0 min", "1"])
             self.assertEqual(rows["Hana wait holders / WaitingForQuotaRefusal / HolderNotNamed"][1:3], ["10.0 min", "1"])
             self.assertEqual(path.read_bytes(), before)
@@ -1570,7 +1676,7 @@ class MergeReceiptsTest(unittest.TestCase):
         receipt = m.parse_receipt(receipt_fixture("a" * 40, self.start))
         merges = [m.HanaMerge("a" * 40, self.start), m.HanaMerge("c" * 40, self.start)]
         rows = m.receipt_rows([receipt], merges, self.window)
-        output = log_records.table("Receipt fixtures", rows)
+        output = log_records.blocks("Receipt fixtures", rows)
         self.assertIn("ReceiptMissing", output)
         self.assertIn("c" * 40, output)
         self.assertEqual((receipt.commit, receipt.checkpoint), ("a" * 40, "b" * 40))
@@ -1589,7 +1695,7 @@ class MergeReceiptsTest(unittest.TestCase):
         rows = m.receipt_rows(receipts, [m.HanaMerge(commit, self.start)], self.window)
         coverage = next(row for row in rows if row.measure == "Hana merge receipts / origin/init/catalyst")
         self.assertEqual((coverage.value, coverage.n), ("0/1", 1))
-        self.assertIn("ReceiptMissing", log_records.table("Receipt fixtures", rows))
+        self.assertIn("ReceiptMissing", log_records.blocks("Receipt fixtures", rows))
 
     def test_receipt_at_window_end_does_not_cover_an_in_window_merge(self) -> None:
         later = m.parse_receipt(receipt_fixture("a" * 40, self.window.until))
@@ -1645,7 +1751,7 @@ class MergeReceiptsTest(unittest.TestCase):
             self.assertEqual(len(problems), 1)
             rows = m.receipt_rows(receipts, [], self.window)
             self.assertIn("HistoryNotRecorded", rows[0].value)
-            self.assertIn(str(path), log_records.table(
+            self.assertIn(str(path), log_records.blocks(
                 "Source problems", log_records.source_problem_rows(problems, self.window)))
             self.assertEqual(path.read_bytes(), before)
 
@@ -1691,9 +1797,9 @@ class BaselineOutputTest(unittest.TestCase):
     def test_full_cli_omits_the_hint_and_summary_only_keeps_it(self) -> None:
         sources = self.sources()
         sources.problems = [log_records.SourceProblem("fixture source", "missing history")]
-        summary = self.output(sources).splitlines()
+        summary = summary_lines(self.output(sources), BASELINE_SUMMARY_PREFIXES)
         full = self.output(sources, full=True)
-        full_summary = full.split("\n\n", 1)[0].splitlines()
+        full_summary = summary_lines(full, BASELINE_SUMMARY_PREFIXES)
         self.assertEqual(summary[-1], "Source problems: 1. Use --full to print the tables.")
         self.assertEqual(full_summary[-1], "Source problems: 1.")
         self.assertEqual(full_summary[:-1], summary[:-1])
@@ -1702,10 +1808,10 @@ class BaselineOutputTest(unittest.TestCase):
 
     def test_default_cli_prints_short_summary_in_user_zone_without_tables(self) -> None:
         output = self.output(self.sources())
-        lines = output.splitlines()
+        lines = summary_lines(output, BASELINE_SUMMARY_PREFIXES)
         self.assertGreaterEqual(len(lines), 3)
         self.assertLessEqual(len(lines), 5)
-        self.assertTrue(all(len(line) <= 100 for line in lines), lines)
+        self.assertEqual(phone_overflow_lines(output), [])
         self.assertEqual(lines[0], "Window: 2026-10-21 00:00 to 2026-10-28 00:00 EDT (end excluded).")
         self.assertEqual(lines[1], "Hana: 2 merges to origin/init/catalyst; 2 Hana-project issues closed.")
         self.assertEqual(lines[2], "Goal 1: 3 issues closed; 2 declined closures left out.")
@@ -1717,16 +1823,39 @@ class BaselineOutputTest(unittest.TestCase):
         sources = self.sources()
         summary = self.output(sources)
         output = self.output(sources, full=True)
-        self.assertTrue(output.startswith(summary.replace(" Use --full to print the tables.", "") + "\nCapacity on Hana\n"))
-        self.assertRegex(output, r"Measure\s+Value\s+n\s+Window\s+Source")
-        rows = {cells[0]: cells[1] for line in output.splitlines()
-                if len(cells := re.split(r"\s{2,}", line)) == 5}
+        self.assertEqual(summary_lines(output, BASELINE_SUMMARY_PREFIXES),
+                         [line.replace(" Use --full to print the tables.", "") for line in summary_lines(summary, BASELINE_SUMMARY_PREFIXES)])
+        self.assertIn("\n\nCapacity on Hana\n", output)
+        rows = {row.measure: row.value for row in read_report_blocks(output)}
+        self.assertEqual(phone_overflow_lines(output), [])
         self.assertIn(f"Goal 1: {rows['goal 1 issues closed']} issues closed; "
-                      + f"{rows['goal 1 declined closures excluded']} declined closures left out.", summary)
+                      + f"{rows['goal 1 declined closures excluded']} declined closures left out.", " ".join(summary.split()))
         self.assertIn(f"Hana: {rows['Hana merges / origin/init/catalyst']} merges to origin/init/catalyst; "
-                      + f"{rows['goal 1 Hana-project issues closed']} Hana-project issues closed.", summary)
+                      + f"{rows['goal 1 Hana-project issues closed']} Hana-project issues closed.", " ".join(summary.split()))
         self.assertIn(f"User attention: {rows['phone pushes sent']} pushes sent to user; "
-                      + f"{rows['phone pushes after failed review']} after a failed text check.", summary)
+                      + f"{rows['phone pushes after failed review']} after a failed text check.", " ".join(summary.split()))
+
+    def test_full_baseline_preserves_every_row_field_in_phone_blocks(self) -> None:
+        sources = self.sources()
+        sources.problems = [log_records.SourceProblem("fixture history", "history was not recorded for this phase")]
+        now = self.window.until
+        snapshot = f"snapshot {now.astimezone(user_zone()):%Y-%m-%d %H:%M %Z}"
+        expected = [
+            *m.capacity(sources.units, sources.workers, snapshot),
+            *m.resource_use(sources.builds, sources.tokens, self.window),
+            *m.phase_flow(sources.phases, self.window, sources.wait_history),
+            *m.issue_flow(sources.issue_records, self.window),
+            *m.merge_flow(sources.merges, self.window),
+            *m.receipt_rows(sources.receipts, sources.merges, self.window),
+            *m.attention(sources.push_report, sources.messages),
+            *m.pending_attention(sources.waiting, now, self.window),
+            *m.rank_coverage(sources.issue_records, sources.rankings, sources.units, snapshot),
+            *log_records.source_problem_rows(sources.problems, self.window),
+        ]
+        output = m.render(sources, self.window, now, full=True)
+        self.assertEqual(read_report_blocks(output), expected)
+        self.assertEqual(phone_overflow_lines(output), [])
+        self.assertEqual(phone_overflow_lines(m.render(sources, self.window, now)), [])
 
     def test_full_cli_adds_waits_and_receipts_below_the_same_five_line_summary(self) -> None:
         sources = self.sources()
@@ -1738,11 +1867,12 @@ class BaselineOutputTest(unittest.TestCase):
         sources.receipts = (m.parse_receipt(receipt_fixture("a" * 40, self.window.since)),)
         summary = self.output(sources)
         output = self.output(sources, full=True)
-        self.assertEqual(len(summary.splitlines()), 5)
-        self.assertTrue(output.startswith(summary.replace(" Use --full to print the tables.", "") + "\nCapacity on Hana\n"))
+        self.assertEqual(len(summary_lines(summary, BASELINE_SUMMARY_PREFIXES)), 5)
+        self.assertEqual(summary_lines(output, BASELINE_SUMMARY_PREFIXES),
+                         [line.replace(" Use --full to print the tables.", "") for line in summary_lines(summary, BASELINE_SUMMARY_PREFIXES)])
+        self.assertIn("\n\nCapacity on Hana\n", output)
         self.assertNotIn("Hana wait /", summary)
-        rows = {cells[0]: cells for line in output.splitlines()
-                if len(cells := re.split(r"\s{2,}", line)) == 5}
+        rows = row_cells(output)
         self.assertEqual(rows["Hana wait / WaitingForUser"][1:3], ["8.0 min", "1"])
         expected_kinds = {
             "Hana wait / WaitingForQuotaRefusal", "Hana wait / WaitingForMemoryOrSlot",
@@ -1759,23 +1889,23 @@ class BaselineOutputTest(unittest.TestCase):
         sources.merges = m.MergeHistoryNotRecorded.MISSING
         output = self.output(sources, full=True)
         summary = output.split("\n\n", 1)[0]
-        self.assertIn("Hana: not recorded merges to origin/init/catalyst; 2 Hana-project issues closed.", summary)
-        self.assertTrue(all(len(line) <= 100 for line in summary.splitlines()), summary)
-        self.assertRegex(output, r"Hana merges / origin/init/catalyst\s+not recorded\s+0\s+")
+        self.assertIn("Hana: not recorded merges to origin/init/catalyst; 2 Hana-project issues closed.",
+                      " ".join(summary.split()))
+        self.assertEqual(phone_overflow_lines(summary), [])
+        self.assertEqual(row_cells(output)["Hana merges / origin/init/catalyst"][1:3], ["not recorded", "0"])
 
     def test_source_problem_count_and_full_hint_show_with_and_without_problems(self) -> None:
         sources = self.sources()
-        self.assertIn("Source problems: 0. Use --full to print the tables.", self.output(sources))
+        self.assertIn("Source problems: 0. Use --full to print the tables.", summary_lines(self.output(sources), BASELINE_SUMMARY_PREFIXES))
         sources.problems = [log_records.SourceProblem("reviews", "missing review file"),
                             log_records.SourceProblem("builds", "cannot read build file")]
         summary = self.output(sources)
-        self.assertIn("Source problems: 2. Use --full to print the tables.", summary)
+        self.assertIn("Source problems: 2. Use --full to print the tables.", summary_lines(summary, BASELINE_SUMMARY_PREFIXES))
         self.assertNotIn("missing review file", summary)
         output = self.output(sources, full=True)
-        problem_table = output.split("Source problems (dependent counts can be incomplete)\n", 1)[1]
-        self.assertEqual(problem_table.count("source unavailable"), 2)
-        self.assertIn("missing review file", problem_table)
-        self.assertIn("cannot read build file", problem_table)
+        problems = [row for row in read_report_blocks(output) if row.measure == "source unavailable"]
+        self.assertEqual(len(problems), 2)
+        self.assertEqual([row.value for row in problems], ["missing review file", "cannot read build file"])
 
 
 class SourcesTest(unittest.TestCase):

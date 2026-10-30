@@ -1082,8 +1082,8 @@ class Herdr:
     def open_tab(self, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
         """Open a tab and pane named `title` in the workspace named `space`, creating the workspace first.
 
-        A server that holds none of the saved workspaces gets them all first, in their saved order,
-        each holding a placeholder tab until its first session's tab arrives.
+        Restore prepares only its selected workspaces in saved order. A standalone
+        launch creates only its own workspace.
         """
         options = ["--label", title, "--cwd", cwd]
         for key, value in {**child_environment(environment), "HERDR_AGENT_PANE": "1"}.items():
@@ -1091,7 +1091,7 @@ class Herdr:
         with _LayoutLock(self.session):
             saved = saved_layout(self.session)
             workspace = self._workspace_named(space)
-            if workspace is None and self._place_saved_workspaces(saved):
+            if workspace is None and self._place_saved_workspaces(saved, frozenset({space})):
                 workspace = self._workspace_named(space)
             if workspace is not None:
                 result = self.result("tab", "create", "--workspace", workspace, *options, "--no-focus")
@@ -1116,9 +1116,10 @@ class Herdr:
         found = [item for item in workspaces if item.get("label") == space]
         return json_text(found[0].get("workspace_id"), "herdr workspace id") if found else None
 
-    def _place_saved_workspaces(self, saved: SavedLayout) -> bool:
-        """Create the recently live workspaces in saved order, when the server holds none of them."""
-        wanted = [space["name"] for space in saved["workspaces"] if space["seen"] >= saved["at"] - LAYOUT_RESTORE_SECONDS]
+    def _place_saved_workspaces(self, saved: SavedLayout, selected: frozenset[str]) -> bool:
+        """Create only workspaces this restore uses, in their saved order."""
+        wanted = [space["name"] for space in saved["workspaces"]
+                  if space["name"] in selected and space["seen"] >= saved["at"] - LAYOUT_RESTORE_SECONDS]
         if not wanted or {space.label for space in self.live_layout()} & set(wanted):
             return False
         home = str(Path.home())
@@ -1131,12 +1132,41 @@ class Herdr:
             _ = self.run("pane", "rename", pane, LAYOUT_PLACEHOLDER)
         return True
 
+    def prepare_restore_workspaces(self, selected: frozenset[str]) -> None:
+        """Reserve this run's saved workspace positions before any launch."""
+        with _LayoutLock(self.session):
+            _ = self._place_saved_workspaces(saved_layout(self.session), selected)
+
     def _close_placeholders(self, workspace: str) -> None:
         tabs = [json_object(item, "herdr tab") for item in json_items(
             self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
         for tab in tabs:
-            if tab.get("label") == LAYOUT_PLACEHOLDER and tab.get("pane_count") == 1:
-                _ = self.run("tab", "close", json_text(tab.get("tab_id"), "herdr tab id"))
+            if tab.get("label") != LAYOUT_PLACEHOLDER or tab.get("pane_count") != 1:
+                continue
+            ident = json_text(tab.get("tab_id"), "herdr tab id")
+            panes = [json_object(item, "herdr pane") for item in json_items(
+                self.result("pane", "list").get("panes"), "herdr pane list")]
+            owned = [pane for pane in panes if pane.get("tab_id") == ident]
+            if len(owned) != 1 or owned[0].get("label") != LAYOUT_PLACEHOLDER:
+                continue
+            if not isinstance(self.pane_activity(json_text(owned[0].get("pane_id"), "herdr pane id")), PaneAtShell):
+                continue
+            # A late session may have renamed the placeholder while activity was read.
+            current = [json_object(item, "herdr tab") for item in json_items(
+                self.result("tab", "list", "--workspace", workspace).get("tabs"), "herdr tab list")]
+            if not any(tab.get("tab_id") == ident and tab.get("label") == LAYOUT_PLACEHOLDER
+                       and tab.get("pane_count") == 1 for tab in current):
+                continue
+            if len(current) == 1:
+                _ = self.run("workspace", "close", workspace)
+            else:
+                _ = self.run("tab", "close", ident)
+
+    def close_restore_placeholders(self) -> None:
+        """Remove unfilled shell placeholders even when their launches failed."""
+        with _LayoutLock(self.session):
+            for space in self.live_layout():
+                self._close_placeholders(space.workspace_id)
 
     def live_layout(self) -> list[_LiveSpace]:
         """The session's workspaces in order, each with its tab titles in order, placeholders left out."""
@@ -2243,12 +2273,14 @@ def save_shared_layout(running: set[str]) -> None:
             client.save_layout()
 
 
-def reload_agent_rules(name: str) -> None:
-    """Make the running session `name` read its agent detection rules again; a failure is a line on stderr."""
+def reload_agent_rules(name: str) -> bool:
+    """Return whether session `name` reloaded its detection rules; report a failure on stderr."""
     try:
         _ = Herdr(name).run("server", "reload-agent-manifests")
     except HerdrFailure as error:
         print(f"herdr {name}: detection rules not reloaded: {error}", file=sys.stderr)
+        return False
+    return True
 
 
 def close_agent(session: str, pane: str) -> None:
@@ -2647,18 +2679,23 @@ def _live_server_processes(candidates: list[Path]) -> dict[int, str]:
     return {next(iter(pids)): listeners[inode] for inode, pids in holders.items() if len(pids) == 1}
 
 
-def _systemd_cgroups(process: Path) -> list[tuple[str, Path]]:
-    """Read unified or legacy systemd membership, never a process environment."""
-    try:
-        lines = process.joinpath("cgroup").read_text().splitlines()
-    except OSError:
-        return []
+def systemd_cgroups(process: Path) -> list[tuple[str, Path]]:
+    """Read systemd memberships; callers decide whether a read error is uncertainty."""
+    lines = process.joinpath("cgroup").read_text().splitlines()
     groups: list[tuple[str, Path]] = []
     for line in lines:
         fields = line.split(":", 2)
         if len(fields) == 3 and fields[1] in ("", "name=systemd") and fields[2].startswith("/"):
             groups.append((fields[0], Path(fields[2])))
     return groups
+
+
+def _systemd_cgroups(process: Path) -> list[tuple[str, Path]]:
+    """Discovery outside a stop tolerates processes disappearing during a scan."""
+    try:
+        return systemd_cgroups(process)
+    except OSError:
+        return []
 
 
 def _pane_shell_pids(session: str) -> list[int]:
@@ -3110,7 +3147,7 @@ def agent_base_environment(environment: dict[str, str], unset_environment: froze
     for key in tuple(base_env):
         # scripts/lib/unit_env.sh and unit_runs.environ map every PLAN_DELEGATE_ alias to UNIT_.
         if (key.startswith(("HERDR_", "CODEX_", "UNIT_", "PLAN_DELEGATE_", "SHOWRUNNER_", "CLAUDE_", "NIX_HEAL_"))
-                or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE"}):
+                or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE", "SHUTDOWN_PARENT_LAUNCH_CLAIM"}):
             del base_env[key]
     base_env.update(environment)
     for key in unset_environment:
@@ -3150,6 +3187,8 @@ def launch_prepared_agent(name: str, space: str, title: str, prepared: PreparedA
     _check_agent_arguments(kind, agent_arguments)
     pane = open_tab(name, space, title, str(prepared.directory), prepared.env)
     try:
+        from scripts.shutdown.launch_permission import claim_launch_pane
+        claim_launch_pane(name, pane)
         outcome = start_agent(name, pane, kind, agent_arguments, opening, timeout_ms, agent=agent)
     except (HerdrFailure, OSError, subprocess.SubprocessError):
         close_agent(name, pane)

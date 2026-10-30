@@ -210,7 +210,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(split, style_ledger.RecordedSplit(0, 1, 1, 0, measured_at))
         self.assertIn(f"waiting names: {self.sources[0]} has open types work\n", output.getvalue())
         changed = next(finding for finding in findings if finding.path == self.sources[1])
-        self.assertIn(f"waiting {issue}: {changed.finding_id} {changed.path} changed since it was judged\n", output.getvalue())
+        self.assertIn(f"waiting {issue}: {changed.path} changed since it was judged (1 finding)\n", output.getvalue())
 
 
     def test_split_changes_only_refill_results_and_keeps_the_plan_and_decisions(self) -> None:
