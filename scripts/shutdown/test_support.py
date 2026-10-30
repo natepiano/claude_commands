@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import faulthandler
+import os
+import tempfile
 import shlex
 import socket
 import sys
 import unittest
 from enum import StrEnum
 from types import ModuleType
+from pathlib import Path
 from typing import Never, cast, override
 from unittest.mock import patch
 
@@ -68,6 +71,12 @@ def registry_confirmation(ids: frozenset[str]) -> restart.RegistryConfirmation:
         for index, identity in enumerate(sorted(ids))))
 
 
+def empty_session_registry(test: unittest.TestCase, directory: Path) -> None:
+    """Supply complete empty registry evidence alongside a private process fixture."""
+    directory.mkdir(parents=True, exist_ok=True)
+    _ = cast(object, test.enterContext(patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(directory)})))
+
+
 def linux_process_fixture(test: unittest.TestCase) -> None:
     """Select the platform modeled by proc trees and systemd stand-ins."""
     _ = cast(object, test.enterContext(patch.object(sys, "platform", "linux")))
@@ -89,6 +98,8 @@ class ShutdownTestCase(unittest.TestCase):
         super().setUp()
         faulthandler.dump_traceback_later(TEST_TIME_LIMIT_SECONDS, exit=True)
         self.addCleanup(faulthandler.cancel_dump_traceback_later)
+        registry = Path(self.enterContext(tempfile.TemporaryDirectory())) / "sessions"
+        empty_session_registry(self, registry)
         # Records and reports in these fixtures belong to natedev.
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="natedev"))
         # Launch limits stay as written on a loaded machine.

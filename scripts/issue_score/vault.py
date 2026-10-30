@@ -133,7 +133,7 @@ def normalize_area(area: str) -> str:
 
 
 def load_area_definitions(path: Path = AREA_DEFINITIONS_PATH) -> dict[str, str]:
-    """Require a readable area table; missing area rows retain name-only criteria."""
+    """Require a two-column area table; missing rows retain name-only criteria."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
@@ -143,7 +143,7 @@ def load_area_definitions(path: Path = AREA_DEFINITIONS_PATH) -> dict[str, str]:
     for line in lines:
         cells = [cell.strip().replace(r"\|", "|")
                  for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
-        if [cell.casefold() for cell in cells] in (["area", "definition"], ["area", "definition", "issues"]):
+        if [cell.casefold() for cell in cells] == ["area", "definition"]:
             columns = len(cells)
             continue
         if not columns:

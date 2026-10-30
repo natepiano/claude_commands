@@ -121,6 +121,7 @@ class RunProcessTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(os, "getsid", self.session))
         _ = self.enterContext(mock.patch.object(os, "kill", self.kill))
         _ = self.enterContext(mock.patch.object(shutdown_record, "all_session_records", lambda: [STOPPED_RECORD]))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_unit", return_value=None))
         _ = self.enterContext(mock.patch.object(unit_lookup, "marked_units", self.no_units))
 
     def run_folder(self, name: str, worktree: Path) -> Path:
