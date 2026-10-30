@@ -351,31 +351,17 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Gotchas:** `codex_mesh.py end --cleanup-only` is models-unit's and was queued, not shipped, at this checkpoint; until it lands, the cleanup exits 1 and the record stays and is counted. A rerun after a stop between the log append and the journal rewrite logs the outcome twice; that is accepted.
 
 ### Phase 13a — The change review check skips commits already on another production's merge branch  · status: done
-**Depends on:** none. A fix the showrunner asked for ahead of Phase 14 (2026-10-29): performance's frame-cost checkpoint a20f211eb3 merges init/catalyst, and the change-review step held it for 15 catalyst commits whose rows were written when they landed there.
 
-#### Work Order
+#### As-built
 
-**Goal:** `merge_checkpoint.py` and `merge_gate.py` check Change-Review lines only on a unit's own commits, also when the unit merged another production's merge branch.
-
-**Hana link:** direct. Nine performance merges toward Hana wait on this hold.
-
-**Spec:**
-- `change_review.unit_commits` leaves out every commit already on the origin merge branch of any production in the same repository whose merges write rows (its own production's, as today, and every other one's). A branch with no `origin/<branch>` ref is skipped. Unreadable production docs keep today's behaviour.
-- The productions are a parameter with a default that reads `showrunners.timer_docs()`.
-- The `Change-Review-Covers` advice stays for a unit's own commits.
-- Tests: a unit branch that merged another production's merge branch; a production whose merges write no rows; a production in another repository; unreadable docs; a rerun of a held merge request that now passes the change-review step.
+- `change_review.unit_commits(..., *, productions=registered_productions)` leaves out the commits on `origin/<merge branch>` of every production in the same repository whose doc has a Change review line, beside the unit's own merge branch. `reviewed_merge_refs` matches repositories by their resolved `git rev-parse --git-common-dir`, so a checkout in a worktree matches its repository. A doc that cannot be read, lacks a field or names a repository missing here is skipped on its own; its commits stay checked. A failure to read the checkout or the registry keeps the own-branch-only check.
+- `merge_checkpoint.py` and `merge_gate.py` get it through `unit_commits`, unchanged.
 
 **Files:**
-- `scripts/production/change_review.py` — `unit_commits`
-- `scripts/production/merge_checkpoint.py` — `change_review_commits`, only if the signature needs it
-- `scripts/production/merge_gate.py` — its `unit_commits` call, only if the signature needs it
-- `scripts/production/test_change_review.py` — tests
-- `scripts/production/test_merge_checkpoint.py` — the rerun test
+- `scripts/production/change_review.py` — `registered_productions`, `reviewed_merge_refs`, `unit_commits`
+- `scripts/production/test_change_review.py`, `scripts/production/test_merge_checkpoint.py` — imported production branch, linked worktree, missing repository, incomplete doc, no Change review line, rerun of a held merge
 
-**Workers:** `1 writer`
-- `impl2` — every file above
-
-**Acceptance gate:** the two test modules green; `basedpyright` on the five files ends `0 errors, 0 warnings, 0 notes`; the showrunner's merge test of the held checkpoint is the merge gate. **Change-Review row:** none — the merge step holds fewer checkpoints; nothing a person reads changes.
+**Gotchas:** the default reads `showrunners.timer_docs()`, so a production with no registered timer is not known and its commits stay checked.
 
 ### Phase 14 — The change review list and the open-question list survive a stopped write, and a rerun of verdict or answer finishes its work  · status: todo
 **Depends on:** Phases 9 and 11 (done). Its files do not overlap Phase 13's, so the two can run in either order.
