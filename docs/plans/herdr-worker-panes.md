@@ -1,8 +1,10 @@
-# Workers in herdr panes
+# Workers in herdr panes, and one staff record
 
-> **Status: DESIGN PLAN — for showrunner review, then the user.** Retire `codex_mesh` and run every unit worker as an agent in a herdr pane in its director's tab. Rename `agents.conf` to `models.conf` and `/agent` to `/default_models`. Nothing is built yet.
+> **Status: IMPLEMENTATION PLAN — phased, direct-ready.** Approved to build on 2026-10-30 by the user, through the sdlc showrunner, before a plan review; the user reviews an overview in the morning. It adds one staff record of every showrunner, unit director and worker, retires `codex_mesh`, and runs every unit worker as an agent in a herdr pane in its director's tab. It renames `agents.conf` to `models.conf` and `/agent` to `/default_models`.
 
-Written by herdr-unit on 2026-10-29 for the sdlc showrunner. Source: the user's request relayed by the sdlc showrunner the same night. The inventory was read from `~/.claude` main at 7e85a74b. The natedev-herdr worktree is 16 commits behind main. Its launchers pin model and effort from the roster, where main resolves them per turn. Work starts from main's version.
+> **Production: natedev** — unit `herdr-unit`; production doc `docs/plans/natedev-production.md`. The unit moves to sdlc later; checkpoints go to sdlc.
+
+Written by herdr-unit on 2026-10-29 for the sdlc showrunner, from the user's request relayed the same night. Team review 2026-10-30 (four lenses and the sdlc showrunner's review) and the user's later answers are folded in. The inventory was read from `~/.claude` main at 7e85a74b.
 
 ## The user's request
 
@@ -13,250 +15,495 @@ Written by herdr-unit on 2026-10-29 for the sdlc showrunner. Source: the user's 
 - Starting a session may become a herdr command, so that a lot of infrastructure can retire.
 - Update the showrunner and unit director instructions (their skills), and clean up the old things.
 - Rename `agents.conf` to `models.conf` everywhere, and `/agent` to a name with no clash, for example `/default_models`.
+- (2026-10-30) One command starts or resumes a worker by a unique name such as `sdlc-models-impl1` or `hana-lfo-test1`, with model and effort looked up for its role.
+- (2026-10-30) Add workers to the record of showrunners and unit directors, so one record shows the full production staff, with a stable unique id for each so a rename is easy. This record is a resource for other work too.
+
+## Delegation Context
+
+- **Project:** `~/.claude` scripts — the agent tooling. This plan adds the staff record, moves unit workers from `codex_mesh` app-server threads to herdr panes, and renames the model registry.
+- **Stack:** Python 3.11+ through the `scripts/lib/py` shim, bash, `unittest`, basedpyright; herdr 0.9.5 CLI; the interactive Claude Code and Codex CLIs.
+- **Layout:**
+  - `scripts/production/` — production tools: `showrunners.py`, `production_units.py`, `live_units.py`, `unit_lookup.py`, `add_unit.py`, `add_showrunner.py`, `retire_unit.py`, `rename_unit.py`, `transfer_unit.py`, `rename.py`, `promote_*.py`, `resume_unit.py`, `production_tree.py`, `broadcast.py`, `codex_winddown.py`; the new `staff.py`
+  - `scripts/herdr/` — `herdr.py` (the one herdr client), the new `worker_panes.py`
+  - `scripts/direct/` — the launchers `implement.sh`, `review.sh`, `assign.sh`/`assign.py`, `workers.py`, `worker_state.py`, `remove_workers.py`, `mesh_runs.py`, `board.sh`, `progress_history.py`
+  - `scripts/agents/` — `codex_mesh.py`, `agents_config.sh`, `agent_admin.sh`, `agent_exec.sh`, `sync_codex_catalog.sh`
+  - `scripts/message/` — `send.py`, `roster.py`, `sessions.py`
+  - `scripts/shutdown/` — `inventory.py`, `stop.py`, `restart.py`, `shutdown_record.py`, `pane_record.py`, `pane_restore.py`
+  - `scripts/lib/` — `agents_registry.py`, `unit_runs.py`, `names.py`
+  - `config/` — `agents.conf` (renamed `models.conf` in Phase 3), `direct.conf`, `names.toml`, the new `staff.toml`
+  - `commands/`, `docs/direct/`, `docs/as-built/`, `skills/herdr/SKILL.md`
+- **Key files:**
+  - `scripts/production/showrunners.py` — showrunners from update timers (`registered_showrunners` :216, `current_name` :341, `parent_of` :427, `attach` :528, `detach` :557; parent files under `~/.local/state/showrunner/<slug>/parent`)
+  - `scripts/production/production_units.py` — a production doc's Units table (`unit_table` :59, `unit_is_retired` :100, `SessionMarks` :84)
+  - `scripts/production/unit_lookup.py` — units found by herdr pane marks `SHOWRUNNER_UNIT` and `SHOWRUNNER_UNIT_ID` (:30-31; `every_marked_unit` :316, `marked_units` :383, `marked_unit` :392)
+  - `scripts/direct/workers.py` — the unit worker ledger under `~/.local/state/unit-workers/` (:529, `ledger_path` :1564), retired in the cleanup phase
+  - `scripts/herdr/herdr.py` — `launch_agent` :3113, `launch_prepared_agent` :3165 (opens a tab today), `_agent_name` :3092 (truncates to 32 characters), `_herdr_resumes_agents` :1987, `Herdr.prompt` :1721
+  - `scripts/agents/codex_mesh.py` — 8652 lines, deleted in the cleanup phase
+  - `docs/as-built/herdr-adoption.md`, `docs/as-built/long-lived-workers.md`, `docs/as-built/agent-registry.md`, `docs/as-built/shutdown-and-restart.md` — how herdr, workers, the registry and shutdown work now
+  - This plan's `## Reference` section — the job table (what the mesh does today and what replaces each job), the risks and the copies this plan retires
+- **Test lanes:** none (no Rust crate); tests sit beside their modules as `test_*.py`.
+- **Build:** none (scripts).
+- **Test:** `~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --tests-only --checkout <tree>`, run from `~/.claude` main's copy, after a merge of `origin/natedev` (memory: merge before a gate). Quick loop: `~/.claude/scripts/lib/py -m unittest discover -s <dir> -p '<test file>'` for the phase's own tests.
+- **Lint:** `basedpyright <changed Python files> <every caller module of a changed file>` — pass is `0 errors, 0 warnings`; `bash -n` and `shellcheck` with no new findings for each changed `.sh`.
+- **Invariants:**
+  - **The Three Gods.** Simple, Fast, Beautiful, in that order, with correctness as the floor (`~/.claude/docs/decision_criteria.md` → `<ThreeGods/>`). Every writer builds to them and every reviewer judges by them.
+  - **The four sdlc lines (2026-10-30), in every work order and review prompt this plan sends:**
+    1. Good engineering first, not after the user notices. Before a worker writes code, ask: is there already one place for this? Use it, or make it, then call it.
+    2. No copies. A second copy of setup, a fixture, a config writer, a parser or a helper is a defect. Reviews flag it; you send it back. A test helper that each file writes for itself goes into one shared helper.
+    3. When many things break the same way, the copy is the cause. Name it first in your report, with the one-place fix, before anyone asks.
+    4. Fix at the cause, never a patch at each site.
+  - **Shown names are proposals.** The pane border label and the over-32-character name rule wait for the user (questions list items 1 and 2). Code reads them from `config/staff.toml`; one line changes each. No phase depends on the answer.
+  - **The worker transport is pinned per run.** `WORKER_TRANSPORT=mesh|herdr` in `config/direct.conf` is read at run start and pinned in the run folder. A run that started on the mesh finishes on the mesh. Every lifecycle caller (dispatch, messages, detached delivery, shutdown, rename, transfer, retire, cleanup) reads the run's pin through one resolver, `unit_runs.worker_transport(run)`.
+  - **Tests never touch the user's tabs.** herdr tests run in a probe tab of `agents` (memory: one herdr session; `herdr.py` refuses other servers) and close it at the end. No test runs `herdr` against a live director's tab.
+  - **Build hold.** Before any test or gate, check `build_hold.py status`; while a natedev hold that is not ours is in force (02:00-05:00 tonight), run nothing that builds or tests. Edits continue.
+  - **Owners.** The models unit owns `agents_registry.py` and the registry writers; the shutdown unit owns `scripts/shutdown/`; the accounts unit owns `scripts/accounts/` and account moves. A phase that changes their files names the owner in its checkpoint notice and agrees the change with them first. The user owns `/etc/nixos` (questions list item 5).
 
 ## Decisions made in this plan
 
-Each item below is my call under the decision criteria. A one-line plan change reverses it.
+Each item is my call under the decision criteria unless it names the user. A one-line plan change reverses it.
 
-1. **The three launcher commands stay; only what they call changes.** `implement.sh`, `review.sh` and `assign.sh` keep their arguments. They keep their recorder, ledger, status-file and board work, and call herdr instead of the mesh. The `/unit:direct` contracts that name them then change little. Risk: the launchers stay three files. When the cleanup shows they are thin, the cleanup phase merges them into one.
-2. **A worker's own files signal completion; herdr's state only wakes the director.** A worker is done when it writes its status and summary files, as today. A herdr `idle`/`done` state wakes the director, which then reads those files. Reason: herdr can read a Codex pane as `idle` or `unknown` in the middle of a turn. Its state alone must never close a pass.
-3. **The director waits on a background `herdr agent wait`, with no poll loop.** The launcher starts the turn with `herdr agent prompt`, then blocks in `herdr agent wait <name> --until idle --until done`. The director runs the launcher in the background, as today, and the task notification is the wake-up.
-4. **A prompt goes in by file path, not as pasted text.** The launcher types one line: `Read <prompt path> and do the work it gives.` Long pasted prompts are where a terminal UI fails.
-5. **Idle worker panes close at the end of each phase; the conversation is kept.** The user said the column splits "for whichever are active". A worker keeps its conversation across phases and runs, as today (workers persist with their director). Its pane closes when its phase work ends. The next dispatch opens a new pane and resumes that conversation (`codex resume <id>` or `claude --resume <id>`). Cost: a few seconds of start time per reopen.
-6. **No launcher compaction, and no "Continue where you stopped." retry.** Interactive Codex and Claude compact by themselves when their context fills. The launcher compaction was already best-effort ("costs tokens, not correctness").
-7. **Codex stays a worker kind.** herdr starts `--kind codex` and `--kind claude` agents. `models.conf` keeps its Codex sections; the default worker kind per role stays where it is set today.
+1. **One staff record (user, 2026-10-30).** `scripts/production/staff.py` and one file per machine, `~/.local/state/staff/staff.json`, hold every showrunner, unit director and worker: a stable id, the current name, kind, role, production, unit and number. A rename changes only the name; the id never changes. There is no separate worker ledger: the unit worker ledger, `mesh_roster.json`, the run `workers` log and the slot claim files retire into this record. Live state (pane, socket, running or not) is never stored; it comes from herdr and the session records at read time. No such record exists today: the hierarchy is joined at each read from update timers, parent files, Units tables, pane marks and the worker ledgers (Reference → Staff record readers).
+2. **One command starts or resumes a worker (user, 2026-10-30).** `worker_panes.py start-or-resume <name> <role>`. Both Claude Code and Codex resume a conversation by its name (user, 2026-10-30), so the command resumes by name and keeps no conversation id. At every start or resume it looks up kind, model, effort, service tier and sandbox for the role in the model registry. The worker name form is `<production>-<unit>-<role><n>`, for example `sdlc-models-impl1` or `hana-lfo-test1` (user, 2026-10-30); several workers of one role take numbers 1, 2, 3.
+3. **Idle panes close at phase end (user, 2026-10-30).** The conversation stays. To bring a worker back, the director calls `start-or-resume` again. This settles the keep-open question.
+4. **The worker's final reply signals completion; herdr's state only wakes the launcher.** Every dispatch has a dispatch id. The prompt file ends with: "End your final reply with the line `DONE <dispatch id>`." The launcher reads the final reply from the worker's own transcript and writes the status file only when it carries that line. The launcher writes the status file today (`implement.sh:629`); the worker writes only its summary. This works the same for read-only reviewers, which cannot write a file (`review.sh:689` starts them with `--sandbox read-only`): the launcher writes their findings file from the reply, as the mesh does today.
+5. **The launcher's whole wait is one background `herdr agent prompt <name> "<line>" --wait`, with no `--timeout` and no `--until`.** herdr then waits for its default settled set, `idle`, `done` or `blocked`, after it sees the turn start (herdr skill, "For normal agent work, `--wait` is enough"). `blocked` wakes the launcher, so a worker at an approval dialog never stalls the director. The director runs the launcher in the background, as today, and the task notification is the wake-up.
+6. **A dispatch refuses a busy worker; a message queues.** A dispatch is a new pass that a launcher waits on, so it needs an `idle` or `done` worker, under the worker's dispatch lock. A message (`send.py`, a detached-run result, review Stage 2) is typed at once, also during a turn: Codex and Claude queue typed input. A blocked or closed worker's message goes to its director. `pending.json` drops.
+7. **A prompt goes in by file path, not as pasted text.** The launcher types one line: `Read <prompt path> and do the work it gives.`
+8. **No launcher compaction, and no "Continue where you stopped." retry.** Interactive Codex and Claude compact by themselves.
+9. **Codex stays a worker kind.** herdr starts `--kind codex` and `--kind claude` agents. The default worker kind per role stays where it is set today.
+10. **`herdr.py` stays the one herdr client.** Launch into a split pane and layout changes are new `herdr.py` primitives; `worker_panes.py` composes them and holds only `start-or-resume`, `dispatch`, `close`, `layout` and `list`. One-line agent calls (`herdr agent send-keys <name> esc` to interrupt, `herdr agent read`, a message's `herdr agent prompt`) run directly and are not wrapped.
+11. **The three launcher commands stay; their shared work moves to one place.** `implement.sh`, `review.sh` and `assign.sh` keep their arguments and their recorder, status-file and board work. Start, dispatch, wait and receipt live once in `worker_panes.py dispatch`. The cleanup phase merges the launchers when they are thin.
+12. **The transport switch lives in `config/direct.conf`, with an end date.** `WORKER_TRANSPORT` is migration state, not a model default, so it stays out of `models.conf`. The cleanup phase deletes it, no later than 7 days after the default switch.
 
-## 1. What codex_mesh and its launchers do today, and who calls each part
+## Questions for the user
 
-`scripts/agents/codex_mesh.py` (8652 lines) is called by 29 scripts, 4 commands, 27 docs and 1 config file, and by 36 test files besides. It is imported as a module by `assign.py`, `workers.py`, `mesh_runs.py`, `astra/design_roles.py`, `accounts.py` and `hierarchies`.
+1. **Worker session names over 32 characters.** These names name the worker sessions: the herdr agent name and the Claude or Codex session name. You gave the form `<production>-<unit>-<role><n>` (2026-10-30). The only open point: herdr allows `[a-z][a-z0-9_-]{0,31}`, and `build-followups-cargo-liner-style-names-impl1` has 45 characters. Options: (A) a short name key per production and per unit, set once, used in every worker name; (B) cut each part and add a 4-character stable hash; (C) refuse, and such a unit keeps mesh workers until it has a shorter name. Recommendation: A, because the names stay readable. Until you answer, the code refuses (C), set by one line, `long_names = "refuse"`, in `config/staff.toml`.
+2. **Pane border label (proposal).** The label on each worker pane: `{role}{n}` (`impl1`, `test1`, `review1`); the tab title already names the unit. Options: role and number; the full worker name; the joined form `production · unit · job`. Recommendation: role and number. One line, `pane_label`, in `config/staff.toml`.
+3. **herdr's `resume_agents_on_restore`.** Phase 4's probe decides whether herdr's own resume keeps each pane's `--env` (its account). If it does, nothing changes: herdr restores split tabs, and our per-pane restore code retires for them. If it does not, the only question is the config change: add `[session] resume_agents_on_restore = false` to `~/.config/herdr/config.toml` on natedev and the Mac (the file holds your own settings), and our restore owns split tabs. Recommendation: follow the probe; if it is negative, make the change before the default switch.
+4. **Model per pass, not per turn (710a6adb).** Tonight's fix 710a6adb (23:21) makes every Codex worker turn read model and effort fresh from `agents.conf` at send time (the dispatch's override, else the current default), so a config change reaches the next turn. A pane fixes its model when its process starts. Options: (A) look up only at start or resume, so a change reaches a worker at its next start, normally the next phase; (B) every dispatch calls `start-or-resume`, which resumes the pane on the new model when its start arguments differ from the registry, so a change reaches the next pass. Recommendation: B. It keeps 710a6adb's promise per pass, costs a few seconds only after a config change, and a `/model` typed by hand holds until the config changes. Phase 5 builds B; A is one deleted compare.
+5. **The NixOS edits (yours).** (a) `modules/common/claude-git-filters.nix:35` `watchPaths`: `agents.conf` → `models.conf`. It is functional: until it changes, the git filter does not refresh on a `models.conf` change. (b) Comments in `modules/common/codex-catalog-sync.nix`, `modules/common/codex.nix:47`, `modules/common/shell.nix:139` (`/agent`) and `README.md:410`. (c) `modules/common/herdr-skill-local.md:7`: the rule "start a new agent in a new tab, not a split pane" must permit worker panes in the director's tab (`skills/herdr/SKILL.md:221` is built from it). (d) The sign-in path unit (natedev) and the launchd agent (Mac) that run `codex_mesh.py signin-changed`: they retire at cleanup, or point at the pane restart if Phase 4's Codex sign-in probe is negative. Options: you write them; or herdr-unit writes one diff file per edit for you to apply, as the builds unit did with `build-followups-memory-nixos-*.diff`. Recommendation: diff files; apply (a) when the rename phase lands, (c) before the pilot, the rest at cleanup.
 
-| # | Job | Where | Callers |
-| --- | --- | --- | --- |
-| 1 | App-server per run: start, watcher, idle stop, sweep (`serve`, `idle-stop`, `sweep`; `mesh_server.json`, `mesh_retired.json`, `mesh_server.log`, watcher locks) | codex_mesh.py:2637, 2742, 2461, 7486, 7533 | Every verb starts the server itself; `retire_unit.py:338` |
-| 2 | Open a worker thread (`start`; `mesh_roster.json`) | codex_mesh.py:3308 | implement.sh:543, review.sh:687, launch_friend.sh:81 |
-| 3 | Another turn on an idle worker (`follow`; drains `<name>.pending.json`) | codex_mesh.py:3408 | implement.sh:524, review.sh:680, assign.py:524, 581 |
-| 4 | Follow claims (`can-follow`, `release-follow`) | codex_mesh.py:3762, 3784 | implement.sh, review.sh, assign.py |
-| 5 | Compaction before a follow-up above `UNIT_COMPACT_ABOVE_TOKENS` (`compact`) | codex_mesh.py:3643; implement.sh:336 | implement.sh, review.sh, assign.py |
-| 6 | "Continue where you stopped." after a context overflow | codex_mesh.py:4526 | inside the mesh |
-| 7 | Retry on a new app-server after a fast failure or a stale sign-in | codex_mesh.py:3174, 2446 | inside `start` and `ensure_server` |
-| 8 | Codex sign-in change: retire old servers and tell the holder (`signin-changed`) | codex_mesh.py:7673 | a NixOS path unit and a launchd agent |
-| 9 | Messages to a worker; held when no launcher is attached (`send`, `<name>.pending.json`) | codex_mesh.py:5525, 2184 | send.py:1266 (`worker:` addresses), assign.py:272 (review Stage 2) |
-| 10 | Steer or interrupt a running turn (`steer`, `interrupt`) | codex_mesh.py:5564, 5612 | the director by hand |
-| 11 | End a worker (`end`) | codex_mesh.py:5679 | workers.py:1683, hierarchies/worker_owners.py:635, end_friend.sh |
-| 12 | Pause or stop every worker of a run (`stop --pause`) | codex_mesh.py:6228 | end_session.sh:92, shutdown/stop.py:377, 1433, retire_unit.py:638, rename_unit.py:724 |
-| 13 | Reopen an ended worker, or carry one into a new run (`reopen`, `adopt`) | codex_mesh.py:5865, 6130 | workers.py:1042, 875; assign.py:397 |
-| 14 | Unit worker ledger: lasting identity per production/unit/role (HeldBy, Paused, Adopted, Retired) | workers.py:422-545; `~/.local/state/unit-workers/` | codex_mesh, assign.py:604, review.sh:233, retire/rename/transfer_unit, rename.py, remove_workers.py |
-| 15 | Run worker log and slot claims (`<run>/workers`, `impl_worker_*.json`, `impl_claim_*.json`) | worker_state.py:48; implement.sh:219-400 | implement.sh, roster.py |
-| 16 | Pass and ledger recording, status and summary files, `UNIT_RESOLVES_ROUND` | implement.sh:419-676; review.sh; assign.py | `/unit:direct` |
-| 17 | Detached long runs and result delivery into the worker's turn (`mesh_runs.py start/supervise/deliver`; "no launcher is attached" message to the director) | mesh_runs.py:300, 437, 523 | verify.sh:868, review.sh:669, shutdown/stop.py:1138, retire_unit.py:286 |
-| 18 | Wait records (`mesh-wait.<name>.<kind>` markers; recorder `start-wait`/`finish-wait`) | codex_mesh.py:3244 | mesh_runs, design_roles.py, verify.sh |
-| 19 | Usage-limit and capacity handling: detect, report to `agent_notes.py`, wait and resume an owed turn | codex_mesh.py:3203, 3275, 4562, 4658, 4628 | inside `start`/`follow` |
-| 20 | Account moves of the Codex workers home (`resume-account-move`, `retire_workers_servers`, `_move_worker`) | codex_mesh.py:7847, 8095, 4208 | accounts.py:3517-3650, quota_alert.py, next_moves.py |
-| 21 | Model and effort per turn from `[direct.codex]`, service tier | codex_mesh.py:5407, 5378 | inside `_start_turn`; `UNIT_CODEX_MESH` override |
-| 22 | Review pool (`prime`, `fork`, `set-instructions`, `reset`; `review_pool.py`) | codex_mesh.py:8181-8390; review_pool.py | retire/transfer/rename_unit, workers.py `transfer-reviewers`. The pool takes no reviews today (review-pool.md:3). review.sh ignores `--pool` |
-| 23 | Unit reviewers: ledger workers with the review role, kept across rounds | workers.py `resolve --role review` | assign.sh, review.sh |
-| 24 | Held Astra design roles on a mesh | astra/design_roles.py:560, 929, 1246 | astra_review, roles.py |
-| 25 | Ask-a-friend resident worker | ask_a_friend/launch_friend.sh, end_friend.sh | `/ask_a_friend` |
-| 26 | Coordination board (`board.log`): register, status and done lines, cargo token | board.sh:572 | launchers, verify.sh, workers' prompts; read by progress_history, board_json, production_tree, roster, shutdown/inventory |
-| 27 | Session roster lists workers (`_mesh_records`, pool and design meshes) | message/roster.py:1344, 1643, 1711, 1763 | /message, broadcast.py `--workers`, about 12 importers |
-| 28 | Shutdown and restart of workers: `codex_seats`, `PausedSeat`, `CodexServer`, resume prompts, the "Codex workers are paused" restart note | shutdown/inventory.py:892-955, stop.py:306-385, 1119-1191, 1327-1440, record.py:466-499, restart.py:614-632, 2242-2395 | `shutdown.py down/restart`, account moves |
-| 29 | Displays and counters: production tree edges, Codex wind-down count, waste watch, hierarchies, transcripts, tmp sweep, process table | production_tree.py, codex_winddown.py, waste_watch.py, hierarchies/*, shot_report/transcripts.py:1680, lint/tmp_sweep.py, process_table.py:52 | showrunner tools |
+## Phases
 
-The word "worker" has a second meaning in the shutdown code: Claude background sessions (`kind: "worker"` in the inventory, `SessionShutdown.workers`). This plan does not change those.
+### Phase 1 — The staff record  · status: todo
 
-## 2. The herdr replacement or a drop, per job
+#### Work Order
 
-One new module, `scripts/herdr/worker_panes.py`, holds every worker pane operation: `open`, `prompt`, `wait`, `interrupt`, `close`, `list`, `layout`. The launchers, send.py, mesh_runs, the roster and shutdown call it. Nothing else runs `herdr` against a worker pane.
+**Goal:** `scripts/production/staff.py` holds this machine's showrunners, unit directors and workers in one file with stable ids, answers lookups by id, by name and by production/unit/role, and `staff.py seed` fills it from today's sources.
 
-| # | Replacement |
+**Spec:**
+
+1. **One module, one file.** New module `scripts/production/staff.py`. Its file is `~/.local/state/staff/staff.json`; the env var `STAFF_FILE` overrides the path (tests). One file per machine: a row lives in the file of the machine where its session runs. Readers on another machine reach it the way they reach that machine today (over ssh), in a later phase; this phase reads and writes the local file only.
+2. **File form.** `{"schema": 1, "rows": [<row>, ...]}`, rows sorted by `id`, written with `json.dumps(..., indent=2, sort_keys=True)` and a final newline, so the same content always gives the same bytes. Writes take `fcntl.flock` on `<file>.lock`, write a temp file in the same folder, `fsync`, then `os.replace`. Reads take no lock. A file that does not parse, or has another `schema`, gives `Unreadable(path, reason)` and no write overwrites it.
+3. **The row.** A frozen dataclass with `to_json()` and `from_json()` (no `Any`; parse with typed checks):
+   ```python
+   Kind = Literal["showrunner", "unit", "worker"]
+   Agent = Literal["claude", "codex"]
+
+   @dataclass(frozen=True)
+   class StaffRow:
+       id: str          # "s" + uuid4().hex[:11]; never changes, never reused, never derived from a name
+       kind: Kind
+       name: str        # the current name; for a worker, its herdr agent name and its session name
+       role: str        # showrunner: "showrunner"; unit: "director"; worker: impl | test | review | astra | friend
+       production: str  # the production slug
+       unit: str        # the unit name; "" for a showrunner
+       number: int      # a worker's number (impl1 -> 1); 0 for a showrunner or a unit
+       parent: str      # a showrunner's parent production slug, else ""
+       agent: Agent
+       machine: str     # machine_name() of the machine whose file holds the row
+       retired: bool
+   ```
+   A worker's director is `find(kind="unit", production=row.production, unit=row.unit)`, and a unit's showrunner is `find(kind="showrunner", production=row.production)`, so the row stores no other parent link.
+4. **Keys and uniqueness.** The key of a row is `(kind, production, unit, role, number)`. Among rows that are not retired, the key is unique and `name` is unique. A write that would break either returns `Refused(reason)` and writes nothing.
+5. **Read API.**
+   ```python
+   def load(path: Path | None = None) -> Staff | Unreadable
+   def by_id(staff_id: str, path: Path | None = None) -> StaffRow | NotFound | Unreadable
+   def by_name(name: str, path: Path | None = None) -> StaffRow | NotFound | Unreadable  # current names of rows not retired
+   def find(*, kind: Kind | None = None, production: str | None = None, unit: str | None = None,
+            role: str | None = None, retired: bool = False, path: Path | None = None) -> list[StaffRow] | Unreadable
+   ```
+6. **Write API.**
+   - `ensure(kind, *, production, unit, role, number, agent, name="", parent="") -> StaffRow | Refused | Unreadable`: returns the row with that key that is not retired, unchanged, when it exists; else adds it. A worker row with `name=""` takes its name from `name_form` in `config/staff.toml`. A showrunner or unit row needs a `name`.
+   - `rename(staff_id, new_name) -> StaffRow | Refused | NotFound | Unreadable`: the same name returns the row unchanged; a name that another active row holds is refused. Only `name` changes.
+   - `move(staff_id, *, production, unit) -> StaffRow | Refused | NotFound | Unreadable`: for a transfer; the same values return the row unchanged. The name does not change here; the caller renames.
+   - `set_parent(staff_id, parent) -> StaffRow | NotFound | Unreadable`: a showrunner's parent slug; the same value changes nothing.
+   - `retire(staff_id) -> StaffRow | NotFound | Unreadable`: a retired row stays retired; a second call changes nothing.
+7. **Worker names.** New file `config/staff.toml`:
+   ```toml
+   # Worker names. The user gave the name form on 2026-10-30.
+   name_form = "{production}-{unit}-{role}{n}"
+   # Proposal, waiting for the user (the plan's questions list item 2).
+   pane_label = "{role}{n}"
+   # Placeholder until the user answers the plan's questions list item 1. "refuse" is the only rule built.
+   long_names = "refuse"
+   ```
+   `staff.worker_name(production, unit, role, number) -> str | Refused` fills `name_form` and checks herdr's agent-name rule `^[a-z][a-z0-9_-]{0,31}$` on the exact result. A name over 32 characters, or with another character, is refused with the name and the rule; it is never cut short (`herdr._agent_name` at `herdr.py:3092` truncates silently, which can join two workers into one name). `staff.pane_label(row) -> str` fills `pane_label`.
+8. **One machine name.** New `scripts/lib/machine.py` with `machine_name() -> str` (`socket.gethostname().split(".", 1)[0]`). Delete the copies at `scripts/message/roster.py:1829` and `scripts/production/stall_watch.py:623`; both call `machine.machine_name()`.
+9. **`staff.py seed`** makes the showrunner and unit rows match today's sources. A second run on the same sources leaves the file byte for byte the same.
+   - Showrunners: `showrunners.registered_showrunners()` (`showrunners.py:216`) reads this machine's update timers. Each gives `ensure("showrunner", production=slug, unit="", role="showrunner", number=0, agent="claude", name=<runner["session"] or slug>)`, then `rename` when the running session's name differs, and `set_parent(id, showrunners.parent_of(slug))` (`:427`).
+   - Units: for each showrunner's production doc (`runner["doc"]`), read the Units table with `production_units.unit_table` (`production_units.py:59`); skip a row where `unit_is_retired(cells, SessionMarks(slug))` (`:100`); add a unit only when its `Worktree` cell names a folder that exists on this machine. Each gives `ensure("unit", production=slug, unit=<Unit cell>, role="director", number=0, agent="claude", name=<the unit's live session name from live_units, else the Unit cell>)`.
+   - Rows whose source read succeeded and no longer lists them are retired. A source that cannot be read (an `OSError`, an unreadable doc) changes none of its rows and prints one stderr line naming it.
+   - Workers are not seeded: mesh workers stay in the unit worker ledger until their unit switches to panes, and `start-or-resume` adds pane workers (Phase 5). Self-made call: the record lacks mesh workers for the migration days; a reader that needs them still reads the ledger until the readers phase.
+10. **CLI.** `staff.py show [--kind K] [--production P] [--unit U] [--role R] [--retired] [--json]` prints one aligned row per staff row (id, kind, name, role, production, unit), sorted by production, kind, unit, role, number. `staff.py get <id or name> [--json]` exits 1 when not found. `staff.py ensure|rename|move|retire|seed [--dry-run]` call the write API and print the resulting row as JSON. Exit codes: 0 done, 1 not found, 2 refused or unreadable, with the reason on stderr.
+11. **Scope note (author's call).** This phase moves no reader and no writer; Phase 2 moves the writers and the readers phase moves the readers. Until then nothing reads the record, so its rows can trail the old sources without harm, and `seed` catches them up.
+
+**Files:**
+- `scripts/production/staff.py` — new: the row, the read and write API, `worker_name`, `pane_label`, `seed`, the CLI.
+- `config/staff.toml` — new: `name_form`, `pane_label`, `long_names`.
+- `scripts/lib/machine.py` — new: `machine_name()`.
+- `scripts/message/roster.py` — `machine_name` at :1829 replaced by `machine.machine_name()`.
+- `scripts/production/stall_watch.py` — `machine_name` at :623 replaced by `machine.machine_name()`.
+- `scripts/production/test_staff.py` — new: the tests in the Acceptance gate.
+- Read only: `scripts/production/showrunners.py`, `scripts/production/production_units.py`, `scripts/production/live_units.py` (the seed sources named above).
+
+**Workers:** `2 writers` — no test lane; the tests split from the module.
+- `impl` — `scripts/production/staff.py`, `config/staff.toml`, `scripts/lib/machine.py`, `scripts/message/roster.py`, `scripts/production/stall_watch.py`; hub: `scripts/production/staff.py` (the API the tests import).
+- `test` (opens as impl) — `scripts/production/test_staff.py`, written from the Spec alone, with the seed sources pointed at fixture folders through `STAFF_FILE`, `NOTIFIER_STATE_DIR` and `SHOWRUNNER_STATE_DIR`.
+
+**State:** `~/.local/state/staff/staff.json` and `staff.json.lock` (new). `seed` writes rows. A crash between the temp write and `os.replace` leaves the old file whole.
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:**
+- `basedpyright scripts/production/staff.py scripts/production/test_staff.py scripts/lib/machine.py scripts/message/roster.py scripts/production/stall_watch.py` and each caller module of `roster.machine_name` and `stall_watch.machine_name`: `0 errors, 0 warnings`.
+- `~/.claude/scripts/lib/py -m unittest discover -s scripts/production -p 'test_staff.py'` green, with these tests:
+  - `ensure` twice gives one row with the same id.
+  - `rename` to a name another active row holds is refused, and the file is unchanged.
+  - `by_id`, `by_name` and `find` by production, unit and role return the expected rows; a retired row is found only with `retired=True`.
+  - `worker_name("sdlc", "models", "impl", 1)` is `sdlc-models-impl1`; `worker_name("build-followups", "cargo-liner-style-names", "impl", 1)` is refused under `long_names = "refuse"`; a name with an upper-case letter is refused.
+  - Two processes that call `ensure` with the same key at the same time give one row.
+  - An exception raised before `os.replace` leaves the old file bytes.
+  - `seed` twice on fixture timers, parent files and a fixture production doc gives the same file bytes; a fixture doc that cannot be read leaves its rows and prints one stderr line.
+- The phase's full gate (Delegation Context → Test) green, run outside the build hold.
+- Behavior: `staff.py seed` then `staff.py show` on natedev lists the running showrunners and their units on this machine, each with an id; a second `seed` leaves `staff.json` byte for byte the same.
+
+### Phase 2 — Staff record writers  · status: todo
+
+#### Work Order
+
+**Goal:** every tool that adds, renames, moves or retires a showrunner or unit also writes the staff record, so the record stays current without `seed`.
+
+**Spec:** Each tool calls the `staff.py` write API after its own change succeeds, and a failed staff write fails the tool with the reason (the tool's own change stays; rerunning the tool, or `staff.py seed`, completes it). `add_showrunner.py` → `ensure` showrunner; `showrunners.py attach`/`detach` (:528, :557) → `set_parent`; `add_unit.py` and `resume_unit.py` → `ensure` unit; `retire_unit.py` → `retire` the unit and its workers; `rename_unit.py` and `rename.py` → `rename` (the id stays); `transfer_unit.py` → `move` the unit and its workers, then `rename` each worker to its new `worker_name`; `promote_unit.py` and `promote_showrunner.py` → `ensure` the new row and `retire` the old one. No reader changes in this phase.
+
+**Files:** `scripts/production/add_showrunner.py`, `showrunners.py`, `add_unit.py`, `resume_unit.py`, `retire_unit.py`, `rename_unit.py`, `rename.py`, `transfer_unit.py`, `promote_unit.py`, `promote_showrunner.py`; their tests (`test_*.py` and `*_test_support.py` beside each); `scripts/production/test_staff.py` (shared fixture helper only, if two test files need it).
+
+**Workers:** `2 writers` — split by tool group.
+- `impl` — add, resume, retire, promote tools and their tests; hub: `scripts/production/test_staff.py` (the one staff fixture helper).
+- `test` (opens as impl) — `showrunners.py`, rename, rename_unit, transfer_unit and their tests.
+
+**State:** rows in `~/.local/state/staff/staff.json`.
+
+**Constraints from prior phases:** Phase 1 built `staff.py` (`ensure`, `rename`, `move`, `set_parent`, `retire`, `worker_name`; `STAFF_FILE` for tests).
+
+**Acceptance gate:** basedpyright 0/0 on changed files and callers; each tool's tests assert the staff row after the tool runs; a test runs each tool's staff step twice and gets the same file; full gate green.
+
+### Phase 3 — Rename agents.conf to models.conf and /agent to /default_models  · status: todo
+
+**Blocked by:** the models unit's registry rewrite (`agents_registry.py` with `RegistryRow` and atomic edits; overlay files removed) and its shared config test fixture, landed on main.
+
+#### Work Order
+
+**Goal:** one name everywhere: `config/models.conf`, `MODELS_CONFIG_FILE`, `models_config.sh`, `models_registry.py`, `/default_models`; no live reference to the old names remains.
+
+**Spec:** One sweep in one commit, no fallback that reads an old name, agreed with the models unit before the edit. Renames: `config/agents.conf` → `config/models.conf`; `AGENTS_CONFIG_FILE` → `MODELS_CONFIG_FILE` (the overlay env var drops with the overlay); `scripts/agents/agents_config.sh` → `models_config.sh`; `scripts/lib/agents_registry.py` → `models_registry.py`; `commands/agent.md` → `commands/default_models.md`; `scripts/agents/agent_admin.sh` → `default_models.sh`; the models unit's shared fixture follows the file. `models_registry.py` is the one parser and the one path authority: the Python path constants (`progress_history.DEFAULT_AGENTS_CONFIG_PATH`, `context_usage.DEFAULT_AGENTS_CONFIG_PATH`, `codex_pacer.AGENTS_CONF`, `quota_alert.REGISTRY`) and the line parsers (`codex_pacer.py:440`, `quota_alert.py:704`, `context_usage.py:269`, `progress_history.py`) call it; bash callers get resolved values from one `models_registry.py` call per launch that prints shell assignments, so bash parses no registry line. The full usage list is Reference → Rename inventory; build the manifest from a repository search, not from that list alone. `affected_modules.py:109` names `agents_config.sh` and changes to `models_config.sh`. Add `scripts/agents/test_no_old_model_names.py`: it fails on any live (non-history) reference to `agents.conf`, `AGENTS_CONFIG_FILE`, `agents_config.sh`, `agents_registry` or the `/agent` command. Send the user the NixOS diff files (questions list item 5).
+
+**Files:** Reference → Rename inventory, plus `scripts/agents/test_no_old_model_names.py` (new).
+
+**Workers:** `2 writers` — split by tree. `impl` — `config/`, `scripts/agents/`, `scripts/lib/`, `scripts/direct/`, `commands/`; hub: `scripts/lib/models_registry.py`. `test` (opens as impl) — `scripts/whoami/`, `scripts/hooks/`, `scripts/astra/`, `scripts/history/`, `scripts/production/`, `scripts/notify/`, `scripts/cli_agent/`, `scripts/ask_a_friend/`, docs, and the new test.
+
+**State:** `config/agents.conf` moves to `config/models.conf`.
+
+**Constraints from prior phases:** none from Phases 1-2.
+
+**Acceptance gate:** `test_no_old_model_names.py` green; a second run of the sweep script changes no file; basedpyright 0/0 on changed files and callers; full gate green.
+
+### Phase 4 — herdr primitives for worker panes, and probes  · status: todo
+
+#### Work Order
+
+**Goal:** `herdr.py` can start an agent in a new split pane and set split ratios, and the probe answers are recorded in this plan.
+
+**Spec:** Add a split destination to `launch_prepared_agent` (`herdr.py:3165`): `SplitPane(of_pane, direction, ratio)` beside today's new tab, with the same environment proof, launch claim, prompt-once proof and cleanup. Add `Herdr.split_ratio(pane, ratio)` over the socket's `layout.set_split_ratio`, and `Herdr.pane_label(pane, text)`. Every split uses `--no-focus`. Probes, in a probe tab of `agents`, written into Reference → Probe results: which side `--ratio` measures; whether a close rebalances the rest; Codex and Claude queue a message typed mid-turn; herdr's Codex state over a 10-minute turn; prompt by path; both CLIs open an image by path from a prompt file; the exact Codex input that names a new session (help shows no `--name` flag; Claude uses `--name`); whether herdr's `resume_agents_on_restore` keeps each pane's `--env` (a positive answer retires our split-tab restore code, questions list item 3); whether interactive Codex picks up a new `auth.json` by itself (a positive answer retires the sign-in restart, Reference job 8).
+
+**Files:** `scripts/herdr/herdr.py`, `scripts/herdr/test_herdr*.py` (the existing launch tests), this plan's Reference → Probe results.
+
+**Workers:** `1 writer + 1 tester` — `impl`: `herdr.py`; `test` (opens as impl): the tests and the probes.
+
+**State:** none.
+
+**Constraints from prior phases:** none.
+
+**Acceptance gate:** basedpyright 0/0; launch tests cover the split destination and a failed start closing its pane; probe results written; full gate green.
+
+### Phase 5 — worker_panes.py: start-or-resume, close, layout, list  · status: todo
+
+#### Work Order
+
+**Goal:** `worker_panes.py start-or-resume <name> <role>` starts or resumes a worker in its director's tab with the registry's settings, and `close` refuses a pane that still has work.
+
+**Spec:** `start-or-resume`: `staff.ensure` the worker row (key production/unit/role/number from the director's run); when the pane is open and its process arguments (cwd, sandbox, model, effort, service tier) equal the registry lookup, do nothing; when they differ, close it and resume; when no pane is open, split the column (first worker: the director pane, `right`, ratio 0.667; later ones: the lowest worker pane, `down`), start with `--resume <name>` (Claude) or `codex resume <name>` when a conversation of that name exists, else a new session named `<name>`, then `layout`. The account comes from the accounts code as today (Codex: the `workers` role). The pane env carries `UNIT_RUN_DIR`, `UNIT_TEAM_ROLE`, `TMPDIR` and the dev shell through `launch_prepared_agent`. `close` passes only `can_close`: dispatch lock free; the last turn ends with a `DONE` line whose pass is recorded complete; no input after it; state `idle` or `done`; no live detached run of the worker. Otherwise it keeps the pane and names the blocker. `layout`: under a per-tab lock, set every split in the worker column to an even share; it changes only panes whose agent name starts with the tab's `<production>-<unit>-`, leaves other panes as they are, and gives focus back where it was. `list`: `herdr agent list` joined with `staff.find`. `rename <id> <new name>`: resume by the old name under the new name, then `staff.rename`.
+
+**Files:** `scripts/herdr/worker_panes.py` (new), `scripts/herdr/test_worker_panes.py` (new).
+
+**Workers:** `1 writer + 1 tester` — `impl`: `worker_panes.py`; `test` (opens as impl): `test_worker_panes.py` against a probe tab.
+
+**State:** staff rows; panes; `~/.local/state/staff/locks/<id>.lock`.
+
+**Constraints from prior phases:** Phase 1 `staff.py`; Phase 3 `models_registry.py`; Phase 4 `SplitPane`, `split_ratio`, `pane_label` and the probe results.
+
+**Acceptance gate:** tests: start, resume by name, settings change resumes, a second `start-or-resume` changes nothing, `close` refused with work left, `layout` twice gives the same ratios, a foreign pane untouched; basedpyright 0/0; full gate green.
+
+### Phase 6 — Dispatch and the launcher switch, landed dark  · status: todo
+
+#### Work Order
+
+**Goal:** with `WORKER_TRANSPORT=herdr` pinned in a run, `implement.sh`, `review.sh` and `assign.sh` dispatch through `worker_panes.py dispatch`; the default stays `mesh`.
+
+**Spec:** `dispatch`: take the worker's dispatch lock (non-blocking; held → exit "busy"); `start-or-resume`; check `idle` or `done`; append "End your final reply with the line `DONE <dispatch id>`." to the prompt file; run `herdr agent prompt <name> "Read <prompt path> and do the work it gives." --wait` (no timeout, no `--until`); then read the final reply from the worker's own transcript: a `DONE <dispatch id>` line → complete (write the reply file; for a reviewer, the findings file); `blocked` → exit 4; settled without the line while `herdr agent get` says `working` → `herdr agent wait <name>` again; settled without the line → exit 3 and the director reads the pane; `agent_prompt_stalled` or a timeout → never resubmit, exit 5. The launchers keep their status, recorder, board and summary work, and write `implemented` only on complete. `unit_runs.worker_transport(run)` reads `WORKER_TRANSPORT` from `config/direct.conf` at run start and pins it in the run folder. Restart: `inventory.py` keeps recording `launcher_command` (:861); a rebuilt launcher waits for the same dispatch id. Several implementers use `impl1`, `impl2`. Transport-aware text in `commands/unit/direct.md` (`<LongLivedWorkers/>`, `<WorkerRuns/>`, `<WorkerLaunchFailure/>`, `<FixDispatch/>`, `<PhaseCleanup/>`) lands with this phase, branched once on the run's pin.
+
+**Files:** `scripts/herdr/worker_panes.py`, `scripts/direct/implement.sh`, `review.sh`, `assign.py`, `scripts/lib/unit_runs.py`, `config/direct.conf`, `commands/unit/direct.md`, launcher tests.
+
+**Workers:** `2 writers` — `impl`: `worker_panes.py`, `unit_runs.py`, `direct.conf`; hub: `worker_panes.py`. `test` (opens as impl): the three launchers, `direct.md`, launcher tests.
+
+**State:** run pin file; dispatch locks.
+
+**Constraints from prior phases:** Phase 5 `start-or-resume`, `can_close`, locks.
+
+**Acceptance gate:** tests for long, fast, blocked, false-idle and stalled turns; two launchers at once get one dispatch and one "busy"; a mesh-pinned run is unchanged; full gate green.
+
+### Phase 7 — Messages, detached runs and review Stage 2  · status: todo
+
+#### Work Order
+
+**Goal:** messages, detached-run results and review Stage 2 reach a pane worker, and none is lost.
+
+**Spec:** `send.py` `worker:<name>` (and `worker:<unit>/<role>` through `staff.find`) types the text with `herdr agent prompt <name> <text>`; `agent_blocked` or no pane → the message goes to the director with one line saying why. `mesh_runs.py` becomes `detached_runs.py`: a run finds its worker by `HERDR_PANE_ID` and `staff.by_name`, and types its result into the pane. `assign.py` types Stage 2 with its own `DONE <dispatch id>-2` line, and the review launcher waits for that line. Usage refusals and settled-without-`DONE` turns go through one classifier in the accounts refusals layer (transcript evidence first, screen text as fallback); the pass status says `refused`, the pass stays open, and the director re-dispatches it after the move.
+
+**Files:** `scripts/message/send.py`, `scripts/direct/mesh_runs.py` → `detached_runs.py`, `scripts/direct/assign.py`, the refusals classifier module (agreed with the accounts unit), their tests.
+
+**Workers:** `2 writers` — `impl`: `send.py`, `detached_runs.py`; `test` (opens as impl): `assign.py`, the classifier, tests.
+
+**State:** none new.
+
+**Constraints from prior phases:** Phase 6 `dispatch` and exit codes.
+
+**Acceptance gate:** tests: a message during a turn arrives; a blocked or closed worker's message reaches the director; Stage 2 waits for its own line; full gate green.
+
+### Phase 8 — Shutdown and restore of split tabs (shutdown unit)  · status: todo
+
+#### Work Order
+
+**Goal:** a shutdown stops worker panes inside the bounded deadline, and a restart brings each director tab back with its workers resumed.
+
+**Spec:** Before the voluntary window, the shutdown record lists each worker pane: staff id, name, pane, pid and start time, scope, run, dispatch id when busy; `BoundedOwner` holds them under their director, and success needs a fresh observation that they are gone. Restore follows Phase 4's probe (questions list item 3): herdr's own resume keeps env → nothing to build; else one locked tab transaction rebuilds the director, then each worker with `start-or-resume`, then rebuilt launchers. Resume texts come from one builder, `worker_resume_prompt(cause, was_busy)`, used by shutdown, moves and launchers. Tab sort sorts a multi-pane tab by its director pane (`herdr.py:902-1300`).
+
+**Files:** `scripts/shutdown/inventory.py`, `stop.py`, `restart.py`, `shutdown_record.py`, `pane_restore.py`, `scripts/herdr/herdr.py` (tab sort), tests.
+
+**Workers:** `2 writers` — `impl`: stop and record; `test` (opens as impl): restart, restore, tab sort.
+
+**State:** shutdown records.
+
+**Constraints from prior phases:** Phases 4-6.
+
+**Acceptance gate:** shutdown tests with worker panes inside 66 s; restart twice gives one set of panes; full gate green.
+
+### Phase 9 — Account moves for pane workers (accounts unit)  · status: todo
+
+#### Work Order
+
+**Goal:** an account move relaunches each worker pane on the new account without a lost or forked conversation.
+
+**Spec:** Under the worker's dispatch lock: wait for or interrupt the turn, close the pane, prove the process gone, copy the conversation files to the new home and check them, `start-or-resume` on the new account, check the name resumes. On failure resume once on the source account and report. Retire `_retire_workers_servers` and `leftover_server_lines`.
+
+**Files:** `scripts/accounts/accounts.py`, `scripts/whoami/quota_alert.py`, `next_moves.py`, `worker_panes.py` (call only), tests.
+
+**Workers:** `1 writer + 1 tester` — `impl`: accounts code; `test` (opens as impl): tests.
+
+**State:** account homes; moves log.
+
+**Constraints from prior phases:** Phases 5-7.
+
+**Acceptance gate:** move tests (busy, idle, failure fallback); full gate green.
+
+### Phase 10 — Astra roles, ask-a-friend, displays and instructions  · status: todo
+
+#### Work Order
+
+**Goal:** Astra roles and ask-a-friend run in panes, every display reads workers from the staff record and herdr, and every instruction file describes panes.
+
+**Spec:** A held Astra role is a pane in the requesting director's tab (`design_roles.py` keeps its fences, loses its mesh calls); ask-a-friend opens a pane beside the caller and closes it at `end`. `roster.py`, `production_tree.py`, `codex_winddown.py`, `waste_watch.py`, `hierarchies/*`, `board_json.py` read workers from `staff.find` and `herdr agent list`. Instruction edits: Reference → Instruction edits.
+
+**Files:** `scripts/astra/design_roles.py`, `scripts/ask_a_friend/*`, the display modules named above, Reference → Instruction edits.
+
+**Workers:** `2 writers` — `impl`: code; `test` (opens as impl): docs and commands.
+
+**State:** none.
+
+**Constraints from prior phases:** Phases 5-7.
+
+**Acceptance gate:** tests for each changed module; no instruction file names a mesh verb outside a mesh-pinned branch; full gate green.
+
+### Phase 11 — Pilot and default switch  · status: todo
+
+#### Work Order
+
+**Goal:** herdr-unit's own next run works on panes, then the default becomes `herdr` and units switch at their run boundaries, Mac units after a Mac probe of Phases 4-5.
+
+**Spec:** Pilot one run; record any defect as a repair before the switch. Then set `WORKER_TRANSPORT=herdr` in `config/direct.conf`. Needs questions list items 3 and 5(c) answered.
+
+**Files:** `config/direct.conf`.
+
+**Workers:** `1 writer` — one line; the pilot is the director's.
+
+**State:** `config/direct.conf`.
+
+**Constraints from prior phases:** Phases 4-10.
+
+**Acceptance gate:** the pilot run's phases finish on panes; Mac probe passes; full gate green.
+
+### Phase 12 — Staff record readers  · status: todo
+
+#### Work Order
+
+**Goal:** every reader of who exists reads the staff record; live state still comes from herdr and session records.
+
+**Spec:** Move each reader in Reference → Staff record readers to `staff.find`/`by_name`/`by_id`; parent files move into `parent`; pane marks stay as the live link to a unit's pane. Add cross-machine reads where today's readers read the other machine.
+
+**Files:** Reference → Staff record readers.
+
+**Workers:** `2 writers` — `impl`: `scripts/production/`; `test` (opens as impl): `scripts/message/`, `scripts/shutdown/`, other modules.
+
+**State:** none.
+
+**Constraints from prior phases:** Phases 1-2.
+
+**Acceptance gate:** each moved reader's tests green; full gate green.
+
+### Phase 13 — Cleanup  · status: todo
+
+#### Work Order
+
+**Goal:** the mesh, the review pool, the old worker records and `WORKER_TRANSPORT` are gone, no later than 7 days after the default switch.
+
+**Spec:** Run only after a check that no run folder pins `mesh` and no mesh process is alive. Delete: Reference → Cleanup list.
+
+**Files:** Reference → Cleanup list.
+
+**Workers:** `2 writers` — `impl`: code; `test` (opens as impl): docs and tests.
+
+**State:** deletes state on disk (listed).
+
+**Constraints from prior phases:** all.
+
+**Acceptance gate:** `grep` finds no live `codex_mesh` reference; full gate green.
+
+## Reference
+
+### Job table (main at 7e85a74b)
+
+| # | Job today (codex_mesh.py unless named) | After |
+| --- | --- | --- |
+| 1 | App-server per run (`serve`, `idle-stop`, `sweep`) | Drop |
+| 2-3 | `start`, `follow` (:3308, :3408) | `start-or-resume` + `dispatch` (Phases 5-6) |
+| 4, 15 | Follow and slot claims (:3762; `impl_claim_*.json`) | Per-worker dispatch lock |
+| 5-6 | Compaction, "Continue where you stopped." | Drop (decision 8) |
+| 7 | Server retry | A failed start closes its pane and tries once in a new pane |
+| 8 | `signin-changed` (:7673) | Phase 4 probe; positive → drop, else resume restart |
+| 9 | `send`, `pending.json` | Decision 6 (Phase 7) |
+| 10-11 | `steer`/`interrupt`, `end` | `herdr agent send-keys <name> esc`; `close` |
+| 12 | `stop --pause` | Shutdown stops panes (Phase 8) |
+| 13-14 | `reopen`/`adopt`; unit worker ledger (workers.py:422-545) | `start-or-resume`; the staff record |
+| 16 | Pass recording in launchers | Keep |
+| 17 | `mesh_runs.py` | `detached_runs.py` (Phase 7) |
+| 18 | Wait markers | Drop markers; recorder waits stay |
+| 19-20 | Usage limits; account moves | Phases 7 and 9 |
+| 21 | Model per turn (710a6adb) | Lookup at start/resume; per dispatch (questions item 4) |
+| 22-23 | Review pool; unit reviewers | Drop the pool; reviewers are panes |
+| 24-25 | Astra roles; ask-a-friend | Panes (Phase 10) |
+| 26 | `board.log` | Keep; `reach=herdr` |
+| 27, 29 | Roster; displays | Staff record + `herdr agent list` |
+| 28 | Shutdown and restart of workers | Phase 8 |
+
+### Staff record readers (move in Phase 12; workers in Phases 6-10)
+
+- Showrunner tree: `showrunners.py:216, 398, 415, 427, 432, 491, 576`; `production_tree.py:111-127, 287`.
+- Units: `unit_lookup.py:316, 383, 392`; `production_units.py:59`; `live_units.py:32`.
+- Workers: `workers.py:529, 1564`; `remove_workers.py:65`; `assign.py:604`; `hierarchies/worker_owners.py:493, 606, 642`; `retire_unit.py:292`; `production_tree.py:156, 169, 231, 256`.
+- Joined readers: `message/roster.py:906, 958, 1050, 1123, 1185, 1344, 1694`; `production/broadcast.py:105-129` (through roster); `direct/board_json.py:371, 427`; `direct/phase_table.py:1664`; `shutdown/inventory.py:422, 427, 908, 1693`; `shutdown/stop.py:409`; `shutdown/restart.py:2848`; `production/codex_winddown.py:290, 304, 332`; `dailies_input.py:300, 1032`; `production_lifecycle.py:173, 353`; `promote_showrunner.py:124`; `rename.py:528, 645`; `rename_unit.py:240, 257, 273, 300, 673, 884, 982`; `rename_outside.py:143, 176`; `resume_unit.py:130`; `retire_unit.py:435`; `transfer_unit.py:459, 505`; `stall_watch.py:755, 771`; `unit_effort.py:206`; `waiting.py:153`; `add_showrunner.py:242`; `add_unit.py:1025`; `accounts/unit_watchdog.py:335`; `astra/design_roles.py:489`; `hierarchies/measure.py:1413-1416`; `nightly_review/nightly_review.py:122, 252, 273`; `style/add_style.py:333`; `style/style_plan.py:2952`; `usage/waste_watch.py:181`; `whoami/agent_accounts.py:239`.
+
+### Rename inventory (Phase 3)
+
+Config: `config/agents.conf`, `config/README.md:7, 14, 15, 20`, `.gitignore:23-26`. Commands: `agent.md`, `ask_a_friend.md:9`, `history.md:113`, `plan/phase_review.md:173`, `unit/direct.md:28`, `showrunner/add_unit.md:31`, `showrunner/promote_unit.md:18`, `api_review.md`, `module_review.md`, `team_review.md`; Codex mirrors regenerate through `claude_to_codex/sync.py`. Scripts: `agents_config.sh`, `sync_codex_catalog.sh`, `agent_admin.sh:95`, `agent_bg.sh:217, 253`, `agent_exec.sh:78`, `ask_a_friend/launch_friend.sh:54`, `production/add_unit.py:506`, `production/unit_effort.py:61-73`, `notify/review.py:667`, `production/affected_modules.py:109`, `progress_history.py:209, 283, 304`, `assign.py:400`, `demo_refusals.sh:20-24`, `hooks/context_usage.py`, `whoami/codex_pacer.py:6, 58, 440, 523`, `whoami/quota_alert.py:248, 723`, `whoami/profile_notes_pass.py:252`, `astra/design_roles.py:528`, `cli_agent/cli_agent.sh:6, 75`, `history/history.py:115, 121`, and their tests. Docs: the as-built docs that name the file, `docs/direct/launch_implementation.md:24, 72`. Leave: `scripts/settings/git_filters_table.sh:16` (history). NixOS: questions list item 5.
+
+### Instruction edits (Phases 6 and 10)
+
+`commands/unit/direct.md` (`<LongLivedWorkers/>`, `<WorkerRuns/>`, `<WorkerLaunchFailure/>`, `<CodexDispatchWait/>`, `<PauseForMove/>`, `<FixDispatch/>`, `<PhaseCleanup/>`, `<HeldAstraRoles/>`, `<ToolingContract/>`); `docs/direct/write_prompt_contract.md` (`<PhaseMesh/>` → `<PhasePanes/>`); `docs/direct/launch_implementation.md`, `dual_review.md`, `phase_end.md`, `run_phase_review.md`; `commands/unit/report.md`; `commands/showrunner/produce.md:287, 390, 476, 534, 1122-1123` and one paragraph on where workers show; `commands/showrunner/accounts.md`, `rename_unit.md`, `retire_unit.md`, `transfer_unit.md`; `commands/message.md`; `commands/codex_winddown.md`; `commands/shutdown.md`; `commands/ask_a_friend.md`; `commands/astra_review.md:32` (still starts `mesh_runs.py`); `docs/quota_alerts.md:19, 27, 39`; `commands/shot_report.md:11`; `skills/herdr/SKILL.md:109, 221` (through the NixOS file, questions item 5); `docs/production_format.md:39, 166`; `docs/accounts.md`. A final search for mesh paths outside history ends the phase.
+
+### Cleanup list (Phase 13)
+
+`codex_mesh.py` and its tests; `review_pool.py` and its state; the mesh parts of `workers.py` and the unit worker ledger; `mesh_roster.json`, `*.pending.json`, `mesh_*` run files; follow-claim code; `launch_friend.sh`, `end_friend.sh`; `[direct.options] codex_mesh`, `UNIT_CODEX_MESH`, `UNIT_COMPACT_ABOVE_TOKENS`, `WORKER_TRANSPORT`; shutdown's `CodexServer`, `codex_seats`, `PausedSeat`, `_CODEX_HEADLESS`, mesh pause and paused-workers note; accounts' server lines; display mesh code (`production_tree.py`, `process_table.py`, `waste_watch.py`, `hierarchies/*`, `shot_report/transcripts.py:1680`, `lint/tmp_sweep.py`); showrunner parent files once Phase 12 moved them; the Codex app-server homes; docs: rewrite `long-lived-workers.md`, remove `review-pool*.md`, update `herdr-adoption.md`, `session-roster.md`, `agent-registry.md`, `shutdown-and-restart.md`, `unit-board.md`, `usage-ledger.md`.
+
+### Probe results (Phase 4 writes them)
+
+none yet.
+
+### Risks
+
+1. herdr reads a Codex pane as `idle` mid-turn: only a `DONE <dispatch id>` line completes a pass (decision 4).
+2. A typed prompt stalls: one short line; never resubmit blindly.
+3. Reboot before Phase 8: no real unit uses panes before Phase 11.
+4. Account moves copy conversation files under a lock (Phase 9).
+5. Screen room: three or more workers in a 1/3 column are short; idle panes close; `herdr pane zoom` shows one.
+6. The user and a director type into one pane at once: a message queues; a dispatch needs `idle`.
+7. Two transports for days: the run pin and one resolver; cleanup checks no run pins `mesh`.
+
+### Copies this plan retires
+
+| Copy today | The one place after |
 | --- | --- |
-| 1 | **Drop.** Each worker is its own Codex or Claude process in a pane, so there is no server to start, watch or sweep. |
-| 2 | `worker_panes.py open`: split the column (section 3), then `herdr agent start <name> --kind codex\|claude --pane <id> -- <model, effort and sandbox args from models.conf>`. The pane env carries the account (`CODEX_HOME`, or `accounts.named_account_environment` for Claude), `UNIT_RUN_DIR` and `UNIT_TEAM_ROLE`. |
-| 3 | `worker_panes.py prompt`: check `herdr agent get` shows `idle` or `done`, then `herdr agent prompt <name> "Read <prompt path> and do the work it gives." --wait --timeout 60000` to confirm the turn started. On `agent_prompt_stalled`, read the pane once before any second try. |
-| 4 | **Drop the claim files.** Only the unit's director prompts its own panes. The idle check in 3 refuses a busy worker. |
-| 5, 6 | **Drop** (decision 6). |
-| 7 | **Drop the server retry.** A failed `agent start` closes its pane and tries once more in a new pane. A second failure is a launch failure under `<WorkerLaunchFailure/>`, rewritten for panes. |
-| 8 | **Replace with a check at turn end.** When a turn ends with the stale-token text, `worker_panes.py wait` restarts that pane's agent with resume on the current sign-in, and the launcher reports it. The sign-in path unit and launchd agent retire (nix: the user's change). |
-| 9 | `send.py` `worker:<unit>/<role>` resolves to the pane's agent name and types the message with `herdr agent prompt`. Codex and Claude both queue a message typed during a turn, so nothing is held. **Drop** `pending.json`. |
-| 10 | `worker_panes.py interrupt`: `herdr agent send-keys <name> esc`, then an optional prompt. |
-| 11 | `worker_panes.py close`: `herdr pane close`, then even out the column (section 3). |
-| 12 | Shutdown stops worker panes like any other agent pane (job 28). **Drop** `stop --pause`. |
-| 13, 14 | **Keep a smaller ledger.** One file per production/unit maps each role to its agent name, kind, conversation id, model and effort, with state `open` or `closed`. `reopen` becomes `open` with resume. Adopt, transfer and rename carry the file and move the panes with the director's tab (`herdr pane move`). |
-| 15 | **Drop** the slot claim files. Keep the run worker log only where a reader still needs it (cleanup check). |
-| 16 | **Keep unchanged** in the launchers. |
-| 17 | **Keep `mesh_runs.py`, renamed `detached_runs.py`.** A run finds its worker from `HERDR_PANE_ID` and the ledger, not `CODEX_THREAD_ID`. Delivery types the result into the worker's pane (`herdr agent prompt`). The "no launcher is attached" message to the director drops, because typing needs no launcher. |
-| 18 | **Keep** the recorder waits, called by `worker_panes.py wait` and detached runs. **Drop** the marker files. |
-| 19 | `worker_panes.py wait` reads the pane's last lines after each turn. A usage-limit text reports to `agent_notes.py blocked` as today and queues the workers move (job 20). **Drop** our capacity wait and retry: the CLIs retry an overloaded server themselves. |
-| 20 | An account move relaunches each worker pane on the new account. Wait for or interrupt its turn, carry the conversation file to the new home (the step `_move_worker` does today), close the pane, open a new one with the new env and resume, then type "Continue where you stopped." if a turn was cut. The accounts unit owns this. |
-| 21 | Start args come from `models.conf`. A running worker changes model with `/model`, typed by the user or by the director (risk 7). **Drop** per-turn resolution and the service-tier code. |
-| 22 | **Drop** the review pool and its state. |
-| 23 | A review worker is a pane like any other, its role `review`, started read-only (`codex -s read-only`, or Claude in plan mode). It is kept across rounds as today. |
-| 24 | A held Astra role is a pane in the requesting director's tab, named for its role. design_roles.py keeps its fences and saved prompts and replies, and loses its mesh calls. |
-| 25 | Ask-a-friend opens a pane beside the caller and closes it at `end`. |
-| 26 | **Keep.** Register lines say `reach=herdr` in place of `reach=codex_mesh.py`. |
-| 27 | The roster reads worker panes from `herdr agent list` joined with the ledger. Pool and design meshes drop out. |
-| 28 | Shutdown records each tab's pane layout and each worker's conversation id. Restart rebuilds the tab with the worker panes and resumes each worker. A worker that was mid-turn gets "Continue where you stopped." `codex_seats`, `PausedSeat`, `CodexServer` and the resume-prompt files drop. The shutdown unit owns this. |
-| 29 | Each display reads the ledger and `herdr agent list`. `codex_winddown.py` counts working Codex panes. The process-table mesh match drops. |
+| Hierarchy joined at each read from timers, parent files, Units tables, marks, worker ledgers, `mesh_roster.json`, run `workers` log, claim files | `staff.py` (Phases 1, 2, 12) |
+| `machine_name` in `roster.py:1829` and `stall_watch.py:623` | `scripts/lib/machine.py` (Phase 1) |
+| Config path per module; line parsers in Python and bash | `models_registry.py` (Phase 3) |
+| herdr launch paths: `codex_mesh start`, `agent_exec.sh` fresh review, `launch_friend.sh`, `herdr.launch_agent` | `herdr.launch_prepared_agent` with a split destination (Phases 4-5) |
+| Dispatch logic in three launchers | `worker_panes.py dispatch` (Phase 6) |
+| Resume texts (`stop.py:332-346`, `restart.py`, the mesh's) | `worker_resume_prompt(cause, was_busy)` (Phase 8) |
+| Usage-refusal matchers (`codex_mesh.QUOTA_REFUSAL`, `refusal_watch.py`, `settle.py`) | one classifier in the refusals layer (Phase 7) |
+| Test files that write their own `agents.conf` | the models unit's shared fixture (Phase 3) |
 
-**Session start.** Directors and showrunners already start through `herdr.launch_agent` (`add_unit.py`, `add_showrunner.py`, `restart.py`). After this plan, workers, reviewers, friends and Astra roles start through the same call into a split pane. Then herdr is the only way a session starts, apart from the user's manual `accounts.py exec`. That retires `agent_exec.sh`'s fresh-review path, the friend launcher and every app-server home.
+## Review record (team review 2026-10-30)
 
-## 3. The pane layout
+All four reviewer outputs were present. Claims about code were checked on `~/.claude` main at 7e85a74b.
 
-- **The director's tab.** With no worker, the director pane takes the full width. The first worker splits it: `herdr pane split <director pane> --direction right --ratio 0.667 --no-focus`. The director keeps the left 2/3 and the worker column takes the right 1/3. A probe confirms which side `--ratio` measures.
-- **Adding a worker.** It splits the lowest worker pane down. `worker_panes.py layout` then sets every split in the column to an even share, so k workers each get 1/k of the column. The CLI has no equalize command. The socket's `layout.set_split_ratio` (or one `layout.apply` of the whole tab) sets exact ratios.
-- **Closing a worker.** The pane closes, the column evens out again, and when the last worker closes the director takes the full width. Each operation ends with an even column, so the order of open and close does not matter.
-- **Focus.** Every split uses `--no-focus`, so the user's focus never moves.
-- **Opening and closing.** `implement.sh`, `review.sh` and `assign.sh` open a pane on dispatch when the role has none. Idle panes close at PhaseEnd's worker cleanup point (decision 5), and `end_session.sh` closes the rest. A pane the user opened is never closed by these tools.
-- **Names — a proposal, the user's go needed before anything changes.**
-  - Agent name: `<unit>-<role>` (`herdr-impl`, `herdr-test`, `herdr-review`). herdr allows `[a-z][a-z0-9_-]{0,31}`, unique on the server. Today's mesh names (`claude-natedev-herdr-impl`) exceed 32 characters for longer unit names. When two productions have a unit of the same name, the second takes its production prefix.
-  - Pane border label: the role alone (`impl`, `test`, `review`). The tab title already names the unit.
-  - Outside tabs (roster, worker names in messages) the joined form `production · unit · job` stays as the user picked it.
-- **What else must change for split tabs:**
-  - Tab sort leaves every multi-pane tab unsorted today (`WorkspacesKeptForSplitTabs`, herdr.py:902-1300). It must sort by the director pane.
-  - The herdr skill's local rule "start a new agent in a new tab, not a split pane" changes to permit worker panes in the director's tab.
+- R1 — Wrong wait semantics (`--timeout 60000`, `blocked` left out, no real completion guard: the launcher writes status, `implement.sh:629`). Correctness 1, risk 6, user impact 1, showrunner 2. Decisions 4-5; Phase 6.
+- R2 — Racy dispatch without claims. Correctness 2, architecture 1, user impact 4. Per-worker dispatch lock (Phases 5-6).
+- R3 — Busy refusal vs typed messages queue. Architecture 1, user impact 4, showrunner 3. Decision 6.
+- R4 — Closed panes lose messages and detached results. Correctness 3, risk 1, risk 8. `can_close` gate and director fallback (Phases 5, 7); a durable inbox dropped: nothing is outstanding when a pane may close.
+- R5 — Restart abandons the launcher. Correctness 4. `launcher_command` kept; rebuilt launcher waits for the same dispatch id (Phases 6, 8).
+- R6 — Early review Stage 2 approves early. Correctness 5. Stage 2 has its own `DONE` line (Phase 7).
+- R7 — Bounded shutdown has no worker-pane ownership. Risk 2. Phase 8.
+- R8 — Restore has two owners; `pane_restore.py` closes a whole tab (verified :95-105). Risk 3, user impact 3, showrunner 5. Phase 4 probe, Phase 8, questions item 3.
+- R9 — Pilot before its safety parts. Risk 4, user impact 6. Pilot moved to Phase 11; instructions branch on the pin from Phase 6.
+- R10 — Account moves not fenced. Risk 5. Phase 9.
+- R11 — `/model` vs resume; service tier dropped. Risk 10, user impact 5. Lookup at every start/resume includes tier; questions item 4.
+- R12 — Per-dispatch settings (cwd, sandbox, image, env). Correctness 8. `start-or-resume` compares and resumes; images by path (Phases 4-5).
+- R13 — Ledger states and competing records. Correctness 6, 7, 9; architecture 3. Replaced by the staff record (user 2026-10-30); owed continuation kept as a `refused` pass (Phase 7).
+- R14 — Names over 32 characters, order-dependent, silent truncation (verified `herdr.py:3092`). Correctness 10, architecture 9, risk 11, user impact 8. User's form; refuse placeholder; questions item 1.
+- R15 — Three launcher copies. Architecture 2. Decision 11.
+- R16 — `worker_panes.py` as a second herdr client. Architecture 4, risk 7, showrunner 3. Decision 10; Phase 4.
+- R17 — Layout ownership and focus. Architecture 5, user impact 7. Phase 5 `layout`.
+- R18 — Usage detection parsers and silent failure. Architecture 6, risk 9. One classifier (Phase 7).
+- R19 — Two registry parsers and paths; models unit's rewrite. Architecture 7, showrunner 1. Phase 3, blocked on the models unit.
+- R20 — Transport key in `models.conf`, no end date. Architecture 8, user impact 10, showrunner 7. Decision 12.
+- R21 — Rename inventory misses callers; `affected_modules.py:109` (verified). Architecture 10. Reference → Rename inventory; Phase 3 guard test.
+- R22 — Resume texts are not one constant. Architecture 11. Phase 8 builder.
+- R23 — Instruction inventory misses files (verified `astra_review.md:32`). User impact 9. Reference → Instruction edits.
+- R24 — Phase cleanup can close a newer user turn. User impact 2. `can_close` (Phase 5).
+- R25 — Read-only reviewers cannot write a status file (verified `review.sh:689`). Showrunner 7. Decision 4.
+- R26 — Numbered names for several implementers. Showrunner 7. Decision 2.
+- R27 — Keep idle panes open. Showrunner 4. Settled by the user: close (decision 3).
+- R28 — Dropping per-turn resolve undoes 710a6adb. Showrunner 7. Questions item 4.
+- R29 — Probe: interactive Codex and a new `auth.json`. Showrunner 6. Phase 4.
 
-## 4. Rename agents.conf to models.conf, and /agent to /default_models
-
-**When.** After the models unit lands its current change to `/agent` and the `agents.conf` writers (the overlay removal, ETA about 04:45). I agree the list below with the models unit before any edit. It is one mechanical sweep in one commit, with no fallback that reads the old name.
-
-**What is renamed.**
-
-- `config/agents.conf` → `config/models.conf`. The overlay name follows from the main name (`agents_overlay.sh:20`, `agents_registry.overlay_path()`), so it becomes `models.local.conf` by itself if the overlay still exists.
-- Env vars `AGENTS_CONFIG_FILE` → `MODELS_CONFIG_FILE` and `AGENTS_LOCAL_CONFIG_FILE` → `MODELS_LOCAL_CONFIG_FILE`. These are used in about 30 files, at about 115 places.
-- Code files:
-  - `scripts/agents/agents_config.sh` → `models_config.sh`
-  - `agents_overlay.sh`/`.awk` → `models_overlay.*`
-  - `scripts/lib/agents_registry.py` → `models_registry.py`
-  - The path constants: `progress_history.DEFAULT_AGENTS_CONFIG_PATH`, `context_usage.DEFAULT_AGENTS_CONFIG_PATH`, `codex_pacer.AGENTS_CONF` (with `profile_notes_pass.py:252`) and `quota_alert.REGISTRY`.
-  - The rename uses one name everywhere, so a reader never maps two names to one file.
-- `commands/agent.md` → `commands/default_models.md`. `scripts/agents/agent_admin.sh` → `default_models.sh`. Nothing named `default_models` exists, and it clashes with neither Claude Code's `/agents` nor `/model`.
-
-**Every usage (main at 7e85a74b).**
-
-| Area | Files |
-| --- | --- |
-| Config and ignore | `config/agents.conf`, `config/README.md:7, 14, 15, 20`, `.gitignore:23-26` (all three patterns) |
-| Commands | `agent.md`, `ask_a_friend.md:9`, `history.md:113`, `plan/phase_review.md:173`, `unit/direct.md:28`, `showrunner/add_unit.md:31`, `showrunner/promote_unit.md:18`. The generated Codex skill mirrors (`~/.codex/skills/generated-from-claude/*`) regenerate through `claude_to_codex/sync.py` |
-| scripts/agents | `agents_config.sh` (default path :22, about 34 error strings, 5 `mktemp` sites, comment :466), `agents_overlay.sh`/`.awk` (header text :104), `sync_codex_catalog.sh:2, 6, 35, 189, 396, 405`, `agent_admin.sh:95`, `agent_bg.sh:217, 253`, `codex_mesh.py:5387` (removed with the mesh). Tests: `test_agent_exec.py/.sh`, `test_agents_config.sh` (including fail messages that name `/agent`), `test_agents_overlay.py`, `test_launcher_tasks.sh`, `test_sync_codex_catalog.sh:12, 13, 478, 480` (they assert the `/agent` warning text) |
-| scripts/direct | `progress_history.py:209, 283, 304`, `assign.py:400`, `demo_refusals.sh:20-24`. Tests: `implement_launcher_test_support.py`, `review_launcher_test_support.py`, `recorder_fixture.py`, `test_assign_launcher.py`, `test_implement_launcher_follow.py`, `test_progress_history.py` (11 sites), `test_workers.py` |
-| Other code | `hooks/context_usage.py`, `whoami/codex_pacer.py:6, 58, 440, 523`, `whoami/quota_alert.py:248, 723`, `whoami/profile_notes_pass.py:252`, `astra/design_roles.py:528`, `cli_agent/cli_agent.sh:6, 75`, `history/history.py:115, 121` |
-| Other tests | `hooks/test_stop_direct_continue.py`, `whoami/quota_alert_test_support.py`, `test_codex_alert_accounts.py`, `test_profile_notes_pass.py`, `test_quota_alert_cancellation.py` (glob `agents.conf.*`), `astra/test_design_roles.py`, `production/add_unit_test_support.py`, `test_affected_modules.py`, `test_stall_watch.py`, `test_unit_effort.py`, `style/test_add_style.py` |
-| Docs | as-built: `agent-registry.md` (10 sites plus 15 `/agent`), `showrunner-automation.md`, `message-clarity.md`, `director-model-study.md` (plus its results JSON), `long-lived-workers.md`, `merge-gate-and-test-speed.md`, `style-showrunner.md`, `unit-progress-history.md`; `docs/direct/launch_implementation.md:24, 72`. Finished plans keep their text as history. |
-| Leave as is | `scripts/settings/git_filters_table.sh:16` and its test: a record of a retired filter |
-| /etc/nixos (not ours to edit; the change goes to the user) | `modules/common/claude-git-filters.nix:35` (`watchPaths`, functional), `codex-catalog-sync.nix` comments, `codex.nix:47`, `shell.nix:139` (`/agent`), `README.md:410` |
-
-`affected_modules.py` already treats any `config/*.conf` change as a full-suite trigger, so it needs no edit.
-
-## 5. Skill and instruction edits
-
-There is no `/unit:delegate` command and no `docs/delegate` folder on main (7e85a74b). The unit director's files are `commands/unit/direct.md` and `docs/direct/*.md`, and those are the ones edited.
-
-- **`commands/unit/direct.md`**:
-  - Rewrite `<LongLivedWorkers/>` for panes: open, resume, close at phase end, no compaction.
-  - `<WorkerRuns/>`: delivery into the pane, and cancel by record.
-  - `<WorkerLaunchFailure/>`: drop the app-server recovery and keep the one retry in a new pane.
-  - `<CodexDispatchWait/>`: only for a Codex director, if one remains.
-  - `<PauseForMove/>`: the mover stops and restores worker panes.
-  - `<FixDispatch/>` dispatch lines, `<PhaseCleanup/>` (close idle panes), `<HeldAstraRoles/>` (Astra panes), `<ToolingContract/>`.
-- **`docs/direct/write_prompt_contract.md`**: `<PhaseMesh/>` becomes `<PhasePanes/>`, and item 3 now says detached runs type their result into the pane. 75 lines name Codex, mesh or worker; each is checked.
-- **`docs/direct/launch_implementation.md`, `dual_review.md`, `phase_end.md`, `run_phase_review.md`**: the `assign.sh` and `review.sh` lines lose the pool and mesh text.
-- **`commands/unit/report.md`**: the worker table reads the ledger and herdr.
-- **`commands/showrunner/produce.md`**: lines 287, 390 (unit reviewers), 476, 534 and 1122-1123 ("leave Codex workers running"). Add one short paragraph that tells the user where workers show: the right column of each director's tab.
-- **`commands/showrunner/accounts.md`, `rename_unit.md`, `retire_unit.md`, `transfer_unit.md`**: worker moves become pane relaunches. `commands/message.md`: the `worker:` address. `commands/codex_winddown.md`, `commands/shutdown.md`. `commands/agent.md` becomes `default_models.md` (section 4). `commands/ask_a_friend.md`.
-- **`skills/herdr/SKILL.md`**: the local rules for worker panes in the director's tab.
-- **`docs/production_format.md:39, 166`; `docs/accounts.md`** ("Swapping the Codex workers account", "Automatic Codex moves").
-
-## 6. Cleanup list
-
-Each item is removed in the cleanup phase, after no run uses the mesh (section 7, step 7).
-
-- **Code to delete:**
-  - `scripts/agents/codex_mesh.py` and `test_codex_mesh.py`.
-  - `scripts/direct/review_pool.py`, its tests, and `config/review/code.md` if nothing else reads it.
-  - The mesh parts of `workers.py`: pause, adopt, allocation, `transfer-reviewers`, `open_unit_worker`.
-  - The follow-claim code in the three launchers.
-  - `ask_a_friend/launch_friend.sh` and `end_friend.sh`, replaced.
-- **Config:**
-  - `[direct.options] codex_mesh` and the `UNIT_CODEX_MESH` env var.
-  - `UNIT_COMPACT_ABOVE_TOKENS` in `config/direct.conf`.
-  - The `implement.sh` permission text in `settings.json:442`, if the launcher's name changes.
-- **Shutdown code** (shutdown unit):
-  - `CodexServer`, `codex_seats`, `PausedSeat` and `_CODEX_HEADLESS` in `inventory.py`, `session_types.py` and `shutdown_record.py`.
-  - The mesh pause and server code in `stop.py`.
-  - The paused-workers note and resume-command builder in `restart.py`.
-  - The Codex server lines in `shutdown.py status`.
-  - The "Codex workers are paused" test in `test_account_move.py`.
-- **Accounts code** (accounts unit): `_retire_workers_servers`, `leftover_server_lines` and the roster scan in `accounts.py --detail`.
-- **Displays:**
-  - The mesh edges in `production_tree.py`.
-  - The mesh match in `process_table.py`.
-  - The waits and compaction in `waste_watch.py`.
-  - The mesh `end` in `hierarchies/worker_owners.py`; `hierarchies/measure.py`.
-  - `shot_report/transcripts.py:1680`.
-  - The `mesh_runs` path in `lint/tmp_sweep.py`.
-  - `board_json.py` worker rows.
-- **State on disk:**
-  - `mesh_*` files and `*.pending.json` in old run folders under `/tmp/claude/unit/`.
-  - `~/.local/state/review-pool/`.
-  - The Codex app-server homes used only by the mesh.
-  - The ledger files, rewritten to the small form.
-- **Outside the repo (the user's changes):**
-  - The sign-in path unit (NixOS) and the launchd agent (Mac) that run `signin-changed`.
-- **Docs:**
-  - Rewrite `as-built/long-lived-workers.md` as the pane design.
-  - Remove `review-pool.md` and `review-pool-probes.md`.
-  - Change the herdr-adoption "Why: Codex workers stay headless" to the new decision, with the reason.
-  - Update `session-roster.md`, `agent-registry.md` ("Addressable codex workers"), `shutdown-and-restart.md`, `unit-board.md` and `usage-ledger.md`.
-
-## 7. Migration order, so running units keep working
-
-The transport is a per-run choice: `[direct.options] worker_transport = mesh|herdr` in `models.conf`. It is read at run start and pinned in the run folder. A run that started on the mesh finishes on the mesh, and units move over one at a time at a run boundary. Both transports live side by side until step 7.
-
-| Step | Work | Owner (proposed) | Needs |
-| --- | --- | --- | --- |
-| 1 | **Rename** `agents.conf` → `models.conf`, `/agent` → `/default_models` (section 4), including the models unit's shared test fixture | models unit or herdr-unit, agreed with models | models unit's overlay removal and shared fixture landed |
-| 2 | **`worker_panes.py`**: open, prompt, wait, interrupt, close, list, layout, with tests against a probe tab of `agents`. Probes: the `--ratio` side; whether closing a pane rebalances the rest; Codex queuing a message typed mid-turn; herdr's Codex state over a long turn; prompt by path; resume after close | herdr-unit | — (can run beside step 1) |
-| 3 | **Shutdown and restore of split tabs**: record each tab's pane layout and worker conversation ids, rebuild and resume on restart, sort multi-pane tabs by the director pane. Settle with the user whether to set herdr's `resume_agents_on_restore = false` (natedev's config has no `[session]` section today, so herdr's own resume is on) | shutdown unit | step 2 |
-| 4 | **Transport switch** in `implement.sh`, `review.sh`, `assign.sh`; `detached_runs.py` delivery; send.py `worker:`; roster; the small ledger. Pilot: herdr-unit's own next run | herdr-unit | steps 2, 3 |
-| 5 | **Account moves and usage limits** for pane workers (section 2, rows 19-20) | accounts unit | step 4 |
-| 6 | **Astra roles and ask-a-friend** in panes; skill and doc edits (section 5); then switch units over one by one at their run boundaries, Mac units included | herdr-unit with the guilds and sdlc owners of those files | steps 4, 5 |
-| 7 | **Cleanup** (section 6), after a check that no run folder pins `worker_transport = mesh` and no mesh process is alive | herdr-unit, shutdown unit, accounts unit for their parts | every unit switched |
-
-A reboot before step 3 lands would lose worker panes, so no real unit uses panes before step 3.
-
-## 8. Risks
-
-1. **herdr reads a Codex pane wrong** (`idle` or `unknown` mid-turn). This could close a pass early. Decision 2 guards against it: only the worker's status file ends a pass. Step 2 measures herdr's Codex state over long turns.
-2. **Typed prompts stall or garble** in a terminal UI. A prompt is one short line that names a file. `--wait` reports a stall, and the launcher reads the pane before any second try.
-3. **Workers lost on a reboot** until split-tab restore lands (step 3). herdr's own resume is on today on natedev, and our restore clears herdr's restored layout. These two must agree before any unit uses panes.
-4. **Account moves:** the pane env is fixed when the pane is made, and Codex keeps conversations under `CODEX_HOME`. A move must carry the conversation file and open a new pane. This is the hardest port, and it is why it has its own step.
-5. **Usage limits are no longer retried by our code.** The director learns of a limit only from the end-of-turn read in `worker_panes.py wait`. A limit text that the read does not match leaves a worker idle with no alert. The match uses the same text `codex_mesh` matches today, with tests.
-6. **Screen room.** Three or more workers in a 1/3 column on a laptop screen are short. Idle panes closing at phase end (decision 5) keeps the count low. Zoom (`herdr pane zoom`) shows one pane at full size.
-7. **`/model` in Codex is a picker, not a one-word command.** A director script that drives it with keys is fragile. The director changes a running Codex worker's model by restarting its pane with resume and new args. The user can type `/model` by hand at any time.
-8. **The user and the director typing into one pane at the same moment.** The director checks `idle` before typing, and a user's typing during a turn queues like any message. herdr can't lock a pane against the user, and it should not.
-9. **Shutdown ownership.** Each worker pane is its own process in its own scope. The bounded stop must record worker panes as owned by their director, or a stop reports them as unknown and fails (the round 8 conservative rule). This is the shutdown unit's part of step 3.
-10. **Name length and uniqueness.** herdr names are at most 32 characters and unique on the server. The proposed `<unit>-<role>` names need the user's go, and a check that refuses a clash.
-11. **Mac parity.** Mac directors run in the Mac's herdr. Step 6 switches Mac units only after a Mac probe of steps 2-3.
-12. **Two transports at once** for days. A run pins its transport at start, and the cleanup checks that no run pins the mesh before anything is deleted.
-13. **The NixOS edits** (git filter `watchPaths`, sign-in units) are the user's. Until the user changes the git filter watch path, the filter does not refresh when `models.conf` changes. The rename step sends the user the exact edit.
-
-## 9. Copies this plan retires, and the one place for each
-
-The sdlc standard (2026-10-30) applies to every step. Each work order and review prompt this plan sends carries these four lines beside the Three Gods:
-
-1. Good engineering first, not after the user notices. Before a worker writes code, ask: is there already one place for this? Use it, or make it, then call it.
-2. No copies. A second copy of setup, a fixture, a config writer, a parser or a helper is a defect. Reviews flag it; you send it back. A test helper that each file writes for itself goes into one shared helper.
-3. When many things break the same way, the copy is the cause. Name it first in your report, with the one-place fix, before anyone asks.
-4. Fix at the cause, never a patch at each site.
-
-| Copy today | Where the copies are | The one place after this plan | Step |
-| --- | --- | --- | --- |
-| Test files that write their own `agents.conf` | 26 test and fixture files under `scripts/` (launcher test supports, `recorder_fixture.py`, `test_progress_history.py`, `add_unit_test_support.py`, `quota_alert_test_support.py`, `test_design_roles.py`, …) | The models unit's shared `agents.conf` test fixture (its main-red fix, 2026-10-30, before 02:00). This plan adds no second fixture. Step 1 renames that fixture with the file (`models.conf`, `MODELS_CONFIG_FILE`) and checks that no test still writes its own config | models unit (fixture), 1 (rename) |
-| The config file's path, stated per module | `progress_history.DEFAULT_AGENTS_CONFIG_PATH`, `context_usage.DEFAULT_AGENTS_CONFIG_PATH`, `codex_pacer.AGENTS_CONF`, `quota_alert.REGISTRY`, the bash default in `agents_config.sh:22`, `agents_overlay.sh:19`, `sync_codex_catalog.sh:6` | `models_registry.registry_path()` in Python, and `models_config.sh` exports the one path for bash | 1 |
-| Line parsers of the config | `codex_pacer.py:440`, `quota_alert.py:704`, `context_usage.py:269`, `progress_history.py` each split `registry_text()` lines themselves; `agents_config.sh` parses again in bash | `models_registry.py` gives typed lookups (`resolve(function, subtask)`), and every Python caller uses them. The bash resolver stays as the one bash parser, and a shared test feeds both the same file so they can't drift | 1 |
-| Worker identity records | `mesh_roster.json`, the unit worker ledger, the run `workers` log, `impl_worker_*.json`, `impl_claim_*.json` | The small ledger (section 2, rows 13-15), read through `worker_panes.py` | 4 |
-| herdr calls against worker panes | would spread over the launchers, send.py, detached runs, roster and shutdown | `worker_panes.py` alone; the others call it | 2 |
-| Session start paths | `codex_mesh start`, `agent_exec.sh` fresh review, `launch_friend.sh`, `herdr.launch_agent` | `herdr.launch_agent`, with `worker_panes.py open` as its split-pane form | 4, 6 |
-| Codex process detection | `process_table.is_codex_agent`, `codex_winddown.py`, `inventory._CODEX_HEADLESS`, `stop._mesh_server_roots` | `herdr agent list` joined with the ledger, through `worker_panes.py list` | 7 |
-| Resume and continue texts | `stop.RESUME_PROMPT`/`IDLE_RESUME_PROMPT`, `restart.restart_note`, the mesh's "Continue where you stopped." | One constant in `worker_panes.py`, used by shutdown, moves and the launchers | 3, 5 |
-| Usage-limit text matching | `codex_mesh.QUOTA_REFUSAL`, and matchers in `whoami` | One matcher, used by `worker_panes.py wait` and `quota_alert` | 5 |
+Refuted: none. Dropped: none.
