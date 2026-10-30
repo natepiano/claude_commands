@@ -20,6 +20,8 @@ remain only for the pending archive cleanup; they do not dispatch new reviews.
 
 **Production lifecycle tests.** `test_production_lifecycle.py` restores a private Git origin, checkout and tool seed at the same paths for each test. `production_lifecycle_test_support.py` invokes the real lifecycle CLI in-process with its environment, working directory and import-time state restored for each call. Git pushes, rejection hooks, linked worktrees and external commands still run as real processes; a CLI parity case compares subprocess status and output. No production behavior, timing bound or original assertion is replaced.
 
+**Offload cleanup tests.** `test_offload_cleanup.py` keeps the real sh/zsh cleanup and selector protocols; the results, leftovers and takeover modules cover the command outcomes. `offload_cleanup_test_support.py` copies a private Git and tool seed at the original paths for each case and creates fresh FIFO descriptors. Ordinary calls reuse the existing in-process CLI helper; claim-owner exit, streaming and timeout cases retain real subprocesses and the two-second timeout assertion.
+
 ## How it works
 
 ### The gate: `scripts/production/merge_gate.py`
