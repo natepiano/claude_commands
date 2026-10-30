@@ -253,7 +253,7 @@ including the details to make it clear
 **Assertion-Change:** `scripts/buildlog/test_record_rerun.py` — `assert_health_line` (regex and report filter), `assert_persistent_publish_error_recovers`, `test_clean_log_adds_no_recorder_health_line` and `test_health_uses_the_users_local_midnight_and_existing_local_time_format` expect the new per-machine line (`natedev: … records the recorder has not finished; … — run buildlog launches on natedev`, singular for 1) in place of `records not published yet`; the Spec's label and line form. `assert_health_line` takes an exact error count (was the pattern `[1-9][0-9]*` with `errors?`) and filters report rows on `the recorder has not finished`, so singular rows keep the full equality check; the persistent-retry case expects `attempt + 2` errors and the local-midnight case `1 recorder error since …` (was `1 recorder errors since …`). Each change pins a count the old pattern left loose.
 **Assertion-Change:** `scripts/buildlog/test_sync.py` — `test_non_255_ssh_exit_uses_printed_success` expects `ssh, rsync, rsync` (was `ssh, rsync`) and `test_only_natedev_pushes_ci_and_no_host_pulls_it` expects one push on the Mac too, without `ci/` (was none): the snapshot now creates the Mac's host folder, so its push runs.
 
-### Phase 4e — build-why and /build:queue show how long the first step has been head, who bumped which steps since it joined, the order window and a cargo-token wait  · status: todo
+### Phase 4e — build-why and /build:queue show how long the first step has been head, who bumped which steps since it joined, the order window and a cargo-token wait  · status: done
 
 #### Work Order
 
