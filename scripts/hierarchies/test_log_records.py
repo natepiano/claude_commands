@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime, timezone
 import unittest
 
 from scripts.hierarchies import log_records
@@ -53,6 +54,58 @@ def read_report_blocks(output: str) -> list[log_records.MeasureRow]:
             fields["window"], fields["source"],
         ))
     return rows
+
+
+class ReportTimeTest(unittest.TestCase):
+    def test_date_only_window_end_includes_that_day_and_time_end_stays_exclusive(self) -> None:
+        now = datetime(2026, 11, 1, tzinfo=timezone.utc)
+        expected = log_records.Window(log_records.required_time("2026-10-23"), log_records.required_time("2026-10-31"))
+        self.assertEqual(log_records.parse_window("2026-10-23..2026-10-30"), expected)
+        self.assertEqual(log_records.window_bounds("2026-10-23", "2026-10-30", now), expected)
+        timed = log_records.parse_window("2026-10-23T12:00:00Z..2026-10-30T12:00:00Z")
+        self.assertEqual(timed, log_records.Window(datetime(2026, 10, 23, 12, tzinfo=timezone.utc),
+                                                  datetime(2026, 10, 30, 12, tzinfo=timezone.utc)))
+        self.assertFalse(timed.contains(timed.until))
+        for text in ("2026-10-31..2026-10-30", "2026-10-30T12:00Z..2026-10-30T12:00Z"):
+            with self.subTest(window=text), self.assertRaises(ValueError):
+                _ = log_records.parse_window(text)
+
+    def test_strict_timestamps_keep_offsets_and_refuse_an_unrecorded_offset(self) -> None:
+        expected = datetime(2026, 10, 13, 21, 24, tzinfo=timezone.utc)
+        for value in ("2026-10-13T21:24:00Z", "2026-10-13T17:24:00-04:00", expected):
+            with self.subTest(value=value):
+                at = log_records.strict_time(value)
+                self.assertEqual(at, expected)
+                self.assertIsNotNone(at.utcoffset())
+        for value in ("2026-10-13T17:24:00", datetime(2026, 10, 13, 17, 24)):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "offset"):
+                _ = log_records.strict_time(value)
+        for value in ("bad time", "", 1791926640):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _ = log_records.strict_time(value)
+        self.assertEqual(log_records.required_time("2026-10-13T17:24:00").tzinfo,
+                         log_records.required_time("2026-10-13").tzinfo)
+
+
+class SourceProblemTest(unittest.TestCase):
+    def test_problem_identity_preserves_source_kind_and_skipped_count(self) -> None:
+        state = log_records.SourceProblem("same input", "access denied", log_records.SourceNotApplicable.STATE)
+        phases = log_records.SourceProblem("same input", "access denied", log_records.EventSource.PHASES)
+        skipped_one = log_records.SourceProblem("same input", "access denied", log_records.EventSource.PHASES,
+                                                log_records.RowsSkipped(1))
+        skipped_two = log_records.SourceProblem("same input", "access denied", log_records.EventSource.PHASES,
+                                                log_records.RowsSkipped(2))
+        repeated = log_records.SourceProblem("same input", "access denied", log_records.EventSource.PHASES)
+        problems = list(dict.fromkeys((state, phases, skipped_one, skipped_two, repeated)))
+        self.assertEqual(problems, [state, phases, skipped_one, skipped_two])
+        window = log_records.parse_window("2026-10-13..2026-10-19")
+        rows = log_records.source_problem_rows(problems, window)
+        self.assertEqual([(row.event_source, row.quantity) for row in rows], [
+            (log_records.SourceNotApplicable.STATE, log_records.NotRecorded("access denied")),
+            (log_records.EventSource.PHASES, log_records.NotRecorded("access denied")),
+            (log_records.EventSource.PHASES, log_records.Diagnostic(1, "access denied")),
+            (log_records.EventSource.PHASES, log_records.Diagnostic(2, "access denied")),
+        ])
 
 
 class ReportBlocksTest(unittest.TestCase):

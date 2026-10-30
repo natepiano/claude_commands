@@ -173,24 +173,18 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Ruled out:** ending a named worker of a live director; ending OwnerUnknown before recovery fails; editing `codex_mesh.py` or `end_session.sh` from this unit.
 
-### Phase 6 — The four-week review: which waits slow Hana, which links helped, and which trial steps stay  · status: todo
-**Depends on:** the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), Phase 15's checkpoint (`compare` prints through its `blocks`), and four weeks from the experiment start in design doc Step 2: the first day on which each holder producer (builds' `verify.sh`, models-unit's `codex_mesh.py`) has recorded a `NamedHolder`, read live from `progress_history.py waits`. At Phase 10's checkpoint (bece20e1) neither had, and Step 2 says `start not set`; the unit director sets the start and the review date when both have. The phase starts on the latest of these dates, never before.
+### Phase 6a — `compare` sets a later window beside the Baseline, row by row, built and tested on fixtures  · status: done
+**Depends on:** the checkpoints of Phases 3, 4, 5 and 7–15 (all done). Not on the review dates: this phase builds and tests `compare` on fixtures, so the four-week review (Phase 6) only runs it. Split from Phase 6 on 2026-10-30 by the unit director (packaging only; the finished review is the same).
 
 #### Work Order
 
-**Goal:** design Step 5: the doc reports which waits slow Hana (HI7), which Hana links helped (HI2), and keep or drop for each trial step (HI1).
+**Goal:** `measure.py compare --before <window> --after <window>` prints every Baseline row for both windows with the change, and sets the waits beside their named causes, so the Phase 6 review is a run of this command and a write-up of its output.
 
-**Hana link:** direct. The review keeps a step only by its effect on Hana.
+**Hana link:** direct. The review keeps a trial step only by its effect on Hana, and this command is how that effect is read.
 
 **Spec:**
 - `measure.py compare --before <Baseline window> --after <the four-week window>`: the same rows for both windows, each with before, after and the change; `not recorded` rows stay `not recorded`. The windows differ in length (7 days and 28 days), so each count row (merges, closures, pushes, waits) prints a rate per week, never a raw total, and the change is between the two rates. A row whose source covers only part of a window prints its covered days beside the rate and is marked partial.
 - Set quota and memory waits beside same-hour non-Hana tokens on the same role account and non-Hana build memory on natedev. If the records show non-Hana work slowing Hana, bring a new proposal (HI10); there is no size threshold. Records show it only when a record names a non-Hana cause for a Hana wait: a `WaitingForSupplier` wait whose record names non-Hana work, or a quota or memory wait whose record, or the slot or hold record that covers the whole wait, names a non-Hana holder of that account, slot or memory. Load in the same hour is context, never proof. Holder fixtures: a wait whose holder is `MalformedHolder` for its whole time, and one named for part of its time and then `MalformedHolder`; each keeps its wait count, reports exact named and not-named minutes, and its malformed minutes never count toward non-Hana cause. A wait with no named cause is reported as cause not recorded, with its minutes and n, and does not count. Report each wait with a named non-Hana cause with its minutes and n. The holder comes from Phase 10's holder history: a wait counts as non-Hana-caused only for the minutes a named non-Hana holder covers; a wait whose holder is named for part of its time reports the named and not-named minutes apart.
-- Design doc section **Results**: per step, the measure, its change, keep or drop. The link records (Step 3) set beside Hana merges and closures.
-
-**Files:**
-- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — `compare`
-- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — `audit()` per window
-- `docs/plans/build-followups-hierarchies-design.md` — Results
 
 **Spec additions (architect review after Phase 7, 2026-10-29):**
 - Coverage: a rate per week needs the covered days of each source. Give recorded coverage, an unavailable source and unknown coverage distinct domain types (no bare `None`); event timestamps alone never prove continuous coverage. Fixtures: empty but covered, partly covered, missing, corrupt.
@@ -202,13 +196,55 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - Hourly inputs: `read_tokens` sums by repository and drops the time and the role, so the same-hour token row needs a per-hour, per-account view that keeps them; `BuildStep` has no memory field, so non-Hana build memory needs a named source, or the row prints `not recorded` with its reason. Fixtures: an account change inside one hour, a retired holder, a missing attribution, a build across two hours.
 - Present-state rows (`pending_attention`, capacity, rank coverage) read the state now, and the design doc says their history cannot be rebuilt. `compare` uses the recorded Baseline snapshot for the before side, prints `comparison unavailable` where none exists, and gives a per-week rate only for window event counts. Since Phase 9, the waiting-change count reads earlier lists too; report that visibility change apart from backlog growth.
 
+**Files:**
+- `scripts/hierarchies/measure.py`, `scripts/hierarchies/test_measure.py` — `compare`
+- `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_push_audit.py` — `audit()` per window
+- `config/hierarchies/coverage.toml` — recorded coverage per source (added in repair round 1)
+- `scripts/hierarchies/log_records.py`, `scripts/hierarchies/test_log_records.py` — the one window parser and the one strict time parser (added in repair round 2, so `compare` copies neither)
+
 **Workers:** `1 writer + 1 tester`
-- `impl` — `measure.py`, `push_audit.py` and the doc
-- `test` — `test_measure.py` and `test_push_audit.py`: `compare` on fixtures with known before and after values, and the fixtures above
+- `impl` — `measure.py`, `push_audit.py`, `log_records.py`, `coverage.toml`
+- `test` — `test_measure.py`, `test_push_audit.py`, and `test_log_records.py`: `compare` on fixtures with known before and after values, and the fixtures above
+
+Assertion-Change: scripts/hierarchies/test_measure.py::SourcesTest::test_sqlite_loaders_filter_machine_join_cwd_and_keep_store_read_only — `read_builds` now takes a problems list (bad rows are counted, not fatal); the call adds `[]` and the expected 120 seconds is unchanged.
+Assertion-Change: scripts/hierarchies/test_measure.py::ComparisonTest::test_coverage_file_drives_live_loader_rates_and_leaves_unclaimed_sources_unknown — repair round 2 (F010): a rate counts only events inside covered intervals; all eight after pushes fall in a recorded gap, so after becomes 0.0/week (n 0, change -2.0/week) instead of the gap-inflated 4.0/week.
+Assertion-Change: scripts/hierarchies/test_measure.py::ComparisonTest::test_bad_build_rows_keep_good_minutes_and_one_diagnostic_in_baseline_and_compare — repair round 2 (F013): skipped rows are a typed problem kind that keeps coverage and marks the rate; each side keeps its amount, covered days, change and n and adds `; incomplete: 2 rows skipped`.
+
+**State:** none. `compare` reads logs and records only.
+
+**Coverage record (unit director, repair round 1, 2026-10-30):** live sources record no coverage bounds, so live `compare` printed no rate. Coverage is a recorded claim in `config/hierarchies/coverage.toml`: per source key `since`, `evidence` (the commit that started the writer) and optional `gaps` (`from`, `to`, `reason`). Covered time is `since` to the run time minus gaps, clipped to each window. A source with no entry stays coverage unknown; a malformed entry is a named source problem. Values come from git history, never from the log's own event times. `--full` prints one row per measure per window; a bad build row is counted and named, and the good rows stay.
 
 **Constraints from prior phases:** shared log helpers live in `scripts/hierarchies/log_records.py`; `measure.py` imports `push_audit.py`, never the reverse; session names come only from `config/hierarchies/sessions.toml`. The wait records come from `progress_history.py waits` (phases-unit 820357a2; holder and origin fields from 49fd1b0f) through the Phase 4 loader and types. Phase 11's repair reads origin fields into `RecordedOrigin` / `OriginNotRecorded`; Phase 10 adds the unresolved-origin row and the holder history, and this review keeps that uncertainty visible. From Phase 8: `measure.py baseline` and `push_audit.py report` print a short summary by default and their tables under `--full`; `compare` prints the same way. From Phase 12 (c60f1809): `push_audit.py` classifies a delivery by the exception in force at its delivery time, so a `nate.adhoc` delivery after a failed check from 2026-10-29T03:05:59Z on is `Unapproved` and every other exception stays; the wait share is the union of completed known-kind waits of the Hana phases that finished in the window, divided by those phases' exact intervals, with waits matched by run id and phase instance id; production hand-offs with no phase print as their own row with n, outside the share; the `Hana wait` and `Hana wait holders` coverage rows count the same phase population. From Phase 13: `progress_history.py waits` reports a bad holder record as `MalformedHolder` with its reason; `measure.py` reads it as a holder not named and keeps the wait, and a `MalformedHolder` never counts as a named non-Hana holder. From Phase 15: `compare` prints its tables through `log_records.blocks`, so no line is wider than `PHONE_WIDTH` except a line that holds one word longer than it (a path, a hash), which stays whole. From Phase 13: `worker_owners.py end` keeps a pending cleanup record (`end-cleanup.json`) for each worker whose end saved `ended` but whose server cleanup did not finish; `report` counts them as `end_cleanup_pending`, and `end` output and `ends.jsonl` carry each outcome (`end cleanup finished`, `failed: exit N`, `kept: roster unreadable: …`, `dropped: …`). Live cleanup needs models-unit's `codex_mesh.py end --cleanup-only`. From Phase 14 (97aa0200): `update_registration.py answer` keeps an answered record per item in `outstanding/<slug>.answered.jsonl` for 48 hours only; a later answer with the same text replaces the earlier record, a wrap removes the file, and a record holds the answer time but not the time the question was opened. So `pending_attention`'s "no answer history or answered_at" reason is now wrong: rewrite it to say the answer history kept is a 48-hour replay record, and add a fixture where recent answered records exist and the row still reports no 7-day or 28-day answer rate and no answer latency.
 
-**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green; Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. Step 4's keep-or-drop reads `worker_owners.py report` `end_cleanup_pending` and the cleanup outcomes in `ends.jsonl` beside the ownerless-worker count: a worker ended with its cleanup still pending is not released capacity. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
+**Acceptance gate:** unit tests green; per-slot `basedpyright` ends `0 errors, 0 warnings, 0 notes`; merge gate green. **Change-Review row:** what changed: `measure.py compare` sets any later window beside the Baseline, row by row, with rates per week | how to try it: on natedev from `~/.claude`, `~/.claude/scripts/lib/py ~/.claude/scripts/hierarchies/measure.py compare --before 2026-10-13T17:24..2026-10-20T17:24 --after <the last 7 days>` (the window form is the one `compare` prints in its help) | what you see: a short summary that fits a phone, each row with before, after and the change, `not recorded` and partial rows marked, and the tables under `--full`.
+
+### Phase 6 — The four-week review: which waits slow Hana, which links helped, and which trial steps stay  · status: todo
+**Depends on:** Phase 6a's checkpoint (`compare`), and the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), Phase 15's checkpoint (`compare` prints through its `blocks`), and four weeks from the experiment start in design doc Step 2: the first day on which each holder producer (builds' `verify.sh`, models-unit's `codex_mesh.py`) has recorded a `NamedHolder`, read live from `progress_history.py waits`. At Phase 10's checkpoint (bece20e1) neither had, and Step 2 says `start not set`; the unit director sets the start and the review date when both have. The phase starts on the latest of these dates, never before.
+
+#### Work Order
+
+**Goal:** design Step 5: the doc reports which waits slow Hana (HI7), which Hana links helped (HI2), and keep or drop for each trial step (HI1).
+
+**Hana link:** direct. The review keeps a step only by its effect on Hana.
+
+**Spec:**
+- Run Phase 6a's `measure.py compare --before <Baseline window> --after <the four-week window>` and the two re-run records, and judge each step on the measure and review point each of Phases 3–5 names.
+- Design doc section **Results**: per step, the measure, its change, keep or drop. The link records (Step 3) set beside Hana merges and closures. A wait with a named non-Hana cause brings a new proposal (HI10), as Phase 6a's Spec defines.
+- A defect `compare` shows on live data is fixed in `measure.py` or `push_audit.py` with its test, in this phase.
+- Routed from Phase 6a (2026-10-30): F002, live `compare --full` prints 8564 lines and takes 101 s; make it one row per measure per window. F003, one bad `buildlog/index.sqlite` row (`seconds` not finite) still marks the build source `source unavailable` with n 0; keep and count the good rows, and name the bad rows. F007 (fixture-proven, fix before the Results): per-wait named and not-named holder minutes print only for malformed holders; print the existing per-wait holder row whenever a wait has not-named minutes, so ordinary partial waits (4/6 and 5/7) stay apart beside the malformed 0/10 and 4/6.
+
+**Files:**
+- `docs/plans/build-followups-hierarchies-design.md` — Results
+- `scripts/hierarchies/measure.py`, `scripts/hierarchies/push_audit.py`, `scripts/hierarchies/test_measure.py`, `scripts/hierarchies/test_push_audit.py` — only for a defect live data shows
+
+**Workers:** `1 writer`
+- `impl` — the doc, from the `compare` output and the re-run records the unit director gives it
+
+**State:** none.
+
+**Constraints from prior phases:** as Phase 6a, plus Phase 6a's As-built.
+
+**Acceptance gate:** Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names; unit tests and merge gate green when code changed. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. Step 4's keep-or-drop reads `worker_owners.py report` `end_cleanup_pending` and the cleanup outcomes in `ends.jsonl` beside the ownerless-worker count: a worker ended with its cleanup still pending is not released capacity. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
 
 ### Phase 7 — The baseline measure and the push audit count failed checks by one rule, and session names come from config  · status: done
 
