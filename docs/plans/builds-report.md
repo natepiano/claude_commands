@@ -162,34 +162,29 @@ including the details to make it clear
 
 ### Phase 4b — A failed step's record survives a failed save, and a rerun finishes it  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** when saving a failed step's log fails, the source log and peak file stay on disk, and the next run of the recorder finishes the record with no duplicate row.
-
-**Spec:**
-- Defect (rerun-sweep row `scripts/buildlog/record.py:315`, `~/.claude/docs/plans/sdlc-rerun-sweep.md`, builds-unit section; showrunner order 2026-10-30 00:20 EDT): the save of a failed step's log (near line 280) can fail after the `finally` block has already deleted the source log and the peak file. A rerun then has nothing to record from, and the step's record is lost.
-- Fix: delete the sources only after the save is durable (written and renamed into place). A rerun that finds the sources and no saved record finishes the record; a rerun that finds the saved record and the sources deletes the sources and adds no second row.
-- First confirm the order of save and delete against the live tree.
-- No silent loss (showrunner, 2026-10-30, Phase 4 plan review): a launch whose pending record cannot be saved, and a pending launch or step whose publish keeps failing in `collect()`, today reach only `errors.log`. `/build:report` prints one line, `N records not published yet; M recorder errors since <time>`, only when N or M is above 0; a clean log adds no line.
+- `record.py step` writes a `PendingStep` record (`pending-steps/<row_key>.json`) with the original id, the full record context and `month_offset` before any save. `PendingStep` is its own type, apart from `LaunchStep` and `PublishedLaunch`.
+- `_finish_step` owns the order: save the gzip log, append the row to the host's monthly file, delete the held log and the peak file, then rename the record to `<row_key>.done`. The sources stay on disk until the row is durable.
+- Replay rules: a rerun finishes an existing `.json` and records nothing new. A call that names a held log or peak file and finds `.done` records nothing. A call that names no source always records. Recovery scans the monthly file only from `month_offset` and counts a row only on a newline-terminated line.
+- `launches.collect()` drains `pending-steps/*.json` and deletes `.done` markers older than `STEP_COMPLETION_MAX_AGE_SECONDS` (2 days).
+- `store.append_line` adds a missing final newline under its flock before it appends.
+- `sync.py` pulls only the host folders `record.SYNC_HOSTS` names, minus this host. Only natedev pushes `ci/`, and no host pulls it.
+- `report.recorder_health_lines(day)` prints `N records not published yet; M recorder errors since <time>` for this host, only when N or M is above 0.
 
 **Files:**
-- `scripts/buildlog/record.py` — save, then delete; a rerun finishes a half-done record
-- `scripts/buildlog/sync.py` — the pull carries only the folders `record.py` names (the host folders); every other folder stays local (review finding, showrunner ruling 2026-10-30)
-- `scripts/buildlog/launches.py` — `collect()` counts what it could not publish
-- `scripts/buildlog/report.py` — the unpublished/errors line
-- `scripts/buildlog/test_record_rerun.py` — a stop at each point, then a rerun; a failed pending save, a publish that keeps failing, then recovery; a clean log prints no line
+- `scripts/buildlog/record.py` — `PendingStep`, `_finish_step` order, replay rules, `SYNC_HOSTS`
+- `scripts/buildlog/store.py` — `append_line` tail repair
+- `scripts/buildlog/sync.py` — host-folder allow-list pull, natedev-only `ci/` push
+- `scripts/buildlog/launches.py` — pending-step drain, `.done` expiry
+- `scripts/buildlog/report.py` — local recorder health line
+- `scripts/buildlog/test_record_rerun.py`, `test_store.py`, `test_sync.py` — stop-and-rerun, health line and sync allow-list cases
 
-**Workers:** 1 writer + 1 tester.
-- `impl2` — `record.py`, `launches.py`, `report.py`
-- `test2` — `test_record_rerun.py`
+**Binds later work:** A step row reaches the log only through `record.py`'s `PendingStep` record (`pending-steps/<row_key>.json`, the host's monthly file, `month_offset`, the `.done` replay proof, `store.append_line`); every new row field must be in the pending record before the save starts. A source file the row needs (held log, peak file, any new sidecar) is deleted only by `_finish_step` after the row is durable. `record.SYNC_HOSTS` names the host folders sync carries; a file that must cross machines sits inside a host folder. `report.recorder_health_lines(day)` is the local recorder health line.
 
-**State:** failed-step source logs, peak files, saved step logs, build-log rows
+**Gotchas:** A named peak file that never existed is the normal `fallback` slice, so absent sources never prove a finished step. `_finish_step` sets the `.done` mtime at finish time, so a late finish does not expire at once.
 
-**Depends on:** Phase 4 (both edit `scripts/buildlog/record.py`).
-
-**Constraints from prior phases:** Phase 2: the index never rewrites a source log. Phase 4: app launches publish through a pending record (`record._save_pending_launch`: temp, fsync, `os.replace`), then `finish_pending_launch` publishes the row, checks it is present and only then unlinks the pending record; `launches.collect()` finishes pending launches. Share those persistence helpers, but keep a pending step its own type, apart from `LaunchStep` and `PublishedLaunch`. `step()` makes a new random id on every call (`new_id`), so the pending step keeps the original id and the full record context; a finish from a fresh process with a different environment gives the same row. Name the entry point that finds unfinished steps. The Phase 4 launch recovery tests stay green.
-
-**Acceptance gate:** a test stops the recorder after the save, after the row and before each delete, then reruns it: each case ends with one row, one saved log and no source files. The report line shows for a failed pending save and for a publish that keeps failing, and goes away after recovery; a clean log shows no line. The buildlog tests green; basedpyright 0/0/0.
+**Ruled out:** one file per step row (index cost); source absence as proof of a finish.
 
 ### Phase 4c — Each scoped test step records its test-phase memory peak  · status: todo
 
@@ -210,18 +205,21 @@ including the details to make it clear
 **Files:**
 - `scripts/lint/invoke.sh` — the scope script samples the test phase (owner verify-unit; trial-merge against `origin/natedev-verify-token` and name verify-unit with that tip in the notice's also-touches line)
 - `scripts/buildlog/record.py` — persist the fields on release
-- `scripts/buildlog/test_test_phase_peak.py` — first test binary starts the window, peak over parallel processes, no mark gives unknown, admission field absent gives unknown, terminal and tee steps record after admission's files are gone
+- `scripts/buildlog/test_test_phase_peak.py` — first test binary starts the window, peak over parallel processes, no mark gives unknown, admission field absent gives unknown, terminal and tee steps record after admission's files are gone; a stop after the row is saved and a stop before the sidecar is deleted both recover through `launches.collect()` after admission's files are gone, from a different environment, with the original fields and one row; a requested width of 32 that the share claim narrows to 8 records 8 for terminal and tee steps, with the original repository and filter family
 - `scripts/lint/test_invoke_scope.py` — the shared sampler still writes `.max` and `.wave`
 
 **Workers:** 1 writer + 1 tester.
 - `impl2` — `invoke.sh`, `record.py`
-- `test2` — `test_test_phase_peak.py` and the affected cases in `scripts/lint/test_invoke_scope.py`
+- `test2` — `test_test_phase_peak.py` (with its sidecar recovery fixtures) and the affected cases in `scripts/lint/test_invoke_scope.py`
 
 **State:** step records (new fields), the scope's peak/sample files
 
 **Depends on:** Phase 4b (both edit `scripts/buildlog/record.py`).
 
-**Constraints from prior phases:** Phase 2: the index never rewrites a source log.
+**Constraints from prior phases:**
+- Phase 2: the index never rewrites a source log.
+- Phase 4b: a step row reaches the log only through `record.py`'s `PendingStep` record (`pending-steps/<row_key>.json`, the host's monthly file, `month_offset`, the `.done` replay proof, `store.append_line`). Put every new field and where it came from into `PendingStep` before the save starts, so a failed save keeps them and a rerun publishes the same row. The step sidecar is a named source like the held log and the peak file: only `_finish_step` deletes it, after the row is durable. An absent sidecar maps to a named absence type that records unknown, never 0.
+- `nextest_share_claim` (`scripts/lint/invoke.sh` near line 474) can narrow the width after admission through `memory_admit.set_width`, and the sampler starts after it. Record the width the tests ran with, never the requested width.
 
 **Acceptance gate:** the buildlog and `scripts/lint/test_invoke_scope.py` tests green; basedpyright 0/0/0. Live: one filtered `verify.sh test` step gets a `test_phase_peak_bytes` value, and the notice states the sampler's CPU cost per step.
 
@@ -229,25 +227,35 @@ including the details to make it clear
 
 #### Work Order
 
-**Goal:** `/build:report` on either host shows the recorder health line for both hosts: records not published yet and recorder errors since the report day's local midnight, summed over natedev and the Mac.
+**Goal:** `/build:report` on either host shows recorder health for each machine, natedev and the Mac: records the recorder has not finished and recorder errors since the report day's local midnight, with the host that holds them and the command that recovers them there.
 
 **Spec:**
 - Why (phase 4b contract review, showrunner ruling 2026-10-30 "4d"): the 4b health line reads only the local `errors.log` and pending folders, and sync carries neither, so a failed Mac save or publish never shows on natedev.
-- Each host's `launches.collect()` writes a small health file into its own host folder (the folder sync already carries): pending count and the recorder-error timestamps the report needs. Atomic write (temp + rename).
-- The report sums the local counts and each peer host folder's health file. A peer whose file is absent or older than its last sync shows as unknown, never as 0.
-- One place reads and one place writes the health file; the 4b health function uses it for the local host too.
+- One recorder-health model (new `scripts/buildlog/health.py`) owns the calculation. Move the calculation out of `report.recorder_health_lines()` (near line 1867); do not copy it. The producing host evaluates pending-path existence itself (an error for a pending record that was later finished does not count) and keeps the remaining error timestamps; the reader applies its own local-midnight boundary and the one formatter.
+- One snapshot per machine, written atomically (temp + rename) into that machine's current host folder, so sync carries it. `record.SYNC_HOSTS` (near line 82) names three folders for two machines: map the historical Mac folder names to the one Mac machine, so the Mac counts once and no extra host shows as unknown.
+- Refresh: only natedev runs `buildlog hourly` (`cli.hourly()`, `scripts/buildlog/cli.py` near line 211), and its sync does not collect on either side. Before the transfer, sync writes the local snapshot and has the Mac write its own snapshot inside the ssh call sync already makes (no extra connection). A failed snapshot write goes to `errors.log` and leaves the old snapshot, which then goes stale.
+- Freshness: the snapshot holds `generated_at`. Named states: fresh (generated within two hourly sync periods of now), stale (older), unavailable (absent or unreadable). Do not compare with `sync.json`, which the Mac does not update on a push. A stale or unavailable machine shows as unknown, never as 0.
+- Label: a pending record stays after the row is saved when its cleanup fails, so "not published yet" is wrong for it. The line reads "records the recorder has not finished" for both cases.
+- One line per machine with a nonzero count or a non-fresh state, naming the machine and its recovery command (`buildlog launches`, which `buildlog report` also runs), e.g. `Mac: 2 records the recorder has not finished; 1 recorder error since 00:00 EDT — run buildlog launches on the Mac`. Clean, fresh machines add no line.
 
 **Files:**
-- `scripts/buildlog/launches.py` — write the host health file in `collect()`
-- `scripts/buildlog/report.py` — sum health over hosts
-- `scripts/buildlog/test_recorder_health.py` — Mac failure shows on natedev, absent peer file shows unknown, clean hosts add no line
+- `scripts/buildlog/health.py` — the one recorder-health model: calculate, write and read the snapshot, freshness state
+- `scripts/buildlog/launches.py` — `collect()` writes this host's snapshot
+- `scripts/buildlog/report.py` — one line per machine through the shared model
+- `scripts/buildlog/sync.py` — refresh both snapshots before the transfer
+- `scripts/buildlog/cli.py` — the hourly path, when the refresh needs it
+- `scripts/buildlog/test_recorder_health.py` — a Mac failure reaches natedev's report without a report run on the Mac; a publish failure and a cleanup failure both count; a failed snapshot write cannot replace current failure data with a clean snapshot; fresh, stale and unavailable states; both Mac folder names count the Mac once; peer failure shows the host and its command, then recovery on the peer clears the line
+- `scripts/buildlog/test_sync.py` — the refresh runs before the transfer and adds no ssh connection
+- `scripts/buildlog/test_record_rerun.py` — keep the existing failed-save, persistent-publish, recovery and clean-log health cases green through the moved model
 
 **Workers:** 1 writer + 1 tester.
-- `impl2` — `launches.py`, `report.py`
-- `test2` — `test_recorder_health.py`
+- `impl2` — `health.py`, `launches.py`, `report.py`, `sync.py`, `cli.py`
+- `test2` — `test_recorder_health.py`, `test_sync.py`, the affected health fixtures in `test_record_rerun.py`
 
-**State:** the host health file
+**State:** the per-machine health snapshot
 
 **Depends on:** Phase 4b (health line, sync allow-list).
 
-**Acceptance gate:** the buildlog tests green; basedpyright 0/0/0. Live: after a sync, natedev's report counts a Mac recorder error written for the test.
+**Constraints from prior phases:** Phase 4b: sync pulls only the host folders `record.py` names, minus this host; `ci/` is pushed by natedev only. `.done` stays internal, a bounded replay proof. Cleanup of admission files already pulled from the Mac belongs to resources.
+
+**Acceptance gate:** the buildlog tests green; basedpyright 0/0/0. Live: after one `buildlog hourly` on natedev, with no report run on the Mac, natedev's report shows a Mac line for a recorder error written on the Mac for the test.
