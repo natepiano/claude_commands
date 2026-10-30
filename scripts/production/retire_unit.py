@@ -672,20 +672,21 @@ def stop_rest(unit: Unit, found: Found) -> list[str]:
 def mark_retired(unit: Unit, director: DirectorSession | NoDirectorSession) -> None:
     """Put the retired note in front of the Units row's Plan cell and commit the doc on the merge branch."""
     doc = unit.production.doc
-    lines = doc.read_text(encoding="utf-8").split("\n")
-    headings = production_units.unit_headings(lines)
-    _, rows = production_units.unit_rows(lines)
-    plan_at = headings.index("Plan") + 1
-    note = retired_note(unit, director)
-    for index, line in enumerate(lines):
-        parts = line.split("|")
-        if line in rows and production_units.cell_value(parts[headings.index("Unit") + 1].strip()) == unit.name:
-            parts[plan_at] = f" {note} {parts[plan_at].strip()} "
-            lines[index] = "|".join(parts)
-            break
-    _ = doc.write_text("\n".join(lines), encoding="utf-8")
+    if not unit.retired:
+        lines = doc.read_text(encoding="utf-8").split("\n")
+        headings = production_units.unit_headings(lines)
+        _, rows = production_units.unit_rows(lines)
+        plan_at = headings.index("Plan") + 1
+        note = retired_note(unit, director)
+        for index, line in enumerate(lines):
+            parts = line.split("|")
+            if line in rows and production_units.cell_value(parts[headings.index("Unit") + 1].strip()) == unit.name:
+                parts[plan_at] = f" {note} {parts[plan_at].strip()} "
+                lines[index] = "|".join(parts)
+                break
+        _ = doc.write_text("\n".join(lines), encoding="utf-8")
     add_unit.commit_paths(unit.production, [doc], f"production({unit.production.slug}): retire {unit.name}")
-    print(f"marked: the Units row {note}, committed on {unit.production.merge_branch}")
+    print(f"marked: the retired Units row, committed on {unit.production.merge_branch}")
 
 
 def remove(unit: Unit) -> list[str]:
@@ -753,9 +754,9 @@ def retire(unit: Unit, wait_minutes: float) -> int:
         print("\n".join(f"left running: {reason}" for reason in left))
         print(f"{unit.name} is not retired: rerun once these stop")
         return 1
-    from scripts.guilds import roles
+    from scripts.astra import design_roles
     try:
-        roles.end_holder(unit.production.slug, unit.name)
+        design_roles.end_holder(unit.production.slug, unit.name)
     except (OSError, ValueError, SystemExit) as error:
         print(f"{unit.name} is not retired: held role cleanup: {error}")
         return 1
@@ -767,8 +768,8 @@ def retire(unit: Unit, wait_minutes: float) -> int:
         print("\n".join(f"left running: {reason}" for reason in left))
         print(f"{unit.name} is not retired: rerun once these stop")
         return 1
-    if not unit.retired:
-        mark_retired(unit, director)
+    # The note may have reached disk before its commit; finish it before removal.
+    mark_retired(unit, director)
     failed = remove(unit)
     print("\n".join(f"not removed: {reason}" for reason in failed) if failed else f"{unit.name} retired")
     return 1 if failed else 0

@@ -1,8 +1,16 @@
-"""Read optional fields and promotion destinations from production documents."""
+"""Read names, optional fields and promotion destinations from production documents."""
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
+
+
+class ProductionName(NamedTuple):
+    value: str
+
+
+class ProductionNameNotRecorded(NamedTuple):
+    reason: str
 
 
 class FieldPresent(NamedTuple):
@@ -29,6 +37,13 @@ class MacCheckout(NamedTuple):
 class PromoteTo(NamedTuple):
     checkouts: tuple[Path, ...]
     mac: NoMac | MacCheckout
+
+
+def production_name(lines: list[str]) -> ProductionName | ProductionNameNotRecorded:
+    for line in lines:
+        if line.startswith("# Production — "):
+            return ProductionName(line.removeprefix("# Production — ").strip())
+    return ProductionNameNotRecorded("production doc lacks its name")
 
 
 def optional_field(lines: list[str], field: str) -> FieldPresent | FieldAbsent:

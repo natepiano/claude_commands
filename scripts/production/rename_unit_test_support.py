@@ -121,8 +121,8 @@ class UnitRenameFixture(unittest.TestCase):
             # No waits by default: a test that needs one sets it.
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
             "REVIEW_POOL_STATE": str(self.root / "state/review-pool"),
-            "GUILD_ROLES_STATE": str(self.root / "state/guilds/roles"),
-            "GUILD_OWNERSHIP_STATE": str(self.root / "state/guilds/ownership"),
+            "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
+            "DESIGN_OWNERSHIP_STATE": str(self.root / "state/astra/design-ownership"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
             "UNIT_ACTIVE_DIR": str(self.root / "active"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),

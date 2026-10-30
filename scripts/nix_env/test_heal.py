@@ -142,6 +142,101 @@ class HealTests(NixFixture):
         self.assertEqual(heal.sweep(), 0)
         self.assertEqual(run.call_count, 2)
 
+    def test_rerun_sends_stop_saved_before_an_interrupted_down_call(self) -> None:
+        held, ensure, run = self.install_sweep([self.session])
+        held.return_value = ""
+        complete = cast(Callable[..., subprocess.CompletedProcess[str]], run.side_effect)
+        with (patch.object(heal, "stop_completion", return_value=heal.StopPending(record_missing=True)) as completion,
+              patch.object(sessions, "process_start", return_value=self.session.proc_start)):
+            run.side_effect = KeyboardInterrupt("fixture stopped before down ran")
+            with self.assertRaises(KeyboardInterrupt):
+                _ = heal.sweep()
+            pending = heal.read_history()[self.session.session_id]["pending"]
+            self.assertEqual(pending["kind"], "stopping")
+            if pending["kind"] == "none":
+                self.fail("interrupted stop must keep its reservation")
+            self.assertFalse(pending["stop_request_sent"])
+            interrupted_call = run.call_args
+            run.reset_mock()
+            run.side_effect = complete
+            self.assertEqual(heal.sweep(), 0)
+            run.assert_called_once_with(*interrupted_call.args, **interrupted_call.kwargs)
+            pending = heal.read_history()[self.session.session_id]["pending"]
+            if pending["kind"] == "none":
+                self.fail("accepted stop must wait for the conductor")
+            self.assertTrue(pending["stop_request_sent"])
+            self.assertEqual(heal.sweep(), 0)
+            self.assertEqual(run.call_count, 1)
+            completion.return_value = heal.StopComplete()
+            self.assertEqual(heal.sweep(), 0)
+        self.assertEqual(heal.read_history()[self.session.session_id]["pending"]["kind"], "none")
+        self.assertEqual(ensure.call_count, 2)
+        commands = [cast(list[str], item.args[0]) for item in run.call_args_list]
+        self.assertEqual([command[2] for command in commands], ["down", "restart"])
+
+    def test_rerun_clears_unsent_stop_and_alerts_if_the_saved_process_is_gone(self) -> None:
+        for identity in (None, "reused-pid-start"):
+            with self.subTest(identity=identity), patch.object(heal, "STATE_DIR", self.root / str(identity)):
+                held, ensure, run = self.install_sweep([self.session])
+                held.return_value = ""
+                complete = cast(Callable[..., subprocess.CompletedProcess[str]], run.side_effect)
+                run.side_effect = KeyboardInterrupt("fixture stopped before down ran")
+                with self.assertRaises(KeyboardInterrupt):
+                    _ = heal.sweep()
+                run.reset_mock()
+                run.side_effect = complete
+                with (patch.object(heal, "list_sessions", return_value=[]),
+                      patch.object(heal, "stop_completion", return_value=heal.StopPending(record_missing=True)),
+                      patch.object(sessions, "process_start", return_value=identity)):
+                    self.assertEqual(heal.sweep(), 0)
+                    self.assertEqual(heal.sweep(), 0)
+                self.assertEqual(heal.read_history()[self.session.session_id]["pending"], heal.NoPendingRestart(kind="none"))
+                run.assert_called_once()
+                command = cast(list[str], run.call_args.args[0])
+                self.assertIn("--need", command)
+                self.assertIn("nix-heal-fixture", command)
+                self.assertNotIn("down", command)
+                self.assertNotIn("restart", command)
+                self.assertEqual(ensure.call_count, 1)
+                self.assertIn("unsent shutdown request lost its original session process", cast(str, self.records()[-1]["reason"]))
+
+    def test_sent_stop_with_no_record_keeps_waiting_and_legacy_records_are_sent(self) -> None:
+        held, ensure, run = self.install_sweep([self.session])
+        held.return_value = ""
+        with (patch.object(heal, "stop_completion", return_value=heal.StopPending(record_missing=True)),
+              patch.object(sessions, "process_start", side_effect=AssertionError("a sent stop must not be retried"))):
+            self.assertEqual(heal.sweep(), 0)
+            pending = heal.read_history()[self.session.session_id]["pending"]
+            if pending["kind"] == "none":
+                self.fail("accepted stop must remain pending")
+            self.assertTrue(pending["stop_request_sent"])
+            self.assertEqual(heal.sweep(), 0)
+            # Existing journals predate the sent mark and must retain their wait.
+            legacy = dict(pending)
+            del legacy["stop_request_sent"]
+            histories = heal.read_history()
+            histories[self.session.session_id]["pending"] = heal.read_pending(legacy)
+            heal.save_history(histories)
+            self.assertEqual(heal.sweep(), 0)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(ensure.call_count, 1)
+        invalid_marks: tuple[object, ...] = (None, 1, "false", [])
+        for invalid in invalid_marks:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                _ = heal.read_pending({**pending, "stop_request_sent": invalid})
+
+    def test_missing_shutdown_record_is_distinct_from_an_in_progress_record(self) -> None:
+        sys.path.insert(0, str(heal.SCRIPTS / "shutdown"))
+        from scripts.shutdown import record
+
+        with patch.object(record, "find_session", return_value=None):
+            completion = heal.stop_completion(self.session, "test-account")
+        self.assertIsInstance(completion, heal.StopPending)
+        if not isinstance(completion, heal.StopPending):
+            self.fail("missing shutdown record must remain pending")
+        self.assertTrue(completion.record_missing)
+        self.assertFalse(heal.StopPending().record_missing)
+
     def test_hold_and_busy_sessions_do_not_load_or_restart_and_log_reason_changes(self) -> None:
         held, ensure, run = self.install_sweep([self.session])
         held.return_value = "build hold: fixture"

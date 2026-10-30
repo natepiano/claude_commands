@@ -33,6 +33,8 @@ from scripts.production import production_units, showrunners
 STATE_DIR = Path.home() / ".local/state/notify"
 SESSION_CONFIG = SCRIPTS.parent / "config/hierarchies/sessions.toml"
 PUSHOVER_SEND = "scripts/notify/pushover.py send()"
+# Messaging policy c73a2d02 took effect when dde7ec2e merged.
+AGENT_TEXT_EXCEPTION_ENDED = datetime(2026, 10, 29, 3, 5, 59, tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -163,7 +165,7 @@ class ApprovedPriorityTwo:
 @dataclass(frozen=True)
 class ApprovedRegisteredText:
     code_path: ClassVar[str] = PUSHOVER_SEND + ": registered text_id exception"
-    reason: ClassVar[str] = "recorded text id or registered rewrite outcome; current catalog membership and approval are not required"
+    reason: ClassVar[str] = "registered-text exception in force at delivery; recorded identity is evidence, not text approval"
 
 
 @dataclass(frozen=True)
@@ -466,6 +468,8 @@ def sending_path(push: PushRecord, review: ReviewMatch) -> str:
 def classify(push: PushRecord, identity: TextIdentity, review: ReviewMatch) -> PushClassification:
     if push.priority is PushPriority.EMERGENCY:
         return ApprovedPriorityTwo()
+    if isinstance(identity, TextId) and identity.value == "nate.adhoc" and push.at >= AGENT_TEXT_EXCEPTION_ENDED:
+        return Unapproved(sending_path(push, review) + "; nate.adhoc exception ended 2026-10-29T03:05:59Z")
     if isinstance(identity, TextId) or push.outcome is PushOutcome.ORIGINAL_TEXT_SENT:
         return ApprovedRegisteredText()
     return Unapproved(sending_path(push, review))
@@ -560,13 +564,13 @@ def render(report: AuditReport) -> str:
     return "\n\n".join(output)
 
 
-def report_summary(report: AuditReport) -> str:
+def report_summary(report: AuditReport, full: bool = False) -> str:
     counts = Counter(type(entry.classification) for entry in report.entries)
     return "\n".join([
         f"Window: {report.window.label}.",
         f"Pushes: {len(report.delivered_pushes)} delivered; {len(report.entries)} after a failed text check.",
         "; ".join(f"{kind.__name__}: {counts[kind]}" for kind in CLASSIFICATIONS) + ".",
-        f"Source problems: {len(report.problems)}. Use --full to print the tables.",
+        f"Source problems: {len(report.problems)}." + ("" if full else " Use --full to print the tables."),
     ])
 
 
@@ -583,7 +587,7 @@ def main(arguments: Sequence[str] = ()) -> int:
     except ValueError as error:
         parser.error(str(error))
     report = audit(load_sources(STATE_DIR), window)
-    print(report_summary(report))
+    print(report_summary(report, full=cast(bool, args.full)))
     if cast(bool, args.full):
         print()
         print(render(report))

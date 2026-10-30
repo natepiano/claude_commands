@@ -81,7 +81,7 @@ def _tracked(checkout: Path) -> set[Path]:
 
 def _history(path: Path, roots: Roots, tracked: set[Path]) -> bool:
     try:
-        relative = path.relative_to(roots.state / "guilds/roles")
+        relative = path.relative_to(roots.state / "astra/design-roles")
         if len(relative.parts) > 2 and relative.parts[1] in ("prompts", "replies"):
             return True
         if len(relative.parts) == 2 and relative.parts[1] in ("adoption.json", "transfer.json"):
@@ -131,7 +131,7 @@ def sweep(values: tuple[str, ...], roots: Roots) -> list[str]:
         except OSError:
             continue
         try:
-            relative = path.relative_to(roots.state / "guilds/roles")
+            relative = path.relative_to(roots.state / "astra/design-roles")
             if path.name == "design.json":
                 fields = cast(dict[str, object], json.loads(text))
                 role_entries = fields.get("roles")

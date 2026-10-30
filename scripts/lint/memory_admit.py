@@ -73,6 +73,9 @@ HISTORY_DAYS = 14
 # Build anon at 16–20 GiB averaged 10.4% full PSI; at 20–24 GiB it averaged 16.4%.
 BUILD_BUDGET_BYTES = 21 * GIB
 RAMP_SECONDS = 120
+# Hana nextest: the longest measured gap between waves at >=50% of peak
+# was 954 s (2026-10-29); 1500 s adds margin for sparse slice samples.
+PEAK_DECAY_SECONDS = 1500
 # 2026-10-29 freeze: full avg10 stayed below 10 during about 30 s of thrash.
 FULL_PRESSURE_LIMIT = 5.0
 # The same freeze had swap 80-87% used with some avg10 29-37%.
@@ -785,6 +788,22 @@ def reservation_memory(path: Path, row: Reservation, now: datetime,
         if isinstance(reading, MeasuredMemory):
             return replace(reading, unknown_peak_promise=row["need"])
         return reading
+    last_near_peak_at = now.timestamp()  # Unknown times retain the peak charge.
+    try:
+        near_peak_bytes, recorded_at = map(int, path.with_suffix(".wave").read_text().split())
+        if near_peak_bytes == peak and recorded_at >= 0:
+            last_near_peak_at = recorded_at
+    except FileNotFoundError:
+        # Samplers from before patch B write no .wave; use the last peak publication.
+        if peak > 0:
+            try:
+                last_near_peak_at = path.with_suffix(".max").stat().st_mtime
+            except OSError:
+                pass
+    except (OSError, ValueError):
+        pass
+    if now.timestamp() - last_near_peak_at >= PEAK_DECAY_SECONDS:
+        peak = 0
     if isinstance(reading, MeasuredMemory):
         return replace(reading, observed_peak=peak)
     if isinstance(reading, PromisedMemory):
@@ -966,6 +985,7 @@ def live_reservations(directory: Path) -> list[tuple[Path, Reservation]]:
             pass
         path.unlink(missing_ok=True)
         path.with_suffix(".max").unlink(missing_ok=True)
+        path.with_suffix(".wave").unlink(missing_ok=True)
     return live
 
 
@@ -1213,6 +1233,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             if isinstance(memory, GoneMemory):
                 path.unlink(missing_ok=True)
                 path.with_suffix(".max").unlink(missing_ok=True)
+                path.with_suffix(".wave").unlink(missing_ok=True)
                 continue
             live.append((path, row))
             running.append(memory)
@@ -1597,6 +1618,7 @@ def release(path: Path, status: int, root: Path | None = None) -> None:
             pass
         path.unlink(missing_ok=True)
         maximum.unlink(missing_ok=True)
+        path.with_suffix(".wave").unlink(missing_ok=True)
         if row["sidecar"]:
             Path(row["sidecar"]).unlink(missing_ok=True)
 

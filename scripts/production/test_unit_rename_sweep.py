@@ -1,4 +1,4 @@
-"""Keep saved guild evidence and aliases while checking every live rename route."""
+"""Keep saved design-role evidence and aliases while checking every live rename route."""
 from __future__ import annotations
 
 import json
@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import unit_rename_sweep as sweep  # noqa: E402
 
 
-class GuildRenameSweepTests(unittest.TestCase):
+class DesignRoleRenameSweepTests(unittest.TestCase):
     root: Path = Path()
     state: Path = Path()
     design: Path = Path()
@@ -23,9 +23,9 @@ class GuildRenameSweepTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.state = self.root / "state"
-        self.design = self.state / "guilds/roles/design-one"
+        self.design = self.state / "astra/design-roles/design-one"
         self.design.mkdir(parents=True)
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"GUILD_ROLES_STATE": str(self.design.parent)})))
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"DESIGN_ROLES_STATE": str(self.design.parent)})))
 
     def write(self, relative: str, value: object) -> Path:
         path = self.design / relative

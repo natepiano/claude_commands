@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.buildlog import treekey
-from scripts.guilds import roles
+from scripts.astra import design_roles
 from scripts.lib.socket_test_support import short_socket_directory
 
 WORKER = "unit-impl"
@@ -48,7 +48,7 @@ class MeshRunsTests(unittest.TestCase):
         self.session.mkdir(parents=True)
         _ = self.stack.enter_context(patch.object(mesh_runs, "RUN_ROOTS", (self.root / "unit",)))
         self.stack.enter_context(patch.dict(os.environ, {"REVIEW_POOL_STATE": str(self.root / "pool"),
-                                                        "GUILD_ROLES_STATE": str(self.root / "guilds/roles"),
+                                                        "DESIGN_ROLES_STATE": str(self.root / "astra/design-roles"),
                                                         "BUILDLOG_SCOPE": "0"}))
         self.sent = []
         _ = self.stack.enter_context(patch.object(treekey, "tree_key", return_value="key-1"))
@@ -65,15 +65,15 @@ class MeshRunsTests(unittest.TestCase):
         self.stack.close()
 
     def test_durable_role_is_found_after_its_run_folder_is_gone(self) -> None:
-        role_root = self.root / "guilds/roles"
+        role_root = self.root / "astra/design-roles"
         mesh = role_root / "design-one/mesh"
         mesh.mkdir(parents=True)
         _ = (mesh / codex_mesh.ROSTER_FILE).write_text(json.dumps({"lasting-designer": {
             "thread_id": "lasting-thread", "status": "idle", "launcher_pid": 0}}))
-        with patch.dict(os.environ, {"GUILD_ROLES_STATE": str(role_root)}):
+        with patch.dict(os.environ, {"DESIGN_ROLES_STATE": str(role_root)}):
             caller = mesh_runs.caller_from_environment({"CODEX_THREAD_ID": "lasting-thread"})
         self.assertEqual(caller, mesh_runs.MeshCaller(str(mesh), "lasting-designer", "lasting-thread"))
-        with patch.dict(os.environ, {"GUILD_ROLES_STATE": str(role_root), "CODEX_THREAD_ID": "lasting-thread"}), \
+        with patch.dict(os.environ, {"DESIGN_ROLES_STATE": str(role_root), "CODEX_THREAD_ID": "lasting-thread"}), \
                 patch.object(subprocess, "Popen", return_value=SimpleNamespace(pid=4321)), \
                 contextlib.redirect_stdout(io.StringIO()):
             code = mesh_runs.main(["start", "--label", "role fixture", "--", sys.executable,
@@ -124,22 +124,22 @@ class MeshRunsTests(unittest.TestCase):
 
     def test_detached_result_stays_pending_for_the_held_roles_next_authorized_turn(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000076"
-        design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 1), "fixture-repo",
+        design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 1), "fixture-repo",
             str(self.root), str(self.root / "design.md"), "design", "2026-10-21T12:00:00+00:00",
-            roles.UnitHolder("demo", "design-unit"), roles.DesignUnbound(),
-            (roles.RoleInstance("designer", "unused", roles.RoleNotOpened()),
-             roles.RoleInstance("reviewer", WORKER, roles.RoleOpen("thread-1"))))
-        roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            design_roles.UnitHolder("demo", "design-unit"), design_roles.DesignUnbound(),
+            (design_roles.RoleInstance("designer", "unused", design_roles.RoleNotOpened()),
+             design_roles.RoleInstance("reviewer", WORKER, design_roles.RoleOpen("thread-1"))))
+        design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         roster = {WORKER: {"thread_id": "thread-1", "status": "done", "held_design_id": design_id,
                            "held_role": "reviewer", "launcher_pid": 0}}
         _ = (self.session / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
         path = self.record([sys.executable, "-c", "print('saved verification evidence')"])
         with patch.object(codex_mesh, "command_follow", side_effect=AssertionError("result woke the role")), \
                 patch.object(codex_mesh, "command_send", side_effect=AssertionError("result sent a turn")), \
-                patch.object(roles, "dispatch_turn", side_effect=AssertionError("result dispatched a role")):
+                patch.object(design_roles, "dispatch_turn", side_effect=AssertionError("result dispatched a role")):
             record = self.supervise(path)
             repeated = mesh_runs.deliver(record, 0)
-        messages = roles.pending_messages(design_id, "reviewer")
+        messages = design_roles.pending_messages(design_id, "reviewer")
         self.assertEqual(len(messages), 1)
         self.assertEqual(messages[0].source, "mesh_runs:r1")
         self.assertIn("saved verification evidence", messages[0].text)
