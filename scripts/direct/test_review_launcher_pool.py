@@ -482,7 +482,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             1,
         ), encoding="utf-8")
         result = subprocess.run(self.pool_command(session), env=self.pool_fixture(),
-                                capture_output=True, text=True, check=False, timeout=300)
+                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((session / "review_status_contract").read_text().strip(), "reviewed")
         records = self.turn_records(session)
