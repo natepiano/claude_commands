@@ -28,8 +28,8 @@ compiling the largest hooks exceeds 2 ms. Streams (including stdin.buffer), file
 descriptors, argv, environment, cwd, import path and signal handlers are isolated.
 Alarm calls inside a hook are multiplexed with its outer deadline, so a hook's
 own SIGALRM handler and shorter budget work without cancelling our timeout.
-The outer timeout in settings.json is the sum of the event's hook budgets plus
-30 seconds of dispatcher overhead, preserving every sequential hook's full budget.
+The outer timeout in settings.json covers the largest sum of matching hook budgets
+plus 30 seconds of overhead, preserving every sequential hook's full budget.
 Imported library modules remain cached, which is the intended startup saving.
 """
 from __future__ import annotations
@@ -91,6 +91,7 @@ POST_TOOL_USE = (
     HookSpec("post-tool-use-fn-length.py", "Edit|MultiEdit|Write"),
     HookSpec("post-tool-use-context-usage.py", None),
     HookSpec("post-tool-use-banned-words.py", None),
+    HookSpec("post-tool-use-push-delivered.py", "PushNotification"),
 )
 STOP = (
     HookSpec("stop-direct-continue.py", None),

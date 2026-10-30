@@ -186,7 +186,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             [
                 "bash", str(self.review_script.with_name("implement.sh")),
                 "--to", worker, str(session_dir), str(self.working_dir),
-                str(self.prompt_file), "implementation", "write the repair",
+                str(self.prompt_file), "impl", "write the repair",
                 "impl", "writing the repair", "0", "review2",
             ],
             check=False,

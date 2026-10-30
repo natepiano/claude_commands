@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import launch_permission
-import record
+import shutdown_record
 import herdr
 
 
@@ -28,7 +28,7 @@ class LaunchClaimTests(unittest.TestCase):
                     with launch_permission.admitted_launch("unseen-account", "recorded-session", "restore", lambda: None):
                         self.fail("a restore started after shutdown revocation")
                 self.assertEqual(launch_permission.pending_launches(), ())
-                self.assertEqual(record.all_session_records(), [])
+                self.assertEqual(shutdown_record.all_session_records(), [])
             with launch_permission.admitted_launch("unseen-account", "recorded-session", "restore", lambda: None):
                 self.assertEqual(len(launch_permission.pending_launches()), 1)
 
@@ -55,7 +55,7 @@ class LaunchClaimTests(unittest.TestCase):
               patch.object(herdr, "close_agent") as close):
             with self.assertRaisesRegex(OSError, "revoked"):
                 with launch_permission.admitted_launch("account", "session", "name", lambda: None):
-                    self.assertEqual(record.all_session_records(), [])
+                    self.assertEqual(shutdown_record.all_session_records(), [])
                     claims = launch_permission.revoke_pending_launches("account")
                     self.assertEqual(len(claims), 1)
                     self.assertEqual(claims[0].session_id, "session")

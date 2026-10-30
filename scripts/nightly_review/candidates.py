@@ -27,10 +27,12 @@ import os
 import re
 import socket
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.atomic_file import write_text_atomic
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import urgency  # noqa: E402
@@ -186,7 +188,6 @@ def now() -> datetime:
 def write_note(body: str) -> None:
     value = os.environ.get("NIGHTLY_REVIEW_NOTE")
     note = Path(value).expanduser() if value else Path.home() / "rust" / "hanadocs" / "nightly improvement list.md"
-    temporary: Path | None = None
     try:
         if not note.parent.is_dir() or not (ROOT / "ledger.md").is_file():
             return
@@ -196,21 +197,10 @@ def write_note(body: str) -> None:
             f"Read {moment:%Y-%m-%d %H:%M} {moment:%Z} from the nightly review's ledger on {host}. "
             "The nightly review rewrites this note; edits made here are lost."
         )
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=note.parent, prefix=f".{note.name}.", delete=False
-        ) as handle:
-            temporary = Path(handle.name)
-            _ = handle.write(f"{read_line}\n\n{body}\n")
-            os.fchmod(handle.fileno(), 0o644)
-        os.replace(temporary, note)
+        write_text_atomic(note, f"{read_line}\n\n{body}\n")
+        note.chmod(0o644)
     except OSError as error:
         print(f"candidates: cannot write {note}: {error}", file=sys.stderr)
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
 def gain_words(value: str) -> str:
@@ -260,17 +250,26 @@ def record(report: Path) -> int:
         return 1
     ledger = ROOT / "ledger.md"
     known = read_lines(ledger)
-    new = [each.line for each in candidates if not any(line.startswith(each.head) for line in known)]
+    new: list[str] = []
+    for candidate in candidates:
+        # The outcome follows this exact heading and its optional gain, never words in the title.
+        complete_record = re.compile(re.escape(candidate.head)
+                                     + r"(?: \[gain/week: [^\]]+\])? — (?:proposed|deferred|accepted|declined|done|relayed)(?:[ ,].*)?")
+        if any(complete_record.fullmatch(line) is not None for line in known):
+            continue
+        # A stopped append can leave just the heading or part of its final state.
+        known = [line for line in known if not candidate.line.startswith(line) or not line]
+        known.append(candidate.line)
+        new.append(candidate.line)
     if not new:
         print("nothing new to record")
     else:
+        print("\n".join(new), flush=True)
         try:
-            with ledger.open("a", encoding="utf-8") as handle:
-                _ = handle.write("".join(f"{line}\n" for line in new))
+            write_text_atomic(ledger, "\n".join(known) + "\n")
         except OSError as error:
             print(f"candidates: {error}", file=sys.stderr)
             return 1
-        print("\n".join(new))
     open_candidates = ordered(read_lines(ledger))
     write_note(table(open_candidates) if open_candidates else "no open candidates")
     return 0

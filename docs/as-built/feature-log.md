@@ -13,7 +13,7 @@ The feature log is the current account of what seven projects do: hana, natedev,
 | `scripts/feature_log/feature_log.py` | The only writer of feature notes. The CLI, plus the importable `PROJECTS`, `vault_dir`, `state_dir` and `locked`. |
 | `scripts/feature_log/inventory.py` | Read-only inventory of backfill evidence. Owns the frozen ledgers. |
 | `scripts/feature_log/test_feature_log.py` | 124 `unittest` cases on a temp vault, temp state and temp git checkouts. |
-| `scripts/feature_log/test_inventory.py` | 32 cases on temp git repositories. |
+| `scripts/feature_log/test_inventory.py` | 34 cases on temp git repositories. |
 | `commands/feature_log.md` | `/feature_log digest [--since]` and `/feature_log live <project> [filters]`. Reads only. |
 | `commands/showrunner/produce.md` | `<ChangeReviewFeatureLog/>` inside `<MergeCheckpoint/>`, and `<CloseChangeReview/>`: the hana and claude close-out. |
 | `commands/validate_and_push.md` | `<FeatureLogCloseOut/>` and the `Feature log:` summary line. |
@@ -144,7 +144,7 @@ main(
 
 Exits: `0` success, `unchanged` included. `1` when `check` finds errors or `changelog --compare` finds differences. `2` for every refusal: one stderr line `feature_log: <reason>`, no stdout, nothing written; argparse errors take the same path. A forwarded verb returns the ssh status.
 
-Every write holds `locked()`, an exclusive `flock` on `state_dir()/"lock"`. A note or JSON file is written as `.<name>.tmp` in its target folder and moved with `os.replace`. Each successful write appends one event.
+Every write holds `locked()`, an exclusive `flock` on `state_dir()/"lock"`. A note or JSON file uses `scripts.lib.atomic_file.write_text_atomic`: a sibling temporary file is flushed and fsynced, then moved with `os.replace`. Each successful write appends one event.
 
 | Verb | Arguments | Result | Prints |
 | --- | --- | --- | --- |
@@ -334,6 +334,7 @@ Hana reads documents at `~/rust/hana_catalyst` `init/catalyst`, every merge of `
 | --- | --- |
 | `collect --project P` | With a ledger present: reads it and prints. Otherwise collects outside the lock and writes only if the ledger is still absent. Prints each pool and kind beside the design's figure, and one `ref: <repo> <sha>` line per frozen tip. |
 | `next --project P --pool POOL [--kind K] [--path PREFIX…] [--claim NAME] [--limit N]` | Undisposed records, unclaimed or claimed by NAME, oldest first, as `<id> \| <date> \| <kind> \| <title> \| <source>`. `--path` matches a prefix of the source path; a sha source matches none. `--claim` stores `ClaimedBy(NAME)`. `--limit` defaults to 25; `0` lists all. |
+| `release --project P --worker NAME` | Releases only NAME's undisposed claims under the ledger lock and prints their IDs. Other workers' claims and disposed evidence stay unchanged. A repeat succeeds without rewriting the ledger. After a stopped worker, release its claims, then rerun `next --claim` for the replacement. |
 | `show ID` | The record as one JSON line, then its source text at the frozen ref: the block, the bullet under its version heading, the whole file, or `git show --stat`. |
 | `mark ID… [--ids-from FILE] [--worker NAME] --as D (--note TITLE \| --reason TEXT)` | `represented` and `combined` need `--note` naming an existing note file; `internal`, `not-current` and `unresolved` need `--reason`. A record claimed by another name is refused. Every ID is checked before any write. Re-marking replaces the outcome. |
 | `status --project P [--pool POOL]` | Counts per outcome, then the notes the ledger names. |
@@ -506,3 +507,7 @@ Changelog comparison for the 13 published crates:
 The 217 entries stay pending until each crate's release stamps them.
 
 Old claim records convert old worker field names once on their first ledger read. The CLI accepts only `--worker` when marking a claimed record.
+
+### Rerun recovery (2026-10-29)
+
+New amend events carry `content`, the SHA256 of the complete rendered note. Older events stay readable. An unchanged amend checks the newest event for that note against its current content. If the event is missing or holds older content, the retry appends the missing event. Digest prints and flushes the selected changes under the lock before advancing its cursor. A stop during output leaves the changes available on rerun.

@@ -36,11 +36,11 @@ import progress_history
 
 if TYPE_CHECKING:
     from scripts.style import style_ledger
-    from scripts.shutdown import record as shutdown_record
+    from scripts.shutdown import shutdown_record
 else:
     import style_ledger
     # rename_unit puts the shutdown folder on the path.
-    import record as shutdown_record
+    import shutdown_record
 
 SCRIPT = Path(__file__).with_name("rename_unit.py")
 SLUG = "demo"

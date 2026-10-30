@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import json
 import unittest
 from datetime import timedelta
@@ -71,8 +73,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
 
     def test_refusal_push_says_when_nothing_was_on_codex(self) -> None:
         registry = quota_alert.REGISTRY
-        _ = registry.write_text(REGISTRY.replace("direct=codex", "direct=claude").replace(
-            "module_review=codex", "module_review=claude"))
+        _ = write_registry(registry, {"assignments": {"direct": "claude", "module_review": "claude"}}, base_text=REGISTRY)
         notes: Notes = [self.note("codex1.md", "active", "0")]
         _ = self.alert(notes, self.now)
         self.pushed.clear()

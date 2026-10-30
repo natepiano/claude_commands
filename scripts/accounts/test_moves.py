@@ -14,19 +14,19 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from datetime import timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.accounts import moves
+from scripts.accounts import moves, worker_names
 from scripts.accounts import accounts
 from scripts.shutdown import test_account_move as move_fixture
 from scripts.shutdown.test_restart import STOPPED, entry
 
 if TYPE_CHECKING:
-    from scripts.shutdown import inventory, record, restart
+    from scripts.shutdown import inventory, shutdown_record, restart
 else:
     inventory = import_module("inventory")
-    record, restart = import_module("record"), import_module("restart")
+    shutdown_record, restart = import_module("shutdown_record"), import_module("restart")
 
 
 class RunningRestartMoveTests(unittest.TestCase):
@@ -41,27 +41,27 @@ class RunningRestartMoveTests(unittest.TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
 
-    def save_record(self, progress: record.SessionProgress) -> record.SessionShutdown:
+    def save_record(self, progress: shutdown_record.SessionProgress) -> shutdown_record.SessionShutdown:
         saved = entry(self.fixture.owner, state=progress)
         saved["login"], saved["label"] = "current@example.invalid", "claude1"
         saved["request_id"] = "old-unconfirmed-request"
-        self.assertTrue(record.create_session(saved))
+        self.assertTrue(shutdown_record.create_session(saved))
         return saved
 
     def archived_records(self) -> list[object]:
         directory = Path(os.environ["SHUTDOWN_STATE_DIR"]) / "current@example.invalid" / "history"
         return [cast(object, json.loads(path.read_text())) for path in directory.glob("*.json")]
 
-    def failed_record(self) -> record.SessionShutdown:
-        return self.save_record(record.SessionRestartFailed(kind="restart failed",
+    def failed_record(self) -> shutdown_record.SessionShutdown:
+        return self.save_record(shutdown_record.SessionRestartFailed(kind="restart failed",
             at=STOPPED, reason="restart prompt not submitted"))
 
     def assert_move_closes_record(self, *, automatic: bool) -> None:
         saved = self.failed_record()
         login, identity = saved["login"], saved["session"]["session_id"]
-        record.write_snapshot(record.RecoverySnapshot(machine="natedev",
+        shutdown_record.write_snapshot(shutdown_record.RecoverySnapshot(machine="natedev",
             login=login, label="claude1", taken_at=STOPPED, sessions=[
-                record.SnapshotClaudeSession(agent="claude", session=saved["session"],
+                shutdown_record.SnapshotClaudeSession(agent="claude", session=saved["session"],
                     workers=[], timers=[], last_seen=STOPPED, state="unresolved", crash="host gone")]))
         previous_failure = moves.FailedMove(kind="failed", at=STOPPED, tool="claude",
             subject=identity + ": kept name", move_id="old-failed-move", reason="restart prompt not submitted")
@@ -69,10 +69,10 @@ class RunningRestartMoveTests(unittest.TestCase):
 
         def start(command: tuple[str, ...], **options: object) -> subprocess.CompletedProcess[str]:
             # The old record must be closed before a new shutdown can claim the id.
-            self.assertIsNone(record.find_session(login, identity))
+            self.assertIsNone(shutdown_record.find_session(login, identity))
             self.assertEqual(self.archived_records(), [saved])
-            snapshot = record.read_snapshot(login)
-            assert not isinstance(snapshot, record.NoRecoverySnapshot)
+            snapshot = shutdown_record.read_snapshot(login)
+            assert not isinstance(snapshot, shutdown_record.NoRecoverySnapshot)
             self.assertEqual(snapshot["sessions"], [])
             return self.fixture.start_one(command, **options)
 
@@ -94,7 +94,7 @@ class RunningRestartMoveTests(unittest.TestCase):
         launch.assert_called_once()
         self.assertIn("kept name: closed its unconfirmed restart record; the session is running",
                       output.getvalue() + outcome_text)
-        current = record.find_session(login, identity)
+        current = shutdown_record.find_session(login, identity)
         assert current is not None
         self.assertEqual(current.get("target"), "claude3")
         self.assertEqual(current["progress"]["kind"], "waiting")
@@ -114,17 +114,17 @@ class RunningRestartMoveTests(unittest.TestCase):
         saved = self.failed_record()
 
         def replace_record(_owner: inventory.Session) -> restart.SessionLive:
-            def change(current: record.SessionShutdown) -> None:
+            def change(current: shutdown_record.SessionShutdown) -> None:
                 current["request_id"] = "replacement-request"
-                current["progress"] = record.SessionNeedsManualRestart(
+                current["progress"] = shutdown_record.SessionNeedsManualRestart(
                     kind="manual restart", command="scratch recovery")
-            _ = record.update_session(saved["login"], "move-id", change)
+            _ = shutdown_record.update_session(saved["login"], "move-id", change)
             return restart.SessionLive()
 
         with (patch.object(restart, "_owner_liveness", side_effect=replace_record) as observed,
               patch.object(restart, "_session_liveness", return_value=restart.SessionLive()),
               patch.object(subprocess, "run") as launch,
-              patch.object(record, "acknowledge_snapshot") as acknowledge,
+              patch.object(shutdown_record, "acknowledge_snapshot") as acknowledge,
               redirect_stdout(io.StringIO())):
             outcome = accounts.move_sessions(("move-id",), "claude3", why="auto: exhausted",
                 origin=accounts.AutoOrigin())[0]
@@ -132,7 +132,7 @@ class RunningRestartMoveTests(unittest.TestCase):
         assert isinstance(outcome, accounts.SessionMoveRefused)
         self.assertIn("already has a shutdown in progress", outcome.reason)
         observed.assert_called_once()
-        current = record.find_session(saved["login"], "move-id")
+        current = shutdown_record.find_session(saved["login"], "move-id")
         assert current is not None
         self.assertEqual(current["request_id"], "replacement-request")
         self.assertEqual(current["progress"], {"kind": "manual restart", "command": "scratch recovery"})
@@ -145,7 +145,7 @@ class RunningRestartMoveTests(unittest.TestCase):
         with (patch.object(restart, "_owner_liveness", return_value=restart.SessionLive()),
               patch.object(restart, "_session_liveness", return_value=restart.SessionLive()),
               patch.object(subprocess, "run") as launch,
-              patch.object(record, "acknowledge_snapshot") as acknowledge,
+              patch.object(shutdown_record, "acknowledge_snapshot") as acknowledge,
               redirect_stdout(io.StringIO()) as output):
             outcome = accounts.move_sessions(("move-id",), "claude1", why="auto: exhausted",
                 origin=accounts.AutoOrigin())[0]
@@ -153,33 +153,33 @@ class RunningRestartMoveTests(unittest.TestCase):
         assert isinstance(outcome, accounts.SessionMoveRefused)
         self.assertEqual(outcome.reason, "already on claude1")
         self.assertNotIn("closed its unconfirmed", output.getvalue())
-        self.assertEqual(record.find_session(saved["login"], "move-id"), saved)
+        self.assertEqual(shutdown_record.find_session(saved["login"], "move-id"), saved)
         self.assertEqual(self.archived_records(), [])
         launch.assert_not_called()
         acknowledge.assert_not_called()
 
     def test_move_keeps_unknown_dead_and_other_shutdown_records(self) -> None:
-        failed = record.SessionRestartFailed(kind="restart failed", at=STOPPED,
+        failed = shutdown_record.SessionRestartFailed(kind="restart failed", at=STOPPED,
                                                   reason="restart prompt not submitted")
-        cases: list[tuple[record.SessionProgress,
+        cases: list[tuple[shutdown_record.SessionProgress,
                           restart.SessionLive | restart.SessionNotLive |
                           restart.SessionLivenessUnknown]] = [
             (failed, restart.SessionNotLive()),
             (failed, restart.SessionLivenessUnknown("scratch liveness unreadable")),
-            (record.SessionWaiting(kind="waiting"), restart.SessionLive()),
-            (record.SessionReaping(kind="reaping", at=STOPPED, because="account out of usage", detail="exhausted"), restart.SessionLive()),
-            (record.SessionReadyToStop(kind="ready", at=STOPPED), restart.SessionLive()),
-            (record.SessionHeldByUsageLimit(kind="held by usage limit", at=STOPPED), restart.SessionLive()),
-            (record.SessionStopping(kind="stopping", at=STOPPED), restart.SessionLive()),
-            (record.SessionStopped(kind="stopped", at=STOPPED), restart.SessionLive()),
-            (record.SessionAlreadyGone(kind="already gone", at=STOPPED), restart.SessionLive()),
-            (record.ProcessIdentityLost(kind="process identity lost", at=STOPPED), restart.SessionLive()),
-            (record.SessionStopFailed(kind="stop failed", at=STOPPED, reason="stop refused"), restart.SessionLive()),
-            (record.SessionRestarted(kind="restarted", at=STOPPED), restart.SessionLive()),
-            (record.SessionRestarting(kind="restarting", at=STOPPED, prior=failed), restart.SessionLive()),
-            (record.SessionRestoredTimersPending(kind="timers pending", at=STOPPED,
-                timers=[record.PendingTimer(instance="fixture.timer", reason="timer unavailable")]), restart.SessionLive()),
-            (record.SessionNeedsManualRestart(kind="manual restart", command="manual recovery"), restart.SessionLive()),
+            (shutdown_record.SessionWaiting(kind="waiting"), restart.SessionLive()),
+            (shutdown_record.SessionReaping(kind="reaping", at=STOPPED, because="account out of usage", detail="exhausted"), restart.SessionLive()),
+            (shutdown_record.SessionReadyToStop(kind="ready", at=STOPPED), restart.SessionLive()),
+            (shutdown_record.SessionHeldByUsageLimit(kind="held by usage limit", at=STOPPED), restart.SessionLive()),
+            (shutdown_record.SessionStopping(kind="stopping", at=STOPPED), restart.SessionLive()),
+            (shutdown_record.SessionStopped(kind="stopped", at=STOPPED), restart.SessionLive()),
+            (shutdown_record.SessionAlreadyGone(kind="already gone", at=STOPPED), restart.SessionLive()),
+            (shutdown_record.ProcessIdentityLost(kind="process identity lost", at=STOPPED), restart.SessionLive()),
+            (shutdown_record.SessionStopFailed(kind="stop failed", at=STOPPED, reason="stop refused"), restart.SessionLive()),
+            (shutdown_record.SessionRestarted(kind="restarted", at=STOPPED), restart.SessionLive()),
+            (shutdown_record.SessionRestarting(kind="restarting", at=STOPPED, prior=failed), restart.SessionLive()),
+            (shutdown_record.SessionRestoredTimersPending(kind="timers pending", at=STOPPED,
+                timers=[shutdown_record.PendingTimer(instance="fixture.timer", reason="timer unavailable")]), restart.SessionLive()),
+            (shutdown_record.SessionNeedsManualRestart(kind="manual restart", command="manual recovery"), restart.SessionLive()),
         ]
         for index, (progress, observed) in enumerate(cases):
             for automatic in (False, True):
@@ -189,7 +189,7 @@ class RunningRestartMoveTests(unittest.TestCase):
                     with (patch.object(restart, "_owner_liveness", return_value=observed),
                           patch.object(restart, "_session_liveness", return_value=observed),
                           patch.object(subprocess, "run") as launch,
-                          patch.object(record, "acknowledge_snapshot") as acknowledge,
+                          patch.object(shutdown_record, "acknowledge_snapshot") as acknowledge,
                           redirect_stdout(io.StringIO())):
                         if automatic:
                             result = accounts.move_sessions(("move-id",), "claude3", why="auto: exhausted",
@@ -202,7 +202,7 @@ class RunningRestartMoveTests(unittest.TestCase):
                         self.assertIn("already has a shutdown in progress", result.reason)
                     launch.assert_not_called()
                     acknowledge.assert_not_called()
-                    self.assertEqual(record.find_session(saved["login"], "move-id"), saved)
+                    self.assertEqual(shutdown_record.find_session(saved["login"], "move-id"), saved)
                     self.assertEqual(self.archived_records(), [])
 
     def test_dry_run_previews_closing_live_failed_record_without_archiving_or_acknowledging(self) -> None:
@@ -211,7 +211,7 @@ class RunningRestartMoveTests(unittest.TestCase):
         with (patch.object(restart, "_owner_liveness", return_value=restart.SessionLive()),
               patch.object(restart, "_session_liveness", return_value=restart.SessionLive()),
               patch.object(subprocess, "run") as launch,
-              patch.object(record, "acknowledge_snapshot") as acknowledge):
+              patch.object(shutdown_record, "acknowledge_snapshot") as acknowledge):
             outcome = accounts.move("move-id", "claude3", dry_run=True)
         self.assertIsInstance(outcome, accounts.MoveDryRun)
         assert isinstance(outcome, accounts.MoveDryRun)
@@ -220,7 +220,7 @@ class RunningRestartMoveTests(unittest.TestCase):
         self.assertIn("unconfirmed restart record", preview)
         self.assertIn("move-id", preview)
         self.assertEqual(self.fixture.disk_state(), before)
-        self.assertEqual(record.find_session(saved["login"], "move-id"), saved)
+        self.assertEqual(shutdown_record.find_session(saved["login"], "move-id"), saved)
         self.assertEqual(self.archived_records(), [])
         launch.assert_not_called()
         acknowledge.assert_not_called()
@@ -283,6 +283,21 @@ class MoveJournalTests(unittest.TestCase):
                 else:
                     self.assertIsInstance(evidence, moves.UnreadableMoveJournal)
                 self.assertEqual(path.read_bytes(), valid + suffix)
+
+    def test_an_auto_entry_read_recovers_interrupted_worker_name_conversion(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True)
+        row = {**self.requested(), "cause": "auto", "why": "auto: recovered"}
+        complete = json.dumps(row) + "\n"
+        _ = path.write_text(complete[:70] + "damaged old bytes\n")
+        recovery = path.with_name(f".{path.name}.workers")
+        _ = recovery.write_text(complete)
+        with patch.object(fcntl, "flock", wraps=fcntl.flock) as flock:
+            evidence = moves.recorded_auto_entries()
+        self.assertEqual(evidence, moves.RecordedAutoEntries(frozenset({"recovered"})))
+        self.assertEqual(path.read_text(), complete)
+        self.assertFalse(recovery.exists())
+        self.assertTrue(any(call.args[1] == fcntl.LOCK_EX for call in flock.call_args_list))
 
     def test_move_and_routing_appends_write_one_complete_encoded_line(self) -> None:
         with patch.object(os, "write", wraps=os.write) as write:
@@ -738,6 +753,42 @@ class MoveJournalTests(unittest.TestCase):
         unchanged = path.stat().st_mtime_ns
         self.assertEqual(moves.read_moves(), loaded)
         self.assertEqual(path.stat().st_mtime_ns, unchanged)
+
+    def test_a_partial_worker_name_conversion_recovers_all_history_on_rerun(self) -> None:
+        path = moves.store_file()
+        path.parent.mkdir(parents=True)
+        original = (json.dumps({**self.requested(), "subject": "seats"}) + "\ninvalid JSON\n"
+                    + json.dumps({"role": "seats", "label": "codex2"}) + "\n")
+        migrate = worker_names.migrate_locked_journal
+        for failure in (OSError("disk full"), KeyboardInterrupt("stopped during write")):
+            with self.subTest(failure=type(failure).__name__):
+                _ = path.write_text(original)
+                inode = path.stat().st_ino
+
+                def interrupted(source: TextIO, journal: Path) -> list[str]:
+                    write = source.write
+
+                    def partial_write(text: str) -> int:
+                        _ = write(text[:70])
+                        source.flush()
+                        raise failure
+
+                    with patch.object(source, "write", side_effect=partial_write):
+                        return migrate(source, journal)
+
+                with patch.object(worker_names, "migrate_locked_journal", side_effect=interrupted):
+                    with self.assertRaises(type(failure)):
+                        _ = worker_names.role_history_lines(path)
+                self.assertNotEqual(path.read_text(), original)
+                lines = worker_names.role_history_lines(path)
+                self.assertEqual(len(lines), 3)
+                self.assertEqual(json.loads(lines[0]), {**self.requested(), "subject": "workers"})
+                self.assertEqual(lines[1], "invalid JSON\n")
+                self.assertEqual(json.loads(lines[2]), {"role": "workers", "label": "codex2"})
+                self.assertEqual(path.read_text(), "".join(lines))
+                self.assertEqual(path.stat().st_ino, inode)
+                self.assertFalse(path.with_name(f".{path.name}.workers").exists())
+                self.assertFalse(path.with_name(f".{path.name}.tmp").exists())
 
     def test_confirmation_deduplicates_old_names_before_validation_and_keeps_other_workers(self) -> None:
         path = moves.store_file()

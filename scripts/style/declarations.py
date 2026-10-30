@@ -11,7 +11,7 @@ from bisect import bisect_right
 from dataclasses import dataclass, replace
 import difflib
 from enum import StrEnum
-from functools import lru_cache
+from functools import cached_property, lru_cache
 from itertools import accumulate
 import re
 
@@ -302,6 +302,11 @@ class DeclaredFile:
             return NoDeclarationAtLine()
         return max(holding, key=lambda entry: entry[:3])[3]
 
+    @cached_property
+    def _body_spans(self) -> tuple[style_footprint.TokenSpan, ...]:
+        """Immutable source offsets shared by every item body in this file."""
+        return style_footprint.token_spans("\n".join(self.source_lines))
+
     def item_body(self: DeclaredFile, item: DeclaredItem) -> ReadableBody | UnreadableBody:
         """Read only source inside this item's braces, including comments and header-line fragments."""
         index = self.declared_items.index(item)
@@ -310,7 +315,7 @@ class DeclaredFile:
             return UnreadableBody()
         text = "\n".join(self.source_lines)
         try:
-            spans = style_footprint.token_spans(text)
+            spans = self._body_spans
         except style_footprint.UnreadableTokenSpans:
             return UnreadableBody()
         if body.close >= len(spans):

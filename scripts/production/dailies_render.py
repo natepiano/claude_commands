@@ -72,6 +72,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "build_hold"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "mac_test"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from atomic_file import write_text_atomic
 import run_out
 import note_file
 from run_out import READINGS_LOG, Reading
@@ -1265,7 +1266,7 @@ def read_chart(path: Path) -> str:
 
 def write_chart(path: Path, chart: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    _ = path.write_text(f"{CHART_KEY}={chart}\n")
+    write_text_atomic(path, f"{CHART_KEY}={chart}\n")
 
 
 def parse_report(value: object, chart: str) -> Report:
@@ -1421,7 +1422,7 @@ def save_state(path: Path, report: Report, resolved: dict[str, ResolvedEta],
             "held": unit.held,
             "first": first.isoformat() if first else None,
         }
-    _ = path.write_text(json.dumps(state, indent=2) + "\n")
+    write_text_atomic(path, json.dumps(state, indent=2) + "\n")
 
 
 def clock(moment: datetime, now: datetime, zone_name: str) -> str:
@@ -2089,11 +2090,15 @@ def main(arguments: list[str]) -> int:
         print(f"dailies_render: {error}", file=sys.stderr)
         return 2
     print("\n".join(render(report, previous, resolved, now, abbreviation, outstanding, at=at)))
-    if state_path is not None:
-        save_state(state_path, report, resolved, previous)
-    if log_path is not None:
-        with log_path.open("a") as log:
-            _ = log.write(log_line(report, resolved, now, abbreviation) + "\n")
+    try:
+        if state_path is not None:
+            save_state(state_path, report, resolved, previous)
+        if log_path is not None:
+            with log_path.open("a") as log:
+                _ = log.write(log_line(report, resolved, now, abbreviation) + "\n")
+    except OSError as error:
+        print(f"dailies_render: {error}", file=sys.stderr)
+        return 2
     return 0
 
 
