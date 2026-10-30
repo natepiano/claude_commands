@@ -287,15 +287,34 @@ fi
 
 # Keep the identity of the code loaded by this shell, even when lint's fixes
 # require a new tree key. An updated script belongs to the next invocation.
+hash_stream() {
+    local hash
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash="$(sha256sum)" || return 1
+    else
+        hash="$(shasum -a 256)" || return 1
+    fi
+    printf '%s\n' "${hash%% *}"
+}
+
 lint_code_key() {
-    "$PY" -c 'import hashlib, pathlib, sys
-key = hashlib.sha256()
-for name in sys.argv[1:]:
-    path = pathlib.Path(name)
-    key.update(path.read_bytes() if path.is_file() else b"absent")
-    key.update(b"\0")
-print(key.hexdigest())' "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
-        "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}" 2>/dev/null || true
+    local file hash
+    hash="$(
+        set -o pipefail
+        {
+            for file in "${BASH_SOURCE[0]}" "$HOME/.claude/scripts/lint/invoke.sh" \
+                "${LINT_CONFIG_FILE:-$HOME/.claude/config/lint.conf}"; do
+                if [[ -f "$file" ]]; then
+                    printf 'present\0'
+                    cat -- "$file" || exit 1
+                else
+                    printf 'absent\0'
+                fi
+                printf '\0'
+            done
+        } | hash_stream
+    )" || hash=""
+    printf '%s\n' "$hash"
 }
 LINT_LOADED_CODE_KEY="$(lint_code_key)"
 
@@ -1118,6 +1137,16 @@ tree_key() {
         <<< "${GATE_METADATA}" 2>/dev/null || true
 }
 
+set_verdict_keys() {
+    local keys
+    keys="$(tree_key --with-tree-content "$@")"
+    VERDICT_KEY="${keys%%$'\n'*}"
+    VERDICT_TREE_KEY=""
+    if [[ "$keys" == *$'\n'* ]]; then
+        VERDICT_TREE_KEY="${keys#*$'\n'}"
+    fi
+}
+
 TREE_CHANGED_STATUS=77
 TREE_WATCH_PID=""
 TREE_WATCH_DIR=""
@@ -1179,8 +1208,7 @@ cancel_tree_run() {
 start_tree_watch() {
     [[ -z "$TREE_WATCH_PID" ]] || return 0
     TREE_WATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-tree.$$.XXXXXX")"
-    VERDICT_KEY="$(tree_key --watch-start "$TREE_WATCH_DIR/start")"
-    VERDICT_TREE_KEY="$(tree_key --tree-content)"
+    set_verdict_keys --watch-start "$TREE_WATCH_DIR/start"
     [[ -s "$TREE_WATCH_DIR/start" ]] || { rm -rf "$TREE_WATCH_DIR"; TREE_WATCH_DIR=""; return 0; }
     local scope=()
     if [[ "$CMD" == test ]]; then scope=(--package "${ARGS[0]}"); fi
@@ -1434,8 +1462,7 @@ try_mac_test() {
         start_tree_watch
         mac_owns_watch=1
     elif [[ -n "${CACHE_DIR}" && -z "$TREE_WATCH_PID" ]]; then
-        VERDICT_KEY="$(tree_key)"
-        VERDICT_TREE_KEY="$(tree_key --tree-content)"
+        set_verdict_keys
     fi
     MAC_LOG_FILE="$(mktemp)"
     step_state on_mac
@@ -2311,11 +2338,7 @@ token_waiters_key() {
         key_args=("${key_args[@]:1}")
     fi
     local hash
-    if command -v sha256sum >/dev/null 2>&1; then
-        hash="$( { printf '%s' "$(pwd -P)"; printf '\0%s' "$CMD" ${key_args[@]+"${key_args[@]}"}; } | sha256sum)"
-    else
-        hash="$( { printf '%s' "$(pwd -P)"; printf '\0%s' "$CMD" ${key_args[@]+"${key_args[@]}"}; } | shasum -a 256)"
-    fi
+    hash="$( { printf '%s' "$(pwd -P)"; printf '\0%s' "$CMD" ${key_args[@]+"${key_args[@]}"}; } | hash_stream)"
     printf '%s\n' "${hash:0:16}"
 }
 supersede_older_waiters() {
@@ -2622,7 +2645,7 @@ start_token_renewer() {
             wait "$delay_pid" 2>/dev/null || true
         fi; exit 0' INT TERM HUP
         while kill -0 "$$" 2>/dev/null && kill -0 "$renew_parent" 2>/dev/null; do
-            "$PY" -c 'import sys, time; time.sleep(float(sys.argv[1]))' "$TOKEN_RENEW_S" &
+            sleep "$TOKEN_RENEW_S" &
             delay_pid=$!
             wait "$delay_pid" || break
             delay_pid=""
@@ -2882,8 +2905,7 @@ if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
     # waited is part of the tree it runs on.
     if [[ "$CMD" != test ]]; then
-        VERDICT_KEY="$(tree_key)"
-        VERDICT_TREE_KEY="$(tree_key --tree-content)"
+        set_verdict_keys
     fi
     RUN_LOG="${CACHE_DIR}/run.$$.log"
     : > "${RUN_LOG}"
@@ -3150,8 +3172,7 @@ case "$CMD" in
         fi
         # Record the tree Taplo reads; clippy fix and fmt update the key below.
         if [[ -n "${RUN_LOG}" ]]; then
-            VERDICT_KEY="$(tree_key)"
-            VERDICT_TREE_KEY="$(tree_key --tree-content)"
+            set_verdict_keys
         fi
         # Cargo's workspace root can differ from the caller's directory.
         # Run there so Taplo uses the same config and scope as the push gate.
@@ -3189,8 +3210,7 @@ case "$CMD" in
                 clippy_tree_before="$clippy_tree_after"
             done
             if [[ -n "${RUN_LOG}" ]]; then
-                VERDICT_KEY="$(tree_key)"
-                VERDICT_TREE_KEY="$(tree_key --tree-content)"
+                set_verdict_keys
             fi
             start_tree_watch
             clippy_status=0

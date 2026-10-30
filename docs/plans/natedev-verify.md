@@ -361,7 +361,7 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 - Without `BUILDLOG_MEM_BLOCKER=1`, the memory gate's output and decisions are unchanged (`scripts/lint` tests pass).
 - Merge gate `--tests-only` green on a tree merged with origin/builds; basedpyright 0/0 on changed files and callers. A trial merge of `origin/builds-resources` passes the memory gate tests before the notice.
 
-### Phase 9 — Remove Phase 7's new Python starts  · status: todo
+### Phase 9 — Remove Phase 7's new Python starts  · status: done
 
 **Depends on:** Phase 1 and Phase 7 (same file: `verify.sh`); both are in this phase's baseline.
 
