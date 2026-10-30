@@ -118,7 +118,7 @@ including the details to make it clear
 
 **Gotchas:** origin/builds-resources' Phase 14 rewrites `queue_rows`; on merge, take its `owner_live` + `reservation_lifetime` form (one hunk).
 
-### Phase 4 — App launches reach the build log again, with their memory wait  · status: todo
+### Phase 4 — App launches reach the build log again, with their memory wait  · status: done
 
 #### Work Order
 
@@ -147,7 +147,68 @@ including the details to make it clear
 
 **Constraints from prior phases:** Phase 2: the index never rewrites a source log.
 
-**Acceptance gate:** the buildlog tests green; basedpyright 0/0/0. Live: after one `/hana_shot` on this unit's port, the build log has a new launch row with `mem_wait_s`, and `/build:report` counts it.
+**Acceptance gate:** the buildlog tests green; basedpyright 0/0/0. Live: after one `/hana_shot` on this unit's port, the build log has one new launch row, and `/build:report` counts it.
+
+**Ruling (showrunner, 2026-10-30 00:4x EDT):** a launch takes no memory admission by design (resources Phase 6, "BRP launch skips memory wait"), so a launch row has no wait to carry. The report shows its `mem_wait_s` as "no admission", never "not recorded", so no reader takes it for a lost value. Rows start from now; no backfill is required. The resources launch-hook subshell defect stays with resources.
+
+### Phase 4b — A failed step's record survives a failed save, and a rerun finishes it  · status: todo
+
+#### Work Order
+
+**Goal:** when saving a failed step's log fails, the source log and peak file stay on disk, and the next run of the recorder finishes the record with no duplicate row.
+
+**Spec:**
+- Defect (rerun-sweep row `scripts/buildlog/record.py:315`, `~/.claude/docs/plans/sdlc-rerun-sweep.md`, builds-unit section; showrunner order 2026-10-30 00:20 EDT): the save of a failed step's log (near line 280) can fail after the `finally` block has already deleted the source log and the peak file. A rerun then has nothing to record from, and the step's record is lost.
+- Fix: delete the sources only after the save is durable (written and renamed into place). A rerun that finds the sources and no saved record finishes the record; a rerun that finds the saved record and the sources deletes the sources and adds no second row.
+- First confirm the order of save and delete against the live tree.
+
+**Files:**
+- `scripts/buildlog/record.py` — save, then delete; a rerun finishes a half-done record
+- `scripts/buildlog/test_record_rerun.py` — a stop at each point, then a rerun
+
+**Workers:** 1 writer + 1 tester.
+- `impl2` — `record.py`
+- `test2` — `test_record_rerun.py`
+
+**State:** failed-step source logs, peak files, saved step logs, build-log rows
+
+**Depends on:** Phase 4 (both edit `scripts/buildlog/record.py`).
+
+**Constraints from prior phases:** Phase 2: the index never rewrites a source log.
+
+**Acceptance gate:** a test stops the recorder after the save, after the row and before each delete, then reruns it: each case ends with one row, one saved log and no source files. The buildlog tests green; basedpyright 0/0/0.
+
+### Phase 4c — Each scoped test step records its test-phase memory peak  · status: todo
+
+#### Work Order
+
+**Goal:** every scoped nextest step from `verify`, `cargo-port` and `validate_ci` (full and filtered, terminal and tee) records `test_phase_peak_bytes`: the step scope's largest `memory.stat` `anon`, in bytes, over its test phase.
+
+**Spec:**
+- Why (showrunner order 2026-10-30, for resources' parked test-phase charge, its Phase 15): today's 60 s machine samples cannot show a test peak per step.
+- Spec source: line 20 of `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/15/impl_summary_impl.txt`.
+- Sample once per second, from the first Cargo-profile `deps/` test binary seen in the scope until the scope ends. Count all parallel test processes in the scope.
+- Put the sampling in the existing per-step scope script (`BUILDLOG_SCOPE_SH`, `scripts/lint/invoke.sh:88`). Read the value with the existing `sample.anon_bytes`. Start no second sampler.
+- On release, persist these with the call/step identity: `test_phase_peak_bytes`, `test_phase_started_at` (epoch seconds), the actual `test_threads`, the repository and the filter family. A step with no test-phase mark records unknown, never 0.
+- Also persist the charge admission assigned at test-phase entry, with its history cutoff, form and contributing widths. Read it from admission's own record; never compute it. If admission has no such field, record unknown and tell the showrunner; resources adds the field in its follow-up.
+- Measure the sampler's CPU cost per step; the checkpoint notice names it.
+
+**Files:**
+- `scripts/lint/invoke.sh` — the scope script samples the test phase (owner verify-unit; trial-merge against `origin/natedev-verify-token` and name verify-unit with that tip in the notice's also-touches line)
+- `scripts/buildlog/record.py` — persist the fields on release
+- `scripts/buildlog/test_test_phase_peak.py` — first test binary starts the window, peak over parallel processes, no mark gives unknown, admission field absent gives unknown
+
+**Workers:** 1 writer + 1 tester.
+- `impl2` — `invoke.sh`, `record.py`
+- `test2` — `test_test_phase_peak.py`
+
+**State:** step records (new fields), the scope's peak/sample files
+
+**Depends on:** Phase 4b (both edit `scripts/buildlog/record.py`).
+
+**Constraints from prior phases:** Phase 2: the index never rewrites a source log.
+
+**Acceptance gate:** the buildlog and `scripts/lint/test_invoke_scope.py` tests green; basedpyright 0/0/0. Live: one filtered `verify.sh test` step gets a `test_phase_peak_bytes` value, and the notice states the sampler's CPU cost per step.
 
 ### Phase 5 — A bump by shown name moves only the step it names  · status: todo
 
