@@ -327,27 +327,15 @@ Inserted 2026-10-30 (user, via the showrunner). Work Order: `staff.py move <unit
 
 ### Phase 3f — One showrunner lookup  · status: done
 
-**Depends on:** Phase 3e
+#### As-built
 
-Lands after the shutdown unit's checkpoint (sdlc, 2026-10-30). That checkpoint owns the resume path: every resume runs in the session's own tab with `Herdr.run_in_pane` through `accounts.py exec <account>`, which replaces the launcher and pane-move design this phase first held.
-
-#### Work Order
-
-**Goal:** `staff_sources.py` answers "which row is this production's showrunner" in one place.
-
-**Spec:** `showrunner_members` and the `parents` loop in `unit_parent` answer the same question (natedev, 2026-10-30). `unit_parent` calls `showrunner_members` on one `_MemberSources` and picks the slug whose row is the staff parent. `_unit_member` answers a different question (which row this unit is) and stays. No new public function and no signature change.
+`_MemberSources.showrunner_members(record) -> dict[str, StaffRow]` in `staff_sources.py` is the one answer to which row each production slug has. The public `showrunner_members` and `unit_parent` both call it; `unit_parent` picks the slug whose row is the staff parent, and raises `StaffUnreadable` when that slug is not unique. `_unit_member` answers a different question and stays.
 
 **Files:**
-- `scripts/production/staff_sources.py`
-- `scripts/production/test_staff_sources.py`
+- `scripts/production/staff_sources.py` — the lookup.
+- `scripts/production/test_staff_sources.py` — agreement after a transfer and one read per `unit_parent` call.
 
-**Workers:** `1 writer` — `impl`.
-
-**State:** none.
-
-**Constraints from prior phases:** Phase 3c `showrunner_tree` owns tree reads. `staff_test_support.showrunner_relationship` is the one fixture for a showrunner edge, and `showrunner_tree`'s snapshot-taking functions are the one way to read the tree: a run takes one snapshot.
-
-**Acceptance gate:** basedpyright 0/0 on changed files and every `unit_parent` caller module; `test_staff_sources` proves that `unit_parent` and `showrunner_members` agree, also for a transferred unit; no second loop over productions remains in `unit_parent`; `test_staff*`, `test_showrunner*`, `test_stop*` suites pass.
+**Ruled out:** a launcher and pane-move resume here; the shutdown unit's typed resume through `Herdr.run_in_pane` and `accounts.py exec <account>` replaced it.
 
 ### Phase 3j — Transfer journal removed  · status: todo
 
