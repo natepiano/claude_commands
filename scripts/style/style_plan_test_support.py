@@ -551,7 +551,7 @@ class StylePlanFixture(unittest.TestCase):
         finding = self.ledger().proposal_findings(issue)[0]
         self.assertIn(path, style_plan.EditedFiles(self.repo, self.ledger(), style_plan.NoUnitBranch()).of(finding))
         output = self.refill_with_busy()
-        self.assertIn(f"waiting {issue}: {finding.finding_id} {path} has a path attribute the rename gate cannot read\n",
+        self.assertIn(f"waiting {issue}: {finding.path} {path} has a path attribute the rename gate cannot read (1 finding)\n",
                       output)
         self.assertIsInstance(self.ledger().proposal_findings(issue)[0].build_ticket, style_ledger.NoBuildTicket)
 
