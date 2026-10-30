@@ -2093,6 +2093,28 @@ print('two homes isolated; recorder lock retained; caller restored')
             self.assertTrue(attribution["reason"])
             self.assertTrue(attribution["candidates"])
 
+    def test_uncertain_coverage_counts_repeated_reasons_in_first_seen_order(self) -> None:
+        session = self.covered_wait_phase("repeated-uncertainty")
+        _ = (session / "mesh_roster.json").write_text(json.dumps({
+            "unit-impl": {"thread_id": "impl-thread"},
+            "unit-test": {"thread_id": "test-thread"},
+        }))
+        wait_ids = [self.run_command(
+            "start-wait", "--session-dir", str(session), "--worker-thread-id", thread,
+            "--owner-session", thread, "--kind", "WaitingForMemoryOrSlot", at=1020 + index,
+        ) for index, thread in enumerate(("impl-thread", "test-thread", *("impl-thread",) * 4))]
+        report = cast(dict[str, object], json.loads(self.run_command("waits", "--session-dir", str(session), at=1030)))
+        phase, = cast(list[dict[str, object]], report["phases"])
+        self.assertEqual(phase["state"], "UncertainCoverage")
+        self.assertEqual(phase["reason"], "worker unit-impl has 0 active pass matches (5 times); "
+                         + "worker unit-test has 0 active pass matches")
+        self.assertEqual(phase["attribution_miss_ids"], wait_ids)
+        missing = cast(list[dict[str, object]], report["missing"])
+        expected_candidates = [candidate for wait in missing
+                               for candidate in cast(list[object], cast(dict[str, object], wait["wait_attribution"])["candidates"])]
+        self.assertEqual(len(expected_candidates), 6)
+        self.assertEqual(phase["candidates"], expected_candidates)
+
     def test_checkpoint_identity_survives_reopening_runs_and_active_later_instances(self) -> None:
         for across_runs in (False, True):
             for active_later in (False, True):
