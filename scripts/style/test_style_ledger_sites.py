@@ -26,6 +26,68 @@ TEST_HANG_GUARD_SECS = 300
 
 @final
 class StyleLedgerSitesTests(LedgerTestCase):
+    def assert_hidden_enclosing_move_refused(self, prefix: str) -> None:
+        header = "macro_rules! declarations {\n    () => {\n"
+        work = "            fn work() {\n                let old = 791;\n            }\n"
+        source = (header + "        " + prefix + " fn first() {\n" + work
+                  + "        }\n        " + prefix + " fn second() {}\n    };\n}\n")
+        line = source.splitlines().index("                let old = 791;") + 1
+        ledger, _, finding = self.site_fixture(source=source, line=line)
+        moved = (header + "        " + prefix + " fn first() {}\n        " + prefix
+                 + " fn second() {\n" + work + "        }\n    };\n}\n")
+        tip = self.commit_tip(ledger, {PARENT_FILE: moved})
+        with self.subTest(proof="strict"):
+            self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        with self.subTest(proof="public"):
+            self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+
+    def test_site_refuses_dollar_visibility_owner_move(self) -> None:
+        self.assert_hidden_enclosing_move_refused("$vis")
+
+    def test_site_refuses_unknown_qualifier_chain_owner_move(self) -> None:
+        self.assert_hidden_enclosing_move_refused('unrecognized another pub(crate) unsafe extern "C"')
+
+    def test_site_refuses_two_identifier_owner_move(self) -> None:
+        self.assert_hidden_enclosing_move_refused("alpha beta")
+
+    def test_site_refuses_macro_fragment_owner_move(self) -> None:
+        self.assert_hidden_enclosing_move_refused("$name:ident")
+
+    def test_site_refuses_path_prefix_owner_move(self) -> None:
+        self.assert_hidden_enclosing_move_refused("unknown::modifier")
+
+    def assert_expression_boundary_carries(self, expression: str) -> None:
+        source = "fn work() {\n    " + expression + "\n    let old = 791;\n}\n"
+        ledger, _, finding = self.site_fixture("types", source=source, line=3, before="old", kind="type")
+        tip = self.commit_tip(ledger, {PARENT_FILE: "fn sibling() {}\n" + source})
+        self.assertEqual(self.strict_site(ledger, finding, tip), style_ledger.UnchangedSite(PARENT_FILE, 4))
+        self.assertEqual(ledger.finding_site(finding, tip), style_ledger.UnchangedSite(PARENT_FILE, 4))
+        # A context finding still needs judgment when another line in its item changes.
+        tip = self.commit_tip(ledger, {PARENT_FILE: source.replace(expression, expression + " changed();")})
+        self.assertIsInstance(self.strict_site(ledger, finding, tip), style_ledger.NeedsJudgment)
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+
+    def test_site_carries_none_match_arm_boundary(self) -> None:
+        self.assert_expression_boundary_carries("match x { None => 1, Some(_) => 2 };")
+
+    def test_site_carries_wildcard_match_arm_boundary(self) -> None:
+        self.assert_expression_boundary_carries("match x { _ => 1 };")
+
+    def test_site_carries_struct_literal_field_boundary(self) -> None:
+        self.assert_expression_boundary_carries("let pair = Pair { a: 1 };")
+
+    def test_site_carries_compound_assignment_boundary(self) -> None:
+        self.assert_expression_boundary_carries("x += 1;")
+
+    def test_site_carries_cast_boundary(self) -> None:
+        self.assert_expression_boundary_carries("x as T;")
+
+    def test_site_carries_range_boundary(self) -> None:
+        self.assert_expression_boundary_carries("x..y;")
+
+    def test_site_carries_comma_boundary(self) -> None:
+        self.assert_expression_boundary_carries("collect! { x, };")
+
     def test_context_site_refuses_deleted_same_file_duplicate_in_original_crate_scope(self) -> None:
         source = "fn first() {\n    consume(791);\n}\nfn duplicate() {\n    consume(791);\n}\n"
         ledger, _, finding = self.site_fixture("types", rule_name="no-duplicate-implementations",
@@ -272,15 +334,15 @@ class StyleLedgerSitesTests(LedgerTestCase):
         self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
 
 
-    def test_site_proof_rejects_partly_unreadable_item_parse(self) -> None:
+    def test_site_proof_ignores_unreadable_sibling_owner(self) -> None:
         ledger, _, finding = self.site_fixture()
         source = (self.repo / PARENT_FILE).read_text()
         tip = self.commit_tip(ledger, {PARENT_FILE: source + "fn sibling() {}\n"})
         self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
         tip = self.commit_tip(ledger, {PARENT_FILE: source + "mod nested { unsupported; }\n"})
-        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.NeedsJudgment)
+        self.assertIsInstance(ledger.finding_site(finding, tip), style_ledger.UnchangedSite)
         _ = ledger.follow_declarations([finding.finding_id], tip, lambda _: True)
-        self.assertEqual(ledger.named_held([finding.finding_id])[0].follow, style_ledger.NotFollowed())
+        self.assertEqual(ledger.named_held([finding.finding_id])[0].follow, style_ledger.FollowedDeclaration(PARENT_FILE, 2, tip))
 
 
     def test_site_proof_rejects_non_utf8_pinned_rule_text(self) -> None:

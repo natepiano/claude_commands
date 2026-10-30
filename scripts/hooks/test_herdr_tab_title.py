@@ -44,8 +44,7 @@ class HerdrTabTitleTests(unittest.TestCase):
         self.retitled, self.fault = [], False
         _ = self.enterContext(patch.object(herdr.Herdr, "retitle", autospec=True, side_effect=self.fake_retitle))
 
-    def fake_retitle(self, _client: herdr.Herdr, pane: str, title: str, *, label: str = "") -> bool:
-        self.assertTrue(label)
+    def fake_retitle(self, _client: herdr.Herdr, pane: str, title: str) -> bool:
         self.retitled.append((pane, title))
         if self.fault:
             raise herdr.HerdrFailure("server gone")
@@ -88,12 +87,12 @@ class HerdrTabTitleTests(unittest.TestCase):
             self.assertEqual(herdr_tab_title.main(), 0)
         self.assertEqual(self.retitled, [("w3:p7", "showrunner-fixer")])
 
-    def test_turn_end_preserves_shown_title_and_rename_keeps_identity_separate(self) -> None:
+    def test_turn_end_preserves_session_name_and_rename_updates_tab_and_pane(self) -> None:
         environment = {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents",
                        "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"}
         pane: dict[str, object] = {"pane_id": "w3:p7", "tab_id": "w3:t2", "workspace_id": "w3",
                                    "label": "showrunner-fixer"}
-        tab: dict[str, object] = {"tab_id": "w3:t2", "label": "sdlc · roles · unit director"}
+        tab: dict[str, object] = {"tab_id": "w3:t2", "label": "showrunner-fixer"}
 
         def result(_client: herdr.Herdr, *arguments: str) -> dict[str, object]:
             return {"panes": [pane]} if arguments == ("pane", "list") else {"tabs": [tab]}
@@ -117,12 +116,12 @@ class HerdrTabTitleTests(unittest.TestCase):
             self.record(41, "session-a", "renamed-director")
             self.assertTrue(herdr_tab_title.sync({"session_id": "session-a"}, environment))
             self.assertEqual(pane["label"], "renamed-director")
-            self.assertEqual(tab["label"], "sdlc · roles · unit director")
-            self.assertEqual(writes.call_count, 1)
+            self.assertEqual(tab["label"], "renamed-director")
+            self.assertEqual(writes.call_count, 2)
             ordered.assert_called_once()
             saved.assert_called_once()
 
-    def test_showrunner_title_uses_timer_record_after_session_rename(self) -> None:
+    def test_showrunner_title_uses_session_name_after_session_rename(self) -> None:
         state = self.records.parent / "notifier"
         instance = state / "showrunner-sdlc"
         instance.mkdir(parents=True)
@@ -131,7 +130,26 @@ class HerdrTabTitleTests(unittest.TestCase):
         environment = {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents", "NOTIFIER_STATE_DIR": str(state)}
         self.record(41, "session-a", "renamed-showrunner")
         self.assertTrue(herdr_tab_title.sync({"session_id": "session-a"}, environment))
-        self.assertEqual(self.retitled, [("w3:p7", "sdlc · showrunner")])
+        self.assertEqual(self.retitled, [("w3:p7", "renamed-showrunner")])
+
+    def test_showrunner_unit_director_and_plain_tabs_use_only_the_session_name(self) -> None:
+        state = self.records.parent / "notifier/showrunner-sdlc"
+        state.mkdir(parents=True)
+        _ = (state / "conf").write_text(
+            "TARGET=session:showrunner-id\nCHECK=/scripts/production_check.sh /docs/sdlc-production.md\n")
+        cases: tuple[tuple[str, str, dict[str, str]], ...] = (
+            ("showrunner-id", "control", {}),
+            ("director-id", "roles", {"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"}),
+            ("plain-id", "scratch", {}))
+        for pid, (session_id, name, marks) in enumerate(cases, 50):
+            with self.subTest(session=session_id):
+                self.record(pid, session_id, name)
+                environment = {"HERDR_PANE_ID": "w3:p7", "HERDR_SESSION": "agents", **marks}
+                self.assertTrue(herdr_tab_title.sync({"session_id": session_id}, environment))
+                title = self.retitled[-1][1]
+                self.assertEqual(title, name)
+                for added in (" · ", "sdlc", "showrunner", "unit director"):
+                    self.assertNotIn(added, title)
 
 
 if __name__ == "__main__":

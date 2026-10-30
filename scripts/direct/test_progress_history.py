@@ -106,6 +106,16 @@ class ProgressHistoryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_review_trial_counts_rerun_findings_as_code(self) -> None:
+        self.write_full_config()
+        session = self.start_run("rerun-findings", 71_000)
+        self.start_phase(session, 71_010)
+        _ = self.run_findings(session, "open", "--severity", "minor", "--title", "Claim blocks retry",
+                              "--caught-by", "worker", "--lens", "rerun", at=71_020)
+        self.assertEqual(self.run_command("review-trial", "--session-dir", str(session), at=71_030),
+                         "review trial: ux 0 findings, code 1 findings, review-worker minutes 0, "
+                         + "ux check minutes 0, ux repair minutes 0")
+
     def test_production_resolver_accepts_both_plan_header_forms(self) -> None:
         plan = self.working_dir / "unit-plan.md"
         for header in ("**Production: Example**", "**Production:** Example"):
