@@ -73,6 +73,8 @@ def write(env: Mapping[str, str], units: Sequence[HostedUnit]) -> None:
             {"pane_id": unit.pane, "agent": "claude", "agent_status": unit.agent_status}]}})}
         responses[f"--session {unit.session} pane list"] = {"code": 0, "stdout": json.dumps({"result": {"panes": [
             {"pane_id": unit.pane, "label": unit.label or None}]}})}
+        responses[f"--session {unit.session} pane process-info --pane {unit.pane}"] = {
+            "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": server + 1}}})}
         for source in ("recent", "recent-unwrapped"):
             for lines in (3, 60, 400):
                 for ansi in ("", " --format ansi"):

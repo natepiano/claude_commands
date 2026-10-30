@@ -151,12 +151,16 @@ def _mac_record(pid: int) -> tuple[list[str], dict[str, str]]:
     return list(parts.arguments), parts.environment
 
 
-def _parent(pid: int) -> int:
-    if sys.platform == "darwin":
-        result = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, check=False)
+def process_parent(pid: int) -> int:
+    """Read the OS parent; callers decide how unavailable evidence is handled."""
+    if (os.environ.get("HERDR_PLATFORM") or sys.platform) == "darwin":
+        result = subprocess.run([os.environ.get("HERDR_PS", "ps"), "-o", "ppid=", "-p", str(pid)],
+                                capture_output=True, text=True, check=True, timeout=5)
         return int(result.stdout)
-    stat = process_identity.read_stat(pid, PROC)
-    return 0 if isinstance(stat, process_identity.ProcessGone) else stat.ppid
+    stat = process_identity.read_stat(pid, Path(os.environ.get("HERDR_PROC") or PROC))
+    if isinstance(stat, process_identity.ProcessGone):
+        raise FileNotFoundError(f"process {pid} is gone")
+    return stat.ppid
 
 
 def _arguments(pid: int) -> list[str]:
@@ -170,9 +174,9 @@ def claude_arguments(pid: int) -> list[str]:
     """The argv of the nearest Claude process above `pid`; empty when none is found."""
     for _ in range(ANCESTOR_LIMIT):
         try:
-            pid = _parent(pid)
+            pid = process_parent(pid)
             arguments = _arguments(pid)
-        except (OSError, ValueError, IndexError):
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
             return []
         if herdr.is_claude_process(arguments):
             return arguments

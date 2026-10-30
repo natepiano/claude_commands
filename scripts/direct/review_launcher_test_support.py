@@ -14,11 +14,12 @@ import unittest
 from pathlib import Path
 from typing import TypedDict, ClassVar, cast, override
 
-from scripts.direct.recorder_fixture import STUB_ATOMIC_JSON_WRITER, communicate_launcher, invoke_recorder
 from scripts.direct.implement_launcher_test_support import copy_launcher_dependencies
+from scripts.direct.recorder_fixture import (
+    STUB_ATOMIC_JSON_WRITER, TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS,
+    communicate_launcher, invoke_recorder,
+)
 
-
-TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
 
 DIRECT_DIR = Path(__file__).parent
 
@@ -366,12 +367,6 @@ class ReviewLauncherFixture(unittest.TestCase):
         copy_launcher_dependencies(self.root)
         direct_dir = self.root / "scripts" / "direct"
         agents = self.root / "scripts" / "agents"
-        lib = self.root / "scripts" / "lib"
-        production = self.root / "scripts" / "production"
-        _ = shutil.copy2(DIRECT_DIR.parent / "production" / "showrunners.py", production / "showrunners.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "probe_session.py", lib / "probe_session.py")
-        for name in ("review.sh", "review_tree.py", "tag_inventory.py"):
-            _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
         launcher = direct_dir / "review.sh"
         _ = launcher.write_text(
             launcher.read_text(encoding="utf-8").replace(

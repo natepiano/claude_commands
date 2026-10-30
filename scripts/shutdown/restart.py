@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Literal, Never, Protocol, TypedDict, cast
 
 from scripts.accounts import outage_alerts
+from scripts.lib import process_start as process_identity
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
@@ -68,6 +69,7 @@ from shutdown_record import (  # noqa: E402
     SessionRestoredTimersPending,
     SessionNeedsManualRestart,
     SessionProgress,
+    SessionRestarting,
     SessionRestarted,
     SessionRestartFailed,
     TimerRestore,
@@ -1444,10 +1446,73 @@ def _send_restart_note(
     )
 
 
+@dataclass(frozen=True)
+class TimerRestoreClaim:
+    """One source restore and the process generation whose timers it enables."""
+
+    request_id: str
+    progress: SessionProgress
+    resumed: Session | None
+
+
+def _timer_restore_claim(record: SessionShutdown) -> TimerRestoreClaim:
+    # Capture before the first notifier call, including manual reconciliation.
+    # A saved session id (or a time) does not identify the resumed process.
+    live = next((item for item in sessions.live_sessions()
+                 if item["sessionId"] == record["session"]["session_id"]), None)
+    resumed: Session | None = None
+    if live is not None:
+        started = live.get("procStart", "")
+        if not started:
+            try:
+                observed = process_identity.process_start(live["pid"])
+            except process_identity.ProcessReadError:
+                pass
+            else:
+                if isinstance(observed, process_identity.ProcessStartTime):
+                    started = observed.text
+        if started:
+            resumed = copy.deepcopy(record["session"])
+            resumed["pid"], resumed["proc_start"] = live["pid"], started
+    return TimerRestoreClaim(record["request_id"], copy.deepcopy(record["progress"]), resumed)
+
+
+def _update_timer_owner(record: SessionShutdown, change: Callable[[SessionShutdown], None], *,
+                        claim: TimerRestoreClaim) -> None:
+    """A target stop owns only the exact resumed process, regardless of wall time."""
+    if target := record.get("target"):
+        target_login = named_claude_account(target).login
+        if target_login.casefold() != record["login"].casefold():
+            try:
+                taken = False
+
+                def current_target(current: SessionShutdown) -> None:
+                    nonlocal taken
+                    if claim.resumed is not None and recovery_store.request_matches_process(current, claim.resumed):
+                        taken = True
+                        change(current)
+
+                _ = update_session(target_login, record["session"]["session_id"], current_target)
+                if taken:
+                    return
+            except NoLiveRecord:
+                pass  # No stop has registered on the target yet.
+    _ = update_session(record["login"], record["session"]["session_id"], change)
+
+
 def _restore_timers(
-    timers: list[TimerRestore], *, record: SessionShutdown, dry_run: bool
+    timers: list[TimerRestore], *, record: SessionShutdown, dry_run: bool,
 ) -> tuple[PendingTimer, ...]:
     failures: list[PendingTimer] = []
+    claim: TimerRestoreClaim | None = None
+    claim_error = ""
+    if not dry_run and any(timer["was_enabled"] for timer in timers):
+        try:
+            claim = _timer_restore_claim(record)
+            if record.get("target") and claim.resumed is None:
+                claim_error = "resumed process generation unavailable; timer restore deferred"
+        except (OSError, ValueError) as error:
+            claim_error = _error_reason(error)
     for timer in timers:
         if timer["was_enabled"]:
             if dry_run:
@@ -1456,28 +1521,42 @@ def _restore_timers(
                 _display([*notifier, "start", timer["instance"]])
             else:
                 def stop_if_claim_lost(current: SessionShutdown) -> None:
-                    if (current["request_id"] != record["request_id"]
-                            or current["progress"] != record["progress"]):
+                    assert claim is not None
+                    same_attempt = (current["request_id"] == claim.request_id
+                                    and current["progress"] == claim.progress)
+                    # A later restore owns its timer enable. Only a stop can
+                    # require undoing this attempt's late enable.
+                    stopping = current["progress"]["kind"] in {
+                        "waiting", "ready", "held by usage limit", "reaping", "stopping", "stopped",
+                        "already gone", "process identity lost", "stop failed"}
+                    covers_resumed = (claim.resumed is not None
+                                      and recovery_store.request_matches_process(current, claim.resumed))
+                    if not same_attempt and stopping and covers_resumed:
                         settle.run_notifier("stop", timer["instance"])
 
                 try:
+                    if claim_error:
+                        raise ValueError(claim_error)
                     try:
                         settle.run_notifier("start", timer["instance"])
                     finally:
                         # A stop can snapshot this timer before start enables it.
                         # Check and undo that late enable under the record lock.
-                        try:
-                            _ = update_session(record["login"], record["session"]["session_id"], stop_if_claim_lost)
-                        except (NoLiveRecord, OSError, ValueError):
-                            settle.run_notifier("stop", timer["instance"])
-                            raise
-                except (NoLiveRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                        assert claim is not None
+                        # Missing/unreadable records are reconciliation failures,
+                        # never evidence that a stop owns this process generation.
+                        _update_timer_owner(record, stop_if_claim_lost, claim=claim)
+                except (NoLiveRecord, OSError, RuntimeError, ValueError, UnreadableAccount, subprocess.SubprocessError) as error:
                     failures.append(
                         PendingTimer(
                             instance=timer["instance"],
                             reason=_error_reason(error),
                         )
                     )
+                    # Claim loss rejects the pending-progress write. Report the
+                    # failure independently so a failed undo is still visible.
+                    print(f"shutdown: timer {timer['instance']} of {record['session']['name']}: {_error_reason(error)}",
+                          file=sys.stderr, flush=True)
     return tuple(failures)
 
 
@@ -1499,8 +1578,7 @@ def _same_relaunch_claim(record: SessionShutdown, current: SessionShutdown) -> b
     return (
         record["request_id"] == current["request_id"]
         and expected["kind"] == "restarting"
-        and observed["kind"] == "restarting"
-        and expected["at"] == observed["at"]
+        and observed == expected
     )
 
 
@@ -1670,19 +1748,21 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
         _clear_live_outage(record, observed_at)
         if record.get("target", ""):
             _confirm_move(record)
-        failures = _restore_timers(record["timers"], record=record, dry_run=False)
-        progress: SessionProgress = (SessionRestoredTimersPending(kind="timers pending", at=settle.record_time(), timers=list(failures))
-            if failures else SessionRestarted(kind="restarted", at=settle.record_time()))
-        if not _set_entry_progress(record, progress):
+        if not _finish_timer_restore(record, record["timers"], dry_run=False):
             found = lookup_session(record["login"], record["session"]["session_id"])
             if isinstance(found, ShutdownFound):
                 remaining.append(found.record)
             continue
-        if failures:
-            remaining.append({**record, "progress": progress})
+        progress = record["progress"]
+        if progress["kind"] != "restarted":
+            remaining.append(record)
             continue
-        archive_session(record["login"], record["session"]["session_id"])
-        finished.append({**record, "progress": progress})
+        if archive_session(record["login"], record["session"]["session_id"], expected=record):
+            finished.append({**record, "progress": progress})
+        else:
+            found = lookup_session(record["login"], record["session"]["session_id"])
+            if isinstance(found, ShutdownFound):
+                remaining.append(found.record)
     return TargetCheck(remaining, finished)
 
 
@@ -1705,31 +1785,43 @@ def finish_attached_session(saved: SessionShutdown, target: str, outcome: herdr.
     return clear_running_on_target([current])
 
 
-def _record_timer_restore_progress(
-    record: SessionShutdown,
-    failures: tuple[PendingTimer, ...],
-) -> None:
-    # The caller clears the outage at its live observation, before timer work.
+def _finish_timer_restore(record: SessionShutdown, timers: list[TimerRestore], *, dry_run: bool) -> bool:
+    """Keep a persisted attempt through all timer work, then publish completion."""
+    if not dry_run:
+        expected = copy.deepcopy(record["progress"])
+        claimed = False
+
+        def claim(current: SessionShutdown) -> None:
+            nonlocal claimed
+            if current["request_id"] != record["request_id"] or current["progress"] != expected:
+                return
+            if expected["kind"] != "restarting":
+                if expected["kind"] not in RESTARTABLE_PROGRESS:
+                    return
+                current["progress"] = SessionRestarting(kind="restarting", at=settle.record_time(),
+                    prior=expected)
+            claimed = True
+
+        try:
+            current = update_session(record["login"], record["session"]["session_id"], claim)
+        except NoLiveRecord:
+            return False
+        if not claimed:
+            return False
+        record["progress"] = current["progress"]
+    failures = _restore_timers(timers, record=record, dry_run=dry_run)
+    if dry_run:
+        return True
     _clear_assumed_refusal(record["session"]["session_id"])
-    if failures:
-        _record_pending_timers(record, failures)
-        return
-    progress: SessionProgress = SessionRestarted(
-        kind="restarted", at=settle.record_time()
-    )
-    _ = _set_entry_progress(record, progress)
-
-
-def _record_pending_timers(
-    record: SessionShutdown,
-    pending: tuple[PendingTimer, ...],
-) -> None:
-    progress: SessionProgress = SessionRestoredTimersPending(
-        kind="timers pending",
-        at=settle.record_time(),
-        timers=list(pending),
-    )
-    _ = _set_entry_progress(record, progress)
+    progress: SessionProgress = (SessionRestoredTimersPending(kind="timers pending", at=settle.record_time(),
+                                timers=list(failures)) if failures else
+                                SessionRestarted(kind="restarted", at=settle.record_time()))
+    try:
+        return _set_entry_progress(record, progress)
+    except (OSError, ValueError, UnreadableAccount) as error:
+        print(f"shutdown: timer reconciliation of {record['session']['name']}: {_error_reason(error)}",
+              file=sys.stderr, flush=True)
+        return False
 
 
 def _entry_order(record: SessionShutdown) -> tuple[int, str]:
@@ -2108,9 +2200,7 @@ def launch_entry(
                         return EntrySettled()
                     _clear_live_outage(record, observed_at)
                 timers = _pending_timer_restores(record, progress["timers"])
-                failures = _restore_timers(timers, record=record, dry_run=dry_run)
-                if not dry_run:
-                    _record_timer_restore_progress(record, failures)
+                _ = _finish_timer_restore(record, timers, dry_run=dry_run)
                 return EntrySettled()
             case SessionLivenessUnknown():
                 if not dry_run:
@@ -2153,9 +2243,7 @@ def launch_entry(
             record, note, dry_run=dry_run
         ):
             return EntrySettled()
-        timer_failures = _restore_timers(record["timers"], record=record, dry_run=dry_run)
-        if not dry_run:
-            _record_timer_restore_progress(record, timer_failures)
+        _ = _finish_timer_restore(record, record["timers"], dry_run=dry_run)
         return EntrySettled()
 
     if progress["kind"] == "manual restart" and _host_needs_manual_restart(session["host"]):
@@ -2388,13 +2476,10 @@ def confirm_entry(
         note = restart_note(record, restarted_at)
         if not _restart_note_delivered(record, note, dry_run=False):
             return
-    # Commit confirmation under the record lock before resuming workers or timers.
-    # A stop that took the claim during the checks above wins without these effects.
-    if not _set_entry_progress(record, SessionRestarted(kind="restarted", at=settle.record_time())):
+    # Completion remains unpublished until the shared timer claim reconciles.
+    if not _finish_timer_restore(record, record["timers"], dry_run=False):
         return
     _send_worker_resume(current)
-    timer_failures = _restore_timers(record["timers"], record=record, dry_run=False)
-    _record_timer_restore_progress(record, timer_failures)
     _tell_source_fallback(record)
 
 
@@ -2656,8 +2741,8 @@ def _confirm_entries(records: list[SessionShutdown], *, fast_remote_control: boo
     for record in records:
         if record["progress"]["kind"] == "restarted":
             # Confirmation ended the old outage. Archive must preserve a newer one.
-            archive_session(record["login"], record["session"]["session_id"])
-            _acknowledge_restored_snapshots(record["session"]["session_id"])
+            if archive_session(record["login"], record["session"]["session_id"], expected=record):
+                _acknowledge_restored_snapshots(record["session"]["session_id"])
 
     remote_control_missing(launched, confirmation, wait_seconds=0.0 if fast_remote_control else REMOTE_CONTROL_WAIT_SECONDS)
 

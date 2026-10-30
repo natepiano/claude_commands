@@ -1121,13 +1121,13 @@ def shutdown_identity(pid: int, timeout: float = 5) -> ProcessIdentity:
         return ProcessUnknown(f"pid {pid}: identity unread: {error}")
 
 
-def shutdown_server_identities(timeout: float) -> frozenset[tuple[int, str]]:
+def shutdown_server_identities(timeout: float, *, server_unit: str = "") -> frozenset[tuple[int, str]]:
     """Only the service's verified main process is a permanent server keep."""
     if sys.platform != "linux":
         return frozenset()
     expires = time.monotonic() + timeout
     try:
-        shown = subprocess.run(["systemctl", "--user", "show", herdr.server_unit(herdr.shared_session()),
+        shown = subprocess.run(["systemctl", "--user", "show", server_unit or herdr.server_unit(herdr.shared_session()),
             "--property=MainPID", "--value"], capture_output=True, text=True, check=False, timeout=timeout)
         if shown.returncode or not shown.stdout.strip().isdecimal():
             return frozenset()
@@ -1276,27 +1276,25 @@ def shutdown_processes(timeout: float = 5) -> ProcessObservation:
                 continue
             arguments = tuple(os.fsdecode(word) for word in process.joinpath("cmdline").read_bytes().split(b"\0") if word)
             environment: dict[str, str] = {}
-            cgroups: list[str] = []
+            cgroups: list[tuple[str, Path]] = []
             ownership_unreadable = False
             try:
                 environment = _snapshot_environment(process)
             except OSError as error:
                 errors.append(f"pid {process.name}: environment unread: {error}")
             try:
-                cgroups = process.joinpath("cgroup").read_text().splitlines()
+                cgroups = herdr.systemd_cgroups(process)
             except OSError as error:
                 errors.append(f"pid {process.name}: cgroup unread: {error}")
                 ownership_unreadable = True
-            scope = next((Path(line.split(":", 2)[-1]).name for line in cgroups
-                          if "/builds.slice/" in line and line.endswith((".scope", ".service"))), "")
+            scope = next((group.name for _hierarchy, group in cgroups
+                          if "builds.slice" in group.parts and group.suffix in {".scope", ".service"}), "")
             pid = int(process.name)
             result[pid] = ShutdownProcess(pid, int(fields[1]), fields[19], arguments,
                 environment.get("CLAUDE_CODE_SESSION_ID", ""),
                 environment.get("UNIT_RUN_DIR") or environment.get("UNIT_SESSION_DIR", ""), scope, int(fields[3]),
                 ownership_unreadable=ownership_unreadable,
-                cgroups=frozenset(fields[2] for line in cgroups
-                    if len(fields := line.split(":", 2)) == 3 and fields[1] in {"", "name=systemd"}
-                    and fields[2].startswith("/")))
+                cgroups=frozenset(str(group) for _hierarchy, group in cgroups))
         except FileNotFoundError:
             try:
                 if process.exists():

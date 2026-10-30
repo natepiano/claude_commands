@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import signal
 import re
@@ -14,6 +15,7 @@ import fcntl
 import threading
 import time
 from collections.abc import Callable
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from importlib import import_module
 from datetime import datetime, timedelta, timezone
@@ -26,6 +28,7 @@ from scripts.lib import process_start as process_identity
 for dependency in ("message", "production", "herdr", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
+import shutdown_record as record_store
 import sessions
 import inventory
 import herdr
@@ -42,6 +45,7 @@ from shutdown_record import (
     ReadinessCheck,
     SessionProgress,
     SessionShutdown,
+    OwnerPaneScope,
     PausedSeat,
     SessionStopIssue,
     find_session,
@@ -67,6 +71,7 @@ SHUTDOWN_GRACE_SECONDS = 60.0
 TERM_GRACE_SECONDS = 5.0
 
 KillProcess = Callable[[int, int], None]
+_SYSTEM_KILL = os.kill
 LivenessCheck = Callable[[int], bool]
 SessionRecordPresence = Callable[[int], bool]
 FreshInventory = Callable[[str, frozenset[str]], Inventory]
@@ -86,12 +91,17 @@ class StopClaimLost(Exception):
     """Another worker or request has replaced this stop claim."""
 
 
+class StopGenerationChanged(Exception):
+    """The recorded session has resumed outside this request's process generation."""
+
+
 @dataclass(frozen=True)
 class StopClaim:
     login: str
     session_id: str
     request_id: str
     at: str
+    inventory: FreshInventory | None = None
 
     def require(self, current: SessionShutdown) -> None:
         progress = current["progress"]
@@ -103,11 +113,20 @@ class StopClaim:
         ):
             raise StopClaimLost()
 
-    def check(self) -> None:
+    def _checked_record(self) -> SessionShutdown:
         current = find_session(self.login, self.session_id)
         if current is None:
             raise NoLiveRecord("session shutdown disappeared while stopping")
         self.require(current)
+        return current
+
+    def check(self) -> None:
+        _ = self._checked_record()
+
+    def check_effect(self) -> None:
+        current = self._checked_record()
+        if self.inventory is not None and _session_stop_admission(current, self.inventory):
+            raise StopGenerationChanged()
 
 
 class MatchingSession(TypedDict):
@@ -131,6 +150,11 @@ class SessionAccountUnreadable(TypedDict):
 FreshSession = (
     MatchingSession | SessionAbsent | SessionIdentityLost | SessionAccountUnreadable
 )
+
+
+def stop_admission(owner: FreshSession) -> str:
+    """A stop claim never transfers to a different process of the same session."""
+    return "session identity lost" if owner["kind"] == "session identity lost" else ""
 
 
 def now_utc() -> datetime:
@@ -192,16 +216,12 @@ def _same_process(stored: Session) -> bool:
 
 def fresh_session(stored: Session, report: Inventory) -> FreshSession:
     session_id = stored["session_id"]
-    current = next(
-        (item for item in report["sessions"] if item["session_id"] == session_id),
-        None,
-    )
+    occurrences = [item for item in report["sessions"] if item["session_id"] == session_id]
+    if any(item["pid"] != stored["pid"] or item["proc_start"] != stored["proc_start"]
+           for item in occurrences):
+        return {"kind": "session identity lost"}
+    current = next(iter(occurrences), None)
     if current is not None:
-        if (
-            current["pid"] != stored["pid"]
-            or current["proc_start"] != stored["proc_start"]
-        ):
-            return {"kind": "session identity lost"}
         return {
             "kind": "matching session", "session": current,
             "workers": [
@@ -229,6 +249,54 @@ def fresh_session(stored: Session, report: Inventory) -> FreshSession:
     return {"kind": "session absent"}
 
 
+def _session_stop_admission(
+    saved: SessionShutdown, read: FreshInventory, *,
+    observation: ProcessObservation | None = None,
+    identify: Callable[[int], ProcessIdentity] | None = None,
+) -> str:
+    """Join the complete registry to discovery's identities, never socket membership."""
+    identities = (saved["session"], *saved["workers"])
+    expected = {entry["session_id"]: (entry["pid"], entry["proc_start"]) for entry in identities}
+    # Inventory remains an additional check, never a source of absence proof.
+    # Read it first so a slow account read cannot authorize later registry work.
+    report = read(saved["login"], frozenset(expected))
+    for entry in identities:
+        reason = stop_admission(fresh_session(entry, report))
+        if reason:
+            return reason
+    registry = sessions.read_registry()
+    if registry.unreadable:
+        return f"session identity unreadable: registry {registry.unreadable[0]}"
+    occurrences = [item.record for item in registry.entries if item.record["sessionId"] in expected]
+    if occurrences and observation is None and identify is None:
+        observation = shutdown_processes()
+    for registered in occurrences:
+        pid = registered["pid"]
+        if observation is not None and (pid in observation.uncertain or any(
+                not error.startswith("pid ") or error.startswith(f"pid {pid}:")
+                for error in observation.errors)):
+            return f"session identity unreadable: pid {pid} in process observation"
+        # Probe again at effect boundaries: a registry occurrence born after the
+        # last capture must not borrow that earlier capture's authorization.
+        current = identify(pid) if identify is not None else shutdown_identity(pid)
+        if isinstance(current, ProcessUnknown):
+            return f"session identity unreadable: {current.reason}"
+        starts = {current.started} if isinstance(current, ProcessLive) else set[str]()
+        observed = observation.processes.get(pid) if observation is not None else None
+        if observed is not None:
+            starts.add(observed.started)
+        if not starts:
+            continue
+        started = registered.get("procStart", "")
+        if not started:
+            return f"session identity unreadable: registry pid {pid} has no start"
+        # The capture's live generation cannot disappear from the proof merely
+        # by exiting before this probe; its marker-bearing children still exist.
+        if started in starts and (pid, started) != expected[registered["sessionId"]]:
+            return "session identity lost"
+    return ""
+
+
 def _set_stop_outcome(
     claim: StopClaim,
     progress: Literal["stopped", "already gone", "process identity lost", "stop failed"],
@@ -236,6 +304,8 @@ def _set_stop_outcome(
     issues: list[SessionStopIssue],
     reason: str = "",
 ) -> SessionShutdown:
+    if progress in {"stopped", "already gone"}:
+        claim.check_effect()
     def change(current: SessionShutdown) -> None:
         claim.require(current)
         at = _timestamp(clock)
@@ -353,8 +423,9 @@ def _capture_codex_seats(session: Session) -> list[PausedSeat]:
 
 
 def _save_codex_seats(session: Session, claim: StopClaim) -> None:
-    claim.check()
+    claim.check_effect()
     seats = _capture_codex_seats(session)
+    claim.check_effect()
     def save(current: SessionShutdown) -> None:
         claim.require(current)
         # Retried cleanup must retain the argv read before the launcher exited.
@@ -378,7 +449,7 @@ def _stop_codex_servers(
     issues: list[SessionStopIssue] = []
     for run_dir in _run_directories(session):
         server_pids = _mesh_server_pids(run_dir)
-        claim.check()
+        claim.check_effect()
         status = codex_mesh(["stop", "--pause", "--session-dir", run_dir])
         if status != 0 or any(is_alive(pid) for pid in server_pids):
             issues.append(
@@ -406,13 +477,14 @@ def _stop_unit_session(
         "session_name": name,
         "cause": "stop not confirmed",
     }
-    claim.check()
+    claim.check_effect()
     if name == herdr.shared_session():
         # The shared session holds every production: close only the tab of the pane that carries this unit's marks.
         client = herdr.Herdr(name)
         try:
             marked = unit_lookup.marked_unit(host["production"], host["unit"])
             if marked is not None and marked.place.session == name:
+                claim.check_effect()
                 client.close_tab_of(marked.place.pane)
             left = marked is not None and any(pane["pane_id"] == marked.place.pane for pane in client.panes())
         except (herdr.HerdrFailure, OSError, subprocess.TimeoutExpired):
@@ -477,7 +549,7 @@ def _close_ghostty_window(
     if not is_alive(shell) or not _ghostty_still_owns_shell(shell):
         return
     try:
-        claim.check()
+        claim.check_effect()
         kill(shell, signal.SIGHUP)
     except OSError:
         pass
@@ -573,7 +645,7 @@ def _hold_supervised_window(entry: SessionShutdown, claim: StopClaim) -> bool:
     supervisor = live_supervisor(host)
     if supervisor["kind"] != "supervisor":
         return False
-    claim.check()
+    claim.check_effect()
     relaunch.write_hold(supervisor["pid"])
     return True
 
@@ -582,6 +654,7 @@ def _stop_owner(
     claim: StopClaim,
     entry: SessionShutdown,
     *,
+    match: FreshSession,
     prior: SessionProgress,
     idle_reason: IdleStopReason,
     force_now: bool,
@@ -595,16 +668,6 @@ def _stop_owner(
 ) -> None:
     stored = entry["session"]
     retain_window = False
-    report = fresh_inventory(claim.login, frozenset({stored["session_id"]}))
-    match = fresh_session(stored, report)
-    if match["kind"] == "session identity lost":
-        _ = _set_stop_outcome(
-            claim,
-            "process identity lost",
-            clock,
-            _owner_identity_lost_issues(stored, clock),
-        )
-        return
     if match["kind"] == "session account unreadable" and not (force_now and _same_process(stored)):
         _ = _set_stop_outcome(
             claim, "stop failed", clock,
@@ -667,7 +730,7 @@ def _stop_owner(
         _ = _set_stop_outcome(claim, "stop failed", clock, [], str(error))
         return
     try:
-        claim.check()
+        claim.check_effect()
         kill(stored["pid"], signal.SIGTERM)
     except ProcessLookupError:
         issues = _stop_owner_resources(
@@ -712,7 +775,7 @@ def _stop_owner(
     ):
         second_report = fresh_inventory(claim.login, frozenset({stored["session_id"]}))
         second = fresh_session(stored, second_report)
-        if second["kind"] == "session identity lost":
+        if stop_admission(second):
             _ = _set_stop_outcome(
                 claim,
                 "process identity lost",
@@ -731,7 +794,7 @@ def _stop_owner(
             stopped_progress = "already gone"
         else:
             try:
-                claim.check()
+                claim.check_effect()
                 kill(stored["pid"], signal.SIGTERM)
             except ProcessLookupError:
                 stopped_progress = "already gone"
@@ -834,8 +897,13 @@ def stop_session(
     progress = current["progress"]
     if progress["kind"] != "stopping":
         return current
-    owned = StopClaim(current["login"], current["session"]["session_id"], current["request_id"], progress["at"])
+    owned = StopClaim(current["login"], current["session"]["session_id"], current["request_id"], progress["at"], fresh_inventory)
     try:
+        match = fresh_session(current["session"],
+            fresh_inventory(current["login"], frozenset({current["session"]["session_id"]})))
+        if stop_admission(match):
+            return _set_stop_outcome(owned, "process identity lost", clock,
+                _owner_identity_lost_issues(current["session"], clock))
         if prior["kind"] in {"stopped", "already gone", "process identity lost", "stop failed", "restart failed"}:
             _retry_owner_cleanup(
                 owned, current, is_alive=is_alive,
@@ -846,15 +914,19 @@ def stop_session(
                 owned.require(changing)
                 changing["progress"] = prior
 
+            owned.check_effect()
             return update_session(current["login"], current["session"]["session_id"], restore_progress)
         _stop_owner(
-            owned, current, prior=prior, idle_reason=idle_reason,
+            owned, current, match=match, prior=prior, idle_reason=idle_reason,
             force_now=forced or current["force"] == "now",
             kill=kill, is_alive=is_alive,
             session_record_exists=session_record_exists,
             fresh_inventory=fresh_inventory, clock=clock,
             codex_mesh=codex_mesh, sleep=sleep,
         )
+    except StopGenerationChanged:
+        return _set_stop_outcome(owned, "process identity lost", clock,
+            _owner_identity_lost_issues(current["session"], clock))
     except StopClaimLost:
         pass
 
@@ -894,6 +966,7 @@ class BoundedOwner:
     pause_issues: list[SessionStopIssue] = field(default_factory=list)
     targets: dict[tuple[int, str], StopTarget] = field(default_factory=dict)
     permanent_keeps: set[tuple[int, str]] = field(default_factory=set)
+    ancestor_keeps: set[tuple[int, str]] = field(default_factory=set)
     worker_targets: set[tuple[int, str]] = field(default_factory=set)
     pause_observed: bool = False
     required_observation: int = 1
@@ -906,10 +979,12 @@ class BoundedOwner:
     replaced_parents: set[int] = field(default_factory=set)
     cgroups: set[str] = field(default_factory=set)
     initial_scopes: dict[tuple[int, str], frozenset[str]] = field(default_factory=dict)
-    other_director_scopes: set[str] = field(default_factory=set)
+    other_owner_scopes: set[str] = field(default_factory=set)
     machine_wide: bool = False
     environment_unread: set[int] = field(default_factory=set)
     cgroup_unread: set[int] = field(default_factory=set)
+    shared_server_unit: str = ""
+    admission_error: str = ""
 
 
 @dataclass
@@ -947,7 +1022,7 @@ class StopDeadline:
                 errors.append(str(error))
             finally:
                 finished.set()
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=copy_context().run, args=(work,), daemon=True).start()
         if not finished.wait(timeout=budget):
             return failed("operation exceeded shutdown deadline")
         if errors:
@@ -960,7 +1035,8 @@ def _same_stop_ownership(expected: SessionShutdown, current: SessionShutdown) ->
     return (expected["request_id"] == current["request_id"]
         and expected["session"] == current["session"]
         and expected["workers"] == current["workers"]
-        and expected.get("codex_seats", []) == current.get("codex_seats", []))
+        and expected.get("codex_seats", []) == current.get("codex_seats", [])
+        and expected.get("owner_pane_scopes", []) == current.get("owner_pane_scopes", []))
 
 
 def _predates_owners(owner: BoundedOwner, started: str) -> bool:
@@ -984,6 +1060,46 @@ def _owner_session_ids(saved: SessionShutdown) -> frozenset[str]:
     return frozenset(entry["session_id"] for entry in (saved["session"], *saved["workers"]))
 
 
+def owner_ancestor_keeps(owner: BoundedOwner, observation: ProcessObservation,
+                         workload: BoundedOwner) -> set[tuple[int, str]]:
+    """Only the shared discovery result can exclude work from host ancestors."""
+    observed = {pid: process for pid, process in observation.processes.items()
+                if pid not in observation.uncertain}
+    roots = {entry["pid"] for entry in (owner.record["session"], *owner.record["workers"])
+             if entry["pid"] in observed and observed[entry["pid"]].started == entry["proc_start"]}
+    panes = {group for groups in owner.initial_scopes.values() for group in groups
+             if "app-agents.slice" in Path(group).parts}
+    kept = {pid for pid, process in observed.items()
+            if _predates_owners(owner, process.started) and any(
+                group in panes
+                and process.parent in observed and group not in observed[process.parent].cgroups
+                for group in process.cgroups)}
+    pending = list(roots | kept)
+    visited = roots | kept
+    while pending:
+        process = observed[pending.pop()]
+        for parent in process.observed_parents | {process.parent}:
+            if parent in observed and parent not in visited:
+                kept.add(parent)
+                visited.add(parent)
+                pending.append(parent)
+    return {(pid, observed[pid].started) for pid in kept - workload.processes.keys()}
+
+
+def stop_summary(records: list[SessionShutdown]) -> str:
+    """One total derived from every selected record's stop outcome."""
+    stopped = sum(saved["progress"]["kind"] == "stopped" for saved in records)
+    if stopped == len(records):
+        return f"all {stopped} stopped"
+    lines = [f"{stopped} of {len(records)} stopped"]
+    for saved in records:
+        progress = saved["progress"]
+        if progress["kind"] != "stopped":
+            reason = progress["reason"] if progress["kind"] == "stop failed" else progress["kind"]
+            lines.append(f"{saved['session']['name']}: {reason}")
+    return "\n".join(lines)
+
+
 def _cgroup_relation(owner: BoundedOwner, process: ShutdownProcess) -> Literal["owned", "unrelated", "unknown"]:
     """Readable Linux membership scopes unreadable environment evidence."""
     if (process.session_id in _owner_session_ids(owner.record)
@@ -993,7 +1109,7 @@ def _cgroup_relation(owner: BoundedOwner, process: ShutdownProcess) -> Literal["
         return "unknown"
     if not process.cgroups:
         return "unknown" if process.pid in owner.environment_unread else "unrelated"
-    shared_server = herdr.server_unit(herdr.shared_session())
+    shared_server = owner.shared_server_unit
     for group in process.cgroups:
         path = Path(group)
         if path.name in owner.units:
@@ -1007,12 +1123,10 @@ def _cgroup_relation(owner: BoundedOwner, process: ShutdownProcess) -> Literal["
     if any(Path(group).name == shared_server for group in process.cgroups):
         return "unknown"
     if any("app-agents.slice" in Path(group).parts for group in process.cgroups):
-        # Each recorded identity needs its own first-observation scope. A live
-        # other director can independently exclude its scope when ours is lost.
-        recorded = {(entry["pid"], entry["proc_start"])
-                    for entry in (owner.record["session"], *owner.record["workers"])}
-        return "unrelated" if recorded <= owner.initial_scopes.keys() or all(
-            group in owner.other_director_scopes for group in process.cgroups
+        # A different scope can hold an undiscovered detached child, even at
+        # the first scan. Only independent ownership or chronology excludes it.
+        return "unrelated" if _predates_owners(owner, process.started) or all(
+            group in owner.other_owner_scopes for group in process.cgroups
             if "app-agents.slice" in Path(group).parts) else "unknown"
     if process.pid not in owner.environment_unread:
         return "unrelated"
@@ -1110,6 +1224,20 @@ def stop_succeeded(owner: BoundedOwner, observation: ProcessObservation, *, requ
         and begun >= max(owner.last_signal_at, owner.pause_finished_at) and now <= deadline.expires)
 
 
+def stop_failure_reason(owner: BoundedOwner, errors: list[str], *, request_current: bool,
+                        generation: int, pending: list[tuple[int, str]]) -> str:
+    reasons = errors.copy()
+    if not request_current:
+        reasons.append("shutdown record disappeared or was replaced")
+    if pending:
+        reasons.append("unresolved pids: " + ", ".join(f"{pid}/{start}" for pid, start in pending))
+    if not owner.pause_observed or not owner.pause_done.is_set() or owner.pause_issues:
+        reasons.append("worker pause not confirmed successful")
+    if generation < owner.required_observation:
+        reasons.append("no complete observation after latest signal/pause")
+    return "; ".join(dict.fromkeys(reasons)) or "shutdown deadline exhausted"
+
+
 
 def _descendants(roots: set[int], observed: dict[int, ShutdownProcess]) -> set[int]:
     owned = roots.copy()
@@ -1146,7 +1274,9 @@ def _recorded_builds(session: Session, observed: dict[int, ShutdownProcess], rep
     return builds
 
 
-def _owned_processes(saved: SessionShutdown, observed: dict[int, ShutdownProcess], report: Callable[[str], None] = _ignore_read_error) -> BoundedOwner:
+def _owned_processes(saved: SessionShutdown, observed: dict[int, ShutdownProcess],
+                     report: Callable[[str], None] = _ignore_read_error, *,
+                     captured: BoundedOwner | None = None) -> BoundedOwner:
     command_tree = _descendants({os.getpid()}, observed)
     observed = {pid: process for pid, process in observed.items() if pid not in command_tree}
     owner = saved["session"]
@@ -1155,6 +1285,9 @@ def _owned_processes(saved: SessionShutdown, observed: dict[int, ShutdownProcess
     roots: set[int] = {owner["pid"]} if owner_process is not None and owner_process.started == owner["proc_start"] else set()
     roots.update(worker["pid"] for worker in saved["workers"]
                  if worker["pid"] in observed and observed[worker["pid"]].started == worker["proc_start"])
+    if captured is not None:
+        roots.update(pid for (pid, start), target in captured.targets.items()
+                     if not target.retired and pid in observed and observed[pid].started == start)
     roots.update(pid for pid in _mesh_server_roots(owner, observed, report))
     for directory in runs:
         for value in _json_object(Path(directory) / "mesh_roster.json", report).values():
@@ -1177,10 +1310,16 @@ def _owned_processes(saved: SessionShutdown, observed: dict[int, ShutdownProcess
             roots.add(pid)
             if any(Path(word).name in {"verify.sh", "merge_gate.py"} for word in process.arguments):
                 builds[pid] = " ".join(process.arguments)
-    owned = _descendants(roots, observed)
-    units = {observed[pid].build_unit for pid in owned if pid in observed and observed[pid].build_unit}
-    # A scope may have reparented its members to the user manager.
-    owned.update(pid for pid, process in observed.items() if process.build_unit in units)
+    owned = roots
+    units = captured.units.copy() if captured is not None else set[str]()
+    while True:
+        owned = _descendants(owned, observed)
+        units.update(observed[pid].build_unit for pid in owned if pid in observed and observed[pid].build_unit)
+        # A scope may have reparented its members to the user manager.
+        expanded = owned | {pid for pid, process in observed.items() if process.build_unit in units}
+        if expanded == owned:
+            break
+        owned = expanded
     for pid in owned:
         if pid in observed and observed[pid].build_unit:
             _ = builds.setdefault(pid, observed[pid].build_unit)
@@ -1259,7 +1398,8 @@ def _force_stop_note(session: Session, grace_seconds: float) -> str:
             "check git status, MERGE_HEAD, .git/index.lock and workers before continuing; never remove index.lock automatically")
 
 
-def _release_build_claims(owner: BoundedOwner, identity: Callable[[int], str | None], timeout: float = 30) -> None:
+def _release_build_claims(owner: BoundedOwner, identity: Callable[[int], str | None], timeout: float = 30,
+                          admitted: Callable[[], bool] = lambda: True) -> None:
     """Remove only dead holders' exact records; remote jobs remain visible until confirmed ended."""
     session = owner.record["session"]
     roots = [Path(os.environ.get("BUILDLOG_DIR", str(Path.home() / ".local/state/buildlog"))) / "admission",
@@ -1290,8 +1430,12 @@ def _release_build_claims(owner: BoundedOwner, identity: Callable[[int], str | N
                         continue
                     if fields.get("state") == "on_mac":
                         print(f"left running build  Mac offload ({session['name']}): remote completion unconfirmed", flush=True)
+                    if not admitted():
+                        return
                     path.unlink(missing_ok=True)
                     if path.suffix in {".reservation", ".waiting"}:
+                        if not admitted():
+                            return
                         path.with_suffix(".max").unlink(missing_ok=True)
             except (OSError, ValueError):
                 continue
@@ -1299,12 +1443,16 @@ def _release_build_claims(owner: BoundedOwner, identity: Callable[[int], str | N
     holds = Path(os.environ.get("BUILD_HOLD_DIR", str(Path.home() / ".local/state/build-hold")))
     key = session["session_id"]
     if key and Path(key).name == key:
+        if not admitted():
+            return
         (holds / key).unlink(missing_ok=True)
     block = roots[-1] / "block.json"
     fields = _json_object(block)
     if fields.get("holder_session") == key or fields.get("holder") == key or fields.get("session") == key:
         holder = fields.get("holder")
         if isinstance(holder, str) and holder:
+            if not admitted():
+                return
             # Unblock also restores the CI switch saved by the Mac hold; unlinking loses that intent.
             try:
                 result = subprocess.run([sys.executable, str(SCRIPTS / "mac_test/mac_test.py"),
@@ -1356,6 +1504,55 @@ def _no_exit_request(_saved: SessionShutdown) -> None:
     pass
 
 
+def owner_pane_scopes(session: Session, workers: list[Session]) -> list[OwnerPaneScope]:
+    """Retain verified Linux pane membership before a pause can remove its owners."""
+    if sys.platform != "linux":
+        return []
+    scopes: list[OwnerPaneScope] = []
+    for entry in (session, *workers):
+        expected = ProcessLive(entry["proc_start"])
+        if shutdown_identity(entry["pid"]) != expected:
+            continue
+        try:
+            memberships = herdr.systemd_cgroups(Path(os.environ.get("HERDR_PROC", "/proc"), str(entry["pid"])))
+        except OSError:
+            continue
+        groups = [str(group) for _hierarchy, group in memberships if "app-agents.slice" in group.parts]
+        if groups and shutdown_identity(entry["pid"]) == expected:
+            scopes.append(OwnerPaneScope(pid=entry["pid"], proc_start=entry["proc_start"], cgroups=groups))
+    return scopes
+
+
+def _signal_identity(process: ShutdownProcess, signum: int, *, probe: Callable[[int], ProcessIdentity],
+                     kill: KillProcess, deadline: StopDeadline,
+                     admitted: Callable[[], bool] = lambda: True) -> None:
+    """Bind Linux signals to an opened process, verifying its recorded start after open."""
+    descriptor = -1
+    if sys.platform == "linux" and kill is _SYSTEM_KILL and hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+        try:
+            descriptor = os.pidfd_open(process.pid, 0)
+        except OSError as error:
+            if error.errno not in {errno.ENOSYS, errno.EINVAL, errno.ENODEV}:
+                raise
+    try:
+        current = probe(process.pid)
+        if isinstance(current, ProcessUnknown):
+            raise OSError(current.reason)
+        if not isinstance(current, ProcessLive) or current.started != process.started:
+            return
+        if not admitted():
+            return
+        if deadline.monotonic() > deadline.expires - 1:
+            raise OSError("verification reserve reached before signal")
+        if descriptor >= 0:
+            signal.pidfd_send_signal(descriptor, signum)
+        else:
+            kill(process.pid, signum)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def bounded_stop(
     records: list[SessionShutdown], *, started: float,
     grace_seconds: float = SHUTDOWN_GRACE_SECONDS,
@@ -1370,10 +1567,37 @@ def bounded_stop(
     kill: KillProcess = os.kill,
     codex_mesh: Callable[[list[str], float], int | None] = _bounded_mesh,
 ) -> list[SessionShutdown]:
-    """Prove completion from fresh evidence; no stop path can bypass the proof."""
+    """Prove completion from fresh evidence, including bounded record persistence."""
     deadline = StopDeadline(started + grace_seconds + TERM_GRACE_SECONDS + 1, monotonic)
-    owners: list[BoundedOwner] = []
     results: list[SessionShutdown] = []
+    try:
+        with record_store.record_deadline(record_store.RecordDeadline(deadline.expires, monotonic, sleep)):
+            return _bounded_stop(records, started=started, grace_seconds=grace_seconds,
+                machine_wide=machine_wide, keep=keep, request_exit=request_exit,
+                monotonic=monotonic, sleep=sleep, clock=clock, observe=observe,
+                identity=identity, kill=kill, codex_mesh=codex_mesh, deadline=deadline, results=results)
+    except record_store.RecordDeadlineExpired as error:
+        completed = {(saved["login"], saved["session"]["session_id"]) for saved in results}
+        for saved in records:
+            if (saved["login"], saved["session"]["session_id"]) in completed or keep_infrastructure(saved["session"]):
+                continue
+            failed = saved.copy()
+            failed["progress"] = {"kind": "stop failed", "at": _timestamp(clock), "reason": str(error)}
+            results.append(failed)
+            print(f"{clock().astimezone(user_zone()):%H:%M:%S}  failed  {saved['session']['name']}: {error}", flush=True)
+        print(stop_summary(results), flush=True)
+        return results
+
+
+def _bounded_stop(
+    records: list[SessionShutdown], *, started: float, grace_seconds: float,
+    machine_wide: bool, keep: tuple[Session, ...], request_exit: Callable[[SessionShutdown], None],
+    monotonic: Callable[[], float], sleep: Sleeper, clock: Clock,
+    observe: Callable[[float], ProcessObservation], identity: Callable[[int, float], ProcessIdentity],
+    kill: KillProcess, codex_mesh: Callable[[list[str], float], int | None],
+    deadline: StopDeadline, results: list[SessionShutdown],
+) -> list[SessionShutdown]:
+    owners: list[BoundedOwner] = []
     generation = 0
     server_identities: frozenset[tuple[int, str]] = frozenset()
     server_checked = False
@@ -1395,6 +1619,37 @@ def bounded_stop(
         return deadline.call(lambda budget: identity(pid, budget),
             lambda error: ProcessUnknown(f"pid {pid}: {error}"), verification=True)
 
+    def admitted(owner: BoundedOwner) -> bool:
+        # Session markers and run directories survive a resume. They grant no
+        # authority after the session record identifies a different generation.
+        if not owner.admission_error:
+            reason = deadline.call(lambda _budget: _session_stop_admission(owner.record, _fresh_inventory,
+                observation=latest_observation if generation else None,
+                identify=lambda pid: deadline.call(lambda budget: identity(pid, budget),
+                    lambda error: ProcessUnknown(f"pid {pid}: {error}"), verification=True)),
+                lambda error: f"session identity unreadable: {error}", verification=True)
+            if reason:
+                owner.admission_error = reason
+        return not owner.admission_error
+
+    def refuse(owner: BoundedOwner) -> None:
+        # A refusal describes this attempt without changing the stored request
+        # or claiming that the resumed generation was stopped.
+        if isinstance(owner.state, StopComplete):
+            return
+        refused = owner.record.copy()
+        scoped = _owner_observation(owner, latest_observation)
+        reason = stop_failure_reason(owner,
+            [owner.admission_error, *owner.stop_errors, *owner.ownership_errors, *scoped.errors],
+            request_current=True, generation=generation,
+            pending=[key for key, target in owner.targets.items()
+                     if not target.retired and key not in owner.permanent_keeps])
+        refused["progress"] = {"kind": "stop failed", "at": _timestamp(clock),
+                               "reason": reason}
+        results.append(refused)
+        owner.state = StopComplete()
+        line(f"kept  {owner.record['session']['name']}: {reason}; retained its record")
+
     for saved in records:
         session = saved["session"]
         if keep_infrastructure(session):
@@ -1402,6 +1657,14 @@ def bounded_stop(
             line(f"kept  {session['name']} (protected infrastructure)")
             continue
         owner = BoundedOwner(saved, {}, {}, set(), machine_wide=machine_wide)
+        if not admitted(owner):
+            refuse(owner)
+            continue
+        recorded = {(entry["pid"], entry["proc_start"]) for entry in (session, *saved["workers"])}
+        for scope in saved.get("owner_pane_scopes", []):
+            if (scope["pid"], scope["proc_start"]) in recorded:
+                owner.initial_scopes[(scope["pid"], scope["proc_start"])] = frozenset(scope["cgroups"])
+                owner.cgroups.update(scope["cgroups"])
         for recorded in (session, *saved["workers"]):
             owner.targets[(recorded["pid"], recorded["proc_start"])] = StopTarget(
                 ShutdownProcess(recorded["pid"], 0, recorded["proc_start"]))
@@ -1410,32 +1673,29 @@ def bounded_stop(
             window_host = host
             supervisor = deadline.call(lambda _budget: live_supervisor(window_host), lambda _error: None)
             if supervisor is not None and supervisor["kind"] == "supervisor":
+                if not admitted(owner):
+                    refuse(owner)
+                    continue
                 relaunch.write_hold(supervisor["pid"])
                 owner.permanent_keeps.add((supervisor["pid"], supervisor["proc_start"]))
-        def seats_unread(error: str) -> list[PausedSeat]:
-            owner.stop_errors.append(f"workers unread: {error}")
-            return []
-        seats = deadline.call(lambda _budget: _capture_codex_seats(session), seats_unread)
-        def retain(current: SessionShutdown) -> None:
-            if not _same_stop_ownership(saved, current):
-                raise StopClaimLost()
-            current["codex_seats"] = seats
-        try:
-            owner.record = update_session(saved["login"], session["session_id"], retain)
-        except (NoLiveRecord, StopClaimLost):
-            pass  # The single decision point below reports a lost request.
         if not _run_directories(session):
             owner.pause_started = True
             owner.pause_done.set()
             owner.pause_finished_at = started
         owners.append(owner)
 
-    directors = deadline.call(lambda _budget: _recorded_directors(), lambda _error: {})
+    def directors_unread(error: str) -> dict[tuple[int, str], str]:
+        for owner in owners:
+            owner.stop_errors.append(f"director identities unread: {error}")
+        return {}
+    directors = deadline.call(lambda _budget: _recorded_directors(), directors_unread)
 
     def pause(owner: BoundedOwner) -> None:
         issues: list[SessionStopIssue] = []
         for run in _run_directories(owner.record["session"]):
-            status = deadline.call(lambda budget: codex_mesh(["stop", "--pause", "--session-dir", run], budget),
+            def pause_run(budget: float) -> int | None:
+                return codex_mesh(["stop", "--pause", "--session-dir", run], budget) if admitted(owner) else None
+            status = deadline.call(pause_run,
                                    lambda _error: None)
             if status != 0:
                 issues.append({"kind": "codex server left running", "at": _timestamp(clock),
@@ -1465,34 +1725,67 @@ def bounded_stop(
         generation += 1
         latest_observation = observation
         fresh = observation.processes
-        if not server_checked and any(Path(group).name == herdr.server_unit(herdr.shared_session())
+        shared_server_unit = herdr.server_unit(herdr.shared_session())
+        for owner in owners:
+            owner.shared_server_unit = shared_server_unit
+        if not server_checked and any(Path(group).name == shared_server_unit
                                      for process in fresh.values() for group in process.cgroups):
             server_checked = True
-            server_identities = deadline.call(inventory.shutdown_server_identities, lambda _error: frozenset())
+            server_identities = deadline.call(lambda budget: inventory.shutdown_server_identities(
+                budget, server_unit=shared_server_unit), lambda _error: frozenset())
         # Retain every recorded identity's scope from the first observation,
         # before asking any director to exit. Missing evidence stays missing.
         for owner in owners:
+            if isinstance(owner.state, StopComplete):
+                continue
+            if not admitted(owner):
+                refuse(owner)
+                continue
             if generation == 1:
+                saved = owner.record
+                session = saved["session"]
+                def seats_unread(error: str) -> list[PausedSeat]:
+                    owner.stop_errors.append(f"workers unread: {error}")
+                    return []
+                seats = deadline.call(lambda _budget: _capture_codex_seats(session), seats_unread)
+                if not admitted(owner):
+                    refuse(owner)
+                    continue
+                def retain(current: SessionShutdown) -> None:
+                    if not _same_stop_ownership(saved, current):
+                        raise StopClaimLost()
+                    current["codex_seats"] = seats
+                try:
+                    owner.record = update_session(saved["login"], session["session_id"], retain)
+                except (NoLiveRecord, StopClaimLost):
+                    pass  # The single decision point below reports a lost request.
                 for entry in (owner.record["session"], *owner.record["workers"]):
                     process = fresh.get(entry["pid"])
                     if (process is not None and process.started == entry["proc_start"]
                             and process.pid not in observation.uncertain and process.cgroups):
                         owner.initial_scopes[(process.pid, process.started)] = process.cgroups
                         owner.cgroups.update(process.cgroups)
-            owner.other_director_scopes = {group for (pid, start), session_id in directors.items()
+            owner.other_owner_scopes = {group for other in owners if other is not owner for group in other.cgroups}
+            owner.other_owner_scopes.update(group for (pid, start), session_id in directors.items()
                 if session_id != owner.record["session"]["session_id"] and pid in fresh
                 and fresh[pid].started == start and pid not in observation.uncertain
-                for group in fresh[pid].cgroups}
-        if generation == 1:
-            for owner in owners:
-                request_exit(owner.record)
+                for group in fresh[pid].cgroups)
+            # This running command independently identifies the requester's
+            # pane, even when its director is absent from the saved registry.
+            requester = fresh.get(os.getpid())
+            if requester is not None and requester.pid not in observation.uncertain:
+                owner.other_owner_scopes.update(requester.cgroups)
         for owner in owners:
             if isinstance(owner.state, StopComplete):
                 continue
             saved = owner.record
             session = saved["session"]
             key = (session["pid"], session["proc_start"])
-            current = find_session(saved["login"], session["session_id"])
+            try:
+                current = find_session(saved["login"], session["session_id"])
+            except record_store.RecordDeadlineExpired as error:
+                current = None
+                owner.stop_errors.append(str(error))
             request_current = current is not None and _same_stop_ownership(saved, current)
             identities = observation.observed_identities | observation.terminated | frozenset(
                 (pid, process.started) for pid, process in fresh.items())
@@ -1514,18 +1807,30 @@ def bounded_stop(
                           and fresh[session["pid"]].started == session["proc_start"]}
             permanent = deadline.call(lambda _budget: _protected_processes(saved, fresh, ownership_errors.append),
                                       keeps_unread, verification=True) | _descendants({os.getpid()} | kept_roots, fresh)
+            owner.ancestor_keeps.difference_update((pid, fresh[pid].started) for pid in permanent if pid in fresh)
+            owner.ancestor_keeps.difference_update(server_identities)
             owner.permanent_keeps.update((pid, fresh[pid].started) for pid in permanent if pid in fresh)
             owner.permanent_keeps.update(server_identities)
             discovered = deadline.call(lambda _budget: _owned_processes(saved,
-                {pid: process for pid, process in fresh.items() if pid not in observation.uncertain}, ownership_errors.append),
+                {pid: process for pid, process in fresh.items() if pid not in observation.uncertain},
+                ownership_errors.append, captured=owner),
                                        ownership_unread, verification=True)
-            # Previously attributed identities are durable roots only while the
-            # *same* process still exists. Reused PIDs never inherit ownership.
-            roots = {pid for (pid, start), target in owner.targets.items()
-                     if not target.retired and pid in fresh and pid not in observation.uncertain and fresh[pid].started == start}
-            roots.update(discovered.processes)
-            roots = _descendants(roots, fresh)
-            roots.update(pid for pid, process in fresh.items() if process.build_unit and process.build_unit in owner.units)
+            if not admitted(owner):
+                refuse(owner)
+                continue
+            positive = {(pid, process.started) for pid, process in discovered.processes.items()}
+            # An ancestor is a keep only while it is outside the shared owned
+            # workload. Independent infrastructure keeps are not revoked.
+            owner.permanent_keeps.difference_update(owner.ancestor_keeps & positive)
+            owner.ancestor_keeps.difference_update(positive)
+            owner.ancestor_keeps.update(owner_ancestor_keeps(owner, observation, discovered))
+            owner.permanent_keeps.update(owner.ancestor_keeps)
+            if generation == 1:
+                request_exit(owner.record)
+                if not admitted(owner):
+                    refuse(owner)
+                    continue
+            roots = set(discovered.processes)
             roots.difference_update(pid for pid, start in owner.permanent_keeps
                                     if pid in fresh and fresh[pid].started == start)
             owner.cgroups.update(group for pid in roots for group in fresh[pid].cgroups)
@@ -1549,6 +1854,9 @@ def bounded_stop(
                     owner.builds[pid] = " ".join(fresh[pid].arguments)
             worker_roots = deadline.call(lambda _budget: _mesh_server_roots(session, fresh, ownership_errors.append),
                                          keeps_unread, verification=True)
+            if not admitted(owner):
+                refuse(owner)
+                continue
             owner.ownership_errors = list(dict.fromkeys(ownership_errors))
             scoped = _owner_observation(owner, observation)
             errors = [*scoped.errors, *owner.ownership_errors]
@@ -1595,7 +1903,9 @@ def bounded_stop(
                 try:
                     owner.record = update_session(saved["login"], session["session_id"], claim)
                     owner.state = StopSignalled(monotonic(), owner.forced)
-                except (NoLiveRecord, StopClaimLost):
+                except (NoLiveRecord, StopClaimLost, record_store.RecordDeadlineExpired) as error:
+                    if isinstance(error, record_store.RecordDeadlineExpired):
+                        owner.stop_errors.append(str(error))
                     request_current = False
             if director_gone and not owner.pause_started:
                 owner.pause_started = True
@@ -1636,11 +1946,15 @@ def bounded_stop(
                 owner.last_signal_at = monotonic()
                 owner.required_observation = generation + 1
                 try:
-                    kill(pid, signum)
+                    _signal_identity(target.process, signum, probe=probe, kill=kill, deadline=deadline,
+                                     admitted=lambda: admitted(owner))
                 except ProcessLookupError:
                     pass
                 except OSError as error:
                     errors.append(f"pid {pid}: signal failed: {error}")
+            if not admitted(owner):
+                refuse(owner)
+                continue
             for pid, label in owner.builds.items():
                 if pid in owner.reported_builds or any(
                         kept_pid == pid for kept_pid, _start in owner.permanent_keeps):
@@ -1652,17 +1966,22 @@ def bounded_stop(
             if (not owner.claims_released and not pending and not errors and request_current
                     and owner.pause_observed and owner.pause_done.is_set() and not owner.pause_issues):
                 def cleanup(budget: float) -> str:
+                    if not admitted(owner):
+                        return ""
                     def known_identity(pid: int) -> str | None:
                         state = probe(pid)
                         if isinstance(state, ProcessUnknown):
                             return owner.processes[pid].started if pid in owner.processes else "unknown"
                         return state.started if isinstance(state, ProcessLive) else None
-                    _release_build_claims(owner, known_identity, budget)
+                    _release_build_claims(owner, known_identity, budget, lambda: admitted(owner))
                     return ""
                 cleanup_error = deadline.call(cleanup, lambda error: error, verification=True)
                 owner.claims_released = True
                 if cleanup_error:
                     owner.stop_errors.append(f"build claim cleanup: {cleanup_error}")
+            if not admitted(owner):
+                refuse(owner)
+                continue
             errors.extend(owner.stop_errors)
             # ONE decision point: every persisted/printed/returned success uses
             # this predicate, including the final deadline observation.
@@ -1670,16 +1989,8 @@ def bounded_stop(
                 generation=generation, begun=begun, pending=pending, errors=errors,
                 now=monotonic(), deadline=deadline)
             if success or not request_current or monotonic() >= deadline.expires:
-                reasons = errors.copy()
-                if not request_current:
-                    reasons.append("shutdown record disappeared or was replaced")
-                if pending:
-                    reasons.append("unresolved pids: " + ", ".join(f"{pid}/{start}" for pid, start in pending))
-                if not owner.pause_observed or not owner.pause_done.is_set() or owner.pause_issues:
-                    reasons.append("worker pause not confirmed successful")
-                if generation < owner.required_observation:
-                    reasons.append("no complete observation after latest signal/pause")
-                reason = "; ".join(dict.fromkeys(reasons)) or "shutdown deadline exhausted"
+                reason = stop_failure_reason(owner, errors, request_current=request_current,
+                    generation=generation, pending=pending)
                 def done(changing: SessionShutdown) -> None:
                     if not _same_stop_ownership(saved, changing):
                         raise StopClaimLost()
@@ -1688,8 +1999,9 @@ def bounded_stop(
                     changing["stop_issues"] = owner.pause_issues
                 try:
                     result = update_session(saved["login"], session["session_id"], done)
-                except (NoLiveRecord, StopClaimLost):
-                    rejection = "shutdown ownership changed before final write; newer record left unchanged"
+                except (NoLiveRecord, StopClaimLost, record_store.RecordDeadlineExpired) as error:
+                    rejection = (str(error) if isinstance(error, record_store.RecordDeadlineExpired) else
+                                 "shutdown ownership changed before final write; newer record left unchanged")
                     reason = rejection if success else f"{reason}; {rejection}"
                     result = saved.copy()
                     result["progress"] = {"kind": "stop failed", "at": _timestamp(clock), "reason": reason}
@@ -1706,7 +2018,7 @@ def bounded_stop(
             if pausing is not None:
                 _ = pausing.pause_done.wait(timeout=min(0.01, deadline.remaining(verification=True)))
             sleep(min(0.1, max(0, deadline.expires - monotonic())))
-    print(f"all {sum(saved['progress']['kind'] == 'stopped' for saved in results)} stopped", flush=True)
+    print(stop_summary(results), flush=True)
     return results
 
 
@@ -1728,11 +2040,20 @@ def main(arguments: list[str]) -> int:
     if not command_exited:
         print("shutdown: requester command liveness unresolved at deadline; director left running", flush=True)
         return 1
-    pending = find_session(arguments[1], arguments[2])
-    if pending is not None:
-        def request_exit(saved: SessionShutdown) -> None:
-            threading.Thread(target=settle.request_pause, args=(saved,), daemon=True).start()
-        _ = bounded_stop([pending], started=started, request_exit=request_exit)
+    try:
+        with record_store.record_deadline(record_store.RecordDeadline(deadline.expires, time.monotonic)):
+            pending = find_session(arguments[1], arguments[2])
+            if pending is not None:
+                def request_exit(saved: SessionShutdown) -> None:
+                    def tell() -> None:
+                        with record_store.record_deadline(record_store.RecordDeadline(deadline.expires, time.monotonic)):
+                            settle.request_pause(saved)
+                    threading.Thread(target=tell, daemon=True).start()
+                stopped = bounded_stop([pending], started=started, request_exit=request_exit)
+                return 1 if any(saved["progress"]["kind"] == "stop failed" for saved in stopped) else 0
+    except record_store.RecordDeadlineExpired as error:
+        print(f"shutdown: {error}", file=sys.stderr, flush=True)
+        return 1
     return 0
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from unittest import mock
 
 import pane_record  # first: it puts the whoami scripts on the path
 import account  # noqa: E402  Imported before a test sets the platform to the Mac: urllib checks it on import.
+from scripts.lib.process_start_test_support import write_stat
 
 HOOK = Path(__file__).resolve().parent.parent / "hooks/session-start-pane-record.py"
 BASH = shutil.which("bash") or "/bin/sh"
@@ -59,6 +61,24 @@ class PaneRecordTests(unittest.TestCase):
 
     def entries(self) -> dict[str, dict[str, object]]:
         return cast(dict[str, dict[str, object]], json.loads((self.records / "agents.json").read_text()))
+
+    def test_shared_parent_reader_reads_linux_comm_with_parentheses(self) -> None:
+        process = self.root / "proc/42"
+        _ = write_stat(process.parent, 42, ppid=17, command="shell (fixture)")
+        with mock.patch.dict(os.environ, {"HERDR_PROC": str(process.parent), "HERDR_PLATFORM": "linux"}):
+            self.assertEqual(pane_record.process_parent(42), 17)
+            with self.assertRaises(OSError):
+                _ = pane_record.process_parent(99)
+
+    def test_shared_parent_reader_propagates_mac_errors_and_hook_keeps_its_empty_answer(self) -> None:
+        failure = subprocess.CalledProcessError(1, ["ps"])
+        with (mock.patch.dict(os.environ, {"HERDR_PLATFORM": "darwin", "HERDR_PS": "/fixture/ps"}),
+              mock.patch.object(subprocess, "run", side_effect=failure) as parent):
+            with self.assertRaises(subprocess.CalledProcessError):
+                _ = pane_record.process_parent(42)
+            self.assertEqual(pane_record.claude_arguments(42), [])
+            self.assertEqual(parent.call_args_list, [mock.call(["/fixture/ps", "-o", "ppid=", "-p", "42"],
+                capture_output=True, text=True, check=True, timeout=5)] * 2)
 
     def test_the_hook_records_the_pane_launch_from_its_own_claude(self) -> None:
         started = self.start("w1:p2", "sid-alpha", "-n", "alpha", "--remote-control", "alpha",

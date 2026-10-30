@@ -114,6 +114,7 @@ class UnknownRepository:
 
 Repository = RepositoryIdentity | UnknownRepository
 TestScope = Literal["full", "filtered"]
+NeedSource = Literal["measured", "buildlog", "pooled", "fallback"]
 
 
 @dataclass(frozen=True)
@@ -147,13 +148,69 @@ class Reservation(TypedDict):
 @dataclass(frozen=True)
 class ExpectedPeak:
     bytes: int
-    source: Literal["measured", "buildlog", "pooled", "fallback"]
+    source: NeedSource
     count: int
 
 
 @dataclass(frozen=True)
 class PromisedMemory:
     bytes: int
+
+
+@dataclass(frozen=True)
+class PeakTimeUnknown:
+    pass
+
+
+@dataclass(frozen=True)
+class NoPeakRecorded:
+    pass
+
+
+@dataclass(frozen=True)
+class PromiseNoReading:
+    bytes: int
+
+
+@dataclass(frozen=True)
+class RampPromise:
+    bytes: int
+
+
+@dataclass(frozen=True)
+class PeakSoFar:
+    bytes: int
+    peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
+    last_near_peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
+    old_sampler: bool = False
+
+
+@dataclass(frozen=True)
+class PeakDecayed:
+    bytes: int
+    peak_bytes: int
+    last_near_peak_at: float
+    decayed_at: float
+    old_sampler: bool
+
+
+@dataclass(frozen=True)
+class PeakFileUnreadable:
+    bytes: int
+
+
+@dataclass(frozen=True)
+class UsingNow:
+    bytes: int
+
+
+@dataclass(frozen=True)
+class EndedCharge:
+    bytes: int = 0
+
+
+ChargeBasis = PromiseNoReading | RampPromise | PeakSoFar | PeakDecayed | PeakFileUnreadable | UsingNow | EndedCharge
+PeakHistory = NoPeakRecorded | PeakSoFar | PeakDecayed | PeakFileUnreadable
 
 
 @dataclass(frozen=True)
@@ -166,6 +223,7 @@ class MeasuredMemory:
     observed_peak: int = 0
     # An existing peak file could not be read; its promise remains a floor.
     unknown_peak_promise: int = 0
+    peak_history: PeakHistory = NoPeakRecorded()
 
 
 @dataclass(frozen=True)
@@ -231,6 +289,9 @@ class Waiter(TypedDict):
     test_scope: NotRequired[TestScope]
     package: NotRequired[str]
     filters: NotRequired[list[str]]
+    need_source: NotRequired[NeedSource]
+    need_runs: NotRequired[int]
+    test_threads: NotRequired[int | None]
 
 
 @dataclass(frozen=True)
@@ -245,6 +306,20 @@ class NoHeadPriority:
 
 
 @dataclass(frozen=True)
+class ReadHostAdmissionLimits:
+    pass
+
+
+READ_HOST_ADMISSION_LIMITS = ReadHostAdmissionLimits()
+
+
+@dataclass(frozen=True)
+class AdmissionLimits:
+    budget: int
+    reserve: int
+
+
+@dataclass(frozen=True)
 class AdmissionDecision:
     state: Literal["admit", "hold"]
     threshold: int
@@ -254,6 +329,9 @@ class AdmissionDecision:
     pressure: Pressure = NO_PRESSURE_HOLD
     charged: int = 0
     budget: int = BUILD_BUDGET_BYTES
+    budget_passes: bool = True
+    free_passes: bool = True
+    head_need: int = 0
 
 
 @dataclass(frozen=True)
@@ -384,6 +462,164 @@ class QueueView:
 
 
 @dataclass(frozen=True)
+class UnknownHostTotal:
+    pass
+
+
+@dataclass(frozen=True)
+class HostAvailable:
+    available: int
+    total: int | UnknownHostTotal
+    reserve: int
+    budget: int
+    pressure: Pressure
+
+
+@dataclass(frozen=True)
+class AdmissionTimeNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
+class ExplainedRunningStep:
+    step: RunningStep
+    admitted_at: float | AdmissionTimeNotRecorded
+    promise: int
+    measured: int
+    charged: int
+    basis: ChargeBasis
+
+
+@dataclass(frozen=True)
+class QueueMemoryTotals:
+    charged: int
+    measured: int
+    growth: int
+
+
+@dataclass(frozen=True)
+class WidthNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
+class NeedSourceNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
+class RecordedNeed:
+    source: NeedSource
+    runs: int
+    history_days: int
+    scope: TestScope
+    package: str
+    filters: tuple[str, ...]
+    test_threads: int | WidthNotRecorded
+
+
+@dataclass(frozen=True)
+class BudgetCheck:
+    charged: int
+    need: int
+    head_need: int
+    budget: int
+    starts_at: int
+    passes: bool
+
+
+@dataclass(frozen=True)
+class FreeCheck:
+    available: int
+    need: int
+    reserve: int
+    growth: int
+    head_need: int
+    threshold: int
+    passes: bool
+
+
+@dataclass(frozen=True)
+class QueueBump:
+    priority_since: float
+    by_position: bool
+    holds_younger: bool
+
+
+@dataclass(frozen=True)
+class NoBump:
+    pass
+
+
+@dataclass(frozen=True)
+class HeadExplanation:
+    waiter: WaitingStep
+    need_source: RecordedNeed | NeedSourceNotRecorded
+    decision: AdmissionDecision
+    budget: BudgetCheck
+    free: FreeCheck
+    order: StrictUntil | BackfillUntil
+    has_priority: bool
+    bump: QueueBump | NoBump
+
+
+@dataclass(frozen=True)
+class NoWaiter:
+    pass
+
+
+@dataclass(frozen=True)
+class LineWaiter:
+    waiter: WaitingStep
+    fits_now: bool
+
+
+@dataclass(frozen=True)
+class WaitingLine:
+    steps: tuple[LineWaiter, ...]
+    count: int
+    fitting: int
+    smallest_need: int
+    largest_need: int
+    oldest_since: float
+
+
+@dataclass(frozen=True)
+class QueueExplanation:
+    now: float
+    host: HostAvailable | ReadingUnavailable
+    running: tuple[ExplainedRunningStep, ...]
+    totals: QueueMemoryTotals
+    head: HeadExplanation | NoWaiter
+    line: WaitingLine
+
+
+@dataclass(frozen=True)
+class QueueRead:
+    view: QueueView
+    explanation: QueueExplanation
+    ordered: list[tuple[Path, Waiter]]
+
+
+@dataclass(frozen=True)
+class HeadAdmitsAfterEnd:
+    ended: tuple[int, ...]
+    decision: AdmissionDecision
+    charge_drop: int
+    freed: int
+    growth_drop: int
+
+
+@dataclass(frozen=True)
+class HeadStillHeld:
+    decision: AdmissionDecision
+    causes: tuple[Literal["build budget", "free memory", "pressure", "queue order"], ...]
+
+
+HeadAfterEnd = HeadAdmitsAfterEnd | HeadStillHeld | NoWaiter | ReadingUnavailable
+
+
+@dataclass(frozen=True)
 class ProcessIdentity:
     parent: int
     start: str
@@ -444,6 +680,10 @@ class WaiterGone(FileNotFoundError):
     """The requested waiter has left the admission ledger."""
 
 
+class UnmatchedWaiter(ValueError):
+    """A bump selector matched no waiting step, or more than one."""
+
+
 def blocker_fields(blocker: Blocker) -> dict[str, str]:
     if isinstance(blocker, ReservationBlocker):
         return {"session_id": blocker.session_id, "session_name": blocker.session_name, "pool": blocker.pool}
@@ -479,18 +719,21 @@ def build_budget_bytes() -> int:
 
 
 def decide(available: int, total: int | None, need: int, running: list[StepMemory],
-           head_need: int = 0, pressure: Pressure = NO_PRESSURE_HOLD) -> AdmissionDecision:
+           head_need: int = 0, pressure: Pressure = NO_PRESSURE_HOLD, *,
+           limits: AdmissionLimits | ReadHostAdmissionLimits = READ_HOST_ADMISSION_LIMITS) -> AdmissionDecision:
     """Apply the build budget, free-memory floor and pressure limit together."""
     promised = sum(growth_headroom(row) for row in running)
     measured = sum(row.bytes for row in running if isinstance(row, MeasuredMemory))
     charged = sum(build_charge(row) for row in running)
-    budget = build_budget_bytes()
-    reserve = total * 5 // 100 if total is not None else 0
+    budget = limits.budget if isinstance(limits, AdmissionLimits) else build_budget_bytes()
+    reserve = (limits.reserve if isinstance(limits, AdmissionLimits)
+               else total * 5 // 100 if total is not None else 0)
     threshold = need + promised + reserve + head_need
     fits_budget = charged + need + head_need <= budget or (not has_running_step(running) and not head_need)
-    admit = fits_budget and available >= threshold and isinstance(pressure, NoPressureHold)
+    fits_free = available >= threshold
+    admit = fits_budget and fits_free and isinstance(pressure, NoPressureHold)
     return AdmissionDecision("admit" if admit else "hold", threshold, promised, reserve, measured,
-                             pressure, charged, budget)
+                             pressure, charged, budget, fits_budget, fits_free, head_need)
 
 
 def has_running_step(running: list[StepMemory]) -> bool:
@@ -498,11 +741,23 @@ def has_running_step(running: list[StepMemory]) -> bool:
 
 
 def build_charge(memory: StepMemory) -> int:
+    return charge_basis(memory).bytes
+
+
+def charge_basis(memory: StepMemory) -> ChargeBasis:
+    """Select the charge and its explanation at the same decision point."""
     if isinstance(memory, PromisedMemory):
-        return memory.bytes
+        return PromiseNoReading(memory.bytes)
     if isinstance(memory, MeasuredMemory):
-        return max(memory.ramp_promise, memory.bytes, memory.observed_peak, memory.unknown_peak_promise)
-    return 0
+        peak = memory.peak_history
+        observed = replace(peak, bytes=memory.observed_peak) if isinstance(peak, PeakSoFar) else PeakSoFar(memory.observed_peak)
+        terms: tuple[ChargeBasis, ...] = (UsingNow(memory.bytes), RampPromise(memory.ramp_promise),
+                                         observed, PeakFileUnreadable(memory.unknown_peak_promise))
+        basis = max(terms, key=lambda term: term.bytes)
+        if isinstance(basis, UsingNow) and isinstance(peak, PeakDecayed):
+            return replace(peak, bytes=basis.bytes)
+        return basis
+    return EndedCharge()
 
 
 def growth_headroom(memory: StepMemory) -> int:
@@ -811,26 +1066,37 @@ def reservation_memory(path: Path, row: Reservation, now: datetime,
         peak = 0  # The sampler has not recorded a peak (unscoped steps never do).
     except (OSError, ValueError):
         if isinstance(reading, MeasuredMemory):
-            return replace(reading, unknown_peak_promise=row["need"])
+            return replace(reading, unknown_peak_promise=row["need"], peak_history=PeakFileUnreadable(row["need"]))
         return reading
     last_near_peak_at = now.timestamp()  # Unknown times retain the peak charge.
+    peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
+    peak_time: float | PeakTimeUnknown = PeakTimeUnknown()
+    old_sampler = False
+    if peak > 0:
+        try:
+            peak_at = path.with_suffix(".max").stat().st_mtime
+        except OSError:
+            pass
     try:
         near_peak_bytes, recorded_at = map(int, path.with_suffix(".wave").read_text().split())
         if near_peak_bytes == peak and recorded_at >= 0:
             last_near_peak_at = recorded_at
+            peak_time = recorded_at
     except FileNotFoundError:
         # Samplers from before patch B write no .wave; use the last peak publication.
         if peak > 0:
-            try:
-                last_near_peak_at = path.with_suffix(".max").stat().st_mtime
-            except OSError:
-                pass
+            old_sampler = True
+            if isinstance(peak_at, float):
+                last_near_peak_at = peak_at
+                peak_time = peak_at
     except (OSError, ValueError):
         pass
+    history: PeakHistory = PeakSoFar(peak, peak_at, peak_time, old_sampler) if peak > 0 else NoPeakRecorded()
     if now.timestamp() - last_near_peak_at >= PEAK_DECAY_SECONDS:
+        history = PeakDecayed(0, peak, last_near_peak_at, last_near_peak_at + PEAK_DECAY_SECONDS, old_sampler)
         peak = 0
     if isinstance(reading, MeasuredMemory):
-        return replace(reading, observed_peak=peak)
+        return replace(reading, observed_peak=peak, peak_history=history)
     if isinstance(reading, PromisedMemory):
         return PromisedMemory(max(reading.bytes, peak))
     return reading
@@ -1052,14 +1318,15 @@ def waiter_order(row: Waiter) -> tuple[int, float, int]:
 
 
 def head_priority(waiters: list[Waiter], available: int, total: int | None,
-                  running: list[StepMemory], now: float) -> HeadPriority | NoHeadPriority:
+                  running: list[StepMemory], now: float, *,
+                  limits: AdmissionLimits | ReadHostAdmissionLimits = READ_HOST_ADMISSION_LIMITS) -> HeadPriority | NoHeadPriority:
     ordered = sorted(waiters, key=waiter_order)
     if not ordered:
         return NoHeadPriority()
     head = ordered[0]
     if (head.get("holds_younger", False) or head.get("bump_order", 0) < 0
             or now - head["since"] >= HEAD_SECONDS):
-        decision = decide(available, total, head["need"], running)
+        decision = decide(available, total, head["need"], running, limits=limits)
         if (head.get("holds_younger", False) or decision.state == "admit"
                 or available + decision.measured >= head["need"] + decision.reserve):
             return HeadPriority(head, head_window(head, now))
@@ -1068,11 +1335,12 @@ def head_priority(waiters: list[Waiter], available: int, total: int | None,
 
 def queue_decision(available: int, total: int | None, row: Waiter,
                    running: list[StepMemory], head: HeadPriority | NoHeadPriority,
-                   pressure: Pressure) -> AdmissionDecision:
+                   pressure: Pressure, *,
+                   limits: AdmissionLimits | ReadHostAdmissionLimits = READ_HOST_ADMISSION_LIMITS) -> AdmissionDecision:
     younger = (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
                and waiter_order(head.waiter) < waiter_order(row))
     head_need = head.waiter["need"] if younger and isinstance(head, HeadPriority) else 0
-    decision = decide(available, total, row["need"], running, head_need, pressure)
+    decision = decide(available, total, row["need"], running, head_need, pressure, limits=limits)
     if younger:
         return replace(decision, state="hold")
     if isinstance(head, HeadPriority) and waiter_order(head.waiter) == waiter_order(row) and not has_running_step(running):
@@ -1284,6 +1552,9 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         waiter["package"] = package
         waiter["filters"] = list(filters)
         waiter["estimated_at"] = profile.estimated_at
+        waiter["need_source"] = peak.source
+        waiter["need_runs"] = peak.count
+        waiter["test_threads"] = width
         waiter["repo_identity"] = ""
         if isinstance(profile.repository, RepositoryIdentity):
             waiter["repo_identity"] = profile.repository.key
@@ -1429,10 +1700,13 @@ class QueueIdentityReader:
 
 def queue_rows(directory: Path, suffix: str, processes: ProcessTable) -> list[tuple[Path, dict[str, object]]]:
     rows: list[tuple[Path, dict[str, object]]] = []
-    for path in directory.glob(f"*.{suffix}"):
+    for path in sorted(directory.glob(f"*.{suffix}")):
         try:
             row = cast(dict[str, object], json.loads(path.read_text()))
             pid = row["pid"]
+            if isinstance(pid, int) and suffix == "reservation":
+                rows.append((path, row))
+                continue
             start = row["start_time"]
             if isinstance(pid, int) and isinstance(start, str) and start:
                 owner = (process_start.OwnerCheck.UNKNOWN if isinstance(processes.get(pid), UnreadableProcessIdentity)
@@ -1522,10 +1796,12 @@ def current_blocker(waiter_path: Path) -> Blocker:
         return blocker_snapshot(waiter_path)
 
 
-def read_queue(directory: Path, processes: ProcessTable, now: float) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
+def read_queue_pass(directory: Path, processes: ProcessTable, now: float) -> QueueRead:
+    """Read once for the queue view and the numeric explanation; never update state."""
     proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
     identities = QueueIdentityReader(processes, proc)
     running: list[RunningStep] = []
+    explained: list[ExplainedRunningStep] = []
     memory: list[StepMemory] = []
     for path, row in queue_rows(directory, "reservation", processes):
         reservation = cast(Reservation, cast(object, row))
@@ -1534,12 +1810,20 @@ def read_queue(directory: Path, processes: ProcessTable, now: float) -> tuple[Qu
         if isinstance(reading, GoneMemory):
             continue
         identity = identities.identity(pid, row)
-        running.append(RunningStep(identity["session_id"], identity["session_name"], identity["step"],
-                                   identity["folder"], reservation["need"], reading))
+        step = RunningStep(identity["session_id"], identity["session_name"], identity["step"],
+                           identity["folder"], reservation["need"], reading)
+        running.append(step)
+        explained.append(ExplainedRunningStep(step, _epoch(reservation["admitted_at"]), step.promise,
+                         reading.bytes if isinstance(reading, MeasuredMemory) else 0,
+                         build_charge(reading), charge_basis(reading)))
         memory.append(reading)
     for compiler in sccache_memory():
         memory.append(compiler)
-        running.append(RunningStep("", "sccache.service", "compile", "builds.slice", 0, compiler))
+        step = RunningStep("", "sccache.service", "compile", "builds.slice", 0, compiler)
+        running.append(step)
+        explained.append(ExplainedRunningStep(step, AdmissionTimeNotRecorded(), 0,
+                         compiler.bytes if isinstance(compiler, MeasuredMemory) else 0,
+                         build_charge(compiler), charge_basis(compiler)))
     host = HostMemory(0, None)
     unavailable = False
     try:
@@ -1551,8 +1835,10 @@ def read_queue(directory: Path, processes: ProcessTable, now: float) -> tuple[Qu
     ordered = sorted(((path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)),
                      key=lambda item: waiter_order(item[1]))
     head = head_priority([row for _, row in ordered], available, total, memory, now)
-    pending = sum(growth_headroom(item) for item in memory)
+    totals = decide(available, total, 0, memory, pressure=pressure)
     waiting: list[WaitingStep] = []
+    first: HeadExplanation | NoWaiter = NoWaiter()
+    line: list[LineWaiter] = []
     for _, row in ordered:
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
         own = queue_decision(available, total, row, memory, head, pressure)
@@ -1573,21 +1859,57 @@ def read_queue(directory: Path, processes: ProcessTable, now: float) -> tuple[Qu
                                   own.threshold - row["need"] - own.promised - own.reserve)
                       if available < own.threshold
                       else NeedsBuildBudget(row["need"], own.charged, own.budget))
-        waiting.append(WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
-                                   identity["folder"], row["since"], row["need"], reason))
-    return QueueView(tuple(waiting), tuple(running), available, pending, total * 5 // 100 if total else 0, now), ordered
+        step = WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
+                           identity["folder"], row["since"], row["need"], reason)
+        waiting.append(step)
+        if row is ordered[0][1]:
+            width = row.get("test_threads")
+            source: RecordedNeed | NeedSourceNotRecorded = NeedSourceNotRecorded()
+            if "need_source" in row:
+                source = RecordedNeed(row["need_source"], row.get("need_runs", 0), HISTORY_DAYS,
+                                      row.get("test_scope", "full"), row.get("package", ""),
+                                      tuple(row.get("filters", [])), width if width is not None else WidthNotRecorded())
+            bump: QueueBump | NoBump = NoBump()
+            if row.get("bump_order", 0) < 0 or row.get("holds_younger", False):
+                bump = QueueBump(row.get("priority_since", row["since"]), row.get("bump_order", 0) < 0,
+                                 row.get("holds_younger", False))
+            first = HeadExplanation(step, source, own,
+                BudgetCheck(own.charged, step.need, own.head_need, own.budget,
+                            own.budget - step.need - own.head_need, own.budget_passes),
+                FreeCheck(available, step.need, own.reserve, own.promised, own.head_need, own.threshold, own.free_passes),
+                head_window(row, now), isinstance(head, HeadPriority), bump)
+        else:
+            # Whether this waiter fits the two resource checks, independently of order and pressure.
+            fit = decide(available, total, row["need"], memory)
+            line.append(LineWaiter(step, not unavailable and fit.budget_passes and fit.free_passes))
+    view = QueueView(tuple(waiting), tuple(running), available, totals.promised, totals.reserve, now)
+    host_reading = (ReadingUnavailable() if unavailable else
+                    HostAvailable(available, total if total is not None else UnknownHostTotal(),
+                                  totals.reserve, totals.budget, pressure))
+    explanation = QueueExplanation(now, host_reading, tuple(explained),
+        QueueMemoryTotals(totals.charged, totals.measured, totals.promised), first,
+        WaitingLine(tuple(line), len(line), sum(item.fits_now for item in line),
+                    min((item.waiter.need for item in line), default=0),
+                    max((item.waiter.need for item in line), default=0),
+                    min((item.waiter.since for item in line), default=now)))
+    return QueueRead(view, explanation, ordered)
+
+
+def read_queue(directory: Path, processes: ProcessTable, now: float) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
+    result = read_queue_pass(directory, processes, now)
+    return result.view, result.ordered
 
 
 def _queue_lock_timeout(_signum: int, _frame: object) -> NoReturn:
     raise TimeoutError(f"admission lock busy for {QUEUE_LOCK_TIMEOUT_SECONDS:g} s; try again")
 
 
-def queue_view() -> QueueView:
+def locked_queue_read() -> QueueRead:
     directory = store.root() / "admission"
     try:
         lock = (directory / "lock").open("r")
     except FileNotFoundError:
-        return read_queue(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())[0]
+        return read_queue_pass(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())
     with lock:
         previous = signal.signal(signal.SIGALRM, _queue_lock_timeout)
         try:
@@ -1596,26 +1918,143 @@ def queue_view() -> QueueView:
         finally:
             _ = signal.setitimer(signal.ITIMER_REAL, 0)
             _ = signal.signal(signal.SIGALRM, previous)
-        return read_queue(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())[0]
+        return read_queue_pass(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())
 
 
-def bump_waiter(selector: str, actor: str) -> WaitingStep:
+def queue_view() -> QueueView:
+    return locked_queue_read().view
+
+
+def explain_queue() -> QueueExplanation:
+    """Explain admission under the queue's shared lock without history or SQLite reads."""
+    return locked_queue_read().explanation
+
+
+def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) -> HeadAfterEnd:
+    """Reapply admission to this snapshot after the named running rows end; read no files."""
+    host, head = explanation.host, explanation.head
+    if isinstance(head, NoWaiter):
+        return head
+    if isinstance(host, ReadingUnavailable):
+        return host
+    indices = frozenset(ended)
+    remaining = [row.step.measured for index, row in enumerate(explanation.running) if index not in indices]
+    released = [row for index, row in enumerate(explanation.running) if index in indices]
+    freed = sum(max(0, row.step.measured.bytes - row.step.measured.swap_bytes) for row in released
+                if isinstance(row.step.measured, MeasuredMemory))
+    available = host.available + freed
+    total = host.total if isinstance(host.total, int) else None
+    limits = AdmissionLimits(host.budget, host.reserve)
+    waiter: Waiter = {"pid": head.waiter.pid, "start_time": "", "need": head.waiter.need,
+                      "since": head.waiter.since}
+    if isinstance(head.bump, QueueBump):
+        waiter["priority_since"] = head.bump.priority_since
+        waiter["holds_younger"] = head.bump.holds_younger
+        waiter["bump_order"] = -1 if head.bump.by_position else 0
+    priority = head_priority([waiter], available, total, remaining, explanation.now, limits=limits)
+    decision = queue_decision(available, total, waiter, remaining, priority, host.pressure, limits=limits)
+    if decision.state == "admit":
+        return HeadAdmitsAfterEnd(ended, decision, sum(row.charged for row in released), freed,
+                                 sum(growth_headroom(row.step.measured) for row in released))
+    causes: list[Literal["build budget", "free memory", "pressure", "queue order"]] = []
+    if not decision.budget_passes:
+        causes.append("build budget")
+    if not decision.free_passes:
+        causes.append("free memory")
+    if isinstance(decision.pressure, MemoryPressure):
+        causes.append("pressure")
+    if not causes:
+        causes.append("queue order")
+    return HeadStillHeld(decision, tuple(causes))
+
+
+def smallest_head_release(explanation: QueueExplanation) -> HeadAfterEnd:
+    """Fewest endings, then least charge, then running-row order, using admission's verdict."""
+    current = head_after_steps_end(explanation, ())
+    if not isinstance(current, HeadStillHeld):
+        return current
+    count = len(explanation.running)
+    all_ended = head_after_steps_end(explanation, tuple(range(count)))
+    if not isinstance(all_ended, HeadAdmitsAfterEnd):
+        return all_ended
+    head = explanation.head
+    if not isinstance(head, HeadExplanation):
+        return current
+    # These are bounds from the checks already recorded by admission, not admission verdicts.
+    # A branch that might empty the build queue must bypass both bounds (the run-alone rule).
+    charge_gap = head.budget.charged - head.budget.starts_at
+    free_gap = head.free.threshold - head.free.available
+    charges = [row.charged for row in explanation.running]
+    free_releases = [growth_headroom(row.step.measured)
+        + (max(0, row.step.measured.bytes - row.step.measured.swap_bytes)
+           if isinstance(row.step.measured, MeasuredMemory) else 0) for row in explanation.running]
+    builds = frozenset(index for index, row in enumerate(explanation.running)
+                       if has_running_step([row.step.measured]))
+    max_charge: list[list[int]] = []
+    min_charge: list[list[int]] = []
+    max_free: list[list[int]] = []
+    for start in range(count + 1):
+        charge_order = sorted(charges[start:])
+        free_order = sorted(free_releases[start:], reverse=True)
+        min_charge.append([sum(charge_order[:size]) for size in range(count - start + 1)])
+        max_charge.append([sum(charge_order[len(charge_order) - size:]) if size else 0
+                           for size in range(count - start + 1)])
+        max_free.append([sum(free_order[:size]) for size in range(count - start + 1)])
+    for size in range(1, count + 1):
+        best: HeadAdmitsAfterEnd | HeadStillHeld = current
+        def search(start: int, slots: int, selected: tuple[int, ...], charge: int, freed: int) -> None:
+            nonlocal best
+            if slots > count - start:
+                return
+            if isinstance(best, HeadAdmitsAfterEnd) and charge + min_charge[start][slots] >= best.charge_drop:
+                return
+            missing_builds = builds.difference(selected)
+            can_empty = len(missing_builds) <= slots and all(index >= start for index in missing_builds)
+            if not can_empty and (charge + max_charge[start][slots] < charge_gap
+                                  or freed + max_free[start][slots] < free_gap):
+                return
+            if slots == 0:
+                result = head_after_steps_end(explanation, selected)
+                if isinstance(result, HeadAdmitsAfterEnd):
+                    best = result
+                return
+            for index in range(start, count - slots + 1):
+                search(index + 1, slots - 1, (*selected, index), charge + charges[index], freed + free_releases[index])
+        search(0, size, (), 0, 0)
+        if isinstance(best, HeadAdmitsAfterEnd):
+            return best
+    return all_ended
+
+
+@dataclass(frozen=True)
+class WaiterRowSelector:
+    row_key: str
+    original_selector: str
+
+
+def bump_waiter(selector: str | WaiterRowSelector, actor: str) -> WaitingStep:
     directory = admission_dir(store.root())
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         view, ordered = read_queue(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())
         matches: list[int] = []
-        if selector.isdecimal():
+        if isinstance(selector, WaiterRowSelector):
+            matches = [position for position, item in enumerate(ordered)
+                       if item[0].name == selector.row_key]
+            original_selector = selector.original_selector
+        elif selector.isdecimal():
+            original_selector = selector
             position = int(selector) - 1
             if 0 <= position < len(view.waiting):
                 matches = [position]
         else:
+            original_selector = selector
             matches = [position for position, item in enumerate(view.waiting)
                        if selector in (item.session_id, item.session_name, item.folder, Path(item.folder).name)]
         if len(matches) != 1:
             labels = ", ".join(f"{position + 1}: {item.session_name or item.session_id or item.pid} {item.folder}"
                                for position, item in enumerate(view.waiting) if not matches or position in matches)
-            raise ValueError(f"{selector!r}: {'unknown' if not matches else 'ambiguous'} waiter; matches: {labels or 'none'}")
+            raise UnmatchedWaiter(f"{original_selector!r}: {'unknown' if not matches else 'ambiguous'} waiter; matches: {labels or 'none'}")
         position = matches[0]
         moved = view.waiting[position]
         path, row = ordered[position]

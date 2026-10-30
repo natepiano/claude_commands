@@ -7,10 +7,8 @@ import fcntl
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
-import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast, final, override
@@ -19,7 +17,9 @@ from unittest.mock import patch
 from scripts.lib import process_start
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
 from scripts.direct import workers
-from scripts.direct.recorder_fixture import invoke_recorder, communicate_launcher
+from scripts.direct.recorder_fixture import (
+    LauncherHangGuard, TEST_HANG_GUARD_SECS, communicate_launcher, invoke_recorder,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -43,6 +43,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
     paths: Path = Path()
     prompt: Path = Path()
     registry: Path = Path()
+    hang_guard: LauncherHangGuard
     claims: list[dict[str, object]]
     reservations: list[dict[str, object]]
 
@@ -50,10 +51,14 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         super().__init__(methodName)
         self.claims = []
         self.reservations = []
+        self.hang_guard = LauncherHangGuard(methodName)
 
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.lifecycle_clock.freeze()
+        self.hang_guard = LauncherHangGuard(self.id())
+        self.server.hang_guard = self.hang_guard
         self.project = self.session_dir.parent / "project"
         self.project.mkdir()
         _ = (self.project / "plan.md").write_text("## Delegation Context\n\n- **Project:** Assignment fixture\n")
@@ -87,7 +92,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.reservations = []
         original = self.server.respond
 
-        @mesh_fixture.bounded_fixture
+        @self.hang_guard.callback
         def observe(request: dict[str, object]) -> list[dict[str, object]] | None:
             roster_path = self.session_dir / codex_mesh.ROSTER_FILE
             if roster_path.exists() and roster_path.stat().st_size:
@@ -129,7 +134,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         with subprocess.Popen(arguments, env=os.environ.copy(), cwd=ROOT, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               start_new_session=True) as child:
-            output, errors = communicate_launcher(child, timeout=45)
+            output, errors = communicate_launcher(child)
             return subprocess.CompletedProcess(arguments, child.returncode, output, errors)
 
     def successful(self, role: str = "implement", *options: str) -> subprocess.CompletedProcess[str]:
@@ -155,7 +160,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         for options in ([], ["--prompt", str(self.prompt)], ["--role", "test"], ["test", str(self.prompt)]):
             with self.subTest(options=options):
                 result = subprocess.run(["bash", str(ASSIGN), *options], cwd=ROOT,
-                                        capture_output=True, text=True, timeout=10)
+                                        capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS)
                 self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                 self.assertIn("usage", (result.stdout + result.stderr).lower())
         self.assertEqual(self.methods("thread/start"), [])
@@ -304,7 +309,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                            "Reviewing assigned changes", pass_number, "contract"]
                 with subprocess.Popen(command, cwd=ROOT, env=os.environ.copy(), text=True,
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as child:
-                    output, errors = communicate_launcher(child, timeout=45)
+                    output, errors = communicate_launcher(child)
                     self.assertEqual(child.returncode, 0, output + errors)
                 if flags:
                     self.assertEqual(errors, "review.sh: --pool code and --lease are ignored; using the unit reviewer.\n")
@@ -546,7 +551,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         observed_claims: list[dict[str, object]] = []
         original = self.server.respond
 
-        @mesh_fixture.bounded_fixture
+        @self.hang_guard.callback
         def observe_saved_slot(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "turn/start":
                 observed_claims.append(read_object(self.session_dir / "impl_claim_impl.json"))
@@ -685,7 +690,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         original = self.server.respond
         deliveries: list[str] = []
 
-        @mesh_fixture.bounded_fixture
+        @self.hang_guard.callback
         def final_diff(request: dict[str, object]) -> list[dict[str, object]] | None:
             params = cast(dict[str, object], request.get("params", {}))
             if request.get("method") == "turn/start" and "Stage 2" in json.dumps(params):
@@ -705,7 +710,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
                                        "--early-ready", str(ready))
             try:
-                self.assertTrue(self.server.held_turn_ready.wait(timeout=15), "review did not start")
+                self.hang_guard.event(self.server.held_turn_ready)
                 self.assertEqual(deliveries, [])
                 phase = self.session_dir / "phases/7"
                 self.assertEqual((phase / "review_status_contract").read_text().strip(), "reviewing")
@@ -716,26 +721,22 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                 watch = (codex_mesh.LinuxFileChanges({pending}) if sys.platform.startswith("linux")
                          else codex_mesh.KqueueFileChanges({pending}))
                 try:
-                    wake, peer = socket.socketpair()
-                    with wake, peer:
-                        budget = mesh_fixture.FixtureLoopBudget("Stage 2 inbox delivery", seconds=15)
-                        ready.touch()
-                        while True:
-                            remaining = budget.check()
-                            if pending.exists():
-                                with pending.open() as inbox:
-                                    fcntl.flock(inbox, fcntl.LOCK_SH)
-                                    if "Stage 2" in inbox.read():
-                                        break
-                            event = watch.wait(wake, time.monotonic() + remaining)
-                            self.assertNotEqual(event, codex_mesh.WaitDeadlineExpired.EXPIRED,
-                                                "ready event delivered no Stage 2 message")
+                    ready.touch()
+                    while True:
+                        if pending.exists():
+                            with pending.open() as inbox:
+                                fcntl.flock(inbox, fcntl.LOCK_SH)
+                                if "Stage 2" in inbox.read():
+                                    break
+                        event = self.hang_guard.change(watch.wait, self.lifecycle_clock.monotonic)
+                        self.assertNotEqual(event, codex_mesh.WaitDeadlineExpired.EXPIRED,
+                                            "ready event delivered no Stage 2 message")
                 finally:
                     watch.close()
                 self.live_turn = ""
                 self.server.hold_turn_completion = False
                 self.server.release_held_turn.set()
-                result = launched.result(timeout=30)
+                result = self.hang_guard.result(launched)
             finally:
                 self.server.release_held_turn.set()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -748,10 +749,12 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         ready = self.session_dir.parent / "final.ready"
         reply = self.session_dir / "phases/7/review_reply_contract_1.txt"
         status = reply.with_name("review_status_contract_1")
+        settled = self.session_dir.parent / "stage-one-settled"
+        script = self.observe_follow_settlement(settled)
         original = self.server.respond
         deliveries: list[str] = []
 
-        @mesh_fixture.bounded_fixture
+        @self.hang_guard.callback
         def hold_final_review(request: dict[str, object]) -> list[dict[str, object]] | None:
             params = cast(dict[str, object], request.get("params", {}))
             stage_two = request.get("method") == "turn/start" and "Stage 2:" in json.dumps(params)
@@ -777,36 +780,31 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             return frames
 
         self.server.respond = hold_final_review
-        watch = (codex_mesh.LinuxFileChanges({reply, status}) if sys.platform.startswith("linux")
-                 else codex_mesh.KqueueFileChanges({reply, status}))
+        watch = (codex_mesh.LinuxFileChanges({settled}) if sys.platform.startswith("linux")
+                 else codex_mesh.KqueueFileChanges({settled}))
         try:
             with ThreadPoolExecutor(max_workers=1) as executor:
                 launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
-                                           "--early-ready", str(ready))
+                                           "--early-ready", str(ready), script=script)
                 try:
-                    wake, peer = socket.socketpair()
-                    with wake, peer:
-                        budget = mesh_fixture.FixtureLoopBudget("provisional review reply", seconds=20)
-                        while not reply.exists() or not reply.read_text().strip():
-                            self.assertFalse(launched.done(), "review exited before its final diff existed")
-                            event = watch.wait(wake, time.monotonic() + budget.check())
-                            self.assertNotEqual(event, codex_mesh.WaitDeadlineExpired.EXPIRED)
-                        # Observe ordinary settlement events after Stage 1 has actually written its reply.
-                        _ = watch.wait(wake, time.monotonic() + 1)
+                    while not settled.exists():
+                        self.assertFalse(launched.done(), "review exited before its final diff existed")
+                        event = self.hang_guard.change(watch.wait, self.lifecycle_clock.monotonic)
+                        self.assertNotEqual(event, codex_mesh.WaitDeadlineExpired.EXPIRED)
                     self.assertFalse(launched.done(), "Stage 1 alone completed the review")
                     self.assertEqual(deliveries, [])
                     self.assertIn("Provisional review.", reply.read_text())
                     self.assertFalse(any(event.get("event_type") in {"pass_started", "pass_finished"}
                                          for event in self.events()))
                     ready.touch()
-                    self.assertTrue(self.server.held_turn_ready.wait(timeout=15), "Stage 2 never started")
+                    self.hang_guard.event(self.server.held_turn_ready)
                     self.assertEqual(len([event for event in self.events()
                                           if event.get("event_type") == "pass_started"]), 1)
                     self.assertFalse(any(event.get("event_type") == "pass_finished" for event in self.events()))
                     self.assertEqual(status.read_text().strip(), "running")
                     self.live_turn = ""
                     self.server.release_held_turn.set()
-                    result = launched.result(timeout=20)
+                    result = self.hang_guard.result(launched)
                 finally:
                     ready.touch()
                     self.server.release_held_turn.set()
@@ -838,7 +836,6 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         settled = self.session_dir.parent / "stage-one-settled"
         destination = self.session_dir.parent / "taking-run"
         reply = self.session_dir / "phases/7/review_reply_contract_1.txt"
-        script = self.prepare_launcher()[0]
         transport_override = ""
         if not adopt:
             # A successful transport acknowledgment alone must not complete a review.
@@ -851,19 +848,10 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                 "else:\n" +
                 f"    runpy.run_path({str(ROOT / 'scripts/agents/codex_mesh.py')!r}, run_name='__main__')\n")
             transport_override = f"assign.MESH = {str(transport)!r}\n"
-        _ = script.with_suffix(".py").write_text(
-            "from pathlib import Path\nfrom scripts.direct import assign\n" +
-            transport_override +
-            "real_follow = assign.Dispatch.follow\n" +
-            "def follow(dispatch, command, shown, log):\n" +
-            "    result = real_follow(dispatch, command, shown, log)\n" +
-            f"    Path({str(settled)!r}).touch()\n" +
-            "    return result\n" +
-            "assign.Dispatch.follow = follow\n" +
-            "raise SystemExit(assign.main())\n")
+        script = self.observe_follow_settlement(settled, transport_override)
         original = self.server.respond
 
-        @mesh_fixture.bounded_fixture
+        @self.hang_guard.callback
         def provisional_reply(request: dict[str, object]) -> list[dict[str, object]] | None:
             frames = original(request)
             if request.get("method") == "turn/start" and frames is not None:
@@ -883,17 +871,14 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                 launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
                                            "--early-ready", str(ready), script=script)
                 try:
-                    wake, peer = socket.socketpair()
-                    with wake, peer:
-                        budget = mesh_fixture.FixtureLoopBudget("Stage 1 follower settlement")
-                        while not settled.exists():
-                            self.assertFalse(launched.done(), "Stage 1 completed the entire review")
-                            event = watch.wait(wake, time.monotonic() + budget.check())
-                            if event == codex_mesh.WaitDeadlineExpired.EXPIRED:
-                                ready.touch()
-                                stopped = launched.result(timeout=20)
-                                self.fail(f"Stage 1 never settled: {stopped.stdout}{stopped.stderr}; " +
-                                          f"roster={roster_path.read_text() if roster_path.exists() else 'missing'}")
+                    while not settled.exists():
+                        self.assertFalse(launched.done(), "Stage 1 completed the entire review")
+                        event = self.hang_guard.change(watch.wait, self.lifecycle_clock.monotonic)
+                        if event == codex_mesh.WaitDeadlineExpired.EXPIRED:
+                            ready.touch()
+                            stopped = self.hang_guard.result(launched)
+                            self.fail(f"Stage 1 never settled: {stopped.stdout}{stopped.stderr}; " +
+                                      f"roster={roster_path.read_text() if roster_path.exists() else 'missing'}")
                     self.assertFalse(launched.done(), "Stage 1 completed the entire review")
                     self.assertIn("Stage 1 only.", reply.read_text())
                     roster = self.assignment_records()
@@ -914,7 +899,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                             _ = handle.write(json.dumps(roster))
                             _ = handle.truncate()
                     ready.touch()
-                    result = launched.result(timeout=25)
+                    result = self.hang_guard.result(launched)
                 finally:
                     ready.touch()
         finally:
@@ -1019,7 +1004,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             "raise SystemExit(assign.main())\n")
         original = self.server.respond
 
-        @mesh_fixture.bounded_fixture
+        @self.hang_guard.callback
         def final_reply(request: dict[str, object]) -> list[dict[str, object]] | None:
             frames = original(request)
             if request.get("method") == "turn/start" and frames is not None:
@@ -1044,23 +1029,20 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                 launched = executor.submit(self.launch, "review", "--lens", "contract", "--pass", "1",
                                            "--early-ready", str(ready), script=script)
                 try:
-                    self.assertTrue(self.server.held_turn_ready.wait(timeout=20), "Stage 1 did not start")
+                    self.hang_guard.event(self.server.held_turn_ready)
                     watch = (codex_mesh.LinuxFileChanges({delivered}) if sys.platform.startswith("linux")
                              else codex_mesh.KqueueFileChanges({delivered}))
                     try:
-                        wake, peer = socket.socketpair()
-                        with wake, peer:
-                            budget = mesh_fixture.FixtureLoopBudget("combined review delivery", seconds=20)
-                            ready.touch()
-                            while not delivered.exists():
-                                event = watch.wait(wake, time.monotonic() + budget.check())
-                                self.assertNotEqual(event, codex_mesh.WaitDeadlineExpired.EXPIRED)
+                        ready.touch()
+                        while not delivered.exists():
+                            event = self.hang_guard.change(watch.wait, self.lifecycle_clock.monotonic)
+                            self.assertNotEqual(event, codex_mesh.WaitDeadlineExpired.EXPIRED)
                     finally:
                         watch.close()
                     self.live_turn = ""
                     self.server.hold_turn_completion = False
                     self.server.release_held_turn.set()
-                    result = launched.result(timeout=30)
+                    result = self.hang_guard.result(launched)
                 finally:
                     ready.touch()
                     self.server.release_held_turn.set()
@@ -1138,7 +1120,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                        "Reviewing assigned changes", pass_number, "contract"]
             with subprocess.Popen(command, cwd=ROOT, env=os.environ.copy(), text=True,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as child:
-                output, errors = communicate_launcher(child, timeout=45)
+                output, errors = communicate_launcher(child)
                 self.assertEqual(child.returncode, 0, output + errors)
 
         review("--slot", "review", "1")
@@ -1208,7 +1190,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         original = self.server.respond
         destination = str(self.session_dir.parent / "taking-run")
 
-        @mesh_fixture.bounded_fixture
+        @self.hang_guard.callback
         def handoff(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") != "turn/start":
                 return original(request)
@@ -1233,3 +1215,18 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(len(self.methods("turn/start")), 1)
         self.assertFalse(any(event.get("event_type") == "pass_finished" and
                              event.get("status") == "completed" for event in self.events()))
+
+    def observe_follow_settlement(self, settled: Path, transport_override: str = "") -> Path:
+        """Observe the real follow returning, rather than waiting for an arbitrary interval."""
+        script = self.prepare_launcher()[0]
+        _ = script.with_suffix(".py").write_text(
+            "from pathlib import Path\nfrom scripts.direct import assign\n" +
+            transport_override +
+            "real_follow = assign.Dispatch.follow\n" +
+            "def follow(dispatch, command, shown, log):\n" +
+            "    result = real_follow(dispatch, command, shown, log)\n" +
+            f"    Path({str(settled)!r}).touch()\n" +
+            "    return result\n" +
+            "assign.Dispatch.follow = follow\n" +
+            "raise SystemExit(assign.main())\n")
+        return script

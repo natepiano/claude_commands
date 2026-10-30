@@ -21,13 +21,13 @@ import unittest
 from pathlib import Path
 from typing import TypedDict, ClassVar, cast, override
 
-from scripts.direct.recorder_fixture import STUB_ATOMIC_JSON_WRITER, communicate_launcher, invoke_recorder
+from scripts.direct.recorder_fixture import (
+    STUB_ATOMIC_JSON_WRITER, TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS,
+    communicate_launcher, invoke_recorder,
+)
 
-
-TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
 
 DIRECT_DIR = Path(__file__).parent
-AGENTS_DIR = DIRECT_DIR.parent / "agents"
 
 LEGACY_RECORDER_ARGUMENTS = """
 # Compatibility for older launch cases whose subject is root-level artifacts.
@@ -264,16 +264,21 @@ def copy_launcher_dependencies(root: Path) -> None:
     for directory, names in (
         ("direct", ("implement.sh", "worker_name.sh", "worker_state.py",
                     "progress_history.py", "plan_history.py", "phase_reservation.py",
-                    "recorder_state.py", "findings.py", "board.sh")),
+                    "recorder_state.py", "findings.py", "board.sh", "review.sh",
+                    "review_tree.py", "tag_inventory.py")),
         ("agents", ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk",
-                    "heartbeat.sh", "heartbeat_watch.sh")),
-        ("lib", ("py", "atomic_file.py", "process_start.py", "user_zone.py", "unit_runs.py", "agents_registry.py")),
-        ("production", ("production_doc.py",)),
+                    "heartbeat.sh", "heartbeat_watch.sh", "claude_account.sh", "agent_bg.sh")),
+        ("lib", ("py", "atomic_file.py", "process_start.py", "user_zone.py", "unit_runs.py",
+                 "agents_registry.py", "codex_models_cache.py", "nix_env.py", "probe_session.py")),
+        ("production", ("production_doc.py", "showrunners.py")),
     ):
         destination = root / "scripts" / directory
         destination.mkdir(parents=True)
         for name in names:
             _ = shutil.copy2(DIRECT_DIR.parent / directory / name, destination / name)
+    home_lib = root / ".claude" / "scripts" / "lib"
+    home_lib.mkdir(parents=True, exist_ok=True)
+    _ = shutil.copy2(root / "scripts" / "lib" / "py", home_lib / "py")
     recorder = root / "scripts" / "direct" / "progress_history.py"
     _ = recorder.write_text(recorder.read_text().replace(
         "from __future__ import annotations\n",
@@ -363,18 +368,12 @@ class ImplementLauncherFixture(unittest.TestCase):
         copy_launcher_dependencies(self.root)
         direct_dir = self.root / "scripts" / "direct"
         agents = self.root / "scripts" / "agents"
-        lib = self.root / "scripts" / "lib"
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "nix_env.py", lib / "nix_env.py")
-        home_lib = self.root / ".claude" / "scripts" / "lib"
-        home_lib.mkdir(parents=True, exist_ok=True)
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", home_lib / "py")
         launcher = direct_dir / "implement.sh"
         _ = launcher.write_text(
             launcher.read_text(encoding="utf-8").replace(
                 "HEARTBEAT_INTERVAL_SECS=60", "HEARTBEAT_INTERVAL_SECS=1"
             ), encoding="utf-8",
         )
-        _ = shutil.copy2(AGENTS_DIR / "claude_account.sh", agents / "claude_account.sh")
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
         stub.chmod(0o755)
@@ -382,7 +381,6 @@ class ImplementLauncherFixture(unittest.TestCase):
         _ = mesh.write_text(STUB_MESH, encoding="utf-8")
         mesh.chmod(0o755)
         agent_bg = agents / "agent_bg.sh"
-        _ = shutil.copy2(AGENTS_DIR / "agent_bg.sh", agent_bg)
         _ = agent_bg.write_text(
             agent_bg.read_text(encoding="utf-8").replace(
                 'POLL_SECS="${8:-15}"', 'POLL_SECS="${8:-0.05}"'

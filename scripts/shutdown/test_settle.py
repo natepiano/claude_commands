@@ -29,7 +29,7 @@ from unittest.mock import Mock, call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
+from test_support import registry_confirmation, ShutdownSendLeaf, ShutdownTestCase, empty_session_registry
 from launch_permission import NewWorkLaunchPurpose
 import inventory
 import herdr
@@ -284,6 +284,7 @@ class SettleTests(ShutdownTestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         context = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "state"), "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions")})))
         del context
+        empty_session_registry(self, self.root / "sessions")
         _ = self.enterContext(patch.object(settle, "now_utc", return_value=NOW_UTC))
         _ = self.enterContext(patch.object(settle, "merge_in_progress", return_value=False))
         _ = self.enterContext(patch.object(settle, "_showing_form", return_value=False))
@@ -1100,7 +1101,7 @@ class SettleTests(ShutdownTestCase):
         ):
             self.assertEqual(settle.conduct(LOGIN), 0)
         self.assertTrue(saw_refusal)
-        self.assertEqual(fresh_calls, 2)
+        self.assertEqual(fresh_calls, 6)
         self.assertEqual(signals, [signal.SIGTERM])
         report.assert_called_once()
         outcomes = cast(list[shutdown_record.SessionShutdown], report.call_args.args[0])
@@ -1372,7 +1373,8 @@ class SettleTests(ShutdownTestCase):
             form.assert_not_called()
         for owner in (stop_work.SessionAbsent(kind="session absent"), stop_work.SessionIdentityLost(kind="session identity lost")):
             with self.subTest(owner=owner):
-                self.assertIsInstance(settle.next_step(saved, owner, [], NOW_UTC), settle.StopSession)
+                expected = settle.Hold if owner["kind"] == "session identity lost" else settle.StopSession
+                self.assertIsInstance(settle.next_step(saved, owner, [], NOW_UTC), expected)
         self.assertEqual(settle.next_step(saved, stop_work.SessionAccountUnreadable(kind="session account unreadable"), [], NOW_UTC), settle.Hold("account unreadable"))
         saved["force"] = "now"
         saved["session"]["status"] = "busy"
@@ -1517,7 +1519,8 @@ class SettleTests(ShutdownTestCase):
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "ready", "at": NOW})
         self.assertEqual(settle.next_step(saved, stop_work.SessionAccountUnreadable(kind="session account unreadable"), [], NOW_UTC), settle.Hold("account unreadable"))
         for owner in (stop_work.SessionAbsent(kind="session absent"), stop_work.SessionIdentityLost(kind="session identity lost")):
-            self.assertIsInstance(settle.next_step(saved, owner, [], NOW_UTC), settle.StopSession)
+            expected = settle.Hold if owner["kind"] == "session identity lost" else settle.StopSession
+            self.assertIsInstance(settle.next_step(saved, owner, [], NOW_UTC), expected)
 
     def test_worker_becoming_idle_allows_the_owner_to_stop(self) -> None:
         saved = session_shutdown(top_level("owner", "Owner"), progress={"kind": "ready", "at": NOW})
@@ -3368,7 +3371,8 @@ class SettleTests(ShutdownTestCase):
             line = output.getvalue().splitlines()[index]
             self.assertTrue(line.startswith(f"{index} was not cancelled: {item['kind']}"))
             self.assertIn("in a terminal on natedev:", line)
-            self.assertIn(f"restart {LOGIN} --here --only", line)
+            verb = "now" if item["kind"] == "stop failed" else "restart"
+            self.assertIn(f"{verb} {LOGIN} --here --only {index}", line)
         self.assertIn("restart failed — not live", output.getvalue())
         self.assertIn("manual restart — in a terminal on natedev: resume owner", output.getvalue())
 
@@ -3990,15 +3994,15 @@ class SettleTests(ShutdownTestCase):
         self.assertIsNone(shutdown_record.find_session(LOGIN, "failed"))
         self.assertEqual(shutdown_record.find_session(LOGIN, "other"), sibling)
 
-    def test_cancel_only_failed_stop_with_changed_process_identity_is_retained(self) -> None:
+    def test_cancel_only_failed_stop_with_resumed_process_identity_is_withdrawn(self) -> None:
         saved = session_shutdown(top_level("failed", "Failed"), progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
         self.save(saved)
         reused = top_level("failed", "Failed")
         reused["proc_start"] = "new-start"
         with patch.object(settle, "inventory", return_value=machine_inventory([reused])), patch.object(settle, "_restore_record") as restore, redirect_stdout(io.StringIO()):
-            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True, only=["failed"]), 1)
-        restore.assert_not_called()
-        self.assertEqual(shutdown_record.find_session(LOGIN, "failed"), saved)
+            self.assertEqual(settle.cancel(Account("claude", LOGIN, LABEL), True, only=["failed"]), 0)
+        restore.assert_called_once_with(saved)
+        self.assertIsNone(shutdown_record.find_session(LOGIN, "failed"))
 
     def test_now_only_failed_stop_marks_force_and_workers_retry_to_conductor(self) -> None:
         saved = session_shutdown(top_level("failed", "Failed"), progress={"kind": "stop failed", "at": NOW, "reason": "still live"})
