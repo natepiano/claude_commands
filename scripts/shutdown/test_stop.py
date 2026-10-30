@@ -249,7 +249,7 @@ class SharedHerdrStopTests(ShutdownTestCase):
         marked = unit_lookup.MarkedUnit("review-unit", unit_lookup.ClaudeNotRunning(), herdr.HerdrPlace("agents", "w3:pE"))
         cases: list[tuple[unit_lookup.MarkedUnit | None, list[herdr.PaneIdentity], int, int]] = [
             (marked, [], 1, 0),
-            (marked, [{"pane_id": "w3:pE", "label": "prod-review"}], 1, 1),
+            (marked, [{"pane_id": "w3:pE", "label": "prod-review", "workspace_id": "w3", "session_id": None}], 1, 1),
             (None, [], 0, 0),
         ]
         for found, panes, closes, issues in cases:
