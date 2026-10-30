@@ -1322,9 +1322,9 @@ class MemoryQueueFixture(unittest.TestCase):
         return path
 
     def head(self, need: float = 10.9) -> Path:
-        row: gate.Waiter = {"pid": 300, "start_time": "head", "need": int(need * GIB),
+        row: gate.Waiter = {"pid": 300, "start_time": self.processes[300], "need": int(need * GIB),
                             "since": NOW.timestamp() - 2400, "label": "clone88ci nextest (verify pid 300)"}
-        path = gate.admission_dir(self.root) / "300-head.waiting"
+        path = gate.admission_dir(self.root) / f"300-{self.processes[300]}.waiting"
         _ = path.write_text(json.dumps(row))
         return path
 
@@ -1489,9 +1489,10 @@ class AdmitHeadTests(MemoryQueueFixture):
 
     def test_record_for_a_dead_or_reused_waiter_never_admits_the_new_head(self) -> None:
         _ = self.running(100, 20, age=30)
+        self.processes[300] = "3000"
         _ = self.waiting_head()
         _ = self.set_head()
-        self.processes[300] = "new-process"
+        self.processes[300] = "3001"
         result = self.check(pid=300, need=12, free=23)
         self.assertEqual(result.decision.state, "hold")
         self.assertFalse(self.override_path.exists())

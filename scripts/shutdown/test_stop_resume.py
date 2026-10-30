@@ -4,6 +4,7 @@ import io
 import os
 import shlex
 import signal
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -12,7 +13,10 @@ from threading import Barrier, Lock
 from typing import cast, final, override
 from unittest.mock import Mock, call, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.shutdown import stop_resume
+from scripts.lib import process_start as process_identity
 import herdr
 import pane_record
 import sessions
@@ -44,7 +48,7 @@ class StopResumeTests(unittest.TestCase):
         _ = self.enterContext(patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
         pane_record.write("agents", self.entry)
         _ = self.enterContext(patch.object(sessions, "session_liveness", self.live))
-        _ = self.enterContext(patch.object(sessions, "process_start", return_value="generation-1"))
+        _ = self.enterContext(patch.object(process_identity, "process_start", return_value=process_identity.ProcessStartTime(123456)))
         _ = self.enterContext(patch.object(sessions, "process_liveness", self.process))
         _ = self.enterContext(patch.object(os, "kill", self.kill))
         _ = self.enterContext(patch.object(stop_resume, "Event", self.wait))
@@ -94,6 +98,18 @@ class StopResumeTests(unittest.TestCase):
                 self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123), final]
                 self.assertEqual(stop_resume.stop("sid-alpha"), stop_resume.Stopped("sid-alpha", 123))
                 self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM)])
+
+    def test_stop_keeps_an_unreadable_process_unsignalled(self) -> None:
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        with patch.object(process_identity, "process_start", side_effect=process_identity.ProcessReadError("identity unreadable")):
+            self.assertEqual(stop_resume.stop("alpha"), stop_resume.StopFailed("sid-alpha", "identity unreadable"))
+        self.kill.assert_not_called()
+
+    def test_stop_reports_a_process_that_exits_during_identity_read_as_not_running(self) -> None:
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        with patch.object(process_identity, "process_start", return_value=process_identity.ProcessGone(123)):
+            self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("sid-alpha"))
+        self.kill.assert_not_called()
 
     def test_reused_pid_generation_is_checked_before_each_signal(self) -> None:
         for changed_before_term in (True, False):

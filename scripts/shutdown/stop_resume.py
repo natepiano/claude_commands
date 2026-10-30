@@ -19,6 +19,9 @@ from time import monotonic
 from typing import cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS.parent))
+from scripts.lib import process_start as process_identity
+
 for dependency in ("herdr", "message", "whoami", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
@@ -117,14 +120,14 @@ def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
             return NotRunning(identity)
         if isinstance(live, sessions.SessionLivenessUnknown):
             return StopFailed(identity, live.reason)
-        started = sessions.process_start(live.pid)
-        if not started:
-            return StopFailed(identity, f"process identity unreadable for pid {live.pid}")
-        if not _same_claude(identity, live.pid, started):
+        started = process_identity.process_start(live.pid)
+        if isinstance(started, process_identity.ProcessGone):
+            return NotRunning(identity)
+        if not _same_claude(identity, live.pid, started.text):
             return NotRunning(identity)
         os.kill(live.pid, signal.SIGTERM)
         _ = Event().wait(STOP_GRACE_SECONDS)
-        if _same_claude(identity, live.pid, started):
+        if _same_claude(identity, live.pid, started.text):
             os.kill(live.pid, signal.SIGKILL)
         return Stopped(identity, live.pid)
     except ProcessLookupError:
