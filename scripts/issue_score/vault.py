@@ -8,16 +8,52 @@ import json
 from pathlib import Path
 import re
 from typing import cast
+from urllib.parse import unquote, urlsplit
 
-from .questions import BODY_CHARACTER_LIMIT, GOAL_LABELS, IssueState, PROJECT_ABOUT
+from scripts.feature_log import feature_log
+
+from .questions import BODY_CHARACTER_LIMIT, GOAL_LABELS, IssueState, PROJECT_ABOUT, StyleState
 
 VAULT_ROOT = Path.home() / "rust/hanadocs"
 ISSUES_DIR = VAULT_ROOT / "issues"
 AREA_DEFINITIONS_PATH = VAULT_ROOT / "conf/issue-areas.md"
+PROJECT_BASES_DIR = VAULT_ROOT / "home-base"
+STYLE_RULES_DIRS = (Path.home() / "rust/nate_style", Path(__file__).resolve().parents[2] / "docs/style")
 RATING_FIELDS = ("backlog_alignment", "backlog_impact", "backlog_urgency", "backlog_effort")
 LABEL_FIELDS = ("backlog_goal", *RATING_FIELDS, "category", "area", "backlog_score")
 WIKILINK = re.compile(r"\[\[([^\]\n]+)\]\]")
 PROPOSED_RANKING = re.compile(r"^\s*Proposed ranking:.*$", re.MULTILINE)
+FRONTMATTER_FIELD = re.compile(r'''^(?!-(?:\s|$))("(?:\\.|[^"\\])*"|'(?:''|[^'])*'|[^\s"'#][^:]*):\s*(.*?)\s*$''')
+
+
+@dataclass(frozen=True)
+class RuleSummary:
+    name: str
+    summary: str
+
+
+@dataclass(frozen=True)
+class MissingStyleRule:
+    name: str
+
+
+@dataclass(frozen=True)
+class StyleInputs:
+    rules: tuple[RuleSummary | MissingStyleRule, ...]
+    style_crate: str
+    finding_count: int
+
+    def model_state(self) -> StyleState:
+        return {"style_rules": [
+                    {"name": rule.name, "summary": rule.summary, "status": "available"}
+                    if isinstance(rule, RuleSummary) else {"name": rule.name, "status": "missing"}
+                    for rule in self.rules],
+                "style_crate": self.style_crate, "finding_count": self.finding_count}
+
+
+@dataclass(frozen=True)
+class NoStyleInputs:
+    pass
 
 
 @dataclass(frozen=True)
@@ -28,6 +64,7 @@ class Issue:
     body: str
     labels: dict[str, str]
     is_style: bool = False
+    style_inputs: StyleInputs | NoStyleInputs = NoStyleInputs()
 
 
 @dataclass(frozen=True)
@@ -96,22 +133,22 @@ def normalize_area(area: str) -> str:
 
 
 def load_area_definitions(path: Path = AREA_DEFINITIONS_PATH) -> dict[str, str]:
-    """Require a readable area table; missing area rows retain name-only criteria."""
+    """Require a two-column area table; missing rows retain name-only criteria."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         raise ValueError(f"{path}: area definitions file not found") from None
     definitions: dict[str, str] = {}
-    in_table = False
+    columns = 0
     for line in lines:
         cells = [cell.strip().replace(r"\|", "|")
                  for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
-        if [cell.casefold() for cell in cells] == ["area", "definition", "issues"]:
-            in_table = True
+        if [cell.casefold() for cell in cells] == ["area", "definition"]:
+            columns = len(cells)
             continue
-        if not in_table:
+        if not columns:
             continue
-        if len(cells) != 3:
+        if len(cells) != columns:
             break
         if all(re.fullmatch(r":?-+:?", cell) for cell in cells):
             continue
@@ -119,12 +156,28 @@ def load_area_definitions(path: Path = AREA_DEFINITIONS_PATH) -> dict[str, str]:
         if area and cells[1]:
             definitions[area] = cells[1]
     if not definitions:
-        raise ValueError(f"{path}: no area definitions found in area | definition | issues table")
+        raise ValueError(f"{path}: no area definitions found in area | definition table")
     return definitions
 
 
+def load_project_names(base_dir: Path = PROJECT_BASES_DIR) -> dict[str, str]:
+    """Read each shorthand's project filter from the same bases `/issue` uses."""
+    names: dict[str, str] = {}
+    for path in sorted(base_dir.glob("issues - *.base")):
+        matches = set(re.findall(r'''project\.contains\(link\(["']([^"']+)["']\)\)''', path.read_text(encoding="utf-8")))
+        if len(matches) != 1:
+            raise ValueError(f"{path}: expected one project.contains(link(...)) project")
+        names[path.stem.removeprefix("issues - ")] = matches.pop()
+    return names
+
+
 def _frontmatter(path: Path) -> VaultDocument:
-    text = path.read_text(encoding="utf-8")
+    return parse_document(path, path.read_text(encoding="utf-8"))
+
+
+def parse_document(path: Path, text: str) -> VaultDocument:
+    """Parse a supplied snapshot so validation and editing can share its bytes."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = text.splitlines(keepends=True)
     if not lines or lines[0].strip() != "---":
         return VaultDocument(path, {}, text)
@@ -134,9 +187,9 @@ def _frontmatter(path: Path) -> VaultDocument:
     fields: dict[str, list[str]] = {}
     field_name = ""
     for line in lines[1:closing]:
-        scalar = re.match(r"^([\w-]+):\s*(.*?)\s*$", line)
+        scalar = FRONTMATTER_FIELD.match(line)
         if scalar:
-            field_name, value = scalar.groups()
+            field_name, value = _unquote(scalar[1]), scalar[2]
             fields[field_name] = []
             if value and value not in ("null", "~", "[]"):
                 if value.startswith("[") and not value.startswith("[["):
@@ -161,15 +214,70 @@ def load_open_issues(issues_dir: Path = ISSUES_DIR) -> list[Issue]:
             if plain(document.value("status")).casefold() == "open" and not document.is_style]
 
 
-def _style_formula(document: VaultDocument, project_goals: dict[str, str]) -> dict[str, str]:
+def _finding_count(document: VaultDocument) -> int:
     count_text = document.value("style_count")
     count_match = re.search(r"(?m)^Findings:\s*(\d+)", document.body)
     if count_text.isdigit():
-        count = int(count_text)
-    elif count_match:
-        count = int(count_match[1])
-    else:
-        count = len(document.fields.get("style_findings", []))
+        return int(count_text)
+    if count_match:
+        return int(count_match[1])
+    return len(document.fields.get("style_findings", []))
+
+
+def project_rule_roots(project: str) -> tuple[Path, ...]:
+    """Reuse the feature log's repository and member-crate checkout registry."""
+    return tuple(root for name, spec in feature_log.PROJECTS.items()
+                 if project == name or project in spec.crates for root in spec.checkouts)
+
+
+def _rule_summary(reference: str, rules_dirs: tuple[Path, ...]) -> RuleSummary | MissingStyleRule:
+    relative = reference.split("#", 1)[0].removeprefix("global:").removeprefix("local:")
+    url = urlsplit(relative)
+    parts = url.path.lstrip("/").split("/", 4)
+    if url.netloc == "github.com" and len(parts) == 5 and parts[2] == "blob":
+        relative = unquote(parts[4])
+    relative = plain(relative).removesuffix(".md") + ".md"
+    candidates = [root / relative for root in rules_dirs] + [root / Path(relative).name for root in rules_dirs]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        document = _frontmatter(path)
+        summary = document.value("summary") or document.value("description")
+        if not summary:
+            paragraphs = re.split(r"\n\s*\n", document.body.strip())
+            summary = next((paragraph for paragraph in paragraphs
+                            if paragraph and not paragraph.startswith(("#", "```", "---"))), "")
+        if summary:
+            return RuleSummary(reference, " ".join(plain(summary).split()))
+    return MissingStyleRule(reference)
+
+
+def scoring_issue(document: VaultDocument, *, rules_dirs: tuple[Path, ...] = STYLE_RULES_DIRS) -> Issue:
+    """Build scoring inputs from one issue snapshot, including its owning rules."""
+    issue = document.issue()
+    if not document.is_style:
+        return issue
+    references = list(dict.fromkeys(document.fields.get("style_rule", []) + document.fields.get("style_rules", [])))
+    roots = project_rule_roots(issue.project)
+    inputs = StyleInputs(tuple(_rule_summary(reference, rules_dirs if reference.startswith("global:") else roots + rules_dirs)
+                               for reference in references),
+                         plain(document.value("style_crate")), _finding_count(document))
+    return Issue(issue.path, issue.title, issue.project, issue.body, issue.labels, True, inputs)
+
+
+def load_scoring_issues(issues_dir: Path = ISSUES_DIR, *,
+                        rules_dirs: tuple[Path, ...] = STYLE_RULES_DIRS) -> list[Issue]:
+    """Include open style proposals with explicit available or missing rule state."""
+    issues = load_open_issues(issues_dir)
+    for document in _documents(issues_dir):
+        if not document.is_style or plain(document.value("status")).casefold() != "open":
+            continue
+        issues.append(scoring_issue(document, rules_dirs=rules_dirs))
+    return sorted(issues, key=lambda issue: issue.path)
+
+
+def _style_formula(document: VaultDocument, project_goals: dict[str, str]) -> dict[str, str]:
+    count = _finding_count(document)
     kind_match = re.search(r"(?m)^(?:Kind:\s*|#{1,6} Style )(rename|type|restructure)\b", document.body)
     kind = document.value("style_kind") or (kind_match[1] if kind_match else "")
     # Old proposals used rename as their category; new decisions state Kind.
@@ -221,6 +329,13 @@ def build_state(issue: Issue) -> IssueState:
     if any(project not in PROJECT_ABOUT for project in projects):
         raise ValueError(f"Unknown project context: {issue.project}")
     about = " ".join(PROJECT_ABOUT[project] for project in projects)
-    return {"issue": {"title": plain(issue.title), "project": issue.project,
-                      "project_about": about,
-                      "body": clean_body(PROPOSED_RANKING.sub("", issue.body))}}
+    content: IssueState = {"issue": {"title": plain(issue.title), "project": issue.project,
+                                   "project_about": about,
+                                   "body": clean_body(PROPOSED_RANKING.sub("", issue.body))}}
+    if isinstance(issue.style_inputs, StyleInputs):
+        style = issue.style_inputs.model_state()
+        content["issue"]["body"] = ""
+        content["issue"]["style_rules"] = style["style_rules"]
+        content["issue"]["style_crate"] = style["style_crate"]
+        content["issue"]["finding_count"] = style["finding_count"]
+    return content

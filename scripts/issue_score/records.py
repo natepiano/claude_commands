@@ -1,7 +1,7 @@
 """The persisted run contract shared by scoring and local evaluation."""
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 from . import client, questions
 
@@ -25,6 +25,7 @@ class ProductionJudgment(TypedDict):
 
 
 class ScoredIssue(ProductionJudgment, total=False):
+    style_inputs: questions.StyleState
     variant_set: str
     variant_definitions: dict[str, questions.Question]
     experiment_id: str
@@ -91,3 +92,49 @@ class FailedIssue(TypedDict):
 class ScoreRun:
     result_path: Path
     failure_count: int
+
+
+class AgentProposal(TypedDict):
+    issue_path: str
+    content_hash: str
+    fields: dict[str, str]
+
+
+class AgentProposals(TypedDict):
+    run_id: str
+    issues: list[AgentProposal]
+
+
+class AwaitingAgentProposals(TypedDict):
+    status: Literal["awaiting-agent-proposals"]
+    missing_fields: list[str]
+
+
+class ReadyForBandRouting(TypedDict):
+    status: Literal["ready"]
+    score: float
+    band: str
+
+
+class ReviewRow(TypedDict):
+    issue_path: str
+    content_hash: str
+    group: Literal["unrated", "default-rated", "rated"]
+    current: dict[str, str]
+    proposed: dict[str, str]
+    agent_proposed: dict[str, str]
+    routing: AwaitingAgentProposals | ReadyForBandRouting
+    taken: list[str]
+    user: list[str]
+    missing_rules: list[str]
+    difference: float
+
+
+class Reassessment(TypedDict):
+    run_id: str
+    area_vocabulary: list[str]
+    area_definitions: dict[str, str]
+    complete: bool
+    rows: list[ReviewRow]
+    failed: list[FailedIssue]
+    unscored: list[str]

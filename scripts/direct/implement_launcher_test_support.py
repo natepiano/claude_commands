@@ -267,7 +267,7 @@ def copy_launcher_dependencies(root: Path) -> None:
                     "recorder_state.py", "findings.py", "board.sh")),
         ("agents", ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk",
                     "heartbeat.sh", "heartbeat_watch.sh")),
-        ("lib", ("py", "process_start.py", "user_zone.py", "unit_runs.py", "agents_registry.py")),
+        ("lib", ("py", "atomic_file.py", "process_start.py", "user_zone.py", "unit_runs.py", "agents_registry.py")),
         ("production", ("production_doc.py",)),
     ):
         destination = root / "scripts" / directory
