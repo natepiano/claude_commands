@@ -21,6 +21,14 @@ The build log records how long each build step waited on memory. A machine-wide 
 
 The index reads the former step/call field names in `index.FORMER_FIELDS` as `worker` and `unit_session`, keeping a present new field's value and leaving source JSONL bytes unchanged.
 
+### App launches and admission waits
+
+`hana_shot.launch()` loads the build-log recorder by file path at the call, without changing `sys.path`, after its existing atomic launch-state write. The call is inside the cleanup block, so interruption also shuts the new process down. The recorder reads the state once and records a `step: launch`, `caller: hana-shot` process-start event. Its stable identity uses the launching host, PID, port and recorded start time. The event has no measured startup duration and leaves the screenshot unit's launch-state file unchanged.
+
+Before publication, `record.launch()` saves the complete row under the build log's own `pending-launches/` directory using a temporary file, fsync and rename. `record.finish_pending_launch()` publishes one complete immutable `launch-<identity hash>.jsonl` using a hard link, then removes the pending record only after the row is durable or already present. The launcher and `buildlog launches` share that completion function and lock. A failed publication remains recoverable even after Hana shutdown removes its cache state; interruptions and repeated recorder, collector or report calls keep one row per launch.
+
+Launches skip memory admission by design. Their `mem_wait_s` is null and the report's **App launches** section displays **no admission**, ignoring ambient wait values and admission-record paths. Legacy BRP rows keep their existing recorded/missing wait wording. Rows start with this recorder change: there is no Hana transcript or cache backfill, and the collector continues its existing legacy BRP transcript collection while finishing build-log-owned pending records. `verify.sh build` compiles and prints binary paths; it does not start an app. Its existing build-step records retain their own admission wait. No resources admission follow-up is needed for app launches.
+
 ### Per-step stall: scope file → step record → `steps`
 
 1. On natedev, `buildlog_exec` runs each step through `systemd-run --user --scope … --slice=builds.slice -- /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@"`:

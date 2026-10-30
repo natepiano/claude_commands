@@ -118,38 +118,31 @@ including the details to make it clear
 
 **Gotchas:** origin/builds-resources' Phase 14 rewrites `queue_rows`; on merge, take its `owner_live` + `reservation_lifetime` form (one hunk).
 
-### Phase 4 — App launches reach the build log again, with their memory wait  · status: todo
+### Phase 4 — App launches reach the build log again  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the build log has a launch row for every app launch after 2026-10-15T18:59Z, each with `mem_wait_s`, and `/build:report` shows them.
-
-**Spec:**
-- Known: `scripts/buildlog/launches.py` collects launches only from `mcp__brp__brp_launch` tool results in Claude transcripts. Since 10-16 only 12 transcripts hold such a call; launches go through `/hana_shot` (`scripts/hana_shot/hana_shot.py`) and `verify.sh build`. No row ever had `mem_wait_s`.
-- First confirm the cause against the live tree and log. Then record each launch where it happens, as one append-only row through the build-log recorder, carrying the admission wait from the memory queue's own record. Both the `hana_shot.py` path and the `verify.sh build` path write it. Backfill from 10-15 onward where stored records allow it, and report the count.
-- A cause in resources' launch hook goes to the showrunner with evidence; it is not fixed here.
-- screenshot-unit's atomic launch record in `hana_shot.py` (near line 2078) is on main 9b6e2102. Merge origin/main through origin/builds first. The build-log row is built on top of that record: when the record holds what the row needs, read it and add no second write. The merge waits for the end of tonight's no-merge hold (the showrunner names its start and end). The notice names screenshot-unit (natedev) as also-touches for `hana_shot.py`, tested against origin/main.
+- Each `/hana_shot` start writes one launch row. `record.launch(state_path, worktree)` takes a lock and saves a pending record atomically: `_save_pending_launch` writes a temp file, syncs it with fsync and moves it into place with `os.replace`, under `pending_launches_root()` (`<BUILDLOG_DIR>/pending-launches`).
+- `finish_pending_launch` then publishes the row through `write_launch_line` (hard link, fsync, directory sync). It checks that the row file is present, and only then unlinks the pending record. `launches.collect()` finishes each pending launch that a failed publish left.
+- A launch takes no memory admission by design (resources Phase 6, showrunner ruling 2026-10-30). `report.py` `launches_section` shows "no admission" for each `step=launch` row, never "not recorded".
+- The transcript backfill and the hana-shot cache scan are gone. Legacy BRP transcript rows stay in the log.
+- `hana_shot.py` (owner screenshot-unit) loads the recorder by file path as `_hana_shot_buildlog_record` and calls it in its cleanup step. A recorder failure goes to `note_error`, and cleanup continues.
 
 **Files:**
-- `scripts/buildlog/launches.py` — launch rows from the launch paths, backfill
-- `scripts/buildlog/record.py` — the launch row with `mem_wait_s`
-- `scripts/buildlog/report.py` — count and show the rows
-- `scripts/hana_shot/hana_shot.py` — one recorder call (berth; owner screenshot-unit)
-- `scripts/buildlog/test_launches.py` — rows per path, backfill rerun adds no duplicate
+- `scripts/buildlog/record.py` — `hana_launch_record`, `write_launch_line`, `pending_launches_root`, `_save_pending_launch`, `finish_pending_launch`, `launch`
+- `scripts/buildlog/launches.py` — `collect()` finishes pending launches
+- `scripts/buildlog/report.py` — `launches_section` shows "no admission"
+- `scripts/hana_shot/hana_shot.py` — one recorder call in cleanup
+- `scripts/buildlog/test_launch_recording.py` — 16 tests
+- `docs/as-built/buildlog-memory-stalls.md` — launch rows
 
-**Workers:** 1 writer + 1 tester.
-- `impl2` — `launches.py`, `record.py`, `report.py`, `hana_shot.py`
-- `test2` — `test_launches.py`
+**Binds later work:** a failed step's record that must survive a failed save uses the same durable-before-delete shape. It reuses `_save_pending_launch` and `finish_pending_launch`, and adds no second atomic-save routine.
 
-**State:** build-log rows; the backfill's launches state
+**Gotchas:** hana_shot tests import `scripts.hana_shot` and run from the repo root: `python3 -m unittest scripts.hana_shot.test_hana_shot`. The live check is still open: after 05:00 EDT, one `/hana_shot` must add one row that `/build:report` counts as "no admission".
 
-**Depends on:** Phase 2 (both edit `scripts/buildlog/`; this phase reads index rows).
+**Ruled out:** a launch memory wait (launches take no admission); a transcript backfill (rows start from the phase's landing).
 
-**Constraints from prior phases:** Phase 2: the index never rewrites a source log.
-
-**Acceptance gate:** the buildlog tests green; basedpyright 0/0/0. Live: after one `/hana_shot` on this unit's port, the build log has a new launch row with `mem_wait_s`, and `/build:report` counts it.
-
-### Phase 5 — A bump by shown name moves only the step it names  · status: todo
+### Phase 4a — A bump by shown name moves only the step it names  · status: done
 
 #### Work Order
 
@@ -158,16 +151,18 @@ including the details to make it clear
 **Spec:**
 - Defect (Astra review of phase 1 F005, 2026-10-29; pre-existing since e6baef45): `bump_selector` (`scripts/build_queue/build_queue.py:248`) turns a roster shown name into a position from its first queue read; `memory_admit.bump_waiter` applies that position to its locked reread. With waiters `[A, B, C]`, selecting `B` gives `"2"`; if `B` leaves first, position 2 moves `C`.
 - Fix: resolve the shown name to a stable waiter identity (pid and start time from the waiter row) and have `bump_waiter` accept that identity and check it under the lock; a waiter that has left gives the typed `UnmatchedWaiter` refusal naming the original selector. Session id alone is not enough: several waiters can share one.
-- Tests: a waiter removed between the two reads, and a reorder between them; each refuses or moves the named step only.
+- Seen live 2026-10-30 01:34 EDT (showrunner order, runs first after the 05:00 build hold, before Phase 4b): `bump tool-based-ui-frame-time-frame-cost-fix` read that worker's step at position 23; its call ended 05:34:23Z (status 77) and the bump at 05:34:24Z moved `tool-based-ui-trunk-fix3`'s nextest from position 23 (build-log `queue_bump` row, `old_position` 23).
+- The hand-off key is the key the waiter row already carries: its file name `{pid}-{start_time}.waiting` (`memory_admit.py` near line 1242). Add no second identity (showrunner, 2026-10-30).
+- Tests: a waiter removed between the two reads, and a reorder between them; each refuses or moves the named step only. Two sessions whose shown names share a prefix: only the exact name moves.
 
 **Files:**
 - `scripts/build_queue/build_queue.py` — `bump_selector` returns a waiter identity
-- `scripts/lint/memory_admit.py` — `bump_waiter` takes and checks the identity under the lock (also-touches resources)
-- `scripts/build_queue/test_build_queue.py` — removal and reorder cases
+- `scripts/lint/memory_admit.py` — `bump_waiter` takes and checks the identity under the lock (also-touches resources; trial-merge against `origin/builds-resources`)
+- `scripts/build_queue/test_build_queue.py` — removal, reorder and shared-prefix cases
 
 **Workers:** 1 writer + 1 tester.
-- `impl` — `build_queue.py`, `memory_admit.py`
-- `test` — `test_build_queue.py`
+- `impl2` — `build_queue.py`, `memory_admit.py`
+- `test2` — `test_build_queue.py`
 
 **State:** waiter rows (`bump_order`, `holds_younger`, `priority_since` written by a bump)
 
@@ -175,4 +170,70 @@ including the details to make it clear
 
 **Constraints from prior phases:** Phase 1: a selector refusal is `memory_admit.UnmatchedWaiter`, printed on stdout with exit 3; the mod forwards only that. Phase 3: a waiting row's `session_id` is the writer's `CODEX_THREAD_ID` first, then `CLAUDE_CODE_SESSION_ID` (`waiter_identity`), so the identity `bump_selector` returns must be read from the row, never from the caller's environment; `read_queue` and `explain_queue` share one locked pass (`locked_queue_read`); the /build:queue head line prints from `QueueExplanation` and does no arithmetic. When origin/builds-resources' Phase 14 is merged, `queue_rows` keeps a reservation by `reservation_lifetime`, not by a live owner.
 
+**Assertion-Change:** `scripts/build_queue/test_build_queue.py` `test_bump_by_unique_shown_label_moves_and_logs_the_actual_waiter`: `bump.assert_called_once_with("2", "actor-id")` becomes `bump.assert_called_once_with(memory_admit.WaiterRowSelector(waiter_path.name, "organon-ci88"), "actor-id")`, because the hand-off is now the row key, not a position (unit director, review pass 1, 2026-10-30).
+
 **Acceptance gate:** `python3 -m unittest scripts.build_queue.test_build_queue scripts.lint.test_memory_admit` green (prefix `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY`); basedpyright 0/0/0 on the changed files.
+
+### Phase 4b — A failed step's record survives a failed save, and a rerun finishes it  · status: todo
+
+#### Work Order
+
+**Goal:** when saving a failed step's log fails, the source log and peak file stay on disk, and the next run of the recorder finishes the record with no duplicate row.
+
+**Spec:**
+- Defect (rerun-sweep row `scripts/buildlog/record.py:315`, `~/.claude/docs/plans/sdlc-rerun-sweep.md`, builds-unit section; showrunner order 2026-10-30 00:20 EDT): the save of a failed step's log (near line 280) can fail after the `finally` block has already deleted the source log and the peak file. A rerun then has nothing to record from, and the step's record is lost.
+- Fix: delete the sources only after the save is durable (written and renamed into place). A rerun that finds the sources and no saved record finishes the record; a rerun that finds the saved record and the sources deletes the sources and adds no second row.
+- First confirm the order of save and delete against the live tree.
+- No silent loss (showrunner, 2026-10-30, Phase 4 plan review): a launch whose pending record cannot be saved, and a pending launch or step whose publish keeps failing in `collect()`, today reach only `errors.log`. `/build:report` prints one line, `N records not published yet; M recorder errors since <time>`, only when N or M is above 0; a clean log adds no line.
+
+**Files:**
+- `scripts/buildlog/record.py` — save, then delete; a rerun finishes a half-done record
+- `scripts/buildlog/launches.py` — `collect()` counts what it could not publish
+- `scripts/buildlog/report.py` — the unpublished/errors line
+- `scripts/buildlog/test_record_rerun.py` — a stop at each point, then a rerun; a failed pending save, a publish that keeps failing, then recovery; a clean log prints no line
+
+**Workers:** 1 writer + 1 tester.
+- `impl2` — `record.py`, `launches.py`, `report.py`
+- `test2` — `test_record_rerun.py`
+
+**State:** failed-step source logs, peak files, saved step logs, build-log rows
+
+**Depends on:** Phase 4 (both edit `scripts/buildlog/record.py`).
+
+**Constraints from prior phases:** Phase 2: the index never rewrites a source log. Phase 4: app launches publish through a pending record (`record._save_pending_launch`: temp, fsync, `os.replace`), then `finish_pending_launch` publishes the row, checks it is present and only then unlinks the pending record; `launches.collect()` finishes pending launches. Share those persistence helpers, but keep a pending step its own type, apart from `LaunchStep` and `PublishedLaunch`. `step()` makes a new random id on every call (`new_id`), so the pending step keeps the original id and the full record context; a finish from a fresh process with a different environment gives the same row. Name the entry point that finds unfinished steps. The Phase 4 launch recovery tests stay green.
+
+**Acceptance gate:** a test stops the recorder after the save, after the row and before each delete, then reruns it: each case ends with one row, one saved log and no source files. The report line shows for a failed pending save and for a publish that keeps failing, and goes away after recovery; a clean log shows no line. The buildlog tests green; basedpyright 0/0/0.
+
+### Phase 4c — Each scoped test step records its test-phase memory peak  · status: todo
+
+#### Work Order
+
+**Goal:** every scoped nextest step from `verify`, `cargo-port` and `validate_ci` (full and filtered, terminal and tee) records `test_phase_peak_bytes`: the step scope's largest `memory.stat` `anon`, in bytes, over its test phase.
+
+**Spec:**
+- Why (showrunner order 2026-10-30, for resources' parked test-phase charge, its Phase 15): today's 60 s machine samples cannot show a test peak per step.
+- Spec source: line 20 of `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/phases/15/impl_summary_impl.txt`.
+- Sample once per second, from the first Cargo-profile `deps/` test binary seen in the scope until the scope ends. Count all parallel test processes in the scope.
+- Put the sampling in the existing per-step sampler `buildlog_sample_anon` (`scripts/lint/invoke.sh` near line 172), which already writes admission's `.max` and `.wave` files from the scope's `memory.stat` `anon`. One loop writes both those files and the test-phase window; keep its atomic publication (temp + `mv`) and its exit when the parent ends. Start no second sampler.
+- Admission release deletes its reservation and measurement files (`memory_admit.py` release, near line 2043), and both invoke.sh paths release before they call the recorder (near line 307). So invoke.sh writes the test-phase fields into the step's own sidecar before release, and copies admission's assigned charge there from admission's record, computing nothing; `record.py step` reads that sidecar. Admission's release API does not change (showrunner OK, 2026-10-30).
+- On release, persist these with the call/step identity: `test_phase_peak_bytes`, `test_phase_started_at` (epoch seconds), the actual `test_threads`, the repository and the filter family. A step with no test-phase mark records unknown, never 0.
+- Also persist the charge admission assigned at test-phase entry, with its history cutoff, form and contributing widths. Read it from admission's own record; never compute it. If admission has no such field, record unknown and tell the showrunner; resources adds the field in its follow-up.
+- Measure the sampler's CPU cost per step; the checkpoint notice names it.
+
+**Files:**
+- `scripts/lint/invoke.sh` — the scope script samples the test phase (owner verify-unit; trial-merge against `origin/natedev-verify-token` and name verify-unit with that tip in the notice's also-touches line)
+- `scripts/buildlog/record.py` — persist the fields on release
+- `scripts/buildlog/test_test_phase_peak.py` — first test binary starts the window, peak over parallel processes, no mark gives unknown, admission field absent gives unknown, terminal and tee steps record after admission's files are gone
+- `scripts/lint/test_invoke_scope.py` — the shared sampler still writes `.max` and `.wave`
+
+**Workers:** 1 writer + 1 tester.
+- `impl2` — `invoke.sh`, `record.py`
+- `test2` — `test_test_phase_peak.py` and the affected cases in `scripts/lint/test_invoke_scope.py`
+
+**State:** step records (new fields), the scope's peak/sample files
+
+**Depends on:** Phase 4b (both edit `scripts/buildlog/record.py`).
+
+**Constraints from prior phases:** Phase 2: the index never rewrites a source log.
+
+**Acceptance gate:** the buildlog and `scripts/lint/test_invoke_scope.py` tests green; basedpyright 0/0/0. Live: one filtered `verify.sh test` step gets a `test_phase_peak_bytes` value, and the notice states the sampler's CPU cost per step.
