@@ -82,6 +82,8 @@ if TYPE_CHECKING:
     import sample
 
 RECORD_VERSION = 1
+TARGET_DIR_UNSET = "unset"
+UNKNOWN_IDENTITY = "unknown"
 GIT_TIMEOUT_S = 5
 RUSTC_TIMEOUT_S = 10
 LEDGER = Path.home() / ".local/state/verify/events.jsonl"
@@ -619,7 +621,7 @@ def test_phase_fields(phase: TestPhaseRecord | NoTestPhaseRecord) -> dict[str, o
         "test_phase_peak_bytes": None, "test_phase_started_at": None, "test_phase_charge": None,
     }
     if isinstance(phase, TestPhaseRecord):
-        fields.update(phase.context)
+        fields.update({key: value for key, value in phase.context.items() if key != "repo_identity"})
         if isinstance(phase.window, ObservedTestPhase):
             fields.update(test_phase_peak_bytes=phase.window.peak_bytes,
                           test_phase_started_at=phase.window.started_at)
@@ -780,6 +782,7 @@ def step(args: list[str]) -> None:
             return
         tty = tty_text == "1"
         directory = git_directory(argv, cwd)
+        repository = memory_admit.git_identity(argv, cwd)[0]
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
         sent_key = sent_tree_key()
@@ -813,6 +816,9 @@ def step(args: list[str]) -> None:
             "step": name,
             "argv": argv,
             "cwd": cwd,
+            "target_dir": str((Path(cwd) / os.environ["CARGO_TARGET_DIR"]).resolve())
+                          if "CARGO_TARGET_DIR" in os.environ else TARGET_DIR_UNSET,
+            "repo_identity": repository.key if isinstance(repository, memory_admit.RepositoryIdentity) else UNKNOWN_IDENTITY,
             **git_facts(directory),
             **tree,
             "caller": step_caller,

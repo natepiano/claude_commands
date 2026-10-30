@@ -86,8 +86,9 @@ COLD_BUILD_MIN_CRATES = CASCADE_MAX_CRATES + 1
 NO_REBUILD_LABEL = "none"
 EDITED_CRATE_LABEL = f"edited crate ({EDITED_CRATE_MIN_CRATES}–{EDITED_CRATE_MAX_CRATES} crates)"
 CASCADE_LABEL = f"cascade ({CASCADE_MIN_CRATES}–{CASCADE_MAX_CRATES} crates)"
+FIRST_BUILD_LABEL = f"first build here ({EDITED_CRATE_MIN_CRATES}–{CASCADE_MAX_CRATES} crates)"
 COLD_BUILD_LABEL = f"cold ({COLD_BUILD_MIN_CRATES}+ crates)"
-REBUILD_LABELS = (NO_REBUILD_LABEL, EDITED_CRATE_LABEL, CASCADE_LABEL, COLD_BUILD_LABEL)
+REBUILD_LABELS = (NO_REBUILD_LABEL, EDITED_CRATE_LABEL, CASCADE_LABEL, FIRST_BUILD_LABEL, COLD_BUILD_LABEL)
 PACKAGE_PATTERN = re.compile(r"package\(([^)&|\s]+)\)")
 COPY_WON = "won"
 COPY_NATEDEV_WON = "natedev_won"
@@ -291,6 +292,7 @@ class KnownCrateStep:
     compile_time_known: bool
     kind: str
     argv: str
+    is_warm: bool
 
 
 @dataclass
@@ -632,9 +634,37 @@ def held_target_waits(connection: sqlite3.Connection, day: str) -> tuple[WaitMea
     )
 
 
-def rebuild_bin(crates_compiled: int) -> str:
+def warm_step_clause() -> str:
+    """Same-folder finished history must cover the selected targets or defaults."""
+    # A sweep can delete these outputs without a build-log row. That loss is
+    # intentionally invisible until the floor sweeper records its removals.
+    earlier = (
+        "prior.host = steps.host AND prior.target_folder = steps.target_folder"
+        " AND prior.build_base = steps.build_base AND prior.started_at_us < steps.started_at_us"
+        " AND prior.finished_s IS NOT NULL"
+    )
+    group_coverage = " OR ".join(
+        f"(built.value = '{group}' AND wanted.value LIKE '{member} %')"
+        for group, member in (("--bins", "--bin"), ("--tests", "--test"),
+                              ("--examples", "--example"), ("--benches", "--bench"))
+    )
+    return (
+        "(steps.build_base IS NOT NULL AND steps.target_folder IS NOT NULL AND steps.build_items IS NOT NULL AND CASE"
+        + " WHEN steps.build_items = '[]' THEN EXISTS (SELECT 1 FROM steps AS prior WHERE "
+        + earlier + " AND (prior.build_items = '[]' OR EXISTS (SELECT 1 FROM json_each(prior.build_items) AS built"
+        + " WHERE built.value = '--all-targets')))"
+        + " ELSE NOT EXISTS (SELECT 1 FROM json_each(steps.build_items) AS wanted WHERE NOT EXISTS"
+        + " (SELECT 1 FROM steps AS prior, json_each(prior.build_items) AS built WHERE "
+        + earlier + " AND (built.value = wanted.value OR (built.value = '--all-targets' AND wanted.value <> '--doc') OR "
+        + group_coverage + "))) END)"
+    )
+
+
+def rebuild_bin(crates_compiled: int, warm: bool) -> str:
     if crates_compiled == NO_REBUILD_CRATES:
         return NO_REBUILD_LABEL
+    if crates_compiled < COLD_BUILD_MIN_CRATES and not warm:
+        return FIRST_BUILD_LABEL
     if crates_compiled <= EDITED_CRATE_MAX_CRATES:
         return EDITED_CRATE_LABEL
     if crates_compiled < COLD_BUILD_MIN_CRATES:
@@ -645,13 +675,13 @@ def rebuild_bin(crates_compiled: int) -> str:
 def known_crate_steps(connection: sqlite3.Connection, day: str) -> list[KnownCrateStep]:
     rows = fetch(
         connection,
-        f"SELECT crates_compiled, duration_s, finished_s, step, argv FROM steps WHERE {ON_DAY}"
+        f"SELECT crates_compiled, duration_s, finished_s, step, argv, {warm_step_clause()} FROM steps WHERE {ON_DAY}"
         + " AND step <> 'sweep' AND crates_compiled IS NOT NULL"
         + f" AND {natedev_step_predicate()}",
         day,
     )
     steps: list[KnownCrateStep] = []
-    for crates, duration, finished, kind, argv in rows:
+    for crates, duration, finished, kind, argv, warm in rows:
         compile_time_known = isinstance(finished, int | float)
         steps.append(
             KnownCrateStep(
@@ -661,6 +691,7 @@ def known_crate_steps(connection: sqlite3.Connection, day: str) -> list[KnownCra
                 compile_time_known,
                 str(kind),
                 str(argv or ""),
+                bool(warm),
             )
         )
     return steps
@@ -669,7 +700,7 @@ def known_crate_steps(connection: sqlite3.Connection, day: str) -> list[KnownCra
 def rebuild_timings(steps: Sequence[KnownCrateStep]) -> dict[str, RebuildTiming]:
     timings = {label: RebuildTiming() for label in REBUILD_LABELS}
     for step in steps:
-        timings[rebuild_bin(step.crates_compiled)].add(step)
+        timings[rebuild_bin(step.crates_compiled, step.is_warm)].add(step)
     return timings
 
 
@@ -722,7 +753,7 @@ def rebuild_package(argv: str) -> str:
 def package_rebuild_rows(steps: Sequence[KnownCrateStep]) -> list[list[str]]:
     packages: dict[str, PackageRebuilds] = {}
     for step in steps:
-        if step.kind != "nextest" or rebuild_bin(step.crates_compiled) != EDITED_CRATE_LABEL:
+        if step.kind != "nextest" or rebuild_bin(step.crates_compiled, step.is_warm) != EDITED_CRATE_LABEL:
             continue
         packages.setdefault(rebuild_package(step.argv), PackageRebuilds()).add(step)
     ranked = sorted(packages.items(), key=lambda item: (-item[1].compile_s, item[0]))[:5]
@@ -748,7 +779,8 @@ def rebuilds_section(connection: sqlite3.Connection, day: str) -> list[str]:
         section += [*nextest, ""]
     section += [
         *table(["Rebuild", "Steps", "Compile", "Other", "Total", "Share of compile", "Share of time"], rebuild_rows(timings)),
-        "Source: steps with a known crate count; compile is cargo's own \"Finished … in\" time, other is the rest of the step.",
+        "Source: steps with a known crate count; compile is cargo's own \"Finished … in\" time, other is the rest of the step. "
+        + "Edited-crate and cascade rows count only steps whose folder had built the same target with the same features before.",
         "",
     ]
     if packages:
@@ -1035,15 +1067,15 @@ def profile_step_durations(
 ) -> dict[tuple[str, str, str], list[float]]:
     """Group passing steps by the kind, caller and rebuild class we compare."""
     groups: dict[tuple[str, str, str], list[float]] = {}
-    for kind, caller, crates, duration in fetch(
+    for kind, caller, crates, duration, warm in fetch(
         connection,
-        "SELECT step, caller, crates_compiled, duration_s FROM steps"
+        f"SELECT step, caller, crates_compiled, duration_s, {warm_step_clause()} FROM steps"
         + " WHERE julianday(started_at) >= julianday(?) AND julianday(started_at) < julianday(?)"
         + f" AND {natedev_step_predicate()} AND status = 0 AND step <> 'sweep'"
         + " AND duration_s IS NOT NULL",
         start.isoformat(), end.isoformat(),
     ):
-        rebuild = rebuild_bin(cast(int, crates)) if crates is not None else "—"
+        rebuild = rebuild_bin(cast(int, crates), bool(warm)) if crates is not None else "—"
         key = (str(kind), str(caller), rebuild)
         groups.setdefault(key, []).append(cast(float, duration))
     return groups

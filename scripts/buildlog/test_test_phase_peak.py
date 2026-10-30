@@ -156,8 +156,19 @@ buildlog_sample_anon "$scope_path" "$maximum" "$BASHPID" "$phase_file" "$reserva
         return SampledTestPhase(source, timeline, reservation)
 
     def assert_phase_context(self, fields: dict[str, object], *, filtered: bool = True) -> None:
-        self.assertEqual(fields["test_threads"], 8)
         self.assertEqual(fields["repo_identity"], "original-repository")
+        self.assert_phase_selection(fields, filtered=filtered)
+
+    def fixture_repository_identity(self) -> str:
+        root_commit = self.recovery.fixture.git("rev-list", "--max-parents=0", "HEAD", cwd=self.recovery.fixture.repo)
+        return "git-root:" + root_commit
+
+    def assert_recorded_phase_context(self, fields: dict[str, object], *, filtered: bool = True) -> None:
+        self.assertEqual(fields["repo_identity"], self.fixture_repository_identity())
+        self.assert_phase_selection(fields, filtered=filtered)
+
+    def assert_phase_selection(self, fields: dict[str, object], *, filtered: bool) -> None:
+        self.assertEqual(fields["test_threads"], 8)
         self.assertEqual(fields["test_scope"], "filtered" if filtered else "full")
         self.assertEqual(fields["package"], "hana" if filtered else "")
         self.assertEqual(fields["filters"], ["one", "two"] if filtered else [])
@@ -275,7 +286,7 @@ buildlog_sample_anon "$scope_path" "$maximum" "$BASHPID" "$phase_file" "$reserva
         row = self.recovery.step_records()[0]
         self.assertIsNone(row["test_phase_peak_bytes"])
         self.assertIsNone(row["test_phase_started_at"])
-        self.assert_phase_context(row)
+        self.assert_recorded_phase_context(row)
         self.assertFalse(sampled.source.exists())
 
     def test_absent_admission_entry_charge_is_unknown_rather_than_the_need_or_peak(self) -> None:
@@ -286,7 +297,7 @@ buildlog_sample_anon "$scope_path" "$maximum" "$BASHPID" "$phase_file" "$reserva
         row = self.recovery.step_records()[0]
         self.assertIsNone(row["test_phase_charge"])
         self.assertEqual(row["test_phase_peak_bytes"], 1700)
-        self.assert_phase_context(row)
+        self.assert_recorded_phase_context(row)
 
     def assert_phase_recovers(self, stop: PhaseRecordingStop) -> None:
         sampled = self.sample()
@@ -321,7 +332,8 @@ buildlog_sample_anon "$scope_path" "$maximum" "$BASHPID" "$phase_file" "$reserva
         saved_row = cast(dict[str, object], pending["row"])
         self.assertEqual(pending["test_phase_file"], str(sampled.source))
         self.assertEqual(sampled.source.read_bytes(), original_contents)
-        for field, value in original_fields.items():
+        expected_fields = {**original_fields, "repo_identity": self.fixture_repository_identity()}
+        for field, value in expected_fields.items():
             self.assertEqual(saved_row[field], value, field)
         self.assertEqual(len(self.recovery.step_records()), 0 if stop is PhaseRecordingStop.AFTER_PENDING_SAVE else 1)
         self.assertEqual(self.recovery.held.exists(), stop is not PhaseRecordingStop.BEFORE_SIDECAR_DELETE)
@@ -329,7 +341,7 @@ buildlog_sample_anon "$scope_path" "$maximum" "$BASHPID" "$phase_file" "$reserva
         _ = self.recovery.fresh_cli("launches")
         rows = self.recovery.step_records()
         self.assertEqual(rows, [saved_row])
-        self.assert_phase_context(rows[0])
+        self.assert_recorded_phase_context(rows[0])
         self.assertEqual(rows[0]["test_phase_peak_bytes"], 1700)
         self.assertFalse(sampled.source.exists())
         self.assertFalse(self.recovery.held.exists())
@@ -417,7 +429,7 @@ test ! -e "${maximum%.max}.wave"
         self.assertEqual((row["tty"], row["status"], row["caller"]), (terminal, 0, caller))
         self.assertEqual(row["test_phase_peak_bytes"], 1700)
         self.assertEqual(row["test_phase_started_at"], 1001)
-        self.assert_phase_context(row, filtered=filtered)
+        self.assert_recorded_phase_context(row, filtered=filtered)
         self.assertEqual(row["cwd"], str(self.recovery.fixture.repo))
         self.assertIsNone(row["test_phase_charge"])
         expected_argv = [*arguments]

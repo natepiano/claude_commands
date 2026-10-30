@@ -260,3 +260,41 @@ including the details to make it clear
 - `Cargo token waits: none` only with a present record that has at least one valid line and no bad line. An absent file, no waiting step, a read error, a line without `at`, a torn line or an invalid `token_gap` (`pid` <= 0, `token_back_at` before `token_left_at` or after now) gives unknown; next to matched waits it adds a `Cargo token waits: unknown` line.
 
 **Ruled out:** Waiting-table rows for a step in a token wait (it has no waiter row; the record holds only finished waits); a running step's waits; head time from `since` or `priority_since` (set only at priority or a bump, kept after a later bump moves the row back, deleted at a token give-back); SQLite for bumps (the index lags the live log); a second label read or the full roster.
+
+### Phase 4f — A run counts as warm only when its target folder already built the same target with the same features  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `/build:report` never puts a first build of a target in a folder into the edited-crate or cascade rows, and each step row keeps the names of the crates it compiled.
+
+**Spec:**
+- Wrong result today (showrunner, 2026-10-30): `report.rebuild_bin(crates_compiled)` bins by crate count alone. A first build of hana's test binary with new features in a folder (dependencies already built, so 1–2 crates) lands in `edited crate (1–3 crates)` and reads as warm, though rustc compiled all of hana (measured 338–711 s against a 182 s median).
+- `parse.py`: the one `CRATE` pattern captures the crate name. `log_facts` adds `compiled_crate_names: list[str] | None`, one entry per counted line in log order, so its length always equals `crates_compiled`; `None` exactly when `crates_compiled` is `None`.
+- `record.py` step row: add `target_dir` and `repo_identity`, so the build log has one owner for the target folder (showrunner scope add, 2026-10-30: resources' Phase 4 reads both in `sweep.py` after the copy records are gone and adds no field of its own). Neither is ever `null`:
+  - `target_dir`: `CARGO_TARGET_DIR` from the step's environment resolved against `cwd` (an absolute path), or `"unset"` when the step ran without it (cargo used the workspace's own `target/`).
+  - `repo_identity`: the key from the one `memory_admit.git_identity(argv, cwd)` call, the same value admission writes: `https://<host>/<path>` from the `origin` remote, else `git-root:<root commit>`; `"unknown"` when it returns `UnknownRepository`. No copy of that function. Cost: one more `git_facts` and one `git remote get-url` per step, a few ms.
+  - `test_phase_fields` no longer merges the test-phase context's `repo_identity` into the row (one source for the field); the phase file keeps it for admission. `memory_admit`'s readers of `repo_identity` in step rows keep their meaning: trace them and say in the summary what changes for a row with `"unknown"`.
+- `index.py`: new step columns `compiled_crate_names` (JSON text), `target_dir` and `repo_identity` (both `TEXT NOT NULL`, the row's value, or `"unknown"` for a row written before 4f), `target_folder` (`target_dir` when it is a path, else `worktree`, else `cwd`), `build_base` and `build_items`. Both come from one function over `argv`, so history rows get them too. `build_base` holds the cargo command (`nextest run` and `test` count as one), profile (`--release`, `--profile`, `--cargo-profile`), `--target`, package scope (`--workspace`/`--all`, sorted `-p`/`--package`, `--exclude`) and features (sorted `--features`/`-F` values split on commas and spaces, `--all-features`, `--no-default-features`). `build_items` is the sorted JSON list of target selectors (`--lib`, `--bin X`, `--bins`, `--test X`, `--tests`, `--example X`, `--examples`, `--bench X`, `--benches`, `--all-targets`, `--doc`), with `[]` meaning cargo's default selection. Every other argument (`--test-threads`, `--no-fail-fast`, `-E` and its value, `--retries`, `-j`, `--message-format`, anything after `--`) is dropped. A non-cargo step has `null` for both. Bump `SCHEMA_VERSION`; add an index on `(host, target_folder, build_base, started_at)`.
+- Warm rule, in `report.py`, one function used by every caller of `rebuild_bin`: a step is warm when an earlier step on the same host, with the same `target_folder` and `build_base` and a non-null `finished_s`, exists, and the union of the `build_items` of all such earlier steps covers every item of this step. A group selector covers its own named members: `--bins` covers each `--bin X`, `--tests` each `--test X`, `--examples` each `--example X`, `--benches` each `--bench X`; `--all-targets` covers every item but `--doc`, and `[]`. Otherwise `[]` is covered only by `[]`. The look-back reaches all indexed history, not only the report day.
+- Bins: `none` (0 crates), `edited crate (1–3 crates)` and `cascade (4–49 crates)` only for warm steps, a new `first build here (1–49 crates)` for the rest, `cold (50+ crates)` unchanged. `rebuild_timings`, `package_rebuild_rows` (edited crate only, so warm only) and `profile_step_durations` all use it. The Rebuilds Source line says the edited-crate and cascade rows count only steps whose folder had built the same target with the same features before.
+- Not seen, by design: a sweep that deleted the folder's output after the earlier build (the floor sweeper writes no build-log row). Say so in a code comment at the warm rule.
+
+**Files:**
+- `scripts/buildlog/parse.py` — crate names beside the count
+- `scripts/buildlog/record.py` — `target_dir` and `repo_identity` in the step row
+- `scripts/buildlog/index.py` — new columns, the argv key function, schema bump, the look-up index
+- `scripts/buildlog/report.py` — the warm rule, the new bin, its three callers, the Source line
+- `scripts/buildlog/test_parse.py`, `scripts/buildlog/test_index.py`, `scripts/buildlog/test_report.py` — tests (use the existing test files that cover these modules; add one only if none exists)
+- `scripts/buildlog/test_test_phase_peak.py` — its row assertion moves to the recorder's `repo_identity`; the sidecar keeps admission's (scope add)
+
+**Workers:** 1 writer + 1 tester — the Spec names every rule, so the tester writes from it alone
+- `impl` — `parse.py`, `record.py`, `index.py`, `report.py`
+- `test` — the three test files: names equal the count, `target_dir` and `repo_identity` values (path, `"unset"`, key, `"unknown"`, older rows read as `"unknown"`), key and item extraction for real hana argv forms (`--workspace --bin hana -E …`, `--lib --test a --test b … --features hana/dynamic_linking`, `--workspace --tests`), the warm rule (same folder earlier finished build is warm; other folder, other features, unfinished earlier build, or an uncovered item is first build; `--bins` history covers `--bin hana`), and the new report row
+
+**State:** the index schema version (a rebuild of `index.sqlite` from the source logs); new fields in step rows written from now on.
+
+**Constraints from prior phases:** the index never rewrites a source log and reads old field names (Phase 2). `record.py` imports `memory_admit` at module load (4c). `/build:report` must stay within its current run time.
+
+**Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY python3 -m unittest` over the buildlog test modules green; basedpyright on the changed files `0 errors, 0 warnings, 0 notes`; live: `~/.claude/scripts/buildlog/buildlog report` from the worktree's scripts shows the new row, 63629b falls in `first build here`, and 89d06a does not (measured 2026-10-30: its tree's earlier c764d7 build, `--workspace --lib --bins --tests --features hana/dynamic_linking`, covered it); if 89d06a lands in `first build here`, the summary names the part of its key that differs.

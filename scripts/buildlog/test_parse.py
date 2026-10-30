@@ -8,10 +8,18 @@ the synthetic lines cover forms those runs never printed.
 
 from __future__ import annotations
 
+import json
+import os
 import unittest
+from contextlib import closing
 from pathlib import Path
+from typing import cast, override
+from unittest import mock
 
+import index
 import parse
+import test_record as record_tests
+from record import TARGET_DIR_UNSET, UNKNOWN_IDENTITY
 from test_index import use_test_log
 
 use_test_log()
@@ -108,6 +116,41 @@ class CleaningTests(unittest.TestCase):
 
 
 class FixtureTests(unittest.TestCase):
+    def test_compiled_names_keep_every_counted_line_in_log_order(self) -> None:
+        text = (
+            "\x1b[32m   Compiling hana v0.1.0 (/r/hana)\x1b[0m\n"
+            + "    Checking dependency-one v2.3.4\n"
+            + "   Compiling hana v0.1.0 (/r/hana)\n"
+            + " Documenting docs_lib v0.5.0\n"
+            + "warning: Compiling not_a_crate v1.0.0\n"
+            + "    Building [====>] 4/5: progress_only\n"
+            + "   Compiling without_a_version\n"
+        )
+        result = parse.log_facts("nextest", text)
+        self.assertEqual(result["compiled_crate_names"], ["hana", "dependency-one", "hana", "docs_lib"])
+        self.assertEqual(result["crates_compiled"], 4)
+
+    def test_captured_fixture_names_match_counts_including_documentation_duplicates(self) -> None:
+        for name, expected in (
+            ("clippy", ["alpha", "beta"]),
+            ("doc", ["alpha", "alpha", "beta"]),
+            ("nextest", ["alpha", "beta"]),
+            ("mend", ["alpha", "beta"]),
+            ("fmt", []),
+        ):
+            with self.subTest(fixture=name):
+                result = facts(name, name)
+                self.assertEqual(result["compiled_crate_names"], expected)
+                self.assertEqual(result["crates_compiled"], len(expected))
+
+    def test_unobserved_compilation_is_unknown_but_a_captured_empty_log_is_zero(self) -> None:
+        unobserved = parse.no_facts()
+        self.assertIsNone(unobserved["crates_compiled"])
+        self.assertIsNone(unobserved["compiled_crate_names"])
+        observed = parse.log_facts("nextest", "")
+        self.assertEqual(observed["crates_compiled"], 0)
+        self.assertEqual(observed["compiled_crate_names"], [])
+
     def test_clippy_error_before_finished(self) -> None:
         result = facts("clippy", "clippy")
         self.assertEqual(result["errors"], 1)
@@ -175,6 +218,81 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(result["mend_check_s"], 62.0)
         self.assertEqual(result["mend_s"], 3.5)
         self.assertEqual(result["finished_s"], 62.0)
+
+
+class StepBuildIdentityRecordingTests(unittest.TestCase):
+    fixture: record_tests.RecordTests  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        self.fixture = record_tests.RecordTests()
+        self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
+        self.enterContext(mock.patch.dict(os.environ))
+        if "CARGO_TARGET_DIR" in os.environ:
+            del os.environ["CARGO_TARGET_DIR"]
+
+    def test_target_dir_is_resolved_from_step_cwd_and_unset_is_explicit(self) -> None:
+        absolute = str(self.fixture.base / "shared-target")
+        cases: tuple[tuple[dict[str, str], str], ...] = (
+            ({"CARGO_TARGET_DIR": "../shared-target"}, absolute),
+            ({"CARGO_TARGET_DIR": absolute}, absolute),
+            ({"CARGO_TARGET_DIR": ""}, str(self.fixture.repo)),
+            ({}, TARGET_DIR_UNSET),
+        )
+        for environment, expected in cases:
+            with self.subTest(environment=environment):
+                row = self.fixture.step(0, "0", "", "", record_tests.NEXTEST, environment)
+                self.assertEqual(row["cwd"], str(self.fixture.repo))
+                self.assertEqual(row["target_dir"], expected)
+
+    def test_repository_identity_uses_origin_or_the_root_commit(self) -> None:
+        root_commit = self.fixture.git("rev-list", "--max-parents=0", "HEAD", cwd=self.fixture.repo)
+        row = self.fixture.step(0, "0", "", "", record_tests.NEXTEST)
+        self.assertEqual(row["repo_identity"], "git-root:" + root_commit)
+        self.assertEqual(self.fixture.git("remote", "add", "origin", "git@GitHub.com:example/hana.git", cwd=self.fixture.repo), "")
+        row = self.fixture.step(0, "0", "", "", record_tests.NEXTEST)
+        self.assertEqual(row["repo_identity"], "https://github.com/example/hana")
+
+    def test_step_outside_a_repository_records_unknown_identity(self) -> None:
+        directory = self.fixture.base / "not-a-repository"
+        directory.mkdir()
+        result = self.fixture.record(
+            "step", "0", str(record_tests.START), str(record_tests.START + 12.5),
+            "0", "", "", *record_tests.NEXTEST, cwd=directory,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.fixture.records()[-1]
+        self.assertEqual(row["cwd"], str(directory))
+        self.assertEqual(row["repo_identity"], UNKNOWN_IDENTITY)
+        self.assertEqual(row["target_dir"], TARGET_DIR_UNSET)
+        self.assertEqual(index.update(), 1)
+        with closing(index.read_only()) as connection:
+            indexed = cast(list[tuple[str, str, str]], connection.execute(
+                "SELECT target_dir, repo_identity, target_folder FROM steps").fetchall())
+        self.assertEqual(indexed, [(TARGET_DIR_UNSET, UNKNOWN_IDENTITY, str(directory))])
+
+    def test_scoped_step_keeps_the_recorder_repository_instead_of_phase_context(self) -> None:
+        self.assertEqual(self.fixture.git("remote", "add", "origin", "https://example.com/actual/hana.git", cwd=self.fixture.repo), "")
+        phase = self.fixture.base / "test-phase.json"
+        with phase.open("w") as output:
+            json.dump({
+                "repo_identity": "phase-context-repository", "test_scope": "filtered",
+                "package": "hana", "filters": ["one"], "test_threads": 8,
+                "call_id": "phase-call", "test_phase_peak_bytes": 1700, "test_phase_started_at": 1001,
+            }, output)
+        row = self.fixture.step(0, "0", "", "", record_tests.NEXTEST, {"BUILDLOG_TEST_PHASE_FILE": str(phase)})
+        self.assertEqual(row["repo_identity"], "https://example.com/actual/hana")
+        self.assertEqual(row["test_scope"], "filtered")
+        self.assertEqual(row["filters"], ["one"])
+        self.assertEqual(row["test_phase_peak_bytes"], 1700)
+
+    def test_step_rows_keep_compiled_names_and_tty_rows_keep_them_unknown(self) -> None:
+        for tty, expected in (("0", ["alpha", "beta"]), ("1", None)):
+            with self.subTest(tty=tty):
+                row = self.fixture.step(0, tty, str(self.fixture.handoff()), "", record_tests.NEXTEST)
+                self.assertEqual(row["compiled_crate_names"], expected)
+                self.assertEqual(row["crates_compiled"], len(expected) if expected is not None else None)
 
 
 class SweepTests(unittest.TestCase):
