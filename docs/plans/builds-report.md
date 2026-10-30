@@ -332,86 +332,39 @@ including the details to make it clear
 
 ### Phase 7 — The build report shows how much memory running builds really hold, hour by hour  · status: done
 
-**Depends on:** none
+#### As-built
 
-#### Work Order
-
-**Goal:** `/build:report` gives the true average memory that running builds held in each hour of the last 24 hours, from 60 s readings of current use, not from step peaks.
-
-**Spec:**
-- User, 2026-10-30: asked for the average real memory use of running builds per hour. The only answer the log could give summed step peaks, and one hour came to 56 GiB, above the 44 GiB cap of `builds.slice`. The 60 s `memory_snapshot` rows hold only `memory.peak` (the peak since the slice started), so no true reading exists.
-- Accuracy first (user, 2026-10-30: "we keep making mistakes - undercounting, double counting"). In `memory.slice_state` (`scripts/buildlog/memory.py`), store each reading as the kernel gives it, under its own name, and derive nothing at write time:
-  - `current_bytes` from `memory.current`: the slice's whole charge, the same number `memory.max` enforces. It already includes every child cgroup (each step's scope, `sccache.service`), file cache and kernel memory. This is the one "held" total; never add child cgroups, `memory.stat` lines or swap to it.
-  - `swap_current_bytes` from `memory.swap.current`; kept apart, never added to `current_bytes`.
-  - From `memory.stat`, these lines as named fields in a `stat` record: `anon`, `file`, `kernel`, `shmem`, `file_mapped`, `file_dirty`, `file_writeback`, `active_file`, `inactive_file`, `slab`, `sock`, `zswap`. `shmem` is part of `file`, so never add the two. A line the kernel does not print is stored as absent, never 0.
-  - `max_bytes` at that instant (already read as `max`); `builds` and `ci` slices stay separate, never summed.
-  Use the existing typed slice record and its one reader of slice files; add no second reader.
-- In the report's Memory pressure section, add one line from the samples of the last 24 hours: `Build memory held (60 s samples, last 24 h): average <x> GiB (`anon` <y> GiB, `file` <z> GiB, of which `inactive_file` <v> GiB) of the <cap> GiB cap; busiest hour <HH:00> at <w> GiB.` With no sample that has `current_bytes`, the line reads `Build memory held: no readings yet.` For `report YYYY-MM-DD` the 24 hours end at the end of that local date; with no date they end now.
-- Add the command `usage-hours` to `cli.py` (`hourly` is the hourly job, `cli.py:211`): the hour-by-hour table (columns: hour, average GiB held, processes, file cache, samples), over the same 24 hours. Add its usage line to the `cli.py` docstring.
-- Hours: bucket UTC instants by UTC hour, and label each bucket with its local date, hour and UTC offset, so the two 01:00 hours on 2026-11-01 stay two rows.
-- Averages are the mean of the readings in each hour, with the reading count shown; a missing reading is skipped, never 0. Rows written before this phase have no `current_bytes`; they count as no reading. Step `peak_mem_bytes` is never used for this line.
-- Update `docs/as-built/buildlog-memory-stalls.md` (the snapshot and sample fields, the new line and the command).
-- CPU and disk, same rules (user, 2026-10-30: record what builds really do, for trends). Store raw kernel counters as read; derive rates only in the report, from the difference of two readings; a missing file is absent, never 0:
-  - per step, from the step's own scope cgroup: `cpu.stat` `usage_usec`, `user_usec`, `system_usec` (every cgroup v2 scope has them). Capture in `invoke.sh` after `"$@"` returns and before `buildlog_finish_memory` deletes `"$BUILDLOG_PEAK.cgroup"` (`invoke.sh:262-272`): one call into a buildlog function, a small hunk. The values go into `PendingStep.row` before `_save_pending_step` and stay there until the row is published. Label them "excludes compiles run by sccache.service"; the slice totals count those compiles once.
-  - per-step IO: the same capture reads the step scope's `io.stat` (`rbytes`, `wbytes`, raw lines kept as for the slices) when it is present, and records a typed unavailable value when it is absent. Today `builds.slice/cgroup.subtree_control` is `memory pids` (checked live 2026-10-30), so a step scope has no `io.stat`. Dependency: nixos commit ee6d018 (on nixos main since 2026-10-30, `DefaultIOAccounting=yes` for the user manager; not in this phase). After the user's next rebuild, scopes have `io.stat` and no code change is needed. `IOAccounting` on `builds.slice` alone does not give scopes `io.stat` (tested).
-  - per 60 s sample, for the builds slice and the CI slice apart: `cpu.stat` `usage_usec`, `user_usec`, `system_usec` and `io.stat` `rbytes`, `wbytes`. Keep every raw `io.stat` line with its `major:minor` and device name. Report traffic for one device only: the device behind the filesystem that holds the build targets, found by mapping its `st_dev` `major:minor` through `/sys/dev/block` to the top layer (today `254:0` dm-crypt over NVMe `259:0`). Keep zram swap (`253:0` today) apart. Never sum stacked layers.
-  - per 60 s sample: free, total and used bytes and the filesystem identity of the filesystem that holds the build targets, from `disk.filesystem_usage` extended with total bytes (`f_blocks * f_frsize`; `used + free` is not total when blocks are reserved) and the identity. `disk.json` keeps only the latest snapshot, so it gives no trend.
-  - per 60 s sample: free pool tokens in each jobserver pool (`/dev/steve`, 31; `/dev/steve-ci`, 14), read with `stevie -t` and `stevie -s /dev/steve-ci -t` with a short timeout (read-only: `/etc/nixos/modules/linux/jobserver.nix:53`, `:79`). steve is a CUSE device; `FIONREAD` fails on it. Any failure gives a typed unavailable value. Label the value "free pool tokens", never CPU in use: each client also holds one implicit slot.
-  - Report: `usage-hours` also shows, per hour, average CPU cores busy for builds, disk bytes read and written, lowest free disk and average free pool tokens per pool, each with its reading count.
-- Counter continuity: pair readings by boot id and cgroup identity (the cgroup folder's inode); elapsed time must be above 0. A counter reset or a gap over `report.MAX_SAMPLE_GAP_S` gives unknown, never 0. Split a delta across hour edges by its covered seconds. Average CPU = valid `usage_usec` delta / covered seconds. Extend the pairing in `report.sample_counter_deltas` (`report.py:844`; today it clamps a decrease to 0 and takes a new boot's counter as a delta); add no second pairing loop.
+- `cgroup_capture.py` is the one reader of slice files. It reads each slice's `memory.current` (`current_bytes`), `memory.swap.current` (`swap_current_bytes`), a `stat` record of named `memory.stat` lines (`anon`, `file`, `kernel`, `shmem`, `file_mapped`, `file_dirty`, `file_writeback`, `active_file`, `inactive_file`, `slab`, `sock`, `zswap`), `max_bytes`, `cpu.stat` (`usage_usec`, `user_usec`, `system_usec`) and raw `io.stat` lines into typed values. `sample` and `memory_snapshot` both call it. An unreadable file makes only its own field unavailable; a line the kernel does not print stays absent, never 0.
+- Each 60 s sample row holds `samples.slices`, `filesystem` (free, total, used, identity; `disk.filesystem_usage` gives total as `f_blocks * f_frsize`) and `jobserver` (free pool tokens from `stevie -t` and `stevie -s /dev/steve-ci -t`, with a short timeout). The report reads memory, disk, pool and counter values only from this row. `memory_snapshots` stays for its existing readers. `index.SCHEMA_VERSION` is 26.
+- `memory.current` is the one held total. Swap stays apart, `builds` and `ci` are never added together, and step `peak_mem_bytes` is never used for held memory.
+- `BUILDLOG_SCOPE_SH` copies the scope's `cpu.stat` and `io.stat` by plain `cat` to `PEAK.cpu.stat` and `PEAK.io.stat`. `record.step` parses them into `scope_resources` in `PendingStep.row` before `_save_pending_step` and deletes them with the step's sources. A rerun takes the values from the pending record. A read failure other than a missing file keeps the sources and leaves the step pending for a rerun.
+- `report` prints one Memory pressure line over the last 24 hours (ending now, or at the end of the local date for `report YYYY-MM-DD`): `Build memory held (60 s samples, last 24 h): average <x> GiB (`anon` <y> GiB, `file` <z> GiB, of which `inactive_file` <v> GiB) of the <cap> GiB cap; busiest hour <HH:00> at <w> GiB.` With no `current_bytes` reading it prints `Build memory held: no readings yet.` `cli.py usage-hours` prints one row per hour with average GiB held, processes, file cache, CPU cores busy, disk bytes read and written, lowest free disk and free pool tokens per pool, with a reading count for each value.
+- `report.sample_counter_deltas` is the one counter pairing. It pairs readings by boot id and cgroup folder inode, and needs elapsed time above 0. A reset, a boot or cgroup change, or a gap over `report.MAX_SAMPLE_GAP_S` gives `unavailable`, never 0. Disk traffic covers only the top-layer device behind the build-target filesystem, found by mapping `st_dev` through `/sys/dev/block`; stacked layers are never summed and zram swap stays apart. Hours bucket by UTC hour and carry the local date, hour and offset, so the two 01:00 hours on 2026-11-01 stay two rows.
 
 **Files:**
-- `scripts/lint/invoke.sh` — one capture call after `"$@"` (also-touches: verify-unit's file)
-- `scripts/buildlog/record.py` — the per-step CPU fields in `PendingStep.row` before the save
-- `scripts/buildlog/memory.py` — the new slice fields, through the shared capture
-- `scripts/buildlog/sample.py` — disk and jobserver fields; slice reads through the shared capture
-- `scripts/buildlog/disk.py` — `filesystem_usage` total bytes and identity
-- `scripts/buildlog/index.py` — new `SAMPLE_COLUMNS`, `SCHEMA_VERSION` 26
-- `scripts/buildlog/report.py` — the new line; counter pairing
-- `scripts/buildlog/cli.py` — `usage-hours`
-- `scripts/lint/test_invoke_scope.py` — tests
-- `scripts/buildlog/test_record.py` — tests
-- `scripts/buildlog/test_record_rerun.py` — tests
-- `scripts/buildlog/test_memory_window.py` — tests
-- `scripts/buildlog/test_sample.py` — tests
-- `scripts/buildlog/test_disk.py` — tests
-- `scripts/buildlog/test_index.py` — tests
-- `scripts/buildlog/test_report.py` — tests
-- `docs/as-built/buildlog-memory-stalls.md` — the fields, line and command
+- `scripts/buildlog/cgroup_capture.py` — shared slice reader and parsers
+- `scripts/buildlog/cgroup_test_support.py` — fake cgroup fixtures for tests
+- `scripts/buildlog/sample.py`, `memory.py`, `disk.py` — sample, snapshot and filesystem rows
+- `scripts/buildlog/record.py` — step counters from the scope's copied files
+- `scripts/buildlog/report.py`, `cli.py`, `index.py` — held line, `usage-hours`, schema 26
+- `scripts/lint/invoke.sh` — scope line that copies the counters
+- `docs/as-built/buildlog-memory-stalls.md` — fields, line and command
 
-**Ownership:** `scripts/lint/invoke.sh` belongs to verify-unit; the checkpoint notice names it as also-touches.
+**Gotchas:**
+- `index.open_for_update` deletes an index of another schema version, so a manual run of a tree at a different schema sets `BUILDLOG_DIR` to a copy.
+- `cli.py sample` also starts the Mac idle watcher.
+- Per-step IO reads `unavailable` until nixos ee6d018 (`DefaultIOAccounting=yes`) is live at the next rebuild.
+- `invoke.sh` runs the installed recorder, so a per-step counter change appears only after it lands on main.
+- Hourly usage selects natedev through `natedev_step_predicate('samples')`; `store.host_name()` would empty the Mac's table.
+- A day's pressure totals count an interval once, by its end. Only hourly usage splits an interval across hour edges, by covered seconds.
+- Each component averages its own readings; a missing reading is skipped, and rows without `current_bytes` count as no reading.
+- SQL `julianday` filtering and Python hour buckets can disagree at a window edge, so both use the same parsed instant.
+- `shmem` is part of `file`, so the two are never added.
+- Step CPU excludes compiles run by `sccache.service`; the slice totals count those compiles once.
+- Free pool tokens are not CPU in use: each client also holds one implicit slot. steve is a CUSE device, and `FIONREAD` fails on it.
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `invoke.sh`; `record.py`, `memory.py`, `sample.py`, `disk.py`, `index.py`, `report.py`, `cli.py`; the shared capture; the as-built doc
-- `test` — the test modules in Files: capture in terminal and tee runs and in an interrupted recovery; a scope with and without `io.stat`; fake slice folders; an unreadable slice file that keeps the other readings; a dm-crypt-over-NVMe `io.stat` fixture with zram swap; a counter reset, a gap, a boot change and a cgroup change (unknown, never 0); a delta split across an hour edge; the two 01:00 hours on 2026-11-01; `stevie` failure and timeout (unavailable); the line with readings, with only old rows (`no readings yet`), and an average that never exceeds the cap for a fixture within it
-
-**State:** each slice, disk and jobserver field is measured or unavailable (typed); an unreadable file makes only its own field unavailable and never drops the valid memory or CI readings. Per-step IO is unavailable while a step scope has no `io.stat` (until nixos ee6d018 is built). A counter interval is valid or unknown, never 0.
-
-**Constraints from prior phases:**
-- Samples reach `index.sqlite`: slice measurements in `memory_snapshots.slices` (JSON); disk and jobserver readings in the `sample` row (`SAMPLE_COLUMNS`, `index.py:252`). Bump `SCHEMA_VERSION` from 25 to 26, which reindexes the source logs once. Read through the existing query path.
-- One shared typed capture of slice files feeds `sample.py` and `memory.slice_state`; today `sample.py:192` builds the slice path again and `sample.anon_bytes` reads `memory.stat` apart from `slice_state`. `slice_state` raises on an unreadable file today, so `cli.py sample` loses the whole snapshot.
-- 4b binds: every new row field is in `PendingStep.row` before `_save_pending_step`; a rerun takes it from the pending record and never reads the scope again.
-- Good engineering first, not after the user notices. Before a worker writes code, ask: is there already one place for this? Use it, or make it, then call it.
-- No copies. A second copy of setup, a fixture, a config writer, a parser or a helper is a defect. Reviews flag it; you send it back. A test helper that each file writes for itself goes into one shared helper.
-- When many things break the same way, the copy is the cause. Name it first in your report, with the one-place fix, before anyone asks.
-- Fix at the cause, never a patch at each site.
-
-**Review rulings (director, 2026-10-30, repair round 1):**
-- The report reads memory, disk, jobserver and counter readings from the one sample row (`samples.slices`, `filesystem`, `jobserver`). This replaces the Constraint's "slice measurements in `memory_snapshots.slices`" for this report's reads: a failed snapshot append must not hide a reading the sample row saved. `memory_snapshots` stays for its existing readers.
-- A step's capture is plain `cat` of the scope's `cpu.stat` and `io.stat` in `BUILDLOG_SCOPE_SH`, beside `memory.peak`. No Python runs inside the scope, so the capture adds nothing to the step's peak, CPU or time. `record.step` parses the files with the shared parser.
-- A day's pressure totals count an interval once, by its end in that day. Only the hourly table splits an interval across hour edges.
-- Hourly usage selects natedev's rows through the report's existing natedev selection, so the Mac shows the same answer.
-
-**Assertion-Change (director ruling, 2026-10-30):** `scripts/buildlog/test_index.py::test_sample_power_profile_indexes_without_backfilling_old_lines` — the test took `SAMPLE_COLUMNS[-2:]` as the `power_profile` and `since` definitions; Phase 7 appends sample columns after them, so the test selects those two columns by name, with the same expected definitions.
-
-**Repair round 1 test ruling (director, 2026-10-30):** the step capture's tests move from the `capture-scope` command and `.resources` file to the raw `.cpu.stat` and `.io.stat` files. The exact CPU and IO values, the step's exit status and the event order stay as they are. Python-not-called and missing-`io.stat` assertions are added. Recovery of a saved row must not read the files again. No numeric expectation changes.
-
-**Assertion-Change (director rulings, 2026-10-30):** each follows from this Spec's counter continuity rule (a reset or a gap gives unknown, never 0), its new slice fields, or its jobserver reads.
-- `scripts/buildlog/test_report.py::test_cpu_disk_pressure_counts_reboot_counters_from_zero` — renamed `test_cpu_disk_pressure_does_not_count_across_a_reboot`; the old test took a new boot's counter as a delta, which the Spec forbids, so a pair across a boot now gives no interval.
-- `scripts/buildlog/test_report.py::test_memory_pressure_uses_sample_peaks_and_reboot_counter_deltas` — `3.5 s` and `1.5 s` become `3.0 s` and `1.4 s`: only same-boot adjacent intervals count; the peak, wait and source assertions stay.
-- `scripts/buildlog/test_report.py::test_memory_pressure_samples_without_stalled_steps_have_no_table` — `some 0.0 s` and `full 0.0 s` become `unavailable`: one reading has no interval, and unknown is never 0.
-- `scripts/buildlog/test_report.py::test_memory_pressure_ignores_counter_rise_across_a_long_sampling_gap` — `some 0.0 s` and `full 0.0 s` become `unavailable`: a gap over the limit is unknown, never 0.
-- `scripts/buildlog/test_memory_window.py::test_snapshot_cli_prints_and_appends_exactly_one_record_from_fake_cgroups` — exact equality now covers the same named fields with the same expected values; the new fields have their own exact assertions.
-- `scripts/buildlog/test_sample.py::power_profile_sample` (used by `test_sample_writes_power_profile_and_utc_state_mtime` and `test_sample_without_power_profile_still_writes_null_fields`) — `sample must not fork` gives way to a stub of the two read-only `stevie` calls this Spec adds; the one-row assertion stays for the non-CLI path, and the new CLI path expects its sample and snapshot rows.
-
-**Acceptance gate:** `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY PYTHONPATH=scripts/buildlog python3 -m unittest scripts.lint.test_invoke_scope scripts.buildlog.test_record scripts.buildlog.test_record_rerun scripts.buildlog.test_memory_window scripts.buildlog.test_sample scripts.buildlog.test_disk scripts.buildlog.test_index scripts.buildlog.test_report` from the worktree root green; basedpyright on every changed Python file `0 errors, 0 warnings, 0 notes`; fixtures prove the rules (no sum of stacked layers, unknown never 0, typed unavailable); live: one capture-only run (not `cli.py sample`, which starts the Mac idle watcher at `cli.py:289`) beside timestamped reads of `memory.current`, `memory.stat` and `io.stat` in the folder `memory.builds_path()` returns, compared within a stated tolerance, with the `anon + file + kernel + sock + zswap` gap to `current_bytes` reported; `python3 scripts/buildlog/cli.py report` prints the new line and `python3 scripts/buildlog/cli.py usage-hours` prints a row per hour with readings. The per-step CPU live check runs after the change lands on main (invoke.sh runs the installed recorder).
+**Ruled out:**
+- A Python capture inside the step scope: it raises the step's own peak, CPU and time.
+- Summing `anon`, `file` and `inactive_file` as held memory: they overlap; only `memory.current` is held.
+- Reading report values from `memory_snapshots.slices`: a failed append hides a saved reading.
+- `IOAccounting` on `builds.slice` alone: it does not give scopes `io.stat`.
