@@ -84,46 +84,60 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
 ### Phase 2b — A user's bump merges first and gates the pushed tip  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** `merge_checkpoint.py --bump` merges and pushes a code checkpoint first, then runs the gate on the pushed tip in the background and sends a red result to the unit. `commands/showrunner/bump.md` matches the tool.
-
-**Spec:**
-- Source: the sdlc showrunner, 2026-10-30: "commands/showrunner/bump.md:21-25 says a bumped checkpoint merges on lint and related tests, and the full suite runs on the pushed tip after the merge. merge_checkpoint.py has no such path: every merge runs the full gate. Natedev merged the instant move by hand today for that reason. Add one flag to merge_checkpoint.py for the bump path: merge and push first, then run the gate on the pushed tip, in the background, and send a red result to the unit. Only a user's bump uses it. Keep bump.md matching the tool."
-- **The flag.** `--bump` is valid only for a code checkpoint. With `--shrink`, `--as-built` or `--from-child`, `request_from` refuses it, as it refuses `--cancel-prior` today (`merge_checkpoint.py:318`). The help text says only a user's bump uses it.
-- **Before the push.** `run` (`merge_checkpoint.py:1134`) keeps scope, conflicts, other units, merge, push, records and promotion in their order. With `--bump`, `tests()` does not run, and `report("test", "ok", ...)` says the gate runs on the pushed tip. The merge record names that the gate comes after the push. Without `--bump`, nothing changes. A rerun after a stop between merge and push takes the same path with no tests.
-- **After the push.** `merge_checkpoint.py` starts a new script, `scripts/production/bump_gate.py`, as a detached process (its own session, stdin closed, output in a log file), and does not wait for it. It starts the process after `push` and before `promote`; promotion runs as for any merge, because the user wants the work now.
-- **The gate run.** `bump_gate.py` makes a `git clone --shared` of the production checkout at the pushed tip, detached (never the production checkout: a merge may start there; a copied `.git` pointer moves the real branch, and an export with no git fails a shutdown test). It runs in the clone the same steps a normal merge runs: `test_steps` over the checkpoint's paths and the production's Merge tests. It uses the same pass rule (`test_passed`), flake rule and rerun of named failures as `checkpoint_tests`. Share that code; a second copy of any of them is a defect. It never resets or changes the merge branch, and it removes its clone at the end. The log stays after the clone goes.
-- **The result.** A red result goes through `scripts/message/send.py` to the unit and to the showrunner: the step that failed, the failing test names when known, the tip, and the log path. A green result goes to the showrunner only, as one line. The showrunner needs it because bump.md keeps the work top priority until the tip is green. A run that cannot start or that fails before its first step counts as red. A failed send is written to the log and retried once; it never stays silent. The unit's address comes from the lookup production code already uses; do not add a second one. (Decision: the showrunner also gets the result, which is one extra send, so bump.md's "until the tip is green" has a source. Revert: one line.)
-- **Rerun.** A rerun of the command for the same tip starts no second gate while the first lives. When the first is gone with no result, the rerun starts it again. Keep this record through `checkpoint_step_record`, and use the repo's existing process identity check; add no new one.
-- **bump.md.** Step 3's <MergeCheckpoint/> line names `--bump`. Step 4 says what the flag does: the gate on the pushed tip, in the background, red to the owning unit and the showrunner. The merge unit's full run stays for a production with a merge unit. The Rules line "It skips only the full suite before the merge" stays true. `commands/showrunner/produce.md` and `docs/as-built/showrunner-automation.md` name the flag where they list `merge_checkpoint.py`'s options.
+- `merge_checkpoint.py --bump` is for a user's bump only, and its help text says so. It applies only to a code checkpoint. `user_bump` refuses it with `--shrink`, `--as-built` or `--from-child` before any merge.
+- With `--bump`, `run` keeps scope, conflicts, other units, merge, push, records and promotion in their order, but runs no tests before the push. The `test` step reports that the gate runs on the pushed tip in the background, and the merge log line says `gate after push`. A rerun after a stop between merge and push also runs no tests. Without `--bump`, nothing changes: a red test stops the merge.
+- After the push and before `promote`, `start_gate` writes a `BumpGateRecord` to `checkpoint_step_record(checkout, merge_head, "bump-gate")`, with `bump-gate.log` beside it. It starts `scripts/production/bump_gate.py --record <path>` in its own session, with stdin closed and output in the log, and does not wait. Promotion runs as for any merge. A start failure is a red result and does not stop promotion.
+- The record holds the tip, the gate plan (paths, Merge tests, flakes, flaky tests), the production and unit names, the runner `pid` and `proc_start`, `result` (`pending`, `green`, `red`), `detail`, `log` and `delivered_to`. A rerun for the same tip starts no second gate while the runner lives, reports `held` when liveness is unknown, starts the gate again when the runner died with no result, and sends a completed result only to recipients not in `delivered_to`.
+- `bump_gate.py` claims the record under `record_lock`, and stops with no tests when the result is done or a live other runner holds it. It makes a `git clone --shared` of the production checkout in a temporary folder beside the record, detached at the tip, and runs `run_checkpoint_test_steps` there. Flake notes go to the real checkout's production log. The clone goes at the end; the log stays. Any failure, also before the first step, is red.
+- `run_checkpoint_test_steps(production, paths, merge_tests, flakes, flaky_tests, log) -> str` is the one copy of the test steps, pass rule, flake rule and rerun of named failures. `checkpoint_tests` and the bump gate both call it. It appends to the log, and the caller owns merge rollback. A red step names its failing tests when known.
+- A red result goes to the unit and the showrunner, a green result to the showrunner only, through `scripts/message/send.py` (`MERGE_CHECKPOINT_SEND` overrides it). The text is `Bump gate <red|green>: <unit>; tip <tip>; <detail>; log <log>`. A failed send is written to the log and retried once. Each sent recipient is saved in `delivered_to`.
 
 **Files:**
-- `scripts/production/merge_checkpoint.py` — the flag, the path with no tests, the start of the background gate; any shared test-step code
-- `scripts/production/bump_gate.py` — new: the background gate on the pushed tip
-- `scripts/production/test_merge_checkpoint_bump.py` — new: tests through the real merge path
-- `scripts/production/merge_checkpoint_test_support.py` — fixture additions, if needed
-- `commands/showrunner/bump.md` — matches the tool
-- `commands/showrunner/produce.md` — names the flag
-- `docs/as-built/showrunner-automation.md` — names the flag
+- `scripts/production/merge_checkpoint.py` — the flag, the path with no tests, `start_gate`, the record and its lock, `run_checkpoint_test_steps`, `complete_gate`, `send_result`, `bump_gate_addresses`.
+- `scripts/production/bump_gate.py` — the background gate on the pushed tip.
+- `scripts/production/test_merge_checkpoint_bump.py`, `scripts/production/merge_checkpoint_test_support.py` — tests through the real `run` path on a fixture repo with a real origin, and their fixture.
+- `commands/showrunner/bump.md` — step 3 runs <MergeCheckpoint/> with `--bump`; step 4 says what the gate does; `bump done` is logged once the tip is green. `commands/showrunner/produce.md` and `docs/as-built/showrunner-automation.md` name the flag.
 
-**Workers:** `1 writer + 1 tester` — `merge_checkpoint.py` is the hub, owned by `impl`.
-- `impl` — `scripts/production/merge_checkpoint.py`, `scripts/production/bump_gate.py`, the three docs
-- `test` — `scripts/production/test_merge_checkpoint_bump.py`, `scripts/production/merge_checkpoint_test_support.py`
+**Gotchas:**
+- `complete_gate` and `send_result` read the record again under `record_lock` and write only when it still names this runner (`same_gate_runner`: tip, pid, process start). An old runner cannot replace a new owner's result or send one.
+- Addresses come at send time from `bump_gate_addresses(slug, unit)` (`unit_lookup.marked_unit`, `showrunners.current_address`). The record keeps only slug and unit, so a notice follows a recipient that moved during the run.
 
-**State:** `bump_gate.py` writes one per-merge step record (started, process identity, result) through `checkpoint_step_record`, and one log. Both stay until the normal cleanup of those records.
+**Ruled out:** the gate in the production checkout (a merge may start there), in a copied `.git` pointer (it moves the real branch) or in an export with no git (it fails a shutdown test); a second copy of the test-step, pass or flake code.
 
-**Constraints from prior phases:** every hang limit comes from `scripts/lib/test_hang_guard.py` (Phase 2). `test_merge_checkpoint_rerun.py` (3 tests) and `test_merge_checkpoint_validation.py` `test_a_merge_adds_a_row_per_visible_change_to_the_named_list` fail on origin/sdlc 7a18d704 before this phase, and they pass on main 6c319087, which changes `merge_checkpoint_test_support.py`. They are not this phase's to fix. Do not port main's change here; the sdlc merge of main brings it.
+### Phase 2c — The assertion guard pairs a moved Rust string continuation  · status: todo
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** a Rust assertion that moves and changes indent, with a `\` line continuation inside a string, pairs with its old copy and is no finding.
+
+**Spec:**
+- Source: the sdlc showrunner, 2026-10-30, change-review row C437: in `~/rust/cargo-liner`, `assertion_guard.py --base e21d5b93^ --head e21d5b93` prints 74 blocking where the row says 73. "If the guard got better, correct the row; if wrong, fix the guard." The guard is wrong: the 74th item is `crates/cargo-tile/src/render.rs:14864 a_short_tree_asks_for_fewer_rows_than_a_long_one removed`. The commit moved that assertion to `render/tests/mod.rs:15961` with one less indent. Its tokens are the same; only the spaces after a `\` line continuation inside the message string changed (13 to 9).
+- **Cause.** `normalized()` (`scripts/direct/assertion_guard.py:140-148`, since db889600, phase 6b) keeps each literal span exactly as written, so whitespace inside a Rust string continuation counts. Rust drops a `\` + newline and all leading whitespace on the next line, so both strings have the same value.
+- **Fix at the cause.** Inside a non-raw Rust string literal (`"…"`, `b"…"`, `c"…"`), the comparison key removes each `\` + newline + the leading whitespace after it, which is Rust's own rule. An escaped backslash (`\\`) before a newline is no continuation. Raw strings (`r"…"`, `r#"…"#`) keep their text as written. Python literals keep their text as written. Every other part of the 6b literal-exact pairing stays as it is.
+- After the fix, the C437 command prints 73 blocking again, and the row stays as written.
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — the key rule
+- `scripts/direct/test_assertion_guard_strings.py` — regression tests
+- `scripts/direct/assertion_guard_test_support.py` — fixture additions, if needed
+
+**Workers:** `1 writer + 1 tester`.
+- `impl` — `scripts/direct/assertion_guard.py`
+- `test` — `scripts/direct/test_assertion_guard_strings.py`, `scripts/direct/assertion_guard_test_support.py`
+
+**State:** none.
+
+**Constraints from prior phases:** every hang limit comes from `scripts/lib/test_hang_guard.py` (Phase 2).
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/production -p 'test_merge_checkpoint*.py'`, from the worktree root: green, except the four tests named above.
-- `scripts/production/test_merge_checkpoint_bump.py`, through the real `run` path on a fixture repo with a real origin, shows each of these:
-  - A merge test that fails: with `--bump`, the merge is on origin and the command exits 0. A fake `send.py` (`MERGE_CHECKPOINT_SEND`) receives the failed step, the tip and the log path, for the unit and the showrunner.
-  - A merge test that passes: the showrunner gets one line, and the unit gets nothing.
-  - The gate ran in a clone at the pushed tip: the fixture's test command writes `git rev-parse HEAD` and its cwd to a file, the HEAD equals the tip, and the cwd is not the checkout. The production checkout's HEAD and status do not change during the gate, and the clone is gone at the end.
-  - `--bump` with `--shrink`, `--as-built` or `--from-child` is refused, with no merge.
-  - A rerun for the same tip while the gate lives starts no second gate; a rerun after the gate died with no result starts one.
-  - Without `--bump`, the same failing test stops the merge, as today.
+- A test through the real guard on a fixture repo: an assertion with a `\` continuation in its message moves to a new file with a new indent and less space after the `\`; the guard reports no finding for it. Without the fix, the test fails.
+- A test: the same move where the string's value changes (a word after the `\` differs) is still a finding.
+- A test: an escaped `\\` before a newline, and a raw string with `\` and a newline, keep their whitespace in the key.
+- `python3 -m unittest discover -s scripts/direct -p 'test_assertion_guard*.py'`: green.
+- In `~/rust/cargo-liner`, `python3 scripts/direct/assertion_guard.py --repo ~/rust/cargo-liner --base e21d5b93^ --head e21d5b93` from the worktree prints `assertion guard: 73 blocking`, and its other 73 items are the ones the current guard prints. The director runs this check.
 - basedpyright prints `0 errors, 0 warnings, 0 notes` on each slot's changed files.
 - The director runs the full merge gate (`--tests-only --full`) on the phase tree.
 
