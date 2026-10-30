@@ -440,6 +440,7 @@ def read_role_map() -> RoleMap:
         elif isinstance(_role_map_source.get(), StoredRoleMap):
             result, stamp = _cached_role_map()
             result = replace(result, provenance=ExplicitStoredRoleMap(stamp))
+            _map_observer.get()(result.provenance)
         else:
             try:
                 result = decode_role_map(ssh_role_map(("role-map-read",)))
@@ -447,6 +448,7 @@ def read_role_map() -> RoleMap:
                 result, stamp = _cached_role_map()
                 provenance = CachedAfterFetchFailure(stamp, str(error))
                 result = replace(result, provenance=provenance)
+                _map_observer.get()(provenance)
                 print(cached_map_warning(provenance), file=sys.stderr)
             else:
                 saved_map = CachedRoleMap(at=datetime.now(timezone.utc).isoformat(),
@@ -466,6 +468,23 @@ def observed_map_provenance() -> RoleMapProvenance:
     """Return the provenance of the same memoized read used by this command."""
     scope = _command_map.get()
     return scope.value.provenance if isinstance(scope, CommandRoleMap) and isinstance(scope.value, RoleMap) else CurrentRoleMap()
+
+
+@contextmanager
+def observe_map_reads(observer: Callable[[RoleMapProvenance], None]) -> Generator[None]:
+    token = _map_observer.set(observer)
+    try:
+        yield
+    finally:
+        _map_observer.reset(token)
+
+
+def _ignore_map_read(_provenance: RoleMapProvenance) -> None:
+    pass
+
+
+_map_observer: ContextVar[Callable[[RoleMapProvenance], None]] = ContextVar(
+    "map_observer", default=_ignore_map_read)
 
 
 def cached_map_warning(provenance: CachedAfterFetchFailure) -> str:
