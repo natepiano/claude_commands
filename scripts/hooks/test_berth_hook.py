@@ -19,7 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "direct"))
 import phase_reservation  # noqa: E402
-from scripts.guilds import roles  # noqa: E402
+from scripts.astra import design_roles  # noqa: E402
 
 HOOK = Path(__file__).with_name("pre-tool-use-berth.py")
 DIRECTOR = "sid-director"
@@ -87,9 +87,9 @@ class BerthHookTests(unittest.TestCase):
             "UNIT_ACTIVE_DIR": str(self.root / "unit" / "active"),
             "FAKE_BERTH_LOG": str(self.root / "berth.log"),
             "FAKE_BERTH_ANSWER": str(self.root / "answer.json"),
-            "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
-            "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership"),
-            "GUILD_ROLES_HOST": "fixture-host",
+            "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
+            "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership"),
+            "DESIGN_ROLES_HOST": "fixture-host",
         }
         _ = self.environment.pop("CARGO_BERTH_SESSION_ID", None)
         # A test run from inside a seat inherits its run; each test names the run it wants.
@@ -142,15 +142,15 @@ class BerthHookTests(unittest.TestCase):
 
     def bind_designer(self, directory: Path, phase: str) -> None:
         design_id = "00000000-0000-4000-8000-000000000036"
-        binding = roles.DesignBoundToPhase(str(directory), phase, str(self.repo), ("src/lib.rs",))
-        design = roles.HeldDesign(roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
+        binding = design_roles.DesignBoundToPhase(str(directory), phase, str(self.repo), ("src/lib.rs",))
+        design = design_roles.HeldDesign(design_roles.DesignPlacement(design_id, "fixture-host", 2), "fixture-repo",
                                   str(self.repo), str(self.repo / "design.md"), "design",
-                                  "2026-10-21T12:00:00+00:00", roles.UnitHolder("demo", "design-unit"), binding,
-                                  (roles.RoleInstance("designer", "lasting-designer", roles.RoleOpen("designer-thread")),
-                                   roles.RoleInstance("reviewer", "lasting-reviewer", roles.RoleNotOpened())))
-        self.environment.update({"GUILD_DESIGN_ID": design_id, "GUILD_BINDING_GENERATION": "2"})
+                                  "2026-10-21T12:00:00+00:00", design_roles.UnitHolder("demo", "design-unit"), binding,
+                                  (design_roles.RoleInstance("designer", "lasting-designer", design_roles.RoleOpen("designer-thread")),
+                                   design_roles.RoleInstance("reviewer", "lasting-reviewer", design_roles.RoleNotOpened())))
+        self.environment.update({"HELD_DESIGN_ID": design_id, "DESIGN_BINDING_GENERATION": "2"})
         with mock.patch.dict(os.environ, self.environment):
-            roles._save(design)  # pyright: ignore[reportPrivateUsage]
+            design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
         _ = (directory / "phases" / phase / "files").write_text("src/lib.rs\n")
         _ = (directory / "progress_history_state.json").write_text(json.dumps({
             "run_id": directory.name, "history_file": str(self.root / (directory.name + ".jsonl")),
@@ -162,7 +162,7 @@ class BerthHookTests(unittest.TestCase):
         decide = cast(Callable[[str], int], runpy.run_path(str(HOOK))["decide"])
         payload = json.dumps({"tool_name": "apply_patch", "cwd": str(self.repo), "tool_input": {"command": patch}})
         with mock.patch.dict(os.environ, self.environment), \
-                mock.patch.object(roles, "resolve_holder", return_value=roles.HolderReach(DIRECTOR)), \
+                mock.patch.object(design_roles, "resolve_holder", return_value=design_roles.HolderReach(DIRECTOR)), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(decide(payload), 0)
         return output.getvalue()
@@ -187,7 +187,7 @@ class BerthHookTests(unittest.TestCase):
         )
         for generation, command in cases:
             with self.subTest(generation=generation, patch=command):
-                self.environment["GUILD_BINDING_GENERATION"] = generation
+                self.environment["DESIGN_BINDING_GENERATION"] = generation
                 refused = cast(dict[str, object], json.loads(self.held_hook(command)))
                 self.assertEqual(cast(dict[str, object], refused["hookSpecificOutput"])["permissionDecision"], "deny")
                 self.assertEqual(self.berth_calls(), [])

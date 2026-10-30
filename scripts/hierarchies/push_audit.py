@@ -33,6 +33,8 @@ from scripts.production import production_units, showrunners
 STATE_DIR = Path.home() / ".local/state/notify"
 SESSION_CONFIG = SCRIPTS.parent / "config/hierarchies/sessions.toml"
 PUSHOVER_SEND = "scripts/notify/pushover.py send()"
+# Messaging policy c73a2d02 took effect when dde7ec2e merged.
+AGENT_TEXT_EXCEPTION_ENDED = datetime(2026, 10, 29, 3, 5, 59, tzinfo=timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -163,7 +165,7 @@ class ApprovedPriorityTwo:
 @dataclass(frozen=True)
 class ApprovedRegisteredText:
     code_path: ClassVar[str] = PUSHOVER_SEND + ": registered text_id exception"
-    reason: ClassVar[str] = "recorded text id or registered rewrite outcome; current catalog membership and approval are not required"
+    reason: ClassVar[str] = "registered-text exception in force at delivery; recorded identity is evidence, not text approval"
 
 
 @dataclass(frozen=True)
@@ -466,6 +468,8 @@ def sending_path(push: PushRecord, review: ReviewMatch) -> str:
 def classify(push: PushRecord, identity: TextIdentity, review: ReviewMatch) -> PushClassification:
     if push.priority is PushPriority.EMERGENCY:
         return ApprovedPriorityTwo()
+    if isinstance(identity, TextId) and identity.value == "nate.adhoc" and push.at >= AGENT_TEXT_EXCEPTION_ENDED:
+        return Unapproved(sending_path(push, review) + "; nate.adhoc exception ended 2026-10-29T03:05:59Z")
     if isinstance(identity, TextId) or push.outcome is PushOutcome.ORIGINAL_TEXT_SENT:
         return ApprovedRegisteredText()
     return Unapproved(sending_path(push, review))

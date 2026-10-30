@@ -363,6 +363,9 @@ class ImplementLauncherFixture(unittest.TestCase):
         direct_dir.mkdir(parents=True)
         agents.mkdir(parents=True)
         lib.mkdir(parents=True)
+        production = self.root / "scripts" / "production"
+        production.mkdir(parents=True)
+        _ = shutil.copy2(DIRECT_DIR.parent / "production" / "production_doc.py", production / "production_doc.py")
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # location, so the copy needs the interpreter shim beside it too.
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")

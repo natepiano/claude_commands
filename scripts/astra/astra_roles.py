@@ -236,18 +236,18 @@ def live_roles() -> list[LiveRole]:
             lifetime = record["lifetime"]
             if isinstance(lifetime, HeldDesignRole):
                 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-                from scripts.guilds import roles as durable_roles
-                design = durable_roles.read_design(lifetime.design_id)
+                from scripts.astra import design_roles
+                design = design_roles.read_design(lifetime.design_id)
                 instance = next(role for role in design.roles if role.role == lifetime.role_id)
-                if isinstance(instance.lifecycle, durable_roles.RoleEnded):
+                if isinstance(instance.lifecycle, design_roles.RoleEnded):
                     path.unlink(missing_ok=True)
                     continue
-                if isinstance(instance.lifecycle, durable_roles.RoleNotOpened) or instance.lifecycle.thread_id != record["thread_id"]:
+                if isinstance(instance.lifecycle, design_roles.RoleNotOpened) or instance.lifecycle.thread_id != record["thread_id"]:
                     raise ValueError("durable instance thread differs from hold")
-                entry = _mesh_worker(durable_roles.mesh_directory(lifetime.design_id), instance.name)
+                entry = _mesh_worker(design_roles.mesh_directory(lifetime.design_id), instance.name)
                 state: RoleState = "busy" if entry.get("status") in ("starting", "running", "waiting_capacity") else "idle"
-                reach = durable_roles.resolve_holder(design.holder)
-                if isinstance(reach, durable_roles.HolderReach):
+                reach = design_roles.resolve_holder(design.holder)
+                if isinstance(reach, design_roles.HolderReach):
                     record["manager"] = reach.session_id
             elif isinstance(lifetime, MeshWorker):
                 session_dir = Path(lifetime.session_dir)
