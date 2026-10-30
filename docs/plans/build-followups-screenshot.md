@@ -39,7 +39,7 @@ The user, via natedev, 2026-10-06 13:1x PDT: "create a long running unit directo
 
 ## Delegation Context
 
-- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan builds the screenshot episode report (Phase 1), counts screenshot scripts run in later calls (Phase 2), records every `/hana_shot` call with failures and the kept shot (Phase 3), runs the report hourly with each change's effect (Phase 4), brings the Mac's transcripts up to date in a few hourly runs and fixes two report types (Phase 5), then proposes improvements (Phase 6). Work in the worktree `/home/natepiano/worktrees/claude-build-followups-screenshot` on branch `build-followups-screenshot` (unit `screenshot-unit` of production `build-followups`).
+- **Project:** `~/.claude` — Claude Code commands, skills, hooks and scripts. This plan builds the screenshot episode report (Phase 1), counts screenshot scripts run in later calls (Phase 2), records every `/hana_shot` call with failures and the kept shot (Phase 3), runs the report hourly with each change's effect (Phase 4), brings the Mac's transcripts up to date in a few hourly runs and fixes two report types (Phase 5), then proposes improvements (Phase 6). Work in the worktree `/home/natepiano/worktrees/claude-natedev-screenshot` on branch `natedev-screenshot` (unit `screenshot-unit` of production `natedev`).
 - **Project started:** 2026-10-06T20:30:00+00:00
 - **Stack:** Python 3.13, standard library only.
 - **Layout:**
@@ -525,3 +525,39 @@ Unpriced (below every priced one):
 - A test that patches `port_answers` while a fake server listens does not prove relaunch; close the fake listener instead.
 
 **Ruled out:** `LaunchState | None` plus a reason as the reader result (a three-state union instead); deleting temp records without reading them first (it can destroy the only pid record); killing a process group that no whole record identifies.
+
+### Phase 15 — The screenshot report's transcript tests pass in any temp folder · status: done
+
+#### Work Order
+
+**Goal:** `scripts/shot_report/test_transcripts.py` passes with `TMPDIR` anywhere — a Claude scratchpad, `/tmp/claude/session/<id>`, or `/dev/shm` — so it can join the merge gate, and a scratchpad cwd never resolves through a second scratchpad decode.
+
+**Spec:**
+- Source: the showrunner, 2026-10-30, found by devtools: 8 tests in `test_transcripts.py` fail when `TMPDIR` is inside a Claude scratchpad path; under `/dev/shm` all 90 pass. Reproduced by the director with `TMPDIR` in this session's scratchpad: the same 8 fail, each with project `.claude` (the live `~/.claude` repository) in place of the fixture's project.
+- Cause 1 (production): `_scratchpad_project` (`transcripts.py:741`) matches any `claude-*` path segment that has `scratchpad` after it, anywhere in the cwd. A fixture path under a scratchpad `TMPDIR` holds such a segment, so a fixture cwd that is not a scratchpad gets decoded to the live repository.
+- Cause 2 (production): once `_scratchpad_project` decodes the cwd to a real folder, it calls `_project` on that folder (lines 751, 761, 773). When that folder is itself under a scratchpad, `_project` runs the scratchpad decoder again and returns the outer scratchpad's project.
+- Cause 3 (tests): `test_scratchpad_decodes_punctuation_and_missing_worktree` and `test_scratchpad_removed_worktree_matches_repository_outside_parent` encode the temp root by hand (`"-".join(parts).replace("_", "-")`), which is not Claude's rule (every non-alphanumeric character becomes `-`, `_claude_encoded`). A `TMPDIR` with `.` or another mark in it breaks them; seen with `TMPDIR=/dev/shm/shotrep.XXXX`.
+- Fix 1: the scan takes the folders that hold Claude's per-user temp roots as an explicit input, `scratchpad_roots: tuple[Path, ...]`, threaded from `scan_calls` (and the cached scan path) to `_project` and `_scratchpad_project`. A cwd is a scratchpad cwd only when it lies under one of those roots as `<root>/claude-<name>/<encoded project>/…/scratchpad…`. The default is Claude's real temp parents, `(Path("/tmp"), Path("/private/tmp"))`; `shot_report.py` keeps the default. One rule, no second "match anywhere" mode.
+- Fix 2: after a decode finds a real folder, its project comes from the git lookup alone (the repository step of `_project`), never from another scratchpad decode. Factor that step into one private helper that both paths call, so there is one git lookup, not two.
+- Fix 3: every test that builds an encoded project name uses `_claude_encoded` (or the same regex), and every scratchpad fixture lives under the test's own temp root and passes that root as `scratchpad_roots`. The test that uses a literal `/tmp/claude-1000/...` cwd moves under its temp root too.
+- New tests: (a) a fixture repository whose path lies under a scratchpad-shaped folder (`<root>/claude-9/-x-y/s/scratchpad/repo`), used as a plain cwd with `scratchpad_roots=(other_root,)`, resolves to `repo` with attribution `repository`; (b) a scratchpad cwd that decodes to a folder under another scratchpad-shaped folder resolves to that folder's own repository, not the outer one.
+- Real-path check: scan the live transcripts before and after the change with the roots `shot_report.py` uses — the local roots and the Mac mirror roots (Mac scratchpads may sit under another temp parent; if they do, add that parent to the default) — and compare `(project, project_attribution)` counts per source host. Any difference must be named in the summary with its cause; an unexplained shift fails the phase. Save no scan output beyond the count table.
+- No change to record fields, report text, the scan cache format, or `ProjectAttribution`'s members.
+
+**Files:**
+- `scripts/shot_report/transcripts.py` — `scratchpad_roots` input; root-bound scratchpad match; one shared git lookup.
+- `scripts/shot_report/test_transcripts.py` — explicit roots, real encoding rule, the two new tests.
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `scripts/shot_report/transcripts.py` (and `scripts/shot_report/shot_report.py` only if a call site must change).
+- `test` — `scripts/shot_report/test_transcripts.py`: Fix 3 and new tests (a) and (b); runs the module under all three `TMPDIR` forms below.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 13's measurement change re-parses local transcripts once on the first scan after it landed; this phase changes attribution only for cwds that sit under a scratchpad-shaped folder outside the real temp parents, so it needs no `changes.json` entry unless the real-path check shows a shift, in which case report it to the director before any entry is added. The scan cache format is unchanged, so no re-parse is forced.
+
+**Acceptance gate:**
+- `python3 -m unittest discover -s scripts/shot_report -p 'test_*.py'` green three times, with `TMPDIR` set to (1) a folder inside a Claude scratchpad (`/tmp/claude-<uid>/<encoded>/<session>/scratchpad/x`), (2) `/tmp/claude/session/<id>/x`, (3) a `/dev/shm` folder whose name holds a `.`.
+- `basedpyright scripts/shot_report/transcripts.py scripts/shot_report/test_transcripts.py scripts/shot_report/shot_report.py` ends `0 errors, 0 warnings, 0 notes`.
+- The real-path count table shows no unexplained shift.
+- The checkpoint merge gate (`python3 ~/.claude/scripts/production/merge_gate.py --checkout <tree> --tests-only`) green.
