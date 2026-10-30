@@ -217,6 +217,37 @@ class AddStyleTests(unittest.TestCase):
         _ = self.git("add", "--all")
         _ = self.git("commit", "-q", "-m", "Add workspace packages")
 
+    def interrupted_bootstrap_publish(self, path: Path) -> None:
+        injection = """import atomic_file
+real_replace = atomic_file.os.replace
+def interrupted_replace(source, destination):
+    if Path(destination) == Path(os.environ["TEST_STOP_FILE"]):
+        raise OSError("stopped before publish")
+    return real_replace(source, destination)
+atomic_file.os.replace = interrupted_replace
+"""
+        stopped_bootstrap = BOOTSTRAP.replace("real_run_script =", injection + "\nreal_run_script =", 1)
+        with mock.patch.dict(self.env, {"TEST_STOP_FILE": str(path)}), mock.patch.dict(
+            globals(), {"BOOTSTRAP": stopped_bootstrap}
+        ):
+            stopped = self.run_bootstrap(success=False)
+        self.assertEqual(stopped.returncode, 2, stopped.stderr)
+        self.assertIn("stopped before publish", stopped.stderr)
+        self.assertFalse(path.exists())
+        finished = self.run_bootstrap()
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        self.assertEqual(read_production(self.doc).merge_branch, "style/main")
+        self.assertEqual(len(list((self.checkout / add_style.PLAN_DIRECTORY).glob("*.md"))), 4)
+        self.assertIn("## Units", self.doc.read_text())
+        self.assertIn("## Phases", (self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md").read_text())
+        self.assertEqual(sum(call["command"] == "launch.py" for call in self.calls()), 1)
+
+    def test_interrupted_first_production_doc_publish_reruns_bootstrap(self) -> None:
+        self.interrupted_bootstrap_publish(self.doc)
+
+    def test_interrupted_first_unit_plan_publish_reruns_bootstrap(self) -> None:
+        self.interrupted_bootstrap_publish(self.checkout / add_style.PLAN_DIRECTORY / "sample-style-names-unit.md")
+
     def test_pilot_rows_and_package_scopes_are_ready_before_the_showrunner_launches(self) -> None:
         self.add_workspace_packages()
         snapshot = self.root / "bootstrap-at-launch.json"

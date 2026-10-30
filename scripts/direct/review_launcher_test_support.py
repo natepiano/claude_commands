@@ -405,6 +405,7 @@ class ReviewLauncherFixture(unittest.TestCase):
         # The wrapper reaches python3 through ../lib/py, resolved from its own
         # directory.
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "atomic_file.py", lib / "atomic_file.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
