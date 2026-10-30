@@ -1,0 +1,192 @@
+{
+  "workspace_root": "/tmp/verify workspace's $root; literal",
+  "target_directory": "/tmp/verify target's $dir; literal",
+  "workspace_members": [
+    "alpha",
+    "beta",
+    "solo"
+  ],
+  "packages": [
+    {
+      "id": "alpha",
+      "name": "alpha",
+      "manifest_path": "/tmp/verify fixture/alpha/Cargo.toml",
+      "features": {
+        "default": [
+          "fast"
+        ],
+        "fast": [
+          "cycle"
+        ],
+        "cycle": [
+          "fast"
+        ],
+        "graphics": []
+      },
+      "targets": [
+        {
+          "name": "alpha",
+          "kind": [
+            "lib"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "alpha-cli",
+          "kind": [
+            "bin"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "integration",
+          "kind": [
+            "test"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "ignored",
+          "kind": [
+            "test"
+          ],
+          "test": false,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "timing",
+          "kind": [
+            "bench"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "demo",
+          "kind": [
+            "example"
+          ],
+          "test": false,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "gated",
+          "kind": [
+            "example"
+          ],
+          "test": false,
+          "required-features": [
+            "graphics",
+            "dep/window"
+          ],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/gated.rs"
+        }
+      ]
+    },
+    {
+      "id": "beta",
+      "name": "beta",
+      "manifest_path": "/tmp/verify fixture/beta/Cargo.toml",
+      "features": {},
+      "targets": [
+        {
+          "name": "beta",
+          "kind": [
+            "proc-macro"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "beta-cli",
+          "kind": [
+            "bin"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "integration",
+          "kind": [
+            "test"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        }
+      ]
+    },
+    {
+      "id": "solo",
+      "name": "solo",
+      "manifest_path": "/tmp/verify fixture/solo/Cargo.toml",
+      "features": {},
+      "targets": [
+        {
+          "name": "solo",
+          "kind": [
+            "rlib"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "solo-cli",
+          "kind": [
+            "bin"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "solo-test",
+          "kind": [
+            "test"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        },
+        {
+          "name": "solo-bench",
+          "kind": [
+            "bench"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/demo.rs"
+        }
+      ]
+    },
+    {
+      "id": "external",
+      "name": "external",
+      "manifest_path": "/tmp/verify fixture/external/Cargo.toml",
+      "features": {},
+      "targets": [
+        {
+          "name": "bad-external",
+          "kind": [
+            "example"
+          ],
+          "test": true,
+          "required-features": [],
+          "src_path": "scripts/direct/fixtures/verify_metadata/sources/bad.rs"
+        }
+      ]
+    }
+  ]
+}

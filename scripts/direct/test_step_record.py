@@ -7,6 +7,9 @@ import os
 from pathlib import Path
 import tempfile
 import socket
+import subprocess
+import sys
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +17,50 @@ from scripts.direct import step_record as steps
 
 
 class StepRecordTests(unittest.TestCase):
+    def test_cli_updates_records_without_importing_argument_or_dataclass_machinery(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            proc = root / "proc/42"
+            proc.mkdir(parents=True)
+            _ = (proc / "stat").write_text("42 (verify) S " + "0 " * 18 + "123 0\n")
+            boot = root / "proc/sys/kernel/random"
+            boot.mkdir(parents=True)
+            _ = (boot / "boot_id").write_text("boot")
+            environment = {**os.environ, "VERIFY_STEPS_DIR": folder,
+                           "VERIFY_PROC_ROOT": str(root / "proc"), "BUILDLOG_DIR": str(root / "log")}
+            launcher = """import runpy, sys
+
+def reject_optional_import(event, arguments):
+    if event == "import" and arguments[0] in ("argparse", "dataclasses", "inspect"):
+        raise RuntimeError("unnecessary CLI import: " + arguments[0])
+
+sys.addaudithook(reject_optional_import)
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+            operations = (
+                (["write", "--call-id", "cli", "--pid", "42", "--repo", folder, "--kind", "lint",
+                  "--runs-on", "natedev_only", "--reason", "local lint", "--state", "waiting_hold"], 0),
+                (["state", "--call-id", "cli", "on_natedev"], 0),
+                (["stopped", "--call-id", "cli", "--consumed", str(root / "consumed")], 1),
+                (["remove", "--call-id", "cli"], 0),
+            )
+            for arguments, expected_status in operations:
+                with self.subTest(command=arguments[0]):
+                    result = subprocess.run([sys.executable, "-c", launcher, str(Path(steps.__file__)),
+                                             *arguments], env=environment, capture_output=True, text=True,
+                                            timeout=30)
+                    self.assertEqual(result.returncode, expected_status, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(result.stderr, "")
+                    if arguments[0] == "write":
+                        row = cast(dict[str, object], json.loads((root / "cli.json").read_text()))
+                        self.assertEqual(row["runs_on"], {"kind": "natedev_only", "reason": "local lint"})
+                        self.assertEqual(row["package"], None)
+                    elif arguments[0] == "state":
+                        self.assertEqual(cast(dict[str, object], json.loads((root / "cli.json").read_text()))["state"], "on_natedev")
+            self.assertFalse((root / "cli.json").exists())
+
     def test_record_lifecycle_preserves_decision_and_changes_location(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

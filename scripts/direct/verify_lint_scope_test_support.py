@@ -324,10 +324,11 @@ if __name__ == "__main__":
     def isolate_path_without_taplo(self) -> None:
         tools = self.root / "tools"
         tools.mkdir()
+        hash_tool = "sha256sum" if shutil.which("sha256sum") else "shasum"
         for name in (
             "bash", "python3", "awk", "cat", "cut", "date", "dirname", "env", "grep",
             "head", "mkdir", "mktemp", "mv", "ps", "rm", "sed", "sleep",
-            "sort", "tail", "tee", "tr", "uname", "wc",
+            "sort", "tail", "tee", "tr", "uname", "wc", hash_tool,
         ):
             executable = shutil.which(name)
             if executable is None:

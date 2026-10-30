@@ -136,7 +136,8 @@ if finished.exists() and not Path(os.environ["TEST_MAC_EVENTS"]).exists() and (a
         helpers = [cast(dict[str, object], json.loads(line)) for line in
                    (self.fixture.root / "between-steps").read_text().splitlines()]
         self.assertTrue(any(row["args"] == ["+nightly", "fmt", "--version"] for row in helpers))
-        self.assertTrue(any(cast(list[str], row["args"])[:1] == ["metadata"] for row in helpers))
+        self.assertEqual(len([event for event in self.fixture.cargo_events()
+                              if event["args"][:1] == ["metadata"]]), 1)
         self.assertTrue(all(row["state"] == "local_noncompiling" for row in helpers), helpers)
         self.assertTrue(any("clippy" in cast(list[str], row["args"]) for row in self.mac_rows()))
         self.assert_removed()
