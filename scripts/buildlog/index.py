@@ -31,7 +31,7 @@ from urllib.parse import quote
 import store
 
 SCHEMA_VERSION = 23
-# Step and call fields under a former name, renamed in the file on its next read.
+# Step and call fields under a former name, read as the current name.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
 MARK_BYTES = 256
@@ -660,41 +660,8 @@ def marks(handle: BinaryIO, offset: int) -> str:
     return head.hex() + ":" + handle.read(offset - start).hex()
 
 
-def migrate_worker_fields(path: Path) -> None:
-    """Rename old step/call fields once under the same lock as appenders."""
-    with path.open("r+b") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        data = handle.read()
-        end = data.rfind(b"\n") + 1
-        lines: list[bytes] = []
-        changed = False
-        for raw in data[:end].splitlines(keepends=True):
-            try:
-                value = cast(object, json.loads(raw))
-            except ValueError:
-                lines.append(raw)
-                continue
-            if isinstance(value, dict):
-                fields = cast(dict[str, object], value)
-                renamed = [(old, new) for old, new in FORMER_FIELDS if old in fields]
-                if fields.get("kind") in ("step", "call") and renamed:
-                    for old, new in renamed:
-                        _ = fields.setdefault(new, fields[old])
-                        del fields[old]
-                    raw = (json.dumps(fields, ensure_ascii=False) + "\n").encode()
-                    changed = True
-            lines.append(raw)
-        if changed:
-            _ = handle.seek(0)
-            _ = handle.write(b"".join(lines) + data[end:])
-            _ = handle.truncate()
-            handle.flush()
-            os.fsync(handle.fileno())
-
-
 def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple[int, str] | None) -> int:
     """Index the complete lines past the stored offset; returns the lines read."""
-    migrate_worker_fields(path)
     with path.open("rb") as handle:
         size = os.fstat(handle.fileno()).st_size
         offset = 0
@@ -720,6 +687,10 @@ def read_file(connection: sqlite3.Connection, path: Path, src: str, known: tuple
             if not isinstance(record, dict):
                 continue
             typed = cast(dict[str, object], record)
+            if typed.get("kind") in ("step", "call"):
+                for old, new in FORMER_FIELDS:
+                    if old in typed:
+                        _ = typed.setdefault(new, typed[old])
             adder = ADDERS.get(str(typed.get("kind")))
             if adder is not None:
                 adder(connection, typed, src)

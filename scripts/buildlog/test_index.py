@@ -228,19 +228,19 @@ class IndexTests(unittest.TestCase):
     def ids(self) -> list[object]:
         return [row[0] for row in self.rows("SELECT id FROM steps ORDER BY id")]
 
-    def test_first_index_read_migrates_worker_fields_and_preserves_incomplete_appends(self) -> None:
+    def test_first_index_read_maps_worker_fields_and_leaves_source_unchanged(self) -> None:
         partial = encode(step("pending", worker="next"))[:20]
         self.write(self.host_file, step("old-step", seat="impl", delegate_session="run-1"),
                    call("old-call", seat="test"))
         with self.host_file.open("ab") as output:
             _ = output.write(partial)
+        original = self.host_file.read_bytes()
         self.assertEqual(index.update(), 2)
         self.assertEqual(self.rows("SELECT worker FROM steps"), [("impl",)])
         self.assertEqual(self.rows("SELECT worker FROM calls"), [("test",)])
         rewritten = self.host_file.read_bytes()
         self.assertEqual(self.rows("SELECT unit_session FROM steps"), [("run-1",)])
-        self.assertNotIn(b'"seat"', rewritten)
-        self.assertNotIn(b'"delegate_session"', rewritten)
+        self.assertEqual(rewritten, original)
         self.assertTrue(rewritten.endswith(partial))
         modified = self.host_file.stat().st_mtime_ns
         self.assertEqual(index.update(), 0)

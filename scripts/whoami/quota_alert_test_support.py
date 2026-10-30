@@ -481,3 +481,32 @@ class CodexZeroEpisodeFixture(unittest.TestCase):
         self.assertFalse(any(row["kind"] == "requested" for row in moves.read_moves()))
         self.assertEqual(accounts.role_account("workers").label, "codex1")
         self.assertEqual(next_moves.read_next_moves(), (head,))
+
+
+class CodexRerunFixture(CodexZeroEpisodeFixture):
+    """Persist fake assignments while the real alert state and journal survive a stop."""
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = (self.root / "rerun-assignments.json").write_text(json.dumps({
+            "direct": "codex", "module_review": "codex", "cli": "claude", "ask_a_friend": "caller"}))
+        _ = self.enterContext(mock.patch.object(quota_alert, "registry_assignments", side_effect=self.read_assignments))
+        _ = self.enterContext(mock.patch.object(quota_alert, "edit_registry", side_effect=self.edit_assignments))
+        _ = self.enterContext(mock.patch.object(accounts, "check_codex_target", return_value=
+            accounts.SelectableCodexAccount(self.root / ".codex3", "account3@example.invalid", "codex3")))
+
+    def read_assignments(self) -> dict[str, str]:
+        return cast(dict[str, str], json.loads((self.root / "rerun-assignments.json").read_text()))
+
+    def edit_assignments(self, editor: str, *arguments: str) -> str | None:
+        assignments = self.read_assignments()
+        if editor == "agents_set_all_assignments":
+            assignments = {key: arguments[0] if family in ("codex", "claude") else family
+                           for key, family in assignments.items()}
+        elif editor == "agents_set_assignment":
+            assignments[arguments[0]] = arguments[1]
+        else:
+            raise AssertionError("unexpected registry editor")
+        _ = (self.root / "rerun-assignments.json").write_text(json.dumps(assignments))
+        return None
