@@ -7,7 +7,6 @@ make replay after an interrupted state update safe without scanning old logs.
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import os
 from collections import Counter
@@ -21,7 +20,7 @@ import record
 import store
 
 STATE_NAME = "launches_state.json"
-LOCK_NAME = "launches.lock"
+LOCK_NAME = record.LAUNCH_LOCK_NAME
 MARK_BYTES = 256
 
 
@@ -178,21 +177,7 @@ def launch_record(
 
 
 def save_launch(record_data: dict[str, object]) -> bool:
-    identity = str(record_data["id"])
-    digest = hashlib.sha256(identity.encode()).hexdigest()
-    path = store.root() / str(record_data["host"]) / f"launch-{digest}.jsonl"
-    if path.exists():
-        return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-    try:
-        _ = temporary.write_text(json.dumps(record_data, separators=(",", ":")) + "\n")
-        _ = os.link(temporary, path)
-    except FileExistsError:
-        return False
-    finally:
-        temporary.unlink(missing_ok=True)
-    return True
+    return record.write_launch_line(record_data)
 
 
 def collect_file(
@@ -303,6 +288,16 @@ def collect() -> LaunchCounts:
             counts.update(file_counts)
             unresolved += file_unresolved
             added += count
+        for path in sorted(record.pending_launches_root().glob("*.json")):
+            try:
+                published = record.finish_pending_launch(path)
+                counts[LaunchOutcome.RECORDED] += 1
+                if published.added:
+                    added += 1
+                    if published.unknown_worktree:
+                        unresolved += 1
+            except (OSError, ValueError):
+                continue
         temporary = state_path.with_name(state_path.name + f".{os.getpid()}.tmp")
         _ = temporary.write_text(json.dumps(state, separators=(",", ":")))
         _ = temporary.replace(state_path)

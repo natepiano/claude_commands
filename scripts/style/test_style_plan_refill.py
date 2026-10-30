@@ -81,21 +81,79 @@ class StylePlanTests(StylePlanFixture):
                 self.assertEqual(self.run_next(), (3, f"waiting for sync: read crates/alpha: main touched {path}\n", ""))
                 self.assertEqual(self.count_tickets(), 0)
 
-    def test_refill_holds_for_a_rename_in_another_crate(self) -> None:
+    def test_refill_starts_after_a_rename_in_another_crate(self) -> None:
         _ = self.rule("read")
         self.sync()
         _ = self.git("mv", self.sources[2], "crates/beta/src/moved.rs")
         _ = self.commit()
-        self.assertEqual(self.run_next(), (3, "waiting for sync: touched set unknown: rename or copy in main range\n", ""))
-        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["base"], self.tip)
+        self.assertEqual(self.sync_wait_rows(), [])
 
-    def test_refill_holds_for_a_copy_in_another_crate(self) -> None:
+    def test_refill_starts_after_a_copy_in_another_crate(self) -> None:
         _ = self.rule("read")
         self.sync()
         self.write("crates/beta/src/copied.rs", (self.repo / self.sources[2]).read_text())
         _ = self.commit()
-        self.assertEqual(self.run_next(), (3, "waiting for sync: touched set unknown: rename or copy in main range\n", ""))
-        self.assertEqual(self.count_tickets(), 0)
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["base"], self.tip)
+        self.assertEqual(self.sync_wait_rows(), [])
+
+    def test_main_changes_reads_a_weak_copy_as_an_added_path(self) -> None:
+        source = self.sources[2]
+        shared = "".join(f"pub fn shared_{index:02d}() {{}}\n" for index in range(10))
+        self.write(source, shared)
+        self.commit_to_every_checkout()
+        copied = "crates/beta/src/copied.rs"
+        self.write(copied, shared + "".join(f"pub fn added_{index:02d}() {{}}\n" for index in range(8)))
+        main = self.commit()
+        detected = self.git("log", "--format=", "--name-status", "-M", "-C", "--find-copies-harder",
+                            f"{self.tip}..{main}")
+        self.assertRegex(detected, rf"^C0[56]\d\t{source}\t{copied}$")
+        self.assertEqual(style_plan.main_changes(self.ledger(), "main", self.tip),
+                         style_plan.MainChanges(main, frozenset({copied}), ("crates/alpha", "crates/beta")))
+
+    def test_main_changes_reads_both_rename_paths(self) -> None:
+        old, new = self.sources[2], "crates/beta/src/moved.rs"
+        _ = self.git("mv", old, new)
+        main = self.commit()
+        self.assertEqual(style_plan.main_changes(self.ledger(), "main", self.tip),
+                         style_plan.MainChanges(main, frozenset({old, new}), ("crates/alpha", "crates/beta")))
+
+    def test_ticket_sync_check_uses_only_the_copy_destination(self) -> None:
+        source, copied = self.sources[2], "crates/beta/src/copied.rs"
+        self.write(copied, (self.repo / source).read_text())
+        _ = self.commit()
+        changes = style_plan.main_changes(self.ledger(), "main", self.tip)
+        for path in (source, self.sources[0], copied):
+            with self.subTest(path=path):
+                expected = style_plan.SyncNeeded(f"main touched {copied}") if path == copied else style_plan.SyncNotNeeded()
+                self.assertEqual(style_plan.ticket_sync_check(changes, (path,)), expected)
+
+    def test_ticket_sync_check_uses_both_rename_paths(self) -> None:
+        old, new = self.sources[2], "crates/beta/src/moved.rs"
+        _ = self.git("mv", old, new)
+        _ = self.commit()
+        changes = style_plan.main_changes(self.ledger(), "main", self.tip)
+        for path in (old, new, self.sources[0], self.sources[3]):
+            with self.subTest(path=path):
+                expected = style_plan.SyncNeeded(f"main touched {path}") if path in (old, new) else style_plan.SyncNotNeeded()
+                self.assertEqual(style_plan.ticket_sync_check(changes, (path,)), expected)
+
+    def test_ticket_sync_check_protects_build_inputs_after_copies_and_renames(self) -> None:
+        ledger = self.ledger()
+        for operation, path in (("copy", "Cargo.lock"), ("copy", "crates/alpha/build.rs"),
+                                ("rename", "Cargo.toml"), ("rename", "crates/alpha/Cargo.toml")):
+            with self.subTest(operation=operation, path=path):
+                _ = self.git("reset", "--hard", self.tip)
+                if operation == "copy":
+                    self.write(path, (self.repo / self.sources[2]).read_text())
+                else:
+                    _ = self.git("mv", path, path + ".old")
+                _ = self.commit()
+                changes = style_plan.main_changes(ledger, "main", self.tip)
+                self.assertEqual(style_plan.ticket_sync_check(changes, self.sources[:1]),
+                                 style_plan.SyncNeeded(f"main touched {path}"))
 
     def test_refill_holds_when_the_synced_tip_is_missing(self) -> None:
         _ = self.rule("read")

@@ -1002,6 +1002,8 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
     if request.production.log.exists() and recorded in request.production.log.read_text(encoding="utf-8"):
         report("record", "ok", "checkpoint already recorded")
         return
+    detail = ("review ledger and production log updated" if isinstance(request.kind, CodeCheckpoint)
+              else f"{'shrink' if isinstance(request.kind, ShrinkCommit) else 'as-built'} logged without review-ledger row")
     if isinstance(request.kind, CodeCheckpoint):
         numbers = request.review_trial
         if isinstance(numbers, NoReviewTrial):
@@ -1022,13 +1024,14 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
         if result.returncode:
             raise Stop("record", "failed", result.stderr.strip() or result.stdout.strip(),
                        "the showrunner will repair the review record and rerun")
+        if result.stdout.startswith("kept "):
+            detail = result.stdout.strip() + "; " + detail
     request.production.log.parent.mkdir(parents=True, exist_ok=True)
     with request.production.log.open("a", encoding="utf-8") as log:
         suffix = "; promoted" if isinstance(request.promotion, production_doc.PromoteTo) else ""
         _ = log.write(f"- {datetime.now(request.production.zone):%H:%M %Z}: {request.unit.name} phase {request.phase} "
                       + f"({request.commit}) merged as {merge_head}; {tests_green} green; pushed{suffix}\n")
-    report("record", "ok", "review ledger and production log updated" if isinstance(request.kind, CodeCheckpoint)
-           else f"{'shrink' if isinstance(request.kind, ShrinkCommit) else 'as-built'} logged without review-ledger row")
+    report("record", "ok", detail)
 
 
 def end_phase_scratch(request: MergeRequest) -> None:
