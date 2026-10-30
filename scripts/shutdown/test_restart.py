@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+from scripts.lib import names
+from scripts.lib.test_names import fixture_names
+
 import copy
 import io
 from types import SimpleNamespace
@@ -21,7 +24,7 @@ from collections.abc import Callable, Iterable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, TypedDict, cast, final, override
+from typing import BinaryIO, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
@@ -326,11 +329,14 @@ class RestartTests(ShutdownTestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         _ = self.enterContext(patch.object(quota_alert, "tell_user",
             side_effect=AssertionError("restart test must fake the fallback push")))
         # Mac cases override the shared Linux fixture locally.
         linux_process_fixture(self)
         _ = self.enterContext(patch.object(herdr, "security_session", return_value=herdr.DesktopSession()))
+        _ = self.enterContext(patch.object(restart, "_prepare_restore_server"))
+        _ = self.enterContext(patch.object(herdr.Herdr, "close_restore_placeholders"))
         # Every restart lands in the one shared session; the herdr fixture names it `writing`.
         _ = self.enterContext(patch.object(herdr, "shared_session", return_value="writing"))
         _ = self.enterContext(patch.object(restart, "_folder_exists", return_value=True))
@@ -877,6 +883,46 @@ class RestartTests(ShutdownTestCase):
                 self.assertNotIn("private-thread-", text)
                 persisted = next(item for item in record.session_records(LOGIN) if item["session"]["session_id"] == owner["session_id"])
                 self.assertEqual(persisted["progress"]["kind"], "restarted")
+
+    def test_restarted_unit_keeps_its_adopted_reviewer_and_queue_with_the_pool_archive_unreadable(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
+        owner = unit("adopted-review-owner")
+        run = self.root / "adopted-review-run"
+        run.mkdir()
+        name = "project-review"
+        thread = "adopted-private-thread"
+        archive = self.root / "review-pool"
+        archive.mkdir()
+        roster = run / "mesh_roster.json"
+        _ = roster.write_text(json.dumps({name: {"thread_id": thread, "role": "review",
+                                               "status": "paused", "slot": "review"}}))
+        inbox = run / (name + ".pending.json")
+        _ = inbox.write_text(json.dumps({"thread_id": thread, "messages": ["finish the saved review"]}))
+        before = {path: path.read_bytes() for path in (roster, inbox)}
+        saved = entry(owner)
+        saved["codex_seats"] = [record.PausedSeat(run_dir=str(run), seat=name, role="review", thread_id=thread,
+                                                  turn_live=False, launcher_command=[])]
+        self.create([saved])
+        commands = CommandRecorder()
+        original_open = Path.open
+
+        def refuse_archive(path: Path, mode: str = "r", buffering: int = -1,
+                           encoding: str | None = None, errors: str | None = None,
+                           newline: str | None = None) -> TextIO | BinaryIO:
+            if path.is_relative_to(archive):
+                raise AssertionError(f"restart read the archive: {path}")
+            return cast(TextIO | BinaryIO, original_open(path, mode, buffering, encoding, errors, newline))
+
+        with patch.dict(os.environ, {"REVIEW_POOL_STATE": str(archive)}), \
+                patch.object(Path, "open", refuse_archive), patch.object(restart, "_run", commands):
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
+        sends = [argv for argv in commands.calls if "resume-workers-" + owner["session_id"] in argv]
+        self.assertEqual(len(sends), 1)
+        self.assertIn("Your next dispatch with --to project-review resumes it.",
+                      sends[0][sends[0].index("--text") + 1])
+        self.assertNotIn(thread, sends[0][sends[0].index("--text") + 1])
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual(self.stored_record()["progress"]["kind"], "restarted")
 
     def test_confirmed_top_level_restart_with_a_paused_seat_also_gets_the_resume_message(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
@@ -1951,11 +1997,11 @@ class RestartTests(ShutdownTestCase):
                 self.assertFalse(any(row[2:4] in (["workspace", "list"], ["workspace", "close"])
                                      for row in calls))
 
-    def test_a_started_shared_server_that_keeps_its_layout_restores_its_other_panes_once(self) -> None:
+    def test_started_server_does_not_restore_unselected_panes_before_its_requested_session(self) -> None:
         import pane_restore
 
         owner, _, _ = self.herdr_restart_fixture()
-        for server, kept, restored in ((herdr.ServerCreated(), True, [call("writing", dry_run=False)]),
+        for server, kept, restored in ((herdr.ServerCreated(), True, []),
                                        (herdr.ServerCreated(), False, []), (herdr.ServerAdopted(), True, [])):
             with (self.subTest(server=server, kept=kept), patch.object(herdr, "restore_server", return_value=server),
                   patch.object(herdr, "keeps_restored_layout", return_value=kept),
@@ -1969,7 +2015,8 @@ class RestartTests(ShutdownTestCase):
                   patch.object(pane_restore, "restore", side_effect=[failed]), redirect_stdout(io.StringIO()) as output):
                 result = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
                 self.assertIsInstance(result, restart.SessionLaunched)
-                self.assertIn("writing restart issue: pane restore left panes not resumed", output.getvalue())
+                restore.assert_not_called()
+                self.assertNotIn("pane restore left panes", output.getvalue())
 
     def test_ssh_mac_refusal_keeps_claude_records_restartable_and_reaches_peer_json(self) -> None:
         _ = self.enterContext(patch.object(settle, "_deliver_message", return_value=settle.MessageSent(kind="sent")))
@@ -2381,18 +2428,49 @@ class RestartTests(ShutdownTestCase):
         _ = cast(object, self.enterContext(patch.object(herdr, "server_environment", return_value={})))
         _ = cast(object, self.enterContext(patch.object(herdr.Herdr, "pane_activity", return_value=herdr.PaneAtShell())))
         # The fake server records a tab as a workspace it creates; workspace layout is herdr's own test.
-        def open_tab(name: str, _space: str, _title: str, cwd: str, environment: dict[str, str]) -> str:
+        def open_tab(name: str, _space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
             client = herdr.Herdr(name)
             arguments = ["workspace", "create", "--label", name, "--cwd", cwd]
             for key, value in {**environment, "HERDR_AGENT_PANE": "1"}.items():
                 arguments.extend(["--env", f"{key}={value}"])
             root_pane = herdr.json_object(client.result(*arguments, "--no-focus").get("root_pane"), "fake root pane")
             pane = herdr.json_text(root_pane.get("pane_id"), "fake root pane id")
-            _ = client.run("pane", "rename", pane, name)
+            _ = client.run("pane", "rename", pane, title)
             return pane
 
         _ = cast(object, self.enterContext(patch.object(herdr, "open_tab", open_tab)))
         return owner, responses, log
+
+    def test_restart_keeps_session_name_in_saved_layout_pane_and_attach_hint(self) -> None:
+        from scripts.herdr.test_herdr import TitledLayoutHerdr
+        owner = self.herdr_restart_fixture()[0]
+        _ = self.enterContext(patch.object(herdr, "herdr_processes", return_value=[]))
+        old = TitledLayoutHerdr()
+        _ = old.open_tab("ad-hoc", owner["name"], owner["cwd"], {})
+        _ = old.open_tab("ad-hoc", "other-key", owner["cwd"], {})
+        fresh = TitledLayoutHerdr()
+        _ = fresh.open_tab("ad-hoc", "other-key", owner["cwd"], {})
+
+        def open_tab(host: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
+            self.assertEqual(host, "fixture")
+            return fresh.open_tab(space, title, cwd, environment)
+
+        parts = restart._resume_parts(owner, "restart")  # pyright: ignore[reportPrivateUsage]
+        parts = replace(parts, environment={**parts.environment, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"})
+        with patch.object(names, "runtime_names", return_value=fixture_names(director="coordinator")), \
+                patch.object(herdr, "restore_server", return_value=herdr.ServerAdopted()), \
+                patch.object(herdr, "Herdr", return_value=fresh), \
+                patch.object(herdr, "open_tab", side_effect=open_tab), \
+                patch.object(herdr, "start_agent", return_value=SUBMITTED_PROMPT):
+            launched = restart._herdr_launch(parts,  # pyright: ignore[reportPrivateUsage]
+                restart.SharedHerdrTab("fixture"), owner, dry_run=False)
+        self.assertEqual(launched.prompt_outcome, SUBMITTED_PROMPT)
+        self.assertEqual([tab["pane_label"] for tab in fresh.tabs], [owner["name"], "other-key"])
+        found = fresh.lookup(owner["name"])
+        self.assertIsInstance(found, herdr.PaneFound)
+        self.assertEqual(fresh.tabs[0]["label"], owner["name"])
+        self.assertEqual(fresh.lookup(fresh.tabs[0]["label"]), found)
+        self.assertTrue(herdr.attach_hint("ad-hoc", owner["name"]).endswith("tab " + owner["name"]))
 
     def test_shared_tab_restart_carries_its_destination_transcript_and_failed_submit_outcome(self) -> None:
         owner, _responses, _log = self.herdr_restart_fixture()
@@ -3466,7 +3544,9 @@ class RestartTests(ShutdownTestCase):
     def test_a_folder_no_account_trusts_refuses_in_the_dry_run_and_saves_the_trust_command(self) -> None:
         owner, _, log = self.herdr_restart_fixture()
         config_dir = Path(owner.get("config_dir", ""))
-        _ = (config_dir / ".claude.json").write_text('{"projects": {}}')
+        _ = (config_dir / ".claude.json").write_text(json.dumps({
+            "projects": {}, "oauthAccount": {"emailAddress": "third@example.invalid"},
+        }))
         command = f"cd {shlex.quote(owner['cwd'])} && {named_prefix(str(config_dir))}claude"
         saved = entry(owner)
         self.create([saved])
@@ -3507,7 +3587,7 @@ class RestartTests(ShutdownTestCase):
                 self.assertEqual(record.session_records(LOGIN)[0]["session"]["cwd"], str(new if moved else old))
                 self.assertIn("checkout move", output.getvalue())
 
-    def test_a_restore_whose_folder_is_gone_is_dropped_and_frees_the_account_hold(self) -> None:
+    def test_a_restore_whose_folder_is_gone_fails_and_keeps_its_record_and_hold(self) -> None:
         for dry_run in (True, False):
             with self.subTest(dry_run=dry_run), patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / f"gone-{dry_run}")}):
                 saved = entry(top_level("gone", name="dashboard", cwd="/tmp/no-such-folder",
@@ -3522,15 +3602,16 @@ class RestartTests(ShutdownTestCase):
                 with patch.object(restart, "_folder_exists", return_value=False), \
                      patch.object(restart, "_launch_session") as launch, patch.object(restart, "_retire"), \
                      redirect_stdout(output):
-                    self.assertEqual(restart.up(LOGIN, dry_run=dry_run), 0)
+                    self.assertEqual(restart.up(LOGIN, dry_run=dry_run), 1)
                 launch.assert_not_called()
-                self.assertIn("dashboard: folder /tmp/no-such-folder no longer exists; restore dropped", output.getvalue())
+                self.assertIn("folder /tmp/no-such-folder no longer exists; restore the folder", output.getvalue())
+                self.assertIn("shutdown.py restart", output.getvalue())
                 if dry_run:
                     self.assertEqual(record.session_records(LOGIN), [saved])
                     self.assertIsNotNone(record.account_hold(LOGIN))
                 else:
-                    self.assertEqual(record.session_records(LOGIN), [])
-                    self.assertIsNone(record.account_hold(LOGIN))
+                    self.assertEqual(record.session_records(LOGIN)[0]["progress"]["kind"], "restart failed")
+                    self.assertIsNotNone(record.account_hold(LOGIN))
 
     def test_herdr_restart_does_not_accept_trust_from_an_ancestor_folder(self) -> None:
         owner, _, log = self.herdr_restart_fixture()
@@ -3934,6 +4015,22 @@ class RestartTests(ShutdownTestCase):
         self.assertIn('restarted 2026-01-15 10:00 PST', january_note)
         self.assertIn('It left no note of where it was', january_note)
         self.assertNotIn('Before it you wrote', january_note)
+
+    def test_forced_stop_note_requires_tree_and_worker_checks_without_deleting_locks(self) -> None:
+        saved = entry(unit("forced"))
+        saved["force_stop_note"] = "stopped by force at 60 s, no ready line"
+        note = restart.restart_note(saved, RESTARTED)
+        for text in ("stopped by force at 60 s, no ready line", "git status", "MERGE_HEAD", ".git/index.lock", "workers",
+                     "Do not remove index.lock automatically"):
+            self.assertIn(text, note)
+
+    def test_restart_note_names_saved_workers_and_their_mid_turn_state(self) -> None:
+        saved = entry(unit("paused-director"))
+        saved["codex_seats"] = [record.PausedSeat(run_dir="/run", seat="impl", role="impl", thread_id="kept", turn_live=True, launcher_command=[])]
+        note = restart.restart_note(saved, RESTARTED)
+        self.assertIn("Saved workers: impl (paused mid-turn).", note)
+        self.assertIn("implement.sh --to", note)
+        self.assertIn("existing thread", note)
 
     def test_restart_note_adds_only_missing_sentence_punctuation(self) -> None:
         for summary in ('finished the work.', 'finished the work'):
@@ -4492,7 +4589,7 @@ class RestartTests(ShutdownTestCase):
         clock = [1000.0]
         sent: list[str] = []
         def send(_push: RenderedPush, **_kwargs: object) -> bool:
-            pending = records[len(sent) + 1:]
+            pending = [saved for saved in records if saved["session"]["name"] not in {*sent, _push.values["session"]}]
             for saved in pending:
                 claim = outage_alerts.claim(saved["session"]["session_id"])
                 self.assertIsInstance(claim, outage_alerts.AlertClaim)
@@ -5110,8 +5207,8 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(restart.up(LOGIN), 0)
         self.assertEqual({saved["session"]["session_id"] for saved in launched}, {"recorded", "crashed"})
         self.assertEqual(next(saved["session"]["cwd"] for saved in launched if saved["session"]["session_id"] == "recorded"), owner["cwd"])
-        self.assertEqual(purposes, ["crashed"])
-        self.assertIn("recorded: from shutdown record", output.getvalue())
+        self.assertCountEqual(purposes, ["crashed", "recorded"])
+        self.assertNotIn("from shutdown record", output.getvalue())
         self.assertIn("crashed: from snapshot taken", output.getvalue())
         retained = record.read_snapshot(LOGIN)
         assert not isinstance(retained, record.NoRecoverySnapshot)
@@ -5168,7 +5265,7 @@ class RestartTests(ShutdownTestCase):
         restored = cast(SessionShutdown, launch.call_args.args[0])
         self.assertEqual(restored["session"]["host"], owner["host"])
         self.assertEqual(restored["request_id"], current["request_id"])
-        self.assertIn("recent-shutdown: from shutdown record", output.getvalue())
+        self.assertNotIn("from shutdown record", output.getvalue())
         self.assertNotIn("from snapshot taken", output.getvalue())
 
     def test_snapshot_retry_uses_persisted_crash_context_without_the_snapshot(self) -> None:
@@ -5395,12 +5492,12 @@ class RestartTests(ShutdownTestCase):
         self.assertIn("already running on third@example.invalid; skipped", output.getvalue())
         self.assertIsNotNone(record.find_session(LOGIN, "moved-again"))
 
-    def test_six_herdr_launches_run_at_once(self) -> None:
-        saved = [entry(top_level(str(index), host=inventory.HerdrHost(kind="herdr", herdr_session=str(index), pane_id="w1:p1", presentation="detached"))) for index in range(6)]
+    def test_nine_herdr_launches_run_at_once(self) -> None:
+        saved = [entry(top_level(str(index), host=inventory.HerdrHost(kind="herdr", herdr_session=str(index), pane_id="w1:p1", presentation="detached"))) for index in range(9)]
         self.create(saved)
         threads: set[int] = set()
         lock = threading.Lock()
-        launches_in_flight = threading.Barrier(6, timeout=HANG_GUARD_SECONDS)
+        launches_in_flight = threading.Barrier(9, timeout=HANG_GUARD_SECONDS)
         launches: list[str] = []
 
         def launch(parts: restart.ResumeParts, destination: restart.HerdrDestination,
@@ -5416,21 +5513,20 @@ class RestartTests(ShutdownTestCase):
             return restart.HerdrLaunch(herdr.ServerAdopted(), SUBMITTED_PROMPT)
 
         def confirm(ids: frozenset[str], timeout: float) -> restart.RegistryConfirmation:
-            self.assertCountEqual(launches, [str(index) for index in range(6)])
+            self.assertCountEqual(launches, [str(index) for index in range(9)])
             return self.all_sessions_live(ids, timeout)
 
         with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=EMPTY_SESSION_IDS),
               patch.object(restart, "_herdr_launch", side_effect=launch),
               patch.object(restart, "_leave_recorded_session") as leave,
               patch.object(restart, "wait_for_confirmation", side_effect=confirm),
-              patch.object(time, "sleep") as sleeping, redirect_stdout(io.StringIO())):
+              patch.object(time, "sleep", wraps=time.sleep) as sleeping, redirect_stdout(io.StringIO())):
             self.assertEqual(restart.up(LOGIN), 0)
-        sleeping.assert_not_called()
-        self.assertEqual(leave.call_count, 6)
-        self.assertCountEqual(launches, [str(index) for index in range(6)])
+        self.assertNotIn(call(1.2), sleeping.call_args_list)
+        self.assertEqual(leave.call_count, 9)
+        self.assertCountEqual(launches, [str(index) for index in range(9)])
 
-        self.assertEqual(restart.RESTART_LAUNCH_WORKERS, 6)
-        self.assertEqual(len(threads), 6)
+        self.assertEqual(len(threads), 9)
         self.assertNotIn(threading.get_ident(), threads)
         self.assertEqual(record.session_records(LOGIN), [])
 
@@ -5444,10 +5540,10 @@ class RestartTests(ShutdownTestCase):
             return restart.SessionLaunched(SUBMITTED_PROMPT)
 
         def wait(ids: frozenset[str], timeout: float) -> restart.RegistryConfirmation:
-            self.assertCountEqual(launched, [str(index) for index in range(8)])
-            self.assertEqual(ids, frozenset(launched))
+            self.assertEqual(len(ids), 1)
+            self.assertTrue(ids <= frozenset(launched))
             self.assertEqual(timeout, restart.SESSION_WAIT_SECONDS)
-            return registry_confirmation(frozenset({"7"}))
+            return registry_confirmation(ids & {"7"})
 
         with patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_launch_session", launch), patch.object(restart, "wait_for_confirmation", wait), redirect_stdout(io.StringIO()):
             self.assertEqual(restart.up(LOGIN), 1)
@@ -5497,8 +5593,10 @@ class RestartTests(ShutdownTestCase):
 
         with patch.object(restart, "_retire"), patch.object(restart, "_launch_session", launch), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", wait), patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")), redirect_stdout(io.StringIO()):
             self.assertEqual(restart.up(LOGIN), 0)
-        self.assertCountEqual(events[:2], ["unit", "showrunner"])
-        self.assertEqual(events[2:], ["wait", "requester", "wait"])
+        self.assertLess(events.index("showrunner"), events.index("unit"))
+        self.assertLess(events.index("unit"), events.index("requester"))
+        self.assertEqual(events.count("wait"), 3)
+        self.assertEqual(events[-2:], ["requester", "wait"])
 
     def test_requester_of_a_separate_request_does_not_wait_on_another_request(self) -> None:
         waiting = entry(top_level("busy"), state=record.SessionWaiting(kind="waiting"))
@@ -5510,6 +5608,189 @@ class RestartTests(ShutdownTestCase):
         with patch.object(restart, "_session_liveness", return_value=restart.SessionLive()):
             self.assertEqual(self.run_restarts(confirmed=frozenset({"requester"})), (0, ["requester"]))
         self.assertEqual(record.session_records(LOGIN), [waiting])
+
+    def test_eligible_requester_confirms_while_unrelated_confirmation_is_held(self) -> None:
+        for dependency_account in ("none", "same", "other"):
+            with self.subTest(dependency_account=dependency_account), patch.dict(os.environ,
+                    {"SHUTDOWN_STATE_DIR": str(self.root / dependency_account)}):
+                saved = [entry(top_level("unrelated")), entry(top_level("requester"))]
+                saved[0]["request_id"] = "unrelated-request"
+                saved[1]["request_id"] = "ready-request"
+                saved[1]["requested_by"] = record.FromSession(kind="session", session_id="requester")
+                dependency_login = "third@example.invalid" if dependency_account == "other" else LOGIN
+                if dependency_account != "none":
+                    dependency = entry(top_level("dependency"))
+                    dependency["request_id"] = "ready-request"
+                    if dependency_account == "other":
+                        dependency.update(login=dependency_login, label="claude3")
+                    saved.append(dependency)
+                self.create(saved)
+                unrelated_confirming = threading.Event()
+                requester_confirmed = threading.Event()
+                dependency_committed = threading.Event()
+                requester_launched = threading.Event()
+                observations: list[bool] = []
+                progress_line = restart.progress_line
+
+                def progress(action: str, name: str, detail: str = "") -> None:
+                    progress_line(action, name, detail)
+                    if action == "back" and name == "requester":
+                        self.assertIsNone(record.find_session(LOGIN, "requester"))
+                        requester_confirmed.set()
+
+                def launch(_saved: SessionShutdown, _note: str, _state: restart.DesktopLaunchState,
+                           *, dry_run: bool) -> restart.SessionLaunched:
+                    del dry_run
+                    name = _saved["session"]["session_id"]
+                    if name == "unrelated" and dependency_account != "none":
+                        self.assertTrue(dependency_committed.wait(HANG_GUARD_SECONDS))
+                    if name == "requester" and dependency_account != "none":
+                        try:
+                            self.assertTrue(dependency_committed.is_set())
+                            dependency_record = record.find_session(dependency_login, "dependency")
+                            self.assertTrue(dependency_record is None or dependency_record["progress"]["kind"] == "restarted")
+                        finally:
+                            requester_launched.set()
+                    return restart.SessionLaunched(SUBMITTED_PROMPT)
+
+                def resume_workers(current: SessionShutdown) -> None:
+                    if current["session"]["session_id"] == "dependency":
+                        # Confirmation is committed; keep archival pending until the
+                        # requester observes that valid settled state.
+                        dependency_committed.set()
+                        self.assertTrue(requester_launched.wait(HANG_GUARD_SECONDS))
+
+                def confirm(ids: frozenset[str], _timeout: float) -> restart.RegistryConfirmation:
+                    if "unrelated" in ids:
+                        unrelated_confirming.set()
+                        # A finite guard releases the old scheduler without hanging the suite.
+                        observations.append(requester_confirmed.wait(HANG_GUARD_SECONDS))
+                    elif "requester" in ids:
+                        self.assertTrue(unrelated_confirming.wait(HANG_GUARD_SECONDS))
+                    return registry_confirmation(ids)
+
+                with (patch.object(restart, "_retire"),
+                      patch.object(restart, "_live_session_ids", return_value=frozenset()),
+                      patch.object(restart, "_launch_recovery_record", side_effect=launch),
+                      patch.object(restart, "wait_for_confirmation", side_effect=confirm),
+                      patch.object(restart, "progress_line", side_effect=progress),
+                      patch.object(restart, "_send_worker_resume", side_effect=resume_workers),
+                      redirect_stdout(io.StringIO()) as output):
+                    result = restart._up("", False, all_accounts=True)  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(result.exit_status, 0, output.getvalue())
+                self.assertEqual(observations, [True], "requester must confirm before unrelated confirmation returns")
+                self.assertEqual(record.all_session_records(), [])
+
+    def test_independent_requesters_launch_and_confirm_concurrently(self) -> None:
+        requesters = [entry(top_level(name)) for name in ("requester-a", "requester-b")]
+        for saved in requesters:
+            saved["request_id"] = saved["session"]["session_id"]
+            saved["requested_by"] = record.FromSession(kind="session", session_id=saved["session"]["session_id"])
+        self.create(requesters)
+        launching = threading.Barrier(2, timeout=5)
+        confirming = threading.Barrier(2, timeout=5)
+
+        def launch(_saved: SessionShutdown, _note: str, _state: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
+            del dry_run
+            _ = launching.wait()
+            return restart.SessionLaunched(SUBMITTED_PROMPT)
+
+        def confirm(ids: frozenset[str], _timeout: float) -> restart.RegistryConfirmation:
+            _ = confirming.wait()
+            return registry_confirmation(ids)
+
+        with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_launch_recovery_record", side_effect=launch),
+              patch.object(restart, "wait_for_confirmation", side_effect=confirm),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.up(LOGIN), 0, output.getvalue())
+        self.assertEqual(record.session_records(LOGIN), [])
+
+    def test_server_start_failure_fails_herdr_sessions_and_continues_other_hosts(self) -> None:
+        snapshot, _codex, _responses, _log = self.codex_recovery_fixture()
+        self.create([entry(top_level("herdr-owner", host=inventory.HerdrHost(kind="herdr",
+            herdr_session="writing", pane_id="w1:p1", presentation="detached"))),
+            entry(top_level("terminal-owner", host=inventory.TerminalHost(kind="terminal")))])
+        with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(inventory, "codex_liveness", return_value=inventory.CodexGone()),
+              patch.object(restart, "_prepare_restore_server", side_effect=herdr.HerdrFailure("server cannot start")),
+              patch.object(restart, "_launch_codex_snapshot") as codex,
+              patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)) as launch,
+              patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live),
+              redirect_stdout(io.StringIO()) as output):
+            result = restart._up("", False, all_accounts=True)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual((result.restarted, result.failed), (1, 2), output.getvalue())
+        self.assertEqual(result.exit_status, 1)
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args[0]["session"]["session_id"], "terminal-owner")
+        codex.assert_not_called()
+        for name in ("herdr-owner", "Codex writing"):
+            self.assertRegex(output.getvalue(), rf"\d\d:\d\d:\d\d  failed  {name}  .*server cannot start")
+        remaining = record.read_snapshot(snapshot["login"])
+        assert not isinstance(remaining, record.NoRecoverySnapshot)
+        self.assertEqual(len(remaining["sessions"]), 1)
+
+    def test_non_herdr_hosts_skip_eager_server_preparation(self) -> None:
+        self.create([entry(top_level("terminal-owner", host=inventory.TerminalHost(kind="terminal")))])
+        with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_prepare_restore_server", side_effect=herdr.HerdrFailure("must not start")) as prepare,
+              patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)),
+              patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.up(LOGIN), 0, output.getvalue())
+        prepare.assert_not_called()
+
+    def test_codex_and_claude_launch_together_after_server_preparation_with_flushed_progress(self) -> None:
+        snapshot, first, _responses, _log = self.codex_recovery_fixture()
+        second = copy.deepcopy(first)
+        second["session"]["session_id"] = "second-codex"
+        second["session"]["name"] = "Codex second"
+        snapshot["sessions"].append(second)
+        record.write_snapshot(snapshot)
+        self.create([entry(showrunner("runner"))])
+        launching = threading.Barrier(3, timeout=5)
+        prepared = threading.Event()
+        lines: list[str] = []
+        real_print = print
+
+        def prepare(_records: Sequence[SessionShutdown], _state: restart.DesktopLaunchState,
+                    _codex: Sequence[tuple[record.RecoverySnapshot, record.SnapshotCodexSession]]) -> None:
+            prepared.set()
+
+        def printed(*values: object, sep: str = " ", end: str = "\n", file: object = None, flush: bool = False) -> None:
+            del file
+            text = sep.join(str(value) for value in values)
+            if "  start " in text or "  back " in text:
+                self.assertTrue(flush)
+                lines.append(text)
+            real_print(*values, sep=sep, end=end, flush=flush)
+
+        def codex(_snapshot: record.RecoverySnapshot, _entry: record.SnapshotCodexSession,
+                  _state: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
+            del dry_run
+            self.assertTrue(prepared.is_set(), "server must be prepared before Codex environment loading")
+            _ = launching.wait()
+            return restart.SessionLaunched()
+
+        def claude(_saved: SessionShutdown, _note: str, _state: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
+            del dry_run
+            _ = launching.wait()
+            return restart.SessionLaunched(SUBMITTED_PROMPT)
+
+        with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(inventory, "codex_liveness", return_value=inventory.CodexGone()),
+              patch.object(restart, "_prepare_restore_server", side_effect=prepare),
+              patch.object(restart, "_launch_codex_snapshot", side_effect=codex),
+              patch.object(restart, "_launch_recovery_record", side_effect=claude),
+              patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")),
+              patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live),
+              patch("builtins.print", side_effect=printed), redirect_stdout(io.StringIO()) as output):
+            result = restart._up("", False, all_accounts=True)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(result.exit_status, 0, output.getvalue())
+        self.assertEqual(result.restarted, 3)
+        for name in ("Codex writing", "Codex second", "runner"):
+            self.assertEqual(sum(f"  start   {name} " in line for line in lines), 1)
+            self.assertEqual(sum(f"  back    {name} " in line for line in lines), 1)
 
     def test_recent_relaunch_claim_is_left_to_its_owner(self) -> None:
         saved = entry(top_level("owner", host=inventory.HerdrHost(kind="herdr", herdr_session="owner", pane_id="w1:p1", presentation="detached")))
@@ -5797,7 +6078,6 @@ class RestartTests(ShutdownTestCase):
         with patch.object(sys, "platform", "linux"), patch.object(restart, "_resume_shell", side_effect=resume), patch.object(restart, "_live_session_ids", return_value=frozenset()), redirect_stdout(output):
             self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
         self.assertEqual(output.getvalue().replace(str(restart.SCRIPTS), "<scripts>").splitlines(), [
-            "alpha: from shutdown record", "manual: from shutdown record", "zeta: from shutdown record",
             f"{sys.executable} <scripts>/message/send.py retire --to session:alpha --from shutdown --key shutdown-owner@example.com-alpha",
             "manual restart alpha: claude --resume alpha",
             f"{sys.executable} <scripts>/message/send.py retire --to session:manual --from shutdown --key shutdown-owner@example.com-manual",
@@ -5828,9 +6108,9 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(restart.restart(restart.AccountNotNamed(), dry_run=False, alerts=restart.NeverAlert()), 0)
         up.assert_called_once_with(LOGIN, False, ())
 
-    def test_window_hosts_launch_serially_on_the_calling_thread_with_spacing(self) -> None:
+    def test_window_hosts_launch_in_worker_threads_without_spacing(self) -> None:
         saved = [
-            # Recorded in the shared session, so this case spaces windows without a move out of another session.
+            # Recorded in the shared session; window presentation must not delay agent startup.
             entry(top_level("c-native", host=inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="attached window"))),
             entry(top_level("d-terminal", host=inventory.TerminalHost(kind="terminal"))),
             entry(top_level("b-zed", host=inventory.WindowHost(kind="zed", window_shell=11, desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot")))),
@@ -5843,20 +6123,21 @@ class RestartTests(ShutdownTestCase):
         def run(argv: list[str], *, dry_run: bool, check: bool = True) -> subprocess.CompletedProcess[str]:
             del check
             self.assertFalse(dry_run)
-            self.assertEqual(threading.get_ident(), caller)
             if argv[0] in {"systemd-run", "open"}:
+                self.assertNotEqual(threading.get_ident(), caller)
                 events.append(next(item["session"]["name"] for item in saved if item["session"]["session_id"] in argv[-1]))
             return subprocess.CompletedProcess(argv, 0, "0", "")
 
-        def sleep(seconds: float) -> None:
-            self.assertEqual(threading.get_ident(), caller)
-            self.assertEqual(seconds, restart.WINDOW_DELAY_SECONDS)
-            events.append("delay")
-
-        with patch.object(herdr, "attached_clients", return_value=herdr.NoClientAttached()), patch.object(restart, "_herdr_launch", return_value=restart.HerdrLaunch(herdr.ServerAdopted(), SUBMITTED_PROMPT)), patch.object(restart, "_retire"), patch.object(restart, "_record_scheduled_restart_prompt"), patch.object(restart, "_run", run), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live), patch.object(time, "sleep", sleep), redirect_stdout(io.StringIO()):
+        with (patch.object(herdr, "attached_clients", return_value=herdr.NoClientAttached()),
+              patch.object(restart, "_herdr_launch", return_value=restart.HerdrLaunch(herdr.ServerAdopted(), SUBMITTED_PROMPT)),
+              patch.object(restart, "_retire"), patch.object(restart, "_record_scheduled_restart_prompt"),
+              patch.object(restart, "_run", run), patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live),
+              patch.object(time, "sleep", wraps=time.sleep) as sleeping, redirect_stdout(io.StringIO())):
             self.assertEqual(restart.up(LOGIN), 1 if sys.platform == "linux" else 0)
-        self.assertEqual(events, ["a-ghostty", "delay", "b-zed", "delay", "c-native"] if sys.platform == "linux" else
-            ["a-ghostty", "delay", "b-zed", "delay", "c-native", "delay", "d-terminal"])
+        self.assertNotIn(call(1.2), sleeping.call_args_list)
+        self.assertCountEqual(events, ["a-ghostty", "b-zed", "c-native"] if sys.platform == "linux" else
+            ["a-ghostty", "b-zed", "c-native", "d-terminal"])
 
     def test_a_competing_relaunch_claim_is_not_confirmed_by_the_losing_caller(self) -> None:
         saved = entry(top_level("owner", host=inventory.HerdrHost(kind="herdr", herdr_session="owner", pane_id="w1:p1", presentation="detached")))
@@ -6371,6 +6652,58 @@ class RestartTests(ShutdownTestCase):
                 timer.assert_not_called()
                 self.assertEqual(self.stored_record()["progress"], replacement)
 
+    def test_stop_after_confirmation_claim_check_prevents_resume_and_timer_restore(self) -> None:
+        saved = entry(top_level("owner"), timers=[TimerRestore(
+            instance="timer", was_enabled=True,
+        )])
+        saved["progress"] = record.SessionRestarting(
+            kind="restarting", at=RESTARTED,
+            prior=record.SessionStopped(kind="stopped", at=STOPPED),
+        )
+        self.create([saved])
+        stopped = record.SessionStopped(kind="stopped", at=RESTARTED)
+
+        def stop_after_claim_check(_saved: SessionShutdown) -> bool:
+            _ = record.update_session(LOGIN, "owner", lambda current: current.update(progress=stopped))
+            return True
+
+        with (patch.object(restart, "_prove_move", side_effect=stop_after_claim_check),
+              patch.object(restart, "_send_worker_resume") as resume,
+              patch.object(restart, "_restore_timers", return_value=()) as timers):
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
+        resume.assert_not_called()
+        timers.assert_not_called()
+        self.assertEqual(self.stored_record()["progress"], stopped)
+
+    def test_timer_completion_preserves_a_stop_after_confirmation_commit(self) -> None:
+        saved = entry(top_level("owner"), timers=[TimerRestore(
+            instance="timer", was_enabled=True,
+        )])
+        saved["progress"] = record.SessionRestarting(
+            kind="restarting", at=RESTARTED,
+            prior=record.SessionStopped(kind="stopped", at=STOPPED),
+        )
+        self.create([saved])
+        stopped = record.SessionStopped(kind="stopped", at=RESTARTED)
+        timer_enabled = False
+        stop_snapshot: list[bool] = []
+
+        def stop_during_timer_restore(verb: str, _instance: str) -> None:
+            nonlocal timer_enabled
+            if verb == "start":
+                # Shutdown snapshots the disabled timer before start finishes enabling it.
+                stop_snapshot.append(timer_enabled)
+                _ = record.update_session(LOGIN, "owner", lambda current: current.update(progress=stopped))
+                timer_enabled = True
+            elif verb == "stop":
+                timer_enabled = False
+
+        with patch.object(settle, "run_notifier", side_effect=stop_during_timer_restore):
+            restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
+        self.assertEqual(self.stored_record()["progress"], stopped)
+        self.assertEqual(stop_snapshot, [False])
+        self.assertFalse(timer_enabled, "timer must be off when shutdown took the restore claim")
+
     def test_timer_completion_does_not_overwrite_a_replacement_claim(self) -> None:
         saved = entry(top_level("owner"), timers=[TimerRestore(
             instance="timer", was_enabled=True,
@@ -6382,10 +6715,11 @@ class RestartTests(ShutdownTestCase):
         replacement = record.SessionRestarting(
             kind="restarting", at=RESTARTED, prior=record.SessionStopped(kind="stopped", at=STOPPED),
         )
-        def timer(_verb: str, _instance: str) -> None:
-            def replace(current: SessionShutdown) -> None:
-                current["progress"] = replacement
-            _ = record.update_session(LOGIN, "owner", replace)
+        def timer(verb: str, _instance: str) -> None:
+            if verb == "start":
+                def replace(current: SessionShutdown) -> None:
+                    current["progress"] = replacement
+                _ = record.update_session(LOGIN, "owner", replace)
         with patch.object(settle, "run_notifier", timer):
             restart.confirm_entry(saved, STOPPED, True, observed_at=time.time())
         self.assertEqual(self.stored_record()["progress"], replacement)
@@ -6456,7 +6790,7 @@ class RestartTests(ShutdownTestCase):
             result = restart._up(LOGIN, False, ["waiting"])  # pyright: ignore[reportPrivateUsage]
         self.assertEqual((result.restarted, result.workers, result.manual, result.failed), (0, 0, 0, 0))
         self.assertEqual(result.failed_sessions, ())
-        self.assertEqual(output.getvalue(), "Waiting: from shutdown record\nWaiting: already running; skipped\nWaiting is waiting, not stopped; nothing to restart\n")
+        self.assertEqual(output.getvalue(), "Waiting: already running; skipped\nWaiting is waiting, not stopped; nothing to restart\n")
         summary.assert_not_called()
         with redirect_stdout(io.StringIO()):
             self.assertEqual(restart.up(LOGIN, only=["waiting"]), 1)
@@ -6479,7 +6813,7 @@ class RestartTests(ShutdownTestCase):
             result = restart._up(LOGIN, False, ["held"])  # pyright: ignore[reportPrivateUsage]
         self.assertEqual((result.restarted, result.workers, result.manual, result.failed), (0, 0, 0, 0))
         self.assertEqual(result.failed_sessions, ())
-        self.assertEqual(output.getvalue(), "Held: from shutdown record\nHeld: already running; skipped\nHeld is held by usage limit, not stopped; nothing to restart\n")
+        self.assertEqual(output.getvalue(), "Held: already running; skipped\nHeld is held by usage limit, not stopped; nothing to restart\n")
         summary.assert_not_called()
         launch.assert_not_called()
         self.assertEqual(record.find_session(LOGIN, "held"), saved)
@@ -6512,7 +6846,7 @@ class RestartTests(ShutdownTestCase):
                 {"kind": "not stopped", "session_id": "reaping", "name": "Reaping owner", "progress": "reaping"},
             ])
             self.assertEqual((result.restarted, result.failed), (0, 0))
-            self.assertEqual(output.getvalue(), "Reaping owner: from shutdown record\nReaping owner: already running; skipped\nReaping owner is reaping, not stopped; nothing to restart\n")
+            self.assertEqual(output.getvalue(), "Reaping owner: already running; skipped\nReaping owner is reaping, not stopped; nothing to restart\n")
             launch.assert_not_called()
             self.assertEqual({path.relative_to(self.state_root): path.read_bytes()
                               for path in self.state_root.rglob("*") if path.is_file()}, before)
@@ -6604,10 +6938,10 @@ class RestartTests(ShutdownTestCase):
                     saved["requested_at"] = "2026-10-09T21:49:" + str(10 + (2 if policy == "none" else 0) + int(isinstance(command_alerts, restart.NeverAlert))) + "+00:00"
                     self.create([saved])
                     output = io.StringIO()
-                    with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "_retire"), patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((sessions.SessionRecord(pid=912, sessionId="owner", name="Owner", procStart="resumed-start", messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))), patch.object(remote_control, "launch_fixer") as fixer, patch.object(restart, "wait_for_remote_control", return_value=frozenset()) as check, patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")), patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(output):
+                    with patch.object(restart, "named_claude_account", return_value=self.account), patch.object(restart, "_retire"), patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "wait_for_confirmation", return_value=restart.RegistryConfirmation((sessions.SessionRecord(pid=912, sessionId="owner", name="Owner", procStart="resumed-start", messagingSocketPath="", updatedAt=1, tmux="", formerNames=[]),))), patch.object(remote_control, "launch_fixer") as fixer, patch.object(sessions, "remote_control", return_value="absent"), patch.object(restart, "wait_for_remote_control", return_value=frozenset()) as check, patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")), patch.object(settle, "alert_user", return_value=True) as alert, redirect_stdout(output):
                         self.assertEqual(restart.restart(restart.AccountNamed(LOGIN), dry_run=False, alerts=command_alerts, here=True), 0)
                     self.assertNotIn("Remote Control", output.getvalue())
-                    check.assert_called_once()
+                    check.assert_not_called()
                     self.assertIsNone(record.find_session(LOGIN, "owner"))
                     history = list((self.state_root / LOGIN / "history").glob("*.json"))
                     self.assertEqual(cast(dict[str, object], json.loads(history[-1].read_text()))["progress"], {"kind": "restarted", "at": RESTARTED})
@@ -6716,6 +7050,138 @@ class RestartTests(ShutdownTestCase):
             with self.subTest(response=response), self.assertRaises(ValueError):
                 _ = restart.parse_peer_result(response)
 
+
+    def test_all_accounts_launch_supervisors_before_units_without_confirmation_wait(self) -> None:
+        first = [entry(showrunner("runner")), entry(top_level("standalone"))]
+        third = entry(unit("third-unit"))
+        third.update(login="third@example.invalid", label="claude3")
+        self.create([*first, entry(unit("unit")), third])
+        first_started = threading.Barrier(2, timeout=10)
+        unit_started = threading.Event()
+        returned: set[str] = set()
+        events: list[str] = []
+        lock = threading.Lock()
+        def launch(saved: SessionShutdown, _note: str, _state: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
+            self.assertFalse(dry_run)
+            identity = saved["session"]["session_id"]
+            with lock:
+                events.append(identity)
+            if saved["session"]["kind"] == "unit":
+                self.assertEqual(returned, {"runner", "standalone"})
+                unit_started.set()
+            else:
+                _ = first_started.wait()
+                with lock:
+                    returned.add(identity)
+            return restart.SessionLaunched(SUBMITTED_PROMPT)
+        def confirm(ids: frozenset[str], _timeout: float) -> restart.RegistryConfirmation:
+            self.assertTrue(unit_started.wait(10), "units waited for supervisor confirmation")
+            return registry_confirmation(ids)
+        with (patch.object(restart, "_send_restart_note", return_value=settle.MessageSent(kind="sent")),
+              patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_launch_session", side_effect=launch),
+              patch.object(restart, "wait_for_confirmation", side_effect=confirm),
+              patch.object(restart, "run_remote", side_effect=AssertionError("--all is local")),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(shutdown.main(["restart", "--all", "--no-alert"]), 0, output.getvalue())
+        self.assertCountEqual(events[:2], ["runner", "standalone"])
+        self.assertCountEqual(events[2:], ["unit", "third-unit"])
+        self.assertIn("restoring 4 sessions: 2 showrunners and top-level, then 2 units", output.getvalue())
+        self.assertEqual(record.all_session_records(), [])
+
+    def test_failed_account_does_not_stop_other_account_restore(self) -> None:
+        broken = entry(top_level("broken"))
+        healthy = entry(top_level("healthy"))
+        healthy.update(login="third@example.invalid", label="claude3")
+        healthy["session"]["config_dir"] = str(self.root / ".claude3")
+        self.create([broken, healthy])
+        launched: list[str] = []
+        def launch(saved: SessionShutdown, _note: str, _state: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
+            del dry_run
+            launched.append(saved["session"]["session_id"])
+            if saved["login"] == LOGIN:
+                raise OSError("account cannot launch")
+            return restart.SessionLaunched(SUBMITTED_PROMPT)
+        with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_launch_session", side_effect=launch),
+              patch.object(herdr.Herdr, "close_restore_placeholders") as cleanup,
+              patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.restart_all(alerts=restart.NeverAlert()), 1)
+        cleanup.assert_called_once()
+        self.assertCountEqual(launched, ["broken", "healthy"])
+        self.assertIsNone(record.find_session("third@example.invalid", "healthy"))
+        self.assertIn("failed", output.getvalue())
+        self.assertIn("account cannot launch", output.getvalue())
+
+    def test_unreadable_account_does_not_hide_healthy_account_records(self) -> None:
+        broken = entry(top_level("unreadable"))
+        healthy = entry(top_level("healthy"))
+        healthy.update(login="third@example.invalid", label="claude3")
+        healthy["session"]["config_dir"] = str(self.root / ".claude3")
+        self.create([broken, healthy])
+        broken_path = self.state_root / LOGIN / "sessions" / "unreadable.json"
+        _ = broken_path.write_text("{not json", encoding="utf-8")
+        with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)) as launch,
+              patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live),
+              redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.restart_all(alerts=restart.NeverAlert()), 1)
+        self.assertEqual(launch.call_count, 1, output.getvalue())
+        self.assertEqual(launch.call_args.args[0]["session"]["session_id"], "healthy")
+        self.assertIsNone(record.find_session("third@example.invalid", "healthy"))
+        self.assertTrue(broken_path.exists())
+        self.assertIn(LOGIN, output.getvalue())
+
+    def test_confirmation_and_flushed_progress_follow_each_own_launch(self) -> None:
+        self.create([entry(top_level("fast")), entry(top_level("slow"))])
+        fast_back = threading.Event()
+        observed: list[str] = []
+        def launch(saved: SessionShutdown, _note: str, _state: restart.DesktopLaunchState, *, dry_run: bool) -> restart.SessionLaunched:
+            del dry_run
+            if saved["session"]["session_id"] == "slow":
+                self.assertTrue(fast_back.wait(10), "confirmation waited for the slow launch")
+            return restart.SessionLaunched(SUBMITTED_PROMPT)
+        real_print = print
+        def printed(*values: object, sep: str = " ", end: str = "\n", file: object = None, flush: bool = False) -> None:
+            del file
+            text = sep.join(str(value) for value in values)
+            if any(word in text for word in ("  start ", "  back ", "  failed ")):
+                self.assertTrue(flush)
+                observed.append(text)
+                if "  back    fast " in text:
+                    fast_back.set()
+            real_print(*values, sep=sep, end=end, flush=flush)
+        with (patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(restart, "_launch_session", side_effect=launch),
+              patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live),
+              patch("builtins.print", side_effect=printed), redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(restart.up(LOGIN), 0, output.getvalue())
+        fast_start = next(index for index, line in enumerate(observed) if "  start   fast " in line)
+        fast_end = next(index for index, line in enumerate(observed) if "  back    fast " in line)
+        slow_end = next(index for index, line in enumerate(observed) if "  back    slow " in line)
+        self.assertLess(fast_start, fast_end)
+        self.assertLess(fast_end, slow_end)
+        self.assertRegex(observed[0], r"^\d{2}:\d{2}:\d{2}  ")
+
+
+class RestoreServerTests(unittest.TestCase):
+    def test_new_server_is_started_before_workspaces_and_printed_once(self) -> None:
+        events: list[str] = []
+        def start(_name: str, _timeout: int, *, session_kind: herdr.SecuritySession) -> herdr.ServerCreated:
+            self.assertIsInstance(session_kind, herdr.DesktopSession)
+            events.append("server")
+            return herdr.ServerCreated()
+        def prepare(selected: frozenset[str]) -> None:
+            self.assertEqual(selected, frozenset())
+            events.append("workspaces")
+        with (patch.object(herdr, "shared_session", return_value="agents"),
+              patch.object(herdr, "restore_server", side_effect=start),
+              patch.object(herdr.Herdr, "prepare_restore_workspaces", side_effect=prepare),
+              redirect_stdout(io.StringIO()) as output):
+            restart._prepare_restore_server([], restart.DesktopLaunchState(session_kind=herdr.DesktopSession()))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(events, ["server", "workspaces"])
+        self.assertEqual(output.getvalue().splitlines(), ["started herdr server agents for restore"])
 
 
 if __name__ == "__main__":

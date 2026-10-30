@@ -32,6 +32,35 @@ TEST_HANG_GUARD_SECS = 300
 
 @final
 class StyleLedgerRecordsTests(LedgerTestCase):
+    def test_metadata_only_rule_edit_accepts_pin_and_keeps_cell_current_but_body_edit_does_not(self) -> None:
+        rule_id = self.rule("metadata")
+        path = self.rule_dir / "metadata.md"
+        _ = subprocess.run(["git", "init", "-q", str(self.rule_dir.parent)], check=True)
+        _ = subprocess.run(["git", "-C", str(self.rule_dir.parent), "hash-object", "-w", str(path)], check=True,
+                           capture_output=True)
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip)
+            old = self.blob(rule_id)
+            ledger.ticket_add("read-1", "read", "read", "names", "crates/alpha", [self.sources[0]], [rule_id])
+            ledger.record(rule_id, self.sources[0], self.initial_tip, old, "clean", ticket="read-1", worker="old")
+            _ = path.write_text(path.read_text().replace("input_scope: file", "input_scope: file\napproval: always"))
+            current = self.blob(rule_id)
+            with self.ledger() as refreshed:
+                self.assertTrue(any(cell.path == self.sources[0] and cell.state == "current"
+                                    for cell in refreshed.cells(rule_id)))
+            try:
+                ledger.record(rule_id, self.sources[0], self.initial_tip, current, "clean", ticket="read-1", worker="new")
+            except style_ledger.LedgerError as error:
+                self.fail(f"metadata-only pin must remain valid: {error}")
+            self.assertEqual(ledger._judgments(rule_id, self.sources[0])[0].rule_blob, current)  # pyright: ignore[reportPrivateUsage]
+            with self.ledger() as refreshed:
+                state = tuple(refreshed.cells())
+                self.assertTrue(any(cell.rule == rule_id and cell.path == self.sources[0] and cell.state == "current"
+                                    for cell in state))
+            _ = path.write_text(path.read_text() + "Changed body\n")
+            with self.assertRaisesRegex(style_ledger.LedgerError, "differs from ticket pin"):
+                ledger.record(rule_id, self.sources[0], self.initial_tip, self.blob(rule_id), "clean", ticket="read-1", worker="body")
+
     def test_refill_lock_blocks_another_worktree_until_the_body_exits(self) -> None:
         worktree = self.root / "other-checkout"
         _ = self.git("worktree", "add", "-q", "-b", "other", str(worktree))
@@ -62,6 +91,132 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                     self.assertFalse(acquired.is_set(), "second worktree entered a held refill lock")
             contender.result(timeout=TEST_HANG_GUARD_SECS)
         self.assertTrue(acquired.is_set(), "refill lock was not released on context exit")
+
+    def test_migration_27_upgrades_copies_at_25_and_26_and_is_repeatable(self) -> None:
+        rule = self.rule("pipeline")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        ledger.ticket_add("names-9", "names", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+        ledger.ticket_assign("names-9", "main")
+        _ = ledger.ticket_base("names-9")
+        self.record(rule, self.sources[0], self.initial_tip, ticket="names-9")
+        ledger.ticket_checkpoint("names-9", self.initial_tip)
+        schema = {"bulk_workspace_tickets", "bulk_workspace_batch", "ticket_predecessors", "tickets_one_assigned"}
+        with closing(sqlite3.connect(ledger.database)) as fresh:
+            self.assertEqual(fresh.execute("SELECT version FROM schema_version").fetchone(), (27,))
+            names = cast(list[tuple[str]], fresh.execute("SELECT name FROM sqlite_master").fetchall())
+            self.assertTrue(schema.issubset({row[0] for row in names}))
+        for version in (25, 26):
+            with self.subTest(version=version):
+                database = self.root / f"existing-copy-{version}.sqlite"
+                with closing(sqlite3.connect(ledger.database)) as source, closing(sqlite3.connect(database)) as copy:
+                    source.backup(copy)
+                    _ = copy.executescript("""
+                        DROP INDEX tickets_one_assigned;
+                        DROP TABLE ticket_predecessors;
+                        CREATE UNIQUE INDEX tickets_one_open ON tickets(unit) WHERE state IN ('assigned','checkpointed');
+                    """)
+                    if version == 25:
+                        _ = copy.execute("DROP TABLE bulk_workspace_tickets")
+                    else:
+                        _ = copy.execute("INSERT INTO bulk_workspace_tickets VALUES ('names-9','existing-batch')")
+                    _ = copy.execute("UPDATE schema_version SET version=?", (version,))
+                    copy.commit()
+                    rows = copy.execute("SELECT * FROM tickets").fetchall()
+                    judgments = copy.execute("SELECT * FROM judgments").fetchall()
+                for _ in range(2):
+                    with style_ledger.Ledger(self.repo, database):
+                        pass
+                with closing(sqlite3.connect(database)) as copy:
+                    self.assertEqual(copy.execute("SELECT version FROM schema_version").fetchone(), (27,))
+                    names = cast(list[tuple[str]], copy.execute("SELECT name FROM sqlite_master").fetchall())
+                    self.assertTrue(schema.issubset({row[0] for row in names}))
+                    self.assertEqual(copy.execute("SELECT * FROM tickets").fetchall(), rows)
+                    self.assertEqual(copy.execute("SELECT * FROM judgments").fetchall(), judgments)
+                    self.assertEqual(copy.execute("SELECT * FROM bulk_workspace_tickets").fetchall(),
+                                     [("names-9", "existing-batch")] if version == 26 else [])
+                    for _ in range(2):
+                        _ = copy.executescript(style_ledger.MIGRATIONS[27])
+                    self.assertEqual(copy.execute("SELECT name FROM sqlite_master WHERE name='tickets_one_open'").fetchall(), [])
+                with style_ledger.Ledger(self.repo, database) as upgraded:
+                    upgraded.ticket_add("names-10", "names", "read", "names", "crates/beta", [self.sources[2]], [rule])
+                    upgraded.ticket_assign("names-10", "main")
+                    self.assertEqual(upgraded.ticket_base("names-10"), self.initial_tip)
+                    self.assertEqual(len(upgraded.ticket_open("names")), 2)
+        self.assertEqual(len(ledger.ticket_open("names")), 1)
+
+    def pipeline_tickets(self) -> tuple[style_ledger.Ledger, str, str]:
+        rule = self.rule("pipeline")
+        ledger = self.ledger()
+        _ = self.git("branch", "style/main")
+        ledger.set_tip(self.initial_tip, "style/main")
+        # A queued lower-number id proves reconcile follows dependencies rather than textual/numeric ids.
+        for ticket, path in (("names-10", self.sources[0]), ("names-2", self.sources[2]), ("names-11", self.sources[3])):
+            ledger.ticket_add(ticket, "names", "read", "names", path.split("/src/")[0], [path], [rule])
+        ledger.ticket_assign("names-10", "main")
+        _ = ledger.ticket_base("names-10")
+        self.write(self.sources[0], "pub fn first() {}\n")
+        first = self.commit("First ticket")
+        self.record(rule, self.sources[0], first, ticket="names-10")
+        ledger.ticket_checkpoint("names-10", first)
+        ledger.ticket_assign("names-2", "main")
+        self.assertEqual(ledger.ticket_base("names-2"), first)
+        self.write(self.sources[2], "pub fn second() {}\n")
+        second = self.commit("Second ticket")
+        self.record(rule, self.sources[2], second, ticket="names-2")
+        ledger.ticket_checkpoint("names-2", second)
+        return ledger, first, second
+
+    def test_pipeline_bounds_assignment_and_merge_waits_for_the_predecessor(self) -> None:
+        ledger, _, second = self.pipeline_tickets()
+        with self.assertRaisesRegex(style_ledger.LedgerError, "already has"):
+            ledger.ticket_assign("names-11", "main")
+        _ = self.git("update-ref", "refs/heads/style/main", second)
+        with self.assertRaisesRegex(style_ledger.LedgerError, "waiting for predecessor names-10"):
+            _ = ledger.ticket_merge("names-2")
+        self.assertEqual(len(ledger.ticket_open("names")), 2)
+        _ = ledger.ticket_merge("names-10")
+        _ = ledger.ticket_merge("names-2")
+        self.assertEqual(ledger.ticket_open("names"), ())
+
+    def test_pipeline_reconcile_merges_predecessors_before_successors(self) -> None:
+        ledger, _, second = self.pipeline_tickets()
+        _ = self.git("update-ref", "refs/heads/style/main", second)
+        output = self.cli("reconcile", "--branch-point", "main", "--style-branch", "style/main")
+        self.assertLess(output.stdout.index("ticket names-10:"), output.stdout.index("ticket names-2:"))
+        self.assertEqual(ledger.ticket_open("names"), ())
+
+    def test_pipeline_growth_merge_refuses_legacy_overlap_even_after_predecessor_merged(self) -> None:
+        ledger, _, second = self.pipeline_tickets()
+        _ = self.git("update-ref", "refs/heads/style/main", second)
+        # A ledger written by the earlier implementation can already contain overlapping footprints.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET files=? WHERE id='names-2'",
+                                   (json.dumps([self.sources[0], self.sources[2]]),))
+        with self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + self.sources[0]):
+            _ = ledger.ticket_merge("names-10")
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE tickets SET state='merged' WHERE id='names-10'")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "overlap: " + self.sources[0]):
+            _ = ledger.ticket_merge("names-2")
+        self.assertEqual(ledger.ticket_open("names")[0]["state"], "checkpointed")
+
+    def test_pipeline_assignment_refuses_an_assigned_predecessor_and_wrong_branch_tip(self) -> None:
+        rule = self.rule("pipeline")
+        ledger = self.ledger()
+        ledger.set_tip(self.initial_tip, "main")
+        for number in (1, 2):
+            ledger.ticket_add(f"names-{number}", "names", "read", "names", "crates/alpha", [self.sources[number - 1]], [rule])
+        ledger.ticket_assign("names-1", "main")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "already has"):
+            ledger.ticket_assign("names-2", "main")
+        self.record(rule, self.sources[0], self.initial_tip, ticket="names-1")
+        ledger.ticket_checkpoint("names-1", self.initial_tip)
+        self.write(self.sources[0], "pub fn unrelated() {}\n")
+        _ = self.commit("Wrong branch tip")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "branch must start at waiting checkpoint"):
+            ledger.ticket_assign("names-2", "main")
+        self.assertEqual(len(ledger.ticket_open("names")), 1)
 
     def test_migration_25_backfills_from_merged_build_ticket_else_the_finding(self) -> None:
         database = self.root / "version-24.sqlite"

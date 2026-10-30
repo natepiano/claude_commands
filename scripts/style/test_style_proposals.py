@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
@@ -147,6 +148,32 @@ class StyleProposalsTests(unittest.TestCase):
 
     def ledger(self) -> style_ledger.Ledger:
         return style_ledger.open_ledger(self.repo)
+
+    def test_rank_source_git_failures_are_not_cached_as_absence(self) -> None:
+        with self.ledger() as ledger:
+            reader = style_proposals.RankExemptions(ledger, self.tip)
+            for code in (errno.EMFILE, errno.ENOENT):
+                with self.subTest(errno=code):
+                    failure = OSError(code, "PRIVATE launch failure")
+                    with mock.patch.object(subprocess, "run", side_effect=failure):
+                        with self.assertRaises(style_ledger.GitReadFailed) as refused:
+                            _ = reader.source("src/missing.rs")
+                    self.assertIs(refused.exception.__cause__, failure)
+                    self.assertEqual(reader.sources, {})
+            self.assertEqual(reader.source("src/missing.rs"), "")
+            self.assertEqual(reader.sources, {"src/missing.rs": ""})
+
+    def test_proposal_blob_git_failures_are_not_absence(self) -> None:
+        with self.ledger() as ledger:
+            reader = style_proposals.GitProposalReader(ledger)
+            for code in (errno.EMFILE, errno.ENOENT):
+                with self.subTest(errno=code):
+                    failure = OSError(code, "PRIVATE launch failure")
+                    with mock.patch.object(subprocess, "run", side_effect=failure):
+                        with self.assertRaises(style_ledger.GitReadFailed) as refused:
+                            _ = reader.blob(self.tip, "src/missing.rs")
+                    self.assertIs(refused.exception.__cause__, failure)
+            self.assertEqual(reader.blob(self.tip, "src/missing.rs"), "")
 
     def git(self, *args: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *args], capture_output=True, text=True, check=True).stdout.strip()
@@ -825,6 +852,18 @@ class StyleProposalsTests(unittest.TestCase):
         finding = self.hold(ledger, ticket=ticket, kind="restructure")
         ledger.ticket_drop(ticket)
         return finding
+
+    def test_metadata_only_rule_edit_keeps_ticket_filing_current_but_body_edit_waits(self) -> None:
+        with self.ledger() as ledger:
+            finding = self.hold(ledger)
+            path = self.catalog / "names.md"
+            _ = path.write_text(path.read_text().replace("input_scope: file", "input_scope: file\ntags:\n  - metadata-only"))
+            self.assertFalse(style_ledger.rule_changed_since_judged(
+                finding, {rule.rule_id: rule for rule in rules.load_rules(self.repo)}))
+            self.assertEqual(len(self.file(ledger)), 1)
+            _ = path.write_text(path.read_text() + "Changed requirement\n")
+            self.assertTrue(style_ledger.rule_changed_since_judged(
+                finding, {rule.rule_id: rule for rule in rules.load_rules(self.repo)}))
 
     def test_current_file_gate_uses_shared_site_proof_without_certifying_changed_rule(self) -> None:
         source = "fn work() {\n    consume(791);\n}\n"

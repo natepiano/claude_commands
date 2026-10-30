@@ -140,11 +140,11 @@ def _alive(pid: int) -> bool:
     return True
 
 
-def _idle(reviewer: Reviewer) -> bool:
+def reviewer_is_idle(reviewer: Reviewer) -> bool:
     return isinstance(reviewer.ownership, IdleReviewer) or not _alive(reviewer.ownership.pid)
 
 
-def _decode(data: PoolJson) -> Pool:
+def decode_pool(data: PoolJson) -> Pool:
     pool = Pool(generation=data.get("generation", 0),
                 stopping=data.get("stopping", False))
     pool.next_index.update(data.get("next_index", {}))
@@ -203,25 +203,28 @@ class ProductionPool:
                 path = self.directory / "pool.json"
                 if path.exists():
                     data: PoolJson = cast(PoolJson, json.loads(path.read_text(encoding="utf-8")))
-                    pool = _decode(data)
+                    pool = decode_pool(data)
                 else:
                     pool = Pool()
                 yield pool
                 if write:
-                    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.directory,
-                                                     prefix=".pool-", delete=False) as output:
-                        temporary = Path(output.name)
-                        try:
-                            json.dump(_encode(pool), output)
-                            output.flush()
-                            # Disposable fixtures may omit disk durability; production syncs by default.
-                            if (os.environ.get("UNIT_SYNC_WRITES") or os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1")) != "0":
-                                os.fsync(output.fileno())
-                            os.replace(temporary, path)
-                        finally:
-                            temporary.unlink(missing_ok=True)
+                    self.save(pool)
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def save(self, pool: Pool) -> None:
+        """Write while the caller holds locked(write=False) or locked()."""
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.directory,
+                                         prefix=".pool-", delete=False) as output:
+            temporary = Path(output.name)
+            try:
+                json.dump(_encode(pool), output)
+                output.flush()
+                if (os.environ.get("UNIT_SYNC_WRITES") or os.environ.get("PLAN_DELEGATE_SYNC_WRITES", "1")) != "0":
+                    os.fsync(output.fileno())
+                os.replace(temporary, self.directory / "pool.json")
+            finally:
+                temporary.unlink(missing_ok=True)
 
     def mesh(self, verb: str, *arguments: str, generation: int, mesh_generation: int,
              allow_stopping: bool = False) -> subprocess.CompletedProcess[str]:
@@ -254,7 +257,7 @@ class ProductionPool:
                 continue
 
 
-def _production(value: str) -> ProductionPool:
+def production_pool(value: str) -> ProductionPool:
     slug = Path(value).name.removesuffix("-production.md")
     if slug in ("", ".", ".."):
         raise PoolError("production must name a production or slug")
@@ -286,10 +289,6 @@ def _thread_id(result: subprocess.CompletedProcess[str]) -> str:
     if not thread_id or "\n" in thread_id:
         raise PoolError("mesh returned no single thread id")
     return thread_id
-
-
-def _config_dir() -> Path:
-    return Path(os.environ.get("REVIEW_POOL_CONFIG") or Path(__file__).resolve().parents[2] / "config" / "review_pool")
 
 
 def _ux_rules(guide: Path) -> list[Path]:
@@ -332,7 +331,13 @@ def _ui_parts(slug: str) -> list[str]:
 
 def standing_prompt(slug: str, reviewer_type: ReviewerType) -> bytes:
     """The prompt a template is primed with: the type's base prompt, and for ui the production's UX rules."""
-    base = _config_dir() / f"{reviewer_type}.md"
+    config = Path(__file__).resolve().parents[2] / "config"
+    defaults: dict[ReviewerType, Path] = {
+        "code": config / "review" / "code.md",
+        "ui": config / "review_pool" / "ui.md",
+    }
+    override = os.environ.get("REVIEW_POOL_CONFIG", "")
+    base = Path(override) / f"{reviewer_type}.md" if override else defaults[reviewer_type]
     try:
         parts = [base.read_text(encoding="utf-8").rstrip()]
     except OSError as exc:
@@ -380,7 +385,7 @@ def _prime(production: ProductionPool, reviewer_type: ReviewerType, content: byt
 
 
 def command_prime(args: PoolArguments) -> int:
-    print(_prime(_production(str(args.production)), args.type, Path(str(args.instructions_file)).read_bytes()))
+    print(_prime(production_pool(str(args.production)), args.type, Path(str(args.instructions_file)).read_bytes()))
     return 0
 
 
@@ -404,7 +409,7 @@ def rename_unit(production: str, old: str, new: str) -> int:
 
     Thread ids and ordinals stay, so the unit keeps the reviewers that already know it.
     """
-    pool_dir = _production(production)
+    pool_dir = production_pool(production)
     if not pool_dir.directory.exists():
         return 0
     moved = 0
@@ -474,7 +479,7 @@ def _repoint_idle(production: ProductionPool, reviewer_type: ReviewerType, gener
             reviewer = pool.reviewers.get(name)
             template = pool.templates.get(reviewer_type)
             if (reviewer is None or template is None or reviewer.type != reviewer_type or not reviewer.thread_id
-                    or reviewer.prime_hash == template.prime_hash or not _idle(reviewer)):
+                    or reviewer.prime_hash == template.prime_hash or not reviewer_is_idle(reviewer)):
                 continue
             reviewer.ownership = ClaimedReviewer(pid)
             thread_id = reviewer.thread_id
@@ -504,11 +509,11 @@ def _choose(pool: Pool, reviewer_type: ReviewerType, unit: str, pid: int) -> tup
     owned = _unit_reviewers(pool, reviewer_type, unit)
     source = ""
     for name, reviewer in owned:
-        if _idle(reviewer):
+        if reviewer_is_idle(reviewer):
             break
     else:
         spare = [(name, reviewer) for name, reviewer in pool.reviewers.items()
-                 if reviewer.type == reviewer_type and reviewer.thread_id and _idle(reviewer)
+                 if reviewer.type == reviewer_type and reviewer.thread_id and reviewer_is_idle(reviewer)
                  and isinstance(reviewer.lease, Unleased) and reviewer.prime_hash == template.prime_hash]
         if spare and not owned:
             name, reviewer = spare[0]
@@ -534,7 +539,7 @@ def _choose(pool: Pool, reviewer_type: ReviewerType, unit: str, pid: int) -> tup
 
 
 def command_allocate(args: PoolArguments) -> int:
-    production = _production(str(args.production))
+    production = production_pool(str(args.production))
     pid = int(args.pid)
     _prime_standing(production, args.type)
     unit = _lease_unit(production, str(args.unit))
@@ -600,7 +605,7 @@ def command_allocate(args: PoolArguments) -> int:
 
 
 def command_release(args: PoolArguments) -> int:
-    with _production(str(args.production)).locked() as pool:
+    with production_pool(str(args.production)).locked() as pool:
         reviewer = pool.reviewers.get(str(args.reviewer))
         if reviewer is not None and isinstance(reviewer.ownership, ClaimedReviewer) and reviewer.ownership.pid == int(args.pid):
             if args.thread_id and args.thread_id != reviewer.thread_id:
@@ -644,7 +649,7 @@ def _unit_id(slug: str, unit: str) -> str:
 
 def command_retire(args: PoolArguments) -> int:
     """End the unit's reviewers; one still reviewing keeps its turn and is left in place."""
-    production = _production(str(args.production))
+    production = production_pool(str(args.production))
     unit = _lease_unit(production, str(args.unit))
     pid = os.getpid()
     with production.locked(write=False) as pool:
@@ -658,7 +663,7 @@ def command_retire(args: PoolArguments) -> int:
             reviewer = pool.reviewers.get(name)
             if reviewer is None:
                 continue
-            if not _idle(reviewer):
+            if not reviewer_is_idle(reviewer):
                 print(f"review_pool: {name} is reviewing; left in place", file=sys.stderr)
                 continue
             if not reviewer.thread_id:
@@ -705,7 +710,7 @@ def migration_plan(pool: Pool, running: set[str]) -> list[MigrationStep]:
     ordered = sorted(pool.reviewers.items(), key=lambda entry: (entry[1].last_allocated, entry[0]), reverse=True)
     for name, reviewer in ordered:
         lease = reviewer.lease
-        if not _idle(reviewer):
+        if not reviewer_is_idle(reviewer):
             steps.append(MigrationStep(name, reviewer.thread_id, True, "busy"))
         elif not reviewer.thread_id:
             steps.append(MigrationStep(name, "", True, "fork in flight"))
@@ -723,7 +728,7 @@ def migration_plan(pool: Pool, running: set[str]) -> list[MigrationStep]:
 
 
 def command_migrate(args: PoolArguments) -> int:
-    production = _production(str(args.production))
+    production = production_pool(str(args.production))
     running = running_units(production.directory.name)
     with production.locked(write=False) as pool:
         _require_finished_stop(pool)
@@ -741,7 +746,7 @@ def command_migrate(args: PoolArguments) -> int:
             _generation(pool, generation)
             reviewer = pool.reviewers.get(step.name)
             # Allocation may have taken it since the plan was printed.
-            if reviewer is None or reviewer.thread_id != step.thread_id or not _idle(reviewer):
+            if reviewer is None or reviewer.thread_id != step.thread_id or not reviewer_is_idle(reviewer):
                 print(f"review_pool: {step.name} changed since the plan; left in place", file=sys.stderr)
                 continue
             reviewer.ownership = ClaimedReviewer(pid)
@@ -750,16 +755,16 @@ def command_migrate(args: PoolArguments) -> int:
 
 
 def command_status(args: PoolArguments) -> int:
-    with _production(str(args.production)).locked(write=False) as pool:
+    with production_pool(str(args.production)).locked(write=False) as pool:
         for name, reviewer in pool.reviewers.items():
             lease = reviewer.lease
             description = "unleased" if isinstance(lease, Unleased) else f"{lease.unit}:{lease.ordinal}"
-            print(f"{name}\t{reviewer.type}\t{description}\t{'idle' if _idle(reviewer) else 'busy'}\t{reviewer.reviews}")
+            print(f"{name}\t{reviewer.type}\t{description}\t{'idle' if reviewer_is_idle(reviewer) else 'busy'}\t{reviewer.reviews}")
     return 0
 
 
 def command_stop(args: PoolArguments) -> int:
-    production = _production(str(args.production))
+    production = production_pool(str(args.production))
     with production.locked() as pool:
         adoption = production.directory / "ui_adopted"
         if adoption.exists():

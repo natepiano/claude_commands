@@ -1,13 +1,13 @@
-"""Check lint repair ordering and judgment after repair failures."""
+"""Check lint repairs converge before the first judgment."""
 
 from __future__ import annotations
 
 import unittest
-from scripts.direct import verify_lint_scope_test_support as support
+from scripts.direct import verify_lint_cache_test_support as support
 import json
 
 
-class VerifyLintScopeTests(support.VerifyLintScopeFixture):
+class VerifyLintScopeTests(support.VerifyLintCacheFixture):
     def test_fix_exposes_another_fix_before_the_first_judgment(self) -> None:
         original = "pub fn sum(a: f64, b: f64, c: f64) -> f64 { a * b + c }\n"
         first_fix = original.replace("a * b + c", "a.mul_add(b, c)")
@@ -29,23 +29,6 @@ class VerifyLintScopeTests(support.VerifyLintScopeFixture):
                 self.assertEqual(self.calls("doc"), [])
                 self.assertEqual([args for args in self.calls("+nightly") if "--version" not in args],
                                  [["fmt", "-p", "sample"]] * 4)
-
-    def test_failed_fix_still_formats_and_returns_judgment_status(self) -> None:
-        self.environment["TEST_CLIPPY_FIX_STATUS"] = "41"
-        for judgment_status in (0, 43):
-            with self.subTest(judgment_status=judgment_status):
-                self.environment["TEST_CLIPPY_STATUS"] = str(judgment_status)
-                result = self.invoke_verify("lint", "sample", cwd=self.root)
-                self.assertEqual(result.returncode, judgment_status, result.stdout + result.stderr)
-                self.assert_fix_and_judgment_calls()
-                stages = self.lint_stages()
-                self.assertEqual(stages[:4], [
-                    ["+nightly", "fmt", "-p", "sample"],
-                    ["clippy", *self.calls("clippy")[0]],
-                    ["+nightly", "fmt", "-p", "sample"],
-                    ["clippy", *self.calls("clippy")[1]],
-                ])
-                self.assertEqual(self.calls("doc"), [])
 
 
 if __name__ == "__main__":

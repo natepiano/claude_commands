@@ -20,6 +20,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 
+if TYPE_CHECKING:
+    from ..lib.socket_test_support import short_socket_directory
+else:
+    from scripts.lib.socket_test_support import short_socket_directory
+
 import record as recorder
 import sample
 import store
@@ -28,8 +33,10 @@ TEST_HANG_GUARD_SECS = 300
 
 if TYPE_CHECKING:
     from ..direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+    from ..lint.memory_test_support import fake_memory_readings
 else:
     from scripts.direct.test_verify_untested_examples import FIXED_RUSTC, rust_tool_path
+    from scripts.lint.memory_test_support import fake_memory_readings
 from test_index import point_root_at
 
 SCRIPT = Path(__file__).with_name("record.py")
@@ -99,6 +106,7 @@ class RecordTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(mock.patch.dict(os.environ, fake_memory_readings(self.base)))
         tools = rust_tool_path(self.base / "tools")
         self.enterContext(mock.patch.dict(os.environ, {"PATH": tools}))
         self.root = self.base / "buildlog"
@@ -232,7 +240,7 @@ class RecordTests(unittest.TestCase):
     def test_piped_run_records_memory_wait_outside_step_duration(self) -> None:
         meminfo = self.base / "meminfo"
         _ = meminfo.write_text("MemAvailable: 11534336 kB\n")
-        runtime = self.base / "runtime" / "systemd"
+        runtime = Path(self.enterContext(short_socket_directory())) / "systemd"
         runtime.mkdir(parents=True)
         with socket.socket(socket.AF_UNIX) as manager:
             manager.bind(str(runtime / "private"))

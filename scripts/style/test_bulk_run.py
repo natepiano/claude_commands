@@ -82,6 +82,22 @@ class WorkspaceRunTests(CargoProjectTests):
         self.runner = FakeRunner()
         self.server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
 
+    def test_metadata_only_rule_edit_selects_approved_findings_but_body_edit_is_stale(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        _ = subprocess.run(["git", "init", "-q", str(definition.path.parent.parent)], check=True)
+        _ = subprocess.run(["git", "-C", str(definition.path.parent.parent), "hash-object", "-w", str(definition.path)],
+                           check=True, capture_output=True)
+        text = definition.path.read_text()
+        _ = definition.path.write_text(text.replace("---\n", "---\napproval: always\n", 1))
+        current = next(rule for rule in rules.load_rules(self.repo) if rule.rule_id == definition.rule_id)
+        self.assertEqual({f.finding_id for f in run.select(ledger, current).findings}, {f.finding_id for f in findings})
+        _ = definition.path.write_text(definition.path.read_text() + "Changed requirement\n")
+        changed = next(rule for rule in rules.load_rules(self.repo) if rule.rule_id == definition.rule_id)
+        selected = run.select(ledger, changed)
+        self.assertFalse(selected.findings)
+        self.assertEqual({item.reason for item in selected.skipped}, {"rule changed since judged"})
+
     def setup_findings(self) -> tuple[ledger_api.Ledger, rules.Rule, tuple[ledger_api.HeldFinding, ...]]:
         ledger = self.ledger()
         ledger.set_tip(self.base)
@@ -114,6 +130,22 @@ class WorkspaceRunTests(CargoProjectTests):
             self.assertIsInstance(evidence, ledger_api.UnchangedSite, repr((evidence, judged)))
             self.assertIsInstance(run.current_rename(ledger, finding, self.base, run.RenameSources()), bulk.RenameFinding,
                                   repr((evidence, judged, finding)))
+
+    def test_field_refactor_runs_through_lineage_and_post_format_guard(self) -> None:
+        source = "struct Record {\n old: usize,\n}\nfn f(r: Record) -> usize { r.old }\n"
+        for path in ("src/lib.rs", "beta/src/lib.rs"):
+            _ = (self.repo / path).write_text(source)
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "private field fixture")
+        self.base = self.git("rev-parse", "HEAD")
+        self.tree = self.git("rev-parse", "HEAD^{tree}")
+        ledger, definition, findings = self.setup_findings()
+        for finding in findings:
+            self.assertIsInstance(run.current_rename(ledger, finding, self.base, run.RenameSources()), bulk.RenameFinding)
+        report = self.execute(ledger, definition)
+        self.assertEqual(report["applied"], 2)
+        self.assertEqual(report["refused"], 0)
+        self.assertIn("r.number", (self.repo / "src/lib.rs").read_text())
 
     def test_workspace_selection_crosses_crates_and_skips_built_withdrawn_and_held_with_reasons(self) -> None:
         ledger, definition, findings = self.setup_findings()
@@ -217,7 +249,7 @@ class WorkspaceRunTests(CargoProjectTests):
             path_report = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, self.server, self.runner,
                                        available=available)
         report = bulk.object_fields(cast(object, json.loads(path_report.read_text())))
-        self.assertEqual(available.call_count, 2)
+        self.assertEqual(available.call_count, 4)  # Selection, then every WorkspaceEdit document before writing.
         self.assertEqual({call.args[1] for call in available.call_args_list}, {"src/lib.rs", "beta/src/lib.rs"})
         judged_reads = [call.args[0] for call in calls.call_args_list
                         if call.args[0][:2] == ["git", "show"]]
@@ -344,7 +376,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.runner.unrelated = False
         self.runner.break_proof = True
         report = self.execute(ledger, definition)
-        self.assertIn("post-format binding proof failed", str(report["status"]))
+        self.assertIn("post-format rename edit changed", str(report["status"]))
         self.assertEqual(self.git("status", "--porcelain"), "")
 
 

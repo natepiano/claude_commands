@@ -38,6 +38,20 @@ PHASE_STATUS_PATTERN = re.compile(r"·[ \t]*status:[ \t]*(?P<status>todo|done)\b
 # em-dash separator.
 PHASE_TITLE_PATTERN = re.compile(r"^[ \t]*[—–-][ \t]*\S")
 DEPENDS_ON_PATTERN = re.compile(r"^\*\*Depends on:\*\*[ \t]*(?P<list>[^\n]*)$", re.MULTILINE)
+PHASE_REFERENCE_PATTERN = re.compile(
+    r"\b(?i:Phase)[ \t]+(?P<single>\d+[a-z]?(?!\w|[-:./]\w))"
+    + r"|\b(?i:Phases)[ \t]+(?P<list>\d+[a-z]?(?!\w|[-:./]\w)"
+    + r"(?:[ \t]*(?:,[ \t]*(?:(?i:and)[ \t]+)?|(?i:and)[ \t]+|&[ \t]*)"
+    + r"\d+[a-z]?(?!\w|[-:./]\w))*)",
+)
+UNIT_PHASE_PREFIX = re.compile(
+    r"(?<![\w-])(?P<quote>`|'|\"|\*\*)?(?P<unit>[\w-]+-unit)"
+    + r"(?:['’]s)?(?(quote)(?P=quote))(?:['’]s)?[ \t]+$"
+)
+PLAN_UNIT_HEADER = re.compile(
+    r"^>[ \t]+\*\*Production:(?:\*\*)?[ \t]+[^\n]*?—[ \t]+unit[ \t]+`(?P<unit>[^`\n]+)`",
+    re.MULTILINE,
+)
 BLOCKED_BY_PATTERN = re.compile(r"^\*\*Blocked by:\*\*[ \t]*(?P<gate>G\d+)", re.MULTILINE)
 
 
@@ -83,6 +97,7 @@ def resolve_plan_path(working_dir: Path, value: str) -> Path:
 
 def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
     text = plan_path.read_text(encoding="utf-8")
+    unit_header = PLAN_UNIT_HEADER.search(text)
     phases: list[PlanPhase] = []
     seen: set[str] = set()
     duplicates: list[str] = []
@@ -111,11 +126,21 @@ def plan_phase_details(plan_path: Path) -> tuple[list[PlanPhase], list[str]]:
         end = headings[position + 1].start() if position + 1 < len(headings) else len(text)
         body = text[match.end() : end]
         depends_match = DEPENDS_ON_PATTERN.search(body)
-        depends_on = (
-            None
-            if depends_match is None
-            else re.findall(r"\b\d+[a-z]?\b", depends_match.group("list"))
-        )
+        depends_on: list[str] | None = None
+        if depends_match is not None:
+            depends_on = []
+            dependency_text = depends_match.group("list")
+            for reference in PHASE_REFERENCE_PATTERN.finditer(dependency_text):
+                # A unit name qualifies only the phase span that follows it.
+                qualifier = UNIT_PHASE_PREFIX.search(dependency_text[: reference.start()])
+                if qualifier is not None and (
+                    unit_header is None or qualifier.group("unit") != unit_header.group("unit")
+                ):
+                    continue
+                phase_ids = reference.group("single") or reference.group("list")
+                for dependency in phase_ids.replace(",", " ").replace("&", " ").split():
+                    if dependency.lower() != "and" and dependency not in depends_on:
+                        depends_on.append(dependency)
         blocked_match = BLOCKED_BY_PATTERN.search(body)
         phases.append(
             PlanPhase(

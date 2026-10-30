@@ -34,6 +34,7 @@ import sessions
 import remote_control
 import shutdown
 import settle
+import stop as stop_work
 from scripts.accounts import accounts
 from push_texts import RenderedPush
 import restart as restart_work
@@ -151,8 +152,10 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.state = self.root / "shutdown"
-        # Fixture folders do not exist; a restore whose folder is gone is dropped before launch.
+        # Keep this CLI fixture focused on selection; missing-folder behavior has separate restore tests.
         _ = self.enterContext(patch.object(restart_work, "_folder_exists", return_value=True))
+        _ = self.enterContext(patch.object(restart_work, "_prepare_restore_server"))
+        _ = self.enterContext(patch.object(herdr.Herdr, "close_restore_placeholders"))
         self.home = self.root / "home"
         self.home.mkdir()
         (self.home / ".claude").mkdir()
@@ -2014,8 +2017,17 @@ class OnlySessionCliTests(ShutdownTestCase):
         super().setUp()
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.root), "SHUTDOWN_STATE_DIR": str(self.root / "state")})))
-        # Fixture folders do not exist; a restore whose folder is gone is dropped before launch.
+        real_bounded_stop = stop_work.bounded_stop
+        def stop_selected(saved: list[record.SessionShutdown], *, started: float, grace_seconds: float) -> list[record.SessionShutdown]:
+            # Selection fixtures have no real processes; supply a complete exit observation.
+            return real_bounded_stop(saved, started=started, grace_seconds=grace_seconds,
+                observe=lambda _budget: inventory.ProcessObservation({}),
+                identity=lambda _pid, _budget: inventory.ProcessGone())
+        _ = self.enterContext(patch.object(stop_work, "bounded_stop", side_effect=stop_selected))
+        # Keep this CLI fixture focused on selection; missing-folder behavior has separate restore tests.
         _ = self.enterContext(patch.object(restart_work, "_folder_exists", return_value=True))
+        _ = self.enterContext(patch.object(restart_work, "_prepare_restore_server"))
+        _ = self.enterContext(patch.object(herdr.Herdr, "close_restore_placeholders"))
         _ = self.enterContext(patch.object(sessions, "remote_control", return_value="active"))
         self.owners = []
         for identity, name in (("alpha-id", "Alpha"), ("beta-id", "Beta"), ("gamma-id", "Gamma")):
@@ -2138,6 +2150,8 @@ class OnlySessionCliTests(ShutdownTestCase):
         with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
               patch.object(shutdown, "own_claude_account", return_value=showrunner),
               patch.object(shutdown, "listing", return_value=[]),
+              patch.object(settle, "run_inventory", return_value=inventory.Inventory(
+                  machine="natedev", login=LOGIN, label=LABEL, sessions=[], unattributed=[])),
               patch.object(settle, "_launch_conductor") as conductor,
               redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
             status = shutdown.main(["now", "--only", selection, "--here"])
@@ -2170,7 +2184,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         selected = [Account("claude", LOGIN, LABEL), Account("claude", "other@example.com", "claude3")]
         by_login = {account.login: account for account in selected}
         owners = {LOGIN: self.owners[0], "other@example.com": unit_session("other-id")}
-        def report(login: str) -> inventory.Inventory:
+        def report(login: str, _only: tuple[str, ...] = ()) -> inventory.Inventory:
             return inventory.Inventory(machine="natedev", login=login, label=by_login[login].label,
                 sessions=[owners[login]], unattributed=[])
         def account_for_login(login: str) -> Account:
@@ -2180,6 +2194,7 @@ class OnlySessionCliTests(ShutdownTestCase):
               patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection(tuple(selected))),
               patch.object(shutdown, "named_claude_account", side_effect=account_for_login),
               patch.object(shutdown, "inventory", side_effect=report),
+              patch.object(settle, "run_inventory", side_effect=report),
               patch.object(settle, "_launch_conductor") as conduct,
               patch.object(shutdown, "follow", side_effect=AssertionError("following first account blocks second")),
               redirect_stdout(output)):
@@ -2222,7 +2237,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         down.assert_not_called()
         self.assertIn("claude2, claude3", error.getvalue())
 
-    def test_down_exact_name_builds_one_filtered_inventory_and_keeps_owned_workers(self) -> None:
+    def test_down_exact_name_rescans_after_revocation_and_keeps_owned_workers(self) -> None:
         worker = cast(inventory.WorkerSession, cast(object, {
             **unit_session("owned-worker"), "kind": "worker", "name": "Worker",
             "host": inventory.UnknownHost(kind="unknown"),
@@ -2235,11 +2250,13 @@ class OnlySessionCliTests(ShutdownTestCase):
             return inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
                 sessions=[self.owners[1], worker], unattributed=[])
         with (patch.object(shutdown, "inventory", side_effect=filtered) as read,
-              patch.object(settle, "run_inventory", side_effect=AssertionError("down inventories twice")),
+              patch.object(settle, "run_inventory", return_value=inventory.Inventory(
+                  machine="natedev", login=LOGIN, label=LABEL, sessions=[self.owners[1], worker], unattributed=[])) as rescan,
               patch.object(settle, "inventory", side_effect=AssertionError("begin inventories twice"))):
             status, _, error = self.action("down", "Beta")
         self.assertEqual((status, error), (0, ""))
         read.assert_called_once_with(LOGIN, only=frozenset({"beta-id"}))
+        rescan.assert_called_once_with(LOGIN, ("beta-id",))
         saved = record.session_records(LOGIN)
         self.assertEqual([item["session"]["session_id"] for item in saved], ["beta-id"])
         self.assertEqual(saved[0]["workers"], [worker])
@@ -2257,16 +2274,17 @@ class OnlySessionCliTests(ShutdownTestCase):
         launch.assert_not_called()
         self.assertEqual(record.session_records(LOGIN), [])
 
-    def test_down_without_selection_reuses_one_full_inventory(self) -> None:
+    def test_down_without_selection_rescans_after_revocation(self) -> None:
         report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
             sessions=self.owners, unattributed=[])
         with (patch.object(shutdown, "inventory", return_value=report) as read,
-              patch.object(settle, "run_inventory", side_effect=AssertionError("begin inventories twice")),
+              patch.object(settle, "run_inventory", return_value=report) as rescan,
               patch.object(settle, "inventory", side_effect=AssertionError("down inventories twice")),
               redirect_stdout(io.StringIO())):
             status = shutdown.main(["down", LOGIN, "--here"])
         self.assertEqual(status, 0)
         read.assert_called_once_with(LOGIN)
+        rescan.assert_called_once_with(LOGIN, ())
         self.assertEqual({saved["session"]["session_id"] for saved in record.session_records(LOGIN)},
             {owner["session_id"] for owner in self.owners})
 
@@ -2542,7 +2560,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         _ = self.save_three({"kind": "waiting"})
         with patch.object(restart_work, "_session_liveness", return_value=restart_work.SessionLive()), patch.object(settle, "alert_user") as alert, patch.object(restart_work, "_print_result") as summary:
             status, output, error = self.action("restart", "beta-id")
-        self.assertEqual((status, output, error), (1, "Beta: from shutdown record\nBeta: already running; skipped\nBeta is waiting, not stopped; nothing to restart\n", ""))
+        self.assertEqual((status, output, error), (1, "Beta: already running; skipped\nBeta is waiting, not stopped; nothing to restart\n", ""))
         alert.assert_not_called()
         summary.assert_not_called()
 
@@ -2578,7 +2596,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         self.assertEqual(push.id, "shutdown.move_failed")
         self.assertEqual((push.values["session"], push.values["target"]), ("Beta", "claude3"))
 
-    def test_selected_now_refuses_in_progress_and_clean_stopped_records_without_work(self) -> None:
+    def test_selected_now_stops_live_owners_with_old_stopping_or_stopped_records(self) -> None:
         cases: list[record.SessionProgress] = [{"kind": "stopping", "at": OCTOBER}, {"kind": "stopped", "at": OCTOBER}]
         for progress in cases:
             with self.subTest(progress=progress["kind"]):
@@ -2588,9 +2606,16 @@ class OnlySessionCliTests(ShutdownTestCase):
                 before = self.save_three(progress)
                 with patch.object(settle, "_launch_conductor") as conductor:
                     status, output, error = self.action("now", "beta-id")
-                self.assertEqual((status, output, error), (1, f"Beta is {progress['kind']}; nothing to stop\n", ""))
-                conductor.assert_not_called()
-                self.assertEqual(record.session_records(LOGIN), before)
+                self.assertEqual((status, error), (0, ""))
+                self.assertIn("Beta: stopping now\n", output)
+                self.assertRegex(output, r"\d\d:\d\d:\d\d  stopped  Beta \(by itself, [\d.]+ s\)\nall 1 stopped\n")
+                conductor.assert_called_once_with(LOGIN, LABEL)
+                current = record.find_session(LOGIN, "beta-id")
+                assert current is not None
+                self.assertEqual(current["progress"]["kind"], "stopped")
+                self.assertEqual(current["force"], "now")
+                self.assertEqual(record.find_session(LOGIN, "alpha-id"), before[0])
+                self.assertEqual(record.find_session(LOGIN, "gamma-id"), before[2])
 
     def test_selected_cancel_names_the_waiting_session_taken_out(self) -> None:
         _ = self.save_three({"kind": "waiting"})
@@ -2599,7 +2624,10 @@ class OnlySessionCliTests(ShutdownTestCase):
     def test_selected_now_forces_usage_limit_held_session_and_names_it(self) -> None:
         before = self.save_three(record.SessionHeldByUsageLimit(kind="held by usage limit", at=OCTOBER))
         with patch.object(settle, "_launch_conductor") as conductor:
-            self.assertEqual(self.action("now", "beta-id"), (0, "Beta: stopping now\n", ""))
+            status, output, error = self.action("now", "beta-id")
+            self.assertEqual((status, error), (0, ""))
+            self.assertIn("Beta: stopping now\n", output)
+            self.assertRegex(output, r"\d\d:\d\d:\d\d  stopped  Beta \(by itself, [\d.]+ s\)\nall 1 stopped\n")
         conductor.assert_called_once_with(LOGIN, LABEL)
         latest = record.find_session(LOGIN, "beta-id")
         assert latest is not None
@@ -2616,12 +2644,15 @@ class OnlySessionCliTests(ShutdownTestCase):
             self.assertEqual(shutdown.main(["status", LOGIN, "--here"]), 0)
         self.assertIn(f"  stop now: in a terminal on natedev: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now {LOGIN} --here --only alpha-id,beta-id,gamma-id · Alpha, Beta, Gamma\n", output.getvalue())
         with patch.object(settle, "_launch_conductor") as conductor:
-            self.assertEqual(self.action("now", "Beta"), (0, "Beta: stopping now\n", ""))
+            status, output, error = self.action("now", "Beta")
+            self.assertEqual((status, error), (0, ""))
+            self.assertIn("Beta: stopping now\n", output)
+            self.assertRegex(output, r"\d\d:\d\d:\d\d  stopped  Beta \(by itself, [\d.]+ s\)\nall 1 stopped\n")
         conductor.assert_called_once_with(LOGIN, LABEL)
         latest = record.find_session(LOGIN, "beta-id")
         assert latest is not None
         self.assertEqual(latest["force"], "now")
-        self.assertEqual(latest["progress"], progress)
+        self.assertEqual(latest["progress"]["kind"], "stopped")
         self.assertEqual(record.find_session(LOGIN, "alpha-id"), before[0])
         self.assertEqual(record.find_session(LOGIN, "gamma-id"), before[2])
 
@@ -2646,7 +2677,7 @@ class OnlySessionCliTests(ShutdownTestCase):
             current["progress"] = {"kind": "restarting", "at": settle.record_time(), "prior": {"kind": "stopped", "at": OCTOBER}}
         saved = record.update_session(LOGIN, "beta-id", claim)
         with patch.object(restart_work, "_launch_session") as launch, patch.object(settle, "alert_user") as alert:
-            self.assertEqual(self.action("restart", "beta-id"), (0, "Beta: from shutdown record\nBeta is already restarting\n", ""))
+            self.assertEqual(self.action("restart", "beta-id"), (0, "Beta is already restarting\n", ""))
         launch.assert_not_called()
         alert.assert_not_called()
         self.assertEqual(record.find_session(LOGIN, "beta-id"), saved)
@@ -2666,9 +2697,13 @@ class OnlySessionCliTests(ShutdownTestCase):
         def stopped(current: record.SessionShutdown) -> None:
             current["progress"] = {"kind": "stopped", "at": OCTOBER}
         refused = record.update_session(LOGIN, "beta-id", stopped)
-        with patch.object(settle, "_launch_conductor") as conductor:
+        report = inventory.Inventory(machine="natedev", login=LOGIN, label=LABEL,
+            sessions=[owner for owner in self.owners if owner["session_id"] != "beta-id"], unattributed=[])
+        with (patch.object(settle, "_launch_conductor") as conductor,
+              patch.object(settle, "run_inventory", return_value=report)):
             status, output, error = self.action("now", "alpha-id,beta-id")
-        self.assertEqual((status, output, error), (1, "Alpha: stopping now\nBeta is stopped; nothing to stop\n", ""))
+        self.assertEqual((status, error), (1, ""))
+        self.assertRegex(output, r"\AAlpha: already in progress\nAlpha: stopping now\n\d\d:\d\d:\d\d  stopped  Alpha \(by itself, [\d.]+ s\)\nall 1 stopped\nBeta is stopped; nothing to stop\n\Z")
         conductor.assert_called_once_with(LOGIN, LABEL)
         changed = record.find_session(LOGIN, "alpha-id")
         assert changed is not None
@@ -2683,7 +2718,7 @@ class OnlySessionCliTests(ShutdownTestCase):
             self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json", "--only", "beta-id"]), 1)
         result = restart_work.parse_peer_result(output.getvalue())
         self.assertEqual(result["outcome"], "nothing")
-        self.assertEqual(result["lines"], ["Beta: from shutdown record", "Beta: already running; skipped",
+        self.assertEqual(result["lines"], ["Beta: already running; skipped",
                                          "Beta is waiting, not stopped; nothing to restart"])
         self.assertEqual(cast(dict[str, object], json.loads(output.getvalue()))["no_remote_control"], [])
         self.assertEqual(result["refused"], [{"kind": "not stopped", "session_id": "beta-id", "name": "Beta", "progress": "waiting"}])
@@ -2709,7 +2744,7 @@ class OnlySessionCliTests(ShutdownTestCase):
         def quiet(current: record.SessionShutdown) -> None:
             current["alerts"] = "none"
         _ = record.update_session(LOGIN, "beta-id", quiet)
-        with patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), patch.object(remote_control, "launch_fixer") as fixer, redirect_stdout(output := io.StringIO()):
+        with patch.object(sessions, "remote_control", return_value="absent"), patch.object(restart_work, "wait_for_remote_control", return_value=frozenset()), patch.object(remote_control, "launch_fixer") as fixer, redirect_stdout(output := io.StringIO()):
             self.assertEqual(shutdown.main(["up", LOGIN, "--here", "--json", "--only", "beta-id"]), 0)
         result = restart_work.parse_peer_result(output.getvalue())
         self.assertFalse(any("Remote Control" in line for line in result["lines"]))

@@ -105,6 +105,20 @@ def marker(session_id: str, override: str | Path | None = None) -> Path:
     return next((path for path in candidates if path.is_file()), candidates[0])
 
 
+def marker_must_stay(path: Path) -> bool:
+    """Keep another session's marker when its owner is live or liveness is unknown.
+
+    The marker name is the session id; its age and target's existence say nothing
+    about the owning process. Reuse the registry's process-identity check.
+    """
+    if TYPE_CHECKING:
+        from ..message import sessions
+    else:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
+        import sessions
+    return not isinstance(sessions.session_liveness(path.name), sessions.SessionNotLive)
+
+
 def record_director(run: Path, session_id: str) -> None:
     """Name the run's director. A Codex worker that dispatches a peer inherits the director's
     session id, so it writes the same one; a Claude worker has its own, so a session the run lists
@@ -208,13 +222,13 @@ def former_owners(running: Mapping[str, str]) -> list[FormerOwner]:
         return []
     owners: list[FormerOwner] = []
     for path in markers:
-        if path.name not in running:
+        if path.name not in running and not marker_must_stay(path):
             continue
         try:
             run = path.read_text(encoding="utf-8").strip()
         except (OSError, UnicodeError):
             run = "an unreadable marker"
-        owners.append(FormerOwner(path.name, running[path.name], run))
+        owners.append(FormerOwner(path.name, running.get(path.name, "live or uncheckable session"), run))
     return owners
 
 
