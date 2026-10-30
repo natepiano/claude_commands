@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
 import unittest
 from scripts.direct import review_launcher_test_support as support
-from scripts.direct.review_launcher_test_support import TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS
 from scripts.direct.wait_for_test_state import wait_until
 from pathlib import Path
 import subprocess
