@@ -95,13 +95,6 @@ def member(selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound
     return _member_sources().member(selector, record)
 
 
-def _initial_snapshot() -> staff.StaffSnapshot:
-    try:
-        return staff.snapshot()
-    except staff.StaffAbsent:
-        return staff.StaffSnapshot(())
-
-
 def _showrunner_key(slug: str) -> str:
     return f"showrunner:{slug}"
 
@@ -231,7 +224,7 @@ def _print_plan(seed_input: staff.SeedInput, record: staff.StaffSnapshot, *, dry
 def seed(*, dry_run: bool = False) -> None:
     """Read local evidence under the operation lock and apply it in one owner write."""
     with staff.operation():
-        record = _initial_snapshot()
+        record = staff.initial_snapshot()
         sources = _member_sources()
         seed_input = _collect(record, sources)
         changed = _print_plan(seed_input, record, dry_run=dry_run)

@@ -16,6 +16,8 @@ from unittest import mock
 
 import fake_unit_host
 import production_lifecycle
+import showrunners
+import unit_lookup
 import tidy_wrapped
 from scripts.production.cli_fixture import invoke_cli
 
@@ -60,7 +62,10 @@ with open(os.environ["TEST_SENT"], "a") as handle:
 '''
 
 
+from scripts.production.staff_test_support import StaffTestCase
+
 class LifecycleFixture(unittest.TestCase):
+    staff: StaffTestCase = StaffTestCase()
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -96,11 +101,20 @@ class LifecycleFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        socket_for = showrunners.socket_for
+        marked_units = unit_lookup.marked_units
+        self.staff = StaffTestCase()
+        self.staff.setUp()
+        self.addCleanup(self.staff.doCleanups)
+        _ = self.enterContext(mock.patch.object(showrunners, "socket_for", socket_for))
+        _ = self.enterContext(mock.patch.object(unit_lookup, "marked_units", marked_units))
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.root = self.fixture_root
         self.bind_fixture()
         self.env = self.fixture_env.copy()
+        self.env["STAFF_FILE"] = str(self.staff.staff_file)
+        self.env["HERDR_PANE_RECORD_DIR"] = str(self.staff.source_root / "panes")
 
     def bind_fixture(self) -> None:
         self.origin = self.root / "origin.git"
