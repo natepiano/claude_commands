@@ -202,7 +202,7 @@ class UnitLookupTests(unittest.TestCase):
             "$3": marked("third", "w6:p1", "third-unit", slug="old"),
         })
         self.live_hosts("w4:p1", "w5:p1", "w6:p1")
-        with mock.patch.object(showrunners, "checked_doc", wraps=showrunners.checked_doc) as reads:
+        with mock.patch.object(showrunners, "_source", wraps=getattr(showrunners, "_source")) as reads:
             for expected_reads in (1, 2):
                 found = unit_lookup.every_marked_unit()
                 self.assertEqual(set(found.units["new"]), {"first-unit", "second-unit", "third-unit"})

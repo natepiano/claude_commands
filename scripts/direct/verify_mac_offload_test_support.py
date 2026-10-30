@@ -422,14 +422,17 @@ import runpy
 import sys
 import time
 
+sys.path.insert(0, str(Path(os.environ["TEST_REAL_TARGETS"]).resolve().parents[2]))
+from scripts.lib.atomic_file import write_text_atomic
+
 command = sys.argv[1]
 root = Path(os.environ["TEST_RUNNER_STATE"])
 if command == "wait-local":
-    (root / "local-wait-args").write_text(json.dumps(sys.argv[2:]))
+    write_text_atomic(root / "local-wait-args", json.dumps(sys.argv[2:]))
 if command == "wait-local" and os.environ.get("TEST_LOCAL_WAIT_SECONDS") and not (root / "local-wait-added").exists():
     with Path(os.environ["BUILDLOG_HOLD_WAIT_FILE"]).open("a") as output:
         output.write(os.environ["TEST_LOCAL_WAIT_SECONDS"] + "\n")
-    (root / "local-wait-added").write_text("added\n")
+    write_text_atomic(root / "local-wait-added", "added\n")
 sys.path.insert(0, str(Path(os.environ["TEST_REAL_TARGETS"]).parent))
 status = 0
 try:
@@ -441,7 +444,7 @@ event = {"command": command, "status": status, "at": time.monotonic(),
 with (root / "routing-events.jsonl").open("a") as output:
     output.write(json.dumps(event) + "\n")
 if command == "register-local" and status == 10:
-    (root / "registered").write_text("registered\n")
+    write_text_atomic(root / "registered", "registered\n")
 raise SystemExit(status)
 '''
 

@@ -1513,6 +1513,8 @@ def _restore_timers(
                 notifier = [override] if override else ["zsh", str(settle.NOTIFIER)]
                 _display([*notifier, "start", timer["instance"]])
             else:
+                undo_errors: list[Exception] = []
+
                 def stop_if_claim_lost(current: SessionShutdown) -> None:
                     assert claim is not None
                     same_attempt = (current["request_id"] == claim.request_id
@@ -1525,7 +1527,13 @@ def _restore_timers(
                     covers_resumed = (claim.resumed is not None
                                       and recovery_store.request_matches_process(current, claim.resumed))
                     if not same_attempt and stopping and covers_resumed:
-                        settle.run_notifier("stop", timer["instance"])
+                        current["timers"] = recovery_store.merge_timer_restores(current["timers"], [timer])
+                        try:
+                            settle.run_notifier("stop", timer["instance"])
+                        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                            # update_session publishes only after this callback
+                            # returns. Keep the intent even if undoing start fails.
+                            undo_errors.append(error)
 
                 try:
                     if claim_error:
@@ -1539,6 +1547,8 @@ def _restore_timers(
                         # Missing/unreadable records are reconciliation failures,
                         # never evidence that a stop owns this process generation.
                         _update_timer_owner(record, stop_if_claim_lost, claim=claim)
+                        if undo_errors:
+                            raise undo_errors[0]
                 except (NoLiveRecord, OSError, RuntimeError, ValueError, UnreadableAccount, subprocess.SubprocessError) as error:
                     failures.append(
                         PendingTimer(
@@ -3372,6 +3382,20 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         or (record["progress"]["kind"] == "restarting" and
             (at - datetime.fromisoformat(record["progress"]["at"])).total_seconds() >= CLAIM_STALE_SECONDS)
     ]
+    if all_accounts and not ids:
+        restoring: list[SessionShutdown] = []
+        for saved in eligible:
+            if (saved["then"] == "stop" and saved["hold"] == "session"
+                    and saved["requested_by"]["kind"] != "snapshot"):
+                origin = saved["requested_by"]
+                reason = ("session stopped itself" if origin["kind"] == "session"
+                          and origin["session_id"] == saved["session"]["session_id"] else "single-session stop")
+                command = settle.shutdown_command("restart", saved["login"], "--here", "--only",
+                                                  saved["session"]["session_id"])
+                print(f"{saved['session']['name']}: skipped: {reason}; to restore it: {command}")
+            else:
+                restoring.append(saved)
+        eligible = restoring
     if not dry_run and (eligible or codex_entries):
         first = sum(saved["session"]["kind"] != "unit" for saved in eligible) + len(codex_entries)
         print(f"restoring {len(eligible) + len(codex_entries)} sessions: {first} showrunners and top-level, then {len(eligible) + len(codex_entries) - first} units", flush=True)

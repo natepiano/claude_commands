@@ -781,13 +781,12 @@ class ShutdownRequestChanged(Exception):
 
 
 def save_timers(saved: SessionShutdown) -> SessionShutdown:
-    """Save the restore snapshot before stopping any of its timers."""
-    timers = saved["timers"] or _session_timer_snapshot(saved["session"])
+    """Merge and save timer restore intent before stopping any timers."""
+    timers = _session_timer_snapshot(saved["session"])
     def remember(current: SessionShutdown) -> None:
         if current["request_id"] != saved["request_id"]:
             raise RuntimeError("shutdown request changed before its timers were saved")
-        if not current["timers"]:
-            current["timers"] = timers
+        current["timers"] = store.merge_timer_restores(current["timers"], timers)
     def stop_timers(current: SessionShutdown) -> None:
         _stop_recorded_timers(current["timers"])
     return store.update_session(saved["login"], saved["session"]["session_id"],
@@ -984,6 +983,8 @@ def _down_all(started: float) -> int:
                 if current["progress"]["kind"] == "restarting":
                     current["progress"] = {"kind": "waiting"}
                 current["stop_deadline"] = deadline
+                # This stop now covers the account, even when it adopts a selected restore.
+                current["hold"] = "account"
                 current["then"] = "stop"
             selected.append(store.update_session(saved["login"], session_id, bound))
 
