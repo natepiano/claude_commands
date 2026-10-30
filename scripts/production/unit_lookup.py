@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -23,7 +23,7 @@ import herdr  # noqa: E402
 import showrunners  # noqa: E402
 import sessions  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
-from sessions import UnreadableSessionRecord, live_session, read_session  # noqa: E402
+from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
 from showrunners import canonical_slug  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 
@@ -321,6 +321,11 @@ def every_marked_unit() -> MarkedProductions:
         marked = list(_herdr_marked(claudes, unread, processes))
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
+    return group_marked_units(marked)
+
+
+def group_marked_units(marked: Iterable[tuple[str, MarkedUnit]]) -> MarkedProductions:
+    """Resolve current production slugs and refuse units marked in more than one place."""
     found: dict[str, dict[str, list[MarkedUnit]]] = {}
     current_slugs: dict[str, str] = {}
     for slug, unit in marked:
@@ -341,6 +346,38 @@ def every_marked_unit() -> MarkedProductions:
             else:
                 units[slug][name] = holders[0] if holders else places[0]
     return MarkedProductions(units, faults)
+
+
+def session_unit_marks(
+    records: list[SessionRecord], environment: Mapping[str, str],
+) -> tuple[MarkedProductions, dict[str, str]]:
+    """Read unit marks only for known session PIDs, without enumerating processes."""
+    marked: list[tuple[str, MarkedUnit]] = []
+    directors: dict[str, str] = {}
+    known = {record["sessionId"] for record in records}
+    proc = Path(environment.get("HERDR_PROC", "/proc"))
+    for record in records:
+        try:
+            # Herdr's Linux environment reader is private; keep this PID-only IO here.
+            raw = (proc / str(record["pid"]) / "environ").read_bytes()
+            values = dict(item.split("=", 1) for item in raw.decode(errors="replace").split("\0")
+                          if "=" in item)
+        except OSError:
+            continue
+        owner = values.get("CLAUDE_CODE_SESSION_ID", "")
+        if owner in known and owner != record["sessionId"]:
+            directors[record["sessionId"]] = owner
+            continue
+        slug = values.get(PRODUCTION_MARK, "")
+        unit = values.get(UNIT_MARK, "")
+        if slug and unit:
+            unit_mark = MarkedUnit(
+                unit, LiveClaude(record["name"], record["sessionId"],
+                                 record["messagingSocketPath"], record["pid"]),
+                herdr.HerdrPlace(values.get("HERDR_SESSION", ""), values.get("HERDR_PANE_ID", "")),
+            )
+            marked.append((slug, unit_mark))
+    return group_marked_units(marked), directors
 
 
 def marked_units(slug: str) -> dict[str, MarkedUnit]:

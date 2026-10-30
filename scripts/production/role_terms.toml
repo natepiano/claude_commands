@@ -365,3 +365,15 @@ name = "ETA"
 kind = "record"
 defined_in = "commands/unit/eta.md#Steps"
 other_names = ["phase ETA"]
+
+[[terms]]
+name = "held design role"
+kind = "role"
+defined_in = "docs/as-built/long-lived-workers.md#Why roles outlive runs"
+other_names = ["guild", "guild head"]
+retired = ["guild", "guilds", "guild head", "guild heads"]
+
+[terms.inflected_forms]
+"held design role" = ["held design roles"]
+guild = ["guilds"]
+"guild head" = ["guild heads"]

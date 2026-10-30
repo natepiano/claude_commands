@@ -105,7 +105,7 @@ steps:
    - the newest run record and the recorder state;
    - this production's open proposal issues and phase notes (`phase_table.owned_notes`).
    - the herdr pane record drops the old unit's entries (`pane_record.forget_unit`), in each session's file. The relaunched unit records its new pane at SessionStart; an old entry would resume the old name.
-   - each held design role of the unit (`roles.rename_holder`, `docs/as-built/long-lived-workers.md#lasting-roles`): with the role idle, the ownership authority moves the checkout and advances the generation, and the holder, checkout, document and binding paths, `guild_context.json` and the roster `cwd` take the new names. A failure raises `RenameRefused`, and the journal retries the step.
+   - each held design role of the unit (`design_roles.rename_holder`, `docs/as-built/long-lived-workers.md#lasting-roles`): with the role idle, the ownership authority moves the checkout and advances the generation, and the holder, checkout, document and binding paths, `design_context.json` and the roster `cwd` take the new names. A failure raises `RenameRefused`, and the journal retries the step.
    Style productions also call `Ledger.rename_unit` with their Repository: queued, assigned and
    checkpointed tickets and sync waits take the new unit id; ticket ids and closed rows stay. It
    refuses a target that owns current rows or maps to another family, and a repeat moves nothing.
@@ -147,7 +147,7 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   - the transcript folders, the stall stretch and the newest run;
   - proposals and phase notes;
   - the shutdown record and the live session's mark;
-  - held design roles (`roles.rename_failures`): no old holder, no old checkout in a live field or roster `cwd`, no stale `guild_context.json`.
+  - held design roles (`design_roles.rename_failures`): no old holder, no old checkout in a live field or roster `cwd`, no stale `design_context.json`.
 - **Control.** The old id must still be in the merge-branch subjects. If the matcher finds nothing
   in history, it is broken.
 - **Sweep.** `unit_rename_sweep.sweep` runs `rg -F` for the old id, branch and worktree path, then
@@ -164,7 +164,7 @@ A unit that was not running has no record, so steps 9 and 10 do nothing for it.
   So are the pause hook's scheduled prompts (`conversation-pause/scheduled-prompts/`): they are copies
   of queued prompt texts, such as the relaunch prompt with its rename note, and the hook matches each
   incoming prompt to them exactly, so a rewrite would break the match. In the held role store
-  (`guilds/roles/`), `prompts/`, `replies/`, `adoption.json` and `transfer.json` are history, and role
+  (`astra/design-roles/`), `prompts/`, `replies/`, `adoption.json` and `transfer.json` are history, and role
   `name` and `aliases` in `design.json` and the entry names and `aliases` in a role mesh roster are identity, not live names. A hit outside the history classes fails and names its file. Shutdown paths print as `(masked)`.
   Three owner-maintained records also keep their original names: `herdr-panes/` contains launch
   snapshots (apply drops the old director's entries; SessionStart rewrites other panes, and

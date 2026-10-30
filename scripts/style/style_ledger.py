@@ -4939,8 +4939,8 @@ class Ledger:
             return NeedsJudgment("original context inputs changed or missing")
         old = self._site_source(before, finding.path)
         new = self._site_source(tip, finding.path)
-        # A partial item parse cannot establish an unambiguous owner, even on an equal line.
-        _ = old.items, new.items
+        # Reject an unproved owner before accepting an unchanged file.
+        _ = old.owner_chain(finding.line), new.items
         if before.blobs.get(finding.path) == tip.blobs.get(finding.path) and finding.path in tip.blobs:
             # The file gate itself is satisfied; context rules also retain their original external inputs.
             return UnchangedSite(finding.path, finding.line)

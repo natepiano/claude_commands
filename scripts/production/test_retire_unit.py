@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Literal, cast, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from scripts.guilds import roles
+from scripts.astra import design_roles
 from scripts.direct import workers  # noqa: E402
 
 import add_unit
@@ -143,8 +143,8 @@ class RetireUnitTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {"RETIRE_UNIT_RUN_ROOT": str(runs),
                                                        "UNIT_WORKERS_STATE": str(self.root / "unit-workers"),
                                                        "BUILD_HOLD_DIR": str(holds),
-                                                       "GUILD_ROLES_STATE": str(self.root / "guild-roles"),
-                                                       "GUILD_OWNERSHIP_STATE": str(self.root / "guild-ownership")}))
+                                                       "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
+                                                       "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership")}))
         _ = self.enterContext(mock.patch.object(retire_unit, "MAC_CLAIMS", self.root / "claims"))
         _ = self.enterContext(mock.patch.object(retire_unit, "production_of", production_of))
         _ = self.enterContext(mock.patch.object(retire_unit, "run", self.fake_run))
@@ -350,7 +350,7 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_role_cleanup_refusal_keeps_the_unit_row_worktree_and_branch(self) -> None:
         before = self.doc.read_bytes()
-        with mock.patch.object(roles, "end_holder", side_effect=roles.RoleRefused("designer turn is still running")):
+        with mock.patch.object(design_roles, "end_holder", side_effect=design_roles.RoleRefused("designer turn is still running")):
             code, output = self.retire()
         self.assertEqual(code, 1, output)
         self.assertIn("held role cleanup", output)
@@ -446,7 +446,7 @@ class RetireUnitTests(unittest.TestCase):
                 def return_director(_slug: str, _unit: str) -> None:
                     self.marked = unit_lookup.MarkedUnit("alpha-unit",
                         unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 5101), HerdrPlace("alpha", "w1:p1"))
-                with mock.patch.object(roles, "end_holder", side_effect=return_director):
+                with mock.patch.object(design_roles, "end_holder", side_effect=return_director):
                     code, output = self.retire()
                 self.assertEqual(code, 1, output)
                 self.assertIn(f"left running: marked session {DIRECTOR}, pid 5101", output)
@@ -504,7 +504,7 @@ class RetireUnitTests(unittest.TestCase):
         before = self.doc.read_bytes()
         def pending_stop(_slug: str, _unit: str) -> None:
             self.records = [self.shutdown_state("stopping")]
-        with mock.patch.object(roles, "end_holder", side_effect=pending_stop):
+        with mock.patch.object(design_roles, "end_holder", side_effect=pending_stop):
             code, output = self.retire()
         self.assertEqual(code, 1, output)
         self.assertIn(f"session {DIRECTOR}, pid 4101: shutdown stopping", output)
@@ -515,7 +515,7 @@ class RetireUnitTests(unittest.TestCase):
         before = self.doc.read_bytes()
         def relaunch(_slug: str, _unit: str) -> None:
             self.claude = [session(SEAT, "returned-worker", 5202)]
-        with mock.patch.object(roles, "end_holder", side_effect=relaunch):
+        with mock.patch.object(design_roles, "end_holder", side_effect=relaunch):
             code, output = self.retire()
         self.assertEqual(code, 1, output)
         self.assertIn(f"session {SEAT}, pid 5202", output)

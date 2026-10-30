@@ -754,9 +754,9 @@ def retire(unit: Unit, wait_minutes: float) -> int:
         print("\n".join(f"left running: {reason}" for reason in left))
         print(f"{unit.name} is not retired: rerun once these stop")
         return 1
-    from scripts.guilds import roles
+    from scripts.astra import design_roles
     try:
-        roles.end_holder(unit.production.slug, unit.name)
+        design_roles.end_holder(unit.production.slug, unit.name)
     except (OSError, ValueError, SystemExit) as error:
         print(f"{unit.name} is not retired: held role cleanup: {error}")
         return 1
