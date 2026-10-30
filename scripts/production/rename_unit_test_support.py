@@ -13,7 +13,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import unittest
 from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
@@ -22,6 +21,10 @@ from unittest import mock
 from scripts.herdr import fake_herdr
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.cli_fixture import invoke_cli
+from scripts.production.rename_test_support import bind_staff_fixture
+from scripts.production.staff_test_support import StaffTestCase
+from scripts.production import staff
+from scripts.lib.atomic_file import write_text_atomic
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -49,7 +52,7 @@ SLUG = "demo"
 TEST_HANG_GUARD_SECS = 300
 
 
-class UnitRenameFixture(unittest.TestCase):
+class UnitRenameFixture(StaffTestCase):
 
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
@@ -80,11 +83,13 @@ class UnitRenameFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         # Git worktrees and production docs embed absolute paths. Each independent
         # copy returns to the seed's original path, with its own refs and origin.
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
+        bind_staff_fixture(self, self.env, {SLUG: ("alpha-unit", "mul_add-unit")})
         # These modules also bind paths at import time; environment changes alone
         # do not isolate their journals, locks, or stall-watch state.
         for module, name, value in (
@@ -213,7 +218,7 @@ class UnitRenameFixture(unittest.TestCase):
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(content, encoding="utf-8")
+        write_text_atomic(path, content)
 
     def git(self, *arguments: str, cwd: Path | None = None) -> str:
         result = subprocess.run(["git", *arguments], cwd=cwd or self.checkout, env=self.env,
@@ -346,6 +351,8 @@ class UnitRenameFixture(unittest.TestCase):
             f"| alpha-unit | docs/plans/alpha.md | `{self.rust / 'claude-demo-alpha'}` | demo-alpha |",
             f"| names-unit | `{plan}` | `{worktree}` | demo-names |")
         self.write(self.doc, text)
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == SLUG)
+        _ = staff.ensure("unit", name="names", parent=parent.id)
         for directory in (self.checkout, worktree):
             self.write(directory / plan, "# Names\n\n> **Production:** demo (names-unit)\n"
                        + "> **Standing:** style_plan.py\n\nnames-unit history stays.\n")

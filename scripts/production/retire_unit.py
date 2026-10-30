@@ -31,6 +31,7 @@ Exit 0 when the unit is retired; 1 on a refusal or when something still runs (a 
 """
 from __future__ import annotations
 
+
 import argparse
 import itertools
 import json
@@ -44,6 +45,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import staff, staff_sources
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -144,7 +148,7 @@ class Found(NamedTuple):
 def run(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     """One command, without this session's id: shutdown then finds the account that holds the unit."""
     environment = {key: value for key, value in os.environ.items() if key != "CLAUDE_CODE_SESSION_ID"}
-    return subprocess.run(argv, cwd=cwd, env=environment, capture_output=True, text=True, check=False,
+    return subprocess.run(argv, pass_fds=staff.operation_fds(), cwd=cwd, env=environment, capture_output=True, text=True, check=False,
                           timeout=900)
 
 
@@ -746,6 +750,7 @@ def retire(unit: Unit, wait_minutes: float) -> int:
     if refused:
         print("\n".join(f"refused: {reason}" for reason in refused))
         return 1
+    member = staff_sources.member(staff_sources.UnitMember(unit.production.slug, unit.name), staff.initial_snapshot())
     # Read before the stop: once stopped, the unit's mark is gone.
     director = director_session(unit) if not unit.retired else NoDirectorSession()
     session_id = director.session_id if isinstance(director, DirectorSession) else last_session(unit)
@@ -781,10 +786,18 @@ def retire(unit: Unit, wait_minutes: float) -> int:
     mark_retired(unit, director)
     failed = remove(unit)
     print("\n".join(f"not removed: {reason}" for reason in failed) if failed else f"{unit.name} retired")
+    if isinstance(member, staff_sources.MemberFound):
+        workers = staff.find(kind="worker", parent=member.row.id)
+        for worker in workers:
+            print(f"kept worker {worker.id} {worker.name} under {member.row.name}")
+        if workers:
+            return 1
+        if not failed:
+            _ = staff.retire(member.row.id)
     return 1 if failed else 0
 
 
-def main(argv: list[str]) -> int:
+def _main(argv: list[str]) -> int:
     from scripts.direct.workers import WorkerUnavailable
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     _ = parser.add_argument("slug")
@@ -797,9 +810,18 @@ def main(argv: list[str]) -> int:
         if cast(bool, options.dry_run):
             return dry_run(unit)
         return retire(unit, cast(float, options.wait_minutes))
+    except (staff.StaffRefused, staff.StaffUnreadable):
+        raise
     except (Refused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, shutdown_record.InvalidRecord, OSError) as error:
         print(f"refused: {error}")
         return 1
+
+
+def main(argv: list[str]) -> int:
+    def run() -> int:
+        with staff.operation():
+            return _main(argv)
+    return staff.cli_result(run)
 
 
 if __name__ == "__main__":

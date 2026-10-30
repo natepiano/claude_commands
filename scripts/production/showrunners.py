@@ -15,13 +15,15 @@ import shlex
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from importlib import import_module
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.lib.atomic_file import write_text_atomic
 
 CONFIG = Path(os.environ.get("SHOWRUNNERS_CONFIG") or Path(__file__).resolve().parents[2] / "config/showrunners.json")
@@ -585,8 +587,12 @@ def name_refusal(slug: str, name: str) -> str:
             + f"rename the production first: `/showrunner:rename plan {slug} {name}`")
 
 
-def attach(child: str, parent: str) -> None:
-    """Store that `child` reports to `parent`. Raises ValueError naming why it cannot."""
+class ParentCycle(ValueError):
+    """The requested source edge would make a showrunner its own ancestor."""
+
+
+def check_attach(child: str, parent: str) -> None:
+    """Check the source-side attach rules before either record changes."""
     child = canonical_slug(child)
     parent = canonical_slug(parent)
     known = timer_slugs()
@@ -605,29 +611,43 @@ def attach(child: str, parent: str) -> None:
     while above in tree:
         above = tree[above]
         if above == child:
-            raise ValueError(f"{parent} already reports to {child}, directly or through others")
+            raise ParentCycle(f"{parent} already reports to {child}, directly or through others")
+
+
+def attach(child: str, parent: str) -> None:
+    """Store the checked desired parent; repeat calls keep the same file."""
+    child, parent = canonical_slug(child), canonical_slug(parent)
+    check_attach(child, parent)
     path = SHOWRUNNER_STATE_DIR / child / PARENT_FILE
+    if path.exists() and stored_parent(child) == parent:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     write_text_atomic(path, f"{parent}\n")
 
 
 def detach(child: str) -> str:
-    """Remove `child`'s parent file and return the parent it named. Raises ValueError when it has none."""
+    """Remove the parent file, returning its former parent or an empty string."""
     child = canonical_slug(child)
     parent = _stored_parent(child)
-    if not parent:
-        raise ValueError(f"{child} reports to no one")
-    (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).unlink()
+    (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).unlink(missing_ok=True)
     return parent
 
 
-class Released(NamedTuple):
-    """The edges a wrapped production left: each one's parent file is gone."""
-
-    # The production it reported to. Empty when it had none.
+@dataclass(frozen=True)
+class ReportedTo:
     parent: str
-    # The productions that reported to it, each a root now.
-    orphans: list[str]
+
+
+@dataclass(frozen=True)
+class Root:
+    """The production had no parent when wrap captured its edges."""
+
+
+@dataclass(frozen=True)
+class WrapRelease:
+    former_parent: ReportedTo | Root
+    former_children: tuple[str, ...]
+    told: tuple[str, ...]
 
 
 def stored_children(slug: str) -> list[str]:
@@ -636,34 +656,56 @@ def stored_children(slug: str) -> list[str]:
                   if path.parent.name != slug and _stored_parent(path.parent.name) == slug)
 
 
-def release_edges(slug: str) -> Released:
-    """Remove `slug`'s parent file and every parent file that names it, so a wrap leaves no edge behind.
-
-    An edge to a wrapped production already counts for nothing; its file would come back to life if a
-    production of the same slug ran again.
-    """
-    released = Released(_stored_parent(slug), stored_children(slug))
-    for child in ([slug] if released.parent else []) + released.orphans:
-        (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).unlink(missing_ok=True)
-    return released
+def edges_to_release(slug: str) -> WrapRelease:
+    """Capture edges before wrap removes the timer or retires any row."""
+    parent = stored_parent(slug)
+    return WrapRelease(ReportedTo(parent) if parent else Root(), tuple(stored_children(slug)), ())
 
 
-def tell(slug: str, key: str, text: str) -> str:
-    """Send one line to the production's showrunner, and say in a few words whether it got there."""
+def release_edges(slug: str, released: WrapRelease) -> None:
+    """Remove captured edges that still hold; preserve subsequent attachments."""
+    captured = [(child, slug) for child in released.former_children]
+    if isinstance(released.former_parent, ReportedTo):
+        captured.insert(0, (slug, released.former_parent.parent))
+    for child, parent in captured:
+        current = stored_parent(child)
+        if current == parent:
+            (SHOWRUNNER_STATE_DIR / child / PARENT_FILE).unlink(missing_ok=True)
+        elif current:
+            print(f"showrunners: keep {child} -> {current}; captured parent was {parent}", file=sys.stderr)
+
+
+@dataclass(frozen=True)
+class NoticeDelivery:
+    """Output lines and delivery failures from one completed notice batch."""
+
+    lines: tuple[str, ...] = ()
+    failed: tuple[str, ...] = ()
+
+
+def _deliver(slug: str, key: str, text: str) -> NoticeDelivery:
     address = current_address(slug)
     if not address:
-        return f"{slug} is not running: tell it when it starts"
+        return NoticeDelivery((f"{slug} is not running: tell it when it starts",))
     sent = subprocess.run([sys.executable, str(SEND), "--to", address, "--from", "showrunners", "--key", key,
                            "--text", text], capture_output=True, text=True, check=False)
     if sent.returncode != 0:
-        return f"could not tell {slug}: {sent.stderr.strip() or f'send.py exited {sent.returncode}'}"
-    return f"told {slug}"
+        return NoticeDelivery((f"could not tell {slug}: {sent.stderr.strip() or f'send.py exited {sent.returncode}'}",),
+                              failed=(slug,))
+    return NoticeDelivery((f"told {slug}",))
 
 
-def tell_others(texts: dict[str, str], key: str) -> list[str]:
+def tell(slug: str, key: str, text: str) -> str:
+    """Send one line and preserve the existing human-readable delivery report."""
+    return _deliver(slug, key, text).lines[0]
+
+
+def tell_others(texts: dict[str, str], key: str) -> NoticeDelivery:
     """Tell each production its line, but for the one this session runs, which reads the command's own output."""
     own = own_slug()
-    return [tell(slug, key, text) for slug, text in texts.items() if slug != own]
+    deliveries = [_deliver(slug, key, text) for slug, text in texts.items() if slug != own]
+    return NoticeDelivery(tuple(line for delivery in deliveries for line in delivery.lines),
+                          failed=tuple(slug for delivery in deliveries for slug in delivery.failed))
 
 
 def main(argv: list[str]) -> int:
@@ -717,28 +759,9 @@ def main(argv: list[str]) -> int:
         elif action == "tree":
             for line in tree_lines(registered_showrunners()):
                 print(line)
-        elif action == "attach":
-            child = canonical_slug(cast(str, args.child))
-            parent = cast(str | None, args.parent) or own_slug()
-            if not parent:
-                raise ValueError("name the parent: this session runs no production")
-            parent = canonical_slug(parent)
-            attach(child, parent)
-            top = root_of(parent)
-            print(f"{child} now reports to {parent}")
-            for line in tell_others({
-                child: f"{child} now reports to {parent}. The root is {top}: send it each item for the user. {RULES}",
-                parent: f"{child} now reports to {parent}. It is a child showrunner, never a unit: it has no Units "
-                        + f"row, and no broadcast is passed on to it. {RULES}",
-            }, f"showrunner-tree:{child}"):
-                print(line)
-        elif action == "detach":
-            child = canonical_slug(cast(str, args.child))
-            parent = detach(child)
-            print(f"{child} no longer reports to {parent}")
-            text = f"{child} no longer reports to {parent}. {child} is a root again."
-            for line in tell_others({child: text, parent: text}, f"showrunner-tree:{child}"):
-                print(line)
+        elif action in ("attach", "detach"):
+            parent_main = cast(Callable[[str, str, str], int], import_module("showrunner_parent").main)
+            return parent_main(action, cast(str, args.child), (cast(str | None, args.parent) or "") if action == "attach" else "")
     except (OSError, ValueError, KeyError) as error:
         print(f"showrunners: {error}", file=sys.stderr)
         return 1
