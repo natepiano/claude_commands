@@ -107,9 +107,10 @@ The sampler publishes `.max` first, then records the committed peak and its
 last near-peak time in `.wave` with an atomic rename, at most once per 60 s
 while use stays near the peak, and with every new peak. Decay requires the
 recorded peak to match `.max`; a failed time update cannot discard a new peak.
-After expiry, current memory and any ramp promise still count. A missing,
-unreadable, malformed, old time-only or mismatched record, or a negative time,
-keeps the peak charge for older or failed samplers.
+After expiry, current memory and any ramp promise still count. A step with no
+`.wave` (a sampler from before the decay) decays 1500 s after its `.max` file
+last changed. An unreadable, malformed, old time-only or mismatched record,
+or a negative time, keeps the peak charge.
 Release and stale-reservation cleanup remove `.wave` with `.max`.
 
 A pressure hold enables start spacing, including a launch hold before the
