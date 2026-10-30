@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import unit_staff_test_support
+from unit_staff_test_support import unit_host
+from scripts.production import staff_sources
 import copy
 import ctypes
 import io
@@ -40,6 +43,7 @@ from user_action import ActionRequired
 from push_texts import RenderedPush, render, catalog, render_entry
 import restart as restart_work
 import settle
+import send as message_send
 import detached
 import shutdown
 if TYPE_CHECKING:
@@ -156,7 +160,7 @@ def unit(
     return inventory.UnitSession(
         **common_session(session_id, name, status=status, ahead=ahead),
         kind="unit",
-        host=inventory.UnitHost(
+        host=unit_host(
             kind="unit",
             production=production,
             unit=name,
@@ -755,7 +759,7 @@ class SettleTests(ShutdownTestCase):
 
         first = self.unit_for_showrunner()
         second_owner = unit("second-unit", "Second")
-        second_owner["host"]["doc"] = "/tmp/demo-production.md"
+        unit_staff_test_support.PARENTS[second_owner["host"]["unit"]] = staff_sources.UnitProduction("demo", "/tmp/demo-production.md")
         second = session_shutdown(second_owner, then="restart")
         self.save(second)
 
@@ -2102,7 +2106,7 @@ class SettleTests(ShutdownTestCase):
 
     def unit_for_showrunner(self, then: shutdown_record.ShutdownContinuation = "restart") -> shutdown_record.SessionShutdown:
         owner = unit("unit", "Unit")
-        owner["host"]["doc"] = "/tmp/demo-production.md"
+        unit_staff_test_support.PARENTS[owner["host"]["unit"]] = staff_sources.UnitProduction("demo", "/tmp/demo-production.md")
         saved = session_shutdown(owner, progress={"kind": "ready", "at": NOW}, then=then)
         saved["target"] = "claude3"
         saved["why"] = "claude2 is out of usage"
@@ -2168,7 +2172,7 @@ class SettleTests(ShutdownTestCase):
 
     def test_retire_reason_is_saved_and_sent_to_the_session_and_showrunner(self) -> None:
         owner = unit("retiring", "Retiring")
-        owner["host"]["doc"] = "/tmp/demo-production.md"
+        unit_staff_test_support.PARENTS[owner["host"]["unit"]] = staff_sources.UnitProduction("demo", "/tmp/demo-production.md")
         added = settle.begin(LOGIN, only=["retiring"], request_id="retire-request",
                              then="stop", why="retired; /showrunner:resume_unit brings it back.",
                              report=machine_inventory([owner]))
@@ -4556,7 +4560,8 @@ class SettleTests(ShutdownTestCase):
 
     def test_now_only_stopped_owner_with_leftover_cleanup_is_retried_by_conductor(self) -> None:
         saved = session_shutdown(top_level("partial", "Partial"), progress={"kind": "stopped", "at": NOW})
-        saved["stop_issues"] = [shutdown_record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir="/tmp/run", cause="stop not confirmed")]
+        saved["stop_issues"] = [shutdown_record.UnitSessionLeftRunning(kind="unit session left running",
+            at=NOW, host="herdr", session_name="unit", cause="stop not confirmed")]
         self.save(saved)
         with patch.object(settle, "_launch_conductor") as conductor, patch.object(stop_work, "stop_session") as stop, redirect_stdout(io.StringIO()):
             self.assertEqual(settle.now(Account("claude", LOGIN, LABEL), True, only=["partial"]), 0)
@@ -4776,6 +4781,50 @@ class SettleTests(ShutdownTestCase):
                 alert.assert_not_called()
                 fixer.assert_called_once_with("restored-" + policy, 912, "resumed-start", "Restored", "Restored")
                 shutdown_record.archive_session(LOGIN, other["session"]["session_id"])
+
+    def test_send_outcomes_without_a_repeat_window_require_delivery_evidence(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
+        acknowledged = message_send.acknowledged_skip_reason("fixture-key", NOW)
+        cases = (
+            ("SENT: fixture socket\n", 0, "sent", "", True, True),
+            (f"SKIPPED: {acknowledged}\n", 0, "acknowledged", acknowledged, True, True),
+            ("SKIPPED: key is inside its repeat window\n", 0, "window skipped",
+             "key is inside its repeat window", False, False),
+            ("", 0, "unconfirmed", "send returned no outcome header", False, False),
+            ("KEPT: existing user message\n", 0, "kept", "existing user message", False, True),
+            ("REPLACED: newer user message\n", 0, "replaced", "newer user message", False, True),
+            ("QUEUED: session unavailable\n", 1, "queued", "session unavailable", False, False),
+        )
+        for index, (stdout, code, kind, reason, delivered, accepted_alert) in enumerate(cases):
+            with self.subTest(kind=kind):
+                saved = session_shutdown(top_level(f"delivery-{index}", "Owner"))
+                self.save(saved)
+                with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, stdout, "")) as sender:
+                    settle.request_pause(saved)
+                    current = shutdown_record.find_session(LOGIN, saved["session"]["session_id"])
+                    assert current is not None
+                    expected = ({"kind": "sent", "at": NOW} if delivered else
+                                {"kind": "queued", "at": NOW, "reason": reason})
+                    self.assertEqual(current["settle_message"], expected)
+                    self.assertEqual(settle.alert_user(render("nixos.ups_battery", charge="30", minutes="5")),
+                                     accepted_alert)
+                    observed = settle.send_message("session:owner", "Shutdown", "Stop work", key="fixture-key")
+                    self.assertEqual(observed, {"kind": kind} if kind == "sent" else
+                                     {"kind": kind, "reason": reason})
+                self.assertEqual(sender.call_count, 3)
+                for invocation in sender.call_args_list:
+                    self.assertNotIn("--repeat-minutes", cast(list[str], invocation.args[0]))
+        saved = session_shutdown(top_level("undelivered-reask", "Owner"))
+        saved["settle_message"] = {"kind": "sent", "at": NOW}
+        self.save(saved)
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
+                [], 0, "SKIPPED: inside the key window\n", "")):
+            settle.request_pause(saved)
+        current = shutdown_record.find_session(LOGIN, "undelivered-reask")
+        assert current is not None
+        self.assertEqual(current["settle_message"],
+                         {"kind": "queued", "at": NOW, "reason": "inside the key window"})
+        self.assertNotIn("reasked_at", current)
 
     def test_user_alert_wait_covers_configured_review_and_remote_transport(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)

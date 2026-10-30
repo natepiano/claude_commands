@@ -8,7 +8,7 @@ import io
 import json
 from contextlib import contextmanager, redirect_stdout
 from contextvars import ContextVar
-from collections.abc import Callable, Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 import os
 import re
 import shlex
@@ -42,6 +42,7 @@ from account import (  # noqa: E402
     NAMED_ACCOUNT_VARIABLES,
 )
 import production_units  # noqa: E402
+from scripts.production import staff, staff_sources  # noqa: E402
 import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import inventory as inventory_work  # noqa: E402
@@ -106,18 +107,6 @@ from push_texts import RenderedPush, render  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
 
-class RestartMessageSent(TypedDict):
-    kind: Literal["sent"]
-
-
-class RestartMessageQueued(TypedDict):
-    kind: Literal["queued"]
-    reason: str
-
-
-RestartMessageDelivery = RestartMessageSent | RestartMessageQueued
-
-
 class ShutdownServices(Protocol):
     NOTIFIER: Path
     SHOWRUNNER_TOLD_BACK: str
@@ -137,7 +126,8 @@ class ShutdownServices(Protocol):
     def send_message(
         self, recipient: str, summary: str, text: str, *,
         machine: str = "", key: str = "",
-    ) -> RestartMessageDelivery: ...
+    ) -> Mapping[str, str]: ...
+    def message_was_delivered(self, outcome: Mapping[str, object]) -> bool: ...
     def unrecorded_local_sessions(
         self, login: str, ids: tuple[str, ...], records: list[SessionShutdown],
     ) -> dict[str, str]: ...
@@ -980,9 +970,10 @@ def _unit_argv(record: SessionShutdown, *, source_fallback: bool = False) -> lis
     # A legacy tmux unit recorded no plan; its Units row names one.
     recorded_plan = host["plan"] if host["kind"] == "unit" else None
     # The Units row first: a brief unit's row names its stub plan before any run record exists.
-    row_plan = _units_row_plan(host["doc"], host["unit"])
+    parent = staff_sources.unit_parent(host["unit"], session["session_id"])
+    row_plan = _units_row_plan(parent.doc, host["unit"])
     if row_plan is not None and production_units.plan_cell_is_retired(row_plan):
-        raise UnitRetired(f"{host['unit']} is retired in the Units table of {host['doc']}")
+        raise UnitRetired(f"{host['unit']} is retired in the Units table of {parent.doc}")
     plan_arguments: list[str]
     if row_plan in ("standby", "permanent"):
         plan_arguments = ["--" + row_plan]
@@ -991,12 +982,12 @@ def _unit_argv(record: SessionShutdown, *, source_fallback: bool = False) -> lis
     elif recorded_plan is not None and recorded_plan["kind"] == "plan":
         plan_arguments = ["--plan", recorded_plan["path"]]
     else:
-        raise NoUnitPlan(f"{host['unit']} has no Plan in the Units table of {host['doc']} and no run record")
+        raise NoUnitPlan(f"{host['unit']} has no Plan in the Units table of {parent.doc} and no run record")
     note_path = _note_path(record, session["session_id"])
     argv = [
         *_add_unit_command(),
         "--production",
-        host["doc"],
+        parent.doc,
         # The recorded id, exactly: add_unit strips one "-unit" before adding its own.
         host["unit"],
         *plan_arguments,
@@ -1431,7 +1422,7 @@ def _send_restart_note(
     note: str,
     *,
     dry_run: bool,
-) -> RestartMessageDelivery:
+) -> Mapping[str, str]:
     session_id = record["session"]["session_id"]
     if dry_run:
         argv = [
@@ -1446,7 +1437,7 @@ def _send_restart_note(
             _message_key(record, session_id),
         ]
         _display(argv)
-        return RestartMessageSent(kind="sent")
+        return {"kind": "sent"}
     return settle.send_message(
         f"session:{session_id}",
         f"{record['label']} restarted",
@@ -1898,13 +1889,13 @@ def _restart_note_delivered(
                 f"restart note not delivered: {_error_reason(error)}",
             )
         return False
-    if delivery["kind"] == "sent":
+    if settle.message_was_delivered(delivery):
         return True
     if not dry_run:
         mark_restart_failed(
             record,
             "restart note not delivered: "
-            + _first_line(delivery["reason"], "queued"),
+            + _first_line(delivery.get("reason", "send not delivered"), "queued"),
         )
     return False
 
@@ -2037,7 +2028,7 @@ def move_checkout(record: SessionShutdown, *, dry_run: bool) -> SessionShutdown:
             fields = cast(dict[str, object], cast(object, session))
             if isinstance(cwd := fields.get("cwd"), str):
                 fields["cwd"] = _under(cwd, old, folder)
-            for part, key in (("checkout", "path"), ("host", "doc")):
+            for part, key in (("checkout", "path"),):
                 inner = cast(dict[str, object], fields.get(part, {}))
                 if isinstance(value := inner.get(key), str):
                     inner[key] = _under(value, old, folder)
@@ -2282,7 +2273,7 @@ def launch_entry(
                 f"restart prompt not recorded: {_error_reason(error)}",
             )
         return EntrySettled()
-    except (NoUnitPlan, UnitRetired) as error:
+    except (NoUnitPlan, UnitRetired, staff.StaffUnreadable) as error:
         if dry_run:
             print(f"cannot restart {session['name']}: {error}")
         else:
@@ -2722,7 +2713,8 @@ def relaunch_session(
 
 def _unfinished_cleanup(record: SessionShutdown) -> bool:
     return bool(recovery_store.legacy_tmux_leftovers(record)) or any(
-        (issue["kind"] == "codex server left running" or issue["kind"] == "unit session left running")
+        recovery_store.stop_issue_blocks_completion(issue)
+        and (issue["kind"] == "codex server left running" or issue["kind"] == "unit session left running")
         and issue["cause"] == "stop not confirmed"
         for issue in record["stop_issues"]
     )
@@ -2940,7 +2932,8 @@ def watchdog_crash_signal(owner: Session) -> AgentCrashConfirmed | NoCrashSignal
     if host["kind"] != "unit":
         return NoCrashSignal()
     try:
-        marked = unit_lookup.marked_unit(host["production"], host["unit"])
+        parent = staff_sources.unit_parent(host["unit"], owner["session_id"])
+        marked = unit_lookup.marked_unit(parent.slug, host["unit"])
         if marked is None or marked.place.session != host["session_name"]:
             return NoCrashSignal()
         agents = herdr.Herdr(marked.place.session).agents()
@@ -2991,7 +2984,7 @@ def progress_line(action: str, name: str, detail: str = "") -> None:
 
 
 def _restore_workspace_names(records: Sequence[SessionShutdown]) -> frozenset[str]:
-    from showrunners import herdr_space as production_space, production_slug
+    from showrunners import herdr_space as production_space
     names: set[str] = set()
     for saved in records:
         owner = saved["session"]
@@ -2999,8 +2992,9 @@ def _restore_workspace_names(records: Sequence[SessionShutdown]) -> frozenset[st
             host = owner["host"]
             if host["kind"] in {"unit", "legacy tmux unit"}:
                 try:
-                    names.add(production_space(production_slug(host["doc"]), host["doc"]))
-                except ValueError:
+                    parent = staff_sources.unit_parent(host["unit"], owner["session_id"])
+                    names.add(production_space(parent.slug, parent.doc))
+                except (OSError, ValueError):
                     pass
         else:
             try:

@@ -95,6 +95,43 @@ def member(selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound
     return _member_sources().member(selector, record)
 
 
+@dataclass(frozen=True)
+class UnitProduction:
+    """The current parent and its source document, resolved from the staff edge."""
+
+    slug: str
+    doc: str
+
+
+def _unit_member(unit: str, session_id: str, record: staff.StaffSnapshot,
+                 sources: _MemberSources) -> staff.StaffRow:
+    launches = [launch for launch in sources.launches
+                if session_id and launch["session_id"] == session_id]
+    if launches:
+        environment = max(launches, key=lambda launch: launch["written_at"])["environment"]
+        found = sources.member(UnitMember(environment.get("SHOWRUNNER_UNIT", ""),
+                                          environment.get("SHOWRUNNER_UNIT_ID", unit)), record)
+        members = [found.row] if isinstance(found, MemberFound) else []
+    else:
+        members = list({found.row.id: found.row for slug in sources.productions
+                        if isinstance(found := sources.member(UnitMember(slug, unit), record), MemberFound)}.values())
+    if len(members) != 1:
+        raise staff.StaffUnreadable(f"{unit}: no unique staff entry")
+    return members[0]
+
+
+def unit_parent(unit: str, session_id: str = "") -> UnitProduction:
+    """Resolve the current staff edge; old launch marks supply identity only."""
+    record, sources = staff.snapshot(), _member_sources()
+    parent = _unit_member(unit, session_id, record, sources).parent
+    parents = [source for slug, source in sources.productions.items()
+               if isinstance(found := sources.member(ShowrunnerMember(slug), record), MemberFound)
+               and found.row.id == parent]
+    if len(parents) != 1:
+        raise staff.StaffUnreadable(f"{unit}: staff parent has no unique production document")
+    return UnitProduction(parents[0].timer.slug, str(parents[0].timer.doc))
+
+
 def _showrunner_key(slug: str) -> str:
     return f"showrunner:{slug}"
 

@@ -22,6 +22,7 @@ import herdr
 import settle
 import shutdown
 import sessions
+from unit_staff_test_support import isolated_parents
 from shutdown_record import SessionShutdown
 
 
@@ -96,6 +97,7 @@ class ShutdownTestCase(unittest.TestCase):
     @override
     def setUp(self) -> None:
         super().setUp()
+        _ = self.enterContext(isolated_parents())
         faulthandler.dump_traceback_later(TEST_TIME_LIMIT_SECONDS, exit=True)
         self.addCleanup(faulthandler.cancel_dump_traceback_later)
         registry = Path(self.enterContext(tempfile.TemporaryDirectory())) / "sessions"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from unit_staff_test_support import unit_host
 import copy
 import io
 import json
@@ -158,7 +159,7 @@ def unit(
             codex_servers=codex_servers,
         ),
         kind="unit",
-        host=inventory.UnitHost(
+        host=unit_host(
             kind="unit",
             production="demo",
             unit=session_id,
@@ -238,11 +239,12 @@ class _HeldClaim:
     check_effect = check
 
 
-class SharedHerdrStopTests(unittest.TestCase):
+class SharedHerdrStopTests(ShutdownTestCase):
     def test_a_unit_in_the_shared_session_closes_only_the_tab_of_its_marked_pane(self) -> None:
         session = cast(inventory.Session, cast(object, {
-            "kind": "unit", "name": "review",
-            "host": {"kind": "unit", "production": "prod", "unit": "review-unit", "session_name": "agents"}}))
+            "kind": "unit", "name": "review", "session_id": "review-session",
+            "host": unit_host(kind="unit", production="prod", unit="review-unit", doc="/prod.md",
+                              session_name="agents", session_host="herdr", plan=inventory.NoRunRecord(kind="no run record"))}))
         claim = cast(stop.StopClaim, cast(object, _HeldClaim()))
         marked = unit_lookup.MarkedUnit("review-unit", unit_lookup.ClaudeNotRunning(), herdr.HerdrPlace("agents", "w3:pE"))
         cases: list[tuple[unit_lookup.MarkedUnit | None, list[herdr.PaneIdentity], int, int]] = [

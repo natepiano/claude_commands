@@ -2755,7 +2755,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `StatusDiagnostics` owns every observed problem until output succeeds: on failure it prints the typed problems, then the remaining raw warnings, then the error. Store warnings keep `warning.reason` (`scripts/whoami/agent_accounts.py`). `check()` returns a plain list.
 - Tests: producer pairing tests in `test_accounts.py` and `test_role_map.py`; Assertion-Change lines in checkpoint b8c75d3c.
 
-### Phase 96 — A stopped account setup, group move or wait is finished by its rerun  · status: todo
+### Phase 96 — A stopped account setup, group move or wait is finished by its rerun  · status: done
 
 **Depends on:** Phase 94e (order only; it edits `scripts/accounts/accounts.py` too). Its checkpoint also waits for shutdown-unit's phase 5 (`natedev-shutdown` 1731b830) and the Phase 99 remerge: the combined tree keeps both the merged timer restore intent and Phase 99's snapshot-before-stop, and passes `test_restart.py` `test_target_stop_inherits_timer_intent_in_both_snapshot_publication_orders`, the `test_settle.py` interrupted-stop/cancel guard, and the shutdown, accounts and message suites. Dispatch does not wait (showrunner, 2026-10-30: start phase 96 now; it edits `scripts/accounts` only).
 

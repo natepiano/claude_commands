@@ -6,6 +6,7 @@ from __future__ import annotations
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 
+from unit_staff_test_support import unit_host, legacy_unit_host
 import copy
 import io
 from types import SimpleNamespace
@@ -47,6 +48,7 @@ import herdr
 from fake_herdr import CommandResponse
 import conversation_pause
 import settle
+from scripts.message import send as message_send
 # The module settle imports by its own path entry: a separate object from the package import below.
 import showrunners as settle_showrunners
 import shutdown
@@ -210,7 +212,7 @@ def unit(
     return inventory.UnitSession(
         **common_session(session_id, run_dirs=run_dirs),
         kind="unit",
-        host=inventory.UnitHost(
+        host=unit_host(
             kind="unit",
             production="demo",
             unit=f"{session_id}-unit",
@@ -1720,8 +1722,8 @@ class RestartTests(ShutdownTestCase):
     def test_every_unit_restarts_in_the_shared_session_a_legacy_tmux_one_by_its_units_row_plan(self) -> None:
         recorded = unit("own-session-unit", session_name="own-session")
         legacy = unit("legacy-unit")
-        legacy["host"] = inventory.LegacyTmuxUnitHost(kind="legacy tmux unit", production="demo",
-            unit="legacy-unit", doc=legacy["host"]["doc"], session_name="legacy-tmux")
+        legacy["host"] = legacy_unit_host(kind="legacy tmux unit", production="demo",
+            unit="legacy-unit", doc="/tmp/demo production.md", session_name="legacy-tmux")
         for owner in (recorded, legacy):
             with self.subTest(host=owner["host"]["kind"]), \
                     patch.object(restart, "_units_row_plan", return_value="docs/plans/demo-unit.md"):
@@ -2634,7 +2636,7 @@ class RestartTests(ShutdownTestCase):
     def test_legacy_hosts_launch_and_only_unconfirmed_leftovers_stay_manual(self) -> None:
         legacy = top_level("legacy", host=inventory.LegacyTmuxHost(kind="legacy tmux", session_name="old:name"))
         old_unit = unit("legacy-unit")
-        old_unit["host"] = inventory.LegacyTmuxUnitHost(kind="legacy tmux unit", production="demo",
+        old_unit["host"] = legacy_unit_host(kind="legacy tmux unit", production="demo",
             unit="old", doc="/tmp/old.md", session_name="old-unit")
         leftover = entry(top_level("leftover", host=inventory.HerdrHost(kind="herdr", herdr_session="new", pane_id="w1:p1", presentation="detached")))
         leftover["stop_issues"] = [shutdown_record.LegacyTmuxSessionLeftRunning(kind="legacy tmux session left running",
@@ -2651,10 +2653,27 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(stored["leftover"]["stop_issues"], leftover["stop_issues"])
         self.assertTrue(restart._unfinished_cleanup(stored["leftover"]))  # pyright: ignore[reportPrivateUsage]
 
+    def test_restart_keeps_an_unconfirmed_codex_pause_issue_without_retrying_cleanup(self) -> None:
+        saved = entry(top_level("advisory-pause", cwd=str(self.root)))
+        issue = shutdown_record.CodexServerLeftRunning(kind="codex server left running",
+            at=STOPPED, run_dir=str(self.root / "run"), cause="stop not confirmed")
+        saved["stop_issues"] = [issue]
+        self.create([saved])
+        with (patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(stop_work, "stop_session", return_value=saved) as cleanup,
+              patch.object(restart, "_launch_entry_safely", return_value=restart.EntrySettled()) as launch,
+              redirect_stdout(io.StringIO()) as output):
+            _ = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
+        cleanup.assert_not_called()
+        launch.assert_called_once()
+        self.assertEqual(self.stored_record()["progress"]["kind"], "restarting")
+        self.assertEqual(self.stored_record()["stop_issues"], [issue])
+        self.assertNotIn("owner cleanup not confirmed", output.getvalue())
+
     def test_manual_resume_selects_the_current_group_account(self) -> None:
         self.configure_groups(units="claude3")
         owner = unit("old-unit")
-        owner["host"] = inventory.LegacyTmuxUnitHost(kind="legacy tmux unit", production="demo",
+        owner["host"] = legacy_unit_host(kind="legacy tmux unit", production="demo",
             unit="old", doc="/tmp/old.md", session_name="old-unit")
         command = restart.legacy_resume_command(entry(owner))
         self.assertIn("exec claude3 --resume old-unit", command)
@@ -6077,6 +6096,34 @@ class RestartTests(ShutdownTestCase):
         with patch.object(restart, "_retire"), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_launch_session", side_effect=OSError("failed")), patch.object(restart, "_session_liveness", return_value=restart.SessionLive()), patch.object(restart, "wait_for_confirmation", side_effect=self.all_sessions_live), redirect_stdout(io.StringIO()):
             self.assertEqual(restart.up(LOGIN), 0)
         self.assertIsNone(shutdown_record.find_session(LOGIN, "owner"))
+
+    def test_restart_note_restores_timers_only_after_delivery_evidence(self) -> None:
+        self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
+        acknowledged = message_send.acknowledged_skip_reason("restart-note", RESTARTED)
+        for index, (stdout, delivered) in enumerate((
+            ("SKIPPED: inside the key window\n", False),
+            ("", False),
+            (f"SKIPPED: {acknowledged}\n", True),
+            ("SENT: fixture socket\n", True),
+        )):
+            with self.subTest(stdout=stdout):
+                saved = entry(showrunner(f"note-delivery-{index}"))
+                saved["timers"] = [TimerRestore(instance=f"timer-{index}", was_enabled=True)]
+                self.create([saved])
+                with (patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout, "")) as sender,
+                      patch.object(settle, "run_notifier") as timers):
+                    restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
+                current = shutdown_record.find_session(LOGIN, saved["session"]["session_id"])
+                assert current is not None
+                if delivered:
+                    timers.assert_called_once_with("start", f"timer-{index}")
+                    self.assertEqual(current["progress"]["kind"], "restarted")
+                else:
+                    timers.assert_not_called()
+                    self.assertEqual(current["progress"]["kind"], "restart failed")
+                    assert current["progress"]["kind"] == "restart failed"
+                    self.assertIn("restart note not delivered", current["progress"]["reason"])
+                self.assertEqual(sender.call_count, 1)
 
     def test_queued_showrunner_note_keeps_its_timers_stopped(self) -> None:
         saved = entry(showrunner("owner"))
