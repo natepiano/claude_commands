@@ -27,7 +27,7 @@ from style_plan_test_support import StylePlanFixture
 class StylePlanTests(StylePlanFixture):
     def test_sync_wait_names_one_needed_main_path(self) -> None:
         path = "crates/alpha/src/a.rs"
-        changes = style_plan.MainChanges(self.tip, frozenset((path, self.sources[2])), ("crates/alpha", "crates/beta"))
+        changes = style_plan.MainChanges(self.tip, frozenset((path, self.sources[2])))
         result = style_plan.ticket_sync_wait(self.ledger(), changes, "listed", "crates/alpha", "rule-x", (path,))
         reason = f"listed crates/alpha rule-x: main touched {path}"
         self.assertEqual(result, style_plan.WaitingForSync(0, reason))
@@ -36,7 +36,7 @@ class StylePlanTests(StylePlanFixture):
 
     def test_sync_wait_names_first_three_of_five_needed_main_paths(self) -> None:
         paths = tuple(f"crates/alpha/src/{name}.rs" for name in "edcba")
-        changes = style_plan.MainChanges(self.tip, frozenset((*paths, self.sources[2])), ("crates/alpha", "crates/beta"))
+        changes = style_plan.MainChanges(self.tip, frozenset((*paths, self.sources[2])))
         result = style_plan.ticket_sync_wait(self.ledger(), changes, "listed", "crates/alpha", "rule-x", paths)
         reason = "listed crates/alpha rule-x: main touched crates/alpha/src/a.rs, crates/alpha/src/b.rs, crates/alpha/src/c.rs +2"
         self.assertEqual(result, style_plan.WaitingForSync(0, reason))

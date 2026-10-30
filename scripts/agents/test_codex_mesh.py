@@ -51,7 +51,7 @@ from unittest.mock import MagicMock, patch
 
 from scripts.agents import codex_mesh
 from scripts.direct import plan_history, workers as unit_workers
-from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.direct.recorder_fixture import LauncherHangGuard, invoke_recorder
 from scripts.lib import nix_env
 from scripts.message import process_table, sessions, roster as message_roster
 from scripts.usage import agents_log
@@ -141,10 +141,13 @@ class FixtureLoopBudget:
     def __post_init__(self) -> None:
         self.started = self.clock()
 
-    def check(self) -> float:
+    def check_calls(self) -> None:
         self.calls += 1
         if self.calls > self.max_calls:
             raise AssertionError(f"{self.name}: exceeded {self.max_calls} fixture calls")
+
+    def check(self) -> float:
+        self.check_calls()
         remaining = self.seconds - (self.clock() - self.started)
         if remaining <= 0:
             raise AssertionError(f"{self.name}: exceeded {self.seconds}s fixture deadline")
@@ -159,6 +162,20 @@ class LifecycleTestClock:
     registry_calls: int = 0
     registry_started: float = 0.0
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    controlled: bool = False
+    wall_seconds: float = 0.0
+    monotonic_seconds: float = 0.0
+
+    def freeze(self) -> None:
+        self.wall_seconds = self.time()
+        self.monotonic_seconds = self.monotonic()
+        self.controlled = True
+
+    def advance(self, seconds: float) -> None:
+        if not self.controlled:
+            raise AssertionError("freeze the lifecycle clock before advancing it")
+        self.wall_seconds += seconds
+        self.monotonic_seconds += seconds
 
     def registry_elapsed(self) -> float:
         with self.lock:
@@ -166,9 +183,13 @@ class LifecycleTestClock:
             return self.registry_seconds + running
 
     def time(self) -> float:
+        if self.controlled:
+            return self.wall_seconds
         return time.time() - self.registry_elapsed()
 
     def monotonic(self) -> float:
+        if self.controlled:
+            return self.monotonic_seconds
         return time.monotonic() - self.registry_elapsed()
 
     def sleep(self, seconds: float) -> None:
@@ -398,6 +419,7 @@ class StubAppServer:
     ) -> None:
         self.respond: Callable[[dict[str, object]], list[dict[str, object]] | None] = respond
         self.requests: list[dict[str, object]] = []
+        self.hang_guard: LauncherHangGuard = LauncherHangGuard("stub app-server")
         self.request_budget = FixtureLoopBudget("stub RPC requests", seconds=180)
         self.connection_budget = FixtureLoopBudget("stub connections", seconds=180, max_calls=128)
         self.errors: list[Exception] = []
@@ -452,7 +474,8 @@ class StubAppServer:
         while not self.stopping.is_set():
             try:
                 self.accept_waiting.set()
-                remaining = self.connection_budget.check()
+                self.connection_budget.check_calls()
+                remaining = self.hang_guard.remaining()
                 ready, _, _ = select.select([self.listener, self.close_reader], [], [], remaining)
                 if not ready:
                     raise AssertionError("stub listener exceeded its real-time fixture deadline")
@@ -483,9 +506,10 @@ class StubAppServer:
 
     def _conversation(self, connection: socket.socket) -> None:
         handshake = bytearray()
-        handshake_budget = FixtureLoopBudget("stub handshake", seconds=5, max_calls=32)
+        handshake_budget = FixtureLoopBudget("stub handshake", max_calls=32)
         while b"\r\n\r\n" not in handshake:
-            connection.settimeout(handshake_budget.check())
+            handshake_budget.check_calls()
+            connection.settimeout(self.hang_guard.remaining())
             chunk = connection.recv(4096)
             if not chunk:
                 raise ConnectionError("stub client disconnected during handshake")
@@ -498,7 +522,8 @@ class StubAppServer:
                 _send_frame(connection, frame)
 
         while not self.stopping.is_set():
-            connection.settimeout(self.request_budget.check())
+            self.request_budget.check_calls()
+            connection.settimeout(self.hang_guard.remaining())
             request = _read_request(connection)
             self.requests.append(request)
             frames = self.respond(request)
@@ -513,7 +538,8 @@ class StubAppServer:
             delta_count = 0
             frame_budget = FixtureLoopBudget("stub response frames", seconds=30, max_calls=20_000)
             for frame in frames:
-                _ = frame_budget.check()
+                frame_budget.check_calls()
+                connection.settimeout(self.hang_guard.remaining())
                 if frame.get("method") == "item/agentMessage/delta":
                     delta_count += 1
                     if self.delta_batch_pause and delta_count % 100 == 0:

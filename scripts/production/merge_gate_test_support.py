@@ -33,7 +33,8 @@ EXPECTED_SUITES = (
     "mac_test", "usage", "bevy_upgrade", "bevy_migration_plan", "production", "direct", "buildlog",
     "lint", "nightly_review", "build_targets", "shutdown", "feature_log",
     "model_study", "herdr", "notify", "statusline", "astra", "style", "history", "issue_score",
-    "hierarchies",
+    "hierarchies", "release", "claude_to_codex", "new_rust_project", "validate_and_push",
+    "exclude", "prioritize",
 )
 # Each suite's fixture holds test_first.py, and lib also test_second.py.
 
