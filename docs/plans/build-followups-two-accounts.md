@@ -2757,6 +2757,19 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/whoami/agent_accounts.py` — claim and save warnings keep their reason.
 - `scripts/accounts/role_map.py` — read: `observed_map_provenance`, `cached_map_warning` (the raw counterpart of the cached-map problem); change only if its delivery needs a mark.
 - `scripts/accounts/test_accounts.py`, `scripts/accounts/test_role_map.py` — the pairing tests.
+- `scripts/whoami/test_agent_accounts.py` — the claim and finish store-error tests expect `warning.reason` (repair round 1).
+
+**Assertion-Change** (accepted at review pass 1; each follows the Spec):
+- `scripts/whoami/test_agent_accounts.py::SharedUsageReadTests::test_a_claim_store_error_still_returns_the_live_read` and `::test_a_finish_store_error_keeps_the_good_live_report` — the expected warning text gains its `warning.reason`.
+- `scripts/accounts/test_accounts.py::AccountsTests::test_exec_refuses_wrong_login_and_status_keeps_the_actual_identity` — the line form drops the `* ` prefix (94c line form).
+- `scripts/accounts/test_accounts.py` `assert_mcp_status_streams` (`test_piped_status_keeps_mcp_problem_in_table_and_json`, `test_piped_status_suppresses_nested_account_notes`, `test_terminal_status_keeps_nested_account_notes`), `test_status_detail_shows_unclassified_entries_and_mcp_difference`, `StatusProblemCauseTests::test_independent_configuration_problems_each_keep_their_repair` — the MCP baseline is the file Claude reads for `~/.claude`, and the step names it.
+- `scripts/accounts/test_accounts.py::AccountsTests::test_status_explains_empty_account_rows_in_the_table_and_json_without_login_addresses` — `check()` no longer carries the state source, so the test clears readiness problems instead; its assertions stay.
+- `scripts/accounts/test_accounts.py::PickerTests::test_unnoted_claude_home_is_displayed_but_never_selected_or_a_destination` and `::test_legacy_group_for_an_unnoted_home_is_display_only_and_cannot_launch` — the unnoted-home cause names its note path and the setup step.
+- `scripts/accounts/test_accounts.py::StatusProblemCauseTests::test_reserved_login_reports_the_test_file_and_write_time_without_account_steps` and `::test_unnoted_legacy_login_merges_read_failure_and_keeps_both_repairs` — an independent usage failure stays its own line.
+- `scripts/accounts/test_role_map.py::RoleMapTests::test_status_refuses_an_unavailable_remote_map_unless_stored` and `::test_stored_status_uses_cached_group_assignments_and_workers_instead_of_local_selections` — role availability binds to the account-state cause; observed account problems print before the final error.
+- Rejected: `StatusProblemCauseTests::test_duplicate_identity_keeps_independent_rate_limit_and_its_times` must still assert which accounts the one duplicate-login line names.
+- `scripts/accounts/test_accounts.py::StatusProblemCauseTests::test_account_state_merge_uses_the_cause_after_wording_changes` — its summary input carries an explicit source observed by readiness, since an unlinked summary no longer merges (repair round 1).
+- Rejected: `test_test_signin_with_malformed_or_unreadable_note_has_only_delete_advice` keeps a check that the real producer's diagnostic is an `UnreadableAccountNote`.
 
 **Workers:** 1 writer, no split.
 - `impl` — all files.
@@ -2807,7 +2820,7 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` passes with a scratch HOME set before import; `basedpyright` on the changed Python files reads `0 errors, 0 warnings, 0 notes`; each of the three stop-and-rerun tests fails on the code before the change.
 
-### Phase 97 — A stopped Codex fallback switch is finished by its rerun  · status: todo
+### Phase 97 — A stopped Codex fallback switch is finished by its rerun  · status: done
 
 **Depends on:** Phase 95 (order only)
 
@@ -2824,6 +2837,10 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 **Files:**
 - `scripts/whoami/quota_alert.py` — the pending switch, the kept failed keys, the consumption check.
 - `scripts/whoami/test_quota_alert.py` — one stop-and-rerun test per row; `scripts/whoami/quota_alert_test_support.py` holds the shared fixtures.
+- `scripts/whoami/test_codex_alert_accounts.py` — the failed-restore test expects the retry (repair round 1).
+- `scripts/whoami/test_quota_zero_episode.py` — each subcase of the uncertain-switch test starts from its own state, so a pending switch from one subcase is not recovered in the next; no assertion changes (repair round 1).
+
+**Assertion-Change** (accepted at review pass 1): `scripts/whoami/test_codex_alert_accounts.py::CodexAccountAlertTests::test_failed_restoration_is_attempted_and_reported_once` — a failed restore key is kept and retried by the next pass, so the attempt count follows the retry; the failure is still reported once.
 
 **Workers:** 1 writer + 1 tester.
 - `impl` — `quota_alert.py`.
@@ -2858,6 +2875,10 @@ After a worker launch's own turn has ended, a move to the selected seats home th
 - `scripts/whoami/five_hour.py` — the claim and sent marker; the kept cancel file.
 - `scripts/production/codex_winddown.py` — the quiet claim; the owed at-zero state.
 - `scripts/whoami/test_five_hour.py`, `scripts/production/test_codex_winddown.py` — one stop-and-rerun test per row, and one failed-send test per send.
+
+**Assertion-Change** (accepted at review pass 1): `scripts/whoami/test_five_hour.py::WatchTests::test_a_low_window_tells_the_alert_list_once_without_a_phone_hold`, renamed `test_a_low_window_retries_failed_relays_without_a_phone_hold` — after a failed relay no sent marker exists and the next pass relays again; the retry relays only to the recipient that failed, so the send count is 3, not 4; the sent marker and the empty later pass are asserted after the successful retry. `WatchTests::test_no_reading_changes_nothing` — the relay succeeds, so the unchanged marker assertion is about a sent warning.
+
+**Repair round 1:** a retry relays only to the recipients that did not get the warning; a recipient that already got it gets no second copy.
 
 **Workers:** 2 writers, split by file (no file in both).
 - `impl` — `scripts/whoami/five_hour.py`, `scripts/whoami/test_five_hour.py`.

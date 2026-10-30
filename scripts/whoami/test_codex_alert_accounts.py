@@ -1389,14 +1389,18 @@ class CodexAccountAlertTests(unittest.TestCase):
         with patch.object(quota_alert, "edit_registry", return_value="editor refused") as edit:
             _ = quota_alert.alert([self.note(1, "active", 90)], self.now, codex_readings=funded)
             count = edit.call_count
+            self.assertEqual(count, 2)
             messages = len(self.sent)
             with quota_alert.state_file() as state:
                 unseen = list(state.get("unseen", []))
             _ = quota_alert.alert([self.note(1, "active", 90)], self.now, codex_readings=funded)
-            self.assertEqual(edit.call_count, count)
+            self.assertEqual(edit.call_count, count * 2)
             self.assertEqual(len(self.sent), messages)
         with quota_alert.state_file() as state:
-            self.assertIsInstance(state["fallback"], quota_alert.NoCodexQuotaFallback)
+            fallback = state["fallback"]
+            self.assertIsInstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            assert isinstance(fallback, quota_alert.AccountCodexQuotaFallback)
+            self.assertEqual(fallback.moved, ("direct", "module_review"))
             self.assertEqual(state.get("unseen"), unseen)
 
     def test_unknown_refusal_logs_without_telling_any_session(self) -> None:
