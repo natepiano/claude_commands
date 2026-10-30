@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
 from scripts.accounts import accounts, outage_alerts, role_map
-from scripts.production import showrunners
+from scripts.production import showrunners, staff_sources
 import account
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -201,7 +201,8 @@ def _sources(state: dict[str, DownOutage]) -> dict[tuple[str, str], RecoverySour
     for _, source in sorted(sessions_by_id.values(), key=lambda item: datetime.fromisoformat(item[0])):
         host = source.session["host"]
         if host["kind"] == "unit":
-            sources[(host["production"], host["unit"])] = source
+            parent = staff_sources.unit_parent(host["unit"], source.session["session_id"])
+            sources[(parent.slug, host["unit"])] = source
     return sources
 
 
@@ -318,7 +319,8 @@ def _alert_failure(source: RecoverySource, outage: DownOutage, cause: str) -> No
     else:
         host = source.session["host"]
         assert host["kind"] == "unit"
-        _alert_without_record(source.session["session_id"], RecoveryAlertContext(production=host["production"], unit=host["unit"],
+        parent = staff_sources.unit_parent(host["unit"], source.session["session_id"])
+        _alert_without_record(source.session["session_id"], RecoveryAlertContext(production=parent.slug, unit=host["unit"],
             account=source.label, session_name=source.session["name"]), outage, cause)
 
 

@@ -585,15 +585,28 @@ raise SystemExit(1)
 
         with mock.patch.object(showrunners, "own_slug", return_value="self"), \
                 mock.patch.object(showrunners, "current_address", side_effect=address), \
+                mock.patch.object(showrunners, "send_to_address", wraps=showrunners.send_to_address) as sender, \
                 mock.patch.object(subprocess, "run", side_effect=[
                     subprocess.CompletedProcess([], 0, "", ""), subprocess.CompletedProcess([], 3, "", "offline")]):
             delivery = showrunners.tell_others({"self": "skip", "top": "hello", "mid": "hello"}, "notice")
         self.assertEqual(list(delivery.lines), ["told top", "could not tell mid: offline"])
         self.assertEqual(delivery.failed, ("mid",))
+        self.assertEqual(sender.call_args_list, [mock.call("session:top", "notice", "hello", recipient="top"),
+                                                 mock.call("session:mid", "notice", "hello", recipient="mid")])
         with self.assertRaises(FrozenInstanceError):
             setattr(delivery, "lines", ())
         with self.assertRaises(FrozenInstanceError):
             setattr(delivery, "failed", ())
+
+    def test_public_address_sender_preserves_recipient_sender_key_and_text(self) -> None:
+        with mock.patch.dict(os.environ, self.environment()), \
+                mock.patch.object(showrunners, "SEND", self.send_script):
+            delivery = showrunners.send_to_address("session:unit-id", "transfer-key", "new production\nkeep running",
+                                                   recipient="alpha-unit", sender="transfer_unit")
+        self.assertEqual(delivery, showrunners.NoticeDelivery(("told alpha-unit",)))
+        sent = [json.loads(line) for line in self.sent.read_text().splitlines()]
+        self.assertEqual(sent, [["--to", "session:unit-id", "--from", "transfer_unit", "--key", "transfer-key",
+                                 "--text", "new production\nkeep running"]])
 
     def test_an_edge_to_a_production_with_no_timer_counts_for_nothing(self) -> None:
         self.showrunner("top")

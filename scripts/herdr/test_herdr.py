@@ -2063,6 +2063,67 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual([(space["name"], [tab["name"] for tab in space["tabs"]]) for space in saved["workspaces"]],
                          [("boss", ["boss", "alpha"])])
 
+    def test_move_pane_to_tab_keeps_running_pane_and_titles_only_the_created_tab(self) -> None:
+        self.configure_herdr(["pane", "move", "w1:p2", "--new-tab", "--workspace", "w2"], json.dumps({"result": {
+            "move_result": {"created_tab": {"tab_id": "w2:t7"}, "pane": {"pane_id": "w2:p9"}},
+        }}))
+        placed = self.herdr.move_pane_to_tab("w1:p2", "w2", "models")
+        self.assertEqual(placed, herdr.TabWithPane("w2:p9", "w2:t7"))
+        self.assertEqual([command[2:] for command in self.commands()], [
+            ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w2"],
+            ["tab", "rename", "w2:t7", "models"],
+        ])
+
+    def test_fake_refuses_workspace_labels_before_reading_responses(self) -> None:
+        self.responses_path.unlink()
+        for workspace in ("sdlc", "wlower", "w", "wD-label"):
+            for command in (["tab", "list"], ["pane", "move", "w1:p2", "--new-tab"]):
+                with self.subTest(workspace=workspace, command=command):
+                    result = self.run_fake([str(self.fake), "--session", "fixture", *command, "--workspace", workspace])
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(herdr.decode_object(result.stderr, "workspace error"), {
+                        "error": {"code": "workspace_not_found", "message": f"workspace {workspace} not found"},
+                        "id": "cli:tab:list",
+                    })
+
+    def test_fake_replays_responses_for_workspace_ids(self) -> None:
+        for workspace in ("wD", "wH", "w12A"):
+            with self.subTest(workspace=workspace):
+                command = ["tab", "list", "--workspace", workspace]
+                self.configure_herdr(command, "workspace tabs")
+                result = self.run_fake([str(self.fake), "--session", "fixture", *command])
+                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "workspace tabs", ""))
+
+    def test_move_pane_to_workspace_uses_its_id_and_returns_the_pane_after_ordering(self) -> None:
+        self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
+            {"workspace_id": "w1", "label": "source"}, {"workspace_id": "w2", "label": "target"}]}}))
+        for pane, tab, moved in (("w1:p2", "w2:t7", "w2:p9"), ("w2:p9", "w2:t8", "w2:p11"),
+                                  ("w2:p2", "w2:t9", "w2:p12")):
+            self.configure_herdr(["pane", "move", pane, "--new-tab", "--workspace", "w2"], json.dumps({"result": {
+                "move_result": {"created_tab": {"tab_id": tab}, "pane": {"pane_id": moved}}}}))
+        self.configure_herdr(["tab", "list", "--workspace", "w2"], json.dumps({"result": {"tabs": [
+            {"tab_id": "w2:t1", "label": "target", "pane_count": 1},
+            {"tab_id": "w2:t2", "label": "apple-terminal", "pane_count": 1},
+            {"tab_id": "w2:t7", "label": "models", "pane_count": 1}]}}))
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w2:p1", "tab_id": "w2:t1"}, {"pane_id": "w2:p2", "tab_id": "w2:t2"},
+            {"pane_id": "w2:p9", "tab_id": "w2:t7"}]}}))
+        self.configure_herdr(["tab", "list"], json.dumps({"result": {"tabs": [
+            {"tab_id": "w2:t1", "workspace_id": "w2", "label": "target"},
+            {"tab_id": "w2:t8", "workspace_id": "w2", "label": "models"},
+            {"tab_id": "w2:t9", "workspace_id": "w2", "label": "apple-terminal"}]}}))
+        self.assertEqual(self.herdr.move_pane_to_workspace("w1:p2", "target", "models"), "w2:p11")
+        self.assertEqual([command[2:] for command in self.commands()], [
+            ["workspace", "list"], ["pane", "move", "w1:p2", "--new-tab", "--workspace", "w2"],
+            ["tab", "rename", "w2:t7", "models"], ["workspace", "list"], ["tab", "list", "--workspace", "w2"],
+            ["pane", "list"], ["pane", "move", "w2:p9", "--new-tab", "--workspace", "w2"],
+            ["tab", "rename", "w2:t8", "models"], ["pane", "move", "w2:p2", "--new-tab", "--workspace", "w2"],
+            ["tab", "rename", "w2:t9", "apple-terminal"], ["workspace", "list"], ["tab", "list"],
+        ])
+        self.assertEqual([tab["name"] for space in herdr.saved_layout("fixture")["workspaces"]
+                          if space["name"] == "target" for tab in space["tabs"]], ["target", "models", "apple-terminal"])
+
     def test_order_tabs_puts_the_showrunner_first_then_moves_each_tab_out_of_place(self) -> None:
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
             {"workspace_id": "w1", "label": "boss", "focused": False, "active_tab_id": "w1:t2"},
@@ -3579,7 +3640,7 @@ class LayoutHerdr(herdr.Herdr):
             case ["pane", "move"]:
                 tab = next(tab for tab in self.tabs if tab["pane_id"] == words[2])
                 self.tabs.remove(tab)
-                moved = {**tab, "tab_id": self.new_id("t")}
+                moved = {**tab, "tab_id": self.new_id("t"), "workspace_id": words[words.index("--workspace") + 1]}
                 self.tabs.append(moved)
                 return {"move_result": {"created_tab": {"tab_id": moved["tab_id"]}, "pane": {"pane_id": moved["pane_id"]}}}
             case _:
@@ -3756,6 +3817,29 @@ class SavedLayoutTests(unittest.TestCase):
         shown = dict(client.layout())
         self.assertEqual(shown["natedev"], ["natedev", "accounts", "builds", "herdr", "unit-board", "zebra"])
         self.assertEqual(shown["fps"], ["performance", "alpha", "benchmark", "frame-cost", "metrics-gathering"])
+
+    def test_move_pane_to_workspace_orders_the_unit_tab_and_saves_its_destination(self) -> None:
+        client = LayoutHerdr()
+        _ = client.open_tab("source", "source", "/repo", {})
+        pane = client.open_tab("source", "models", "/unit", {})
+        _ = client.open_tab("target", "target", "/repo", {})
+        _ = client.open_tab("target", "apple-terminal", "/repo", {})
+        moved = client.move_pane_to_workspace(pane, "target", "models")
+        self.assertEqual(client.layout(), [("source", ["source"]), ("target", ["target", "models", "apple-terminal"])])
+        self.assertEqual(next(tab["workspace_id"] for tab in client.tabs if tab["pane_id"] == moved),
+                         next(ident for ident, label in client.spaces if label == "target"))
+        self.assertEqual([tab["name"] for space in herdr.saved_layout("fixture")["workspaces"]
+                          if space["name"] == "target" for tab in space["tabs"]], ["target", "models", "apple-terminal"])
+
+    def test_move_pane_to_workspace_does_not_create_a_missing_destination(self) -> None:
+        client = LayoutHerdr()
+        pane = client.open_tab("source", "source", "/repo", {})
+        saved = herdr.layout_path("fixture").read_bytes()
+        before = client.layout()
+        with self.assertRaisesRegex(herdr.HerdrFailure, "no workspace named 'absent'"):
+            _ = client.move_pane_to_workspace(pane, "absent", "models")
+        self.assertEqual(client.layout(), before)
+        self.assertEqual(herdr.layout_path("fixture").read_bytes(), saved)
 
     def test_the_snapshot_pass_saves_a_tab_renamed_in_herdr_only_for_a_running_shared_session(self) -> None:
         client = self.running()

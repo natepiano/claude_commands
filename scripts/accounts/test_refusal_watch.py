@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from scripts.whoami.note_file import note_name
 
+from scripts.production import staff_sources
 import io
 import fcntl
 import json
@@ -33,9 +34,11 @@ send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPri
 deliver_notice_jobs = quota_alert.deliver_and_record
 
 if TYPE_CHECKING:
+    from scripts.shutdown.unit_staff_test_support import isolated_parents, unit_host
     from scripts.shutdown import inventory, launch_permission, shutdown_record, restart, settle
     from scripts.message import sessions
 else:
+    from unit_staff_test_support import isolated_parents, unit_host
     launch_permission = import_module("launch_permission")
     inventory = import_module("inventory")
     shutdown_record = import_module("shutdown_record")
@@ -104,6 +107,7 @@ class RefusalWatchTests(unittest.TestCase):
             _ = (accounts.account_dir(label) / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": login}}))
             _ = (self.home / "notes" / note_name(label)).write_text(f"---\nlogin: {login}\n---\n")
         _ = (self.home / "notes/claude2.md").write_text("---\nlogin: main@example.invalid\n---\n")
+        _ = self.enterContext(isolated_parents())
         self.owners = []
         self.live = []
         WatchTime.at = NOW
@@ -161,9 +165,9 @@ class RefusalWatchTests(unittest.TestCase):
             if identity is None or login is not None and identity.login != login:
                 continue
             production = (owner["production"] if owner["kind"] == "showrunner" else
-                          owner["host"]["production"] if owner["host"]["kind"] == "unit" else "")
+                          staff_sources.unit_parent(owner["host"]["unit"]).slug if owner["host"]["kind"] == "unit" else "")
             doc = (owner["doc"] if owner["kind"] == "showrunner" else
-                   owner["host"]["doc"] if owner["host"]["kind"] == "unit" else "")
+                   staff_sources.unit_parent(owner["host"]["unit"]).doc if owner["host"]["kind"] == "unit" else "")
             result.append(inventory.ListedSession(owner["session_id"], owner["pid"], owner["proc_start"],
                 owner["name"], owner["kind"], Path(owner.get("config_dir", str(self.home / ".claude"))), identity.login, production, doc))
         return result
@@ -175,7 +179,7 @@ class RefusalWatchTests(unittest.TestCase):
             checkout=inventory.NotACheckout(kind="not a checkout"),
             run_dirs=[], codex_servers=[], timers=[], config_dir=str(accounts.account_dir(label)))
         if host == "unit":
-            owner: inventory.Session = inventory.UnitSession(**fields, kind="unit", host=inventory.UnitHost(
+            owner: inventory.Session = inventory.UnitSession(**fields, kind="unit", host=unit_host(
                 kind="unit", production="fixture", unit=identity, doc=str(self.home / "fixture-production.md"), session_name=identity, session_host="herdr",
                 plan=inventory.NoRunRecord(kind="no run record")))
         elif host == "herdr":

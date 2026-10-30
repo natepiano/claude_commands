@@ -38,6 +38,7 @@ import launch_permission
 import shutdown_record as store
 from shutdown_record import CheckoutMove, SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
+from scripts.production import staff_sources
 import showrunners
 import sessions
 import stop as stop_work
@@ -1044,7 +1045,7 @@ def _down_all(started: float) -> int:
     for report in reports:
         _ = store.release_finished_account_hold(report["login"])
     return 0 if not refused and len(stopped) == len(selected) - len(deferred) and all(
-        saved["progress"]["kind"] == "stopped" and not saved["stop_issues"] for saved in stopped
+        saved["progress"]["kind"] == "stopped" and not store.stop_incomplete(saved) for saved in stopped
     ) else 1
 
 
@@ -1503,10 +1504,10 @@ def _now(account: Account, here: bool, only: Iterable[str], *, started: float) -
                 print(f"{saved['session']['name']}: stopping now", flush=True)
         stopped = stop_work.bounded_stop(active, started=started, grace_seconds=0)
         refused = refused or len(stopped) != sum(not stop_work.keep_infrastructure(saved["session"]) for saved in active) or any(
-            saved["progress"]["kind"] != "stopped" or saved["stop_issues"] for saved in stopped
+            saved["progress"]["kind"] != "stopped" or store.stop_incomplete(saved) for saved in stopped
         )
         restart_pending = any(saved["then"] == "restart" and saved["progress"]["kind"] == "stopped"
-                              and not saved["stop_issues"] for saved in stopped)
+                              and not store.stop_incomplete(saved) for saved in stopped)
         _ = store.release_finished_account_hold(account.login)
         changed = True
     missing = unrecorded_local_sessions(account.login, ids, records)
@@ -1880,7 +1881,7 @@ def _unit_showrunner(saved: SessionShutdown) -> str:
     if session["kind"] != "unit" or host["kind"] != "unit":
         return ""
     try:
-        return showrunners.current_name(showrunners.production_slug(host["doc"]))
+        return showrunners.current_name(staff_sources.unit_parent(host["unit"], session["session_id"]).slug)
     except (OSError, ValueError):
         return ""
 
@@ -2102,7 +2103,7 @@ def _holdout_host(saved: SessionShutdown) -> str:
     if host["kind"] == "legacy tmux" or host["kind"] == "legacy tmux unit":
         return f"legacy host {host['session_name']}"
     if host["kind"] == "unit":
-        return f"unit {host['production']}/{host['unit']}"
+        return f"unit {host['unit']}"
     if host["kind"] == "ghostty" or host["kind"] == "zed":
         desktop = host["desktop"]
         window = "Ghostty window" if host["kind"] == "ghostty" else "Zed window"

@@ -573,6 +573,14 @@ class HerdrPlace:
 
 
 @dataclass(frozen=True)
+class TabWithPane:
+    """The identities returned when a live pane moves into a new tab."""
+
+    pane: str
+    tab: str
+
+
+@dataclass(frozen=True)
 class NotInHerdr:
     """The process has no identifiable herdr pane and listening server."""
 
@@ -1088,11 +1096,7 @@ class Herdr:
         options = ["--label", title, "--cwd", cwd]
         for key, value in {**child_environment(environment), "HERDR_AGENT_PANE": "1"}.items():
             options.extend(["--env", f"{key}={value}"])
-        with _LayoutLock(self.session):
-            saved = saved_layout(self.session)
-            workspace = self._workspace_named(space)
-            if workspace is None and self._place_saved_workspaces(saved, frozenset({space})):
-                workspace = self._workspace_named(space)
+        def open_pane(workspace: str | None) -> str:
             if workspace is not None:
                 result = self.result("tab", "create", "--workspace", workspace, *options, "--no-focus")
             else:
@@ -1105,7 +1109,21 @@ class Herdr:
             _ = self.run("pane", "rename", pane, title)
             if workspace is not None:
                 self._close_placeholders(workspace)
-                unit_director_titles = {title} if has_unit_marks(environment) else _NO_NEW_UNIT_DIRECTOR_TITLES
+            return pane
+
+        unit_director_titles = {title} if has_unit_marks(environment) else _NO_NEW_UNIT_DIRECTOR_TITLES
+        return self._place_tab_in_workspace(space, open_pane, unit_director_titles, create_workspace=True)
+
+    def _place_tab_in_workspace(self, space: str, place_pane: Callable[[str | None], str],
+                                unit_director_titles: Set[str], *, create_workspace: bool = False) -> str:
+        """Serialize workspace resolution, pane placement, tab ordering and the saved layout."""
+        with _LayoutLock(self.session):
+            saved = saved_layout(self.session)
+            workspace = self._workspace_named(space)
+            if workspace is None and create_workspace and self._place_saved_workspaces(saved, frozenset({space})):
+                workspace = self._workspace_named(space)
+            pane = place_pane(workspace)
+            if workspace is not None:
                 pane = self.order_tabs(workspace, saved, unit_director_titles).get(pane, pane)
             self.save_layout()
             return pane
@@ -1230,6 +1248,24 @@ class Herdr:
             self.save_layout()
         return True
 
+    def move_pane_to_tab(self, pane: str, workspace: str, title: str) -> TabWithPane:
+        """Move the running pane into a new tab in a workspace id, preserving its process and title."""
+        result = json_object(self.result("pane", "move", pane, "--new-tab", "--workspace", workspace)
+                             .get("move_result"), "herdr pane move")
+        tab = json_text(json_object(result.get("created_tab"), "herdr moved tab").get("tab_id"), "herdr tab id")
+        moved = json_text(json_object(result.get("pane"), "herdr moved pane").get("pane_id"), "herdr pane id")
+        _ = self.run("tab", "rename", tab, title)
+        return TabWithPane(moved, tab)
+
+    def move_pane_to_workspace(self, pane: str, space: str, title: str) -> str:
+        """Move a live pane to a named workspace, order its tab and save its place."""
+        def move_pane(workspace: str | None) -> str:
+            if workspace is None:
+                raise HerdrFailure(f"no workspace named {space!r}")
+            return self.move_pane_to_tab(pane, workspace, title).pane
+
+        return self._place_tab_in_workspace(space, move_pane, {title})
+
     def order_tabs(self, workspace: str, saved: SavedLayout,
                    new_unit_director_titles: Set[str] = _NO_NEW_UNIT_DIRECTOR_TITLES) -> dict[str, str]:
         """Keep saved order; sort other tabs by showrunner, unit directors A-Z, then other tabs A-Z.
@@ -1271,13 +1307,10 @@ class Herdr:
         for index in order[start:]:
             tab = json_text(tabs[index].get("tab_id"), "herdr tab id")
             pane = panes_of[tab][0]
-            result = json_object(self.result("pane", "move", pane, "--new-tab", "--workspace", workspace)
-                                 .get("move_result"), "herdr pane move")
-            created = json_text(json_object(result.get("created_tab"), "herdr moved tab").get("tab_id"), "herdr tab id")
-            moved[pane] = json_text(json_object(result.get("pane"), "herdr moved pane").get("pane_id"), "herdr pane id")
-            _ = self.run("tab", "rename", created, titles[index])
+            placed = self.move_pane_to_tab(pane, workspace, titles[index])
+            moved[pane] = placed.pane
             if tab == active:
-                active_tab = created
+                active_tab = placed.tab
         if isinstance(active_tab, str):
             _ = self.run("tab", "focus", active_tab)
         if focused is not None and focused.get("workspace_id") != workspace:

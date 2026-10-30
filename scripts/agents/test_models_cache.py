@@ -1,6 +1,8 @@
 """Cache rewrites are unreadable snapshots, not evidence of a missing model."""
 from __future__ import annotations
 
+from scripts.lib.test_hang_guard import LauncherHangGuard
+
 import json
 import os
 import shutil
@@ -95,7 +97,7 @@ class ModelsCacheTests(unittest.TestCase):
                        "CODEX_CONFIG_FILE": str(configuration),
                        "CODEX_CATALOG_SYNC_STATE_FILE": str(self.root / "last-success")}
         result = subprocess.run(["bash", str(ROOT / "scripts/agents/sync_codex_catalog.sh")],
-                                env=environment, text=True, capture_output=True, check=False, timeout=300)
+                                env=environment, text=True, capture_output=True, check=False, timeout=LauncherHangGuard(self.id()).remaining())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.cache.read_text(), "{broken")
 
@@ -113,7 +115,7 @@ class ModelsCacheTests(unittest.TestCase):
     def resolve(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(["bash", "-c", 'source "$1"; _agents_model_slug codex sol',
                                "cache-test", str(ROOT / "scripts/agents/agents_config.sh")],
-                              env=self.environment(), capture_output=True, text=True, check=False, timeout=300)
+                              env=self.environment(), capture_output=True, text=True, check=False, timeout=LauncherHangGuard(self.id()).remaining())
 
 
 if __name__ == "__main__":

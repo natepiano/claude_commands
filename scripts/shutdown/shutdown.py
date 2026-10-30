@@ -194,7 +194,7 @@ def _selected_account(requested: str | None) -> Account:
 def _host_text(host: Host) -> str:
     match host["kind"]:
         case "unit":
-            return f"unit {host['production']}/{host['unit']} (herdr {host['session_name']})"
+            return f"unit {host['unit']} (herdr {host['session_name']})"
         case "legacy tmux" | "legacy tmux unit":
             return f"{host['kind']} {host['session_name']} (manual recovery)"
         case "herdr":
@@ -842,7 +842,7 @@ def follow(login: str, request_id: str) -> int:
                 if identity in history.taken_out:
                     continue
                 kind = saved["progress"]["kind"]
-                if kind in {"process identity lost", "stop failed", "restart failed", "manual restart", "timers pending"} or (kind == "waiting" and "alerted_at" in saved) or (kind in {"stopped", "already gone"} and saved["stop_issues"]):
+                if kind in {"process identity lost", "stop failed", "restart failed", "manual restart", "timers pending"} or (kind == "waiting" and "alerted_at" in saved) or (kind in {"stopped", "already gone"} and recovery_store.stop_incomplete(saved)):
                     if kind == "stop failed":
                         print(stop_work.stop_summary(list(known.values())), flush=True)
                     print(_follow_action(saved), flush=True)
