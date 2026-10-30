@@ -588,20 +588,102 @@ def read_sources(repo: Path, base: str, head: str, staged: bool,
     return sources
 
 
+@dataclass(frozen=True)
+class ProductionMergeBranch:
+    name: str
+
+
+@dataclass(frozen=True)
+class ProductionBase:
+    commit: str
+
+
+@dataclass(frozen=True)
+class NoProductionBase:
+    """No registered production provides a usable merge-branch base."""
+
+
+def worktree_path_matches(value: str, worktree: Path) -> bool:
+    """Compare absolute worktree paths, ignoring empty cells and retirement notes."""
+    if not value:
+        return False
+    try:
+        path = Path(value).expanduser()
+        return path.is_absolute() and path.resolve() == worktree
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def production_merge_branch(repo: Path) -> ProductionMergeBranch | NoProductionBase:
+    """Match a Units worktree first, then its branch, across registered docs."""
+    original_path = sys.path[:]
+    try:
+        repository_root = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(repository_root))
+        sys.path.insert(0, str(repository_root / "scripts" / "production"))
+        from scripts.production import production_units, showrunners
+    except ImportError:
+        return NoProductionBase()
+    finally:
+        sys.path[:] = original_path
+    worktree = Path(git(repo, "rev-parse", "--show-toplevel").strip()).resolve()
+    branch = git(repo, "branch", "--show-current").strip()
+    branch_match: ProductionMergeBranch | NoProductionBase = NoProductionBase()
+    for doc in dict.fromkeys(showrunners.timer_docs().values()):
+        try:
+            lines = doc.read_text(encoding="utf-8").splitlines()
+            rows = production_units.unit_table(lines)
+            worktree_matches = any(worktree_path_matches(
+                production_units.cell_value(row.get("Worktree", "")), worktree) for row in rows)
+            branch_matches = bool(branch) and any(
+                production_units.cell_value(row.get("Branch", "")) == branch for row in rows)
+            if worktree_matches or branch_matches:
+                match = ProductionMergeBranch(production_units.production_field(lines, "Merge branch"))
+                if worktree_matches:
+                    return match
+                if isinstance(branch_match, NoProductionBase):
+                    branch_match = match
+        except (OSError, UnicodeError, production_units.Refusal):
+            continue
+    return branch_match
+
+
+def production_base(repo: Path) -> ProductionBase | NoProductionBase:
+    branch = production_merge_branch(repo)
+    if isinstance(branch, ProductionMergeBranch):
+        try:
+            return ProductionBase(git(repo, "merge-base", "HEAD", f"origin/{branch.name}").strip())
+        except GuardError:
+            pass
+    return NoProductionBase()
+
+
 def default_base(repo: Path, explicit_base: str = "") -> str:
-    """Use the branch's upstream or its nearest unambiguous remote ancestor."""
+    """Take the newer upstream/production base, or the nearest remote base."""
     if explicit_base:
         return git(repo, "rev-parse", "--verify", f"{explicit_base}^{{commit}}").strip()
+    production = production_base(repo)
     try:
-        return git(repo, "merge-base", "HEAD", "@{upstream}").strip()
+        upstream = git(repo, "merge-base", "HEAD", "@{upstream}").strip()
     except GuardError:
         pass
+    else:
+        if isinstance(production, ProductionBase) and production.commit != upstream:
+            # A descendant always has fewer base..HEAD commits. For diverged bases,
+            # the same count selects the nearer one; ties keep the upstream base.
+            upstream_count = int(git(repo, "rev-list", "--count", f"{upstream}..HEAD").strip())
+            production_count = int(git(repo, "rev-list", "--count", f"{production.commit}..HEAD").strip())
+            if production_count < upstream_count:
+                return production.commit
+        return upstream
     default_remote = ""
     try:
         default_remote = git(repo, "symbolic-ref", "refs/remotes/origin/HEAD").strip()
     except GuardError:
         pass
     nearest: dict[str, int] = {}
+    if isinstance(production, ProductionBase):
+        nearest[production.commit] = int(git(repo, "rev-list", "--count", f"{production.commit}..HEAD").strip())
     for reference in git(repo, "for-each-ref", "--format=%(refname)", "refs/remotes/").splitlines():
         if reference.endswith("/HEAD") or reference == default_remote:
             continue

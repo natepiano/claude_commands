@@ -14,6 +14,11 @@ candidate with keep/remove and a reason, writes the plan, and removes nothing.
 Then use `tmp_sweep.py --apply <plan.json>` to recheck and remove only planned
 paths. Hand cleanup also requires end evidence: all recorded workers ended, a
 scratch task ended, or a recorded verify.sh run stopped. Age alone keeps a path.
+The timed sweep keeps top-level /tmp/claude entries and direct unit/delegate run
+folders without that end evidence until nothing in them changed for 7 days.
+Files and links at the top level also wait 7 days. Tempfile-named entries and
+invoke/verify logs keep their existing rules. Every process and ownership check
+still applies; the log distinguishes an ended owner from the 7-day fallback.
 
 An entry is one top-level file, folder or link under a root: /tmp/claude,
 /tmp/claude/delegate, /tmp/claude/unit, or a /tmp/claude-<uid>/-<project>/
@@ -84,7 +89,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -178,6 +183,8 @@ IN_USE = "a process uses it"
 VERIFY_RUNS = "its verify.sh run is running"
 RECENT = "changed in the last 4 h"
 RECENT_WIDE = "changed in the last 7 days"
+NO_END_RECENT = "no record proves its owner ended, and it changed in the last 7 days"
+NO_END_OLD = "no record proves its owner ended; unchanged for 7 days and unused"
 TASK_OPEN = "its task is open and it changed in the last 7 days"
 SMALL_IN_LIVE_SESSION = "under 1 GiB in a running session's folder"
 UNLISTED_REASONS = (RECENT, RECENT_WIDE, SMALL_IN_LIVE_SESSION, TASK_OPEN)
@@ -193,6 +200,7 @@ class DeletedEntry(TypedDict):
     path: str
     gib: float
     last_change: str
+    reason: str
 
 
 class FailedEntry(TypedDict):
@@ -914,6 +922,7 @@ class RemovableEntry:
     root: str
     newest: float
     size: int
+    reason: str = "idle and unused"
 
 
 def judge_entries(roots: Roots, now: float, proc: str) -> Iterator[KeptEntry | RemovableEntry]:
@@ -988,7 +997,7 @@ def remove_entry(entry: RemovableEntry, result: Sweep, dry_run: bool) -> bool:
             return False
     result.freed += entry.size
     result.deleted.append(DeletedEntry(path=entry.path, gib=round(entry.size / GIB, 3),
-                                       last_change=when(entry.newest)))
+                                       last_change=when(entry.newest), reason=entry.reason))
     return True
 
 
@@ -997,7 +1006,7 @@ def sweep(dry_run: bool, roots: Roots, now: float, proc: str = PROC_DIR) -> Swee
     result = Sweep()
     emptied: set[str] = set()
     removals: list[RemovableEntry] = []
-    for entry in judge_entries(roots, now, proc):
+    for entry in timed_entries(roots, now, proc):
         if isinstance(entry, KeptEntry):
             path = f"{entry.path}: {entry.use}" if entry.use else entry.path
             result.keep(path, entry.reason)
@@ -1050,6 +1059,31 @@ def cleanup_end_reason(entry: RemovableEntry, roots: Roots, now: float, proc: st
     except (OSError, UnicodeError, ValueError):
         return CleanupKeepReason.UNREADABLE
     return CleanupKeepReason.NO_END
+
+
+def timed_entries(roots: Roots, now: float, proc: str) -> Iterator[KeptEntry | RemovableEntry]:
+    """Keep unrecorded top-level work for seven days after all other checks pass."""
+    for entry in judge_entries(roots, now, proc):
+        if isinstance(entry, KeptEntry) or entry.root not in roots.plain + roots.runs:
+            yield entry
+            continue
+        name = Path(entry.path).name
+        if any(pattern.fullmatch(name) for pattern in (TEMPFILE_NAME, INVOKE_TEMP_NAME, VERIFY_TEMP_NAME)):
+            yield entry
+            continue
+        ended = cleanup_end_reason(entry, roots, now, proc)
+        if isinstance(ended, CleanupEndReason):
+            yield replace(entry, reason=ended.value)
+            continue
+        if ended is CleanupKeepReason.UNREADABLE:
+            yield KeptEntry(entry.path, ended.value)
+            continue
+        change = last_change(entry.path, Limit(now - WIDE_IDLE_SECONDS, NO_END_RECENT))
+        if isinstance(change, str):
+            yield KeptEntry(entry.path, change)
+            continue
+        newest, size = change
+        yield replace(entry, newest=newest, size=size, reason=NO_END_OLD)
 
 
 class PlanEntry(TypedDict):

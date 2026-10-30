@@ -28,7 +28,7 @@ from account import Account
 import inventory
 import herdr
 from fake_herdr import CommandResponse
-import record
+import shutdown_record
 import settle
 import sessions
 import stop
@@ -201,23 +201,23 @@ def server(
     )
 
 
-def entry(session: inventory.Session, progress: str = "ready") -> record.SessionShutdown:
-    state: record.SessionProgress = (
-        record.SessionWaiting(kind="waiting") if progress == "waiting"
-        else record.SessionReadyToStop(kind="ready", at=NOW)
+def entry(session: inventory.Session, progress: str = "ready") -> shutdown_record.SessionShutdown:
+    state: shutdown_record.SessionProgress = (
+        shutdown_record.SessionWaiting(kind="waiting") if progress == "waiting"
+        else shutdown_record.SessionReadyToStop(kind="ready", at=NOW)
     )
-    return record.SessionShutdown(
+    return shutdown_record.SessionShutdown(
         login=LOGIN, label=LABEL, machine="natedev", requested_at=NOW,
-        request_id="request", requested_by=record.FromTerminal(kind="terminal"),
+        request_id="request", requested_by=shutdown_record.FromTerminal(kind="terminal"),
         hold="session", then="stop", force="wait for ready", alerts="none", probe=False,
-        session=session, workers=[], timers=[], settle_message=record.SettleMessageNotSent(kind="not sent"),
-        where=record.WhereNotSaid(kind="not said"), progress=state, trail=[], stop_issues=[],
+        session=session, workers=[], timers=[], settle_message=shutdown_record.SettleMessageNotSent(kind="not sent"),
+        where=shutdown_record.WhereNotSaid(kind="not said"), progress=state, trail=[], stop_issues=[],
     )
 
 
 def records_for_test(
-    entries: list[record.SessionShutdown], *, force: record.StopTiming = "wait for ready", state: str = "",
-) -> list[record.SessionShutdown]:
+    entries: list[shutdown_record.SessionShutdown], *, force: shutdown_record.StopTiming = "wait for ready", state: str = "",
+) -> list[shutdown_record.SessionShutdown]:
     del state
     for item in entries:
         item["force"] = force
@@ -294,14 +294,14 @@ class StopTests(ShutdownTestCase):
 
         _ = self.enterContext(patch.object(process_identity, "process_start", side_effect=fixture_start))
 
-    def create(self, records: list[record.SessionShutdown]) -> None:
+    def create(self, records: list[shutdown_record.SessionShutdown]) -> None:
         for item in records:
-            self.assertTrue(record.create_session(item))
+            self.assertTrue(shutdown_record.create_session(item))
 
-    def stored_record(self) -> record.SessionShutdown:
-        return record.session_records(LOGIN)[0]
+    def stored_record(self) -> shutdown_record.SessionShutdown:
+        return shutdown_record.session_records(LOGIN)[0]
 
-    def perform(self, saved: record.SessionShutdown) -> record.SessionShutdown:
+    def perform(self, saved: shutdown_record.SessionShutdown) -> shutdown_record.SessionShutdown:
         return stop.stop_session(
             saved, kill=lambda _pid, _signal: None, is_alive=lambda _pid: False,
             session_record_exists=lambda _pid: False,
@@ -312,7 +312,7 @@ class StopTests(ShutdownTestCase):
         )
 
     def test_busy_fresh_owner_defers_to_prior_readiness_instead_of_failing(self) -> None:
-        priors: tuple[record.SessionProgress, ...] = (
+        priors: tuple[shutdown_record.SessionProgress, ...] = (
             {"kind": "waiting"}, {"kind": "ready", "at": NOW},
             {"kind": "held by usage limit", "at": NOW},
             {"kind": "stopping", "at": (NOW_UTC - timedelta(seconds=120)).isoformat()},
@@ -333,7 +333,7 @@ class StopTests(ShutdownTestCase):
                 self.assertEqual(finished["progress"]["kind"], expected)
                 self.assertEqual(finished["stop_issues"], [{"kind": "not ready to stop",
                     "at": NOW, "status": "busy", "progress": expected}])
-                self.assertFalse(record.stop_incomplete(finished))
+                self.assertFalse(shutdown_record.stop_incomplete(finished))
 
     def test_shell_owner_passes_stop_guard_and_preserves_its_ready_checkpoint(self) -> None:
         owner = top_level("shell-owner", 101, status="shell")
@@ -374,13 +374,13 @@ class StopTests(ShutdownTestCase):
         owner = top_level("became-ready", 101, status="shell")
         saved = entry(owner, progress="waiting")
         self.create([saved])
-        checkpoint = record.WhereSaid(kind="said", text="keep this user checkpoint", at=NOW)
+        checkpoint = shutdown_record.WhereSaid(kind="said", text="keep this user checkpoint", at=NOW)
 
-        def ready(current: record.SessionShutdown) -> None:
+        def ready(current: shutdown_record.SessionShutdown) -> None:
             current["progress"] = {"kind": "ready", "at": NOW}
             current["where"] = checkpoint
 
-        _ = record.update_session(LOGIN, "became-ready", ready)
+        _ = shutdown_record.update_session(LOGIN, "became-ready", ready)
         signals: list[int] = []
         finished = stop.stop_session(saved,
             idle_reason="idle; nothing in progress; a background shell was running",
@@ -428,7 +428,7 @@ class StopTests(ShutdownTestCase):
                 signals: list[tuple[int, int]] = []
 
                 def kill(pid: int, sent_signal: int) -> None:
-                    current = record.find_session(LOGIN, owner["session_id"])
+                    current = shutdown_record.find_session(LOGIN, owner["session_id"])
                     assert current is not None
                     self.assertEqual(current["progress"], {"kind": "stopping", "at": NOW})
                     self.assertEqual(current["where"], {"kind": "said", "text": reason, "at": NOW})
@@ -456,7 +456,7 @@ class StopTests(ShutdownTestCase):
             clock=lambda: NOW_UTC, codex_mesh=lambda _args: self.fail("resources were stopped"),
              sleep=lambda _seconds: None)
         self.assertEqual(finished["progress"]["kind"], "waiting")
-        self.assertEqual(finished["stop_issues"], [record.NotReadyToStop(
+        self.assertEqual(finished["stop_issues"], [shutdown_record.NotReadyToStop(
             kind="not ready to stop", at=NOW, status="idle", progress="waiting")])
         self.assertEqual(finished["where"], saved["where"])
 
@@ -489,13 +489,13 @@ class StopTests(ShutdownTestCase):
                         clock=lambda: NOW_UTC, codex_mesh=lambda _args: self.fail("resources were stopped"),
                          sleep=lambda _seconds: None)
                     self.assertEqual(finished["progress"]["kind"], "waiting")
-                    self.assertEqual(finished["stop_issues"], [record.NotReadyToStop(
+                    self.assertEqual(finished["stop_issues"], [shutdown_record.NotReadyToStop(
                         kind="not ready to stop", at=NOW, status=fresh["status"], progress="waiting")])
 
     def test_reaping_busy_owner_stops_without_ready_but_checks_identity_before_signal(self) -> None:
         owner = top_level("reap-owner", 101, status="busy")
         saved = entry(owner, progress="waiting")
-        saved["progress"] = record.SessionReaping(kind="reaping", at=NOW,
+        saved["progress"] = shutdown_record.SessionReaping(kind="reaping", at=NOW,
             because="account out of usage", detail="weekly limit")
         self.create([saved])
         signals: list[tuple[int, int]] = []
@@ -514,7 +514,7 @@ class StopTests(ShutdownTestCase):
     def test_reaping_owner_with_reused_pid_is_never_signalled(self) -> None:
         owner = top_level("reap-reused", 101, status="busy")
         saved = entry(owner, progress="waiting")
-        saved["progress"] = record.SessionReaping(kind="reaping", at=NOW,
+        saved["progress"] = shutdown_record.SessionReaping(kind="reaping", at=NOW,
             because="refused in its transcript", detail="weekly limit")
         self.create([saved])
         changed = copy.deepcopy(owner)
@@ -574,7 +574,7 @@ class StopTests(ShutdownTestCase):
 
     def test_recent_stop_claim_has_no_signal_or_cleanup_effect(self) -> None:
         saved = entry(unit('owner', 101))
-        saved['progress'] = record.SessionStopping(kind='stopping', at=NOW)
+        saved['progress'] = shutdown_record.SessionStopping(kind='stopping', at=NOW)
         self.create([saved])
         finished = stop.stop_session(
             saved, kill=lambda _pid, _sent: self.fail('a claimed owner was signalled'),
@@ -587,7 +587,7 @@ class StopTests(ShutdownTestCase):
 
     def test_usage_limit_held_owner_is_claimed_and_stopped_without_now(self) -> None:
         saved = entry(top_level("owner", 101))
-        saved["progress"] = record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW)
+        saved["progress"] = shutdown_record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW)
         self.create([saved])
         signals: list[int] = []
         def kill(pid: int, sent_signal: int) -> None:
@@ -605,7 +605,7 @@ class StopTests(ShutdownTestCase):
 
     def test_usage_limit_held_owner_with_busy_worker_keeps_held_progress_in_issue(self) -> None:
         saved = entry(top_level("owner", 101))
-        saved["progress"] = record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW)
+        saved["progress"] = shutdown_record.SessionHeldByUsageLimit(kind="held by usage limit", at=NOW)
         worker = worker_session("worker", 102, owner="owner")
         worker["status"] = "busy"
         saved["workers"] = [worker]
@@ -615,22 +615,22 @@ class StopTests(ShutdownTestCase):
             fresh_inventory=lambda _login, _only: machine_inventory([saved["session"], worker]),
             clock=lambda: NOW_UTC, codex_mesh=lambda _args: self.fail("busy worker was ended"))
         self.assertEqual(finished["progress"]["kind"], "held by usage limit")
-        self.assertEqual(finished["stop_issues"], [record.NotReadyToStop(kind="not ready to stop",
+        self.assertEqual(finished["stop_issues"], [shutdown_record.NotReadyToStop(kind="not ready to stop",
             at=NOW, status="idle", progress="held by usage limit")])
 
     def test_stale_stop_claim_retries_an_idle_owner(self) -> None:
         saved = entry(top_level('owner', 101))
-        saved['progress'] = record.SessionStopping(kind='stopping', at=(NOW_UTC - timedelta(seconds=120)).isoformat())
+        saved['progress'] = shutdown_record.SessionStopping(kind='stopping', at=(NOW_UTC - timedelta(seconds=120)).isoformat())
         self.create([saved])
         self.assertEqual(self.perform(saved)['progress']['kind'], 'stopped')
 
     def test_cleanup_retry_only_repeats_unconfirmed_resources_without_a_signal(self) -> None:
         pending = str(self.root / "pending")
         saved = entry(unit('owner', 101, run_dirs=[str(self.root / "clean"), pending]))
-        saved['progress'] = record.SessionStopped(kind='stopped', at=NOW)
-        saved['stop_issues'] = [record.CodexServerLeftRunning(
+        saved['progress'] = shutdown_record.SessionStopped(kind='stopped', at=NOW)
+        saved['stop_issues'] = [shutdown_record.CodexServerLeftRunning(
             kind='codex server left running', at=NOW, run_dir=pending, cause='stop not confirmed',
-        ), record.UnitSessionLeftRunning(
+        ), shutdown_record.UnitSessionLeftRunning(
             kind='unit session left running', at=NOW, host="herdr", session_name='herdr-owner', cause='stop not confirmed',
         )]
         self.create([saved])
@@ -669,7 +669,7 @@ class StopTests(ShutdownTestCase):
 
     def test_cancel_during_a_stop_claim_keeps_its_record_and_timers(self) -> None:
         saved = entry(top_level('owner', 101))
-        saved['timers'] = [record.TimerRestore(instance='owner-timer', was_enabled=True)]
+        saved['timers'] = [shutdown_record.TimerRestore(instance='owner-timer', was_enabled=True)]
         self.create([saved])
         entered = threading.Event()
         release = threading.Event()
@@ -716,7 +716,7 @@ class StopTests(ShutdownTestCase):
         report = stop.stop_session(self.stored_record(), kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([current]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0,  sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(killed, [])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
-        self.assertEqual(report['stop_issues'], [record.NotReadyToStop(kind='not ready to stop', at=NOW, status='busy', progress='ready')])
+        self.assertEqual(report['stop_issues'], [shutdown_record.NotReadyToStop(kind='not ready to stop', at=NOW, status='busy', progress='ready')])
 
     def test_account_unreadable_entry_is_not_signalled_and_keeps_an_issue(self) -> None:
         stored = top_level('unreadable', 101)
@@ -725,7 +725,7 @@ class StopTests(ShutdownTestCase):
         unattributed = inventory.UnattributedSession(pid=101, name='unreadable', reason='account unreadable')
         report = stop.stop_session(self.stored_record(), kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: True, fresh_inventory=lambda _login, _scope: machine_inventory([], unattributed=[unattributed]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0,  sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(killed, [])
-        self.assertEqual(report['stop_issues'], [record.AccountUnreadableAtStop(kind='account unreadable', at=NOW)])
+        self.assertEqual(report['stop_issues'], [shutdown_record.AccountUnreadableAtStop(kind='account unreadable', at=NOW)])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
 
     def test_forced_stop_signals_a_busy_entry(self) -> None:
@@ -742,7 +742,7 @@ class StopTests(ShutdownTestCase):
             with self.subTest(session_id=session_id):
                 self.create(records_for_test([entry(top_level(session_id, pid))]))
                 unattributed = inventory.UnattributedSession(pid=pid, name=session_id, reason='account unreadable')
-                saved = record.find_session(LOGIN, session_id)
+                saved = shutdown_record.find_session(LOGIN, session_id)
                 assert saved is not None
                 killed: list[int] = []
                 with patch.object(process_identity, 'process_start', return_value=process_identity.parse_start(running_start)):
@@ -762,7 +762,7 @@ class StopTests(ShutdownTestCase):
                 clock=lambda: NOW_UTC, codex_mesh=lambda arguments: 0, sleep=lambda seconds: None)
         self.assertEqual(finished["progress"]["kind"], expected_progress)
         self.assertEqual(finished["session"]["proc_start"], recorded_start)
-        self.assertIsNotNone(record.find_session(LOGIN, "owner-check"))
+        self.assertIsNotNone(shutdown_record.find_session(LOGIN, "owner-check"))
 
     def test_forced_stop_keeps_owner_when_its_process_stat_is_unreadable(self) -> None:
         started = process_identity.process_start(os.getpid())
@@ -805,6 +805,30 @@ class StopTests(ShutdownTestCase):
         self.assertEqual([event for event in events if event.startswith('codex ')], [f'codex stop --pause --session-dir {run_dir}'])
         self.assertEqual([event for event in events if event.startswith('kill ')], [f'kill 101 {signal.SIGTERM}'])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
+
+    def test_ready_move_pauses_running_codex_workers_but_full_stop_waits(self) -> None:
+        for moving in (True, False):
+            with self.subTest(moving=moving):
+                run = str(self.root / f"run-{moving}")
+                owner = top_level(f"owner-{moving}", 101, run_dirs=[run],
+                    codex_servers=[server(run, 900, busy_workers=["Writer"])])
+                saved = entry(owner)
+                if moving:
+                    saved["target"] = "claude3"
+                self.create([saved])
+                events: list[str] = []
+
+                def pause(arguments: list[str]) -> int:
+                    events.append("codex " + " ".join(arguments))
+                    return 0
+
+                finished = stop.stop_session(saved,
+                    kill=lambda pid, _sent: events.append(f"kill {pid}"),
+                    is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
+                    fresh_inventory=lambda _login, _only: machine_inventory([owner]),
+                    clock=lambda: NOW_UTC, codex_mesh=pause, sleep=lambda _seconds: None)
+                self.assertEqual(events, ["kill 101", f"codex stop --pause --session-dir {run}"] if moving else [])
+                self.assertEqual(finished["progress"]["kind"], "stopped" if moving else "ready")
 
     def test_stop_persists_owned_busy_and_idle_seats_before_pause_removes_launcher_evidence(self) -> None:
         run = self.root / "owned run"
@@ -849,8 +873,8 @@ class StopTests(ShutdownTestCase):
                 sleep=lambda _seconds: None)
         self.assertEqual(calls, [["stop", "--pause", "--session-dir", str(run)]])
         seats = {seat["seat"]: seat for seat in finished.get("codex_seats", [])}
-        self.assertEqual(seats["busy"], record.PausedSeat(run_dir=str(run), seat="busy", role="impl", thread_id="busy-thread", turn_live=True, launcher_command=launcher))
-        self.assertEqual(seats["review"], record.PausedSeat(run_dir=str(run), seat="review", role="review", thread_id="review-thread", turn_live=False, launcher_command=[]))
+        self.assertEqual(seats["busy"], shutdown_record.PausedSeat(run_dir=str(run), seat="busy", role="impl", thread_id="busy-thread", turn_live=True, launcher_command=launcher))
+        self.assertEqual(seats["review"], shutdown_record.PausedSeat(run_dir=str(run), seat="review", role="review", thread_id="review-thread", turn_live=False, launcher_command=[]))
         prompt = run / "busy.resume-prompt.md"
         self.assertEqual(prompt.read_text().strip(), "You were paused when your unit director stopped for an account move or restart. Continue the task you were on from where you stopped; your earlier instructions still hold.")
         self.assertEqual((run / "review.resume-prompt.md").read_text().strip(), "You were paused while idle when your unit director stopped for an account move or restart. Nothing was in progress: reply ready and wait for your next assignment; your earlier instructions still hold.")
@@ -948,15 +972,15 @@ class StopTests(ShutdownTestCase):
                 saved = entry(owner)
                 self.create([saved])
                 report = self.perform(saved)
-                self.assertEqual(report["stop_issues"], [record.UnitSessionLeftRunning(
+                self.assertEqual(report["stop_issues"], [shutdown_record.UnitSessionLeftRunning(
                     kind="unit session left running", at=NOW, host="herdr",
                     session_name="unit-host", cause="stop not confirmed")])
                 self.assertEqual(report["progress"]["kind"], "stopped")
 
     def test_herdr_unit_cleanup_retry_does_not_signal_the_stopped_owner(self) -> None:
         saved = entry(unit("retry", 101, session_name="unit-host", session_host="herdr"))
-        saved["progress"] = record.SessionStopped(kind="stopped", at=NOW)
-        saved["stop_issues"] = [record.UnitSessionLeftRunning(kind="unit session left running", at=NOW,
+        saved["progress"] = shutdown_record.SessionStopped(kind="stopped", at=NOW)
+        saved["stop_issues"] = [shutdown_record.UnitSessionLeftRunning(kind="unit session left running", at=NOW,
             host="herdr", session_name="unit-host", cause="stop not confirmed")]
         self.create([saved])
         report = stop.stop_session(saved,
@@ -972,8 +996,8 @@ class StopTests(ShutdownTestCase):
             with self.subTest(error=type(error).__name__):
                 saved = entry(unit(type(error).__name__, 101,
                     session_name="unit-host", session_host="herdr"))
-                saved["progress"] = record.SessionStopped(kind="stopped", at=NOW)
-                saved["stop_issues"] = [record.UnitSessionLeftRunning(
+                saved["progress"] = shutdown_record.SessionStopped(kind="stopped", at=NOW)
+                saved["stop_issues"] = [shutdown_record.UnitSessionLeftRunning(
                     kind="unit session left running", at=NOW, host="herdr",
                     session_name="unit-host", cause="stop not confirmed")]
                 self.create([saved])
@@ -995,7 +1019,7 @@ class StopTests(ShutdownTestCase):
                 patch.object(herdr, "live_sessions", return_value=running) as list_sessions:
             report = self.perform(saved)
         list_sessions.assert_called_once_with()
-        self.assertEqual(report["stop_issues"], [record.UnitSessionLeftRunning(
+        self.assertEqual(report["stop_issues"], [shutdown_record.UnitSessionLeftRunning(
             kind="unit session left running", at=NOW, host="herdr",
             session_name="unit-host", cause="stop not confirmed")])
 
@@ -1010,7 +1034,7 @@ class StopTests(ShutdownTestCase):
                         patch.object(herdr, "live_sessions", side_effect=error) as list_sessions:
                     report = self.perform(saved)
                 list_sessions.assert_called_once_with()
-                self.assertEqual(report["stop_issues"], [record.UnitSessionLeftRunning(
+                self.assertEqual(report["stop_issues"], [shutdown_record.UnitSessionLeftRunning(
                     kind="unit session left running", at=NOW, host="herdr",
                     session_name="unit-host", cause="stop not confirmed")])
 
@@ -1024,7 +1048,7 @@ class StopTests(ShutdownTestCase):
             fresh_inventory=lambda _login, _scope: machine_inventory([changed]), clock=lambda: NOW_UTC)
         self.assertEqual(self.herdr_commands(), [])
         self.assertEqual(report["progress"]["kind"], "process identity lost")
-        self.assertEqual(report["stop_issues"], [record.UnitSessionLeftRunning(
+        self.assertEqual(report["stop_issues"], [shutdown_record.UnitSessionLeftRunning(
             kind="unit session left running", at=NOW, host="herdr",
             session_name="unit-host", cause="owner identity lost")])
 
@@ -1034,9 +1058,9 @@ class StopTests(ShutdownTestCase):
         self.create([saved])
 
         def replace_request(_name: str) -> None:
-            def change(current: record.SessionShutdown) -> None:
+            def change(current: shutdown_record.SessionShutdown) -> None:
                 current["request_id"] = "new-request"
-            _ = record.update_session(LOGIN, owner["session_id"], change)
+            _ = shutdown_record.update_session(LOGIN, owner["session_id"], change)
 
         with patch.object(herdr, "stop_session", side_effect=replace_request) as stop_server, \
                 patch.object(herdr, "live_sessions") as list_sessions:
@@ -1069,7 +1093,7 @@ class StopTests(ShutdownTestCase):
         self.assertEqual(killed, [])
         self.assertEqual(codex_calls, [])
         self.assertEqual(report['progress']['kind'], 'process identity lost')
-        self.assertEqual(report['stop_issues'], [record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=run_dir, cause='owner identity lost'), record.UnitSessionLeftRunning(kind='unit session left running', at=NOW, host="herdr", session_name='reused-unit', cause='owner identity lost')])
+        self.assertEqual(report['stop_issues'], [shutdown_record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=run_dir, cause='owner identity lost'), shutdown_record.UnitSessionLeftRunning(kind='unit session left running', at=NOW, host="herdr", session_name='reused-unit', cause='owner identity lost')])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
 
     def test_process_identity_changed_before_second_signal_is_not_signalled_again(self) -> None:
@@ -1112,16 +1136,16 @@ class StopTests(ShutdownTestCase):
         if progress['kind'] != 'stop failed':
             self.fail('expected stop failure')
         self.assertEqual(progress['reason'], 'alive after two SIGTERMs')
-        self.assertEqual(report['stop_issues'], [record.StillRunningAfterStop(kind='still running', at=NOW, reason='alive after two SIGTERMs')])
+        self.assertEqual(report['stop_issues'], [shutdown_record.StillRunningAfterStop(kind='still running', at=NOW, reason='alive after two SIGTERMs')])
         self.assertNotEqual(report['progress']['kind'], 'stopping')
 
     def test_a_new_stop_pass_replaces_an_entrys_previous_issues(self) -> None:
         stored = top_level('stuck', 101)
         stored_entry = entry(stored)
-        stored_entry['stop_issues'] = [record.AccountUnreadableAtStop(kind='account unreadable', at=NOW)]
+        stored_entry['stop_issues'] = [shutdown_record.AccountUnreadableAtStop(kind='account unreadable', at=NOW)]
         self.create(records_for_test([stored_entry], state='stopping'))
         report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: None, is_alive=lambda _pid: True, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0,  sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
-        self.assertEqual(report['stop_issues'], [record.StillRunningAfterStop(kind='still running', at=NOW, reason='alive after two SIGTERMs')])
+        self.assertEqual(report['stop_issues'], [shutdown_record.StillRunningAfterStop(kind='still running', at=NOW, reason='alive after two SIGTERMs')])
 
     def test_showrunner_codex_server_is_stopped_once_after_exit(self) -> None:
         run_dir = str(self.root / 'showrunner-run')
@@ -1130,7 +1154,7 @@ class StopTests(ShutdownTestCase):
         codex_calls: list[list[str]] = []
         report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: None, is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=lambda arguments: codex_calls.append(arguments) or 0, sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertEqual(codex_calls, [['stop', '--pause', '--session-dir', run_dir]])
-        self.assertEqual(report['progress'], record.SessionStopped(kind='stopped', at=NOW))
+        self.assertEqual(report['progress'], shutdown_record.SessionStopped(kind='stopped', at=NOW))
         self.assertEqual(report['stop_issues'], [])
 
     def test_unconfirmed_codex_server_and_unit_herdr_leave_stop_partial(self) -> None:
@@ -1139,8 +1163,8 @@ class StopTests(ShutdownTestCase):
         stored = unit('unit', 101, session_name='unit-exact', run_dirs=[run_dir])
         self.create(records_for_test([entry(stored)]))
         report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: None, is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 1,  sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
-        self.assertEqual(report['progress'], record.SessionStopped(kind='stopped', at=NOW))
-        self.assertEqual(report['stop_issues'], [record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=run_dir, cause='stop not confirmed'), record.UnitSessionLeftRunning(kind='unit session left running', at=NOW, host="herdr", session_name='unit-exact', cause='stop not confirmed')])
+        self.assertEqual(report['progress'], shutdown_record.SessionStopped(kind='stopped', at=NOW))
+        self.assertEqual(report['stop_issues'], [shutdown_record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=run_dir, cause='stop not confirmed'), shutdown_record.UnitSessionLeftRunning(kind='unit session left running', at=NOW, host="herdr", session_name='unit-exact', cause='stop not confirmed')])
 
     def test_second_stop_retries_only_the_cleanup_left_by_the_first_stop(self) -> None:
         runs = [str(self.root / name) for name in ("resolved", "pending")]
@@ -1160,10 +1184,10 @@ class StopTests(ShutdownTestCase):
             clock=lambda: NOW_UTC, codex_mesh=codex,
         )
         expected_issues = [
-            record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir=runs[1], cause="stop not confirmed"),
-            record.UnitSessionLeftRunning(kind="unit session left running", at=NOW, host="herdr", session_name="herdr-owner", cause="stop not confirmed"),
+            shutdown_record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir=runs[1], cause="stop not confirmed"),
+            shutdown_record.UnitSessionLeftRunning(kind="unit session left running", at=NOW, host="herdr", session_name="herdr-owner", cause="stop not confirmed"),
         ]
-        self.assertEqual(first["progress"], record.SessionStopped(kind="stopped", at=NOW))
+        self.assertEqual(first["progress"], shutdown_record.SessionStopped(kind="stopped", at=NOW))
         self.assertEqual(first["stop_issues"], expected_issues)
         self.assertEqual(first_codex, [["stop", "--pause", "--session-dir", run] for run in runs])
         calls: list[list[str]] = []
@@ -1194,7 +1218,7 @@ class StopTests(ShutdownTestCase):
             return 0
         report = stop.stop_session(self.stored_record(), kill=lambda _pid, _signal: None, is_alive=lambda pid: pid == 900, fresh_inventory=lambda _login, _scope: machine_inventory([stored]), clock=lambda: NOW_UTC, codex_mesh=codex,  sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
         self.assertNotEqual(report['progress']['kind'], 'stopping')
-        self.assertEqual(report['stop_issues'], [record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=str(run_dir), cause='stop not confirmed')])
+        self.assertEqual(report['stop_issues'], [shutdown_record.CodexServerLeftRunning(kind='codex server left running', at=NOW, run_dir=str(run_dir), cause='stop not confirmed')])
 
 
     def test_ghostty_shell_with_a_different_parent_gets_no_sighup(self) -> None:
@@ -1211,7 +1235,7 @@ class StopTests(ShutdownTestCase):
 
     def test_stop_failed_record_can_be_retried_after_the_owner_becomes_idle(self) -> None:
         saved = entry(top_level("owner", 101))
-        saved["progress"] = record.SessionStopFailed(kind="stop failed", at=NOW, reason="busy")
+        saved["progress"] = shutdown_record.SessionStopFailed(kind="stop failed", at=NOW, reason="busy")
         self.create([saved])
         self.assertEqual(self.perform(saved)["progress"]["kind"], "stopped")
 
@@ -1420,7 +1444,7 @@ class StopTests(ShutdownTestCase):
     def test_stop_snapshot_cannot_claim_a_new_request_for_the_same_session(self) -> None:
         old = entry(top_level("owner", 101))
         self.create([old])
-        record.archive_session(LOGIN, "owner")
+        shutdown_record.archive_session(LOGIN, "owner")
         current = entry(top_level("owner", 101))
         current["request_id"] = "new-request"
         self.create([current])
@@ -1439,18 +1463,18 @@ class StopTests(ShutdownTestCase):
     def test_late_stop_outcome_leaves_a_replacement_relaunch_claim_unchanged(self) -> None:
         saved = entry(top_level("owner", 101))
         self.create([saved])
-        replacement = record.SessionRestarting(
+        replacement = shutdown_record.SessionRestarting(
             kind="restarting", at=(NOW_UTC + timedelta(seconds=121)).isoformat(),
-            prior=record.SessionStopped(kind="stopped", at=NOW),
+            prior=shutdown_record.SessionStopped(kind="stopped", at=NOW),
         )
-        real_update = record.update_session
+        real_update = shutdown_record.update_session
         updates = 0
 
-        def update(login: str, session_id: str, change: Callable[[record.SessionShutdown], None]) -> record.SessionShutdown:
+        def update(login: str, session_id: str, change: Callable[[shutdown_record.SessionShutdown], None]) -> shutdown_record.SessionShutdown:
             nonlocal updates
             updates += 1
             if updates == 2:
-                def replace(current: record.SessionShutdown) -> None:
+                def replace(current: shutdown_record.SessionShutdown) -> None:
                     current["progress"] = replacement
                 _ = real_update(login, session_id, replace)
             return real_update(login, session_id, change)
@@ -1473,10 +1497,10 @@ class StopTests(ShutdownTestCase):
         self.create([saved])
 
         def report(_login: str, _only: frozenset[str]) -> inventory.Inventory:
-            def replace(current: record.SessionShutdown) -> None:
+            def replace(current: shutdown_record.SessionShutdown) -> None:
                 current["request_id"] = "replacement"
-                current["progress"] = record.SessionReadyToStop(kind="ready", at=NOW)
-            _ = record.update_session(LOGIN, "owner", replace)
+                current["progress"] = shutdown_record.SessionReadyToStop(kind="ready", at=NOW)
+            _ = shutdown_record.update_session(LOGIN, "owner", replace)
             return machine_inventory([])
 
         finished = stop.stop_session(
@@ -1494,7 +1518,7 @@ class StopTests(ShutdownTestCase):
         self.create([saved])
         paused = threading.Event()
         release = threading.Event()
-        returned: list[record.SessionShutdown] = []
+        returned: list[shutdown_record.SessionShutdown] = []
         errors: list[BaseException] = []
 
         def report(_login: str, _only: frozenset[str]) -> inventory.Inventory:
@@ -1518,7 +1542,7 @@ class StopTests(ShutdownTestCase):
         worker.start()
         try:
             self.assertTrue(paused.wait(HANG_GUARD_SECONDS))
-            replacement_time = NOW_UTC + timedelta(seconds=record.CLAIM_STALE_SECONDS)
+            replacement_time = NOW_UTC + timedelta(seconds=shutdown_record.CLAIM_STALE_SECONDS)
             stopped = stop.stop_session(
                 self.stored_record(), kill=lambda _pid, _sent: None,
                 is_alive=lambda _pid: False, session_record_exists=lambda _pid: False,
@@ -1527,12 +1551,12 @@ class StopTests(ShutdownTestCase):
 
             )
             self.assertEqual(stopped["progress"]["kind"], "stopped")
-            prior = record.SessionStopped(kind="stopped", at=replacement_time.isoformat())
+            prior = shutdown_record.SessionStopped(kind="stopped", at=replacement_time.isoformat())
 
-            def relaunch(current: record.SessionShutdown) -> None:
-                current["progress"] = record.SessionRestarting(kind="restarting", at=replacement_time.isoformat(), prior=prior)
+            def relaunch(current: shutdown_record.SessionShutdown) -> None:
+                current["progress"] = shutdown_record.SessionRestarting(kind="restarting", at=replacement_time.isoformat(), prior=prior)
 
-            replacement = record.update_session(LOGIN, "owner", relaunch)
+            replacement = shutdown_record.update_session(LOGIN, "owner", relaunch)
         finally:
             release.set()
             worker.join(HANG_GUARD_SECONDS)
@@ -1545,22 +1569,22 @@ class StopTests(ShutdownTestCase):
         runs = [str(self.root / name) for name in ("first", "second")]
         self.herdr_replies(["herdr-owner"])
         saved = entry(unit("owner", 101, run_dirs=runs))
-        saved["progress"] = record.SessionStopped(kind="stopped", at=NOW)
-        issues: list[record.SessionStopIssue] = [
-            record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir=run, cause="stop not confirmed")
+        saved["progress"] = shutdown_record.SessionStopped(kind="stopped", at=NOW)
+        issues: list[shutdown_record.SessionStopIssue] = [
+            shutdown_record.CodexServerLeftRunning(kind="codex server left running", at=NOW, run_dir=run, cause="stop not confirmed")
             for run in runs
         ]
-        issues.append(record.UnitSessionLeftRunning(kind="unit session left running", at=NOW, host="herdr", session_name="herdr-owner", cause="stop not confirmed"))
+        issues.append(shutdown_record.UnitSessionLeftRunning(kind="unit session left running", at=NOW, host="herdr", session_name="herdr-owner", cause="stop not confirmed"))
         saved["stop_issues"] = issues
         self.create([saved])
         calls: list[list[str]] = []
-        replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
+        replacement = shutdown_record.SessionRestarting(kind="restarting", at=NOW, prior=shutdown_record.SessionStopped(kind="stopped", at=NOW))
 
         def codex(args: list[str]) -> int:
             calls.append(args)
-            def replace(current: record.SessionShutdown) -> None:
+            def replace(current: shutdown_record.SessionShutdown) -> None:
                 current["progress"] = replacement
-            _ = record.update_session(LOGIN, "owner", replace)
+            _ = shutdown_record.update_session(LOGIN, "owner", replace)
             return 0
 
         finished = stop.stop_session(
@@ -1575,14 +1599,14 @@ class StopTests(ShutdownTestCase):
     def test_stop_rechecks_ownership_after_readiness_before_the_first_signal(self) -> None:
         saved = entry(top_level("owner", 101))
         self.create([saved])
-        replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
+        replacement = shutdown_record.SessionRestarting(kind="restarting", at=NOW, prior=shutdown_record.SessionStopped(kind="stopped", at=NOW))
 
-        def blocker(_session: inventory.Session, *, moving: bool = False) -> record.ReadinessCheck:
+        def blocker(_session: inventory.Session, *, moving: bool = False) -> shutdown_record.ReadinessCheck:
             _ = moving
-            def replace(current: record.SessionShutdown) -> None:
+            def replace(current: shutdown_record.SessionShutdown) -> None:
                 current["progress"] = replacement
-            _ = record.update_session(LOGIN, "owner", replace)
-            return record.ReadinessClear(kind="clear")
+            _ = shutdown_record.update_session(LOGIN, "owner", replace)
+            return shutdown_record.ReadinessClear(kind="clear")
 
         with patch.object(settle, "blocker", blocker):
             finished = stop.stop_session(
@@ -1597,7 +1621,7 @@ class StopTests(ShutdownTestCase):
     def test_stop_rechecks_ownership_before_the_second_signal(self) -> None:
         saved = entry(top_level("owner", 101))
         self.create([saved])
-        replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
+        replacement = shutdown_record.SessionRestarting(kind="restarting", at=NOW, prior=shutdown_record.SessionStopped(kind="stopped", at=NOW))
         inventories = 0
         signals: list[int] = []
 
@@ -1605,9 +1629,9 @@ class StopTests(ShutdownTestCase):
             nonlocal inventories
             inventories += 1
             if inventories == 2:
-                def replace(current: record.SessionShutdown) -> None:
+                def replace(current: shutdown_record.SessionShutdown) -> None:
                     current["progress"] = replacement
-                _ = record.update_session(LOGIN, "owner", replace)
+                _ = shutdown_record.update_session(LOGIN, "owner", replace)
             return machine_inventory([saved["session"]])
 
         finished = stop.stop_session(
@@ -1625,14 +1649,14 @@ class StopTests(ShutdownTestCase):
         saved = entry(unit("owner", 101, codex_servers=[server(run, 900, busy_workers=["one", "two"])]))
         saved["force"] = "now"
         self.create([saved])
-        replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
+        replacement = shutdown_record.SessionRestarting(kind="restarting", at=NOW, prior=shutdown_record.SessionStopped(kind="stopped", at=NOW))
         calls: list[list[str]] = []
 
         def codex(args: list[str]) -> int:
             calls.append(args)
-            def replace(current: record.SessionShutdown) -> None:
+            def replace(current: shutdown_record.SessionShutdown) -> None:
                 current["progress"] = replacement
-            _ = record.update_session(LOGIN, "owner", replace)
+            _ = shutdown_record.update_session(LOGIN, "owner", replace)
             return 0
 
         finished = stop.stop_session(
@@ -1647,12 +1671,12 @@ class StopTests(ShutdownTestCase):
         host = inventory.WindowHost(kind="ghostty", window_shell=901, desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"))
         saved = entry(top_level("owner", 101, host=host))
         self.create([saved])
-        replacement = record.SessionRestarting(kind="restarting", at=NOW, prior=record.SessionStopped(kind="stopped", at=NOW))
+        replacement = shutdown_record.SessionRestarting(kind="restarting", at=NOW, prior=shutdown_record.SessionStopped(kind="stopped", at=NOW))
 
         def shell_owner(_pid: int) -> bool:
-            def replace(current: record.SessionShutdown) -> None:
+            def replace(current: shutdown_record.SessionShutdown) -> None:
                 current["progress"] = replacement
-            _ = record.update_session(LOGIN, "owner", replace)
+            _ = shutdown_record.update_session(LOGIN, "owner", replace)
             return True
 
         signals: list[tuple[int, int]] = []

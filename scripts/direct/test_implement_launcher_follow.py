@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from scripts.lib.test_agents_registry import write_registry
 from scripts.direct.implement_launcher_claims_test_support import CompletedWorkerFixture
 from scripts.direct.implement_launcher_test_support import AGENTS_REGISTRY as AGENTS_REGISTRY
 from scripts.direct.implement_launcher_test_support import TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS
@@ -95,7 +96,7 @@ class ImplementLauncherWorkerTests(CompletedWorkerFixture):
         self.assertEqual(converted["worker_id"], identity["seat_id"])
         self.assertNotIn("seat_id", converted)
 
-    def test_follow_up_rejects_wrong_slot_and_keeps_its_recorded_model(self) -> None:
+    def test_follow_up_rejects_wrong_slot_and_uses_the_current_registry_model(self) -> None:
         session_dir, first = self.completed_worker()
         self.assertEqual(first.returncode, 0, first.stderr)
         roster = cast("dict[str, object]", json.loads(
@@ -110,14 +111,12 @@ class ImplementLauncherWorkerTests(CompletedWorkerFixture):
         self.assertEqual(self.open_passes(session_dir), before)
 
         registry = self.root / ".claude" / "config" / "agents.conf"
-        _ = registry.write_text(
-            AGENTS_REGISTRY.replace("impl=gpt-called:xhigh", "impl=gpt-blind:max"),
-            encoding="utf-8",
-        )
-        # A registry row changed after the worker opened: the follow-up keeps the worker's model.
+        _ = write_registry(registry, {"direct.codex": {"impl": "gpt-blind:max"}}, base_text=AGENTS_REGISTRY)
+        # A registry row changed after the worker opened: the next dispatch uses it.
         changed_model = self.mesh_launch(session_dir, to=name)
         self.assertEqual(changed_model.returncode, 0, changed_model.stderr)
-        self.assertIn("agent=gpt-called\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
+        self.assertIn("agent=gpt-blind\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
+        self.assertIn("effort=max\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
         identity = cast("dict[str, object]", json.loads((session_dir / "impl_worker_impl.json").read_text()))
         self.assertEqual(identity["model"], "gpt-called")
 
@@ -131,7 +130,7 @@ class ImplementLauncherWorkerTests(CompletedWorkerFixture):
         _ = path.write_text(json.dumps({**identity, "model": "gpt-blind"}))
         resumed = self.mesh_launch(session_dir, to=str(identity["name"]))
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertIn("agent=gpt-blind\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
+        self.assertIn("agent=gpt-called\n", (session_dir / "impl_agent_impl").read_text(encoding="utf-8"))
         self.assertEqual(json.loads(path.read_text()), {**identity, "model": "gpt-blind"})
 
     def test_mesh_disabled_follow_refuses_before_recording_a_pass(self) -> None:

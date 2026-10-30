@@ -137,6 +137,7 @@ class StoredHeldMessage(TypedDict):
     origin_session: NotRequired[str]
     codex_owner: NotRequired[StoredCodexAccount]
     relays: NotRequired[list[HeldRelay]]
+    review_reason: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,8 @@ class HeldMessage:
     owner: HoldOwner = field(default_factory=UnownedHold)
     relays: tuple[HeldRelay, ...] = ()
     origin: QuestionOrigin = UNKNOWN_QUESTION_ORIGIN
+    # Non-empty until the held review result has reached the question's sender.
+    review_reason: str = ""
 
     @property
     def summary(self) -> str:
@@ -276,9 +279,12 @@ def read(path: Path) -> ReadHeld:
         return owner
     origin = record.get("origin_session")
     origin = SessionQuestionOrigin(origin) if isinstance(origin, str) and origin else UNKNOWN_QUESTION_ORIGIN
+    review_reason = record.get("review_reason", "")
+    if not isinstance(review_reason, str):
+        return UnreadableHeld()
     push = SessionPush(legacy.summary, legacy.text, action, legacy.need)
     return HeldMessage(push, legacy.held_at, legacy.minutes, legacy.outcome,
-                       owner, _read_relays(record.get("relays")), origin)
+                       owner, _read_relays(record.get("relays")), origin, review_reason)
 
 
 def _read_relays(value: object) -> tuple[HeldRelay, ...]:
@@ -321,6 +327,8 @@ def write(path: Path, held: HeldMessage) -> None:
         record["origin_session"] = held.origin.session_id
     if held.relays:
         record["relays"] = list(held.relays)
+    if held.review_reason:
+        record["review_reason"] = held.review_reason
     if isinstance(held.owner, KnownCodexAccount):
         record["codex_owner"] = StoredCodexAccount(home=str(held.owner.home),
             login=held.owner.login, label=held.owner.label)
@@ -395,19 +403,20 @@ def close(key: str) -> bool:
         if isinstance(held, RetiredScriptHold):
             _ = discard_script_hold(path, held)
             return True
-        try:
-            path.unlink()
-        except FileNotFoundError:
+        if isinstance(held, NoHeld):
             return False
-    if isinstance(held, HeldMessage) and held.outcome == "sent" and held.need == "blocked":
-        try:
-            done = subprocess.run([sys.executable, str(SEND), "retire", "--to", "user", "--from", JOB,
-                                   "--key", user_key(key)], capture_output=True, text=True, check=False, timeout=60)
-            problem = "" if done.returncode == 0 else (done.stdout.strip() or done.stderr.strip()).split("\n")[-1]
-        except (OSError, subprocess.TimeoutExpired) as error:
-            problem = str(error)
-        if problem:
-            print(f"escalate.py: {key}: {problem}", file=sys.stderr)
+        if isinstance(held, HeldMessage) and held.outcome == "sent" and held.need == "blocked":
+            try:
+                done = subprocess.run([sys.executable, str(SEND), "retire", "--to", "user", "--from", JOB,
+                                       "--key", user_key(key)], capture_output=True, text=True, check=False, timeout=60)
+                problem = "" if done.returncode == 0 else (
+                    done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split("\n")[-1]
+            except (OSError, subprocess.TimeoutExpired) as error:
+                problem = str(error)
+            if problem:
+                print(f"escalate.py: {key}: {problem}", file=sys.stderr)
+                return True
+        path.unlink()
     return True
 
 
@@ -493,7 +502,15 @@ def due(now: float) -> list[Settled]:
         seen = typed_at()
         for path in sorted((STATE / "held").glob("*.json")):
             held = read(path)
-            if not isinstance(held, HeldMessage) or held.outcome != "waiting":
+            if not isinstance(held, HeldMessage):
+                continue
+            if held.outcome == "review_held" and held.review_reason:
+                errors = forward_review_hold(held, held.review_reason, path.stem)
+                if not errors:
+                    write(path, replace(held, review_reason=""))
+                settled.extend(Settled(f"{path.stem}: held result relay failed: {error}", True) for error in errors)
+                continue
+            if held.outcome != "waiting":
                 continue
             if (path.stem == "five-hour-codex" or isinstance(held.owner, KnownCodexAccount)) and isinstance(identity, UnknownCodexAccount):
                 continue
@@ -506,9 +523,11 @@ def due(now: float) -> list[Settled]:
                 if not problem.startswith("HELD:"):
                     settled.append(Settled(f"{path.stem}: NOT sent: {problem}", True))
                     continue
-                held = replace(held, outcome="review_held")
+                held = replace(held, outcome="review_held", review_reason=problem)
                 write(path, held)
                 errors = forward_review_hold(held, problem, path.stem)
+                if not errors:
+                    write(path, replace(held, review_reason=""))
                 settled.append(Settled(f"{path.stem}: {problem}", False))
                 settled.extend(Settled(f"{path.stem}: held result relay failed: {error}", True) for error in errors)
                 continue

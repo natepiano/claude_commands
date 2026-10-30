@@ -12,6 +12,7 @@ from typing import cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import merge_checkpoint
+import showrunners
 from scripts.production import production_doc
 from merge_checkpoint import check_parallel
 
@@ -27,6 +28,104 @@ def setUpModule() -> None:
 
 @final
 class MergeCheckpointTests(MergeCheckpointFixture):
+    def import_production_paths(self, *, review_rows: bool = True) -> Path:
+        self.write(self.other, "outside/imported.txt", "other production\n")
+        self.write(self.other, "outside/second.txt", "second imported path\n")
+        _ = self.git("add", "outside", cwd=self.other)
+        _ = self.git("commit", "-m", "checkpoint(other): imported paths\n\nChange-Review: none — internal check", cwd=self.other)
+        _ = self.git("push", "origin", "HEAD:refs/heads/other-production", cwd=self.other)
+        _ = self.git("merge", "--no-ff", "-m", "merge other production", "origin/other-production", cwd=self.unit)
+        doc = self.root / "other-production.md"
+        lines = [f"- **Repository:** `{self.checkout}`", "- **Merge branch:** `other-production`"]
+        if review_rows:
+            lines.append(f"- **Change review:** `{self.root / 'other-review.md'}`")
+        _ = doc.write_text("\n".join(lines) + "\n")
+        return doc
+
+    def test_scope_rerun_leaves_out_another_productions_paths(self) -> None:
+        import change_review
+
+        doc = self.import_production_paths()
+        sha = self.checkpoint(subject="checkpoint(alpha): own work\n\nChange-Review: none — internal check")
+        with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
+            with mock.patch.object(change_review, "reviewed_merge_refs", return_value=[]):
+                held = self.run_checkpoint(sha)
+            self.assert_stopped_before_merge(held, "held", "scope: held — outside Owns: outside/imported.txt, outside/second.txt")
+            accepted = self.run_checkpoint(sha)
+        self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
+        self.assertIn("scope: ok — 1 changed paths are allowed; 2 came from origin merge branches", accepted.process.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
+        self.assertEqual((self.checkout / "outside/imported.txt").read_text(), "other production\n")
+
+    def test_scope_keeps_imported_path_changed_by_unit(self) -> None:
+        doc = self.import_production_paths()
+        sha = self.checkpoint("outside/imported.txt", "unit changed this\n")
+        with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
+            held = self.run_checkpoint(sha)
+        self.assert_stopped_before_merge(held, "held", "scope: held — outside Owns: outside/imported.txt\n")
+        self.assertNotIn("outside/second.txt", held.process.stdout)
+
+    def test_scope_holds_only_unit_outside_paths_then_allows_also(self) -> None:
+        doc = self.import_production_paths()
+        sha = self.checkpoint("outside/unit.txt", "unit's outside work\n")
+        with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
+            held = self.run_checkpoint(sha)
+            self.assert_stopped_before_merge(held, "held", "scope: held — outside Owns: outside/unit.txt\n")
+            self.assertNotIn("outside/imported.txt", held.process.stdout)
+            self.assertNotIn("outside/second.txt", held.process.stdout)
+            accepted = self.run_checkpoint(sha, "--also", "outside/unit.txt")
+        self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
+        self.assertIn("scope: ok — 1 changed paths are allowed; 2 came from origin merge branches", accepted.process.stdout)
+
+    def test_scope_leaves_out_own_origin_paths_not_in_local_merge_branch(self) -> None:
+        self.write(self.other, "outside/own-production.txt", "already on own origin branch\n")
+        _ = self.git("add", "outside/own-production.txt", cwd=self.other)
+        _ = self.git("commit", "-m", "checkpoint(beta): own production work", cwd=self.other)
+        _ = self.git("push", "origin", "HEAD:refs/heads/production", cwd=self.other)
+        _ = self.git("merge", "--no-ff", "-m", "merge production", "origin/production", cwd=self.unit)
+        sha = self.checkpoint()
+        with mock.patch.object(showrunners, "timer_docs", return_value={}):
+            accepted = self.run_checkpoint(sha)
+        self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
+        self.assertIn("scope: ok — 1 changed paths are allowed; 1 came from origin merge branches", accepted.process.stdout)
+        self.assertEqual((self.checkout / "outside/own-production.txt").read_text(), "already on own origin branch\n")
+
+    def test_scope_checks_paths_from_production_without_review_rows(self) -> None:
+        doc = self.import_production_paths(review_rows=False)
+        sha = self.checkpoint()
+        with mock.patch.object(showrunners, "timer_docs", return_value={"other": doc}):
+            held = self.run_checkpoint(sha)
+            self.assert_stopped_before_merge(held, "held", "scope: held — outside Owns: outside/imported.txt, outside/second.txt")
+            _ = doc.write_text(doc.read_text() + f"- **Change review:** `{self.root / 'other-review.md'}`\n")
+            accepted = self.run_checkpoint(sha)
+        self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
+        self.assertIn("scope: ok — 1 changed paths are allowed; 2 came from origin merge branches", accepted.process.stdout)
+
+    def test_same_checkpoint_rerun_skips_another_productions_reviewed_commits(self) -> None:
+        import change_review
+
+        self.write(self.other, "crates/alpha/imported.txt", "other production\n")
+        _ = self.git("add", "crates/alpha/imported.txt", cwd=self.other)
+        _ = self.git("commit", "-m", "checkpoint(other): already on another production", cwd=self.other)
+        foreign = self.git("rev-parse", "HEAD", cwd=self.other)
+        _ = self.git("push", "origin", "HEAD:refs/heads/other-production", cwd=self.other)
+        _ = self.git("fetch", "origin", cwd=self.unit)
+        _ = self.git("merge", "--no-ff", "-m", "merge other production", "origin/other-production", cwd=self.unit)
+        sha = self.checkpoint(subject="checkpoint(alpha): own work\n\nChange-Review: none — internal check")
+        other_doc = self.root / "other-production.md"
+        _ = other_doc.write_text(f"- **Repository:** `{self.checkout}`\n"
+                                 + "- **Merge branch:** `other-production`\n"
+                                 + f"- **Change review:** `{self.root / 'other-review.md'}`\n")
+        with mock.patch.object(showrunners, "timer_docs", return_value={}):
+            held = self.run_checkpoint(sha)
+        self.assert_stopped_before_merge(held, "held", "change review: held")
+        self.assertIn(foreign[:change_review.SHORT], held.process.stdout)
+        with mock.patch.object(showrunners, "timer_docs", return_value={"other": other_doc}):
+            accepted = self.run_checkpoint(sha)
+        self.assertEqual(accepted.process.returncode, 0, accepted.process.stdout + accepted.process.stderr)
+        self.assertIn("change review: ok — 1 unit commit(s)", accepted.process.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD^2"), sha)
+
     def test_missing_hash_and_unpushed_checkpoint_stop_at_ancestry(self) -> None:
         missing = self.run_checkpoint("0" * 40)
         self.assert_stopped_before_merge(missing, "failed", "commit")

@@ -24,7 +24,7 @@ from launch_permission import shutdown_state_root
 import session_pane
 import sessions
 from herdr import AgentBlocked
-from record import SessionShutdown
+from shutdown_record import SessionShutdown
 
 FLAG_WAIT = 60.0
 ATTEMPT_WAIT = 30.0
