@@ -80,9 +80,25 @@ The user asks any session, on natedev or on the Mac, for a link to an output (a 
 
 ## Phase 4 — Rerun-safe detection rules and review-links start  · status: done
 
-The shutdown items first routed here (record locks F032, restore timers at restart.py 1458, 2397 and 1470, the round 8 Astra items 1-3, owner items F2 and F3) moved to shutdown-unit on 2026-10-29 (showrunner, on the user's call). Handover files: ~/.local/state/herdr-unit/handover-2026-10-29/.
+### As-built
 
-- First work: findings F065-F067 landed in round 8 (commit 85f1cc94) and passed closure 9. Record close-route for F066 and F067 with that evidence.
-- From the rerun sweep (docs/plans/sdlc-rerun-sweep.md, section herdr-unit; showrunner 2026-10-29):
-  - scripts/herdr/detection_rules.py:131: a stop after the override replace and before every live session reloads (or a failed reload) leaves sessions on the old rules, and the next refresh returns early because the file already matches. Acceptance: a test that fails the reload once and shows that the next refresh reloads every session.
-  - scripts/review_links/serve.py:62: one expired snapshot that cannot be deleted fails the start-up sweep before bind, so every restart serves no link. Acceptance: a test with an undeletable expired snapshot where the server still binds and serves the other links.
+- `detection_rules.refresh(running: set[str], reload: Callable[[str], bool]) -> bool` builds the override from the downloaded rules. It returns True only when it writes the override file. Beside the override it keeps a receipt, `claude.loaded`: line 1 is the SHA-256 of the built override, and each next line names a session that reloaded that version.
+- When the override and the receipt hash match the build, refresh reloads only the running sessions that are not in the receipt. When no session is missing, refresh changes nothing. A missing or old receipt makes refresh reload every running session, also when the override file already matches.
+- Refresh deletes the old receipt before it replaces the override or starts a reload. It writes the new receipt to a staged file and renames it into place. A stop or an exception before that rename makes the next refresh reload every running session. A failed reload stays out of the receipt, so the next refresh tries that session again.
+- `herdr.reload_agent_rules(name: str) -> bool` returns True after a reload. It returns False after it writes a `HerdrFailure` to stderr.
+- `serve.sweep_snapshots(root: Path, now: float) -> int` catches `OSError` on the root listing, on each entry check and on each delete. It writes the path and the error to stderr and goes on to the next entry. It checks `is_symlink()` before `is_dir()`, so it never follows a symlink. An expired snapshot that the sweep cannot read or delete does not stop the start-up bind, and the server serves the other links.
+
+**Files:**
+- `scripts/herdr/detection_rules.py` — the override build and `refresh` with its reload receipt.
+- `scripts/herdr/herdr.py` — `reload_agent_rules`, which returns whether the reload succeeded.
+- `scripts/herdr/test_detection_rules.py` — tests for a rerun, a new session, an interrupted batch and a failed reload; one test goes through the real `reload_agent_rules` with a patched `Herdr.run`.
+- `scripts/review_links/serve.py` — the snapshot sweep that skips an entry it cannot read or delete.
+- `scripts/review_links/test_serve.py` — localhost tests with an undeletable expired snapshot, an unreadable symlink and an unreadable folder; each server still answers 200 for another link.
+- `docs/as-built/herdr-adoption.md`, `docs/as-built/review-links.md` — describe the receipt and the sweep.
+
+**Gotchas:**
+- The receipt sits beside the override in `~/.config/herdr/agent-detection/`. herdr reads only its own rule files there.
+- A reload resets herdr's per-pane detection: a `done` pane reads `idle` after it. This is why refresh does not reload a confirmed session.
+- The `reload` callback must return True only for a confirmed reload. A callback that catches the error and returns True puts a failed session in the receipt, and that session never retries.
+
+**Ruled out:** reloading every running session when a new session starts; only the sessions missing from the receipt reload.
