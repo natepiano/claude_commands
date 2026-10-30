@@ -78,14 +78,11 @@ The user asks any session, on natedev or on the Mac, for a link to an output (a 
 - `tailscale serve`, HTTPS, and access from outside the tailnet.
 - A live view of a file that changes. Each link is a snapshot; a new version gets a new link.
 
-## Phase 4 — The stop deadline covers record locks
+## Phase 4 — Rerun-safe detection rules and review-links start  · status: done
 
-Follow-up routed from the fast shutdown and restore phase (repair round 4, finding F032; design: Astra review /tmp/claude/astra/20261029T233410Z-3175188/review.md items 1, 4 and 5). Today the bounded stop's record operations (initial updates, reads, claim, final write, and the account-hold release after `bounded_stop` returns) take blocking locks outside the absolute 66 s deadline, so a lock holder can push a correct result past it (probe: `stopped` at 80 s).
+The shutdown items first routed here (record locks F032, restore timers at restart.py 1458, 2397 and 1470, the round 8 Astra items 1-3, owner items F2 and F3) moved to shutdown-unit on 2026-10-29 (showrunner, on the user's call). Handover files: ~/.local/state/herdr-unit/handover-2026-10-29/.
 
-- Pass the absolute deadline through both lock layers (directory lock, then account-file lock) and the post-stop hold release, recomputing the time left at each acquisition. An acquisition timeout happens only before the mutation callback, releases any outer lock, and keeps the temporary-file replace protocol.
-- Define the commit boundary: recheck the deadline before publishing the prepared record; a timeout before publishing is failure with "record not updated".
-- Define the recovery for an attempt that timed out without persistence, so `next_step()` does not hold its record and account hold forever.
-- Acceptance: fake-lock tests (a holder for 80 s returns failure by 66 s, no record published after the failure result; a later retry resolves the abandoned attempt). Files: scripts/shutdown/stop.py, record.py, settle.py and their tests.
-- Also routed (round 5, showrunner ruling): restart.py:1458 stale timer compensation disables a newer completed restore; restart.py:2397 failed timer compensation is invisible after claim loss (phases/3/review_findings_5.txt items 6-7). Acceptance: tests for both.
-- Also routed (round 5 owner check, item N3): restart.py:1470 the F038 timer recheck reads `record["login"]`; a move restore's stop writes under the target login, so the window stays open for moves. Acceptance: a move test where a takeover under the target login prevents the timer restore.
-- Also routed (round 8 Astra design check, /tmp/claude/astra/20261030T014232Z-1618645/review.md items 1-3): down --all skips records whose directors left the live inventory while their workers or builds survive (settle.py:932); a marker-free child that detaches into a new scope before discovery is not attributable (stop.py:995); the identity check and kill() are separate, so a Linux signal should go through a verified pidfd (stop.py:1554). Acceptance: a test for each.
+- First work: findings F065-F067 landed in round 8 (commit 85f1cc94) and passed closure 9. Record close-route for F066 and F067 with that evidence.
+- From the rerun sweep (docs/plans/sdlc-rerun-sweep.md, section herdr-unit; showrunner 2026-10-29):
+  - scripts/herdr/detection_rules.py:131: a stop after the override replace and before every live session reloads (or a failed reload) leaves sessions on the old rules, and the next refresh returns early because the file already matches. Acceptance: a test that fails the reload once and shows that the next refresh reloads every session.
+  - scripts/review_links/serve.py:62: one expired snapshot that cannot be deleted fails the start-up sweep before bind, so every restart serves no link. Acceptance: a test with an undeletable expired snapshot where the server still binds and serves the other links.
