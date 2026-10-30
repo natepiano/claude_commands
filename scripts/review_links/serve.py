@@ -45,24 +45,35 @@ def sweep_snapshots(root: Path, now: float) -> int:
     removed = 0
     if not root.exists():
         return removed
-    for entry in root.iterdir():
-        if entry.is_symlink() or not entry.is_dir():
-            continue
-        children = list(entry.iterdir())
-        # New snapshots contain regular files. A legacy session can contain
-        # only symlinks; preserve those even when its name is also a valid id.
-        flat = re.fullmatch(r"[a-z0-9]{6}", entry.name) is not None and not any(
-            child.is_dir() or child.is_symlink() for child in children
-        )
-        for folder in [entry] if flat else children:
-            if folder.is_symlink() or not folder.is_dir():
+    try:
+        entries = list(root.iterdir())
+    except OSError as error:
+        print(f"review-links sweep: {root}: {error}", file=sys.stderr)
+        return removed
+    for entry in entries:
+        try:
+            if entry.is_symlink() or not entry.is_dir():
                 continue
+            children = list(entry.iterdir())
+            # New snapshots contain regular files. Check symlinks before their
+            # targets; a legacy session may contain only inaccessible links.
+            flat = re.fullmatch(r"[a-z0-9]{6}", entry.name) is not None and not any(
+                child.is_symlink() or child.is_dir() for child in children
+            )
+        except OSError as error:
+            print(f"review-links sweep: {entry}: {error}", file=sys.stderr)
+            continue
+        for folder in [entry] if flat else children:
             try:
+                if folder.is_symlink() or not folder.is_dir():
+                    continue
                 if folder.stat().st_mtime < now - RETENTION_SECONDS:
                     shutil.rmtree(folder)
                     removed += 1
             except FileNotFoundError:
                 continue
+            except OSError as error:
+                print(f"review-links sweep: {folder}: {error}", file=sys.stderr)
     return removed
 
 

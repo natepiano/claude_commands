@@ -1,6 +1,8 @@
 """Named assignment dispatches through the real recorder and loopback app-server."""
 from __future__ import annotations
 
+from scripts.lib.test_agents_registry import write_registry
+
 import fcntl
 import json
 import os
@@ -60,11 +62,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.prompt = self.session_dir.parent / "assignment.txt"
         _ = self.prompt.write_text("Phase 7 — Assignment core\nImplement the assigned change.\n")
         self.registry = self.session_dir.parent / "agents.conf"
-        _ = self.registry.write_text(
-            "[codex.agents]\ngpt-kept-sol=low,medium,high,xhigh,max\n" +
-            "gpt-other-sol=low,medium,high,xhigh,max\n[assignments]\ndirect=codex\n" +
-            "[direct.codex]\nimpl=gpt-kept-sol:high\ntest=gpt-kept-sol:high\n" +
-            "fix=gpt-kept-sol:high\nreview=gpt-kept-sol:high\n")
+        _ = write_registry(self.registry, {'codex.agents': {'gpt-kept-sol': 'low,medium,high,xhigh,max', 'gpt-other-sol': 'low,medium,high,xhigh,max'}, 'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-kept-sol:high', 'test': 'gpt-kept-sol:high', 'fix': 'gpt-kept-sol:high', 'review': 'gpt-kept-sol:high'}})
         checkpoint = self.session_dir.parent / "catalog-current"
         checkpoint.touch()
         self.patches.enter_context(patch.dict(os.environ, {
@@ -236,20 +234,21 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(self.turn_starts, 2)
         self.assertEqual(read_object(self.session_dir / "phases/7/dispatch_2_paths.json")["worker"], name)
 
-    def test_an_explicit_model_mismatch_refuses_without_changing_the_named_worker(self) -> None:
+    def test_explicit_turn_settings_reuse_the_named_worker_without_changing_its_identity(self) -> None:
         _ = self.successful()
         name, original = next(iter(self.assignment_records().items()))
-        for options, requested in ((["--model", "gpt-other-sol:high"], "gpt-other-sol"),
-                                   (["--effort", "max"], "max")):
+        identity_path = next(path for path in self.session_dir.glob("impl_worker_*.json")
+                             if read_object(path).get("name") == name)
+        identity = identity_path.read_bytes()
+        for options, expected in ((["--model", "gpt-other-sol:high"], ("gpt-other-sol", "high")),
+                                  (["--effort", "max"], ("gpt-kept-sol", "max"))):
             with self.subTest(options=options):
-                result = self.launch("implement", "--to", name, *options)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn("gpt-kept-sol", result.stdout + result.stderr)
-                self.assertIn(requested, result.stdout + result.stderr)
-                self.assertEqual((self.assignment_records()[name]["model"],
-                                  self.assignment_records()[name]["effort"]),
-                                 (original["model"], original["effort"]))
-        self.assertEqual(self.turn_starts, 1)
+                _ = self.successful("implement", "--to", name, *options)
+                turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
+                self.assertEqual((turn["model"], turn["effort"]), expected)
+                self.assertEqual(self.assignment_records()[name]["thread_id"], original["thread_id"])
+                self.assertEqual(identity_path.read_bytes(), identity)
+        self.assertEqual(self.turn_starts, 3)
 
     def test_new_worker_uses_its_requested_address_and_full_access_sandbox(self) -> None:
         _ = self.successful("test", "--new-worker", "address-without-role")
@@ -427,7 +426,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertIn(f"mesh={name};", registrations[-1])
         self.assertFalse((self.session_dir / "impl_claim_impl.json").exists())
 
-    def test_a_saved_identity_model_is_accepted_while_the_turn_keeps_the_roster_model(self) -> None:
+    def test_a_saved_identity_model_does_not_override_the_current_registry(self) -> None:
         _ = self.successful()
         name = next(iter(self.assignment_records()))
         identity_path = next(path for path in self.session_dir.glob("impl_worker_*.json")
@@ -441,24 +440,23 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(read_object(identity_path)["model"], "gpt-other-sol")
         self.assertEqual(self.turn_starts, 2)
 
-    def test_a_legacy_roster_without_a_model_uses_the_saved_model_after_registry_changes(self) -> None:
+    def test_a_legacy_roster_without_a_model_uses_the_current_registry_after_it_changes(self) -> None:
         _ = self.successful()
         name, record = next(iter(self.assignment_records().items()))
         original_thread = record["thread_id"]
         del record["model"]
         self.write_pool_roster({name: record})
-        _ = self.registry.write_text(self.registry.read_text().replace(
-            "impl=gpt-kept-sol:high", "impl=gpt-other-sol:high"))
+        _ = write_registry(self.registry, {"direct.codex": {"impl": "gpt-other-sol:high"}}, update=True)
         _ = self.successful("implement", "--to", name)
         turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
-        self.assertEqual(turn["model"], "gpt-kept-sol")
+        self.assertEqual(turn["model"], "gpt-other-sol")
         self.assertEqual(self.assignment_records()[name]["thread_id"], original_thread)
         self.assertEqual(len(self.methods("thread/start")), 1)
-        refused = self.launch("implement", "--to", name, "--model", "gpt-other-sol")
-        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
-        self.assertIn("gpt-kept-sol", refused.stdout + refused.stderr)
-        self.assertIn("gpt-other-sol", refused.stdout + refused.stderr)
-        self.assertEqual(self.turn_starts, 2)
+        _ = self.successful("implement", "--to", name, "--model", "gpt-other-sol")
+        turn = cast(dict[str, object], self.methods("turn/start")[-1]["params"])
+        self.assertEqual((turn["model"], turn["effort"]), ("gpt-other-sol", "high"))
+        self.assertEqual(self.assignment_records()[name]["thread_id"], original_thread)
+        self.assertEqual(self.turn_starts, 3)
 
     def test_two_implementation_workers_have_distinct_board_slot_keys(self) -> None:
         _ = self.successful("implement", "--new-worker", "impl")
@@ -988,8 +986,7 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                              for event in self.events()))
 
     def test_a_review_launcher_follow_uses_its_roster_model_instead_of_the_implementation_anchor(self) -> None:
-        _ = self.registry.write_text(self.registry.read_text().replace(
-            "review=gpt-kept-sol:high", "review=gpt-other-sol:high"))
+        _ = write_registry(self.registry, {"direct.codex": {"review": "gpt-other-sol:high"}}, update=True)
         for arguments in (["init", "-q"], ["add", "plan.md"],
                           ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                            "commit", "-qm", "Initial fixture"]):
