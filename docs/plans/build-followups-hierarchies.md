@@ -363,6 +363,34 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **Gotchas:** the default reads `showrunners.timer_docs()`, so a production with no registered timer is not known and its commits stay checked.
 
+### Phase 13b — The scope check leaves out paths that came from an origin merge branch  · status: todo
+
+**Depends on:** Phase 13a (done; `change_review.reviewed_merge_refs`). Runs before Phase 14's repairs on its own files; showrunner fix-first request 2026-10-29.
+
+#### Work Order
+
+**Goal:** `merge_checkpoint.py`'s scope step holds only the unit's own outside paths; paths that came in with a merge of an origin merge branch the change-review step already skips are left out.
+
+**Hana link:** direct. performance's frame-cost checkpoint `a20f211eb3` (a merge of `init/catalyst`) was held on 585 such paths, and performance passed 585 `--also` flags to merge it.
+
+**Spec:**
+- One private helper in `merge_checkpoint.py` gives `origin/<merge branch>` then `change_review.reviewed_merge_refs(checkout, change_review.registered_productions)`, without duplicates: the list `unit_commits` uses. `change_review.py` is not edited (Phase 14 holds uncommitted edits there).
+- A path came from a ref when its content at the checkpoint equals its content at `git merge-base <ref> <checkpoint>`; one `git diff --name-only <base> <checkpoint> -- <paths>` per ref. A ref with no merge base or a git failure for one ref leaves out nothing for that ref.
+- A path the unit changed after the merge stays its own. `scope` checks only the unit's own paths for every commit kind; its ok line adds `; <M> came from origin merge branches` when M > 0. `other_units` keeps the full list.
+
+**Files:**
+- `scripts/production/merge_checkpoint.py` — the ref helper, the own-paths filter, `scope`'s ok line.
+- `scripts/production/test_merge_checkpoint.py` — rerun of a held merge of another production's branch passes; the unit's own outside path still held and `--also` passes it; a path changed after the merge held; a path from `origin/<own branch>` left out; a branch without a Change review line stays checked.
+
+**Workers:** `1 writer (writes the tests too)`
+- `impl2` — both files.
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 13a: the ref list is `origin/<merge branch>` plus `reviewed_merge_refs`; a doc that cannot be read keeps its commits checked.
+
+**Acceptance gate:** `python3 -m unittest scripts.production.test_merge_checkpoint scripts.production.test_change_review` green; `basedpyright` on both files ends `0 errors, 0 warnings, 0 notes`. No unit merge gate: the showrunner's merge test is its gate. **Change-Review:** none — merge tooling only; the showrunner sees it on the next held merge.
+
 ### Phase 14 — The change review list and the open-question list survive a stopped write, and a rerun of verdict or answer finishes its work  · status: todo
 **Depends on:** Phases 9 and 11 (done). Its files do not overlap Phase 13's, so the two can run in either order.
 
@@ -421,6 +449,8 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **State:** the change review lists in `~/rust/hanadocs/change-review/` (git-committed per write); `~/.local/state/showrunner/outstanding/<slug>.json`, `<slug>.history.jsonl` and the reports file; new `outstanding/<slug>.answered.jsonl` (48 hours; removed by a wrap); temporary `.<name>.<pid>.tmp` files, removed by their writer or by the next write once their pid is gone; scratch folders and holds that a verdict ends.
 
 **Constraints from prior phases:** from Phase 9: `change_review.py edit|verdict|mark-important --row` takes the ID as `/next` prints it; `_row_option` returns `ReviewRowTarget(path, row)`, `C434` selects the current list and `sdlc/C9` selects `list_file("sdlc")`; a list-named ID that differs from `--list` is refused before any write; pins and moved-row state use the plain ID of a current-list row. From Phase 11: `change_queue(path, scope, below)` is the one change queue; `next_item.py` imports `change_review.py`, never the reverse; a pin set by `/next` is the row `/change_review show` shows; `scope_queue(name, below)` and `ALL_BELOW` live in `scripts/lib/urgency.py`, and `update_registration.py` calls `urgency.scope_queue`. Gotcha from Phase 11: the merge gate's basedpyright reports import cycles through function-local imports and a per-file check does not; `update_registration.py` imports `showrunner_footer.py`, so type-check the cycle files (`accounts.py`, `showrunner_footer.py`) or run the gate's basedpyright. Tests: `python3 -m unittest scripts.lib.test_atomic_file scripts.production.test_change_review scripts.production.test_update_registration_answers scripts.production.test_update_registration_questions scripts.production.test_tidy_wrapped`, and the whole lib suite (memory `run-lib-suite-in-gates`).
+
+Assertion-Change: scripts/production/test_change_review.py::ActionTest::test_a_verdict_for_a_row_not_to_review_is_refused — C70 leaves the refused cases: it is a Reviewed row, and a verdict on a Reviewed row is now a repeat (exit 0) or a conflict (exit 1 with the scratch ended), which the verdict rerun tests check.
 
 **Acceptance gate:** unit tests green, including the stop-and-rerun tests above; per-slot `basedpyright` on the changed files and the cycle files ends `0 errors, 0 warnings, 0 notes`; merge gate green. **Change-Review row:** one per visible change, each command run from `~/.claude` (never a worktree path), on a scratch list or scratch state folder made by `~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py new --until <tomorrow> --visible`, never the live list or `~/.local/state/showrunner`, and with a list name (`change-review - demo.md`) whose row tasks match no live row:
 - `change_review.py verdict` run twice with the same words: the second run prints `already has this verdict` and the first run's line, and the Reviewed row shows its Merged cell. Commands: `~/.claude/scripts/lib/py ~/.claude/scripts/production/change_review.py add --list "<folder>/change-review - demo.md" --merged <hash> --change <text> --check <text> --see <text>`, then `... verdict --list "<folder>/change-review - demo.md" --row C1 --verdict "works"` twice.
