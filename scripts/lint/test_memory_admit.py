@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import io
 import json
+import math
 import os
 import re
 import signal
@@ -16,6 +17,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 from contextlib import closing, redirect_stdout
@@ -30,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import memory_admit as gate
 import nextest_budget as budget
+from build_shape import BuildShape, build_shape
 from memory_test_support import fake_memory_readings
 store = gate.store
 
@@ -50,6 +53,8 @@ LAST_TEST_BUILD_AT = NOW - timedelta(minutes=1)
 INVOKE = Path(__file__).with_name("invoke.sh")
 MEMORY_GATE = Path(__file__).with_name("memory_gate.sh")
 HANA = gate.RepositoryIdentity("https://example.org/nate/hana", "hana", "hana")
+RELEASE_BUILD = ["cargo", "build", "--release", "--features=bevy/trace_chrome", "--bin", "hana"]
+RELEASE_SHAPE = build_shape(RELEASE_BUILD)
 
 
 def buildlog_rows(root: Path) -> list[dict[str, object]]:
@@ -99,7 +104,7 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(gate.decide(23 * GIB - 1, 60 * GIB, 20 * GIB, []).state, "hold")
 
     def test_measured_use_is_not_charged_again_but_growth_is_reserved(self) -> None:
-        running: list[gate.StepMemory] = [gate.MeasuredMemory(3 * GIB, 3 * GIB), gate.PromisedMemory(2 * GIB)]
+        running: list[gate.StepMemory] = [gate.MeasuredMemory(3 * GIB, gate.RampPromise(3 * GIB)), gate.PromisedMemory(2 * GIB)]
         result = gate.decide(10 * GIB, 60 * GIB, 5 * GIB, running)
         self.assertEqual((result.promised, result.measured, result.threshold, result.state),
                          (2 * GIB, 3 * GIB, 10 * GIB, "admit"))
@@ -109,7 +114,7 @@ class DecisionTests(unittest.TestCase):
         for used, headroom, state in ((1, 11, "hold"), (11, 1, "admit"), (13, 0, "hold")):
             with self.subTest(measured_gib=used):
                 result = gate.decide(15 * GIB, 60 * GIB, 8 * GIB,
-                                     [gate.MeasuredMemory(used * GIB, 12 * GIB)])
+                                     [gate.MeasuredMemory(used * GIB, gate.RampPromise(12 * GIB))])
                 self.assertEqual((result.state, result.promised, result.measured),
                                  (state, headroom * GIB, used * GIB))
 
@@ -1144,7 +1149,7 @@ class LedgerTests(unittest.TestCase):
                 argv=["cargo", "nextest", "run", "--test-threads", "16"],
             )
         assert path is not None
-        with patch.object(gate, "step_memory", return_value=gate.MeasuredMemory(8 * GIB, 12 * GIB)):
+        with patch.object(gate, "step_memory", return_value=gate.MeasuredMemory(8 * GIB, gate.RampPromise(12 * GIB))):
             result, _ = self.check(12 * GIB)
         self.assertEqual((result.promised, result.measured), (4 * GIB, 8 * GIB))
         _ = path.with_suffix(".max").write_text(str(8 * GIB))
@@ -1330,6 +1335,693 @@ class MemoryQueueFixture(unittest.TestCase):
                           root=self.root, now=NOW,
                           profile=gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(int(need * GIB), "measured", 5)))
 
+
+
+class BuildPromiseFixture(MemoryQueueFixture):
+    """One private history, index and ledger for the build-promise regressions."""
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.enterContext(patch.dict(os.environ, {
+            **fake_memory_readings(self.root), "BUILDLOG_BUILD_BUDGET_GIB": "21",
+        }))
+        _ = self.enterContext(patch.object(gate, "git_identity", return_value=(HANA, "hana-clone")))
+        _ = self.enterContext(patch.object(store, "host_name", return_value="test-host"))
+        _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
+
+    def sample(self, peak: float, *, shape: BuildShape = RELEASE_SHAPE,
+               at: datetime = HISTORY_AT, outcome: str = "completed", need: float = 21,
+               host: str = "test-host", repository: gate.RepositoryIdentity = HANA,
+               call_id: str = "", record_shape: bool = True) -> None:
+        row: dict[str, object] = {
+            "host": host, "repo": repository.name, "repo_identity": repository.key,
+            "step": "build", "ended_at": store.utc_iso(at.timestamp()),
+            "anon_peak_bytes": int(peak * GIB), "need": int(need * GIB), "call_id": call_id,
+        }
+        if record_shape:
+            row["shape"] = shape.key
+        if outcome:
+            row["outcome"] = outcome
+        with (gate.admission_dir(self.root) / "anon_peaks.jsonl").open("a") as stream:
+            _ = stream.write(json.dumps(row) + "\n")
+
+    def index_build(self, call_id: str, arguments: list[str]) -> None:
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as connection, connection:
+            _ = connection.execute("CREATE TABLE IF NOT EXISTS steps(host TEXT, repo TEXT, "
+                                   + "repo_identity TEXT, step TEXT, started_at TEXT, "
+                                   + "call_id TEXT, argv TEXT, peak_mem_bytes INTEGER)")
+            _ = connection.execute("INSERT INTO steps VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                   ("test-host", "hana", HANA.key, "build", HISTORY_AT.isoformat(),
+                                    call_id, json.dumps(arguments), 0))
+
+    def estimate(self, shape: BuildShape = RELEASE_SHAPE, *, now: datetime = NOW) -> gate.ExpectedPeak:
+        return gate.expected_peak(HANA, "build", "test-host", now, self.root, shape=shape)
+
+    def same_shape_basis(self, peak: gate.ExpectedPeak) -> gate.ShapeP90 | gate.ShapeLargest:
+        if not isinstance(peak.basis, (gate.ShapeP90, gate.ShapeLargest)):
+            self.fail(f"expected a same-shape history basis, got {peak.basis}")
+        return peak.basis
+
+    def build_reservation(self, *, pid: int = 100, shape: BuildShape = RELEASE_SHAPE,
+                          need: float = 16, age: float = 3600, sidecar: bool = False) -> Path:
+        path = self.running(pid, need, age)
+        row = cast(dict[str, object], json.loads(path.read_text()))
+        row.update(step="build", repo="hana", repo_identity=HANA.key, shape=shape.key)
+        if sidecar:
+            scope_file = self.root / f"{pid}.cgroup"
+            _ = scope_file.write_text(str(self.root / f"{pid}.ended.scope"))
+            row["sidecar"] = str(scope_file)
+        _ = path.write_text(json.dumps(row))
+        return path
+
+    def build_check(self, *, available: float = 40, argv: list[str] = RELEASE_BUILD,
+                    sidecar: str = "") -> gate.CheckResult:
+        _ = self.meminfo.write_text(f"MemAvailable: {int(available * GIB) // 1024} kB\n"
+                                   + f"MemTotal: {60 * GIB // 1024} kB\n")
+        return gate.check(self.meminfo, 400, sidecar, argv, root=self.root, now=NOW)
+
+
+class BuildShapePromiseTests(BuildPromiseFixture):
+    def test_builds_without_same_shape_history_keep_the_unfactored_fallback(self) -> None:
+        for arguments in (RELEASE_BUILD, ["cargo", "build", "--bin", "hana"]):
+            shape = build_shape(arguments)
+            with self.subTest(profile=shape.profile):
+                peak = self.estimate(shape)
+                self.assertEqual((peak.bytes, peak.source, peak.count), (12 * GIB, "shape", 0))
+                self.assertEqual(peak.basis, gate.ShapeFallback())
+                self.assertEqual(gate.need_basis_record(peak.basis), {
+                    "kind": "shape_fallback", "cap": {"kind": "none"},
+                })
+
+    def test_profile_fallback_caps_its_unfactored_base_at_the_build_budget(self) -> None:
+        for arguments in (RELEASE_BUILD, ["cargo", "build", "--bin", "hana"]):
+            shape = build_shape(arguments)
+            self.sample(24, shape=build_shape(["cargo", "build", "--profile", shape.profile, "--lib"]),
+                        outcome="killed", need=20)
+            with self.subTest(profile=shape.profile):
+                peak = self.estimate(shape)
+                self.assertEqual((peak.bytes, peak.count), (21 * GIB, 0))
+                self.assertEqual(peak.basis, gate.ShapeFallback(cap=gate.CappedAtBudget(24 * GIB)))
+                self.assertEqual(gate.need_basis_record(peak.basis), {
+                    "kind": "shape_fallback", "cap": {"kind": "budget", "uncapped": 24 * GIB},
+                })
+
+    def test_release_history_matches_repository_features_and_target(self) -> None:
+        self.sample(2)
+        self.sample(3)
+        for arguments in (
+            ["cargo", "build", "--bin", "hana", "--features=bevy/trace_chrome"],
+            ["cargo", "build", "--release", "--bin", "hana"],
+            ["cargo", "build", "--release", "--features=bevy/trace_chrome", "--bin", "other"],
+            ["cargo", "build", "--release", "--all-features", "--bin", "hana"],
+            [*RELEASE_BUILD, "--no-default-features"],
+        ):
+            for _ in range(10):
+                self.sample(20, shape=build_shape(arguments))
+        self.sample(20, repository=gate.RepositoryIdentity("https://example.org/other/hana", "hana"))
+        peak = self.estimate()
+        self.assertEqual((peak.bytes, peak.source, peak.count), (math.ceil(3 * GIB * 1.314), "shape", 2))
+        self.assertEqual(peak.basis, gate.ShapeLargest(2, gate.NoFloor(), gate.ReleaseHeadroom(), gate.UnderBudget()))
+
+    def test_fewer_than_ten_same_shape_runs_use_the_largest(self) -> None:
+        for value in range(1, 10):
+            self.sample(value)
+        peak = self.estimate()
+        self.assertEqual((peak.bytes, peak.count), (math.ceil(9 * GIB * 1.314), 9))
+        self.assertIsInstance(peak.basis, gate.ShapeLargest)
+
+    def test_ten_same_shape_runs_use_p90(self) -> None:
+        for _ in range(9):
+            self.sample(3)
+        self.sample(10)
+        peak = self.estimate()
+        self.assertEqual((peak.bytes, peak.count), (math.ceil(3 * GIB * 1.314), 10))
+        self.assertEqual(peak.basis, gate.ShapeP90(10, gate.NoFloor(), gate.ReleaseHeadroom(), gate.UnderBudget()))
+
+    def test_profile_fallback_uses_release_builds_and_never_the_dev_pool(self) -> None:
+        self.sample(13, shape=build_shape(["cargo", "build", "--release", "--lib"]))
+        for _ in range(10):
+            self.sample(20, shape=build_shape(["cargo", "build"]))
+        peak = self.estimate()
+        self.assertEqual((peak.bytes, peak.count, peak.source), (13 * GIB, 0, "shape"))
+        self.assertIsInstance(peak.basis, gate.ShapeFallback)
+
+    def test_without_release_history_the_profile_fallback_is_at_least_fallback(self) -> None:
+        self.sample(20, shape=build_shape(["cargo", "build"]))
+        self.sample(2, shape=build_shape(["cargo", "build", "--release", "--lib"]))
+        self.assertEqual(self.estimate().bytes, 12 * GIB)
+
+    def test_headroom_applies_only_to_the_release_profile(self) -> None:
+        for arguments, factor in ((RELEASE_BUILD, 1.314), (["cargo", "build"], gate.DEV_HEADROOM),
+                                  (["cargo", "build", "--profile", "small"], 1.0)):
+            shape = build_shape(arguments)
+            self.sample(10, shape=shape)
+            with self.subTest(profile=shape.profile):
+                peak = self.estimate(shape)
+                self.assertEqual(peak.bytes, min(21 * GIB, math.ceil(10 * GIB * factor)))
+                expected = (gate.ReleaseHeadroom() if shape.profile == "release" else
+                            gate.DevHeadroom() if shape.profile == "dev" else gate.NoHeadroom())
+                basis = self.same_shape_basis(peak)
+                assert isinstance(basis, gate.ShapeLargest)
+                self.assertEqual(basis.factor, expected)
+
+    def test_dev_history_gets_measured_headroom_below_the_cap(self) -> None:
+        shape = build_shape(["cargo", "build", "--bin", "hana"])
+        self.sample(0.5, shape=shape)
+        peak = self.estimate(shape)
+        self.assertEqual(peak.bytes, math.ceil((GIB // 2) * gate.DEV_HEADROOM))
+        basis = self.same_shape_basis(peak)
+        assert isinstance(basis, gate.ShapeLargest)
+        self.assertEqual(basis.factor, gate.DevHeadroom())
+        self.assertEqual(gate.read_need_basis(gate.need_basis_record(basis)), basis)
+
+    def test_build_promises_never_exceed_21_gib(self) -> None:
+        for arguments in (RELEASE_BUILD, ["cargo", "build"]):
+            shape = build_shape(arguments)
+            self.sample(30, shape=shape, need=30)
+            with self.subTest(profile=shape.profile):
+                peak = self.estimate(shape)
+                self.assertEqual(peak.bytes, 21 * GIB)
+                factor = 1.314 if shape.profile == "release" else gate.DEV_HEADROOM
+                self.assertEqual(self.same_shape_basis(peak).cap, gate.CappedAtBudget(math.ceil(30 * GIB * factor)))
+
+    def test_old_history_matches_a_copy_with_a_different_checkout_name(self) -> None:
+        self.index_build("copied-build", RELEASE_BUILD)
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as connection, connection:
+            _ = connection.execute("UPDATE steps SET repo = 'hana-copy'")
+        self.sample(16, record_shape=False, call_id="copied-build")
+        peak = self.estimate()
+        self.assertEqual((peak.count, peak.bytes), (1, 21 * GIB))
+
+    def test_old_rows_get_shape_only_from_the_call_and_step_index_join(self) -> None:
+        self.index_build("joined", RELEASE_BUILD)
+        self.index_build("dev", ["cargo", "build"])
+        self.sample(5, record_shape=False, call_id="joined")
+        for call_id in ("dev", "no-index-match", ""):
+            self.sample(20, record_shape=False, call_id=call_id)
+        before = (self.root / "index.sqlite").read_bytes()
+        peak = self.estimate()
+        self.assertEqual((peak.bytes, peak.count), (math.ceil(5 * GIB * 1.314), 1))
+        self.assertEqual((self.root / "index.sqlite").read_bytes(), before)
+
+    def test_rows_without_shape_or_join_cannot_supply_even_a_profile_fallback(self) -> None:
+        for _ in range(10):
+            self.sample(20, record_shape=False)
+        peak = self.estimate()
+        self.assertEqual((peak.bytes, peak.count), (12 * GIB, 0))
+
+    def test_shape_history_excludes_other_hosts_future_and_expired_rows(self) -> None:
+        self.sample(3)
+        for _ in range(10):
+            self.sample(20, host="other-host")
+            self.sample(20, at=NOW + timedelta(seconds=1))
+            self.sample(20, at=NOW - timedelta(days=14, seconds=1))
+        self.assertEqual((self.estimate().bytes, self.estimate().count), (math.ceil(3 * GIB * 1.314), 1))
+
+    def test_killed_peak_sets_a_floor_even_when_p90_is_lower(self) -> None:
+        for _ in range(9):
+            self.sample(10)
+        self.sample(15.76, outcome="killed", need=16)
+        peak = self.estimate()
+        self.assertEqual(peak.bytes, math.ceil(int(15.76 * GIB) * 1.314))
+        self.assertEqual(self.same_shape_basis(peak).floor, gate.FailedPeakFloor(int(15.76 * GIB), store.utc_iso(HISTORY_AT.timestamp())))
+        self.assertAlmostEqual(peak.bytes / GIB, 20.70864, places=6)
+
+    def test_later_success_below_the_floor_does_not_end_it(self) -> None:
+        for _ in range(9):
+            self.sample(10)
+        ended = NOW - timedelta(hours=1)
+        self.sample(15.76, outcome="owner_gone", at=ended)
+        self.sample(1, at=HISTORY_AT)
+        peak = self.estimate()
+        self.assertEqual(peak.bytes, math.ceil(int(15.76 * GIB) * 1.314))
+        self.assertEqual(self.same_shape_basis(peak).floor, gate.FailedPeakFloor(int(15.76 * GIB), store.utc_iso(ended.timestamp())))
+
+    def test_completed_run_above_its_need_also_sets_the_floor(self) -> None:
+        for _ in range(9):
+            self.sample(10)
+        self.sample(15.76, need=12, outcome="completed")
+        peak = self.estimate()
+        self.assertEqual(peak.bytes, math.ceil(int(15.76 * GIB) * 1.314))
+        self.assertIsInstance(self.same_shape_basis(peak).floor, gate.FailedPeakFloor)
+
+    def test_newest_failed_row_replaces_the_floor_in_time_order(self) -> None:
+        for _ in range(20):
+            self.sample(10)
+        self.sample(11, outcome="killed", at=HISTORY_AT)
+        # Append the older and larger failure last: file order is not time order.
+        self.sample(15.76, outcome="owner_gone", at=NOW - timedelta(hours=1))
+        peak = self.estimate()
+        self.assertEqual(peak.bytes, math.ceil(11 * GIB * 1.314))
+        self.assertEqual(self.same_shape_basis(peak).floor, gate.FailedPeakFloor(11 * GIB, store.utc_iso(HISTORY_AT.timestamp())))
+
+    def test_failed_floor_expires_after_fourteen_days(self) -> None:
+        for _ in range(9):
+            self.sample(10)
+        self.sample(15.76, outcome="killed", at=NOW - timedelta(days=14, seconds=1))
+        peak = self.estimate()
+        self.assertEqual(peak.bytes, math.ceil(10 * GIB * 1.314))
+        self.assertEqual(self.same_shape_basis(peak).floor, gate.NoFloor())
+
+    def test_old_row_with_no_outcome_never_sets_a_failed_floor(self) -> None:
+        for _ in range(9):
+            self.sample(10)
+        self.sample(15.76, need=1, outcome="")
+        peak = self.estimate()
+        self.assertEqual(peak.bytes, math.ceil(10 * GIB * 1.314))
+        self.assertEqual(self.same_shape_basis(peak).floor, gate.NoFloor())
+
+
+class BuildLifetimePromiseTests(BuildPromiseFixture):
+    def test_release_build_after_ramp_keeps_need_as_its_budget_charge(self) -> None:
+        path = self.build_reservation(need=16, age=gate.RAMP_SECONDS + 3600)
+        row = cast(gate.Reservation, json.loads(path.read_text()))
+        memory = gate.reservation_memory(path, row, NOW, gate.process_table(self.root / "proc"), self.root / "proc")
+        self.assertIsInstance(memory, gate.MeasuredMemory)
+        if not isinstance(memory, gate.MeasuredMemory):
+            self.fail("fixture build must have a current memory reading")
+        self.assertEqual(memory.promise, gate.LifetimePromise(16 * GIB))
+        self.assertEqual(gate.charge_basis(memory), gate.LifetimePromise(16 * GIB))
+        self.assertEqual((gate.build_charge(memory), gate.growth_headroom(memory)), (16 * GIB, 15 * GIB))
+
+    def test_release_build_can_pass_budget_and_still_hold_for_free_growth(self) -> None:
+        _ = self.build_reservation(need=16, age=gate.RAMP_SECONDS + 3600)
+        result = self.check(need=4, free=20)
+        self.assertEqual((result.decision.budget_passes, result.decision.free_passes, result.decision.state),
+                         (True, False, "hold"))
+        self.assertEqual((result.decision.charged, result.decision.promised, result.decision.threshold),
+                         (16 * GIB, 15 * GIB, 22 * GIB))
+
+    def test_release_charge_covers_current_memory_and_observed_peak_above_need(self) -> None:
+        path = self.build_reservation(need=10)
+        row = cast(gate.Reservation, json.loads(path.read_text()))
+        for current, peak in ((18, 17), (2, 19)):
+            with self.subTest(current=current, peak=peak):
+                self.readings[100] = gate.MeasuredMemory(current * GIB)
+                _ = path.with_suffix(".max").write_text(str(peak * GIB))
+                _ = path.with_suffix(".wave").write_text(f"{peak * GIB} {int(NOW.timestamp())}")
+                memory = gate.reservation_memory(path, row, NOW, gate.process_table(self.root / "proc"), self.root / "proc")
+                self.assertEqual(gate.build_charge(memory), max(10, current, peak) * GIB)
+
+    def test_dev_build_and_nextest_after_ramp_keep_current_charge(self) -> None:
+        for step in ("build", "nextest"):
+            path = self.build_reservation(shape=build_shape(["cargo", "build"]), need=16)
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            row["step"] = step
+            _ = path.write_text(json.dumps(row))
+            memory = gate.reservation_memory(path, cast(gate.Reservation, cast(object, row)), NOW,
+                                             gate.process_table(self.root / "proc"), self.root / "proc")
+            with self.subTest(step=step):
+                self.assertEqual(gate.charge_basis(memory), gate.UsingNow(GIB))
+                self.assertEqual((gate.build_charge(memory), gate.growth_headroom(memory)), (GIB, 0))
+                if not isinstance(memory, gate.MeasuredMemory):
+                    self.fail("fixture step must have a current reading")
+                self.assertEqual(memory.promise, gate.NoPromise())
+
+
+class BuildFinalizerTests(BuildPromiseFixture):
+    @contextlib.contextmanager
+    def stop_before_reservation_removal(self, path: Path) -> Generator[None, None, None]:
+        unlink = Path.unlink
+
+        def unlink_except_reservation(file: Path, missing_ok: bool = False) -> None:
+            if file == path:
+                raise InterruptedError("stop after recording history")
+            unlink(file, missing_ok=missing_ok)
+
+        with patch.object(Path, "unlink", unlink_except_reservation), contextlib.suppress(InterruptedError):
+            yield
+
+    def test_cleanup_retry_after_history_append_counts_the_build_once(self) -> None:
+        path = self.build_reservation(sidecar=True)
+        _ = path.with_suffix(".max").write_text(str(10 * GIB))
+        with self.stop_before_reservation_removal(path):
+            gate.release(path, 137, self.root)
+        self.assertTrue(path.exists())
+        gate.release(path, 137, self.root)
+        rows = (self.root / "admission/anon_peaks.jsonl").read_text().splitlines()
+        self.assertEqual(len(rows), 1, "a retry must not change the number of history runs")
+        self.assertEqual(json.loads(rows[0])["outcome"], "killed")
+
+    def test_different_builds_in_one_call_each_keep_their_history(self) -> None:
+        with patch.dict(os.environ, {"BUILDLOG_CALL_ID": "one-verify-call"}):
+            for pid in (100, 200):
+                path = self.build_reservation(pid=pid, sidecar=True)
+                row = cast(dict[str, object], json.loads(path.read_text()))
+                row["call_id"] = "one-verify-call"
+                _ = path.write_text(json.dumps(row))
+                _ = path.with_suffix(".max").write_text(str(pid * GIB))
+                gate.release(path, 0, self.root)
+        rows = [cast(dict[str, object], json.loads(line)) for line in
+                (self.root / "admission/anon_peaks.jsonl").read_text().splitlines()]
+        self.assertCountEqual([row["anon_peak_bytes"] for row in rows], [100 * GIB, 200 * GIB])
+
+    def test_append_retry_keeps_scope_evidence_after_the_sidecar_is_removed(self) -> None:
+        sidecar = self.root / "new-build.cgroup"
+        _ = sidecar.write_text(str(self.root / "new-build.scope"))
+        result = self.build_check(sidecar=str(sidecar))
+        if not isinstance(result.reservation, gate.Reserved):
+            self.fail("fixture build must be admitted")
+        path = result.reservation.path
+        _ = path.with_suffix(".max").write_text(str(int(15.76 * GIB)))
+        with patch.object(store, "append_line", side_effect=OSError("history is temporarily unavailable")), \
+             contextlib.suppress(OSError):
+            gate.release(path, 137, self.root)
+        self.assertTrue(path.exists())
+        sidecar.unlink(missing_ok=True)
+        del self.processes[400]
+        _ = self.build_check(argv=["cargo", "check"])
+        history = self.root / "admission/anon_peaks.jsonl"
+        self.assertTrue(history.exists(), "retry must retain the fact that this build ran in a scope")
+        row = cast(dict[str, object], json.loads(history.read_text()))
+        self.assertEqual((row["outcome"], row["anon_peak_bytes"]), ("killed", int(15.76 * GIB)))
+        self.assertFalse(path.exists())
+
+    def test_peak_read_error_preserves_all_files_for_the_next_cleanup(self) -> None:
+        path = self.build_reservation(sidecar=True)
+        maximum = path.with_suffix(".max")
+        _ = maximum.write_text(str(int(15.76 * GIB)))
+        _ = path.with_suffix(".wave").write_text("peak wave")
+        files = (path, maximum, path.with_suffix(".wave"), self.root / "100.cgroup")
+        before = {file: file.read_bytes() for file in files}
+        read_text = Path.read_text
+
+        def fail_peak_read(file: Path) -> str:
+            if file == maximum:
+                raise PermissionError("peak temporarily unreadable")
+            return read_text(file)
+
+        with patch.object(Path, "read_text", fail_peak_read), contextlib.suppress(OSError):
+            gate.release(path, 137, self.root)
+        self.assertEqual({file: file.read_bytes() for file in files if file.exists()}, before)
+        gate.release(path, 137, self.root)
+        row = cast(dict[str, object], json.loads((self.root / "admission/anon_peaks.jsonl").read_text()))
+        self.assertEqual((row["anon_peak_bytes"], row["outcome"]), (int(15.76 * GIB), "killed"))
+
+    def test_cleanup_finishes_after_a_stop_following_each_file_removal(self) -> None:
+        unlink = Path.unlink
+        for removed_name in ("100.reservation", "100.max", "100.wave", "100.cgroup"):
+            with self.subTest(removed=removed_name):
+                path = self.build_reservation(sidecar=True)
+                _ = path.with_suffix(".max").write_text(str(10 * GIB))
+                _ = path.with_suffix(".wave").write_text("peak wave")
+                files = (path, path.with_suffix(".max"), path.with_suffix(".wave"), self.root / "100.cgroup")
+
+                def stop_after_removal(file: Path, missing_ok: bool = False) -> None:
+                    existed = file.exists()
+                    unlink(file, missing_ok=missing_ok)
+                    if existed and file.name == removed_name:
+                        raise InterruptedError("stop just after removing a file")
+
+                with patch.object(Path, "unlink", stop_after_removal), contextlib.suppress(InterruptedError):
+                    gate.release(path, 137, self.root)
+                gate.release(path, 137, self.root)
+                self.assertEqual([str(file) for file in files if file.exists()], [])
+                history = self.root / "admission/anon_peaks.jsonl"
+                self.assertEqual(len(history.read_text().splitlines()), 1)
+                history.unlink()
+
+    def test_cleanup_added_floor_expires_the_old_estimate_without_losing_queue_place(self) -> None:
+        for _ in range(9):
+            self.sample(10)
+        background = self.running(200, 0.1, 3600)
+        self.readings[200] = gate.MeasuredMemory(GIB // 10)
+        path = self.build_reservation(need=12, sidecar=True)
+        _ = path.with_suffix(".max").write_text(str(int(15.76 * GIB)))
+        del self.processes[100]
+        directory = self.root / "admission"
+        waiter_path = directory / "400-warmup.waiting"
+        previous = {"pid": 400, "start_time": "warmup", "need": math.ceil(10 * GIB * 1.314),
+                    "since": NOW.timestamp() - 900, "label": "release build", "bump_order": -2,
+                    "holds_younger": True, "priority_since": NOW.timestamp() - 60}
+        _ = waiter_path.write_text(json.dumps(previous))
+        recovery = gate.RecoveryStarts(NOW.timestamp() + 120, NOW.timestamp())
+        gate.write_recovery(directory, recovery)
+        first = self.build_check(available=18)
+        self.assertEqual(first.decision.state, "hold", "cleanup made the pre-lock estimate stale")
+        self.assertEqual(first.reservation, gate.NotReserved("held"))
+        self.assertEqual(gate.read_recovery(directory), recovery)
+        row = cast(dict[str, object], json.loads(waiter_path.read_text()))
+        for field in ("since", "bump_order", "holds_younger", "priority_since"):
+            self.assertEqual(row[field], previous[field])
+        second = gate.check(self.meminfo, 400, "", RELEASE_BUILD, root=self.root,
+                            now=NOW + timedelta(seconds=1), profile=first.profile)
+        self.assertEqual(second.decision.state, "hold")
+        self.assertEqual(second.peak.bytes, math.ceil(int(15.76 * GIB) * 1.314))
+        self.assertCountEqual(list(directory.glob("*.reservation")), [background])
+
+    def test_shared_reservation_reader_rejects_missing_required_fields(self) -> None:
+        for reader in ("live", "check"):
+            for missing in ("all", "start_time"):
+                with self.subTest(reader=reader, missing=missing):
+                    path = self.build_reservation()
+                    row = cast(dict[str, object], json.loads(path.read_text()))
+                    if missing == "all":
+                        row.clear()
+                    else:
+                        del row["start_time"]
+                    _ = path.write_text(json.dumps(row))
+                    if reader == "live":
+                        self.assertEqual(gate.live_reservations(path.parent), [])
+                    else:
+                        result = self.build_check(argv=["cargo", "check"])
+                        self.assertEqual(result.decision.state, "admit")
+                        if isinstance(result.reservation, gate.Reserved):
+                            gate.release(result.reservation.path, 0, self.root)
+
+    def test_malformed_finalization_intents_are_ignored_by_cleanup_and_release(self) -> None:
+        valid: dict[str, object] = {
+            "reservation_id": "ended-build", "peak": int(15.76 * GIB), "scoped": True,
+            "outcome": "killed", "ended_at": store.utc_iso(NOW.timestamp()), "status": 137,
+        }
+        malformed: list[object] = [None, {}]
+        for field in ("reservation_id", "peak", "scoped", "outcome", "ended_at"):
+            malformed.append({key: value for key, value in valid.items() if key != field})
+        for field, value in (("reservation_id", 1), ("peak", "large"), ("peak", True),
+                             ("scoped", 1), ("outcome", "unknown"), ("ended_at", None),
+                             ("status", "137"), ("status", True)):
+            malformed.append({**valid, field: value})
+        for caller in ("live", "check", "release"):
+            for intent in malformed:
+                with self.subTest(caller=caller, intent=intent):
+                    self.processes[100] = "first"
+                    path = self.build_reservation(sidecar=True)
+                    row = cast(dict[str, object], json.loads(path.read_text()))
+                    row["finalization"] = intent
+                    _ = path.write_text(json.dumps(row))
+                    maximum = path.with_suffix(".max")
+                    _ = maximum.write_text(str(int(15.76 * GIB)))
+                    files = (path, maximum, self.root / "100.cgroup")
+                    before = {file: file.read_bytes() for file in files}
+                    if caller == "live":
+                        self.assertEqual(gate.live_reservations(path.parent), [])
+                    elif caller == "check":
+                        del self.processes[100]
+                        result = self.build_check(argv=["cargo", "check"])
+                        self.assertEqual(result.decision.state, "admit")
+                        if isinstance(result.reservation, gate.Reserved):
+                            gate.release(result.reservation.path, 0, self.root)
+                    else:
+                        gate.release(path, 137, self.root)
+                    self.assertEqual({file: file.read_bytes() for file in files if file.exists()}, before)
+                    self.assertFalse((path.parent / "anon_peaks.jsonl").exists())
+
+    def test_cleanup_of_an_old_joined_shape_also_expires_the_estimate(self) -> None:
+        for _ in range(9):
+            self.sample(10)
+        self.index_build("old-reservation", RELEASE_BUILD)
+        path = self.build_reservation(need=12, sidecar=True)
+        row = cast(dict[str, object], json.loads(path.read_text()))
+        del row["shape"]
+        row["call_id"] = "old-reservation"
+        _ = path.write_text(json.dumps(row))
+        _ = path.with_suffix(".max").write_text(str(int(15.76 * GIB)))
+        del self.processes[100]
+        result = self.build_check(available=18)
+        self.assertEqual(result.decision.state, "hold", "the history join gives this ended build the waiter's shape")
+        self.assertEqual(result.reservation, gate.NotReserved("held"))
+
+    def test_cleanup_retry_cannot_admit_a_cached_estimate_from_before_the_append(self) -> None:
+        for _ in range(9):
+            self.sample(10)
+        profile = gate.StepProfile("hana", "build", "hana-clone", self.estimate(), HANA,
+                                   estimated_at=NOW.timestamp())
+        path = self.build_reservation(need=12, sidecar=True)
+        _ = path.with_suffix(".max").write_text(str(int(15.76 * GIB)))
+        del self.processes[100]
+        _ = self.meminfo.write_text(f"MemAvailable: {18 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        with self.stop_before_reservation_removal(path):
+            _ = gate.check(self.meminfo, 400, "", RELEASE_BUILD, root=self.root, now=NOW, profile=profile)
+        self.assertTrue(path.exists())
+        result = gate.check(self.meminfo, 400, "", RELEASE_BUILD, root=self.root,
+                            now=NOW + timedelta(seconds=1), profile=profile)
+        self.assertEqual(result.decision.state, "hold", "a journaled floor still invalidates the cached estimate")
+        self.assertEqual(result.reservation, gate.NotReserved("held"))
+
+    def test_check_finalizes_ended_owner_and_next_estimate_uses_the_evidence(self) -> None:
+        path = self.build_reservation(need=12, sidecar=True)
+        _ = path.with_suffix(".max").write_text(str(int(15.76 * GIB)))
+        _ = path.with_suffix(".wave").write_text(f"{int(15.76 * GIB)} {int(NOW.timestamp())}")
+        del self.processes[100]
+        with patch.object(gate, "release", side_effect=AssertionError("check must not take the release lock")), \
+             patch.object(fcntl, "flock", wraps=fcntl.flock) as locks:
+            _ = self.build_check(argv=["cargo", "check"])
+        self.assertEqual([call.args[1] for call in locks.call_args_list
+                          if cast(str, getattr(cast(object, call.args[0]), "name", ""))
+                          == str(self.root / "admission/lock")], [fcntl.LOCK_EX])
+        history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
+        self.assertTrue(history.exists(), "check must preserve an ended owner's measured peak")
+        rows = [cast(dict[str, object], json.loads(line)) for line in history.read_text().splitlines()]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["outcome"], rows[0]["need"], rows[0]["shape"], rows[0]["anon_peak_bytes"]),
+                         ("owner_gone", 12 * GIB, RELEASE_SHAPE.key, int(15.76 * GIB)))
+        for removed in (path, path.with_suffix(".max"), path.with_suffix(".wave"), self.root / "100.cgroup"):
+            self.assertFalse(removed.exists(), str(removed))
+        peak = self.estimate(now=NOW + timedelta(seconds=1))
+        self.assertEqual(peak.bytes, math.ceil(int(15.76 * GIB) * 1.314))
+        self.assertIsInstance(self.same_shape_basis(peak).floor, gate.FailedPeakFloor)
+
+    def test_gone_memory_cleanup_uses_the_same_finalizer(self) -> None:
+        path = self.build_reservation(need=10, sidecar=True)
+        _ = path.with_suffix(".max").write_text(str(14 * GIB))
+        self.readings[100] = gate.GoneMemory()
+        _ = self.build_check(argv=["cargo", "check"])
+        history = gate.admission_dir(self.root) / "anon_peaks.jsonl"
+        self.assertTrue(history.exists(), "GoneMemory cleanup must preserve the peak")
+        row = cast(dict[str, object], json.loads(history.read_text()))
+        self.assertEqual((row["outcome"], row["shape"], row["need"]), ("owner_gone", RELEASE_SHAPE.key, 10 * GIB))
+        self.assertFalse(path.exists())
+
+    def test_release_records_shape_need_and_each_closed_outcome_once(self) -> None:
+        for status, outcome in ((0, "completed"), (1, "failed"), (127, "failed"),
+                                (128, "killed"), (137, "killed")):
+            with self.subTest(status=status):
+                path = self.build_reservation(need=12, sidecar=True)
+                _ = path.with_suffix(".max").write_text(str(10 * GIB))
+                _ = path.with_suffix(".wave").write_text(f"{10 * GIB} {int(NOW.timestamp())}")
+                with patch.object(fcntl, "flock", wraps=fcntl.flock) as locks:
+                    gate.release(path, status, self.root)
+                self.assertEqual([call.args[1] for call in locks.call_args_list
+                                  if cast(str, getattr(cast(object, call.args[0]), "name", ""))
+                                  == str(self.root / "admission/lock")], [fcntl.LOCK_EX])
+                gate.release(path, status, self.root)
+                rows = [cast(dict[str, object], json.loads(line)) for line in
+                        (self.root / "admission/anon_peaks.jsonl").read_text().splitlines()]
+                self.assertEqual((rows[-1]["status"], rows[-1]["outcome"], rows[-1]["shape"], rows[-1]["need"]),
+                                 (status, outcome, RELEASE_SHAPE.key, 12 * GIB))
+                self.assertEqual(len(rows), (0, 1, 127, 128, 137).index(status) + 1)
+                for removed in (path, path.with_suffix(".max"), path.with_suffix(".wave"), self.root / "100.cgroup"):
+                    self.assertFalse(removed.exists(), str(removed))
+
+    def test_live_reservations_skips_ended_rows_and_deletes_nothing(self) -> None:
+        path = self.build_reservation(sidecar=True)
+        _ = path.with_suffix(".max").write_text(str(GIB))
+        _ = path.with_suffix(".wave").write_text(f"{GIB} 1")
+        del self.processes[100]
+        directory = gate.admission_dir(self.root)
+        _ = (directory / "broken.reservation").write_text("not json")
+        paths = [*directory.iterdir(), self.root / "100.cgroup"]
+        before = {file: file.read_bytes() for file in paths}
+        self.assertEqual(gate.live_reservations(directory), [])
+        self.assertEqual({file: file.read_bytes() for file in paths if file.exists()}, before)
+        self.assertFalse((directory / "anon_peaks.jsonl").exists())
+
+    def test_check_records_shape_in_the_admitted_reservation(self) -> None:
+        result = self.build_check()
+        self.assertIsInstance(result.reservation, gate.Reserved)
+        if not isinstance(result.reservation, gate.Reserved):
+            self.fail("fixture must admit its single release build")
+        row = cast(dict[str, object], json.loads(result.reservation.path.read_text()))
+        self.assertEqual(row["shape"], RELEASE_SHAPE.key)
+        self.assertEqual(row["need"], 12 * GIB)
+
+
+class BuildNeedBasisTests(BuildPromiseFixture):
+    def test_fallback_basis_rejects_records_with_a_floor_or_a_factor(self) -> None:
+        for floor, factor in (
+            ({"kind": "failed_peak", "peak": 16 * GIB, "ended_at": "2026-10-05T12:00:00Z"},
+             {"kind": "none"}),
+            ({"kind": "none"}, {"kind": "release", "factor": 1.314}),
+            ({"kind": "none"}, {"kind": "dev", "factor": gate.DEV_HEADROOM}),
+        ):
+            with self.subTest(floor=floor, factor=factor):
+                self.assertEqual(gate.read_need_basis({
+                    "kind": "shape_fallback", "runs": 0, "cap": {"kind": "none"},
+                    "floor": floor, "factor": factor,
+                }), gate.BasisNotRecorded())
+
+    def test_every_shape_tier_round_trips_with_floor_factor_and_cap(self) -> None:
+        floor = gate.FailedPeakFloor(16 * GIB, "2026-10-05T12:00:00Z")
+        for basis in (gate.ShapeP90(10, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(24 * GIB)),
+                      gate.ShapeLargest(2, floor, gate.ReleaseHeadroom(), gate.UnderBudget()),
+                      gate.ShapeFallback(gate.CappedAtBudget(24 * GIB))):
+            with self.subTest(basis=basis):
+                peak = gate.ExpectedPeak(GIB, "shape", 1, basis)
+                self.assertEqual(gate.read_need_basis(gate.need_basis_record(peak.basis)), basis)
+
+    def test_shape_estimate_refuses_a_missing_shape_basis(self) -> None:
+        with self.assertRaises((TypeError, ValueError)):
+            _ = gate.ExpectedPeak(GIB, "shape", 1)
+
+    def test_waiter_records_tagged_basis_and_queue_reads_the_same_basis(self) -> None:
+        for _ in range(9):
+            self.sample(10)
+        self.sample(15.76, outcome="killed")
+        result = self.build_check(available=0)
+        self.assertEqual(result.decision.state, "hold")
+        path = self.root / "admission/400-warmup.waiting"
+        row = cast(dict[str, object], json.loads(path.read_text()))
+        self.assertEqual(row["need_source"], "shape")
+        self.assertIsInstance(row["need_basis"], dict)
+        serialized = json.dumps(row["need_basis"])
+        for value in ("1.314", str(int(15.76 * GIB)), HISTORY_AT.strftime("%Y-%m-%d")):
+            self.assertIn(value, serialized)
+        before = path.read_bytes()
+        explanation = gate.explain_queue()
+        if not isinstance(explanation.head, gate.HeadExplanation):
+            self.fail("fixture must have a queue head")
+        source = explanation.head.need_source
+        if not isinstance(source, gate.RecordedNeed):
+            self.fail("waiter must carry its need basis")
+        self.assertEqual(source.basis, result.peak.basis)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_old_queue_row_has_basis_not_recorded(self) -> None:
+        _ = self.build_check(available=0)
+        path = self.root / "admission/400-warmup.waiting"
+        row = cast(dict[str, object], json.loads(path.read_text()))
+        _ = row.pop("need_basis", None)
+        _ = path.write_text(json.dumps(row))
+        head = gate.explain_queue().head
+        if not isinstance(head, gate.HeadExplanation) or not isinstance(head.need_source, gate.RecordedNeed):
+            self.fail("fixture must have a head with a recorded need")
+        self.assertEqual(head.need_source.basis, gate.BasisNotRecorded())
+
+    def test_cached_cli_rebuilds_basis_from_waiter_and_refreshes_when_absent(self) -> None:
+        self.sample(10)
+        _ = self.build_check(available=0)
+        path = self.root / "admission/400-warmup.waiting"
+        first = cast(dict[str, object], json.loads(path.read_text()))
+        arguments = ["memory_admit.py", "check", str(self.meminfo), "400", "", "0",
+                     "hana", "build", "hana-clone", str(first["need"]), "shape", "1", *RELEASE_BUILD]
+        for remove_basis in (False, True):
+            with self.subTest(remove_basis=remove_basis):
+                row = dict(first)
+                if remove_basis:
+                    _ = row.pop("need_basis", None)
+                _ = path.write_text(json.dumps(row))
+                output = io.StringIO()
+                with patch.object(gate, "expected_peak", wraps=gate.expected_peak) as history, \
+                     patch.object(gate, "datetime", wraps=datetime) as clock, \
+                     patch.object(sys, "argv", arguments), redirect_stdout(output):
+                    clock.configure_mock(**{"now.return_value": NOW})
+                    gate.run_action()
+                fields = output.getvalue().strip().split("|")
+                self.assertEqual(fields[3], "shape")
+                self.assertEqual(history.call_count, int(remove_basis))
+                refreshed = cast(dict[str, object], json.loads(path.read_text()))
+                self.assertEqual(refreshed["need_basis"], first["need_basis"])
 
 
 class GateProfileTests(MemoryQueueFixture):
@@ -2239,6 +2931,7 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
             "pid": 400, "start_time": "warmup", "need": 8 * GIB,
             "since": NOW.timestamp() - 900, "label": "waiting check",
             "repo_identity": "", "test_scope": "full", "estimated_at": NOW.timestamp() - 590,
+            "need_basis": {"kind": "measured"}, "need_runs": 5,
             "bump_order": -1, "holds_younger": True, "priority_since": NOW.timestamp() - 60,
         }
         _ = path.write_text(json.dumps(previous))
@@ -2979,7 +3672,7 @@ class QueueApiTests(MemoryQueueFixture):
                              "head: needs 10.9 GiB; builds use 23.5 of the 20.0 GiB budget "
                              + "(starts when build use falls to 9.1 GiB); needs 34.4 GiB free; 23.1 free; younger steps wait until 18:10")
         self.assertCountEqual([row.measured for row in view.running],
-                              [gate.MeasuredMemory(GIB, 12 * GIB), gate.MeasuredMemory(2 * GIB, int(11.5 * GIB))])
+                              [gate.MeasuredMemory(GIB, gate.RampPromise(12 * GIB)), gate.MeasuredMemory(2 * GIB, gate.RampPromise(int(11.5 * GIB)))])
 
     def test_backfill_at_nine_minutes_becomes_sticky_at_ten_minutes(self) -> None:
         _ = self.running(100, 12)
@@ -3347,6 +4040,56 @@ class ProcessMemoryTests(unittest.TestCase):
 
 
 class ShellTests(unittest.TestCase):
+    def test_shape_without_earlier_builds_names_the_fallback(self) -> None:
+        command = ('source "$1"; BUILDLOG_MEM_WAIT_S=0; buildlog_memory_python() { echo UTC; }; '
+                   + 'buildlog_memory_line first 0 20000000000 17000000000 shape 0 0 0 3000000000 '
+                   + '"" hana build 0')
+        with tempfile.TemporaryDirectory() as folder:
+            result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
+                                    env={**os.environ, **fake_memory_readings(Path(folder)),
+                                         "BUILDLOG_DIR": folder}, capture_output=True,
+                                    text=True, check=False, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fallback", result.stderr)
+        self.assertNotIn("0 earlier builds", result.stderr)
+
+    def test_first_wait_line_names_a_same_shape_promise_without_claiming_p90(self) -> None:
+        command = ('source "$1"; BUILDLOG_MEM_WAIT_S=0; buildlog_memory_python() { echo UTC; }; '
+                   + 'buildlog_memory_line first 0 20000000000 17000000000 shape 2 0 0 3000000000 '
+                   + '"" hana build 0')
+        with tempfile.TemporaryDirectory() as folder:
+            result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE)],
+                                    env={**os.environ, **fake_memory_readings(Path(folder)),
+                                         "BUILDLOG_DIR": folder}, capture_output=True,
+                                    text=True, check=False, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn("same-shape promise", result.stderr)
+        self.assertNotIn("percentile", result.stderr)
+        self.assertNotIn("p90", result.stderr)
+        self.assertNotIn("fallback", result.stderr)
+
+    def test_shell_accepts_shape_source_and_still_refuses_unknown_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            wrapper = root / "checker.py"
+            _ = wrapper.write_text("import os\n" +
+                                   "print('admit|0|0|' + os.environ['TEST_NEED_SOURCE'] + "
+                                   + "'|0|0|0|0|||||0|launch||0|0|')\n")
+            command = 'source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; buildlog_wait_for_memory'
+            environment = {**os.environ, **fake_memory_readings(root), "BUILDLOG_DIR": folder,
+                           "BUILD_HOLD_DIR": str(root / "holds"),
+                           "BUILD_HOLD_RELEASE_DIR": str(root / "releases"),
+                           "UNIT_ACTIVE_DIR": str(root / "active"), "UNIT_RUN_DIR": ""}
+            for source, status in (("shape", 0), ("unknown-shape", 2)):
+                with self.subTest(source=source):
+                    result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(wrapper)],
+                                            env={**environment, "TEST_NEED_SOURCE": source}, capture_output=True,
+                                            text=True, check=False, timeout=30)
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    if status:
+                        self.assertIn("invalid memory source", result.stderr)
+
     def test_wait_line_carries_head_need_step_and_measured_memory(self) -> None:
         command = ('source "$1"; BUILDLOG_MEM_WAIT_S=120; buildlog_memory_python() { echo UTC; }; '
                    + 'buildlog_memory_line "$2" 0 49000000000 11600000000 measured 5 0 2 3000000000 '
@@ -3407,6 +4150,7 @@ class ShellTests(unittest.TestCase):
             _ = (directory / "400-start.waiting").write_text(json.dumps({
                 "pid": 400, "start_time": "start", "need": 12 * GIB, "since": time.time(),
                 "repo_identity": "", "test_scope": "full", "estimated_at": time.time(),
+                "need_basis": {"kind": "fallback"}, "need_runs": 0,
             }))
             arguments = ["memory_admit.py", "check", str(meminfo), "400", "", "0", "repo", "nextest",
                          "clone88ci", str(12 * GIB), "fallback", "0", "cargo", "nextest"]

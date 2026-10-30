@@ -729,7 +729,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Gotchas:** a rebuilt cycle has no delivery evidence, so a session can get a notice twice (at-least-once).
 
-### Phase 24 — A build's promise comes from builds of the same shape and holds until the build ends  · status: todo
+### Phase 24 — A build's promise comes from builds of the same shape and holds until the build ends  · status: done
 **Depends on:** Phase 16 (checkpointed, `d927f744`) and Phase 25 (same files, `memory_admit.py` and `build_why.py`; global order). Part A is complete but not committed: `scripts/lint/build_shape.py` and `scripts/lint/test_build_shape.py` are untracked files in the `builds-resources` worktree, and Part B's checkpoint commits them. Part B is the rest of this Work Order. Merge `origin/builds` first. Global order: serial memory chain 21 → 16 → 25 → **24** → 26 → 15 → 27 → 20 → 11 → 17 → 18 → 19 → 8; 4 → 29 is a parallel branch that starts beside 24 Part B and joins before 11.
 
 **Approved:** builds showrunner 2026-10-30 05:2x EDT, design accepted as written (wrong-result defect, fixed at the cause in the gate).

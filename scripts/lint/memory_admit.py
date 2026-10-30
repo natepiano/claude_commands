@@ -16,6 +16,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
+from collections.abc import Mapping
 from contextlib import redirect_stderr
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -24,9 +26,11 @@ from typing import BinaryIO, Literal, NoReturn, NotRequired, Protocol, TypedDict
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 
+from build_shape import BuildShape, NoBuildShape, build_shape, index_shapes, recorded_build_shape
 from user_zone import user_zone
 from atomic_file import write_text_atomic
 
@@ -80,6 +84,13 @@ ANON_SHARE = 0.65
 HISTORY_DAYS = 14
 # Build anon at 16–20 GiB averaged 10.4% full PSI; at 20–24 GiB it averaged 16.4%.
 BUILD_BUDGET_BYTES = 21 * GIB
+# Option C, 126 builds over 14 days to 2026-10-30: 1.314 covered every
+# replayed release step (including the 15.76 GiB incident).
+RELEASE_HEADROOM = 1.314
+# Repair replay, same 126-build cohort to 2026-10-30: this smallest factor
+# covers all 81 dev steps with prior shape history. The limiting cargo-berth
+# build used 1.412826538 GiB after a 0.336112976 GiB same-shape peak.
+DEV_HEADROOM = 4.2034275337646125
 RAMP_SECONDS = 120
 # Hana nextest: the longest measured gap between waves at >=50% of peak
 # was 954 s (2026-10-29); 1500 s adds margin for sparse slice samples.
@@ -115,7 +126,105 @@ class UnknownRepository:
 
 Repository = RepositoryIdentity | UnknownRepository
 TestScope = Literal["full", "filtered"]
-NeedSource = Literal["measured", "buildlog", "pooled", "fallback"]
+LegacyNeedSource = Literal["measured", "buildlog", "pooled", "fallback"]
+NeedSource = LegacyNeedSource | Literal["shape"]
+
+
+@dataclass(frozen=True)
+class NoFloor:
+    pass
+
+
+@dataclass(frozen=True)
+class FailedPeakFloor:
+    peak: int
+    ended_at: str
+
+
+@dataclass(frozen=True)
+class NoHeadroom:
+    pass
+
+
+@dataclass(frozen=True)
+class ReleaseHeadroom:
+    factor: float = RELEASE_HEADROOM
+
+
+@dataclass(frozen=True)
+class DevHeadroom:
+    factor: float = DEV_HEADROOM
+
+
+@dataclass(frozen=True)
+class UnderBudget:
+    pass
+
+
+@dataclass(frozen=True)
+class CappedAtBudget:
+    uncapped: int
+
+
+@dataclass(frozen=True)
+class ShapeP90:
+    runs: int
+    floor: FailedPeakFloor | NoFloor = NoFloor()
+    factor: ReleaseHeadroom | DevHeadroom | NoHeadroom = NoHeadroom()
+    cap: CappedAtBudget | UnderBudget = UnderBudget()
+
+
+@dataclass(frozen=True)
+class ShapeLargest:
+    runs: int
+    floor: FailedPeakFloor | NoFloor = NoFloor()
+    factor: ReleaseHeadroom | DevHeadroom | NoHeadroom = NoHeadroom()
+    cap: CappedAtBudget | UnderBudget = UnderBudget()
+
+
+@dataclass(frozen=True)
+class ShapeFallback:
+    cap: CappedAtBudget | UnderBudget = UnderBudget()
+
+
+ShapeNeedBasis = ShapeP90 | ShapeLargest | ShapeFallback
+NeedBasis = LegacyNeedSource | ShapeNeedBasis
+
+
+@dataclass(frozen=True)
+class BasisNotRecorded:
+    pass
+
+
+@dataclass(frozen=True)
+class Completed:
+    pass
+
+
+@dataclass(frozen=True)
+class Failed:
+    pass
+
+
+@dataclass(frozen=True)
+class Killed:
+    pass
+
+
+@dataclass(frozen=True)
+class OwnerGone:
+    pass
+
+
+@dataclass(frozen=True)
+class OutcomeNotRecorded:
+    pass
+
+
+FinalOutcome = Completed | Failed | Killed | OwnerGone
+HistoryOutcome = FinalOutcome | OutcomeNotRecorded
+NO_BUILD_SHAPE = NoBuildShape()
+OUTCOME_NOT_RECORDED = OutcomeNotRecorded()
 
 
 @dataclass(frozen=True)
@@ -126,6 +235,25 @@ class PackageTestSelection:
 
 @dataclass(frozen=True)
 class BroadTestSelection:
+    pass
+
+
+class FinalizationIntent(TypedDict):
+    reservation_id: str
+    peak: int
+    scoped: bool
+    outcome: Literal["completed", "failed", "killed", "owner_gone"]
+    ended_at: str
+    status: NotRequired[int]
+
+
+@dataclass(frozen=True)
+class HistoryRecorded:
+    pass
+
+
+@dataclass(frozen=True)
+class NoHistoryRecorded:
     pass
 
 
@@ -144,6 +272,10 @@ class Reservation(TypedDict):
     test_scope: NotRequired[TestScope]
     package: NotRequired[str]
     filters: NotRequired[list[str]]
+    shape: NotRequired[str]
+    reservation_id: NotRequired[str]
+    scoped: NotRequired[bool]
+    finalization: NotRequired[FinalizationIntent]
 
 
 @dataclass(frozen=True)
@@ -151,6 +283,13 @@ class ExpectedPeak:
     bytes: int
     source: NeedSource
     count: int
+    basis: NeedBasis | BasisNotRecorded = BasisNotRecorded()
+
+    def __post_init__(self) -> None:
+        if self.source == "shape" and not isinstance(self.basis, (ShapeP90, ShapeLargest, ShapeFallback)):
+            raise ValueError("a shape estimate needs its shape basis")
+        if isinstance(self.basis, BasisNotRecorded):
+            object.__setattr__(self, "basis", self.source)
 
 
 @dataclass(frozen=True)
@@ -176,6 +315,19 @@ class PromiseNoReading:
 @dataclass(frozen=True)
 class RampPromise:
     bytes: int
+
+
+@dataclass(frozen=True)
+class LifetimePromise:
+    bytes: int
+
+
+@dataclass(frozen=True)
+class NoPromise:
+    pass
+
+
+MemoryPromise = RampPromise | LifetimePromise | NoPromise
 
 
 @dataclass(frozen=True)
@@ -210,15 +362,14 @@ class EndedCharge:
     bytes: int = 0
 
 
-ChargeBasis = PromiseNoReading | RampPromise | PeakSoFar | PeakDecayed | PeakFileUnreadable | UsingNow | EndedCharge
+ChargeBasis = PromiseNoReading | RampPromise | LifetimePromise | PeakSoFar | PeakDecayed | PeakFileUnreadable | UsingNow | EndedCharge
 PeakHistory = NoPeakRecorded | PeakSoFar | PeakDecayed | PeakFileUnreadable
 
 
 @dataclass(frozen=True)
 class MeasuredMemory:
     bytes: int
-    # Only a step inside its ramp window reserves growth.
-    ramp_promise: int = 0
+    promise: MemoryPromise = NoPromise()
     # Swap counts toward the build charge, but its release does not free RAM.
     swap_bytes: int = 0
     observed_peak: int = 0
@@ -288,6 +439,7 @@ class Waiter(TypedDict):
     filters: NotRequired[list[str]]
     need_source: NotRequired[NeedSource]
     need_runs: NotRequired[int]
+    need_basis: NotRequired[dict[str, object]]
     test_threads: NotRequired[int | None]
 
 
@@ -644,6 +796,7 @@ class RecordedNeed:
     package: str
     filters: tuple[str, ...]
     test_threads: int | WidthNotRecorded
+    basis: NeedBasis | BasisNotRecorded = BasisNotRecorded()
 
 
 @dataclass(frozen=True)
@@ -951,8 +1104,11 @@ def charge_basis(memory: StepMemory) -> ChargeBasis:
     if isinstance(memory, MeasuredMemory):
         peak = memory.peak_history
         observed = replace(peak, bytes=memory.observed_peak) if isinstance(peak, PeakSoFar) else PeakSoFar(memory.observed_peak)
-        terms: tuple[ChargeBasis, ...] = (UsingNow(memory.bytes), RampPromise(memory.ramp_promise),
-                                         observed, PeakFileUnreadable(memory.unknown_peak_promise))
+        promise = memory.promise
+        terms: tuple[ChargeBasis, ...] = (UsingNow(memory.bytes), observed,
+                                         PeakFileUnreadable(memory.unknown_peak_promise))
+        if not isinstance(promise, NoPromise):
+            terms = (promise, *terms)
         basis = max(terms, key=lambda term: term.bytes)
         if isinstance(basis, UsingNow) and isinstance(peak, PeakDecayed):
             return replace(peak, bytes=basis.bytes)
@@ -964,7 +1120,8 @@ def growth_headroom(memory: StepMemory) -> int:
     if isinstance(memory, PromisedMemory):
         return memory.bytes
     if isinstance(memory, MeasuredMemory):
-        return max(0, memory.ramp_promise - memory.bytes)
+        return (max(0, memory.promise.bytes - memory.bytes)
+                if not isinstance(memory.promise, NoPromise) else 0)
     return 0
 
 
@@ -995,13 +1152,16 @@ def test_threads(argv: list[str]) -> int | None:
 def expected_peak(repository: Repository, step: str, host: str, now: datetime, root: Path,
                   test_threads: int | None = None, *, scope: TestScope = "full",
                   filters: tuple[str, ...] = (), package: str = "",
-                  fresh: bool = False) -> ExpectedPeak:
-    """The p90 process-memory peak of a step over HISTORY_DAYS.
+                  fresh: bool = False,
+                  shape: BuildShape | NoBuildShape = NO_BUILD_SHAPE) -> ExpectedPeak:
+    """The process-memory promise of a step over HISTORY_DAYS.
 
     The gate pools every test width: one width's history is thin and rebuild-heavy, and the
     claim of a width comes only after admission. `test_threads` narrows the measured history to
     one width, for width_trial.py's report.
     """
+    if step == "build":
+        return build_expected_peak(repository, shape, host, now, root)
     if isinstance(repository, UnknownRepository):
         return ExpectedPeak(FALLBACK, "fallback", 0)
     if fresh and step == "nextest" and package:
@@ -1081,6 +1241,184 @@ def expected_peak(repository: Repository, step: str, host: str, now: datetime, r
     if len(pooled) >= 5:
         return ExpectedPeak(percentile(pooled), "pooled", len(pooled))
     return ExpectedPeak(FALLBACK, "fallback", 0)
+
+
+@dataclass(frozen=True)
+class BuildPeak:
+    shape: BuildShape
+    peak: int
+    ended_at: datetime
+    need: int
+    outcome: HistoryOutcome
+
+
+def history_outcome(raw: object) -> HistoryOutcome:
+    match raw:
+        case "completed":
+            return Completed()
+        case "failed":
+            return Failed()
+        case "killed":
+            return Killed()
+        case "owner_gone":
+            return OwnerGone()
+        case _:
+            return OutcomeNotRecorded()
+
+
+def history_matches_repository(row: Mapping[str, object], repository: Repository) -> bool:
+    return isinstance(repository, RepositoryIdentity) and (
+        row.get("repo_identity") == repository.key
+        or (not row.get("repo_identity") and bool(repository.legacy_name)
+            and row.get("repo") == repository.legacy_name))
+
+
+def build_peaks(repository: RepositoryIdentity, host: str, now: datetime, root: Path) -> list[BuildPeak]:
+    """Read anonymous peaks; old rows need an argv join to establish their shape."""
+    cutoff = now - timedelta(days=HISTORY_DAYS)
+    joins: dict[tuple[str, str], BuildShape] = {}
+    joined = False
+    peaks: list[BuildPeak] = []
+    try:
+        with (root / "admission/anon_peaks.jsonl").open() as lines:
+            for line in lines:
+                try:
+                    item = cast(dict[str, object], json.loads(line))
+                    if not history_matches_repository(item, repository) or item.get("host") != host or item.get("step") != "build":
+                        continue
+                    ended_at = datetime.fromisoformat(str(item.get("ended_at", "")))
+                    peak = item.get("anon_peak_bytes")
+                    if not cutoff <= ended_at < now or not isinstance(peak, int) or peak <= 0:
+                        continue
+                    shape = recorded_build_shape(item.get("shape"))
+                    if isinstance(shape, NoBuildShape) and "shape" not in item:
+                        if not joined:
+                            joins = index_shapes(root / store.INDEX_NAME, host, "build", cutoff, now)
+                            joined = True
+                        shape = joins.get((str(item.get("call_id", "")), "build"), NoBuildShape())
+                    if isinstance(shape, NoBuildShape):
+                        continue
+                    need = item.get("need")
+                    peaks.append(BuildPeak(shape, peak, ended_at,
+                                           need if isinstance(need, int) and need > 0 else 0,
+                                           history_outcome(item.get("outcome"))))
+                except (ValueError, TypeError, AttributeError):
+                    continue
+    except OSError:
+        pass
+    return peaks
+
+
+def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape,
+                        host: str, now: datetime, root: Path) -> ExpectedPeak:
+    rows = build_peaks(repository, host, now, root) if isinstance(repository, RepositoryIdentity) else []
+    same = [row for row in rows if row.shape == shape]
+    floor: FailedPeakFloor | NoFloor = NoFloor()
+    failures = [row for row in same if not isinstance(row.outcome, OutcomeNotRecorded)
+                and (isinstance(row.outcome, (Killed, OwnerGone)) or (row.need > 0 and row.peak > row.need))]
+    if failures:
+        newest = max(failures, key=lambda row: row.ended_at)
+        floor = FailedPeakFloor(newest.peak, store.utc_iso(newest.ended_at.timestamp()))
+    count = len(same)
+    if count >= 10:
+        base = percentile([row.peak for row in same])
+        basis: ShapeNeedBasis = ShapeP90(count)
+    elif same:
+        base = max(row.peak for row in same)
+        basis = ShapeLargest(count)
+    else:
+        base = max([FALLBACK, *(row.peak for row in rows
+                               if isinstance(shape, BuildShape) and row.shape.profile == shape.profile)])
+        basis = ShapeFallback()
+    if isinstance(basis, (ShapeP90, ShapeLargest)):
+        if isinstance(floor, FailedPeakFloor):
+            base = max(base, floor.peak)
+        factor: ReleaseHeadroom | DevHeadroom | NoHeadroom = NoHeadroom()
+        if isinstance(shape, BuildShape):
+            if shape.profile == "release":
+                factor = ReleaseHeadroom()
+            elif shape.profile == "dev":
+                factor = DevHeadroom()
+        uncapped = math.ceil(base * factor.factor) if isinstance(factor, (ReleaseHeadroom, DevHeadroom)) else base
+        basis = replace(basis, floor=floor, factor=factor)
+    else:
+        uncapped = base
+    cap: CappedAtBudget | UnderBudget = (CappedAtBudget(uncapped)
+                                       if uncapped > BUILD_BUDGET_BYTES else UnderBudget())
+    basis = replace(basis, cap=cap)
+    return ExpectedPeak(min(uncapped, BUILD_BUDGET_BYTES), "shape", count, basis)
+
+
+def need_basis_record(basis: NeedBasis | BasisNotRecorded) -> dict[str, object]:
+    if isinstance(basis, (BasisNotRecorded, str)):
+        return {"kind": basis if isinstance(basis, str) else "not_recorded"}
+    cap: dict[str, object] = ({"kind": "budget", "uncapped": basis.cap.uncapped}
+                              if isinstance(basis.cap, CappedAtBudget) else {"kind": "none"})
+    if isinstance(basis, ShapeFallback):
+        return {"kind": "shape_fallback", "cap": cap}
+    floor: dict[str, object] = ({"kind": "failed_peak", "peak": basis.floor.peak, "ended_at": basis.floor.ended_at}
+                                if isinstance(basis.floor, FailedPeakFloor) else {"kind": "none"})
+    factor: dict[str, object] = {"kind": "none"}
+    if isinstance(basis.factor, (ReleaseHeadroom, DevHeadroom)):
+        factor = {"kind": "release" if isinstance(basis.factor, ReleaseHeadroom) else "dev",
+                  "factor": basis.factor.factor}
+    kind = "shape_p90" if isinstance(basis, ShapeP90) else "shape_largest"
+    return {"kind": kind, "runs": basis.runs,
+            "floor": floor, "factor": factor, "cap": cap}
+
+
+def read_need_basis(raw: object) -> NeedBasis | BasisNotRecorded:
+    """One boundary for cached estimates and queue explanations."""
+    if not isinstance(raw, dict):
+        return BasisNotRecorded()
+    row = cast(dict[str, object], raw)
+    kind = row.get("kind")
+    if kind in ("measured", "buildlog", "pooled", "fallback"):
+        return kind
+    if kind not in ("shape_p90", "shape_largest", "shape_fallback"):
+        return BasisNotRecorded()
+    try:
+        cap_row = cast(dict[str, object], row["cap"])
+        cap: CappedAtBudget | UnderBudget = UnderBudget()
+        if cap_row["kind"] == "budget":
+            uncapped = cap_row["uncapped"]
+            if not isinstance(uncapped, int) or uncapped <= BUILD_BUDGET_BYTES:
+                return BasisNotRecorded()
+            cap = CappedAtBudget(uncapped)
+        elif cap_row["kind"] != "none":
+            return BasisNotRecorded()
+        if kind == "shape_fallback":
+            if "floor" in row or "factor" in row:
+                return BasisNotRecorded()
+            return ShapeFallback(cap)
+        floor_row = cast(dict[str, object], row["floor"])
+        factor_row = cast(dict[str, object], row["factor"])
+        floor: FailedPeakFloor | NoFloor = NoFloor()
+        if floor_row["kind"] == "failed_peak":
+            peak, ended_at = floor_row["peak"], floor_row["ended_at"]
+            if not isinstance(peak, int) or peak <= 0 or not isinstance(ended_at, str):
+                return BasisNotRecorded()
+            _ = datetime.fromisoformat(ended_at)
+            floor = FailedPeakFloor(peak, ended_at)
+        elif floor_row["kind"] != "none":
+            return BasisNotRecorded()
+        factor: ReleaseHeadroom | DevHeadroom | NoHeadroom = NoHeadroom()
+        if factor_row["kind"] == "release" and factor_row.get("factor") == RELEASE_HEADROOM:
+            factor = ReleaseHeadroom()
+        elif factor_row["kind"] == "dev" and factor_row.get("factor") == DEV_HEADROOM:
+            factor = DevHeadroom()
+        elif factor_row["kind"] != "none":
+            return BasisNotRecorded()
+        runs = row["runs"]
+        if not isinstance(runs, int) or runs < 0:
+            return BasisNotRecorded()
+        if kind == "shape_p90" and runs >= 10:
+            return ShapeP90(runs, floor, factor, cap)
+        if kind == "shape_largest" and 1 <= runs < 10:
+            return ShapeLargest(runs, floor, factor, cap)
+    except (KeyError, TypeError, ValueError):
+        pass
+    return BasisNotRecorded()
 
 
 def history_arguments(raw: object) -> list[str]:
@@ -1492,11 +1830,18 @@ def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIde
             reading = tree_memory(row["pid"], row["start_time"], processes, proc)
     else:
         reading = tree_memory(row["pid"], row["start_time"], processes, proc)
+    if isinstance(reading, MeasuredMemory) and release_build(row):
+        return replace(reading, promise=LifetimePromise(row["need"]))
     if isinstance(reading, MeasuredMemory) and now.timestamp() - _epoch(row["admitted_at"]) < RAMP_SECONDS:
         if reading.bytes == 0:
             return PromisedMemory(row["need"])
-        return replace(reading, ramp_promise=row["need"])
+        return replace(reading, promise=RampPromise(row["need"]))
     return reading
+
+
+def release_build(row: Reservation) -> bool:
+    shape = recorded_build_shape(row.get("shape"))
+    return row.get("step") == "build" and isinstance(shape, BuildShape) and shape.profile == "release"
 
 
 def reservation_memory(path: Path, row: Reservation, now: datetime,
@@ -1536,7 +1881,7 @@ def reservation_memory(path: Path, row: Reservation, now: datetime,
     except (OSError, ValueError):
         pass
     history: PeakHistory = PeakSoFar(peak, peak_at, peak_time, old_sampler) if peak > 0 else NoPeakRecorded()
-    if now.timestamp() - last_near_peak_at >= PEAK_DECAY_SECONDS:
+    if not release_build(row) and now.timestamp() - last_near_peak_at >= PEAK_DECAY_SECONDS:
         history = PeakDecayed(0, peak, last_near_peak_at, last_near_peak_at + PEAK_DECAY_SECONDS, old_sampler)
         peak = 0
     if isinstance(reading, MeasuredMemory):
@@ -1703,22 +2048,49 @@ def admission_dir(root: Path) -> Path:
     return directory
 
 
-def live_reservations(directory: Path) -> list[tuple[Path, Reservation]]:
-    live: list[tuple[Path, Reservation]] = []
+def read_reservation(path: Path) -> Reservation:
+    """Read one reservation; reject bad fields before a caller uses them."""
+    value = cast(object, json.loads(path.read_text()))
+    if not isinstance(value, dict):
+        raise ValueError("reservation must be an object")
+    row = cast(dict[str, object], value)
+    if (not isinstance(row.get("pid"), int) or isinstance(row.get("pid"), bool)
+            or not isinstance(row.get("need"), int) or isinstance(row.get("need"), bool)
+            or not all(isinstance(row.get(key), str) for key in
+                       ("start_time", "repo", "step", "worktree", "admitted_at", "sidecar"))):
+        raise ValueError("reservation has invalid required fields")
+    if (row.get("test_threads") is not None and not isinstance(row["test_threads"], int)
+            or row.get("call_id") is not None and not isinstance(row["call_id"], str)):
+        raise ValueError("reservation has invalid test threads or call id")
+    if "finalization" in row:
+        saved = row["finalization"]
+        if not isinstance(saved, dict):
+            raise ValueError("finalization intent must be an object")
+        intent = cast(dict[str, object], saved)
+        if (not all(isinstance(intent.get(key), str) for key in ("reservation_id", "ended_at"))
+                or not isinstance(intent.get("peak"), int) or isinstance(intent.get("peak"), bool)
+                or not isinstance(intent.get("scoped"), bool)
+                or intent.get("outcome") not in ("completed", "failed", "killed", "owner_gone")
+                or "status" in intent and (not isinstance(intent["status"], int)
+                                           or isinstance(intent["status"], bool))):
+            raise ValueError("finalization intent has invalid fields")
+    return cast(Reservation, cast(object, row))
+
+
+def reservation_rows(directory: Path) -> list[tuple[Path, Reservation]]:
+    rows: list[tuple[Path, Reservation]] = []
     for path in directory.glob("*.reservation"):
-        owner_live = False
         try:
-            row = cast(Reservation, json.loads(path.read_text()))
-            owner_live = process_start_time(row["pid"]) == row["start_time"]
+            rows.append((path, read_reservation(path)))
         except (OSError, ValueError, KeyError, TypeError):
-            row = None
-        if row is not None and not isinstance(reservation_lifetime(row, owner_live), EndedStep):
-            live.append((path, row))
-            continue
-        path.unlink(missing_ok=True)
-        path.with_suffix(".max").unlink(missing_ok=True)
-        path.with_suffix(".wave").unlink(missing_ok=True)
-    return live
+            pass
+    return rows
+
+
+def live_reservations(directory: Path) -> list[tuple[Path, Reservation]]:
+    """A read-only lookup: only the locked check or release finalizes rows."""
+    return [(path, row) for path, row in reservation_rows(directory)
+            if not isinstance(reservation_lifetime(row, process_start_time(row["pid"]) == row["start_time"]), EndedStep)]
 
 
 def live_waiters(directory: Path) -> list[tuple[Path, Waiter]]:
@@ -1980,12 +2352,9 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         fresh = (step == "nextest" and is_fresh_test(
             root, host, worktree_path, package, scope,
             os.environ.get("BUILDLOG_TEST_BUILD_KEY", ""), estimate_time, target_dir))
-        if fresh:
-            peak = expected_peak(repository, step, host, estimate_time, root, scope=scope,
-                                 package=package, filters=filters, fresh=True)
-        else:
-            peak = expected_peak(repository, step, host, estimate_time, root, scope=scope,
-                                 package=package, filters=filters)
+        peak = expected_peak(repository, step, host, estimate_time, root, scope=scope,
+                             package=package, filters=filters, fresh=fresh,
+                             shape=build_shape(argv) if step == "build" else NoBuildShape())
         profile = StepProfile(repo, step, worktree, peak, repository, scope, estimate_time.timestamp())
     elif not profile.estimated_at:
         profile = replace(profile, estimated_at=estimate_time.timestamp())
@@ -2008,12 +2377,16 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         processes = process_table(proc)
         live: list[tuple[Path, Reservation]] = []
         running: list[StepMemory] = []
-        for path, row in live_reservations(directory):
+        for path, row in reservation_rows(directory):
             memory = reservation_memory(path, row, now, processes, proc)
             if isinstance(memory, GoneMemory):
-                path.unlink(missing_ok=True)
-                path.with_suffix(".max").unlink(missing_ok=True)
-                path.with_suffix(".wave").unlink(missing_ok=True)
+                finalized = finalize_reservation(path, row, OwnerGone(), now)
+                if (isinstance(finalized, HistoryRecorded) and step == row["step"] == "build"
+                        and history_matches_repository(row, profile.repository)
+                        and ("shape" not in row or recorded_build_shape(row["shape"]) == build_shape(argv))):
+                    # Use the existing expiry path; the next poll estimates outside the lock.
+                    # An old row may get its shape from the index outside this lock.
+                    profile = replace(profile, estimated_at=now.timestamp() - HEAD_SECONDS)
                 continue
             live.append((path, row))
             running.append(memory)
@@ -2035,6 +2408,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         waiter["fresh_test"] = fresh
         waiter["need_source"] = peak.source
         waiter["need_runs"] = peak.count
+        waiter["need_basis"] = need_basis_record(peak.basis)
         waiter["test_threads"] = width
         waiter["repo_identity"] = ""
         if isinstance(profile.repository, RepositoryIdentity):
@@ -2118,10 +2492,13 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                                     "repo": repo, "step": step, "worktree": worktree,
                                     "admitted_at": store.utc_iso(now.timestamp()), "sidecar": sidecar,
                                     "test_threads": width,
-                                    "call_id": os.environ.get("BUILDLOG_CALL_ID") or None}
+                                    "call_id": os.environ.get("BUILDLOG_CALL_ID") or None,
+                                    "reservation_id": uuid.uuid4().hex, "scoped": bool(sidecar)}
                 row["test_scope"] = profile.scope
                 row["package"] = package
                 row["filters"] = list(filters)
+                if step == "build":
+                    row["shape"] = build_shape(argv).key
                 if isinstance(profile.repository, RepositoryIdentity):
                     row["repo_identity"] = profile.repository.key
                 write_admission_record(path, row)
@@ -2386,7 +2763,8 @@ def read_queue_pass(directory: Path, processes: dict[int, ProcessIdentity], now:
             if "need_source" in row:
                 source = RecordedNeed(row["need_source"], row.get("need_runs", 0), HISTORY_DAYS,
                                       row.get("test_scope", "full"), row.get("package", ""),
-                                      tuple(row.get("filters", [])), width if width is not None else WidthNotRecorded())
+                                      tuple(row.get("filters", [])), width if width is not None else WidthNotRecorded(),
+                                      read_need_basis(row.get("need_basis")))
             bump: QueueBump | NoBump = NoBump()
             if row.get("bump_order", 0) < 0 or row.get("holds_younger", False):
                 bump = QueueBump(row.get("priority_since", row["since"]), row.get("bump_order", 0) < 0,
@@ -2572,34 +2950,81 @@ def cancel_waiter(pid: int, root: Path | None = None) -> None:
         (directory / f"{pid}-{start}.waiting").unlink(missing_ok=True)
 
 
+def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, now: datetime,
+                         status: int | OutcomeNotRecorded = OUTCOME_NOT_RECORDED) -> HistoryRecorded | NoHistoryRecorded:
+    """Keep a scoped step's peak before removing its evidence; caller owns the lock."""
+    maximum = path.with_suffix(".max")
+    if "finalization" not in row:
+        try:
+            peak = int(maximum.read_text())
+        except (FileNotFoundError, ValueError):
+            peak = 0
+        intent: FinalizationIntent = {
+            "reservation_id": row.get("reservation_id") or uuid.uuid4().hex,
+            "peak": peak,
+            "scoped": row.get("scoped", bool(row["sidecar"] and Path(row["sidecar"]).is_file())),
+            "outcome": ("completed" if isinstance(outcome, Completed) else "failed" if isinstance(outcome, Failed)
+                        else "killed" if isinstance(outcome, Killed) else "owner_gone"),
+            "ended_at": store.utc_iso(now.timestamp()),
+        }
+        if isinstance(status, int):
+            intent["status"] = status
+        row["finalization"] = intent
+        write_admission_record(path, row)
+    intent = row["finalization"]
+    result: HistoryRecorded | NoHistoryRecorded = NoHistoryRecorded()
+    history_path = path.parent / "anon_peaks.jsonl"
+    recorded = False
+    if intent["peak"] > 0 and intent["scoped"]:
+        try:
+            with history_path.open() as lines:
+                for line in lines:
+                    try:
+                        previous = cast(object, json.loads(line))
+                        if (isinstance(previous, dict)
+                                and cast(dict[str, object], previous).get("reservation_id") == intent["reservation_id"]):
+                            recorded = True
+                            break
+                    except ValueError:
+                        continue
+        except FileNotFoundError:
+            pass
+    if intent["peak"] > 0 and intent["scoped"] and not recorded:
+        history: dict[str, object] = {
+            "host": store.host_name(), "repo": row["repo"], "step": row["step"],
+            "reservation_id": intent["reservation_id"],
+            "worktree": row["worktree"], "anon_peak_bytes": intent["peak"], "outcome": intent["outcome"], "need": row["need"],
+            "test_threads": row.get("test_threads"), "call_id": row.get("call_id"),
+            "repo_identity": row.get("repo_identity"), "test_scope": row.get("test_scope", "full"),
+            "package": row.get("package", ""), "filters": row.get("filters", []),
+            "ended_at": intent["ended_at"],
+        }
+        if "status" in intent:
+            history["status"] = intent["status"]
+        if "shape" in row:
+            history["shape"] = row["shape"]
+        store.append_line(history_path, history)
+    if intent["peak"] > 0 and intent["scoped"]:
+        result = HistoryRecorded()
+    maximum.unlink(missing_ok=True)
+    path.with_suffix(".wave").unlink(missing_ok=True)
+    if row["sidecar"]:
+        Path(row["sidecar"]).unlink(missing_ok=True)
+    path.unlink(missing_ok=True)
+    return result
+
+
 def release(path: Path, status: int, root: Path | None = None) -> None:
     root = root if root is not None else store.root()
     directory = admission_dir(root)
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            row = cast(Reservation, json.loads(path.read_text()))
+            row = read_reservation(path)
         except (OSError, ValueError, TypeError):
             return
-        maximum = path.with_suffix(".max")
-        try:
-            peak = int(maximum.read_text())
-            if peak > 0 and row["sidecar"] and Path(row["sidecar"]).is_file():
-                store.append_line(directory / "anon_peaks.jsonl", {
-                    "host": store.host_name(), "repo": row["repo"], "step": row["step"],
-                    "worktree": row["worktree"], "anon_peak_bytes": peak, "status": status,
-                    "test_threads": row.get("test_threads"), "call_id": row.get("call_id"),
-                    "repo_identity": row.get("repo_identity"), "test_scope": row.get("test_scope", "full"),
-                    "package": row.get("package", ""), "filters": row.get("filters", []),
-                    "ended_at": store.utc_iso(time.time()),
-                })
-        except (OSError, ValueError):
-            pass
-        path.unlink(missing_ok=True)
-        maximum.unlink(missing_ok=True)
-        path.with_suffix(".wave").unlink(missing_ok=True)
-        if row["sidecar"]:
-            Path(row["sidecar"]).unlink(missing_ok=True)
+        outcome = Completed() if status == 0 else Killed() if status >= 128 else Failed()
+        _ = finalize_reservation(path, row, outcome, datetime.now(UTC), status)
 
 
 def set_width(path: Path, width: int, root: Path | None = None) -> None:
@@ -2657,14 +3082,16 @@ def run_action() -> None:
     if action == "width":
         set_width(Path(sys.argv[2]), int(sys.argv[3]))
         return
-    _, _, meminfo, pid, sidecar, since, cached_repo, cached_step, cached_worktree, cached_need, cached_source, cached_count, *argv = sys.argv
+    meminfo, pid, sidecar, since, cached_repo, cached_step, cached_worktree, cached_need = sys.argv[2:10]
+    argv = sys.argv[12:]
     profile: InferFromArgv | StepProfile = InferFromArgv()
     if cached_need != "-":
         start = process_start_time(int(pid))
         try:
             row = cast(Waiter, json.loads((store.root() / "admission" / f"{pid}-{start}.waiting").read_text()))
+            basis = read_need_basis(row.get("need_basis"))
             # An empty key is the explicit unknown identity. Old rows must refresh.
-            if (not row.get("fresh_test", False)
+            if (not row.get("fresh_test", False) and not isinstance(basis, BasisNotRecorded)
                     and "repo_identity" in row and "test_scope" in row and "estimated_at" in row
                     and (row["test_scope"] == "full"
                          or (row.get("package") == test_package(argv)
@@ -2674,7 +3101,8 @@ def run_action() -> None:
                 repository: Repository = (RepositoryIdentity(key, row.get("repository_name", cached_repo), row.get("legacy_name", ""))
                                           if key else UnknownRepository())
                 profile = StepProfile(cached_repo, cached_step, cached_worktree,
-                                      ExpectedPeak(int(cached_need), cast(Literal["measured", "buildlog", "pooled", "fallback"], cached_source), int(cached_count)),
+                                      ExpectedPeak(row["need"], basis if isinstance(basis, str) else "shape",
+                                                   row.get("need_runs", 0), basis),
                                       repository, row["test_scope"], row["estimated_at"])
         except (OSError, ValueError, TypeError, KeyError):
             pass

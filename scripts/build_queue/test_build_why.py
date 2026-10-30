@@ -394,6 +394,67 @@ class BuildWhyTests(unittest.TestCase):
                 for word in words:
                     self.assertIn(word, changed)
 
+    def test_shape_need_text_names_each_tier_and_its_run_count(self) -> None:
+        for basis, words in (
+            (gate.ShapeP90(12), ("same-shape", "p90", "12 runs")),
+            (gate.ShapeLargest(3), ("same-shape", "largest", "3 runs")),
+            (gate.ShapeFallback(), ("same-profile", "fallback")),
+        ):
+            with self.subTest(basis=basis):
+                source = gate.RecordedNeed("shape", 12 if isinstance(basis, gate.ShapeP90) else 3,
+                                           14, "full", "", (), gate.WidthNotRecorded(), basis)
+                text = build_why.need_text(source)
+                for word in (*words, "14 days"):
+                    self.assertIn(word, text)
+                if not isinstance(basis, gate.ShapeP90):
+                    self.assertNotIn("p90", text)
+
+    def test_shape_need_text_names_floor_release_factor_and_budget_cap(self) -> None:
+        ended_at = "2026-10-29T09:09:52Z"
+        floor = gate.FailedPeakFloor(gib(15.76), ended_at)
+        for tier in (
+            gate.ShapeP90(10, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(gib(24))),
+            gate.ShapeLargest(2, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(gib(24))),
+            gate.ShapeFallback(gate.CappedAtBudget(gib(24))),
+        ):
+            with self.subTest(tier=tier):
+                text = build_why.need_text(gate.RecordedNeed(
+                    "shape", 10, 14, "full", "", (), gate.WidthNotRecorded(), tier))
+                words = (("cap", "21.0 GiB", "24.0 GiB", "no headroom factor")
+                         if isinstance(tier, gate.ShapeFallback) else
+                         ("floor", "15.8 GiB", "05:09", "1.314", "cap", "21.0 GiB", "24.0 GiB"))
+                for word in words:
+                    self.assertIn(word, text)
+
+    def test_fallback_need_text_names_its_base_and_cap_without_a_floor_or_factor(self) -> None:
+        basis = gate.ShapeFallback(cap=gate.CappedAtBudget(gib(24)))
+        source = gate.RecordedNeed("shape", 0, 14, "full", "", (), gate.WidthNotRecorded(), basis)
+        self.assertEqual(build_why.need_text(source),
+                         "same-shape fallback: no runs; heavier of fallback and same-profile builds, last 14 days"
+                         + "; no headroom factor; capped at 21.0 GiB (uncapped 24.0 GiB)")
+
+    def test_lifetime_charge_text_says_the_promise_holds_until_the_step_ends(self) -> None:
+        text = build_why.charge_text(gate.LifetimePromise(16 * GIB), user_zone())
+        self.assertIn("promise", text)
+        self.assertIn("until the step ends", text)
+        self.assertNotIn("first 2 min", text)
+        self.assertEqual(build_why.charge_text(gate.RampPromise(16 * GIB), user_zone()),
+                         "ramp promise: first 2 min after admission")
+
+    def test_failed_floor_clause_uses_the_users_local_clock(self) -> None:
+        basis = gate.ShapeLargest(1, gate.FailedPeakFloor(gib(15.76), "2026-10-29T02:09:52Z"))
+        source = gate.RecordedNeed("shape", 1, 14, "full", "", (), gate.WidthNotRecorded(), basis)
+        with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
+            text = build_why.need_text(source)
+        self.assertEqual(text.split("; ")[1], "failed-build floor 15.8 GiB from 22:09")
+
+    def test_dev_shape_names_its_measured_promise_factor(self) -> None:
+        source = gate.RecordedNeed("shape", 2, 14, "full", "", (), gate.WidthNotRecorded(),
+                                   gate.ShapeLargest(2, factor=gate.DevHeadroom()))
+        text = build_why.need_text(source)
+        self.assertEqual(text.split("; ")[2], "dev promise factor × 4.203")
+        self.assertNotIn("release headroom", text)
+
     def test_old_waiter_without_need_source_is_reported_and_not_rewritten(self) -> None:
         row = cast(dict[str, object], json.loads(self.head_path.read_text()))
         for key in ("need_source", "need_runs", "test_threads"):
