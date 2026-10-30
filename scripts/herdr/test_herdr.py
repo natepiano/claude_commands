@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.lib import names
-from scripts.lib.test_names import fixture_names
 
 import json
 import io
@@ -2058,10 +2056,9 @@ class HerdrTests(unittest.TestCase):
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
             {"pane_id": "w1:p1", "tab_id": "w1:t1"}, {"pane_id": "w1:p2", "tab_id": "w1:t2"}]}}))
         self.assertEqual(herdr.open_tab("fixture", "boss", "alpha", "/wt", {}), "w1:p2")
-        self.assertEqual([command[2:] for command in self.commands()[-9:]], [
+        self.assertEqual([command[2:] for command in self.commands()[-8:]], [
             tab, ["pane", "rename", "w1:p2", "alpha"], ["tab", "list", "--workspace", "w1"], ["workspace", "list"],
-            ["tab", "list", "--workspace", "w1"], ["pane", "list"], ["workspace", "list"], ["tab", "list"],
-            ["pane", "list"]])
+            ["tab", "list", "--workspace", "w1"], ["pane", "list"], ["workspace", "list"], ["tab", "list"]])
         saved = herdr.saved_layout("fixture")
         self.assertEqual([(space["name"], [tab["name"] for tab in space["tabs"]]) for space in saved["workspaces"]],
                          [("boss", ["boss", "alpha"])])
@@ -3604,7 +3601,7 @@ class LayoutHerdr(herdr.Herdr):
 
 
 class TitledLayoutHerdr(LayoutHerdr):
-    """Model distinct tab titles and pane labels through the real layout code."""
+    """Record tab and pane renames through the real layout code."""
 
     @override
     def result(self, *arguments: str) -> dict[str, object]:
@@ -3656,31 +3653,39 @@ class SavedLayoutTests(unittest.TestCase):
                 _ = client.open_tab(space, title, "/repo", {})
         return client
 
-    def test_display_rename_restores_saved_tab_order_and_resolves_each_pane_by_key(self) -> None:
-        from scripts.message import roster
-
-        def title(key: str) -> str:
-            return roster.ShownName(roster.ProductionPart("sdlc"), roster.UnitPart(key + "-unit"),
-                                    roster.ShownJob("unit_director", roster.Unqualified()), key).render()
-
+    def test_session_names_restore_saved_tab_order_and_resolve_each_pane(self) -> None:
         old = TitledLayoutHerdr()
-        with patch.object(names, "runtime_names", return_value=fixture_names()):
-            for key in ("sdlc", "zulu", "alpha"):
-                _ = old.open_tab("sdlc", title(key), "/repo", {}, label=key)
+        for key in ("sdlc", "zulu", "alpha"):
+            _ = old.open_tab("sdlc", key, "/repo", {})
         order = [tab["pane_label"] for tab in old.tabs]
         self.assertEqual([tab["name"] for tab in herdr.saved_layout("fixture")["workspaces"][0]["tabs"]], order)
+
         fresh = TitledLayoutHerdr()
-        with patch.object(names, "runtime_names", return_value=fixture_names(director="coordinator")):
-            for key in reversed(order):
-                _ = fresh.open_tab("sdlc", title(key), "/repo", {}, label=key)
+        for key in reversed(order):
+            _ = fresh.open_tab("sdlc", key, "/repo", {})
         self.assertEqual([tab["pane_label"] for tab in fresh.tabs], order)
         for tab in fresh.tabs:
             key = tab["pane_label"]
             self.assertEqual(fresh.lookup(key), herdr.PaneFound(tab["pane_id"]))
-            self.assertIsInstance(fresh.lookup(tab["label"]), herdr.NoPane)
-            self.assertIn("coordinator", tab["label"])
+            self.assertEqual(fresh.lookup(tab["label"]), herdr.PaneFound(tab["pane_id"]))
+            self.assertEqual(tab["label"], key)
             self.assertTrue(herdr.attach_hint("sdlc", key).endswith("tab " + key))
         self.assertEqual([tab["name"] for tab in herdr.saved_layout("fixture")["workspaces"][0]["tabs"]], order)
+
+    def test_showrunner_unit_director_and_plain_tabs_and_panes_take_the_session_name(self) -> None:
+        client = TitledLayoutHerdr()
+        cases: tuple[tuple[str, str, dict[str, str]], ...] = (
+            ("control", "control", {}),
+            ("control", "roles", {"SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "roles-unit"}),
+            ("ad-hoc", "scratch", {}))
+        for space, name, environment in cases:
+            with self.subTest(session=name):
+                pane = client.open_tab(space, name, "/repo", environment)
+                tab = next(tab for tab in client.tabs if tab["pane_id"] == pane)
+                self.assertEqual(tab["label"], name)
+                self.assertEqual(tab["pane_label"], name)
+                for added in (" · ", "sdlc", "showrunner", "unit director"):
+                    self.assertNotIn(added, tab["label"])
 
     def test_a_reboot_restart_in_any_order_brings_back_every_workspace_and_tab_in_place(self) -> None:
         self.assertEqual(self.running().layout(), self.BEFORE)
