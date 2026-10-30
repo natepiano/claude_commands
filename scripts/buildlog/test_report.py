@@ -25,6 +25,7 @@ import index
 import mac_outcome
 import report
 import holds
+import health
 from cgroup_test_support import GIB, slice_reading
 from user_zone import user_zone
 import rust_release
@@ -259,6 +260,31 @@ class ReportTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(subprocess, "run"))
         _ = self.enterContext(mock.patch.object(ci, "gh_get"))
         self.records = []
+
+    def test_recorder_health_action_matches_unfinished_records_errors_or_both(self) -> None:
+        day = "2026-10-02"
+        at = datetime(2026, 10, 2, 16, tzinfo=UTC).timestamp()
+        for machine, location in ((health.Machine.NATEDEV, "natedev"), (health.Machine.MAC, "the Mac")):
+            for unfinished, errors in ((2, 0), (0, 3), (2, 3)):
+                with self.subTest(machine=machine, unfinished=unfinished, errors=errors):
+                    snapshot = health.FreshRecorderHealth(health.RecorderHealthSnapshot(
+                        machine, at, unfinished, (at,) * errors))
+                    with mock.patch.object(health, "read_snapshots", return_value=[snapshot]):
+                        lines = report.recorder_health_lines(day)
+                    self.assertEqual(len(lines), 1)
+                    line = lines[0]
+                    self.assertIn(f"{unfinished} records the recorder has not finished", line)
+                    self.assertIn(f"{errors} recorder errors", line)
+                    if unfinished:
+                        self.assertIn(f"run buildlog launches on {location}", line)
+                    else:
+                        self.assertNotIn("run buildlog launches", line)
+                    if errors:
+                        self.assertIn("see ", line)
+                        self.assertIn(f"errors.log on {location}", line)
+                    else:
+                        self.assertNotIn("see ", line)
+                        self.assertNotIn("errors.log", line)
 
     def write(self, path: Path, *records: Record) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -138,6 +138,12 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(markers, ["---:" if heading in numeric else "---" for heading in headings])
         self.assertEqual(tables, 2)
 
+    def test_head_line_uses_singular_for_one_recorded_bump(self) -> None:
+        write_bumps(NOW, [bump_line(NOW - 1)])
+        text = build_queue.queue_snapshot(head_reading(since=NOW - 600, now=NOW), ZoneInfo("UTC"))["head"]["text"]
+        self.assertIn("1 bump since it joined, most: bumped check (1)", text)
+        self.assertNotIn("1 bumps", text)
+
     def test_head_line_short_forms_share_the_recorded_head_and_bump_facts(self) -> None:
         reading = head_reading(since=NOW - 158 * 60, now=NOW,
                                fields={"head_since": NOW - 125, "priority_since": NOW - 3600})

@@ -2093,6 +2093,7 @@ def recorder_health_lines(day: str) -> list[str]:
     since = datetime.combine(date.fromisoformat(day), datetime.min.time(), user_zone())
     lines: list[str] = []
     for state in health.read_snapshots():
+        actions: list[str] = []
         if isinstance(state, health.RecorderHealthUnavailable):
             machine = state.machine
             detail = "recorder health unknown (snapshot unavailable)"
@@ -2110,8 +2111,13 @@ def recorder_health_lines(day: str) -> list[str]:
                 error_word = "error" if errors == 1 else "errors"
                 detail = (f"{snapshot.unfinished_records} {record_word} the recorder has not finished; "
                           f"{errors} recorder {error_word} since {local_time(since.isoformat())}")
+                if errors:
+                    actions.append(f"see {store.ERRORS_DISPLAY_PATH}")
         location = "the Mac" if machine is health.Machine.MAC else "natedev"
-        lines.append(f"{machine.value}: {detail} — run buildlog launches on {location}")
+        if not isinstance(state, health.FreshRecorderHealth) or state.snapshot.unfinished_records:
+            actions.append("run buildlog launches")
+        advice = "; ".join(f"{action} on {location}" for action in actions)
+        lines.append(f"{machine.value}: {detail} — {advice}")
     return lines
 
 

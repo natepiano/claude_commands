@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import memory_admit as gate
 import nextest_budget as budget
 from memory_test_support import fake_memory_readings
+from atomic_file import write_text_atomic
 store = gate.store
 
 
@@ -1317,11 +1318,12 @@ class MemoryQueueFixture(unittest.TestCase):
         return path
 
     def check(self, pid: int = 400, need: float = 11.6, free: float = 26,
-              since: float = 0) -> gate.CheckResult:
+              since: float = 0, *, token_left_at: float = 0, token_back_at: float = 0) -> gate.CheckResult:
         _ = self.meminfo.write_text(f"MemAvailable: {int(free * GIB) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
         return gate.check(self.meminfo, pid, "", ["cargo", "nextest"], since,
                           root=self.root, now=NOW,
-                          profile=gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(int(need * GIB), "measured", 5)))
+                          profile=gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(int(need * GIB), "measured", 5)),
+                          token_left_at=token_left_at, token_back_at=token_back_at)
 
 
 
@@ -1365,6 +1367,29 @@ class AdmitHeadTests(MemoryQueueFixture):
         row["bump_order"] = -1
         _ = younger.write_text(json.dumps(row))
         return younger
+
+    def test_admit_head_uses_queue_order_and_marks_only_that_head_in_its_transaction(self) -> None:
+        former = self.waiting_head()
+        row = cast(gate.Waiter, json.loads(former.read_text()))
+        row["head_since"] = NOW.timestamp() - 60
+        _ = former.write_text(json.dumps(row))
+        _ = self.check(need=12, free=0)
+        younger = self.bump_younger_waiter()
+        with patch.object(gate, "ordered_waiters", wraps=gate.ordered_waiters) as ordered:
+            self.assertIn("head admission set", self.set_head())
+        ordered.assert_called()
+        self.assertEqual(json.loads(self.override_path.read_text())["waiter"], younger.name)
+        self.assertEqual(json.loads(younger.read_text())["head_since"], NOW.timestamp())
+        self.assertNotIn("head_since", cast(dict[str, object], json.loads(former.read_text())))
+
+    def test_admit_head_keeps_its_override_when_head_time_recording_fails(self) -> None:
+        path = self.waiting_head()
+        with patch.object(gate, "write_head_since", side_effect=OSError("head write failed")), \
+             patch.object(store, "note_error") as noted:
+            self.assertIn("head admission set", self.set_head("user checked memory"))
+        self.assertEqual(json.loads(self.override_path.read_text())["waiter"], path.name)
+        self.assertEqual(self.events()[0]["why"], "user checked memory")
+        noted.assert_called_once()
 
     def test_showrunner_sets_one_record_for_the_current_head(self) -> None:
         path = self.waiting_head()
@@ -2582,6 +2607,196 @@ class QueueApiTests(MemoryQueueFixture):
                 self.waiter(400, NOW.timestamp() - 300, "/tmp/warmup-tree", "warmup"),
                 self.waiter(500, NOW.timestamp() - 60, "/tmp/third", "third"))
 
+    def poll_at(self, seconds: int, *, pid: int = 300, free: float = 0,
+                token_left_at: float = 0, token_back_at: float = 0) -> gate.CheckResult:
+        instant = NOW + timedelta(seconds=seconds)
+        with patch(__name__ + ".NOW", instant), patch.object(time, "time", return_value=instant.timestamp()):
+            return self.check(pid=pid, need=1, free=free,
+                              token_left_at=token_left_at, token_back_at=token_back_at)
+
+    def assert_only_head_has_time(self, pid: int, at: float) -> None:
+        reading = gate.locked_queue_read()
+        self.assertEqual(reading.view.waiting[0].pid, pid)
+        self.assertEqual(reading.ordered[0][1].get("head_since"), at)
+        self.assertTrue(all("head_since" not in item[1] for item in reading.ordered[1:]))
+
+    def test_head_time_write_errors_leave_hold_and_reservation_decisions_unchanged(self) -> None:
+        for error in (OSError("head file unavailable"), ValueError("invalid head order")):
+            for free, state in ((0, "hold"), (40, "admit")):
+                with self.subTest(error=type(error).__name__, state=state), \
+                     patch.object(gate, "write_head_since", side_effect=error), \
+                     patch.object(store, "note_error") as noted:
+                    result = self.poll_at(0, free=free)
+                    self.assertEqual(result.decision.state, state)
+                    noted.assert_called_once()
+                    if isinstance(result.reservation, gate.Reserved):
+                        saved = cast(dict[str, object], json.loads(result.reservation.path.read_text()))
+                        self.assertEqual((saved["pid"], saved["need"]), (300, GIB))
+                        result.reservation.path.unlink()
+                    else:
+                        self.assertEqual(state, "hold")
+                        self.assertTrue((self.root / "admission/300-head.waiting").exists())
+
+    def test_token_gap_write_failure_preserves_the_admitted_reservation(self) -> None:
+        with patch.object(gate, "append_token_gap", side_effect=OSError("disk full")), \
+             patch.object(store, "note_error") as noted:
+            result = self.poll_at(200, free=40, token_left_at=NOW.timestamp() + 10,
+                                  token_back_at=NOW.timestamp() + 164)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertIsInstance(result.reservation, gate.Reserved)
+        if isinstance(result.reservation, gate.Reserved):
+            row = cast(dict[str, object], json.loads(result.reservation.path.read_text()))
+            self.assertEqual((row["pid"], row["need"]), (300, GIB))
+        noted.assert_called_once()
+        self.assertFalse((self.root / "admission/queue_times.jsonl").exists())
+
+    def test_invalid_token_intervals_are_noted_without_changing_admission(self) -> None:
+        at = NOW.timestamp()
+        for left, back in ((at - 2, at - 3), (float("nan"), at - 1),
+                           (at - 2, float("inf")), (at - 1, at + 1), (-1, at - 1)):
+            with self.subTest(left=left, back=back), patch.object(store, "note_error") as noted:
+                result = self.poll_at(0, token_left_at=left, token_back_at=back)
+                self.assertEqual(result.decision.state, "hold")
+                self.assertIsInstance(result.reservation, gate.NotReserved)
+                self.assertTrue((self.root / "admission/300-head.waiting").exists())
+                self.assertFalse((self.root / "admission/queue_times.jsonl").exists())
+                noted.assert_called_once()
+
+    def test_bad_token_environment_is_noted_and_the_checker_still_admits(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: {40 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        arguments = ["memory_admit.py", "check", str(self.meminfo), "300", "", "0",
+                     "test", "nextest", "test", "-", "measured", "5", "cargo", "nextest"]
+        for left, back in (("broken", str(NOW.timestamp())), (str(NOW.timestamp() - 10), "broken")):
+            with self.subTest(left=left, back=back), patch.object(sys, "argv", arguments), \
+                 patch.dict(os.environ, {"BUILDLOG_TOKEN_LEFT_AT": left, "BUILDLOG_TOKEN_BACK_AT": back}), \
+                 patch.object(gate, "git_identity", return_value=(gate.UnknownRepository(), "test")), \
+                 patch.object(gate, "expected_peak", return_value=gate.ExpectedPeak(GIB, "measured", 5)), \
+                 patch.object(store, "note_error") as noted, redirect_stdout(io.StringIO()) as output:
+                gate.run_action()
+                fields = output.getvalue().strip().split("|")
+                self.assertEqual(fields[0], "admit")
+                self.assertTrue(Path(fields[9]).exists())
+                Path(fields[9]).unlink()
+                noted.assert_called_once()
+                self.assertFalse((self.root / "admission/queue_times.jsonl").exists())
+
+    def test_failed_head_time_write_does_not_undo_a_bump(self) -> None:
+        _ = self.poll_at(0)
+        _ = self.poll_at(10, pid=400)
+        with patch.object(gate, "write_head_since", side_effect=OSError("head write failed")), \
+             patch.object(store, "note_error") as noted:
+            moved = gate.bump_waiter("2", "user:tester")
+        self.assertEqual(moved.pid, 400)
+        self.assertEqual(gate.locked_queue_read().view.waiting[0].pid, 400)
+        noted.assert_called_once()
+
+    def test_interrupted_head_handoff_clears_every_old_tenure_before_marking(self) -> None:
+        paths = self.queue()
+        for path in paths[1:]:
+            row = cast(gate.Waiter, json.loads(path.read_text()))
+            row["head_since"] = NOW.timestamp() - 10
+            _ = path.write_text(json.dumps(row))
+
+        def interrupted_write(path: Path, text: str) -> None:
+            if path == paths[0]:
+                raise OSError("stopped before new head mark")
+            write_text_atomic(path, text)
+
+        processes = gate.process_table(self.root / "proc")
+        with (self.root / "admission/lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with patch.object(gate, "write_text_atomic", side_effect=interrupted_write):
+                with self.assertRaises(OSError):
+                    gate.write_head_since(self.root / "admission", processes, NOW.timestamp())
+            self.assertTrue(all("head_since" not in json.loads(path.read_text()) for path in paths))
+            gate.write_head_since(self.root / "admission", processes, NOW.timestamp() + 5)
+        self.assert_only_head_has_time(300, NOW.timestamp() + 5)
+
+    def test_join_records_only_the_head_and_rechecks_keep_its_original_time(self) -> None:
+        self.assertEqual(self.poll_at(0).decision.state, "hold")
+        self.assert_only_head_has_time(300, NOW.timestamp())
+        self.assertEqual(self.poll_at(10, pid=400).decision.state, "hold")
+        self.assertEqual(self.poll_at(20).decision.state, "hold")
+        self.assert_only_head_has_time(300, NOW.timestamp())
+        rows = gate.locked_queue_read().ordered
+        self.assertEqual([item[1]["since"] for item in rows], [NOW.timestamp(), NOW.timestamp() + 10])
+
+    def test_bump_changes_the_head_time_in_the_same_transaction(self) -> None:
+        _ = self.poll_at(0)
+        _ = self.poll_at(10, pid=400)
+        original = cast(dict[str, object], json.loads((self.root / "admission/300-head.waiting").read_text()))
+        with patch.object(time, "time", return_value=NOW.timestamp() + 30):
+            self.assertEqual(gate.bump_waiter("2", "user:tester").pid, 400)
+        self.assert_only_head_has_time(400, NOW.timestamp() + 30)
+        previous = cast(dict[str, object], json.loads((self.root / "admission/300-head.waiting").read_text()))
+        self.assertEqual(previous, {key: value for key, value in original.items() if key != "head_since"})
+
+    def test_admitting_the_head_marks_its_successor_before_the_transaction_returns(self) -> None:
+        _ = self.poll_at(0)
+        _ = self.poll_at(10, pid=400)
+        self.readings[300] = gate.MeasuredMemory(0)
+        admitted = self.poll_at(60, free=40)
+        self.assertEqual(admitted.decision.state, "admit")
+        self.assertFalse((self.root / "admission/300-head.waiting").exists())
+        self.assert_only_head_has_time(400, NOW.timestamp() + 60)
+
+    def test_dead_head_is_pruned_and_its_successor_gets_a_new_head_time(self) -> None:
+        _ = self.poll_at(0)
+        _ = self.poll_at(10, pid=400)
+        del self.processes[300]
+        _ = self.poll_at(60, pid=400)
+        self.assertFalse((self.root / "admission/300-head.waiting").exists())
+        self.assert_only_head_has_time(400, NOW.timestamp() + 60)
+
+    def test_a_step_that_loses_and_regains_head_starts_a_new_head_time(self) -> None:
+        _ = self.running(100, need=1)
+        _ = self.poll_at(0)
+        _ = self.poll_at(10, pid=400)
+        with patch.object(time, "time", return_value=NOW.timestamp() + 30):
+            _ = gate.bump_waiter("2", "user:tester")
+        self.assert_only_head_has_time(400, NOW.timestamp() + 30)
+        with patch.object(time, "time", return_value=NOW.timestamp() + 50):
+            _ = gate.bump_waiter("2", "user:tester")
+        self.assert_only_head_has_time(300, NOW.timestamp() + 50)
+        _ = self.poll_at(60)
+        self.assert_only_head_has_time(300, NOW.timestamp() + 50)
+
+    def test_finished_token_times_append_one_gap_with_the_waiter_identity(self) -> None:
+        _ = self.poll_at(0)
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-id", "CLAUDE_SESSION_NAME": "worker"}):
+            result = gate.check(self.meminfo, 300, "", ["cargo", "nextest"], NOW.timestamp(),
+                                root=self.root, now=NOW + timedelta(seconds=200),
+                                profile=gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(GIB, "measured", 5)),
+                                token_left_at=NOW.timestamp() + 10.25, token_back_at=NOW.timestamp() + 164.25)
+        self.assertEqual(result.decision.state, "hold")
+        path = self.root / "admission/queue_times.jsonl"
+        rows = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
+        self.assertEqual(rows, [{"kind": "token_gap", "at": NOW.timestamp() + 200,
+                                "session_id": "worker-id", "step": "nextest", "pid": 300,
+                                "start_time": "head", "token_left_at": NOW.timestamp() + 10.25,
+                                "token_back_at": NOW.timestamp() + 164.25}])
+        _ = self.poll_at(210)
+        self.assertEqual([json.loads(line) for line in path.read_text().splitlines()], rows)
+
+    def test_token_gap_append_retains_the_seven_day_boundary_and_drops_older_rows(self) -> None:
+        _ = self.poll_at(0)
+        path = self.root / "admission/queue_times.jsonl"
+        edge = NOW.timestamp() - 7 * 86400
+        _ = path.write_text(json.dumps({"kind": "token_gap", "at": edge - 0.25}) + "\n"
+                            + json.dumps({"kind": "token_gap", "at": edge}) + "\n")
+        _ = gate.check(self.meminfo, 300, "", ["cargo", "nextest"], NOW.timestamp() - 300,
+                       root=self.root, now=NOW,
+                       profile=gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(GIB, "measured", 5)),
+                       token_left_at=NOW.timestamp() - 200, token_back_at=NOW.timestamp() - 46)
+        rows = [cast(dict[str, object], json.loads(line)) for line in path.read_text().splitlines()]
+        self.assertEqual([row["at"] for row in rows], [edge, NOW.timestamp()])
+        self.assertEqual(rows[0], {"kind": "token_gap", "at": edge})
+
+    def test_first_wait_and_plain_recheck_do_not_record_a_token_gap(self) -> None:
+        _ = self.poll_at(0)
+        _ = self.poll_at(10)
+        self.assertFalse((self.root / "admission/queue_times.jsonl").exists())
+
     def test_waiter_identity_keeps_the_bare_step_and_caller_identity(self) -> None:
         with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-id", "CLAUDE_CODE_SESSION_ID": "parent-id",
                                      "CLAUDE_SESSION_NAME": "recorded-name"}), \
@@ -3097,6 +3312,81 @@ class ProcessMemoryTests(unittest.TestCase):
 
 
 class ShellTests(unittest.TestCase):
+    def run_gate_scenario(self, root: Path, command: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "-c", command, "test", str(MEMORY_GATE)], text=True,
+            capture_output=True, check=False, timeout=300,
+            env={**os.environ, **fake_memory_readings(root), "HOME": str(root),
+                 "BUILDLOG_DIR": str(root / "log"),
+                 "BUILD_HOLD_DIR": str(root / "holders"), "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+                 "UNIT_ACTIVE_DIR": str(root / "active"), "MAC_TEST_STATE_DIR": str(root / "mac"),
+                 "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "", "BUILDLOG_MEM_WAIT_SINCE": "",
+                 "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": ""},
+        )
+
+    def test_token_pair_survives_meminfo_and_checker_failures_until_a_successful_check(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            command = (
+                'source "$1"; unset EPOCHREALTIME; EPOCHREALTIME=110.5; '
+                + 'BUILDLOG_MEM_WAIT_SINCE=90; BUILDLOG_MEM_TOKEN_LEFT_AT=100.25; '
+                + 'real_meminfo=$BUILDLOG_MEMINFO; BUILDLOG_MEMINFO="$HOME/missing"; '
+                + 'buildlog_wait_for_memory cargo check; printf "meminfo:%s\\n" "$?"; '
+                + 'BUILDLOG_MEMINFO=$real_meminfo; '
+                + 'buildlog_memory_python() { '
+                + 'printf "%s|%s\\n" "$BUILDLOG_TOKEN_LEFT_AT" "$BUILDLOG_TOKEN_BACK_AT" >> "$HOME/pairs"; '
+                + 'if [[ ! -e "$HOME/failed" ]]; then touch "$HOME/failed"; return 9; fi; '
+                + 'printf "admit|1|1|measured|5|0|0|0||reservation|test|check|1|reserved|tree\\n"; }; '
+                + 'EPOCHREALTIME=210.5; buildlog_wait_for_memory cargo check; printf "checker:%s\\n" "$?"; '
+                + 'EPOCHREALTIME=310.5; buildlog_wait_for_memory cargo check; printf "success:%s:%s\\n" "$?" "$BUILDLOG_MEM_OUTCOME"; '
+                + 'buildlog_wait_for_memory cargo check; printf "later:%s:%s\\n" "$?" "$BUILDLOG_MEM_OUTCOME"'
+            )
+            result = self.run_gate_scenario(root, command)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["meminfo:2", "checker:2", "success:0:Granted", "later:0:Granted"])
+            self.assertEqual((root / "pairs").read_text().splitlines(), ["100.25|110.5", "100.25|110.5", "|"])
+
+    def test_token_left_time_is_stamped_after_the_release_call_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            command = (
+                'source "$1"; unset EPOCHREALTIME; EPOCHREALTIME=100.25; '
+                + 'BUILDLOG_MEM_RESERVATION=reservation; '
+                + 'buildlog_memory_python() { [[ "$2" == release ]] || return 9; EPOCHREALTIME=200.75; }; '
+                + 'buildlog_release_memory 0; printf "%s|%s\\n" "$BUILDLOG_MEM_TOKEN_LEFT_AT" "$BUILDLOG_MEM_RESERVATION"'
+            )
+            result = self.run_gate_scenario(root, command)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "200.75|")
+
+    def test_gate_release_records_one_token_gap_on_the_first_recheck_only(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            command = (
+                'set -e; source "$1"; buildlog_wait_for_memory cargo check; '
+                + 'BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM; buildlog_release_memory 0; '
+                + 'printf "MemAvailable: 0 kB\\nMemTotal: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"; '
+                + 'polls=0; sleep() { polls=$((polls + 1)); '
+                + 'if (( polls == 1 )); then cp "$BUILDLOG_DIR/admission/queue_times.jsonl" "$HOME/first-poll.jsonl"; fi; '
+                + 'if (( polls == 2 )); then printf "MemAvailable: 67108864 kB\\nMemTotal: 67108864 kB\\n" > "$BUILDLOG_MEMINFO"; fi; }; '
+                + 'buildlog_wait_for_memory cargo check; printf "%s:%s\\n" "$BUILDLOG_MEM_OUTCOME" "$polls"'
+            )
+            result = self.run_gate_scenario(root, command)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "Granted:2")
+            first = (root / "first-poll.jsonl").read_bytes()
+            self.assertEqual((root / "log/admission/queue_times.jsonl").read_bytes(), first)
+            rows = [cast(dict[str, object], json.loads(line)) for line in first.splitlines()]
+            gaps = [row for row in rows if row["kind"] == "token_gap"]
+            self.assertEqual(len(gaps), 1)
+            gap = gaps[0]
+            left = gap["token_left_at"]
+            back = gap["token_back_at"]
+            self.assertIsInstance(left, int | float)
+            self.assertIsInstance(back, int | float)
+            self.assertLessEqual(cast(float, left), cast(float, back))
+            self.assertEqual(gap["step"], "check")
+
     def test_wait_line_carries_head_need_step_and_measured_memory(self) -> None:
         command = ('source "$1"; BUILDLOG_MEM_WAIT_S=120; buildlog_memory_python() { echo UTC; }; '
                    + 'buildlog_memory_line "$2" 0 49000000000 11600000000 measured 5 0 2 3000000000 '

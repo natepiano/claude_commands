@@ -11,7 +11,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from typing import cast, override
+from typing import TypedDict, Unpack, cast, override
 from unittest import mock
 
 from scripts.build_queue import build_queue, build_why, head_facts
@@ -26,6 +26,11 @@ NOW = datetime(2026, 10, 30, 1, 51, tzinfo=UTC).timestamp()
 
 def gib(value: float) -> int:
     return int(value * GIB)
+
+
+class FinishedTokenGapTimes(TypedDict, total=False):
+    token_left_at: float
+    token_back_at: float
 
 
 class BuildWhyTests(unittest.TestCase):
@@ -378,6 +383,46 @@ class BuildWhyTests(unittest.TestCase):
         for path in self.directory.glob("*.waiting"):
             path.unlink()
         self.assertTrue(self.output().rstrip().endswith("Nothing waits."))
+
+    def check_waiting_head(self, at: float, **token_times: Unpack[FinishedTokenGapTimes]) -> gate.CheckResult:
+        self.reset_running(available=0, need=11.8)
+        _ = self.running(800, "holder", "clippy", 1, 1, 3600)
+        self.head_path = self.head_path.rename(self.directory / "500-500.waiting")
+        with mock.patch.object(gate, "process_start_time", side_effect=str), \
+             mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "id-inspectors-fix", "CLAUDE_SESSION_NAME": "inspectors-fix"}):
+            return gate.check(self.root / "meminfo", 500, "", ["cargo", "nextest"], NOW - 122 * 60,
+                              now=datetime.fromtimestamp(at, UTC),
+                              profile=gate.StepProfile("hana", "nextest", "inspectors-fix",
+                                                       gate.ExpectedPeak(gib(11.8), "measured", 7)),
+                              **token_times)
+
+    def test_admission_written_head_time_reaches_build_why_and_queue(self) -> None:
+        started_head = NOW - 125
+        result = self.check_waiting_head(started_head)
+        self.assertEqual(result.decision.state, "hold")
+        self.assertEqual(json.loads(self.head_path.read_text())["head_since"], started_head)
+        self.assertIn("Head for: 2 min (since 21:48:55)", self.output())
+        reading = gate.locked_queue_read()
+        snapshot = build_queue.queue_snapshot(reading, user_zone())
+        self.assertIn("head for 2 min", snapshot["head"]["text"])
+        self.assertNotIn("head for 122 min", snapshot["head"]["text"])
+
+    def test_admission_written_token_gap_matches_the_reader_and_both_commands(self) -> None:
+        result = self.check_waiting_head(NOW, token_left_at=NOW - 200, token_back_at=NOW - 46)
+        self.assertEqual(result.decision.state, "hold")
+        facts = head_facts.read_head_facts(gate.locked_queue_read())
+        self.assertIsInstance(facts, head_facts.HeadFacts)
+        if not isinstance(facts, head_facts.HeadFacts):
+            self.fail("the held step must have head facts")
+        waits = facts.token_waits
+        self.assertIsInstance(waits, head_facts.RecordedTokenWaits)
+        if not isinstance(waits, head_facts.RecordedTokenWaits):
+            self.fail("admission's token gap must match its waiting step")
+        self.assertEqual([(wait.session_id, wait.pid, wait.start_time, wait.left_at, wait.returned.at)
+                          for wait in waits.head_waits], [("id-inspectors-fix", 500, "500", NOW - 200, NOW - 46)])
+        self.assertIn("Cargo token: inspectors-fix-session nextest: waited 154 s (21:47-21:50)", self.output())
+        snapshot = build_queue.queue_snapshot(gate.locked_queue_read(), user_zone())
+        self.assertIn("cargo token waited 154 s", snapshot["head"]["text"])
 
     def test_four_head_facts_follow_first_in_line_in_the_specified_order(self) -> None:
         write_bumps(NOW, [bump_line(NOW - 1)])

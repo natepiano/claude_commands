@@ -20,3 +20,17 @@
 - **Need:** `sccache_memory` builds the builds slice path and parses `memory.stat` a third time, beside Phase 7's shared slice capture.
 - **Completion:** `sccache_memory` reads the shared typed slice capture; no second parse of the slice's `memory.stat` remains.
 - **Source phase:** 6 (phase review).
+
+## The build log stores each memory reading once each minute
+- **Starts when:** any time. Showrunner disposition 2026-10-30: next.
+- **Target:** `scripts/buildlog/memory.py`, `scripts/buildlog/sample.py`.
+- **Need:** each tick writes the builds slice fields in both the sample row and the memory_snapshot row, so the log grows faster than it needs to.
+- **Completion:** the slice fields live only in the sample row; memory_snapshot keeps its old fields; a test pins each row's fields.
+- **Source phase:** 7.
+
+## A real build step's row shows measured CPU and IO
+- **Starts when:** the showrunner says Phase 7 is on main (CPU); the user's next natedev rebuild with IO accounting (IO). Showrunner disposition 2026-10-30: next.
+- **Target:** `scripts/buildlog/record.py`, `scripts/lint/invoke.sh`.
+- **Need:** `invoke.sh` runs the installed recorder, so tests and the copy-based live check could not show a real step's counters.
+- **Completion:** one real step on natedev has measured CPU in `scope_resources`; IO is measured after the rebuild.
+- **Source phase:** 7.

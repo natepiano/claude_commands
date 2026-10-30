@@ -20,7 +20,7 @@ from scripts.message import roster
 BLOCK_BYTES = 1024 * 1024
 MAX_SCAN_BYTES = 32 * BLOCK_BYTES
 BUMP_TABLE_ROWS = 8
-QUEUE_TIMES_PATH = Path("admission/queue_times.jsonl")
+QUEUE_TIMES_PATH = gate.QUEUE_TIMES_PATH
 _BUMP_KIND = re.compile(rb'"kind"\s*:\s*"queue_bump"')
 
 
@@ -359,7 +359,8 @@ def bump_text(facts: HeadFacts, zone: ZoneInfo, *, short: bool = False) -> str:
             return "no bumps since it joined"
         most = bumps.groups[0]
         folder = Path(most.folder).name or "unknown"
-        return f"{bumps.total} bumps since it joined, most: {folder} {most.step} ({most.count})"
+        noun = "bump" if bumps.total == 1 else "bumps"
+        return f"{bumps.total} {noun} since it joined, most: {folder} {most.step} ({most.count})"
     count = str(bumps.total) if bumps.groups else "none"
     return f"Bumps since it joined at {_clock(facts.joined_at, zone)}: {count}"
 
@@ -382,7 +383,9 @@ def bump_remainder(facts: HeadFacts) -> str:
     remaining = facts.bumps.groups[BUMP_TABLE_ROWS:]
     if not remaining:
         return ""
-    return f"and {len(remaining)} more steps with {sum(group.count for group in remaining)} bumps"
+    count = sum(group.count for group in remaining)
+    noun = "bump" if count == 1 else "bumps"
+    return f"and {len(remaining)} more steps with {count} {noun}"
 
 
 def order_text(facts: HeadFacts, zone: ZoneInfo) -> str:

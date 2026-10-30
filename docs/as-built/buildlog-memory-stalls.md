@@ -30,6 +30,8 @@ Before publication, `record.launch()` saves the complete row under the build log
 
 Launches skip memory admission by design. Their `mem_wait_s` is null and the report's **App launches** section displays **no admission**, ignoring ambient wait values and admission-record paths. Legacy BRP rows keep their existing recorded/missing wait wording. Rows start with this recorder change: there is no Hana transcript or cache backfill, and the collector continues its existing legacy BRP transcript collection while finishing build-log-owned pending records. `verify.sh build` compiles and prints binary paths; it does not start an app. Its existing build-step records retain their own admission wait. No resources admission follow-up is needed for app launches.
 
+`report.recorder_health_lines()` gives each machine the action its fresh health snapshot needs: unfinished records say `run buildlog launches on <machine>`; recorder errors say `see ~/.local/state/buildlog/errors.log on <machine>`, using `store.ERRORS_DISPLAY_PATH` from the shared default root. When both counts are nonzero, both actions appear on the same line. Completing pending records does not clear the error log. Stale or unavailable health stays explicitly unknown.
+
 ### Per-step stall: scope file → step record → `steps`
 
 1. On natedev, `buildlog_exec` runs each step through `systemd-run --user --scope … --slice=builds.slice -- /bin/sh -c "$BUILDLOG_SCOPE_SH" "$BUILDLOG_PEAK" "$@"`:

@@ -35,11 +35,13 @@ SYNC_STATUS_NAME = "sync.json"
 SYNC_PAUSED_NAME = "sync_paused.json"
 CI_POLLED_NAME = "polled.json"
 DISK_NAME = "disk.json"
+DEFAULT_ROOT_DISPLAY = "~/.local/state/buildlog"
+ERRORS_DISPLAY_PATH = f"{DEFAULT_ROOT_DISPLAY}/{ERRORS_NAME}"
 
 
 def root() -> Path:
     override = os.environ.get("BUILDLOG_DIR")
-    return Path(override) if override else Path.home() / ".local/state/buildlog"
+    return Path(override) if override else Path(DEFAULT_ROOT_DISPLAY).expanduser()
 
 
 def host_name() -> str:

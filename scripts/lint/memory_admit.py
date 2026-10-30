@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 import fcntl
-from contextlib import closing
+from collections.abc import Generator
+from contextlib import closing, contextmanager
 import importlib
 import io
 import json
@@ -60,6 +61,7 @@ class BuildLogStore(Protocol):
     def utc_iso(self, epoch: float) -> str: ...
     def append_line(self, path: Path, record: object) -> None: ...
     def host_file(self, host: str, epoch: float) -> Path: ...
+    def note_error(self, context: str) -> None: ...
 
 
 class BuildLogFileMarks(Protocol):
@@ -70,6 +72,24 @@ parse: StepParser = cast(StepParser, cast(object, importlib.import_module("parse
 record: GitIdentityReader = cast(GitIdentityReader, cast(object, importlib.import_module("record")))
 store: BuildLogStore = cast(BuildLogStore, cast(object, importlib.import_module("store")))
 file_marks: BuildLogFileMarks = cast(BuildLogFileMarks, cast(object, importlib.import_module("index")))
+
+
+@contextmanager
+def recorder_write(context: str) -> Generator[None]:
+    """Recorder facts cannot change an admission transaction's result."""
+    try:
+        yield
+    except Exception:
+        store.note_error(context)
+
+
+def token_times_from_environment() -> tuple[float, float]:
+    """An invalid recorder input is noted and treated as no finished wait."""
+    times = (0.0, 0.0)
+    with recorder_write("memory admission token times"):
+        times = (float(os.environ.get("BUILDLOG_TOKEN_LEFT_AT") or 0),
+                 float(os.environ.get("BUILDLOG_TOKEN_BACK_AT") or 0))
+    return times
 
 GIB = 1 << 30
 FALLBACK = 12 * GIB
@@ -98,6 +118,8 @@ RECOVERY_WINDOW_SECONDS = 120
 PROC = Path("/proc")
 # A step held this long gets room first when it can start.
 HEAD_SECONDS = 600
+QUEUE_TIMES_PATH = Path("admission/queue_times.jsonl")
+QUEUE_TIMES_DAYS = 7
 STRICT_SECONDS = 600
 BACKFILL_SECONDS = 120
 QUEUE_LOCK_TIMEOUT_SECONDS = 10.0
@@ -280,6 +302,7 @@ class Waiter(TypedDict):
     bump_order: NotRequired[int]
     holds_younger: NotRequired[bool]
     priority_since: NotRequired[float]
+    head_since: NotRequired[float]
     estimated_at: NotRequired[float]
     fresh_test: NotRequired[bool]
     repo_identity: NotRequired[str]
@@ -377,12 +400,14 @@ def admit_head(why: str = "") -> str:
     directory = admission_dir(store.root())
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        ordered = sorted(live_waiters(directory), key=lambda item: waiter_order(item[1]))
+        now = time.time()
+        proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
+        processes = process_table(proc)
+        ordered = ordered_waiters(directory, processes)
         if not ordered:
             raise AdmitHeadRefused("nothing waits; no head to admit")
         path, row = ordered[0]
-        proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
-        identities = QueueIdentityReader(process_table(proc), proc)
+        identities = QueueIdentityReader(processes, proc)
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
         host = read_meminfo(Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")))
         reserve = decide(host.available, host.total, row["need"], []).reserve
@@ -393,7 +418,9 @@ def admit_head(why: str = "") -> str:
             "reserve": reserve, "why": why, "set_by": actor,
         }
         write_text_atomic(head_override_path(directory), json.dumps(override, separators=(",", ":")))
-        head_override_event("set", override, row["need"], host.available, reserve, time.time())
+        head_override_event("set", override, row["need"], host.available, reserve, now)
+        with recorder_write("memory admission head time"):
+            write_head_since(directory, processes, now)
         return f"head admission set for {override['unit']} {override['step']}"
 
 
@@ -1769,7 +1796,8 @@ def test_scope(argv: list[str]) -> TestScope:
 
 def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float = 0.0,
           root: Path | None = None, now: datetime | None = None,
-          profile: StepProfile | None = None) -> CheckResult:
+          profile: StepProfile | None = None, *, token_left_at: float = 0.0,
+          token_back_at: float = 0.0) -> CheckResult:
     """Admit or hold one step. A held step is a waiter from `since` (epoch seconds; 0 means now), so a
     step that gave its reservation back for the cargo token keeps its place."""
     root = root if root is not None else store.root()
@@ -1860,6 +1888,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 waiter["holds_younger"] = True
             if "priority_since" in previous:
                 waiter["priority_since"] = previous["priority_since"]
+            if "head_since" in previous:
+                waiter["head_since"] = previous["head_since"]
         host = read_meminfo(meminfo)
         available, total = host.available, host.total
         pressure = read_pressure(host)
@@ -1916,7 +1946,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             identity = waiter_identity(step, worktree)
             waiter["session_id"], waiter["session_name"] = identity["session_id"], identity["session_name"]
             waiter["step"], waiter["folder"] = identity["step"], identity["folder"]
-            _ = mine.write_text(json.dumps(waiter, separators=(",", ":")))
+            write_text_atomic(mine, json.dumps(waiter, separators=(",", ":")))
         if decision.state == "admit" and isinstance(recovery, RecoveryStarts):
             write_recovery(directory, replace(recovery, next_start_at=now.timestamp() + RECOVERY_START_SECONDS))
         if argv and decision.state == "admit":
@@ -1940,6 +1970,15 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             if not isinstance(waiter_override, NoHeadAdmissionOverride):
                 end_head_override(directory, "admitted", waiter_override, peak.bytes, available,
                                   decision.reserve, now.timestamp())
+        with recorder_write("memory admission token gap"):
+            if token_left_at or token_back_at:
+                if not (math.isfinite(token_left_at) and math.isfinite(token_back_at)
+                        and 0 < token_left_at <= token_back_at <= now.timestamp()):
+                    raise ValueError("invalid finished token wait")
+                append_token_gap(root, waiter_identity(step, worktree), pid, start or "",
+                                 token_left_at, token_back_at, now.timestamp())
+        with recorder_write("memory admission head time"):
+            write_head_since(directory, processes, now.timestamp())
         head_reason = (head_wait_reason(decision, peak.bytes, available, waiter, now.timestamp())
                        if candidates and candidates[0] is waiter else ReadyForAdmission())
         return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile,
@@ -2023,6 +2062,57 @@ def queue_rows(directory: Path, suffix: str, processes: dict[int, ProcessIdentit
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return rows
+
+
+def ordered_waiters(directory: Path, processes: dict[int, ProcessIdentity]) -> list[tuple[Path, Waiter]]:
+    """The queue's one order, shared by explanations and head-time writes."""
+    return sorted(((path, cast(Waiter, cast(object, row)))
+                   for path, row in queue_rows(directory, "waiting", processes)),
+                  key=lambda item: waiter_order(item[1]))
+
+
+def write_head_since(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> None:
+    """Under the admission lock, clear old heads before marking the current one."""
+    ordered = ordered_waiters(directory, processes)
+    if not ordered:
+        return
+    for path, row in ordered[1:]:
+        if "head_since" in row:
+            del row["head_since"]
+            write_text_atomic(path, json.dumps(row, separators=(",", ":")))
+    path, row = ordered[0]
+    if "head_since" not in row:
+        row["head_since"] = now
+        write_text_atomic(path, json.dumps(row, separators=(",", ":")))
+
+
+def append_token_gap(root: Path, identity: WaiterIdentity, pid: int, start: str,
+                     left: float, back: float, now: float) -> None:
+    """Append a finished wait under the admission lock, retaining seven days."""
+    path = root / QUEUE_TIMES_PATH
+    retained: list[str] = []
+    expired = False
+    try:
+        with path.open() as source:
+            for line in source:
+                try:
+                    value = cast(object, json.loads(line))
+                    at = cast(dict[str, object], value).get("at") if isinstance(value, dict) else None
+                    if (isinstance(at, (int, float)) and not isinstance(at, bool)
+                            and math.isfinite(at) and at < now - QUEUE_TIMES_DAYS * 86400):
+                        expired = True
+                        continue
+                except ValueError:
+                    pass
+                retained.append(line)
+    except FileNotFoundError:
+        pass
+    if expired:
+        write_text_atomic(path, "".join(retained))
+    store.append_line(path, {"kind": "token_gap", "at": now,
+                            "session_id": identity["session_id"], "step": identity["step"],
+                            "pid": pid, "start_time": start,
+                            "token_left_at": left, "token_back_at": back})
 
 
 def reservation_blocker(waiter: Waiter, waiters: list[Waiter], reservations: list[Reservation],
@@ -2139,8 +2229,7 @@ def read_queue_pass(directory: Path, processes: dict[int, ProcessIdentity], now:
         unavailable = True
     available, total = host.available, host.total
     pressure = recovery_pressure(directory, read_pressure(host), now)
-    ordered = sorted(((path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)),
-                     key=lambda item: waiter_order(item[1]))
+    ordered = ordered_waiters(directory, processes)
     head = head_priority([row for _, row in ordered], available, total, memory, now)
     totals = decide(available, total, 0, memory, pressure=pressure)
     waiting: list[WaitingStep] = []
@@ -2343,7 +2432,9 @@ def bump_waiter(selector: str | WaiterRowSelector, actor: str) -> WaitingStep:
     directory = admission_dir(store.root())
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        view, ordered = read_queue(directory, process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc"))), time.time())
+        now = time.time()
+        processes = process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc")))
+        view, ordered = read_queue(directory, processes, now)
         matches: list[int] = []
         if isinstance(selector, WaiterRowSelector):
             matches = [position for position, item in enumerate(ordered)
@@ -2368,10 +2459,12 @@ def bump_waiter(selector: str | WaiterRowSelector, actor: str) -> WaitingStep:
         # Each move gets an order before all current waiters. Keep the wait time.
         row["bump_order"] = min(0, *(item.get("bump_order", 0) for _, item in ordered)) - 1
         row["holds_younger"] = True
-        row["priority_since"] = time.time()
+        row["priority_since"] = now
         temporary = path.with_suffix(".bump")
         _ = temporary.write_text(json.dumps(row, separators=(",", ":")))
         os.replace(temporary, path)
+        with recorder_write("memory admission head time"):
+            write_head_since(directory, processes, now)
         record.queue_bump(actor, moved.session_id or moved.session_name, moved.step, moved.folder, position + 1, view.now)
         reason = moved.reason if isinstance(moved.reason, (NeedsBuildBudget, NeedsMemory, ReadingUnavailable, MemoryPressure)) else ReadyForAdmission()
         return WaitingStep(moved.pid, moved.session_id, moved.session_name, moved.step, moved.folder,
@@ -2482,8 +2575,10 @@ def run_action() -> None:
     # The shell combines stdout and stderr and requires one protocol line.
     # Keep nonfatal read diagnostics visible in its existing summary field.
     diagnostics = io.StringIO()
+    token_left_at, token_back_at = token_times_from_environment()
     with redirect_stderr(diagnostics):
-        result = check(Path(meminfo), int(pid), sidecar, argv, float(since or 0), profile=profile)
+        result = check(Path(meminfo), int(pid), sidecar, argv, float(since or 0), profile=profile,
+                       token_left_at=token_left_at, token_back_at=token_back_at)
     decision, peak, live = result.decision, result.peak, result.live
     summary = ", ".join(f"{row['repo']} {row['step']} in {row['worktree']}" for row in live)
     if isinstance(result.head_reason, HeadAdmissionStatus):

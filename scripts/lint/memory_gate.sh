@@ -181,6 +181,14 @@ buildlog_memory_line() {
 }
 
 buildlog_wait_for_memory() {
+    local token_left_at="" token_back_at=""
+    if [[ -n "${BUILDLOG_MEM_WAIT_SINCE:-}" && -n "${BUILDLOG_MEM_TOKEN_LEFT_AT:-}" ]]; then
+        token_left_at=$BUILDLOG_MEM_TOKEN_LEFT_AT
+        if [[ -z "${BUILDLOG_MEM_TOKEN_BACK_AT:-}" ]]; then
+            BUILDLOG_MEM_TOKEN_BACK_AT=${EPOCHREALTIME:-$(buildlog_memory_python -c 'import time; print(time.time())')}
+        fi
+        token_back_at=$BUILDLOG_MEM_TOKEN_BACK_AT
+    fi
     BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
     # This admission gate serves Linux. The Mac uses its claim admission.
     if [[ "${OSTYPE:-}" == darwin* && -z "${BUILDLOG_MEMINFO+x}" ]]; then
@@ -227,11 +235,13 @@ buildlog_wait_for_memory() {
                 printf 'still waiting for memory after %d min: this step is now first in line, and no build starts without memory\n' "$(( BUILDLOG_MEM_WAIT_S / 60 ))" >&2
             fi
         fi
-        if ! result="$(BUILDLOG_MEM_DETAIL=1 buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" check "$meminfo" "$caller_pid" "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" "$BUILDLOG_MEM_WAIT_FROM" "$cached_repo" "$cached_step" "$cached_worktree" "$cached_need" "$cached_source" "$cached_count" "$@" 2>&1)"; then
+        if ! result="$(BUILDLOG_MEM_DETAIL=1 BUILDLOG_TOKEN_LEFT_AT="$token_left_at" BUILDLOG_TOKEN_BACK_AT="$token_back_at" buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" check "$meminfo" "$caller_pid" "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" "$BUILDLOG_MEM_WAIT_FROM" "$cached_repo" "$cached_step" "$cached_worktree" "$cached_need" "$cached_source" "$cached_count" "$@" 2>&1)"; then
             error_line=${result##*$'\n'}
             buildlog_memory_refuse "${error_line:-checker returned an error}"
             return 2
         fi
+        token_left_at="" token_back_at=""
+        unset BUILDLOG_MEM_TOKEN_LEFT_AT BUILDLOG_MEM_TOKEN_BACK_AT
         fields=${result//[^|]/}
         if [[ "$result" == *$'\n'* || ( ${#fields} != 14 && ${#fields} != 17 ) ]]; then
             buildlog_memory_refuse 'invalid checker output'
@@ -301,4 +311,6 @@ buildlog_release_memory() {
     BUILDLOG_MEM_RESERVATION=""
     [[ -n "$reservation" ]] || return 0
     buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" release "$reservation" "${1:-0}" >/dev/null 2>&1 || true
+    BUILDLOG_MEM_TOKEN_LEFT_AT=${EPOCHREALTIME:-$(buildlog_memory_python -c 'import time; print(time.time())')}
+    unset BUILDLOG_MEM_TOKEN_BACK_AT
 }

@@ -368,3 +368,67 @@ including the details to make it clear
 - Summing `anon`, `file` and `inactive_file` as held memory: they overlap; only `memory.current` is held.
 - Reading report values from `memory_snapshots.slices`: a failed append hides a saved reading.
 - `IOAccounting` on `builds.slice` alone: it does not give scopes `io.stat`.
+
+### Phase 8 — The queue shows true head times and cargo-token waits, and the report's recorder-error count holds only real errors  · status: done
+
+**Depends on:** none
+
+#### Work Order
+
+**Goal:** `/build:queue` and build-why show how long the first step has been head and its cargo-token waits from values admission really writes, and `/build:report`'s recorder line counts only real recorder errors and names an action that works.
+
+**Spec:**
+- Showrunner, 2026-10-30: four rows from merge 2fddc45d failed a live check (C595, C597, C598, C599). This is a wrong-result fix. Each fix comes back with a `Change-Review:` line that a person can run on the live machine.
+- **Head time has no writer (C598, C599).** `head_facts.read_head_facts` (`scripts/build_queue/head_facts.py:334`) reads the Waiter field `head_since` from the first row of `QueueRead.ordered`, and nothing writes it: 0 of 43 live waiter files have it. The tests pass only because their fixtures supply it. Build the writer in `scripts/lint/memory_admit.py`, as one function called from each place that holds the admission lock and changes or reads the waiting set:
+  - The head is the first row in the one order `read_queue` uses for `QueueRead.ordered` (`memory_admit.py:2142`). Use that order; never sort a second way.
+  - The head row has `head_since`: the value it already holds, if it was head at the last write, or else the transaction's `now`. Every other row has no `head_since`. A row that loses the head and later gets it back starts a new time.
+  - Call it in `check` (a join, a re-check, an admission that removes the head's file: the next head is marked in the same transaction) and in `bump_waiter` (a bump changes the head at once). `check` already rebuilds its own waiter dict from `previous`; carry `head_since` the same way as `bump_order` and `priority_since`.
+  - Writes to another waiter's file go under the lock with the existing atomic waiter write. They never change any field other than `head_since`.
+- **Cargo-token gaps have no writer (C598).** `head_facts._read_token_waits` reads `kind: "token_gap"` lines from `<buildlog root>/admission/queue_times.jsonl`. The file does not exist, and nothing writes it. `verify.sh:2645-2651` releases the step's memory with `buildlog_release_memory 0`, waits for the cargo token with `acquire_token`, and then waits for memory again with `BUILDLOG_MEM_WAIT_SINCE` set. Build the writer without a change to `verify.sh`:
+  - `memory_gate.sh`: `buildlog_release_memory` keeps the release time (epoch seconds with fraction). The next `buildlog_wait_for_memory` that has `BUILDLOG_MEM_WAIT_SINCE` set passes that time and its own start time (the token-back time) to its first `memory_admit.py check` call only, then clears them.
+  - `memory_admit.check`, given both times, appends one line under the admission lock: `{"kind": "token_gap", "at": now, "session_id", "step", "pid", "start_time", "token_left_at", "token_back_at"}`. Identity comes from `waiter_identity` and `process_start_time`, the same values the waiter row and `WaitingStep` carry, so `_gap_matches_waiter` matches it. Use `store.append_line` for the write. The file is bounded the way other admission logs are; if none is, keep the last 7 days on append.
+  - No times passed (a first wait, or a call outside `verify.sh`) gives no line.
+- **"1 bumps" (C599).** `head_facts.bump_text` short form prints `1 bumps since it joined`. Use the singular for one, in each bump text form.
+- **False recorder-error alarm (C597).** `/build:report` printed "10 recorder errors" on natedev. Every one was a `launch <state path>` error from `record.py:343` with a `/tmp/claude/session/...` path and a `Mock` traceback. Test runs wrote them to the REAL `~/.local/state/buildlog/errors.log`.
+  - Find every test module that writes the real log. Method: run each candidate module with `BUILDLOG_DIR` unset and `HOME` set to a new empty folder, and check for `<HOME>/.local/state/buildlog/errors.log`. Candidates are modules that reach `record.py` launch recording: `scripts/shutdown/test_pane_record.py`, `test_pane_restore.py`, `scripts/production/test_unit_operation_panes.py`, `scripts/lib/test_nix_env_launches.py` and the buildlog tests.
+  - Fix each leak in the test that leaks: point the buildlog root at the test's temporary folder. When more than one module leaks the same way, use one shared fixture, not a copy in each module.
+  - Add one regression test in the buildlog tests. It runs the leaking modules in a subprocess with `HOME` at a temporary folder and `BUILDLOG_DIR` unset, and asserts that no `errors.log` appears.
+- **Health line action (C597).** `report.recorder_health_lines` (`report.py:2114`) tells the reader to "run buildlog launches" for both counts. `buildlog launches` finishes unfinished records; it does not clear errors. Name the action that fits each count:
+  - unfinished records: `run buildlog launches on <machine>`.
+  - errors: `see <errors.log path> on <machine>`.
+  - With both, give both actions on the one line.
+- **C595.** The row's line no longer exists, because C597's health line replaced it. If nothing that C595 named is missing from the health line, report it in one line so the showrunner closes it.
+- Update `docs/as-built/build-memory-admission.md` (the head-time and token-gap writers) and `docs/as-built/buildlog-memory-stalls.md` (the health line actions).
+
+**Files:**
+- `scripts/lint/memory_admit.py` — head-time writer and token-gap line (also-touches: resources-unit's)
+- `scripts/lint/memory_gate.sh` — release time and token-back time to the first re-check (also-touches: resources-unit's)
+- `scripts/build_queue/head_facts.py` — singular bump text (also-touches: queue-unit's)
+- `scripts/buildlog/report.py` — health line actions
+- the leaking test modules found by the method above (also-touches: each owner)
+- `scripts/lint/test_memory_admit.py` (also-touches: resources-unit's), `scripts/build_queue/test_head_facts.py`, `test_build_queue.py`, `test_build_why.py` (also-touches: queue-unit's), `scripts/buildlog/test_report.py`, one new buildlog regression test module — tests
+- `docs/as-built/build-memory-admission.md`, `docs/as-built/buildlog-memory-stalls.md`
+
+**Ownership:** the showrunner assigned these fixes to this unit (2026-10-30). Trial-merge against `origin/builds-resources` (31c3ee3e or newer) and `origin/builds-queue`, plus each leaking test's owner branch. Name each one as also-touches in the notice.
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `memory_admit.py`, `memory_gate.sh`, `head_facts.py`, `report.py`, the leak fixes, the as-built docs
+- `test` — head time: a join, a bump, an admission that hands the head on in one transaction, a dead head, a head that loses and regains the head; no row but the head carries `head_since`. Token gap: the two times given (one line that `_read_token_waits` matches), not given (no line), and a second re-check (no second line). The gate script passes the times only on the first re-check. The bump text singular. The health line actions for each count and for both. The no-leak regression test. Each rule test fails on HEAD.
+
+**State:** head time is recorded or not recorded (typed, as today). A token gap is one line per give-back, or none.
+
+**Acceptance gate:**
+- The unit's eight buildlog modules, `scripts.lint.test_memory_admit`, and `scripts.build_queue.test_head_facts`, `test_build_queue`, `test_build_why` pass, plus every test module this phase edits. basedpyright reports 0 errors and 0 warnings on every changed Python file. `bash -n` passes on `memory_gate.sh`.
+- A run of the leaking modules leaves the real `errors.log` unchanged (size and mtime before and after).
+- Live check on a scratch `BUILDLOG_DIR` (never the shared admission folder): two fake waiting steps join and one is bumped, and the waiter files show `head_since` on the head only. One step goes through release, token and re-check through `memory_gate.sh`, and `queue_times.jsonl` holds one `token_gap` line. Then `build_why.py` and `build_queue.py` print `Head for: <n> min` and `cargo token waited <n> s`.
+
+**Constraints from prior phases:**
+- 4e's reader stays as built: `head_since` is used only when finite, >= 0 and <= now; token gaps match waiting steps only. Change no reader rule.
+- Good engineering first, not after the user notices. Before a worker writes code, ask: is there already one place for this? Use it, or make it, then call it.
+- No copies. A second copy of setup, a fixture, a config writer, a parser or a helper is a defect. Reviews flag it; you send it back. A test helper that each file writes for itself goes into one shared helper.
+- When many things break the same way, the copy is the cause. Name it first in your report, with the one-place fix, before anyone asks.
+- Fix at the cause, never a patch at each site.
+
+**Review rulings (director, 2026-10-30):**
+- Assertion-Change: `scripts/buildlog/test_record_rerun.py` `assert_health_line` (used by `test_health_uses_the_users_local_midnight_and_existing_local_time_format`, `test_launch_pending_save_failure_reaches_the_report_without_losing_its_source`, `test_launch_publication_stays_visible_until_collect_recovers`, `test_step_publication_stays_visible_until_collect_recovers`): the action now matches each count (C597). Count, time and render checks stay.
+- No test module in this tree writes the real `errors.log`. The ten entries came from older copies of `scripts/hana_shot/test_hana_shot.py` in two other worktrees; this tree already isolates it (Phase 4's shared `BuildLogIsolatedTest`). The no-leak regression test stays.

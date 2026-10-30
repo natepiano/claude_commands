@@ -139,6 +139,20 @@ class HeadFactsTests(unittest.TestCase):
             self.fail(f"complete fixture log must be readable: {result}")
         return result
 
+    def test_one_bump_uses_singular_text_and_plural_counts_stay_plural(self) -> None:
+        write_bumps(NOW, [bump_line(NOW - 1)])
+        facts = self.facts(head_reading())
+        self.assertEqual(head_facts.bump_text(facts, ZONE, short=True),
+                         "1 bump since it joined, most: bumped check (1)")
+        write_bumps(NOW, [bump_line(NOW - 2), bump_line(NOW - 1)])
+        self.assertEqual(head_facts.bump_text(self.facts(head_reading()), ZONE, short=True),
+                         "2 bumps since it joined, most: bumped check (2)")
+
+    def test_bump_table_remainder_uses_singular_for_one_remaining_bump(self) -> None:
+        write_bumps(NOW, [bump_line(NOW - 20 + number, session=f"session-{number}")
+                          for number in range(9)])
+        self.assertTrue(head_facts.bump_remainder(self.facts(head_reading())).endswith("with 1 bump"))
+
     def test_bumps_include_join_and_now_but_exclude_earlier_and_future_rows(self) -> None:
         since = NOW - 600
         write_bumps(NOW, [bump_line(since - 0.001), bump_line(since),

@@ -7,6 +7,7 @@ import fcntl
 import gzip
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -800,8 +801,14 @@ class RecordRerunTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         record_word = "record" if pending == 1 else "records"
         error_word = "error" if errors == 1 else "errors"
+        actions: list[str] = []
+        if errors:
+            actions.append("see ~/.local/state/buildlog/errors.log on natedev")
+        if pending:
+            actions.append("run buildlog launches on natedev")
+        advice = "; ".join(actions)
         self.assertRegex(lines[0],
-                         rf"^natedev: {pending} {record_word} the recorder has not finished; {errors} recorder {error_word} since .+ — run buildlog launches on natedev$")
+                         rf"^natedev: {pending} {record_word} the recorder has not finished; {errors} recorder {error_word} since .+ — {re.escape(advice)}$")
         rendered = self.report_text()
         self.assertEqual([line for line in rendered.splitlines() if "the recorder has not finished" in line], lines)
         return lines[0]
@@ -902,7 +909,7 @@ class RecordRerunTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
             line = self.assert_health_line(0, 1)
         self.assertEqual(line,
-                         "natedev: 0 records the recorder has not finished; 1 recorder error since 2026-10-02 00:00:00 EDT — run buildlog launches on natedev")
+                         "natedev: 0 records the recorder has not finished; 1 recorder error since 2026-10-02 00:00:00 EDT — see ~/.local/state/buildlog/errors.log on natedev")
 
     def test_successful_step_removes_its_sources_without_saving_a_failure_log(self) -> None:
         self.assertEqual(self.run_step(status=0), 0)
