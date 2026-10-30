@@ -20,8 +20,19 @@ from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
+    def production_row(self) -> staff.StaffRow:
+        return next(row for row in staff.find(kind="showrunner") if row.name == OLD)
+
+    def test_plan_uses_staff_children_without_reading_saved_parent_contents(self) -> None:
+        self.write(self.state / "child/parent", "obsolete-parent\n")
+        self.write(self.state / "other/parent", "old\n")
+        result = self.run_rename("plan")
+        self.assert_success(result)
+        self.assertIn(f"4. parent {self.state / 'child/parent'}: old -> new", result.stdout)
+        self.assertNotIn(f"4. parent {self.state / 'other/parent'}:", result.stdout)
+
     def test_rename_finds_the_workspace_member_and_keeps_its_id(self) -> None:
-        row = staff.snapshot().find(kind="showrunner")[0]
+        row = self.production_row()
         _ = staff.rename(row.id, "tools")
         self.write(self.doc, self.doc.read_text().replace("## Production Context\n", "## Production Context\n\n- **Showrunner session:** `tools`\n"))
         _ = self.git("add", str(self.doc))
@@ -40,7 +51,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertEqual(self.snapshot(), before)
 
     def test_missing_staff_member_refuses_before_sources_change(self) -> None:
-        row = staff.snapshot().find(kind="showrunner")[0]
+        row = self.production_row()
         for unit in staff.snapshot().find(kind="unit", parent=row.id):
             _ = staff.retire(unit.id)
         _ = staff.retire(row.id)

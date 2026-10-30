@@ -54,7 +54,7 @@
 | efficiency-unit | docs/as-built/token-efficiency-study.md | `/home/natepiano/worktrees/claude-natedev-efficiency` | `natedev-efficiency` | — | the efficiency proposals ledger (~/.local/state/nightly-review/ledger.md and its night reports); the token-efficiency investigation |
 | typesafe-unit | docs/plans/build-followups-typesafe.md | `/home/natepiano/worktrees/claude-natedev-typesafe` | `natedev-typesafe` | — | — |
 | postmaster-unit | permanent | `/home/natepiano/worktrees/claude-natedev-postmaster` | `natedev-postmaster` | — | — |
-| ups-unit | permanent | `/home/natepiano/worktrees/claude-natedev-ups` | `natedev-ups` | — | — |
+| ups-unit | (retired 2026-10-30, worktree removed, session 097e0938-66d3-4f01-a8e8-96feb3675493, folder /etc/nixos) permanent | `/home/natepiano/worktrees/claude-natedev-ups` | `natedev-ups` | — | — |
 | security-unit | standby | /home/natepiano/worktrees/claude-natedev-security | natedev-security | — | — |
 
 ## Hub files

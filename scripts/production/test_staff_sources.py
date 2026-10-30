@@ -15,6 +15,7 @@ from scripts.production.staff_test_support import PROCESS_TIMEOUT, SOURCES_SCRIP
 from scripts.shutdown import pane_record
 import herdr
 import showrunners
+import showrunner_tree
 
 
 class StaffSourcesTests(StaffTestCase):
@@ -22,6 +23,35 @@ class StaffSourcesTests(StaffTestCase):
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             staff_sources.seed(dry_run=dry_run)
         return output.getvalue(), errors.getvalue()
+
+    def test_seed_preserves_recorded_moves_despite_stale_sources(self) -> None:
+        old = staff.ensure("showrunner", name="old")
+        new = staff.ensure("showrunner", name="new")
+        child = staff.ensure("showrunner", name="tools", parent=old.id)
+        unit = staff.ensure("unit", name="models", parent=old.id)
+        worker = staff.ensure("worker", name="impl1", parent=unit.id)
+        _ = self.production("old", "models-unit")
+        _ = self.production("new")
+        _ = self.production("child", workspace="tools", parent="old")
+        moved_unit = staff.move(unit.id, new.id)
+        moved_child = staff.move(child.id, new.id)
+        before = self.staff_file.read_bytes()
+        output, errors = self.seed()
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertIn("unchanged", errors)
+        self.assertNotIn("add ", output)
+        self.assertEqual(staff.by_id(unit.id), moved_unit)
+        self.assertEqual(staff.by_id(child.id), moved_child)
+        self.assertEqual(staff.by_id(worker.id), worker)
+        self.assertEqual(showrunner_tree.parent_of("child"), "new")
+        self.assertEqual(showrunner_tree.children_of("new"), ["child"])
+        self.assertEqual(showrunner_tree.children_of("old"), [])
+
+    def test_reading_a_snapshot_never_collects_seed_sources(self) -> None:
+        expected = self.tree()
+        with mock.patch.object(staff_sources, "_collect", side_effect=AssertionError("read ran seed")):
+            record = staff.snapshot()
+            self.assertCountEqual(record.rows, expected)
 
     def test_seed_rerun_uses_timers_parent_files_docs_and_pane_records(self) -> None:
         _ = self.production("parent", workspace="umbrella")
@@ -39,7 +69,7 @@ class StaffSourcesTests(StaffTestCase):
         child = staff.by_path("tools")
         unit = staff.by_path("tools/models")
         assert root is not None and child is not None and unit is not None
-        self.assertEqual(child.parent, root.id)
+        self.assertIsNone(child.parent)
         self.assertEqual(unit.parent, child.id)
         self.assertEqual(len(staff.find()), 3)
         self.assertEqual(staff.find(kind="worker"), [])
@@ -152,14 +182,16 @@ class StaffSourcesTests(StaffTestCase):
         unregistered = staff.ensure("showrunner", name="other-machine")
         doc = self.production("sdlc", "models-unit", "empty-unit")
         self.units_doc(doc, ("models-unit", "empty-unit", "remote-unit"), workspace="sdlc", retired=("models-unit", "empty-unit"))
+        before = self.staff_file.read_bytes()
         _output, errors = self.seed()
-        self.assertIsNone(staff.by_id(empty.id))
-        self.assertIsNone(staff.by_id(omitted.id))
+        self.assertEqual(staff.by_id(empty.id), empty)
+        self.assertEqual(staff.by_id(omitted.id), omitted)
         self.assertEqual(staff.by_id(remote.id), remote)
         self.assertEqual(staff.by_id(unit.id), unit)
         self.assertEqual(staff.by_id(worker.id), worker)
         self.assertEqual(staff.by_id(unregistered.id), unregistered)
-        self.assertEqual(len([line for line in errors.splitlines() if "models" in line]), 1, errors)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertEqual(errors, "unchanged\n")
 
     def test_unreadable_doc_keeps_its_rows_and_reports_one_source_line(self) -> None:
         _ = self.tree()
@@ -334,28 +366,29 @@ class StaffSourcesTests(StaffTestCase):
         child = staff.ensure("showrunner", name="child", parent=parent.id)
         _ = self.production("parent", parent="child")
         _ = self.production("child", parent="parent")
+        before = self.staff_file.read_bytes()
         _ = self.seed()
-        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        self.assertEqual(staff.by_id(child.id), child)
         self.assertEqual(staff.by_id(parent.id), parent)
+        self.assertEqual(self.staff_file.read_bytes(), before)
         _ = staff.move(child.id, parent.id)
         parent_file = showrunners.SHOWRUNNER_STATE_DIR / "child" / showrunners.PARENT_FILE
         parent_file.unlink()
         _ = self.seed()
-        self.assertEqual(staff.by_id(child.id), replace(child, parent=None))
+        self.assertEqual(staff.by_id(child.id), child)
+        self.assertEqual(self.staff_file.read_bytes(), before)
 
     def test_unreadable_parent_evidence_leaves_its_production_unchanged(self) -> None:
         showrunner = self.tree()[0]
         _ = self.production("sdlc", "models-unit", "new-unit")
         path = showrunners.SHOWRUNNER_STATE_DIR / "sdlc" / showrunners.PARENT_FILE
         path.mkdir(parents=True)
-        before = self.staff_file.read_bytes()
-        with self.assertRaises(OSError):
-            _ = showrunners.stored_parent("sdlc")
-        self.assertEqual(showrunners.parent_of("sdlc"), "")
+        self.assertEqual(showrunner_tree.parent_of("sdlc"), "")
+        self.assertEqual(showrunner_tree.parent_of("sdlc"), "")
         _output, errors = self.seed()
-        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertIsNotNone(staff.by_path("sdlc/new"))
         self.assertEqual(staff.by_id(showrunner.id), showrunner)
-        self.assertEqual(len([line for line in errors.splitlines() if str(path) in line]), 1, errors)
+        self.assertEqual(errors, "")
 
     def test_seed_reads_each_source_once_and_reports_a_bad_doc_once(self) -> None:
         _ = self.write_document({"schema": 1, "rows": []})
@@ -367,8 +400,8 @@ class StaffSourcesTests(StaffTestCase):
         paths = [*docs, bad, pane_record.record_path(herdr.shared_session())]
         for slug in ("one", "two", "bad"):
             paths.append(showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}" / "conf")
-        for slug in ("one", "two"):
-            paths.append(showrunners.SHOWRUNNER_STATE_DIR / slug / showrunners.PARENT_FILE)
+        parent_paths = [showrunners.SHOWRUNNER_STATE_DIR / slug / showrunners.PARENT_FILE
+                        for slug in ("one", "two")]
         reads: Counter[Path] = Counter()
         read_text = Path.read_text
 
@@ -381,6 +414,9 @@ class StaffSourcesTests(StaffTestCase):
         for path in paths:
             with self.subTest(path=path):
                 self.assertEqual(reads[path], 1)
+        for path in parent_paths:
+            with self.subTest(path=path):
+                self.assertEqual(reads[path], 0)
         self.assertEqual(len([line for line in errors.splitlines() if str(bad) in line]), 1, errors)
         for path in ("one/alpha", "one/beta", "two/gamma"):
             self.assertIsNotNone(staff.by_path(path))
