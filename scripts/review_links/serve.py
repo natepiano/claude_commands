@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -40,14 +41,20 @@ def tailscale_ip() -> str:
 
 
 def sweep_snapshots(root: Path, now: float) -> int:
-    """Remove expired snapshot folders, leaving sessions and newer snapshots alone."""
+    """Expire flat snapshots and legacy session snapshots without following symlinks."""
     removed = 0
     if not root.exists():
         return removed
-    for session in root.iterdir():
-        if session.is_symlink() or not session.is_dir():
+    for entry in root.iterdir():
+        if entry.is_symlink() or not entry.is_dir():
             continue
-        for folder in session.iterdir():
+        children = list(entry.iterdir())
+        # New snapshots contain regular files. A legacy session can contain
+        # only symlinks; preserve those even when its name is also a valid id.
+        flat = re.fullmatch(r"[a-z0-9]{6}", entry.name) is not None and not any(
+            child.is_dir() or child.is_symlink() for child in children
+        )
+        for folder in [entry] if flat else children:
             if folder.is_symlink() or not folder.is_dir():
                 continue
             try:
@@ -70,6 +77,8 @@ class ReviewLinksHandler(SimpleHTTPRequestHandler):
             if ".." in decoded.split("/"):
                 raise FileNotFoundError("parent traversal")
             file = (root / decoded.lstrip("/")).resolve()
+            if file == root / ".index.json" or file.name.startswith(".review-link-"):
+                raise FileNotFoundError("private index or unfinished write")
             if not file.is_relative_to(root) or not file.is_file():
                 raise FileNotFoundError("outside root or not a file")
             stream = file.open("rb")

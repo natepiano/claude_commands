@@ -104,10 +104,10 @@ def doc_status(lines: list[str]) -> ProductionPlanned | ProductionRunning | Prod
 
 
 def production_name(lines: list[str]) -> str:
-    heading = next((line for line in lines if line.startswith("# Production — ")), "")
-    if not heading:
-        raise LifecycleStop("input", "failed", "production doc lacks its name")
-    return heading.removeprefix("# Production — ").strip()
+    name = production_doc.production_name(lines)
+    if isinstance(name, production_doc.ProductionNameNotRecorded):
+        raise LifecycleStop("input", "failed", name.reason)
+    return name.value
 
 
 def units(lines: list[str], production: Production) -> tuple[UnitRow, ...]:

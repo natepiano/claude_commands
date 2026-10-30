@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import unittest
 from scripts.direct import review_launcher_test_support as support
+from scripts.direct.test_review_launcher_pool import own_review_with_legacy_flags
+from pathlib import Path
+from typing import override
 from scripts.direct.review_launcher_test_support import TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS
 from typing import cast
 import json
@@ -11,6 +14,12 @@ import subprocess
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
+    @override
+    def pool_command(self, session_dir: Path, *, lens: str = "contract", phase: str = "3",
+                     early: str = "", reviewer_type: str = "code", pass_index: int = 1) -> list[str]:
+        return own_review_with_legacy_flags(self, session_dir, lens=lens, phase=phase, early=early,
+                                           reviewer_type=reviewer_type, pass_index=pass_index)
+
     def test_own_turn_records_survive_two_phases_in_the_same_session(self) -> None:
         session = self.start_implementation("two-phases")
         self.finish_implementation(session)
@@ -26,7 +35,8 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual(len(records), 2)
         self.assertIn(first_record, records)
         self.assertEqual(len({str(record["phase_instance_id"]) for record in records}), 2)
-        self.assertTrue(all(record["unit"] == record["phase"] == "" for record in records))
+        self.assertTrue(all(record["unit"] == "" for record in records))
+        self.assertCountEqual([record["phase"] for record in records], ["3", "4"])
 
     def test_own_ux_lens_records_ux_kind_without_pass_calls(self) -> None:
         session = self.start_implementation("own-ux")
@@ -53,7 +63,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         start, = [call for call in self.call_records("pass-calls.jsonl") if call["verb"] == "start-pass"]
         self.assertEqual(cast("list[str]", start["argv"])[-2:], ["--phase-id", "3"])
 
-    def test_a_pool_review_naming_an_older_open_phase_records_its_turn_in_that_phase(self) -> None:
+    def test_a_legacy_flag_review_naming_an_older_open_phase_records_its_turn_in_that_phase(self) -> None:
         session = self.start_implementation("named-phase-turn")
         self.finish_implementation(session)
         older = cast("dict[str, object]", json.loads(
@@ -86,7 +96,7 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertTrue(list(phase_dir.glob("review_status*")))
         self.assertEqual(sorted(path.name for path in session.glob("review_*")), [])
 
-    def test_a_pool_review_names_the_director_in_the_unit_run_folder(self) -> None:
+    def test_a_legacy_flag_review_names_the_director_in_the_unit_run_folder(self) -> None:
         session = self.start_implementation("director")
         self.finish_implementation(session)
         environment = self.pool_fixture()
@@ -123,30 +133,34 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual(record["pass"], 2)
         self.assertEqual(record["raised"], 1)
         self.assertEqual(record["status"], "error")
-        self.assertEqual(record["phase"], "")
+        self.assertEqual(record["phase"], "3")
 
-    def test_failed_pool_attempt_and_own_retry_leave_one_record_each_and_ignore_review_lease(self) -> None:
+    def test_ignored_pool_attempt_and_own_retry_leave_two_own_records(self) -> None:
         session = self.start_implementation("pool-retry")
         self.finish_implementation(session)
         environment = self.pool_fixture()
-        environment["STUB_POOL_FAILURE"] = "1"
+        environment["STUB_TURN_FAILURE"] = "1"
         failed = subprocess.run(self.pool_command(session), env=environment, capture_output=True,
                                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(failed.returncode, 1, failed.stderr)
         self.assertEqual((session / "review_status_contract").read_text().strip(), "error")
-        self.assertEqual([call["verb"] for call in self.call_records("pool-calls.jsonl")], ["allocate"])
-        worker = self.open_worker(session)
-        retry = subprocess.run(self.review_command(session, "contract", "", worker), env=environment,
+        self.assertFalse((self.root / "pool-calls.jsonl").exists())
+        roster = cast(dict[str, dict[str, object]], json.loads((session / "mesh_roster.json").read_text()))
+        self.assertEqual(roster["fixture-review"]["status"], "failed")
+        self.assertEqual(roster["fixture-review"]["thread_id"], "thread-fixture")
+        _ = environment.pop("STUB_TURN_FAILURE")
+        retry = subprocess.run(self.review_command(session, "contract", "", "fixture-review"), env=environment,
                                capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         self.assertEqual(retry.returncode, 0, retry.stderr)
-        records = {str(record["arm"]): record for record in self.turn_records(session)}
-        self.assertEqual(set(records), {"pool", "own"})
-        self.assertEqual(records["pool"]["status"], "error")
-        self.assertEqual(records["own"]["status"], "reviewed")
-        self.assertEqual(records["own"]["thread_id"], "thread-fixture")
-        self.assertEqual((records["own"]["unit"], records["own"]["phase"]), ("", ""))
+        records = self.turn_records(session)
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(record["arm"] == "own" for record in records))
+        self.assertTrue(all(record["reviewer"] == "fixture-review" for record in records), records)
+        self.assertCountEqual([record["status"] for record in records], ["error", "reviewed"])
+        self.assertTrue(all(record["thread_id"] == "thread-fixture" for record in records), records)
+        self.assertTrue(all((record["unit"], record["phase"]) == ("", "3") for record in records))
 
-    def test_code_pool_review_still_starts_and_finishes_a_pass(self) -> None:
+    def test_ignored_code_flag_review_still_starts_and_finishes_a_pass(self) -> None:
         session = self.start_implementation("code-pass")
         self.finish_implementation(session)
         environment = self.pool_fixture()

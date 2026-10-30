@@ -24,7 +24,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review  # noqa: E402
 import showrunners  # noqa: E402
 import unit_move  # noqa: E402
-import update_registration  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
 from unit_move import PathMove  # noqa: E402
 
@@ -43,8 +42,8 @@ LOG_LINE = "- **Log:** "
 def pin_moves(old: str, new: str) -> tuple[PathMove, ...]:
     """Each /next pin file named for the production, existing or not."""
     root = urgency.state_dir()
-    return tuple(PathMove(root / f"{update_registration.scope_queue(f'{kind}-{old}', below)}.json",
-                          root / f"{update_registration.scope_queue(f'{kind}-{new}', below)}.json")
+    return tuple(PathMove(root / f"{urgency.scope_queue(f'{kind}-{old}', below)}.json",
+                          root / f"{urgency.scope_queue(f'{kind}-{new}', below)}.json")
                  for kind in PIN_KINDS for below in (False, True))
 
 

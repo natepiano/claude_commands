@@ -8,7 +8,7 @@ import os
 import sys
 import subprocess
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,14 +16,18 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 import unittest
 
+sys.path.insert(0, str(Path(__file__).parent))
+
 import build_targets
 import build_hold
 import offload
 import mac_test
 import targets
 if TYPE_CHECKING:
+    from ..message import roster
     from ..buildlog import record, store
 else:
+    from scripts.message import roster
     import record
     import store
 from test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
@@ -45,6 +49,17 @@ def pacific_zone() -> Generator[None, None, None]:
         time.tzset()
 
 
+class FolderInvocationTests(unittest.TestCase):
+    def test_folder_invocation_records_hold_events(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "unittest",
+             "test_build_targets.WaitLocalTests.test_hold_and_release_write_temp_log_without_writing_real_log"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class IsolatedBuildTargetTest(IsolatedTargetTest):
     @override
     def setUp(self) -> None:
@@ -60,6 +75,7 @@ class StatusTests(IsolatedBuildTargetTest):
         super().setUp()
         _ = self.enterContext(pacific_zone())
         _ = self.enterContext(mock.patch.object(targets, "utc_now", return_value=NOW))
+        _ = self.enterContext(mock.patch.object(roster, "unit_labels_for", return_value={}))
 
     def capture_status(self, probe: bool = False) -> tuple[int, str, str]:
         output = io.StringIO()
@@ -79,6 +95,101 @@ class StatusTests(IsolatedBuildTargetTest):
             ),
             "mac: running nextest hana since 13:20 PDT",
         )
+
+    def capture_claim_status(self, holder_session: str = "") -> tuple[int, str, str]:
+        self.write_claim("claims/hana.json")
+        if holder_session:
+            path = self.mac_state / "claims" / "hana.json"
+            claim = cast(dict[str, object], json.loads(path.read_text()))
+            claim["holder_session"] = holder_session
+            _ = path.write_text(json.dumps(claim))
+        config = self.write_config(
+            "targets=mac,natedev\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n"
+            + "kind.natedev=local\nplatform.natedev=linux\n",
+        )
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+            return self.capture_status()
+
+    def test_claim_holder_names_showrunner_and_unit_after_since(self) -> None:
+        labels = {"inspector-session": roster.UnitLabels("inspectors", "hana", "inspectors")}
+        with mock.patch.object(roster, "unit_labels_for", return_value=labels) as lookup, \
+             mock.patch.object(roster, "roster", side_effect=AssertionError("no full roster")) as full:
+            code, output, errors = self.capture_claim_status("inspector-session")
+        self.assertEqual((code, errors), (0, ""))
+        self.assertEqual(output,
+            "mac: running nextest hana since 13:05 PDT (showrunner hana, unit inspectors)\nnatedev: free\n")
+        lookup.assert_called_once()
+        self.assertEqual(set(cast(Iterable[str], lookup.call_args.args[0])), {"inspector-session"})
+        full.assert_not_called()
+
+    def test_unknown_claim_holder_preserves_running_text(self) -> None:
+        with mock.patch.object(roster, "unit_labels_for", return_value={}):
+            result = self.capture_claim_status("unknown-session")
+        self.assertEqual(result, (0, "mac: running nextest hana since 13:05 PDT\nnatedev: free\n", ""))
+
+    def test_stale_claim_with_same_description_and_time_cannot_replace_live_holder(self) -> None:
+        for name, holder, started in (
+            ("a-live", "live-session", "test-run-start"),
+            ("z-stale", "stale-session", "ended-run-start"),
+        ):
+            self.write_claim(f"claims/{name}.json")
+            path = self.mac_state / "claims" / f"{name}.json"
+            claim = cast(dict[str, object], json.loads(path.read_text()))
+            claim.update(holder_session=holder, proc_start=started)
+            _ = path.write_text(json.dumps(claim))
+        config = self.write_config("targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n")
+        labels = {
+            "live-session": roster.UnitLabels("report", "builds", "report"),
+            "stale-session": roster.UnitLabels("inspectors", "hana", "inspectors"),
+        }
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"), \
+             mock.patch.object(mac_test, "read_claims", wraps=mac_test.read_claims) as claims_read, \
+             mock.patch.object(roster, "unit_labels_for", return_value=labels) as lookup:
+            result = self.capture_status()
+        self.assertEqual(result, (
+            0, "mac: running nextest hana since 13:05 PDT (showrunner builds, unit report)\n", "",
+        ))
+        lookup.assert_called_once()
+        self.assertEqual(set(cast(Iterable[str], lookup.call_args.args[0])), {"live-session"})
+        claims_read.assert_called_once()
+
+    def test_claim_without_holder_session_does_not_read_labels(self) -> None:
+        with mock.patch.object(roster, "unit_labels_for") as lookup:
+            result = self.capture_claim_status()
+        self.assertEqual(result, (0, "mac: running nextest hana since 13:05 PDT\nnatedev: free\n", ""))
+        lookup.assert_not_called()
+
+    def test_failed_claim_label_lookup_preserves_successful_status(self) -> None:
+        with mock.patch.object(roster, "unit_labels_for", side_effect=RuntimeError("broken registry")):
+            result = self.capture_claim_status("inspector-session")
+        self.assertEqual(result, (0, "mac: running nextest hana since 13:05 PDT\nnatedev: free\n", ""))
+
+    def test_named_hold_uses_the_same_labels_after_since(self) -> None:
+        self.write_holder()
+        _ = (self.holders / "hana").rename(self.holders / "report-session")
+        config = self.write_config("targets=natedev\nkind.natedev=local\nplatform.natedev=linux\n")
+        labels = {"report-session": roster.UnitLabels("report", "builds", "report")}
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+             mock.patch.object(roster, "unit_labels_for", return_value=labels):
+            result = self.capture_status()
+        self.assertEqual(result, (
+            0, "natedev: held by hana since 13:05 PDT (showrunner builds, unit report) — render checks\n", "",
+        ))
+
+    def test_named_mac_hold_uses_current_labels_and_keeps_expiry(self) -> None:
+        self.write_block()
+        config = self.write_config(
+            "targets=mac\nkind.mac=ssh\nplatform.mac=macos\nsettings.mac=mac_test.conf\n",
+        )
+        labels = {"hana-session": roster.UnitLabels("inspectors", "hana", "inspectors")}
+        with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
+             mock.patch.object(roster, "unit_labels_for", return_value=labels):
+            result = self.capture_status()
+        self.assertEqual(result, (
+            0, "mac: held by hana since 13:05 PDT (showrunner hana, unit inspectors) until 15:05 PDT — render checks\n", "",
+        ))
 
     def test_mac_running_status_adds_idle_since_from_claim(self) -> None:
         self.write_claim()
@@ -326,7 +437,8 @@ class StatusTests(IsolatedBuildTargetTest):
                         with mock.patch.object(offload, "probe_reachability", side_effect=reachable):
                             self.assertEqual(
                                 build_targets.probe_target(target),
-                                targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END)),
+                                targets.Held("hana", "render checks", SINCE, targets.ExpiresAt(END),
+                                             targets.HolderSession("hana-session")),
                             )
         reader.assert_called_once_with(self.settings)
         self.assertEqual(calls, [config])

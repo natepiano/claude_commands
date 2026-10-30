@@ -58,6 +58,13 @@ opening in <ReviewPromptContract/>; one to a Codex reviewer also carries item
    (pass or fail, exit code, log path, last lines) arrives as your next
    message, also after an account move or a stop. Never poll, sleep, call
    `wait`, loop on a status file, or post a waiting status.
+   Status 77 means cancelled because the tree changed: resubmit after your
+   edits are done; it is not a test failure.
+   When a later edit or result makes a run of yours useless, cancel it in
+   the same turn: take `pid` from the run's record (the `.json` beside its
+   log), check that `ps -p <pid> -o args=` still shows
+   `mesh_runs.py supervise` with that record's path, then run
+   `kill -TERM -- -<pid>`.
    ```
 
    Every model call resends the worker's whole context, and on 2026-10-15
@@ -143,8 +150,9 @@ them. Command-list order must not make lint a precondition for test. It must
 also say: run only its listed commands, never raw Cargo; run each
 with the sandbox disabled; do not report until every command has exited and its
 output has been read. For a Codex worker, the final report waits for the
-results item 3's runs send. A run that prints `PASS (recorded)` is that gate's result,
-and the log it names is the output to read; add `--no-cache` only to re-run a
+results item 3's runs send. Status 77 means cancelled because the tree changed:
+resubmit after your edits are done; it is not a test failure. A run that prints
+`PASS (recorded)` is that gate's result, and the log it names is the output to read; add `--no-cache` only to re-run a
 passing gate on purpose, as in a flake hunt. If an edited package has no listed `test` line, add that
 package's scoped `verify.sh test` and report it. Omit plan **Style** metadata.
 </WritePromptContract>
