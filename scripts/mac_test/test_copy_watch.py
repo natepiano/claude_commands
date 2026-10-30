@@ -15,7 +15,17 @@ import time
 import unittest
 from unittest import mock
 from collections.abc import Callable
-from typing import TypedDict, cast, final, override
+from typing import TYPE_CHECKING, TypedDict, cast, final, override
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+if TYPE_CHECKING:
+    from ..lib import process_start
+    from ..lib.process_start_test_support import write_stat
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
+    from scripts.lib.process_start_test_support import write_stat
 
 import copy_watch
 import mac_test
@@ -154,6 +164,24 @@ class LineKindTests(unittest.TestCase):
 
 
 class StepProgressTests(unittest.TestCase):
+    def test_group_cleanup_keeps_a_matching_zombie_but_rejects_reuse_and_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            proc = root / "proc"
+            _ = write_stat(proc, 77, start_ticks=123)
+            read_stat = process_start.read_stat
+            def stat(pid: int, proc_root: Path = process_start.PROC_ROOT) -> process_start.ProcessStat | process_start.ProcessGone:
+                _ = proc_root
+                return read_stat(pid, proc)
+            with mock.patch.object(process_start, "read_stat", side_effect=stat), mock.patch.object(os, "getpgid", return_value=77):
+                progress = copy_watch.StepProgress(copy_watch.StepInfo(77, root / "step.log"))
+                _ = write_stat(proc, 77, start_ticks=123, state="Z")
+                self.assertTrue(progress.leader_alive())
+                _ = write_stat(proc, 77, start_ticks=456)
+                self.assertFalse(progress.leader_alive())
+                with mock.patch.object(process_start, "read_stat", side_effect=process_start.ProcessReadError("denied")):
+                    self.assertFalse(progress.leader_alive())
+
     def test_still_compiling_spans_the_first_cargo_line_to_the_starting_line(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "step.log"
@@ -256,7 +284,7 @@ class CandidateTests(unittest.TestCase):
         path = self.directory / f"{call_id}.json"
         record: copy_watch.CandidateRecord = {
             "pid": pid,
-            "proc_start": proc_start if proc_start is not None else mac_test.process_start_time(pid) or "",
+            "proc_start": proc_start if proc_start is not None else cast(process_start.ProcessStart, process_start.process_start(pid)).text,
             "call_started": started,
             "call_id": call_id,
         }
@@ -266,7 +294,7 @@ class CandidateTests(unittest.TestCase):
     def test_newest_live_candidate_wins_and_dead_records_are_removed(self) -> None:
         _ = self.write("v1", self.live_pid(), 100.0)
         _ = self.write("v2", self.live_pid(), 200.0)
-        dead = self.write("v3", self.live_pid(), 300.0, proc_start="gone")
+        dead = self.write("v3", self.live_pid(), 300.0, proc_start="0")
         _ = (self.directory / "damaged.json").write_text("{")
         self.assertEqual(copy_watch.newest_candidate(self.directory), "v2")
         self.assertFalse(dead.exists())
@@ -277,9 +305,45 @@ class CandidateTests(unittest.TestCase):
         _ = self.write("v-b", self.live_pid(), 100.0)
         self.assertEqual(copy_watch.newest_candidate(self.directory), "v-b")
 
+    def test_blank_start_keeps_candidate_selection_running_and_preserves_the_record(self) -> None:
+        blank = self.write("v-blank", 0, 100.0, proc_start="")
+        live = self.write("v-live", self.live_pid(), 200.0)
+        self.assertEqual(copy_watch.newest_candidate(self.directory), "v-live")
+        self.assertTrue(blank.exists())
+        live.unlink()
+        self.assertEqual(copy_watch.newest_candidate(self.directory), "v-blank")
+        self.assertTrue(blank.exists())
+
+    def test_blank_start_claim_is_never_reclaimed_or_signalled(self) -> None:
+        paths = mac_test.StatePaths(self.directory / "state")
+        paths.claims.mkdir(parents=True)
+        path = paths.claims / "repo.json"
+        pid = self.live_pid()
+        for start_text in ("", " \t"):
+            for remote in (False, True):
+                with self.subTest(start=start_text, remote=remote):
+                    record: mac_test.RunRecord = {
+                        "pid": pid, "proc_start": start_text, "what": "copy",
+                        "worktree": str(self.directory), "since": "2026-10-30T00:00:00+00:00",
+                        "copy": True,
+                    }
+                    if remote:
+                        record = {**record, "remote_host": "mac"}
+                    _ = path.write_text(json.dumps(record))
+                    with mock.patch.object(os, "kill") as kill:
+                        claims = mac_test.live_claims(paths)
+                        self.assertEqual(len(claims), 1)
+                        owner = claims[0].record
+                        self.assertFalse(mac_test.run_is_kept(owner))
+                        self.assertFalse(mac_test.copy_gives_way(owner))
+                        mac_test.stop_copy(owner)
+                    kill.assert_not_called()
+                    self.assertTrue(path.exists())
+                    self.assertEqual(owner["proc_start"], start_text)
+
     def test_no_live_candidate_names_none(self) -> None:
         self.assertIsNone(copy_watch.newest_candidate(self.directory))
-        _ = self.write("v1", self.live_pid(), 100.0, proc_start="gone")
+        _ = self.write("v1", self.live_pid(), 100.0, proc_start="0")
         self.assertIsNone(copy_watch.newest_candidate(self.directory))
 
 
@@ -311,7 +375,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = (self.root / "mac.conf").write_text("offload=on\nlinux_only.repo=\n")
         busy: ClaimRecord = {
             "pid": os.getpid(),
-            "proc_start": mac_test.process_start_time(os.getpid()) or "",
+            "proc_start": cast(process_start.ProcessStart, process_start.process_start(os.getpid())).text,
             "what": "nextest other",
             "worktree": str(self.repository),
             "since": datetime.now(timezone.utc).isoformat(),
@@ -513,7 +577,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         newer = self.state / "copy_candidates" / "repo" / "v-newer.json"
         newer.parent.mkdir(parents=True)
         record: copy_watch.CandidateRecord = {
-            "pid": os.getpid(), "proc_start": mac_test.process_start_time(os.getpid()) or "",
+            "pid": os.getpid(), "proc_start": cast(process_start.ProcessStart, process_start.process_start(os.getpid())).text,
             "call_started": 2000.0, "call_id": "v-newer",
         }
         _ = newer.write_text(json.dumps(record))

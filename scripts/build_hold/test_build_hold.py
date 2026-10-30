@@ -17,9 +17,17 @@ from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
-from typing import TypedDict, cast, override
+from typing import TYPE_CHECKING, TypedDict, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+if TYPE_CHECKING:
+    from ..lib.process_start_test_support import write_stat
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib.process_start_test_support import write_stat
 
 import build_hold
 import unit_runs
@@ -283,13 +291,8 @@ class RenameHolderTests(IsolatedBuildHoldTest):
 
 class QuietTests(IsolatedBuildHoldTest):
     def write_process_stat(self, process: build_hold.Process, utime: int, stime: int, started: int = 1) -> Path:
-        path = self.scratch / "proc" / str(process.pid) / "stat"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["0"] * 20
-        fields[0] = "R"
-        fields[11], fields[12], fields[19] = str(utime), str(stime), str(started)
-        _ = path.write_text(f"{process.pid} ({process.command} worker)) " + " ".join(fields) + "\n")
-        return path
+        return write_stat(self.scratch / "proc", process.pid, command=f"{process.command} worker)",
+                          state="R", utime=utime, stime=stime, start_ticks=started)
 
     def test_long_username_cargo_keeps_quiet_check_busy(self) -> None:
         user = "natepiano"
@@ -1641,8 +1644,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
                 environment: dict[str, str] | None = None, argv: tuple[str, ...] = ()) -> Path:
         directory = self.proc / str(pid)
         directory.mkdir(exist_ok=True)
-        fields = ["S", str(parent), *(["0"] * 17), str(start or pid * 10), "0"]
-        _ = (directory / "stat").write_text(f"{pid} ({command}) " + " ".join(fields))
+        _ = write_stat(directory.parent, pid, command=command, ppid=parent, start_ticks=start or pid * 10)
         _ = (directory / "comm").write_text(command + "\n")
         _ = (directory / "cmdline").write_bytes(b"\0".join(arg.encode() for arg in (argv or (command, "test"))) + b"\0")
         _ = (directory / "environ").write_bytes(b"\0".join(f"{key}={value}".encode()
@@ -1732,7 +1734,7 @@ class BuildAuditTests(IsolatedBuildHoldTest):
         def read(path: Path) -> bytes:
             data = read_bytes(path)
             if path == directory / "environ":
-                _ = (directory / "stat").write_text("10 (cargo) S 1 " + "0 " * 17 + "101 0")
+                _ = write_stat(directory.parent, 10, command="cargo", start_ticks=101)
             return data
 
         with mock.patch.object(Path, "read_bytes", read):

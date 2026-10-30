@@ -13,8 +13,11 @@ import tempfile
 import time
 import unittest
 from datetime import datetime
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
+from scripts.lib.process_start_test_support import write_stat
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
@@ -548,8 +551,8 @@ class InventoryTests(ShutdownTestCase):
             object,
             self.enterContext(patch("inventory._process_environment", return_value={})),
         )
-        _process_start_context: object = self.enterContext(
-            patch("inventory._process_start", return_value=CURRENT_PROCESS_START)
+        _ = self.enterContext(
+            patch.object(process_identity, "process_start", return_value=process_identity.parse_start(CURRENT_PROCESS_START))
         )
 
         self.director_pid = os.getpid()
@@ -603,7 +606,7 @@ class InventoryTests(ShutdownTestCase):
     def herdr_process(self, pid: int, parent: int, arguments: list[str], environment: dict[str, str]) -> None:
         process = self.proc / str(pid)
         process.mkdir(exist_ok=True)
-        _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0\n")
+        _ = write_stat(process.parent, int(process.name), ppid=parent)
         _ = (process / "cmdline").write_bytes(("\0".join(arguments) + "\0").encode())
         _ = (process / "environ").write_bytes(
             ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()
@@ -1134,7 +1137,7 @@ elif "comm=" in joined:
         with (patch.object(sys, "platform", "darwin"),
               patch.object(Path, "read_bytes", side_effect=FileNotFoundError),
               patch.object(subprocess, "run", side_effect=process),
-              patch.object(inventory, "_process_start", return_value="supervisor-start")):
+              patch.object(process_identity, "process_start", return_value=process_identity.parse_start("supervisor-start"))):
             host = inventory._terminal_host(101, inventory.DesktopNotInSnapshot(kind="not in snapshot"))  # pyright: ignore[reportPrivateUsage]
             self.assertEqual(host, {"kind": "terminal", "supervisor": {
                 "kind": "supervisor", "pid": 902, "proc_start": "supervisor-start"}})
@@ -1211,10 +1214,10 @@ elif "comm=" in joined:
     def test_reused_pid_with_different_process_start_is_unknown(self) -> None:
         path = self.records / f"{DESKTOP_PID}.json"
         record = cast(dict[str, object], cast(object, json.loads(path.read_text(encoding="utf-8"))))
-        record["procStart"] = "recorded-before-pid-reuse"
+        record["procStart"] = "123"
         _ = path.write_text(json.dumps(record), encoding="utf-8")
 
-        with patch("inventory._process_start", return_value="live-reused-pid-start"):
+        with patch.object(process_identity, "process_start", return_value=process_identity.ProcessStartTime(456)):
             found = inventory.inventory(TARGET_LOGIN)
 
         self.assertNotIn(DESKTOP_ID, {session["session_id"] for session in found["sessions"]})
@@ -1588,8 +1591,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         directory = self.proc / str(pid)
         directory.mkdir()
         _ = (directory / "comm").write_text(command + "\n")
-        fields = ["S", "1", "1", "1", str(terminal), *("0" for _ in range(14)), "12345"]
-        _ = (directory / "stat").write_text(f"{pid} (fixture) " + " ".join(fields))
+        _ = write_stat(self.proc, pid, start_ticks=12345, tty_nr=terminal)
         _ = (directory / "cmdline").write_bytes(("\0".join(arguments or [command]) + "\0").encode())
         _ = (directory / "environ").write_bytes(("\0".join(f"{key}={value}" for key, value in
             (environment or {}).items()) + "\0").encode())
@@ -1616,7 +1618,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         _ = cast(object, self.enterContext(patch.object(sys, "platform", "darwin")))
         _ = cast(object, self.enterContext(patch.object(herdr, "_PLATFORM", "darwin")))
         _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HERDR_PS": fake, "HERDR_LSOF": fake, "SHUTDOWN_SYSCTL": fake,
+            "HERDR_PS": fake, "HERDR_LSOF": fake, "SHUTDOWN_SYSCTL": fake, "HERDR_PROC": "/proc",
             "XDG_CONFIG_HOME": str(self.root / ".config"),
         })))
         # Unit lookup's registry liveness is independent of this synthetic PID.
@@ -1648,17 +1650,35 @@ class RecoveryInventoryTests(unittest.TestCase):
                            f"CODEX_HOME={self.root}/.codex" if pid == 2001 else "")
             responses[f"-o command= -p {pid}"] = {"code": 0, "stdout": command + "\n"}
             responses[f"eww -o command= -p {pid}"] = {"code": 0, "stdout": command + " " + environment + "\n"}
-            responses[f"-o lstart=,tty= -p {pid}"] = {"code": 0, "stdout": "Thu Oct 15 12:00:00 2026 ttys001\n"}
+            responses[f"-o lstart= -p {pid}"] = {"code": 0, "stdout": "Thu Oct 15 12:00:00 2026\n"}
+            responses[f"-o stat= -p {pid}"] = {"code": 0, "stdout": "S\n"}
+            responses[f"-o tty= -p {pid}"] = {"code": 0, "stdout": "ttys001\n"}
             responses[f"-a -p {pid} -d cwd -Fn"] = {"code": 0, "stdout": f"p{pid}\nn{self.root}\n"}
         responses["-a -p 2001 -Fn"] = {"code": 0,
             "stdout": f"p2001\nf8\nn{self.root}/.codex/sessions/2026/rollout-date-{OTHER_ID}.jsonl\n"}
         _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
         # Fail on even an attempted proc read, including swallowed fallback reads.
-        read_bytes, read_text, iterdir = Path.read_bytes, Path.read_text, Path.iterdir
+        read_bytes, read_text, iterdir, stat = Path.read_bytes, Path.read_text, Path.iterdir, Path.stat
+        run = subprocess.run
 
         def forbid_proc(path: Path) -> None:
             if path.is_relative_to(self.proc) or path.is_relative_to(Path("/proc")):
                 self.fail(f"Darwin observation tried to read {path}")
+
+        def checked_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+            if path == process_identity.PROC_ROOT:
+                raise FileNotFoundError("Mac has no proc")
+            return stat(path, follow_symlinks=follow_symlinks)
+
+        def ps(command: Sequence[str], *, capture_output: bool, text: bool, check: bool, timeout: float,
+               env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+            if command[0] != "ps":
+                return run(command, capture_output=capture_output, text=text, check=check, timeout=timeout, env=env)
+            self.assertTrue(capture_output and text)
+            self.assertFalse(check)
+            self.assertEqual(timeout, 5)
+            self.assertEqual((env["LC_ALL"], env["TZ"]), ("C", "UTC"))
+            return herdr.run_program([fake, *command[1:]], timeout=timeout, environment=env)
 
         def checked_bytes(path: Path) -> bytes:
             forbid_proc(path)
@@ -1672,6 +1692,8 @@ class RecoveryInventoryTests(unittest.TestCase):
             forbid_proc(path)
             return iterdir(path)
 
+        _ = self.enterContext(patch.object(Path, "stat", checked_stat))
+        _ = self.enterContext(patch.object(subprocess, "run", ps))
         _ = self.enterContext(patch.object(Path, "read_bytes", checked_bytes))
         _ = self.enterContext(patch.object(Path, "read_text", checked_text))
         _ = self.enterContext(patch.object(Path, "iterdir", checked_iterdir))
@@ -1724,6 +1746,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         key = "-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm="
         responses[key]["stdout"] = "".join(line + "\n" for line in responses[key]["stdout"].splitlines()
             if not line.startswith(("400 ", "300 ", "2001 ", "2002 ")))
+        responses["-o lstart= -p 400"] = {"code": 1, "stdout": ""}
         _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
         lost = inventory.snapshot_inventory()
         assert isinstance(lost, inventory.CompleteInventory), lost
@@ -1781,6 +1804,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         _ = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")
         responses[key]["stdout"] = "".join(line + "\n" for line in responses[key]["stdout"].splitlines()
             if not line.startswith(("500 ", "501 ")))
+        responses["-o lstart= -p 500"] = {"code": 1, "stdout": ""}
         responses["--session default session list --json"]["stdout"] = '{"sessions":[]}'
         responses["-n -P -a -U -u " + str(os.getuid()) + " -F pfn"]["stdout"] = ""
         _ = (self.root / "herdr-responses.json").write_text(json.dumps(responses))
@@ -1814,7 +1838,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         keys = ("-n kern.bootsessionuuid", "-U " + str(os.getuid()) + " -o pid=,ppid=,uid=,comm=",
                 "-U " + str(os.getuid()) + " -o pid=,command=",
                 "-n -P -a -U -u " + str(os.getuid()) + " -F pfn", "eww -o command= -p 1001",
-                "-a -p 1001 -d cwd -Fn", "-a -p 2001 -d cwd -Fn", "-a -p 2001 -Fn", "-o lstart=,tty= -p 1001")
+                "-a -p 1001 -d cwd -Fn", "-a -p 2001 -d cwd -Fn", "-a -p 2001 -Fn", "-o lstart= -p 1001", "-o tty= -p 1001")
         for key in keys:
             original = responses[key]
             responses[key] = {"code": 1, "stdout": "", "stderr": "fixture source denied"}
@@ -1933,6 +1957,14 @@ class RecoveryInventoryTests(unittest.TestCase):
         assert isinstance(absent, inventory.CompleteInventory)
         self.assertEqual(absent.sessions, {})
 
+    def test_snapshot_excludes_zombie_sessions_without_marking_the_inventory_partial(self) -> None:
+        self.claude()
+        _ = write_stat(self.proc, 1001, start_ticks=12345, state="Z", tty_nr=7)
+        found = inventory.snapshot_inventory()
+        self.assertIsInstance(found, inventory.CompleteInventory)
+        assert isinstance(found, inventory.CompleteInventory)
+        self.assertEqual(found.sessions, {})
+
     def test_unreadable_production_registration_is_a_source_failure(self) -> None:
         self.claude()
         production = self.notifier / "showrunner-show"
@@ -2004,8 +2036,7 @@ class RecoveryInventoryTests(unittest.TestCase):
         # 20:30 EDT on October 15 is already October 16 in UTC.
         started = datetime.fromisoformat("2026-10-16T00:30:00+00:00")
         _ = (self.proc / "stat").write_text(f"btime {int(started.timestamp())}\n")
-        stat = process / "stat"
-        _ = stat.write_text(stat.read_text().rsplit(" ", 1)[0] + " 0")
+        _ = write_stat(self.proc, int(process.name), start_ticks=0, tty_nr=7)
         home = self.root / ".codex"
         _ = self.codex_rollout(home, OTHER_ID, day="2026/10/15", timestamp="2026-10-16T00:31:00Z")
         self.assertEqual(self.observed_codex_resume(), record.CodexSessionId(kind="session id", session_id=OTHER_ID))
@@ -2033,8 +2064,7 @@ class RecoveryInventoryTests(unittest.TestCase):
     def test_codex_closed_rollout_before_process_birth_or_in_another_cwd_is_ignored(self) -> None:
         process = self.process(2001, command="codex")
         # Born two seconds after boot; a one-second-old session predates this process.
-        stat = process / "stat"
-        _ = stat.write_text(stat.read_text().rsplit(" ", 1)[0] + f" {2 * os.sysconf('SC_CLK_TCK')}")
+        _ = write_stat(self.proc, int(process.name), start_ticks=2 * os.sysconf("SC_CLK_TCK"), tty_nr=7)
         _ = self.codex_rollout(self.root / ".codex", OTHER_ID, timestamp="2026-10-15T12:00:01Z")
         _ = self.codex_rollout(self.root / ".codex", UNKNOWN_ID, cwd=str(self.root / "other"))
         self.assertEqual(self.observed_codex_resume(), record.CodexResumePicker(kind="picker"))
@@ -2199,8 +2229,7 @@ class RecoveryInventoryTests(unittest.TestCase):
     def test_terminal_process_loss_retains_recovery_but_agent_exit_alone_does_not(self) -> None:
         self.claude()
         terminal = self.process(3001, command="ghostty")
-        agent = self.proc / "1001/stat"
-        _ = agent.write_text(agent.read_text().replace("S 1 ", "S 3001 ", 1))
+        _ = write_stat(self.proc, 1001, start_ticks=12345, ppid=3001, tty_nr=7)
         first = inventory.snapshot_inventory()
         assert isinstance(first, inventory.CompleteInventory), first
         saved = record.merge_snapshots(first, "2026-10-15T12:00:00+00:00")[0]

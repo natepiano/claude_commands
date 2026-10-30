@@ -169,6 +169,98 @@ class EndSessionTests(unittest.TestCase):
         self.assertTrue((other / "p62_bin").is_dir())
         self.assertFalse(self.marker.exists())
 
+    def test_failed_unbind_cleans_other_runs_and_rerun_retries_only_failures(self) -> None:
+        failed = self.make_run("run-failed", self.session_id)
+        successful = self.make_run("run-successful", self.session_id)
+        _ = self.marker.write_text(f"{failed}\n")
+        fault = self.root / "fail-unbind"
+        fault.touch()
+        shim = self.root / ".claude/scripts/lib/py"
+        source = shim.read_text()
+        source = source.replace("case \"$1\" in", (
+            'if [[ "$1" == */design_roles.py && "$3" == "' + str(failed) +
+            '" && -f "' + str(fault) + '" ]]; then\n'
+            + "  printf '%s\\n' \"$*\" >> \"${END_SESSION_CALLS}\"\n  exit 1\nfi\n" +
+            'case "$1" in'))
+        _ = shim.write_text(source)
+        first = subprocess.run(["bash", str(self.script)], check=False, capture_output=True,
+                               text=True, env=self.environment())
+        self.assertNotEqual(first.returncode, 0)
+        self.assertIn(str(failed), first.stderr)
+        self.assertFalse((successful / "verify_cache").exists())
+        self.assertTrue((failed / "verify_cache").exists())
+        before = self.calls.read_text().splitlines()
+        fault.unlink()
+        second = subprocess.run(["bash", str(self.script)], check=False, capture_output=True,
+                                text=True, env=self.environment())
+        self.assertEqual(second.returncode, 0, second.stderr)
+        retried = self.calls.read_text().splitlines()[len(before):]
+        self.assertEqual([call.split()[-1] for call in retried if "unbind-run" in call], [str(failed)])
+        self.assertNotIn(str(successful), "\n".join(retried))
+        self.assertFalse((failed / "verify_cache").exists())
+        self.assertFalse(self.marker.exists())
+
+    def inject_cleanup_failure(self, step: str, run: Path) -> Path:
+        fault = self.root / "cleanup-fault"
+        fault.touch()
+        shim = self.root / ".claude/scripts/lib/py"
+        source = shim.read_text()
+        failure = (
+            'if [[ "$1" == */' + step + ' && "$*" == *"' + str(run) + '"*'
+            + ' && -f "' + str(fault) + '" ]]; then\n'
+            + '  printf \'%s\\n\' "$*" >> "${END_SESSION_CALLS}"\n'
+            + '  echo "injected cleanup failure" >&2\n  exit 1\nfi\n')
+        _ = shim.write_text(source.replace('case "$1" in', failure + 'case "$1" in'))
+        return fault
+
+    def test_retry_also_cleans_a_run_started_after_the_failure(self) -> None:
+        failed = self.make_run("run-failed", self.session_id)
+        successful = self.make_run("run-successful", self.session_id)
+        _ = self.marker.write_text(f"{failed}\n")
+        fault = self.inject_cleanup_failure("design_roles.py", failed)
+        first = subprocess.run(["bash", str(self.script)], check=False, capture_output=True,
+                               text=True, env=self.environment())
+        self.assertNotEqual(first.returncode, 0)
+        self.assertFalse((successful / "verify_cache").exists())
+        added = self.make_run("run-new", self.session_id)
+        _ = self.marker.write_text(f"{added}\n")
+        before = self.calls.read_text().splitlines()
+        fault.unlink()
+        second = subprocess.run(["bash", str(self.script)], check=False, capture_output=True,
+                                text=True, env=self.environment())
+        self.assertEqual(second.returncode, 0, second.stderr)
+        retried = self.calls.read_text().splitlines()[len(before):]
+        unbinds = [call.split()[-1] for call in retried if "unbind-run" in call]
+        self.assertCountEqual(unbinds, [str(failed), str(added)])
+        self.assertFalse((added / "verify_cache").exists())
+        self.assertFalse((failed / "verify_cache").exists())
+        self.assertNotIn(str(successful), "\n".join(retried))
+        self.assertFalse(self.marker.exists())
+
+    def test_failed_cleanup_steps_remain_pending_until_the_same_command_succeeds(self) -> None:
+        for step in ("remove_workers.py", "codex_mesh.py", "remove_run_scratch.py"):
+            with self.subTest(step=step):
+                run = self.make_run(step + "-run", self.session_id)
+                _ = self.marker.write_text(f"{run}\n")
+                fault = self.inject_cleanup_failure(step, run)
+                first = subprocess.run(["bash", str(self.script)], check=False, capture_output=True,
+                                       text=True, env=self.environment())
+                self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+                self.assertIn(str(run), first.stderr)
+                self.assertTrue(self.marker.exists())
+                pending = Path(str(self.marker) + ".cleanup")
+                self.assertIn(str(run), pending.read_text().splitlines())
+                before = self.calls.read_text().splitlines()
+                fault.unlink()
+                second = subprocess.run(["bash", str(self.script)], check=False, capture_output=True,
+                                        text=True, env=self.environment())
+                self.assertEqual(second.returncode, 0, second.stderr)
+                retried = self.calls.read_text().splitlines()[len(before):]
+                self.assertTrue(any(step in call and str(run) in call for call in retried))
+                self.assertFalse((run / "verify_cache").exists())
+                self.assertFalse(self.marker.exists())
+                self.assertFalse(pending.exists())
+
     def test_held_runs_are_cleaned_after_the_marker_is_gone(self) -> None:
         side = self.make_run("run-side", self.session_id)
         other = self.make_run("run-other", "another-director")

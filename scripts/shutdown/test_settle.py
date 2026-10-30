@@ -21,6 +21,9 @@ from collections.abc import Callable, Generator, Sequence
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
+
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final, override
 from unittest.mock import Mock, call, patch
 
@@ -695,7 +698,7 @@ class SettleTests(ShutdownTestCase):
             patch.object(sys, "platform", "linux"),
             patch.dict(os.environ, {"REFUSAL_WATCH_INVENTORY": "refresh"}),
             patch.object(sessions, "live_sessions", return_value=[registered]),
-            patch.object(inventory, "_record_matches_process", return_value=True),
+            patch.object(inventory, "_record_owner", return_value=process_identity.OwnerCheck.ALIVE),
             patch.object(inventory, "_configuration_for_session", return_value=
                 inventory.AttributedSessionConfiguration(Account("claude", LOGIN, LABEL), self.root / ".claude")),
             patch.object(inventory, "_checkout", return_value=owner["checkout"]),

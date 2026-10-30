@@ -16,6 +16,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 
+if TYPE_CHECKING:
+    from ..lib.process_start_test_support import write_stat
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib.process_start_test_support import write_stat
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cli
@@ -89,8 +95,7 @@ class MacIdleTests(unittest.TestCase):
     def process(self, pid: int, parent: int, start: str, argv: tuple[str, ...], env: dict[str, str] | None = None) -> None:
         path = self.paths.proc / str(pid)
         path.mkdir(exist_ok=True)
-        fields = ["S", str(parent), *(["0"] * 17), start]
-        _ = (path / "stat").write_text(f"{pid} (test) " + " ".join(fields))
+        _ = write_stat(path.parent, pid, command="test", ppid=parent, start_ticks=int(start))
         _ = (path / "cmdline").write_bytes(b"\0".join(word.encode() for word in argv))
         _ = (path / "environ").write_bytes(b"\0".join(f"{key}={value}".encode() for key, value in (env or {}).items()))
         cwd = path / "cwd"
@@ -149,7 +154,7 @@ class MacIdleTests(unittest.TestCase):
                 self.assertEqual(self.rows(), [])
 
     def test_unreadable_and_stale_records_are_named_without_hiding_a_live_waiter(self) -> None:
-        step_record.write(step_record.StepRecord("stale-call", 123, "old-start", Path(self.call.repo),
+        step_record.write(step_record.StepRecord("stale-call", 123, "0", Path(self.call.repo),
             "check", None, step_record.MacAllowed(), step_record.StepState.WAITING_MAC, "2026-10-28T22:00:00Z"))
         damaged = step_record.record_path("damaged-call")
         _ = damaged.write_text("{")

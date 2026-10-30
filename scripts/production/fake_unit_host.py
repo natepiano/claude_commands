@@ -8,6 +8,9 @@ import unittest
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
+from scripts.lib.process_start_test_support import write_stat
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
@@ -43,7 +46,7 @@ def environment(root: Path) -> dict[str, str]:
 def process(env: Mapping[str, str], pid: int, parent: int, argv: Sequence[str], marks: Mapping[str, str]) -> None:
     directory = Path(env["HERDR_PROC"]) / str(pid)
     directory.mkdir(parents=True, exist_ok=True)
-    _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+    _ = write_stat(directory.parent, int(directory.name), ppid=parent)
     _ = (directory / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
     _ = (directory / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in marks.items()).encode())
     cwd = directory / "cwd"
@@ -89,7 +92,10 @@ def place_process(env: Mapping[str, str], pid: int, pane: str) -> None:
         raw = (directory / "environ").read_bytes().decode().split("\0")
         marks = dict(item.split("=", 1) for item in raw if "=" in item)
         if marks.get("HERDR_PANE_ID") == pane:
-            parent = int((directory / "stat").read_text().split()[3])
+            stat = process_identity.read_stat(int(directory.name), directory.parent)
+            if isinstance(stat, process_identity.ProcessGone):
+                continue
+            parent = stat.ppid
             process(env, pid, parent, ["claude"], marks)
             return
     raise AssertionError(f"no hosted pane {pane}")

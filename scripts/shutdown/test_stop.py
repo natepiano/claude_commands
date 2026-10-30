@@ -13,8 +13,12 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from functools import partial
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
+from scripts.lib.process_start_test_support import write_stat
 from collections.abc import Callable
 from typing import Literal, cast, final, override
 from unittest.mock import patch
@@ -281,6 +285,14 @@ class StopTests(ShutdownTestCase):
         del environment
         self.herdr_replies([])
         _ = self.enterContext(patch.object(settle, "record_time", return_value=NOW))
+        read_start = process_identity.process_start
+
+        def fixture_start(pid: int, proc_root: Path = process_identity.PROC_ROOT) -> process_identity.ProcessStart | process_identity.ProcessGone:
+            if proc_root == process_identity.PROC_ROOT and pid != os.getpid():
+                return process_identity.ProcessGone(pid)
+            return read_start(pid, proc_root)
+
+        _ = self.enterContext(patch.object(process_identity, "process_start", side_effect=fixture_start))
 
     def create(self, records: list[record.SessionShutdown]) -> None:
         for item in records:
@@ -545,7 +557,7 @@ class StopTests(ShutdownTestCase):
                 patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(())),
                 patch.object(inventory, "_unit_sessions", return_value={}),
                 patch.object(inventory, "_active_run_directories", return_value={}),
-                patch.object(inventory, "_record_matches_process", return_value=reason != "process start mismatch"),
+                patch.object(inventory, "_record_owner", return_value=process_identity.OwnerCheck.REPLACED if reason == "process start mismatch" else process_identity.OwnerCheck.ALIVE),
                 patch.object(inventory, "_configuration_for_session", return_value=inventory.UnreadableSessionConfiguration()),
                 patch.object(inventory, "_snapshot_desktops") as snapshot,
                 patch.object(inventory, "label_for", return_value=LABEL),
@@ -733,9 +745,50 @@ class StopTests(ShutdownTestCase):
                 saved = record.find_session(LOGIN, session_id)
                 assert saved is not None
                 killed: list[int] = []
-                with patch.object(sessions, 'process_start', return_value=running_start):
+                with patch.object(process_identity, 'process_start', return_value=process_identity.parse_start(running_start)):
                     _ = stop.stop_session(saved, forced=True, kill=lambda pid, _signal: killed.append(pid), is_alive=lambda _pid: False, fresh_inventory=lambda _login, _scope: machine_inventory([], unattributed=[unattributed]), clock=lambda: NOW_UTC, codex_mesh=lambda _arguments: 0,  sleep=lambda _seconds: None, session_record_exists=lambda _pid: False)
                 self.assertEqual(killed, expected)
+
+    def assert_forced_owner_not_signalled(self, proc: Path, recorded_start: str,
+                                        expected_progress: Literal["stop failed", "already gone"]) -> None:
+        owner = top_level("owner-check", os.getpid())
+        owner["proc_start"] = recorded_start
+        self.create(records_for_test([entry(owner)]))
+        with patch.object(process_identity, "check_owner", partial(process_identity.check_owner, proc_root=proc)):
+            finished = stop.stop_session(self.stored_record(), forced=True,
+                kill=lambda pid, sent: self.fail(f"unconfirmed owner was signalled: {pid} {sent}"),
+                is_alive=lambda pid: True, session_record_exists=lambda pid: True,
+                fresh_inventory=lambda login, scope: machine_inventory([]),
+                clock=lambda: NOW_UTC, codex_mesh=lambda arguments: 0, sleep=lambda seconds: None)
+        self.assertEqual(finished["progress"]["kind"], expected_progress)
+        self.assertEqual(finished["session"]["proc_start"], recorded_start)
+        self.assertIsNotNone(record.find_session(LOGIN, "owner-check"))
+
+    def test_forced_stop_keeps_owner_when_its_process_stat_is_unreadable(self) -> None:
+        started = process_identity.process_start(os.getpid())
+        assert not isinstance(started, process_identity.ProcessGone)
+        proc = self.root / "proc"
+        stat = write_stat(proc, os.getpid())
+        _ = stat.write_text("malformed process stat")
+        self.assert_forced_owner_not_signalled(proc, started.text, "stop failed")
+
+    def test_forced_stop_never_signals_a_reused_linux_pid(self) -> None:
+        started = process_identity.process_start(os.getpid())
+        assert isinstance(started, process_identity.ProcessStartTime)
+        proc = self.root / "proc"
+        _ = write_stat(proc, os.getpid(), start_ticks=started.ticks + 1)
+        self.assert_forced_owner_not_signalled(proc, started.text, "already gone")
+        with patch.object(process_identity, "check_owner", partial(process_identity.check_owner, proc_root=proc)):
+            self.assertIsInstance(sessions.process_liveness(os.getpid(), started.text), sessions.SessionNotLive)
+
+    def test_forced_stop_never_signals_a_gone_pid(self) -> None:
+        started = process_identity.process_start(os.getpid())
+        assert not isinstance(started, process_identity.ProcessGone)
+        proc = self.root / "proc"
+        proc.mkdir()
+        self.assert_forced_owner_not_signalled(proc, started.text, "already gone")
+        with patch.object(process_identity, "check_owner", partial(process_identity.check_owner, proc_root=proc)):
+            self.assertIsInstance(sessions.process_liveness(os.getpid(), started.text), sessions.SessionNotLive)
 
     def test_now_pauses_codex_run_without_ending_busy_workers(self) -> None:
         run_dir = str(self.root / 'run')
@@ -763,7 +816,7 @@ class StopTests(ShutdownTestCase):
         for pid, parent, argv in ((800, 801, ["python3", "codex_mesh.py", "start"]), (801, 1, launcher)):
             path = proc / str(pid)
             path.mkdir(parents=True)
-            _ = (path / "stat").write_text(f"{pid} (fixture) S {parent} 0 0\n")
+            _ = write_stat(path.parent, int(path.name), ppid=parent)
             _ = (path / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
         roster = run / "mesh_roster.json"
         _ = roster.write_text(json.dumps({
@@ -1261,7 +1314,7 @@ class StopTests(ShutdownTestCase):
         def kill(pid: int, sent: int) -> None:
             self.assertTrue(hold.is_file(), "supervisor could exit before the hold is written")
             signals.append((pid, sent))
-        with (patch.object(inventory, "_process_start", return_value="supervisor-start"),
+        with (patch.object(process_identity, "process_start", return_value=process_identity.parse_start("supervisor-start")),
               patch.object(stop, "_ghostty_still_owns_shell", return_value=True)):
             finished = stop.stop_session(saved, kill=kill, is_alive=lambda pid: pid in {901, 902},
                 session_record_exists=lambda _pid: False,
@@ -1285,7 +1338,7 @@ class StopTests(ShutdownTestCase):
             self.assertTrue(hold.is_file(), "hold must precede the Claude signal")
             signals.append((pid, sent))
         with (patch.object(sys, "platform", "darwin"),
-              patch.object(inventory, "_process_start", return_value="supervisor-start")):
+              patch.object(process_identity, "process_start", return_value=process_identity.parse_start("supervisor-start"))):
             finished = stop.stop_session(saved, kill=kill, is_alive=lambda pid: pid == 902,
                 session_record_exists=lambda _pid: False,
                 fresh_inventory=lambda _login, _only: machine_inventory([owner]),
@@ -1304,7 +1357,7 @@ class StopTests(ShutdownTestCase):
         saved["then"] = "restart"
         self.create([saved])
         signals: list[tuple[int, int]] = []
-        with (patch.object(inventory, "_process_start", return_value="supervisor-start"),
+        with (patch.object(process_identity, "process_start", return_value=process_identity.parse_start("supervisor-start")),
               patch.object(relaunch, "write_hold", side_effect=PermissionError("state is read only"))):
             finished = stop.stop_session(saved, kill=lambda pid, sent: signals.append((pid, sent)),
                 is_alive=lambda pid: pid in {101, 901, 902},
@@ -1332,7 +1385,7 @@ class StopTests(ShutdownTestCase):
                 saved["then"] = "restart" if then == "restart" else "stop"
                 self.create([saved])
                 signals: list[tuple[int, int]] = []
-                with (patch.object(inventory, "_process_start", return_value=actual_start),
+                with (patch.object(process_identity, "process_start", return_value=process_identity.parse_start(actual_start) if actual_start else process_identity.ProcessGone(902)),
                       patch.object(stop, "_ghostty_still_owns_shell", return_value=True)):
                     finished = stop.stop_session(saved,
                         kill=lambda pid, sent: signals.append((pid, sent)),

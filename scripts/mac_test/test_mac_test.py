@@ -24,6 +24,16 @@ from typing import TYPE_CHECKING, NotRequired, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+if TYPE_CHECKING:
+    from ..lib import process_start
+    from ..lib.process_start_test_support import write_stat, process_start_probe
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
+    from scripts.lib.process_start_test_support import write_stat, process_start_probe
+
 import mac_test
 
 if TYPE_CHECKING:
@@ -533,8 +543,7 @@ class MacTestCommandTests(unittest.TestCase):
         deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         process_name = b""
         while time.monotonic() < deadline:
-            stat = Path(f"/proc/{child.pid}/stat").read_bytes()
-            process_name = stat[stat.find(b"(") + 1 : stat.rfind(b")")]
+            process_name = Path(f"/proc/{child.pid}/comm").read_bytes().rstrip(b"\n")
             if process_name == name:
                 break
             time.sleep(0.01)
@@ -941,7 +950,7 @@ class MacTestCommandTests(unittest.TestCase):
 
     def test_run_reader_accepts_old_record_and_decodes_idle_fields(self) -> None:
         self.state_directory.mkdir()
-        record: RunState = {"pid": os.getpid(), "proc_start": "owner-start", "what": "tests",
+        record: RunState = {"pid": os.getpid(), "proc_start": "123", "what": "tests",
                             "worktree": str(self.root), "since": "2026-10-13T12:00:00+00:00"}
         path = self.state_directory / "run.json"
         _ = path.write_text(json.dumps(record))
@@ -985,7 +994,7 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertEqual(taken.stdout + taken.stderr, "leftovers: previous-mac\n")
         after = self.run_state()
         self.assertEqual(after["pid"], taker.pid)
-        self.assertEqual(after["proc_start"], mac_test.process_start_time(taker.pid))
+        self.assertEqual(after["proc_start"], cast(process_start.ProcessStart, process_start.process_start(taker.pid)).text)
         self.assertEqual({key: value for key, value in after.items() if key not in ("pid", "proc_start")},
                          {key: value for key, value in previous.items() if key not in ("pid", "proc_start")})
         refused = self.command("claim", "--pid", str(other.pid), "--what", "third tests", "--remote", "third-mac")
@@ -1030,7 +1039,7 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertEqual(self.run_state()["pid"], taker.pid)
 
     def test_run_record_without_remote_host_still_decodes_with_mapping_access(self) -> None:
-        started = mac_test.process_start_time(os.getpid())
+        started = cast(process_start.ProcessStart, process_start.process_start(os.getpid())).text
         self.assertIsNotNone(started)
         assert started is not None
         record: RunState = {"pid": os.getpid(), "proc_start": started, "what": "legacy tests",
@@ -1257,7 +1266,7 @@ class MacTestCommandTests(unittest.TestCase):
         self.assertIsNone(first.poll())
 
     def write_machine_wide_record(self, owner: int, worktree: Path) -> RunState:
-        started = mac_test.process_start_time(owner)
+        started = cast(process_start.ProcessStart, process_start.process_start(owner)).text
         assert started is not None
         record: RunState = {"pid": owner, "proc_start": started, "what": "older tests",
                             "worktree": str(worktree), "since": datetime.now(timezone.utc).isoformat()}
@@ -2825,13 +2834,13 @@ class ClaimWatchTests(unittest.TestCase):
             "BUILD_HOLD_DIR": str(self.root / "holders"), "BUILDLOG_DIR": str(self.root / "buildlog"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })))
-        _ = self.enterContext(mock.patch.object(mac_test, "process_start_time", return_value="owner-start"))
+        _ = self.enterContext(mock.patch.object(process_start, "process_start", return_value=process_start.parse_start("123")))
         _ = self.enterContext(mock.patch.object(subprocess, "run", side_effect=AssertionError("Unexpected external command")))
         _ = self.enterContext(mock.patch.object(subprocess, "Popen", side_effect=AssertionError("Unexpected external command")))
 
     def write_claim(self, **changes: object) -> dict[str, object]:
         record: dict[str, object] = {
-            "pid": os.getpid(), "proc_start": "owner-start", "what": "alpha tests",
+            "pid": os.getpid(), "proc_start": "123", "what": "alpha tests",
             "worktree": str(self.root), "since": "2026-10-13T12:00:00+00:00",
             "remote_host": "claim-mac", "holder_session": "holder-session", **changes,
         }
@@ -2886,7 +2895,7 @@ class ClaimWatchTests(unittest.TestCase):
         _ = record.pop("remote_host")
         _ = self.paths.run.write_text(json.dumps(record))
         before = self.paths.run.read_bytes()
-        with mock.patch.object(mac_test, "process_start_time", return_value="different-process"), \
+        with mock.patch.object(process_start, "process_start", return_value=process_start.parse_start("456")), \
              mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
              mock.patch.object(mac_test, "write_json") as write, \
              mock.patch.object(mac_test, "send_message") as send:
@@ -2902,7 +2911,7 @@ class ClaimWatchTests(unittest.TestCase):
         _ = record.pop("remote_host")
         _ = self.paths.run.write_text(json.dumps(record))
         before = self.paths.run.read_bytes()
-        with mock.patch.object(mac_test, "process_start_time", side_effect=["owner-start", "different-process"]), \
+        with mock.patch.object(process_start, "process_start", side_effect=[process_start.ProcessStartTime(123), process_start.ProcessStartTime(456)]), \
              mock.patch.object(mac_test, "check_mac_activity", return_value=mac_test.MacIdle()) as activity, \
              mock.patch.object(mac_test, "write_json") as write, \
              mock.patch.object(mac_test, "send_message") as send:
@@ -2989,7 +2998,7 @@ class ClaimWatchTests(unittest.TestCase):
         records: dict[str, dict[str, object]] = {}
         for name in ("hana", "cargo-liner"):
             record: dict[str, object] = {
-                "pid": os.getpid(), "proc_start": "owner-start", "what": f"{name} tests",
+                "pid": os.getpid(), "proc_start": "123", "what": f"{name} tests",
                 "worktree": f"/work/{name}", "since": "2026-10-13T12:00:00+00:00",
                 "remote_host": "claim-mac", "holder_session": "holder-session",
             }
@@ -3130,6 +3139,40 @@ class ClaimWatchTests(unittest.TestCase):
         _ = path.write_text("host=other-mac\nclaim_idle_minutes=0.5\nclaim_poll_seconds=2\n")
         config = mac_test.read_config()
         self.assertEqual((config.claim_idle_minutes, config.claim_poll_seconds), (0.5, 2))
+
+
+class ClaimIdentityTests(unittest.TestCase):
+    def test_unknown_owner_keeps_claim_and_reused_or_gone_owner_is_reclaimed_without_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            proc = root / "proc"
+            stat = write_stat(proc, 77, start_ticks=123)
+            paths = mac_test.StatePaths(root / "state")
+            paths.directory.mkdir()
+            record: mac_test.ProcessBoundClaim = {
+                "pid": 77, "proc_start": "123", "what": "copy", "worktree": str(root),
+                "since": "2026-10-30T00:00:00+00:00", "copy": True,
+            }
+            start = process_start_probe(proc)
+            for state in ("unknown", "replaced", "gone"):
+                with self.subTest(state=state):
+                    mac_test.write_json(paths.run, record)
+                    if state == "replaced":
+                        _ = write_stat(proc, 77, start_ticks=456)
+                    elif state == "gone":
+                        stat.unlink()
+                    with mock.patch.object(process_start, "process_start", side_effect=start), \
+                         mock.patch.object(os, "kill") as kill:
+                        if state == "unknown":
+                            with mock.patch.object(process_start, "read_stat", side_effect=process_start.ProcessReadError("denied")):
+                                claims = mac_test.live_claims(paths)
+                                mac_test.stop_copy(record)
+                        else:
+                            claims = mac_test.live_claims(paths)
+                            mac_test.stop_copy(record)
+                    self.assertEqual(len(claims), 1 if state == "unknown" else 0)
+                    self.assertEqual(paths.run.exists(), state == "unknown")
+                    kill.assert_not_called()
 
 
 if __name__ == "__main__":

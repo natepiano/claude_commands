@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -15,6 +17,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
 from typing import cast, override
+
+from scripts.lib import process_start
+from scripts.lib.process_start_test_support import write_stat
 
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
@@ -99,6 +104,82 @@ class BoardReclaimTests(unittest.TestCase):
     def assert_busy(self, result: subprocess.CompletedProcess[str], holder: str = "holder") -> None:
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn(f"busy cargo held by {holder}", result.stderr)
+
+    def test_group_cleanup_keeps_unknown_and_drops_replaced_or_gone_leaders_without_signals(self) -> None:
+        for outcome in ("unknown", "replaced", "gone"):
+            with self.subTest(outcome=outcome):
+                group = subprocess.Popen(["sleep", "600"], start_new_session=True)
+                self.addCleanup(self.stop_holder, group)
+                start = process_start.process_start(group.pid)
+                if isinstance(start, process_start.ProcessGone):
+                    self.fail("group owner ended before the test")
+                self.assert_acquired(self.board("acquire", "holder", "cargo"), "acquired cargo")
+                _ = (self.lock / "owned").write_text(json.dumps({"group": group.pid, "start": start.text}))
+                proc_root = self.root / outcome
+                proc_root.mkdir()
+                if outcome == "unknown":
+                    (proc_root / str(group.pid) / "stat").mkdir(parents=True)
+                elif outcome == "replaced":
+                    _ = write_stat(proc_root, group.pid, start_ticks=456)
+                observer = self.root / "observe-group"
+                signals = self.root / "signals"
+                _ = observer.write_text(f"#!{sys.executable}\n" + """import functools, os, runpy, sys
+from pathlib import Path
+""" + f"sys.path.insert(0, {str(BOARD.resolve().parents[2])!r})\n"
+                    + "from scripts.lib import process_start\n"
+                    + f"process_start.check_group_leader = functools.partial(process_start.check_group_leader, proc_root=Path({str(proc_root)!r}))\n"
+                    + f"os.killpg = lambda *args: Path({str(signals)!r}).write_text(repr(args))\n"
+                    + "sys.argv = sys.argv[1:]\n"
+                    + "if sys.argv[0] == '-':\n    exec(compile(sys.stdin.read(), '<group-cleanup>', 'exec'))\n"
+                    + "elif sys.argv[0].endswith('/process_start.py'):\n    runpy.run_path(sys.argv[0], run_name='__main__')\n"
+                    + "else:\n    os.execv(sys.executable, [sys.executable, *sys.argv])\n")
+                observer.chmod(0o755)
+                result = subprocess.run(
+                    ["bash", str(BOARD), "release", str(self.root), "holder", "cargo"],
+                    env={**os.environ, "UNIT_NOW_EPOCH": "1000", "CLAUDE_PYTHON": str(observer)},
+                    capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS,
+                )
+                self.assertFalse(signals.exists(), result.stdout + result.stderr)
+                self.assertIsNone(group.poll(), "cleanup signalled an unproven group owner")
+                if outcome == "unknown":
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertTrue(self.lock.exists())
+                    (self.lock / "owned").unlink()
+                    self.assertEqual(self.board("release", "holder", "cargo").returncode, 0)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertFalse(self.lock.exists())
+
+    def test_matching_zombie_leaders_live_children_are_cleaned(self) -> None:
+        leader = subprocess.Popen(
+            [sys.executable, "-u", "-c", 'import os, signal; child = os.fork(); os.write(1, (str(os.getpid()) + "\\n").encode()); signal.pause()'],
+            stdout=subprocess.PIPE, text=True, start_new_session=True,
+        )
+        self.addCleanup(self.stop_guard, leader)
+        self.addCleanup(self.kill_group, leader.pid)
+        if leader.stdout is None:
+            self.fail("group has no readiness pipe")
+        pids = {int(cast(str, leader.stdout.readline())), int(cast(str, leader.stdout.readline()))}
+        child, = pids - {leader.pid}
+        start = process_start.process_start(leader.pid)
+        if isinstance(start, process_start.ProcessGone):
+            self.fail("group leader ended before it recorded its identity")
+        self.assert_acquired(self.board("acquire", "holder", "cargo"), "acquired cargo")
+        _ = (self.lock / "owned").write_text(json.dumps({"group": leader.pid, "start": start.text}))
+        os.kill(leader.pid, signal.SIGKILL)
+        # waitid observes the exit without reaping the zombie leader.
+        _ = os.waitid(os.P_PID, leader.pid, os.WEXITED | os.WNOWAIT)
+        result = self.board("release", "holder", "cargo")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(process_start.process_state(child), process_start.ProcessRunState.GONE)
+        self.assertFalse(self.lock.exists())
+
+    @staticmethod
+    def kill_group(group: int) -> None:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     def test_reaps_gone_holder_without_waiting(self) -> None:
         holder = self.holder_process()

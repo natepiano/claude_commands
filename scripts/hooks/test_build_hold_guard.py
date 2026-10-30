@@ -9,8 +9,14 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import cast, override
+from typing import TYPE_CHECKING, cast, override
 from unittest import mock
+
+if TYPE_CHECKING:
+    from ..lib.process_start_test_support import write_stat
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib.process_start_test_support import write_stat
 
 from scripts.build_hold.test_hold_applies import REFUSAL
 from scripts.hooks.build_hold_guard_test_support import TemporaryGuardTest, hold_applies, invoke_hook
@@ -127,9 +133,7 @@ class BuildHoldGuardTest(TemporaryGuardTest):
         os.environ["BUILDLOG_CALL_ID"] = "verify-call"
         proc = self.root / "proc" / "10"
         proc.mkdir(parents=True)
-        fields = ["0"] * 20
-        fields[0], fields[19] = "S", "11000"
-        _ = (proc / "stat").write_text("10 (verify.sh) " + " ".join(fields))
+        _ = write_stat(proc.parent, 10, command="verify.sh", start_ticks=11000)
         os.environ["VERIFY_PROC_ROOT"] = str(proc.parent)
         for state in ("missing", "waiting_hold", "waiting_mac", "on_mac", "on_natedev", "unreadable"):
             record = directory / "verify-call.json"

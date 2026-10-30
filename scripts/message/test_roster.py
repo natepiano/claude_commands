@@ -19,6 +19,9 @@ import unittest
 from contextlib import AbstractContextManager, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
+from scripts.lib.process_start_test_support import write_stat
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
@@ -195,8 +198,8 @@ class RosterTests(unittest.TestCase):
             self.addCleanup(listener.close)
         record_pid = (991100 if file_name == "director" else os.getpid()) if pid is None else pid
         if not with_socket and not proc_start:
-            started = sessions.process_start(record_pid)
-            proc_start = started or "fixture"
+            started = process_identity.process_start(record_pid)
+            proc_start = "fixture" if isinstance(started, process_identity.ProcessGone) else started.text
         _ = (self.sessions / f"{file_name}.json").write_text(json.dumps({
             "pid": record_pid,
             "sessionId": session_id,
@@ -1671,7 +1674,7 @@ class RosterTests(unittest.TestCase):
     def _herdr_process(self, pid: int, parent: int, argv: list[str], **environment: str) -> None:
         path = Path(os.environ["HERDR_PROC"]) / str(pid)
         path.mkdir(parents=True)
-        _ = (path / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+        _ = write_stat(path.parent, int(path.name), ppid=parent)
         _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
         _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
         (path / "cwd").symlink_to(self.home)
@@ -2038,7 +2041,9 @@ class RosterTests(unittest.TestCase):
         path = self.sessions / "director.json"
         data = cast(dict[str, object], json.loads(path.read_text()))
         data["messagingSocketPath"] = ""
-        data["procStart"] = sessions.process_start(os.getpid())
+        started = process_identity.process_start(os.getpid())
+        assert not isinstance(started, process_identity.ProcessGone)
+        data["procStart"] = started.text
         _ = path.write_text(json.dumps(data))
         result, lines, errors = self._run_main("--snapshot")
         self.assertEqual((result, errors), (0, []))

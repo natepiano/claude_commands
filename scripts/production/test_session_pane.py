@@ -9,6 +9,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from scripts.lib.process_start_test_support import write_stat
 from typing import cast, override
 from unittest import mock
 
@@ -64,7 +66,7 @@ class SessionPaneTests(unittest.TestCase):
     def process(self, pid: int, parent: int, argv: list[str], environment: dict[str, str]) -> None:
         path = self.root / "proc" / str(pid)
         path.mkdir(parents=True, exist_ok=True)
-        _ = (path / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+        _ = write_stat(path.parent, int(path.name), ppid=parent)
         _ = (path / "cmdline").write_bytes("\0".join(argv).encode())
         _ = (path / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
         if not (path / "cwd").exists():

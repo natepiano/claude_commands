@@ -569,8 +569,7 @@ if [[ -n "${FOLLOW_TO}" ]]; then
       if [[ -n "$(worker_record turn 2>/dev/null || true)" ]]; then
         break
       fi
-      kill -0 "${AGENT_PID}" 2>/dev/null || break
-      [[ "$(ps -o stat= -p "${AGENT_PID}" 2>/dev/null || true)" == Z* ]] && break
+      [[ "$("$PY" "${SCRIPT_DIR}/../lib/process_start.py" state "${AGENT_PID}" 2>/dev/null || true)" == gone ]] && break
       sleep "${UNIT_WORKER_POLL_SECS:-1}"
     done
   fi
@@ -579,8 +578,7 @@ elif [[ "${AGENT_FAMILY}" == "claude" || "${USE_CODEX_MESH}" == "1" ]]; then
     if worker_record record 2>/dev/null; then
       break
     fi
-    kill -0 "${AGENT_PID}" 2>/dev/null || break
-    [[ "$(ps -o stat= -p "${AGENT_PID}" 2>/dev/null || true)" == Z* ]] && break
+    [[ "$("$PY" "${SCRIPT_DIR}/../lib/process_start.py" state "${AGENT_PID}" 2>/dev/null || true)" == gone ]] && break
     sleep "${UNIT_WORKER_POLL_SECS:-1}"
   done
 fi

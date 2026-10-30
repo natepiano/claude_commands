@@ -50,6 +50,7 @@ import time
 from typing import Literal, TextIO, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import process_start
 from scripts.production import change_review  # noqa: E402
 from scripts.production.affected_modules import (  # noqa: E402
     AffectedSelection, CertifiedBase, FullSuite, NoCertifiedBase, select_affected,
@@ -354,10 +355,12 @@ def process_memory_mib(roots: set[int]) -> dict[int, float]:
         if not entry.name.isdecimal():
             continue
         try:
-            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
             pid = int(entry.name)
-            parents[pid] = int(fields[1])
-            resident[pid] = int(fields[21])
+            stat = process_start.read_stat(pid)
+            if isinstance(stat, process_start.ProcessGone):
+                continue
+            parents[pid] = stat.ppid
+            resident[pid] = stat.rss
         except (OSError, ValueError, IndexError):
             continue
     totals: dict[int, float] = {}

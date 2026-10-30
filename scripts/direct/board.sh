@@ -53,6 +53,9 @@
 set -euo pipefail
 UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 [[ ! -r "$UNIT_ENV_SHIM" ]] || source "$UNIT_ENV_SHIM"
+BOARD_REPOSITORY="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd -P)"
+BOARD_PY="$BOARD_REPOSITORY/scripts/lib/py"
+BOARD_PROCESS_START="$BOARD_REPOSITORY/scripts/lib/process_start.py"
 
 MAX_MESSAGE_CHARS=900
 DEFAULT_HOLD_SECONDS=900
@@ -168,7 +171,7 @@ lock_guard() {
     return 2
   fi
   local status
-  if python3 -c 'import fcntl, sys
+  if "$BOARD_PY" -c 'import fcntl, sys
 try:
     fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError:
@@ -196,13 +199,9 @@ lock_is_expired() {
 }
 
 pid_is_gone() {
-  local state status
-  if state="$(ps -p "$1" -o stat= 2>/dev/null)"; then
-    [[ "$state" == Z* ]]
-  else
-    status=$?
-    [[ "$status" -eq 1 && -z "$state" ]]
-  fi
+  local state
+  state="$("$BOARD_PY" "$BOARD_PROCESS_START" state "$1" 2>/dev/null)" || return 1
+  [[ "$state" == gone ]]
 }
 
 lock_stale_reason() {
@@ -231,7 +230,7 @@ write_lock_meta() {
 cleanup_owned_group() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 0
-  python3 - "$dir/owned" <<'PY'
+  "$BOARD_PY" - "$dir/owned" "$BOARD_REPOSITORY" <<'PY'
 from __future__ import annotations
 
 import json
@@ -244,18 +243,8 @@ import time
 
 record = Path(sys.argv[1])
 
-def identity(pid: int) -> str | None:
-    try:
-        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
-        # A zombie leader still owns its PID, so its start time is safe to
-        # check while live children remain in the group.
-        return fields[19]
-    except (OSError, IndexError):
-        try:
-            return subprocess.check_output(['ps', '-p', str(pid), '-o', 'lstart='],
-                                           text=True, stderr=subprocess.DEVNULL).strip()
-        except subprocess.CalledProcessError:
-            return None
+sys.path.insert(0, sys.argv[2])
+from scripts.lib import process_start
 
 def live_group(group: int) -> bool:
     try:
@@ -270,16 +259,17 @@ def live_group(group: int) -> bool:
 try:
     saved = json.loads(record.read_text())
     group = int(saved['group'])
-    start = str(saved['start'])
+    start = process_start.parse_start(str(saved['start']))
 except (OSError, ValueError, KeyError, TypeError):
     print('board.sh: invalid step ownership record', file=sys.stderr)
     sys.exit(1)
 
-if identity(group) != start:
-    if live_group(group):
-        print('board.sh: step group leader identity changed', file=sys.stderr)
-        sys.exit(1)
+check = process_start.check_group_leader(group, start)
+if check in (process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED):
     sys.exit(0)
+if check is not process_start.OwnerCheck.ALIVE:
+    print("board.sh: cannot verify step group leader", file=sys.stderr)
+    sys.exit(1)
 
 try:
     os.killpg(group, signal.SIGKILL)

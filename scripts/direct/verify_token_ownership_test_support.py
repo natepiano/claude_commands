@@ -9,6 +9,7 @@ import time
 from typing import override
 
 from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture
+from scripts.lib import process_start
 
 
 # load 136 on natedev, 2026-10-29
@@ -38,15 +39,10 @@ class VerifyTokenOwnershipFixture(VerifyTokenWaitFixture):
             if not entry.name.isdecimal():
                 continue
             pid = int(entry.name)
-            try:
-                if os.getpgid(pid) != group and os.getsid(pid) != group:
-                    continue
-                # comm can contain spaces and parentheses. Fields after its
-                # final ')' start with state, ppid, pgrp, session.
-                fields = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
-            except (FileNotFoundError, ProcessLookupError):
+            stat = process_start.read_stat(pid)
+            if isinstance(stat, process_start.ProcessGone):
                 continue
-            if fields[0] != "Z" and group in (int(fields[2]), int(fields[3])):
+            if stat.state not in ("Z", "X") and group in (stat.pgrp, stat.session):
                 found.append(pid)
         return found
 

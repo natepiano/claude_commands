@@ -17,6 +17,9 @@ import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
+from scripts.lib.process_start_test_support import write_stat
 from typing import ClassVar, cast, override
 from types import ModuleType
 from collections.abc import Callable, Iterator
@@ -393,7 +396,7 @@ class AddUnitTestCase(ShutdownTestCase):
                 for path, parent, command in ((process, int(server.name), ["zsh"]), (server, 1, ["herdr", "--session", name, "server"])):
                     path.mkdir(parents=True, exist_ok=True)
                     _ = (path / "cmdline").write_bytes("\0".join(command).encode() + b"\0")
-                    _ = (path / "stat").write_text(f"{path.name} (fixture) S {parent} 0")
+                    _ = write_stat(path.parent, int(path.name), ppid=parent)
                     _ = (path / "status").write_text(f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n")
                 (process / "cwd").unlink(missing_ok=True)
                 (process / "cwd").symlink_to(request.session_cwd)
@@ -738,10 +741,10 @@ class AddUnitTestCase(ShutdownTestCase):
                        stop_progress: str = "stopped", timeout: bool = False) -> tuple[Path, list[str]]:
         prior = self.root / "prior-session"
         prior.mkdir()
-        started = sessions.process_start(os.getpid())
-        assert started is not None
-        self.write_resume_registry_record(started)
-        source = inventory.ListedSession("session-123", os.getpid(), started, "postmaster", "top-level",
+        started = process_identity.process_start(os.getpid())
+        assert not isinstance(started, process_identity.ProcessGone)
+        self.write_resume_registry_record(started.text)
+        source = inventory.ListedSession("session-123", os.getpid(), started.text, "postmaster", "top-level",
                                          self.root / "home/.claude", "owner@example.com", "", "")
         _ = self.enterContext(patch.object(inventory, "listing", return_value=[source]))
         document, head = self.doc.read_text(), self.git("rev-parse", "HEAD")
@@ -802,7 +805,7 @@ class AddUnitTestCase(ShutdownTestCase):
         for pid, parent, arguments in ((201, 1, ["herdr", "--session", name, "server"]), (202, 201, ["zsh"])):
             process = self.root / "proc" / str(pid)
             process.mkdir(parents=True)
-            _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0")
+            _ = write_stat(process.parent, int(process.name), ppid=parent)
             _ = (process / "cmdline").write_bytes("\0".join(arguments).encode())
             _ = (process / "environ").write_text("HERDR_PANE_ID=w2:p1\0SHOWRUNNER_UNIT=build-followups\0SHOWRUNNER_UNIT_ID=alpha-unit" if pid == 202 else "")
             (process / "cwd").symlink_to(cwd)

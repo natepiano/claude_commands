@@ -1189,6 +1189,42 @@ def _in_flight_round(state: dict[str, object]) -> dict[str, object] | None:
     return None
 
 
+def _landed_event(round_entry: dict[str, object]) -> dict[str, object]:
+    landed_at = _number(round_entry.get("landed_at"))
+    return {
+        "event_type": "finding_batch_landed",
+        "timestamp": _iso_time(landed_at),
+        "timestamp_epoch": landed_at,
+        "round": _integer(round_entry.get("round")),
+        "landed": round_entry.get("landed", round_entry.get("covered", [])),
+    }
+
+
+def _restore_landed_events(session_dir: Path, state: dict[str, object]) -> list[int]:
+    """Repair the state/event write gap under the caller's findings lock."""
+    history_file = _history_file(session_dir)
+    if history_file is None:
+        return []
+    try:
+        lines = history_file.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = []
+    recorded = {
+        _integer(event.get("round")) for line in lines
+        if (event := _json_object(line)) is not None
+        and event.get("event_type") == "finding_batch_landed"
+        and event.get("phase_instance_id") == state.get("phase_instance_id")
+    }
+    restored: list[int] = []
+    for entry in _rounds(state):
+        number = _integer(entry.get("round"))
+        if entry.get("outcome") == "landed" and number not in recorded:
+            _append_event(session_dir, state, _landed_event(entry))
+            recorded.add(number)
+            restored.append(number)
+    return restored
+
+
 def _landed(args: argparse.Namespace) -> None:
     """Promote an in-flight round to review after its worker exited cleanly.
 
@@ -1207,7 +1243,11 @@ def _landed(args: argparse.Namespace) -> None:
     round_entry = _in_flight_round(state)
     in_flight = _in_flight_ids(state)
     if round_entry is None or not in_flight:
-        print("no repair round in flight")
+        restored = _restore_landed_events(session_dir, state)
+        if restored:
+            print("restored finding_batch_landed for rounds: " + ", ".join(map(str, restored)))
+        else:
+            print("no repair round in flight")
         return
     for finding_id in in_flight:
         entry = _finding(state, finding_id)
@@ -1215,18 +1255,9 @@ def _landed(args: argparse.Namespace) -> None:
         entry["landed_at"] = now
     round_entry["outcome"] = "landed"
     round_entry["landed_at"] = now
+    round_entry["landed"] = in_flight
     _write_state(session_dir, state)
-    _append_event(
-        session_dir,
-        state,
-        {
-            "event_type": "finding_batch_landed",
-            "timestamp": _iso_time(now),
-            "timestamp_epoch": now,
-            "round": _integer(round_entry.get("round")),
-            "landed": in_flight,
-        },
-    )
+    _append_event(session_dir, state, _landed_event(round_entry))
     print(f"round {_integer(round_entry.get('round'))} landed: {', '.join(in_flight)}")
 
 

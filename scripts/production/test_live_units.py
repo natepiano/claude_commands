@@ -9,6 +9,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from scripts.lib.process_start_test_support import write_stat
 from typing import override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
@@ -116,7 +118,7 @@ class LiveUnitsTests(unittest.TestCase):
         ):
             directory = self.root / "proc" / str(pid)
             directory.mkdir(parents=True)
-            _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+            _ = write_stat(directory.parent, int(directory.name), ppid=parent)
             _ = (directory / "cmdline").write_bytes("\0".join(argv).encode())
             _ = (directory / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
             (directory / "cwd").symlink_to(self.root)

@@ -9,6 +9,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
+from scripts.lib.process_start_test_support import write_stat
 from typing import cast, override
 from unittest import mock
 
@@ -22,7 +25,6 @@ import fake_unit_host
 import showrunners
 import unit_lookup
 import herdr
-import sessions
 from fake_herdr import herdr_listener
 from fake_unit_host import HostedUnit
 from sessions import SessionRecord
@@ -73,7 +75,7 @@ class UnitLookupTests(unittest.TestCase):
     def process(self, pid: int, parent: int, argv: list[str], **environment: str) -> None:
         directory = self.root / "proc" / str(pid)
         directory.mkdir(parents=True, exist_ok=True)
-        _ = (directory / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+        _ = write_stat(directory.parent, int(directory.name), ppid=parent)
         _ = (directory / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
         _ = (directory / "environ").write_bytes("\0".join(f"{key}={value}" for key, value in environment.items()).encode())
         (directory / "cwd").symlink_to(self.root)
@@ -471,7 +473,9 @@ class UnitLookupTests(unittest.TestCase):
         self.claude("trunk", "w4:p1")
         record = self.records / "trunk-1.json"
         data = cast(dict[str, object], json.loads(record.read_text()))
-        data["procStart"] = sessions.process_start(os.getpid())
+        started = process_identity.process_start(os.getpid())
+        assert not isinstance(started, process_identity.ProcessGone)
+        data["procStart"] = started.text
         data["messagingSocketPath"] = ""
         _ = record.write_text(json.dumps(data))
         found = unit_lookup.marked_units("show")["trunk-unit"]

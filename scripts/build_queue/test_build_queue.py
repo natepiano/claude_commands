@@ -8,6 +8,7 @@ import fcntl
 import io
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 import threading
@@ -15,8 +16,14 @@ import time
 import unittest
 import unittest.mock
 from unittest import mock
-from typing import Protocol, cast, override
+from typing import TYPE_CHECKING, Protocol, cast, override
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from ..lib.process_start_test_support import write_stat
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib.process_start_test_support import write_stat
 
 from scripts.build_queue import build_queue
 from scripts.lint import memory_admit
@@ -78,8 +85,7 @@ class QueueTests(unittest.TestCase):
     def write_waiter(self, pid: int, session: str, name: str, step: str = "nextest") -> Path:
         process = self.root / "proc" / str(pid)
         process.mkdir()
-        fields = ["S", "1", *(["0"] * 17), str(pid)]
-        _ = (process / "stat").write_text(f"{pid} (verify) {' '.join(fields)}\n")
+        _ = write_stat(process.parent, pid, command="verify", start_ticks=pid)
         directory = self.root / "buildlog/admission"
         directory.mkdir(parents=True, exist_ok=True)
         row: memory_admit.Waiter = {
@@ -427,8 +433,7 @@ class QueueTests(unittest.TestCase):
     def test_live_queue_pressure_reason_reaches_the_cli(self) -> None:
         process = self.root / "proc/100"
         process.mkdir()
-        fields = ["S", "1", *(["0"] * 17), "100"]
-        _ = (process / "stat").write_text(f"100 (verify) {' '.join(fields)}\n")
+        _ = write_stat(process.parent, 100, command="verify", start_ticks=100)
         directory = self.root / "buildlog/admission"
         directory.mkdir(parents=True)
         _ = (directory / "100.waiting").write_text(json.dumps({
@@ -567,8 +572,7 @@ class QueueTests(unittest.TestCase):
         for pid in (100, 200):
             process = self.root / "proc" / str(pid)
             process.mkdir()
-            fields = ["S", "1", *(["0"] * 17), str(pid)]
-            _ = (process / "stat").write_text(f"{pid} (verify) {' '.join(fields)}\n")
+            _ = write_stat(process.parent, pid, command="verify", start_ticks=pid)
         directory = self.root / "buildlog" / "admission"
         directory.mkdir(parents=True)
         actors = (

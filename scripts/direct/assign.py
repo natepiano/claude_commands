@@ -24,7 +24,7 @@ from scripts.agents import codex_mesh
 from scripts.direct import workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
 from scripts.astra import design_roles
-from scripts.lib import unit_runs
+from scripts.lib import unit_runs, process_start
 from scripts.usage.agents_log import LENSES
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -331,6 +331,18 @@ class Dispatch:
         workers.release_allocation(self.run, self.worker, self.reservation)
 
 
+def launcher_claim_is_live(pid: int, claim: dict[str, object]) -> bool:
+    saved_start = claim.get("start_time")
+    if not isinstance(saved_start, (int, str)) or not str(saved_start).strip():
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True  # Claims without start times keep the legacy pid-only check.
+    return process_start.check_owner(pid, process_start.parse_start(str(saved_start))) not in (
+        process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED)
+
+
 def claim_worker(dispatch: Dispatch) -> WorkerClaim:
     """Port the durable identity, stale-claim, role and compaction checks of worker_record claim."""
     with worker_claim_lock(dispatch.run):
@@ -359,17 +371,24 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         pid = previous_claim.get("pid")
         stale_claim = False
         if isinstance(pid, int) and pid > 0:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                stale_claim = True
-                claim_path.unlink(missing_ok=True)
-            else:
+            if launcher_claim_is_live(pid, previous_claim):
                 refuse(f"{dispatch.worker} is claimed by launcher {pid}")
+            stale_claim = True
+            # Release the stale mesh claim before removing its identity evidence.
+            release_options = ["--claim-pid", str(pid)]
+            saved_start = previous_claim.get("start_time")
+            if isinstance(saved_start, (int, str)):
+                release_options += ["--claim-start-time", str(saved_start)]
+            _ = dispatch.mesh_call("release-follow", *release_options, capture=True)
+            record = read_roster(dispatch.run, dispatch.worker)
+            if record.get("launcher_pid") == pid and record.get("status") in {
+                    "starting", "running", "waiting_capacity"}:
+                refuse(f"{dispatch.worker}: mesh did not release stale launcher {pid}; claim retained")
+            claim_path.unlink(missing_ok=True)
         status_path = dispatch.run / f"impl_status_{slot}"
         if stale_claim or (status_path.exists() and status_path.read_text().strip() == "implementing"):
             launcher = record.get("launcher_pid")
-            if isinstance(launcher, int) and launcher > 0:
+            if isinstance(launcher, int) and launcher > 0 and not (stale_claim and launcher == pid):
                 try:
                     os.kill(launcher, 0)
                 except ProcessLookupError:
@@ -401,8 +420,13 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                 dispatch.board(slot, "status", f"launcher: {compact.stdout.strip() or f'compacted {dispatch.worker}'}")
         if record.get("status") == "ended":
             _ = dispatch.mesh_call("reopen", capture=True)
+        claim_record: dict[str, object] = {"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}
+        started = process_start.process_start(os.getpid())
+        if isinstance(started, process_start.ProcessGone):
+            refuse("launcher has ended")
+        claim_record["start_time"] = started.ticks if isinstance(started, process_start.ProcessStartTime) else started.text
         dispatch.claim_follow()
-        _ = claim_path.write_text(json.dumps({"pid": os.getpid(), "worker": dispatch.worker, "turn_id": ""}))
+        _ = claim_path.write_text(json.dumps(claim_record))
         return WorkerClaim(identity_path, slot, model, effort)
 
 

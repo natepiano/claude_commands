@@ -21,8 +21,14 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, time as ClockTime, timezone
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 from sessions import addressed, live_sessions  # noqa: E402
@@ -314,16 +320,6 @@ def owning_session(environment: Mapping[str, str] = os.environ) -> OwningSession
     return OwningSession(session_id) if session_id else NoOwningSession()
 
 
-def process_start_time(pid: int, proc_root: Path = PROC_ROOT) -> str:
-    if pid <= 0:
-        return ""
-    try:
-        fields = (proc_root / str(pid) / "stat").read_text(encoding="utf-8", errors="replace").rsplit(")", 1)[1].split()
-        return fields[19] if fields[0] != "Z" else ""
-    except (OSError, IndexError):
-        return ""
-
-
 @dataclass(frozen=True)
 class ProcessIdentity:
     pid: int
@@ -395,13 +391,13 @@ def read_audit_processes(
             continue
         pid = int(directory.name)
         try:
-            stat = (directory / "stat").read_text(errors="replace").rsplit(")", 1)[1].split()
-            start = stat[19]
-            if stat[0] == "Z" or not start.isdecimal():
+            stat = process_start.read_stat(pid, proc_root)
+            if isinstance(stat, process_start.ProcessGone) or stat.state in ("Z", "X", "x"):
                 continue
-            parent_pid = int(stat[1])
+            start = stat.start.text
+            parent_pid = stat.ppid
             command = (directory / "comm").read_text(errors="replace").strip()
-            uid, tty_nr = directory.stat().st_uid, int(stat[4])
+            uid, tty_nr = directory.stat().st_uid, stat.tty_nr
         except (OSError, ValueError, IndexError):
             continue
         try:
@@ -443,7 +439,9 @@ def read_audit_processes(
                                      for line in (directory / "cgroup").read_text(errors="replace").splitlines())
             except OSError:
                 pass
-        if process_start_time(pid, proc_root) != process.identity.start_time:
+        if process_start.check_owner(pid, process_start.parse_start(process.identity.start_time), proc_root) in (
+            process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED
+        ):
             del processes[pid]
             continue
         processes[pid] = AuditProcess(process.identity, process.parent_pid, process.command, argv, cwd,
@@ -543,7 +541,7 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder], buildlog_root: Path
             roots.append(process)
     for process in sorted(roots, key=lambda item: item.identity.pid):
         ancestors = audit_ancestors(process, processes)
-        if any(process_start_time(item.identity.pid, proc_root) != item.identity.start_time
+        if any(process_start.check_owner(item.identity.pid, process_start.parse_start(item.identity.start_time), proc_root) is not process_start.OwnerCheck.ALIVE
                for item in (process, *ancestors)):
             continue
         owner = audit_owner(process, ancestors)
@@ -557,7 +555,7 @@ def audit_builds(proc_root: Path, holders: Sequence[Holder], buildlog_root: Path
         else:
             classification = "no_session"
         live_children = tuple(sorted((child for child in children.get(process.identity.pid, [])
-                                      if process_start_time(child.pid, proc_root) == child.start_time),
+                                      if process_start.check_owner(child.pid, process_start.parse_start(child.start_time), proc_root) is process_start.OwnerCheck.ALIVE),
                                      key=lambda item: item.pid))
         builds.append(AuditedBuild(process, owner, classification, live_children))
     return tuple(builds)
@@ -1220,9 +1218,9 @@ def read_process_cpu_times(processes: Sequence[Process], proc_root: Path) -> dic
     readings: dict[int, ProcessCpuTime] = {}
     for process in processes:
         try:
-            # comm can contain spaces and closing parentheses; the remaining fields start at 3.
-            fields = (proc_root / str(process.pid) / "stat").read_text().rsplit(")", 1)[1].split()
-            readings[process.pid] = ProcessCpuTime(int(fields[11]) + int(fields[12]), int(fields[19]))
+            stat = process_start.read_stat(process.pid, proc_root)
+            if not isinstance(stat, process_start.ProcessGone):
+                readings[process.pid] = ProcessCpuTime(stat.utime + stat.stime, stat.start.ticks)
         except (OSError, ValueError, IndexError):
             continue
     return readings
@@ -1337,10 +1335,10 @@ def main(arguments: list[str]) -> int:
             keep: list[ProcessIdentity] = []
             proc_root = cast(Path, options.proc_root)
             for pid in cast(list[int], options.keep):
-                start = process_start_time(pid, proc_root)
-                if not start:
+                start = process_start.process_start(pid, proc_root)
+                if isinstance(start, process_start.ProcessGone):
                     raise ValueError(f"--keep {pid}: no live process with a start time")
-                keep.append(ProcessIdentity(pid, start))
+                keep.append(ProcessIdentity(pid, start.text))
             print(start_hold(holder_directory(), identity, cast(str, options.purpose), request,
                              datetime.now(timezone.utc), keep))
             hold_enforcer().start()

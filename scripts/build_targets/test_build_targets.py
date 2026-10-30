@@ -16,6 +16,12 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 import unittest
 
+if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import build_targets
@@ -34,7 +40,7 @@ from test_targets import END, NOW, SHIPPED_CONFIG, SINCE, IsolatedTargetTest
 
 REAL_SUBPROCESS_RUN = subprocess.run
 REAL_SUBPROCESS_POPEN = subprocess.Popen
-REAL_PROCESS_START_TIME = build_hold.process_start_time
+REAL_PROCESS_START_TIME = process_start.process_start
 REAL_RECORD_HOLD_EVENT = build_hold.record_hold_event
 REAL_BUILDLOG_ROOT = Path.home() / ".local/state/buildlog"
 
@@ -108,7 +114,7 @@ class StatusTests(IsolatedBuildTargetTest):
             + "kind.natedev=local\nplatform.natedev=linux\n",
         )
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
-             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+             mock.patch.object(process_start, "process_start", return_value=process_start.parse_start("123")):
             return self.capture_status()
 
     def test_claim_holder_names_showrunner_and_unit_after_since(self) -> None:
@@ -130,8 +136,8 @@ class StatusTests(IsolatedBuildTargetTest):
 
     def test_stale_claim_with_same_description_and_time_cannot_replace_live_holder(self) -> None:
         for name, holder, started in (
-            ("a-live", "live-session", "test-run-start"),
-            ("z-stale", "stale-session", "ended-run-start"),
+            ("a-live", "live-session", "123"),
+            ("z-stale", "stale-session", "456"),
         ):
             self.write_claim(f"claims/{name}.json")
             path = self.mac_state / "claims" / f"{name}.json"
@@ -144,7 +150,7 @@ class StatusTests(IsolatedBuildTargetTest):
             "stale-session": roster.UnitLabels("inspectors", "hana", "inspectors"),
         }
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
-             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"), \
+             mock.patch.object(process_start, "process_start", return_value=process_start.parse_start("123")), \
              mock.patch.object(mac_test, "read_claims", wraps=mac_test.read_claims) as claims_read, \
              mock.patch.object(roster, "unit_labels_for", return_value=labels) as lookup:
             result = self.capture_status()
@@ -202,7 +208,7 @@ class StatusTests(IsolatedBuildTargetTest):
             + "kind.natedev=local\nplatform.natedev=linux\n",
         )
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
-             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+             mock.patch.object(process_start, "process_start", return_value=process_start.parse_start("123")):
             code, output, errors = self.capture_status()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(output, "mac: running nextest hana since 13:05 PDT, idle since 13:20\nnatedev: free\n")
@@ -220,7 +226,7 @@ class StatusTests(IsolatedBuildTargetTest):
             + "kind.natedev=local\nplatform.natedev=linux\n",
         )
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
-             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+             mock.patch.object(process_start, "process_start", return_value=process_start.parse_start("123")):
             code, output, errors = self.capture_status()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(
@@ -231,7 +237,7 @@ class StatusTests(IsolatedBuildTargetTest):
 
     def test_mac_running_status_without_idle_time_keeps_existing_line(self) -> None:
         self.write_claim()
-        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_start, "process_start", return_value=process_start.parse_start("123")):
             state = targets.target_state(targets.SshTarget("mac", "macos", self.settings))
             self.assertEqual(build_targets.format_state("mac", state), "mac: running nextest hana since 13:05 PDT")
 
@@ -562,7 +568,7 @@ class WaitLocalTests(IsolatedBuildTargetTest):
             "BUILDLOG_HOLD_WAITER_FILE": str(self.root / "waiter"),
             "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
         })))
-        _ = self.enterContext(mock.patch.object(build_hold, "process_start_time", return_value="test-start"))
+        _ = self.enterContext(mock.patch.object(process_start, "process_start", return_value=process_start.parse_start("test-start")))
         _ = self.enterContext(mock.patch.object(build_hold, "socket_for", return_value=build_hold.RecipientLive("/test/socket")))
         _ = self.enterContext(mock.patch.object(build_hold, "send_release", return_value=build_hold.ReleaseDelivered()))
         _ = self.enterContext(mock.patch.object(build_targets, "wait_clock", return_value=NOW))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
 import signal
@@ -14,6 +15,7 @@ import unittest
 
 from scripts.direct.test_verify_mac_offload import stub_build_tool_path
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.direct import implement_launcher_test_support, review_launcher_test_support
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -37,6 +39,40 @@ def shell_function(source: str, name: str) -> str:
     if match is None:
         raise AssertionError(f"missing shell function: {name}")
     return match.group(0)
+
+
+class CopiedLauncherBoardTests(unittest.TestCase):
+    def test_copied_launchers_reclaim_unexpired_locks_after_their_holder_exits(self) -> None:
+        for fixture_type in (implement_launcher_test_support.ImplementLauncherFixture,
+                             review_launcher_test_support.ReviewLauncherFixture):
+            with self.subTest(fixture=fixture_type.__name__):
+                root = Path(self.enterContext(tempfile.TemporaryDirectory(
+                    prefix="copied-launcher-board-")))
+                fixture = fixture_type("runTest")
+                fixture.root = root
+                fixture.prepare_fixture()
+                environment = fixture.environment()
+                _ = environment.pop("PYTHONPATH", None)
+                environment["UNIT_NOW_EPOCH"] = "1000"
+                with subprocess.Popen([sys.executable, "-c", "pass"],
+                                      env=environment) as holder:
+                    self.assertEqual(holder.wait(timeout=300), 0)
+                session = root / "run"
+                lock = session / "locks" / "cargo.d"
+                lock.mkdir(parents=True)
+                _ = (lock / "holder").write_text("former-worker")
+                _ = (lock / "holder_pid").write_text(str(holder.pid))
+                _ = (lock / "expires").write_text("1600")
+                result = subprocess.run(
+                    ["bash", str(root / "scripts" / "direct" / "board.sh"), "acquire",
+                     str(session), "next-worker", "cargo", "--pid", str(os.getpid())],
+                    cwd=root, env=environment, capture_output=True, text=True,
+                    check=False, timeout=300,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("reclaimed from former-worker", result.stdout)
+                self.assertEqual((lock / "holder").read_text(), "next-worker")
+                self.assertEqual((lock / "holder_pid").read_text(), str(os.getpid()))
 
 
 class VerifyStepOwnerTests(unittest.TestCase):
@@ -64,6 +100,8 @@ class VerifyStepOwnerTests(unittest.TestCase):
             "TOKEN_HELD": "1",
             "TEST_ROOT": str(self.root),
             "TEST_PYTHON": sys.executable,
+            "PY": str(VERIFY.parent.parent / "lib" / "py"),
+            "PROCESS_REPOSITORY": str(VERIFY.parent.parent.parent),
             "TEST_WAIT": str(WAIT),
             "TEST_COMMAND": str(self.root / "step.py"),
         }

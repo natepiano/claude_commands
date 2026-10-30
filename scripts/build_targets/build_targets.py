@@ -20,6 +20,12 @@ import time
 from types import FrameType
 from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, cast, final
 
+if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
@@ -374,8 +380,11 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.signal(signum, interrupted)
         if waiter_file:
+            owner_start = process_start.process_start(os.getpid())
+            if isinstance(owner_start, process_start.ProcessGone):
+                raise RuntimeError("hold waiter process ended before registration")
             waiter: ActiveWaitProcess = {"call_id": call_id, "pid": os.getpid(),
-                                         "proc_start": build_hold.process_start_time(os.getpid())}
+                                         "proc_start": owner_start.text}
             temporary = Path(waiter_file).with_suffix(".tmp")
             _ = temporary.write_text(json.dumps(waiter))
             os.replace(temporary, waiter_file)
@@ -447,7 +456,7 @@ def command_interrupt_local(call_id: str, signal_name: str) -> int:
         identity = waiter.get("proc_start")
         if (waiter.get("call_id") != call_id or not isinstance(pid, int) or pid <= 0
             or not isinstance(identity, str) or not identity
-            or build_hold.process_start_time(pid) != identity):
+            or process_start.check_owner(pid, process_start.parse_start(identity)) is not process_start.OwnerCheck.ALIVE):
             return 0
         os.kill(pid, signal.SIGINT if signal_name == "INT" else signal.SIGTERM)
         deadline = time.monotonic() + 2

@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, final, override
 from unittest import mock
 from scripts.direct import workers
+from scripts.lib import process_start
+from scripts.lib.process_start_test_support import process_start_probe, write_stat
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -83,13 +85,16 @@ class RunProcessTests(unittest.TestCase):
         super().__init__(methodName)
         self.root = Path()
         self.worktree = Path()
+        self.proc = Path()
         self.processes: dict[int, FakeProcess] = {}
         self.signalled: list[int] = []
 
     @override
     def setUp(self) -> None:
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp/claude")))
         self.worktree = self.root / "claude-demo-alpha"
+        self.proc = self.root / "proc"
+        self.proc.mkdir()
         other = self.root / "claude-demo-beta"
         mine = self.run_folder("run-a", self.worktree)
         theirs = self.run_folder("run-b", other)
@@ -116,6 +121,7 @@ class RunProcessTests(unittest.TestCase):
             "UNIT_WORKERS_STATE": str(self.root / "unit-workers")}))
         _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", self.inside))
         _ = self.enterContext(mock.patch.object(retire_unit, "command_line", self.arguments))
+        _ = self.enterContext(mock.patch.object(process_start, "process_start", side_effect=process_start_probe(self.proc)))
         from scripts.agents import mesh_runs
         _ = self.enterContext(mock.patch.object(mesh_runs, "_process_args", self.arguments))
         _ = self.enterContext(mock.patch.object(os, "getsid", self.session))
@@ -146,6 +152,14 @@ class RunProcessTests(unittest.TestCase):
         pass
 
     def inside(self, worktree: Path) -> list[int]:
+        # Keep stat entries in step with the simulated process list. Keep an
+        # existing entry so a test can inject a read error or pid replacement.
+        for path in self.proc.glob("*/stat"):
+            if int(path.parent.name) not in self.processes:
+                path.unlink()
+        for pid, item in self.processes.items():
+            if not (self.proc / str(pid) / "stat").exists():
+                _ = write_stat(self.proc, pid, session=item.session)
         return sorted(pid for pid, item in self.processes.items() if item.cwd == worktree)
 
     def arguments(self, pid: int) -> list[str]:
@@ -162,6 +176,7 @@ class RunProcessTests(unittest.TestCase):
         if signal_number:
             self.signalled.append(pid)
             del self.processes[pid]
+            (self.proc / str(pid) / "stat").unlink(missing_ok=True)
 
     def rename(self) -> rename_unit.UnitRename:
         return rename_unit.UnitRename(SLUG, "alpha-unit", "gamma-unit", "", "", SLUG, "demo-alpha", "demo-gamma",
@@ -250,6 +265,53 @@ class RunProcessTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(rename_unit, "RUN_STOP_WAIT_SECONDS", 0.0))
         with self.assertRaisesRegex(RenameRefused, r"of lint in run run-a: still runs after SIGTERM"):
             _ = self.stop()
+
+    def test_unreadable_run_identity_keeps_the_process_and_a_rerun_stops_it(self) -> None:
+        self.processes = {101: self.processes[101]}
+        _ = self.inside(self.worktree)
+        _ = (self.proc / "101/stat").write_bytes(b"unreadable")
+
+        with self.assertRaisesRegex(RenameRefused, r"of lint in run run-a: owner cannot be confirmed; kept"):
+            _ = self.stop()
+
+        self.assertEqual(self.signalled, [])
+        self.assertIn(101, self.processes)
+        _ = write_stat(self.proc, 101, session=101)
+        printed = self.stop()
+        self.assertEqual(self.signalled, [101])
+        self.assertNotIn(101, self.processes)
+        self.assertFalse((self.proc / "101/stat").exists())
+        self.assertIn("stopped: process 101 (", printed)
+        _ = self.stop()
+        self.assertEqual(self.signalled, [101])
+
+    def test_a_pid_replaced_before_termination_is_never_signalled_on_a_rerun(self) -> None:
+        self.processes = {101: self.processes[101]}
+        read_stat = process_start.read_stat
+
+        def replace_after_read(pid: int, proc_root: Path = process_start.PROC_ROOT) -> process_start.ProcessStat | process_start.ProcessGone:
+            stat = read_stat(pid, proc_root)
+            if isinstance(stat, process_start.ProcessStat) and stat.start.ticks == 123:
+                _ = write_stat(proc_root, pid, start_ticks=456, session=101)
+                self.processes[pid] = FakeProcess(self.worktree, 101, ["zsh"])
+            return stat
+
+        with mock.patch.object(process_start, "read_stat", side_effect=replace_after_read):
+            _ = self.stop()
+
+        self.assertEqual(self.signalled, [])
+        self.assertEqual(self.processes[101].arguments, ["zsh"])
+        self.assertEqual(process_start.process_start(101), process_start.ProcessStartTime(456))
+        _ = self.stop()
+        self.assertEqual(self.signalled, [])
+        self.assertIn(101, self.processes)
+
+    def test_stopping_a_unit_with_no_run_processes_reads_no_identity(self) -> None:
+        self.processes.clear()
+        with mock.patch.object(process_start, "process_start", side_effect=AssertionError("no process to read")):
+            _ = self.stop()
+            _ = self.stop()
+        self.assertEqual(self.signalled, [])
 
     def serve(self, code: int) -> list[list[str]]:
         """Run run-a's app-server 501 with its code-mode host 502; `codex_mesh.py stop` exits `code`

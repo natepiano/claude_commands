@@ -12,7 +12,15 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
+import sys
+
+if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
 
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
@@ -153,13 +161,10 @@ class BuildScopeTests(unittest.TestCase):
             return False
         except PermissionError:
             return True
-        stat = Path(f"/proc/{pid}/stat")
-        if stat.exists():
-            try:
-                return stat.read_text().rsplit(") ", 1)[1][0] != "Z"
-            except FileNotFoundError:
-                return False
-        return True
+        try:
+            return process_start.process_state(pid) is not process_start.ProcessRunState.GONE
+        except process_start.ProcessReadError:
+            return True
 
     def test_unreserved_scoped_step_removes_cgroup_sidecar(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

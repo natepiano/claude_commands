@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast, override
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS.parent))
+from scripts.lib import process_start as process_identity
 # Sibling imports need this folder. Append it so a caller's own modules
 # (buildlog's record) keep precedence over shutdown's.
 if str(SCRIPTS / "shutdown") not in sys.path:
@@ -38,7 +40,6 @@ else:
 import detection_rules
 import herdr
 import sessions
-from sessions import process_start as _process_start
 import showrunners
 import unit_lookup
 from account import Account, label_for
@@ -121,7 +122,7 @@ def supervisor_identity(host: WindowHost | TerminalHost) -> SupervisorIdentity |
 def live_supervisor(host: WindowHost | TerminalHost) -> SupervisorIdentity | NoSupervisor:
     identity = supervisor_identity(host)
     if (identity["kind"] == "supervisor" and identity["proc_start"]
-            and _process_start(identity["pid"]) == identity["proc_start"]):
+            and process_identity.check_owner(identity["pid"], process_identity.parse_start(identity["proc_start"])) is process_identity.OwnerCheck.ALIVE):
         return identity
     return NoSupervisor(kind="no supervisor")
 
@@ -146,7 +147,7 @@ class ListedSession:
 class UnattributedSession(TypedDict):
     pid: int
     name: str
-    reason: Literal["account unreadable", "process start mismatch"]
+    reason: Literal["account unreadable", "process start mismatch", "process identity unreadable"]
 
 
 class Inventory(TypedDict):
@@ -236,7 +237,7 @@ def parse_inventory(text: str) -> Inventory:
         reason = _wire_string(
             _wire_required(report, "reason", place), f"{place}.reason"
         )
-        if reason not in {"account unreadable", "process start mismatch"}:
+        if reason not in {"account unreadable", "process start mismatch", "process identity unreadable"}:
             raise InvalidInventory(f"{place}.reason is invalid")
         unattributed.append(
             cast(
@@ -358,10 +359,11 @@ def _configuration_from_setting(
         return UnreadableSessionConfiguration()
 
 
-def _record_matches_process(record: SessionFile) -> bool:
+def _record_owner(record: SessionFile) -> process_identity.OwnerCheck:
     recorded = _string(record.get("procStart"))
-    current = _process_start(record.get("pid", 0))
-    return bool(recorded) and current is not None and recorded == current
+    if not recorded:
+        return process_identity.OwnerCheck.UNKNOWN
+    return process_identity.check_owner(record.get("pid", 0), process_identity.parse_start(recorded))
 
 
 def _conf(path: Path) -> dict[str, str]:
@@ -559,9 +561,12 @@ def _supervisor_process(pid: int) -> SupervisorIdentity | NoSupervisor:
             argv = []
     if any(Path(argument).name == "relaunch.py" and argv[index + 1:index + 3] == ["run", "--"]
            for index, argument in enumerate(argv)):
-        start = _process_start(pid)
-        if start:
-            return SupervisorIdentity(kind="supervisor", pid=pid, proc_start=start)
+        try:
+            start = process_identity.process_start(pid)
+        except process_identity.ProcessReadError:
+            return NoSupervisor(kind="no supervisor")
+        if not isinstance(start, process_identity.ProcessGone):
+            return SupervisorIdentity(kind="supervisor", pid=pid, proc_start=start.text)
     return NoSupervisor(kind="no supervisor")
 
 
@@ -872,8 +877,10 @@ def _launcher_command(pid: int) -> list[str]:
             if sys.platform == "linux":
                 process = Path(os.environ.get("HERDR_PROC", "/proc")) / str(pid)
                 argv = [os.fsdecode(part) for part in process.joinpath("cmdline").read_bytes().split(b"\0") if part]
-                fields = process.joinpath("stat").read_text().rsplit(")", 1)[1].split()
-                parent = int(fields[1])
+                stat = process_identity.read_stat(pid, process.parent)
+                if isinstance(stat, process_identity.ProcessGone):
+                    return []
+                parent = stat.ppid
             else:
                 process = darwin.get(pid)
                 if process is None or isinstance(process.arguments, herdr.UnreadableProcessArguments):
@@ -976,7 +983,10 @@ def _listed_session(
 ) -> ListedSession | UnattributedSession:
     pid = record.get("pid", 0)
     name = _string(record.get("name"))
-    if not _record_matches_process(record):
+    owner = _record_owner(record)
+    if owner is process_identity.OwnerCheck.UNKNOWN:
+        return {"pid": pid, "name": name, "reason": "process identity unreadable"}
+    if owner in (process_identity.OwnerCheck.GONE, process_identity.OwnerCheck.REPLACED):
         return {"pid": pid, "name": name, "reason": "process start mismatch"}
     attributed = _configuration_for_session(pid, home_state)
     if isinstance(attributed, UnreadableSessionConfiguration):
@@ -1175,17 +1185,6 @@ def _snapshot_environment(process: Path) -> dict[str, str]:
                 if b"=" in item)
 
 
-def _snapshot_stat(process: Path) -> tuple[str, int]:
-    fields = process.joinpath("stat").read_bytes().rpartition(b")")[2].split()
-    try:
-        started = fields[19].decode("ascii")
-        if not started.isdecimal():
-            raise ValueError("invalid process start")
-        return started, int(fields[4])
-    except (IndexError, ValueError, UnicodeError) as error:
-        raise ObservationFailure(f"process liveness {process}: malformed stat") from error
-
-
 class _SnapshotProcesses:
     """Strict Linux observations; absence and unreadability remain distinct."""
 
@@ -1205,10 +1204,16 @@ class _SnapshotProcesses:
         return self.root / str(pid)
 
     def exists(self, process: Path) -> bool:
-        return process.exists()
+        try:
+            return process_identity.process_state(int(process.name), self.root) is not process_identity.ProcessRunState.GONE
+        except process_identity.ProcessReadError:
+            return True
 
     def identity(self, process: Path) -> tuple[str, int]:
-        return _snapshot_stat(process)
+        stat = process_identity.read_stat(int(process.name), self.root)
+        if isinstance(stat, process_identity.ProcessGone) or stat.state in ("Z", "X", "x"):
+            raise FileNotFoundError(f"process {process.name} is gone")
+        return stat.start.text, stat.tty_nr
 
     def environment(self, process: Path) -> dict[str, str]:
         return _snapshot_environment(process)
@@ -1227,11 +1232,7 @@ class _SnapshotProcesses:
 
     def started_at(self, process: Path) -> datetime:
         started, _ = self.identity(process)
-        for line in (self.root / "stat").read_text().splitlines():
-            if line.startswith("btime "):
-                return datetime.fromtimestamp(int(line.split()[1]) +
-                    int(started) / os.sysconf("SC_CLK_TCK"), timezone.utc)
-        raise ObservationFailure("process start: boot time is missing")
+        return process_identity.started_at(process_identity.parse_start(started), self.root)
 
     def servers(self, processes: list[Path]) -> dict[str, RecoveryHostProcess]:
         found: dict[str, RecoveryHostProcess] = {}
@@ -1318,8 +1319,7 @@ class _DarwinSnapshotProcesses(_SnapshotProcesses):
     @override
     def started_at(self, process: Path) -> datetime:
         started, _ = self.identity(process)
-        # darwin_process_identity reads lstart with LC_ALL=C and TZ=UTC.
-        return datetime.strptime(started, "%a %b %d %H:%M:%S %Y").replace(tzinfo=timezone.utc)
+        return process_identity.started_at(process_identity.parse_start(started))
 
     @override
     def servers(self, processes: list[Path]) -> dict[str, RecoveryHostProcess]:
@@ -1611,8 +1611,10 @@ def _snapshot_host_process(owner: Session, hosts: _SnapshotHosts) -> RecoveryHos
             if terminal_kind(command) != "unknown":
                 started, _ = reader.identity(process)
                 return RecoveryHostProcess(kind="process", pid=current, proc_start=started)
-            fields = process.joinpath("stat").read_text().rsplit(")", 1)[1].split()
-            current = int(fields[1])
+            stat = process_identity.read_stat(current, proc)
+            if isinstance(stat, process_identity.ProcessGone):
+                break
+            current = stat.ppid
         except FileNotFoundError:
             if reader.exists(process):
                 raise ObservationFailure(f"host ancestry {process}: required process data is missing") from None
@@ -1635,14 +1637,12 @@ def _snapshot_gone_hosts(hosts: _SnapshotHosts, boot_id: str) -> frozenset[tuple
             lost = False
             identity = entry.get("host_process", RecoveryHostUnrecorded(kind="not recorded"))
             if identity["kind"] == "process":
-                process = reader.path(identity["pid"])
-                try:
-                    started, _ = reader.identity(process)
-                    lost = started != identity["proc_start"]
-                except FileNotFoundError:
-                    if reader.exists(process):
-                        raise ObservationFailure(f"host process {identity['pid']}: stat is missing") from None
-                    lost = True
+                state = process_identity.check_owner(identity["pid"],
+                    process_identity.parse_start(identity["proc_start"]),
+                    process_identity.PROC_ROOT if isinstance(reader, _DarwinSnapshotProcesses) else reader.root)
+                if state is process_identity.OwnerCheck.UNKNOWN:
+                    raise ObservationFailure(f"host process {identity['pid']}: identity is unknown")
+                lost = state in (process_identity.OwnerCheck.GONE, process_identity.OwnerCheck.REPLACED)
             elif host["kind"] == "herdr":
                 lost = host["herdr_session"] not in hosts.presentation
             elif host["kind"] == "unit" and host["session_host"] == "herdr":
@@ -1691,10 +1691,15 @@ def snapshot_inventory() -> CompleteInventory | PartialInventory:
         process = reader.path(registered["pid"])
         try:
             started, _ = reader.identity(process)
-            if registered.get("procStart") and registered.get("procStart") != started:
-                continue  # A positively different process is no longer this session.
-            if not registered.get("procStart"):
+            recorded_start = registered.get("procStart", "")
+            if not recorded_start:
                 raise ObservationFailure(f"session {registered['sessionId']}: recorded process identity is missing")
+            state = process_identity.check_owner(registered["pid"], process_identity.parse_start(recorded_start),
+                process_identity.PROC_ROOT if isinstance(reader, _DarwinSnapshotProcesses) else reader.root)
+            if state in (process_identity.OwnerCheck.GONE, process_identity.OwnerCheck.REPLACED):
+                continue
+            if state is process_identity.OwnerCheck.UNKNOWN:
+                raise ObservationFailure(f"session {registered['sessionId']}: process identity is unknown")
             data = cast(SessionFile, cast(object, {**registered, **details}))
             if isinstance(reader, _DarwinSnapshotProcesses):
                 data["cwd"] = reader.cwd(process)
@@ -1781,12 +1786,19 @@ def codex_liveness(entry: SnapshotCodexSession) -> CodexLive | CodexGone | Codex
         try:
             if reader.command(process) != "codex":
                 continue
-            started, terminal = reader.identity(process)
+            identity = reader.identity(process)
+            terminal = identity[1]
             argv = reader.arguments(process)
             if not terminal or not argv or not _codex_interactive(argv):
                 continue
-            if int(process.name) == entry["session"]["pid"] and started == entry["session"]["proc_start"]:
-                return CodexLive(int(process.name))
+            if int(process.name) == entry["session"]["pid"]:
+                state = process_identity.check_owner(int(process.name),
+                    process_identity.parse_start(entry["session"]["proc_start"]),
+                    process_identity.PROC_ROOT if isinstance(reader, _DarwinSnapshotProcesses) else reader.root)
+                if state is process_identity.OwnerCheck.ALIVE:
+                    return CodexLive(int(process.name))
+                if state is process_identity.OwnerCheck.UNKNOWN:
+                    failure = f"process {process.name}: identity is unknown"
             if entry["codex"]["resume"]["kind"] != "session id":
                 continue
             environment = reader.environment(process)

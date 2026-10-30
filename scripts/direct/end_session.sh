@@ -78,22 +78,112 @@ while IFS= read -r run; do
   fi
 done <<< "${HELD}"
 
+# Keep both the failed runs and the completed runs until the whole cleanup
+# succeeds. New runs discovered on a retry must join the pending runs.
+PENDING="${MARKER}.cleanup"
+COMPLETED="${PENDING}.done"
+
+contains_run() {
+  local wanted="$1"
+  shift
+  local candidate
+  for candidate in "$@"; do
+    [[ "${candidate}" != "${wanted}" ]] || return 0
+  done
+  return 1
+}
+
+save_runs() {
+  local destination="$1"
+  shift
+  mkdir -p "$(dirname "${destination}")"
+  local staged="${destination}.$$"
+  : > "${staged}"
+  if (( $# > 0 )); then
+    printf '%s\n' "$@" > "${staged}"
+  fi
+  mv -f "${staged}" "${destination}"
+}
+
+DONE_RUNS=()
+if [[ -f "${PENDING}" ]]; then
+  if [[ -f "${COMPLETED}" ]]; then
+    while IFS= read -r run; do
+      [[ -z "${run}" ]] || DONE_RUNS+=("${run}")
+    done < "${COMPLETED}"
+  fi
+  while IFS= read -r run; do
+    [[ -z "${run}" ]] || RUNS+=("${run}")
+  done < "${PENDING}"
+fi
+SELECTED_RUNS=()
+for run in "${RUNS[@]}"; do
+  if ! contains_run "${run}" "${DONE_RUNS[@]}" &&
+      ! contains_run "${run}" "${SELECTED_RUNS[@]}"; then
+    SELECTED_RUNS+=("${run}")
+  fi
+done
+RUNS=("${SELECTED_RUNS[@]}")
+
+FAILED_RUNS=()
+fail_run() {
+  if ! contains_run "$1" "${FAILED_RUNS[@]}"; then
+    FAILED_RUNS+=("$1")
+  fi
+}
+
 if (( ${#RUNS[@]} > 0 )); then
+  save_runs "${PENDING}" "${RUNS[@]}"
+  CLEAN_RUNS=()
   REMOVE_ARGS=()
   for run in "${RUNS[@]}"; do
-    REMOVE_ARGS+=(--session-dir "${run}")
-  done
-  for run in "${RUNS[@]}"; do
-    "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}" || exit 1
-  done
-  "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}" || true
-  for run in "${RUNS[@]}"; do
-    if [[ -f "${run}/mesh_roster.json" || -f "${run}/mesh_server.json" || -f "${run}/mesh_retired.json" ]]; then
-      "$PY" "${MESH}" stop --pause --session-dir "${run}" || true
+    if "$PY" "${SCRIPT_DIR}/../astra/design_roles.py" unbind-run "${run}"; then
+      CLEAN_RUNS+=("${run}")
+      REMOVE_ARGS+=(--session-dir "${run}")
+    else
+      fail_run "${run}"
     fi
   done
-  "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${RUNS[@]}" || true
-  # remove_run_scratch also ends tracked run scratch while keeping live commands' cwd.
+  if (( ${#CLEAN_RUNS[@]} > 0 )); then
+    # Keep the grouped fast path. On failure, retry each run to identify which
+    # runs still need cleanup. The helpers return success for absent resources.
+    if ! "$PY" "${SCRIPT_DIR}/remove_workers.py" "${REMOVE_ARGS[@]}"; then
+      for run in "${CLEAN_RUNS[@]}"; do
+        if ! "$PY" "${SCRIPT_DIR}/remove_workers.py" --session-dir "${run}"; then
+          fail_run "${run}"
+        fi
+      done
+    fi
+    for run in "${CLEAN_RUNS[@]}"; do
+      if [[ -f "${run}/mesh_roster.json" || -f "${run}/mesh_server.json" || -f "${run}/mesh_retired.json" ]]; then
+        if ! "$PY" "${MESH}" stop --pause --session-dir "${run}"; then
+          fail_run "${run}"
+        fi
+      fi
+    done
+    if ! "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${CLEAN_RUNS[@]}"; then
+      for run in "${CLEAN_RUNS[@]}"; do
+        if ! "$PY" "${SCRIPT_DIR}/remove_run_scratch.py" --tracked "${run}"; then
+          fail_run "${run}"
+        fi
+      done
+    fi
+    # Scratch cleanup keeps any live command's cwd.
+  fi
+  for run in "${RUNS[@]}"; do
+    if ! contains_run "${run}" "${FAILED_RUNS[@]}"; then
+      DONE_RUNS+=("${run}")
+    fi
+  done
+  save_runs "${COMPLETED}" "${DONE_RUNS[@]}"
+  save_runs "${PENDING}" "${FAILED_RUNS[@]}"
+fi
+
+if (( ${#FAILED_RUNS[@]} > 0 )); then
+  for run in "${FAILED_RUNS[@]}"; do
+    echo "Unable to finish cleanup for run: ${run}; rerun end_session.sh to retry." >&2
+  done
+  exit 1
 fi
 
 if [[ -f "${MARKER}" ]]; then
@@ -102,3 +192,5 @@ if [[ -f "${MARKER}" ]]; then
 else
   echo "No active unit run marker for this session."
 fi
+
+rm -f "${PENDING}" "${COMPLETED}"

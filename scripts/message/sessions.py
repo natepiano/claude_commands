@@ -6,13 +6,16 @@ from __future__ import annotations
 import json
 import os
 import stat
-import subprocess
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import process_start as process_identity
 
 
 # Claude's entrypoint for a print-mode run starts with this; an interactive session's is "cli".
@@ -162,34 +165,6 @@ def remote_control(record: SessionRecord) -> Literal["active", "absent"]:
     return "absent"
 
 
-def process_start(pid: int) -> str | None:
-    """The process identity stored in session records, in this platform's native units."""
-    if sys.platform == "darwin":
-        # Claude writes procStart under this locale and zone; other text never matches.
-        try:
-            result = subprocess.run(
-                ("ps", "-o", "lstart=", "-p", str(pid)),
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-                env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        started = result.stdout.strip()
-        return started if result.returncode == 0 and started else None
-    try:
-        # The kernel can truncate the process name inside a UTF-8 character.
-        _, separator, fields = Path(f"/proc/{pid}/stat").read_bytes().rpartition(b")")
-        if not separator:
-            return None
-        started = fields.split()[19].decode("ascii")
-        return started if started.isdigit() else None
-    except (OSError, IndexError, UnicodeDecodeError):
-        return None
-
-
 def headless(record: SessionRecord) -> bool:
     """A `claude -p` run, such as send.py's relay, which takes its sender's name for one message.
 
@@ -210,7 +185,7 @@ def running_session(record: SessionRecord) -> bool:
         return False
     recorded_start = record.get("procStart", "")
     if recorded_start:
-        return recorded_start == process_start(record["pid"])
+        return process_identity.check_owner(record["pid"], process_identity.parse_start(recorded_start)) is process_identity.OwnerCheck.ALIVE
     return messaging_socket_exists(record)
 
 
@@ -218,19 +193,10 @@ def process_liveness(pid: int, recorded_start: str) -> LiveSessionProcess | Sess
     """Check the saved process identity without treating unreadable evidence as absence."""
     if not recorded_start:
         return SessionNotLive()
-    current = process_start(pid)
-    if current is not None and current != recorded_start:
+    state = process_identity.check_owner(pid, process_identity.parse_start(recorded_start))
+    if state in (process_identity.OwnerCheck.GONE, process_identity.OwnerCheck.REPLACED):
         return SessionNotLive()
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return SessionNotLive()
-    except PermissionError:
-        if current == recorded_start:
-            return LiveSessionProcess(pid)
-    except (OSError, OverflowError) as error:
-        return SessionLivenessUnknown(f"process identity unreadable: {error}")
-    if current is None:
+    if state is process_identity.OwnerCheck.UNKNOWN:
         return SessionLivenessUnknown(f"process identity unreadable for pid {pid}")
     return LiveSessionProcess(pid)
 

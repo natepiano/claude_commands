@@ -19,6 +19,8 @@ from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
 from typing import BinaryIO, Literal, TextIO, cast, override
 from unittest.mock import patch
 
@@ -1435,16 +1437,17 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         registry = self.session_dir / "director-sessions"
         registry.mkdir()
         from scripts.lib import unit_runs
-        from scripts.message import sessions
         director = "fixture-director"
         _ = (self.session_dir / unit_runs.DIRECTOR_FILE).write_text(director)
         with socket.socket(socket.AF_UNIX) as endpoint:
             address = self.session_dir / "director.sock"
             endpoint.bind(str(address))
+            started = process_identity.process_start(os.getpid())
+            assert not isinstance(started, process_identity.ProcessGone)
             _ = (registry / f"{os.getpid()}.json").write_text(json.dumps({
                 "pid": os.getpid(), "sessionId": director, "name": "demo · builders · director",
                 "messagingSocketPath": str(address), "updatedAt": 1, "tmux": "", "formerNames": [],
-                "procStart": sessions.process_start(os.getpid()), "entrypoint": "cli"}))
+                "procStart": started.text, "entrypoint": "cli"}))
             self.patches.enter_context(patch.dict(os.environ, {"NOTIFIER_SESSIONS_DIR": str(registry)}))
             self.assertEqual(workers.director_pid(self.session_dir), os.getpid())
             self.check_short_lived_resolve()

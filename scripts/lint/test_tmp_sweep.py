@@ -19,6 +19,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+if TYPE_CHECKING:
+    from ..lib import process_start
+    from ..lib.process_start_test_support import write_stat
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
+    from scripts.lib.process_start_test_support import write_stat
+
 import tmp_sweep
 if TYPE_CHECKING:
     from ..lib import scratch
@@ -57,7 +67,7 @@ def fake_start(proc: Path, pid: int, start: float, *arguments: str) -> None:
     """A /proc/<pid> entry that started at start with arguments, as verify_running reads it."""
     _ = write(proc / "stat", f"cpu 0\nbtime {BOOT}\n")
     ticks = round((start - BOOT) * os.sysconf("SC_CLK_TCK"))
-    _ = write(proc / str(pid) / "stat", f"{pid} (a b) S " + "0 " * 18 + f"{ticks} 0 0\n")
+    _ = write_stat(proc, pid, command="a b", start_ticks=ticks)
     _ = write(proc / str(pid) / "cmdline", "\0".join(arguments) + "\0")
 
 
@@ -456,12 +466,10 @@ class TempFolderTests(TmpSweepCase):
         self.assertEqual([entry["path"] for entry in later.deleted], [str(old_name)])
         self.assertTrue(copy.is_dir())
 
-    def test_ps_elapsed_time_reads_in_seconds(self) -> None:
-        self.assertEqual(tmp_sweep.elapsed_seconds("05:07"), 307)
-        self.assertEqual(tmp_sweep.elapsed_seconds("02:05:07"), 7507)
-        self.assertEqual(tmp_sweep.elapsed_seconds("3-02:05:07"), 3 * DAY + 7507)
-        self.assertIsNone(tmp_sweep.elapsed_seconds(""))
-        self.assertIsNone(tmp_sweep.elapsed_seconds("x-05:07"))
+    def test_unreadable_verify_identity_keeps_scratch_and_gone_identity_does_not(self) -> None:
+        with mock.patch.object(process_start, "process_start", side_effect=process_start.ProcessReadError("denied")):
+            self.assertTrue(tmp_sweep.verify_running(20, 1200, 1300, str(self.proc)))
+        self.assertFalse(tmp_sweep.verify_running(20, 1200, 1300, str(self.proc)))
 
     def test_the_wide_root_is_tmp_alone_and_only_when_it_is_a_temp_folder(self) -> None:
         temp = self.tmp.parent / "temp"

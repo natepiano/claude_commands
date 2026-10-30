@@ -91,6 +91,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
 from urllib.parse import unquote, urlparse
 
+if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import scratch  # noqa: E402
 from user_zone import user_zone  # noqa: E402
@@ -369,50 +375,27 @@ def holds_no_file(folder: str) -> bool:
     return True
 
 
-def process_start(pid: int, now: float, proc: str = PROC_DIR) -> tuple[float, list[str]] | None:
-    """When pid started and its arguments, from proc, else from ps (the Mac); None when it is gone
-    or cannot be read."""
-    if os.path.isdir(proc):
-        try:
-            with open(os.path.join(proc, str(pid), "cmdline"), "rb") as handle:
-                arguments = handle.read().decode(errors="replace").split("\0")
-            with open(os.path.join(proc, str(pid), "stat"), encoding="utf-8") as handle:
-                fields = handle.read().rpartition(")")[2].split()
-            with open(os.path.join(proc, "stat"), encoding="utf-8") as handle:
-                boot = next(int(line.split()[1]) for line in handle if line.startswith("btime "))
-            return boot + int(fields[19]) / os.sysconf("SC_CLK_TCK"), arguments
-        except (OSError, ValueError, IndexError, StopIteration):
-            return None
-    try:
-        completed = subprocess.run(["ps", "-o", "etime=", "-o", "command=", "-p", str(pid)],
-                                   capture_output=True, text=True, check=False, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    elapsed, _, command = completed.stdout.strip().partition(" ")
-    seconds = elapsed_seconds(elapsed)
-    return None if seconds is None else (now - seconds, command.split())
-
-
-def elapsed_seconds(elapsed: str) -> int | None:
-    """ps etime, [[dd-]hh:]mm:ss, in seconds."""
-    days, _, clock = elapsed.rpartition("-")
-    parts = clock.split(":")
-    if not 2 <= len(parts) <= 3 or not all(part.isdigit() for part in parts) or (days and not days.isdigit()):
-        return None
-    seconds = 0
-    for part in parts:
-        seconds = seconds * 60 + int(part)
-    return seconds + int(days or 0) * 86400
-
-
 def verify_running(pid: int, made: float, now: float, proc: str = PROC_DIR) -> bool:
     """Whether pid is a verify.sh run that started before made, the folder's mtime: a pid reused by
     another process, or by a later run, is not the run that made the folder."""
-    started = process_start(pid, now, proc)
-    if started is None:
-        return False
-    start, arguments = started
-    return any(os.path.basename(argument) == VERIFY_SCRIPT for argument in arguments) and start <= made + START_SLACK_SECONDS
+    _ = now
+    root = Path(proc)
+    try:
+        start = process_start.process_start(pid, root)
+        if isinstance(start, process_start.ProcessGone):
+            return False
+        instant = process_start.started_at(start, root).timestamp()
+        if root.is_dir():
+            arguments = (root / str(pid) / "cmdline").read_bytes().decode(errors="replace").split("\0")
+        else:
+            command = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                                     capture_output=True, text=True, check=False, timeout=10)
+            if command.returncode or command.stderr.strip():
+                return True  # Unknown ownership keeps the scratch folder.
+            arguments = command.stdout.split()
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return True  # A read error cannot prove that the run ended.
+    return any(os.path.basename(argument) == VERIFY_SCRIPT for argument in arguments) and instant <= made + START_SLACK_SECONDS
 
 
 def listing(directory: str) -> Iterator[os.DirEntry[str]]:

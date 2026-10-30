@@ -219,6 +219,7 @@ UNIT_ENV_SHIM="${BASH_SOURCE[0]%/*}/../lib/unit_env.sh"
 # rather than by path: the python3 on PATH is Apple 3.9 on the Mac, and this
 # repo needs >= 3.11.
 PY="${HOME}/.claude/scripts/lib/py"
+PROCESS_REPOSITORY="$(cd "${BASH_SOURCE[0]%/*}/../.." && pwd -P)"
 
 # The single bottom layer: run(), lint.conf gating, fmt_cargo, run_nextest,
 # invoke_clippy_fix, invoke_clippy, and sandbox-failure detection come from here.
@@ -955,10 +956,78 @@ ROUTING_WAIT_STARTED=""
 # step subshells to the parent cleanup, which also ends interrupted waits.
 PHASE_WAIT_SESSION="${UNIT_RUN_DIR:-${UNIT_SESSION_DIR:-}}"
 PHASE_WAIT_RECORDER="$(cd "${BASH_SOURCE[0]%/*}" && pwd)/progress_history.py"
+PHASE_WAIT_RETRY_ROOT=""
+PHASE_WAIT_PUBLISHED=0
+# Publish the folder only after its owner is recorded. A missing process or
+# a changed start time makes it recoverable, even if cleanup never ran.
+PHASE_WAIT_OWNER_PY='
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+sys.path.insert(0, sys.argv[-1])
+from scripts.lib import process_start
+
+proc_root = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
+owner = Path(sys.argv[2]) / "owner.json"
+if sys.argv[1] == "record":
+    pid = int(sys.argv[3])
+    start = process_start.process_start(pid, proc_root)
+    if isinstance(start, process_start.ProcessGone):
+        sys.exit("verify.sh: wait owner has ended")
+    identity = {"pid": pid, "start_time": start.text}
+    with tempfile.NamedTemporaryFile(mode="w", dir=owner.parent, prefix=".owner-", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            json.dump(identity, output)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        temporary.replace(owner)
+    finally:
+        temporary.unlink(missing_ok=True)
+else:
+    try:
+        record = json.loads(owner.read_text())
+        pid = record["pid"]
+        saved_start = record["start_time"]
+        if not isinstance(pid, int) or pid <= 0 or not isinstance(saved_start, str) or not saved_start:
+            raise ValueError("invalid wait owner identity")
+        recorded = process_start.parse_start(saved_start)
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        # An unpublished folder without an owner can still be under construction.
+        if sys.argv[1] == "staging-live":
+            sys.exit(2)
+        # Legacy folders have only a pid. A read error cannot prove it is gone.
+        try:
+            pid = int(owner.parent.name.split(".")[1])
+            if pid <= 0:
+                raise ValueError("invalid wait owner pid")
+        except (ValueError, IndexError) as error:
+            print(f"verify.sh: wait history NotRecorded: cannot identify {owner}: {error}", file=sys.stderr)
+            sys.exit(2)
+        try:
+            state = process_start.process_state(pid, proc_root)
+        except process_start.ProcessReadError:
+            sys.exit(2)
+        sys.exit(1 if state is process_start.ProcessRunState.GONE else 0)
+    check = process_start.check_owner(pid, recorded, proc_root)
+    if check in (process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED):
+        sys.exit(1)
+    sys.exit(0 if check is process_start.OwnerCheck.ALIVE else 2)
+
+'
 phase_wait_start() {
     local key=$1 reason=$2 id file
     [[ "${CLAUDE_PROBE_SESSION:-}" != 1 && -n "$PHASE_WAIT_SESSION" \
-        && -f "$PHASE_WAIT_SESSION/progress_history_state.json" && -n "$HOLD_WAIT_DIR" ]] || return 0
+        && -f "$PHASE_WAIT_SESSION/progress_history_state.json" && "$PHASE_WAIT_PUBLISHED" -eq 1 ]] || return 0
+    if ! phase_wait_retry_pending; then
+        printf 'verify.sh: wait history NotRecorded: an earlier wait still needs to close\n' >&2
+        return 0
+    fi
     file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$key"
     [[ ! -s "$file" ]] || return 0
     local args=(start-wait --session-dir "$PHASE_WAIT_SESSION"
@@ -976,24 +1045,86 @@ phase_wait_start() {
     fi
 }
 phase_wait_finish() {
-    local file="$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$1" id
+    phase_wait_finish_file "$HOLD_WAIT_DIR/phase-wait.${BASHPID:-$$}.$1" || true
+}
+phase_wait_finish_file() {
+    local file=$1 id=""
     [[ -s "$file" ]] || return 0
-    read -r id < "$file"
+    if ! { read -r id < "$file"; } 2>/dev/null; then
+        # Another scanner may have finished and removed it after the size check.
+        [[ ! -e "$file" ]] && return 0
+        printf 'verify.sh: wait history NotRecorded: cannot read %s\n' "$file" >&2
+        return 1
+    fi
     if "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id"; then
         rm -f "$file"
     else
         printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
+        return 1
     fi
 }
 phase_wait_finish_all() {
-    local file id
+    local file
     [[ -n "$HOLD_WAIT_DIR" ]] || return 0
     for file in "$HOLD_WAIT_DIR"/phase-wait.*; do
         [[ -s "$file" ]] || continue
-        read -r id < "$file"
-        "$PY" "$PHASE_WAIT_RECORDER" finish-wait --session-dir "$PHASE_WAIT_SESSION" --wait-id "$id" \
-            || printf 'verify.sh: wait history NotRecorded: cannot close %s\n' "$id" >&2
+        phase_wait_finish_file "$file" || true
     done
+}
+phase_wait_retry_pending() {
+    local directory file pending owner_status failed=0
+    [[ -n "$PHASE_WAIT_RETRY_ROOT" ]] || return 0
+    for directory in "$PHASE_WAIT_RETRY_ROOT"/.verify-hold-new.*; do
+        [[ -d "$directory" ]] || continue
+        if "$PY" -c "$PHASE_WAIT_OWNER_PY" staging-live "$directory" "$PROCESS_REPOSITORY"; then
+            continue
+        else
+            owner_status=$?
+            if [[ "$owner_status" -eq 1 ]]; then
+                rm -rf "$directory"
+            fi
+        fi
+    done
+    for directory in "$PHASE_WAIT_RETRY_ROOT"/verify-hold.*; do
+        [[ -d "$directory" && "$directory" != "$HOLD_WAIT_DIR" ]] || continue
+        if "$PY" -c "$PHASE_WAIT_OWNER_PY" live "$directory" "$PROCESS_REPOSITORY"; then
+            continue
+        else
+            owner_status=$?
+            if [[ "$owner_status" -ne 1 ]]; then
+                failed=1
+                continue
+            fi
+        fi
+        pending=0
+        for file in "$directory"/phase-wait.*; do
+            phase_wait_finish_file "$file" || pending=1
+        done
+        if [[ "$pending" -eq 0 ]]; then
+            rm -rf "$directory"
+        else
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+phase_wait_create_directory() {
+    local staging directory
+    if [[ -n "$PHASE_WAIT_RETRY_ROOT" ]]; then
+        if staging="$(mktemp -d "$PHASE_WAIT_RETRY_ROOT/.verify-hold-new.$$.XXXXXX")" \
+            && "$PY" -c "$PHASE_WAIT_OWNER_PY" record "$staging" "$$" "$PROCESS_REPOSITORY"; then
+            directory="$PHASE_WAIT_RETRY_ROOT/verify-hold.${staging##*/.verify-hold-new.}"
+            if mv "$staging" "$directory"; then
+                HOLD_WAIT_DIR="$directory"
+                PHASE_WAIT_PUBLISHED=1
+                return 0
+            fi
+        fi
+        printf 'verify.sh: wait history NotRecorded: cannot publish wait owner\n' >&2
+    fi
+    # Build admission still needs these files when wait history is unavailable.
+    HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
 }
 
 # The memory gate announces only blocked admission. A granted first check
@@ -1032,6 +1163,7 @@ interrupt_hold_wait() {
 }
 
 finish_hold_wait() {
+    local file
     phase_wait_finish_all
     collect_hold_wait
     if [[ -n "${TOKEN_WAIT_ENTRY:-}" ]]; then rm -f -- "$TOKEN_WAIT_ENTRY"; fi
@@ -1039,6 +1171,14 @@ finish_hold_wait() {
         "$PY" "$MAC_IDLE_SCRIPT" remove "$BUILDLOG_CALL_ID" || true
     fi
     if [[ -n "$HOLD_WAIT_DIR" ]]; then
+        for file in "$HOLD_WAIT_DIR"/phase-wait.*; do
+            if [[ -s "$file" ]]; then
+                # Keep the owner and ids. The next call retries once this
+                # owner has exited, even if cleanup stops at this line.
+                HOLD_WAIT_DIR=""
+                return 0
+            fi
+        done
         rm -rf "$HOLD_WAIT_DIR"
         HOLD_WAIT_DIR=""
     fi
@@ -2032,8 +2172,10 @@ cache_record() {
             printf 'host=mac\n'
         fi
     } > "${CACHE_DIR}/${key}.${kind}.tmp"
-    mv -f "${CACHE_DIR}/${key}.${kind}.tmp" "${CACHE_DIR}/${key}.${kind}"
+    # Remove the old verdict first: a stop before publication must make the
+    # next call run again, not reuse an answer this run has disproved.
     rm -f "${CACHE_DIR}/${key}.${other}"
+    mv -f "${CACHE_DIR}/${key}.${kind}.tmp" "${CACHE_DIR}/${key}.${kind}"
 }
 
 # Records a Mac pass, whose output is in the file $1, as this call's pass
@@ -2113,7 +2255,18 @@ if [[ "$CMD" == test && -z "${GATE_METADATA}" ]]; then
     GATE_METADATA="$(cargo metadata --no-deps --format-version 1 2>/dev/null)" || GATE_METADATA=""
 fi
 
-HOLD_WAIT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/verify-hold.$$.XXXXXX")"
+if [[ "${CLAUDE_PROBE_SESSION:-}" != 1 && -n "$PHASE_WAIT_SESSION" \
+    && -f "$PHASE_WAIT_SESSION/progress_history_state.json" ]]; then
+    # Scope retries to this run and physical working tree. Owner identity
+    # lets a later call recover a stopped call without taking a live wait.
+    PHASE_WAIT_RETRY_ROOT="$PHASE_WAIT_SESSION/verify_waits/$("$PY" -c \
+        'import hashlib, os; print(hashlib.sha256(os.fsencode(os.getcwd())).hexdigest())')"
+    if ! mkdir -p "$PHASE_WAIT_RETRY_ROOT"; then
+        printf 'verify.sh: wait history NotRecorded: cannot create wait folder\n' >&2
+        PHASE_WAIT_RETRY_ROOT=""
+    fi
+fi
+phase_wait_create_directory
 export BUILDLOG_HOLD_WAIT_FILE="$HOLD_WAIT_DIR/seconds"
 export BUILDLOG_HOLD_WAITER_FILE="$HOLD_WAIT_DIR/waiter"
 export BUILDLOG_CHECK_FAILED_FILE="$HOLD_WAIT_DIR/check-failed"
@@ -2132,6 +2285,7 @@ hold_interrupted() {
 trap 'hold_interrupted INT 130' INT
 trap 'hold_interrupted TERM 143' TERM
 trap 'hold_interrupted HUP 129' HUP
+phase_wait_retry_pending || true
 initialize_step_record
 if cache_lookup; then
     exit "${LOOKUP_STATUS}"
@@ -2496,20 +2650,17 @@ import signal
 import subprocess
 import sys
 
-lock = Path(sys.argv[1])
-holder = sys.argv[2]
-command = sys.argv[3:]
+sys.path.insert(0, sys.argv[1])
+from scripts.lib import process_start
+
+proc_root = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
+lock = Path(sys.argv[2])
+holder = sys.argv[3]
+command = sys.argv[4:]
 
 def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
 
-def identity(pid):
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
-        return fields[19]
-    except (OSError, IndexError):
-        return subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="],
-                                       text=True, stderr=subprocess.DEVNULL).strip()
 
 child = os.fork()
 if child:
@@ -2541,8 +2692,11 @@ with (lock.parent / "cargo.guard").open("a+") as guard:
         print("verify.sh: this run lost the cargo token before its step started; run it again.",
               file=sys.stderr)
         sys.exit(125)
+    start = process_start.process_start(os.getpid(), proc_root)
+    if isinstance(start, process_start.ProcessGone):
+        sys.exit("verify.sh: step owner has ended; step refused")
     record = lock / f"owned.{os.getpid()}.tmp"
-    record.write_text(json.dumps({"group": os.getpid(), "start": identity(os.getpid())}))
+    record.write_text(json.dumps({"group": os.getpid(), "start": start.text}))
     os.replace(record, lock / "owned")
     fcntl.flock(guard, fcntl.LOCK_UN)
 
@@ -2554,8 +2708,8 @@ sys.exit(shell_status(subprocess.call(command)))
 eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
 buildlog_exec() {
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-        buildlog_exec_unowned python3 -c "$STEP_OWNER_PY" \
-            "${BOARD_DIR}/locks/cargo.d" "$$" "$@"
+        buildlog_exec_unowned "$PY" -c "$STEP_OWNER_PY" \
+            "$PROCESS_REPOSITORY" "${BOARD_DIR}/locks/cargo.d" "$$" "$@"
     else
         buildlog_exec_unowned "$@"
     fi
@@ -2611,12 +2765,23 @@ remember_tree_reservation() {
 }
 
 buildlog_wait_for_memory() {
-    local memory_wait stat fields=()
-    if [[ -n "${TREE_WATCH_DIR:-}" && -r "/proc/${BASHPID:-$$}/stat" ]]; then
-        stat="$(< "/proc/${BASHPID:-$$}/stat")"
-        read -r -a fields <<< "${stat##*) }"
+    local memory_wait admission_start
+    if [[ -n "${TREE_WATCH_DIR:-}" ]] && admission_start="$("$PY" -c "
+import os
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[1])
+from scripts.lib import process_start
+try:
+    start = process_start.process_start(int(sys.argv[2]), Path(os.environ.get(\"VERIFY_PROC_ROOT\", \"/proc\")))
+except process_start.ProcessReadError:
+    sys.exit(2)
+if not isinstance(start, process_start.ProcessStartTime):
+    sys.exit(1)
+print(start.text)
+" "$PROCESS_REPOSITORY" "${BASHPID:-$$}")"; then
         printf '%s/admission/%s-%s.waiting\n' "${BUILDLOG_DIR:-$HOME/.local/state/buildlog}" \
-            "${BASHPID:-$$}" "${fields[19]}" >> "$TREE_WATCH_DIR/waiters"
+            "${BASHPID:-$$}" "$admission_start" >> "$TREE_WATCH_DIR/waiters"
     fi
     step_state waiting_hold
     if release_token && [[ "${TOKEN_USED}" -eq 1 && -n "${TOKEN_WAIT_FILE:-}" ]]; then

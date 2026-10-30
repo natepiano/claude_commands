@@ -50,6 +50,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib import process_start
 import add_unit  # noqa: E402
 import berth_board  # noqa: E402
 import production_units  # noqa: E402
@@ -245,15 +247,6 @@ def _alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
-
-
-def proc_start(pid: int) -> str:
-    """The process's start time in clock ticks, as /proc/<pid>/stat field 22 gives it."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    return stat.rsplit(")", 1)[-1].split()[19]
 
 
 def claude_sessions(worktree: Path, ids: frozenset[str]) -> tuple[SessionRecord, ...]:
@@ -608,21 +601,42 @@ def stop_sessions(unit: Unit, found: Found, wait_minutes: float, known_ids: froz
     return left
 
 
-def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) -> list[str]:
+def terminate(pids: list[int], what: dict[int, str], wait: float | None = None, *,
+              recorded: dict[int, process_start.ProcessStart]) -> list[str]:
     """SIGTERM each pid; one alive after `wait` seconds (TERM_WAIT_SECONDS) comes back as still running."""
+    identities = dict(recorded)
+    refused: list[str] = []
+    signalled: list[int] = []
     for pid in pids:
+        if pid not in identities:
+            try:
+                started = process_start.process_start(pid)
+            except process_start.ProcessReadError:
+                refused.append(f"{what[pid]}: owner cannot be confirmed; kept")
+                continue
+            if isinstance(started, process_start.ProcessGone):
+                continue
+            identities[pid] = started
+        owner = process_start.check_owner(pid, identities[pid])
+        if owner is process_start.OwnerCheck.UNKNOWN:
+            refused.append(f"{what[pid]}: owner cannot be confirmed; kept")
+            continue
+        if owner is not process_start.OwnerCheck.ALIVE:
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
+            signalled.append(pid)
         except ProcessLookupError:
             continue
         except PermissionError as error:
-            what[pid] += f": {error}"
+            refused.append(f"{what[pid]}: {error}")
     deadline = time.monotonic() + (TERM_WAIT_SECONDS if wait is None else wait)
-    while any(_alive(pid) for pid in pids) and time.monotonic() < deadline:
+    while any(process_start.check_owner(pid, identities[pid]) is process_start.OwnerCheck.ALIVE for pid in signalled) and time.monotonic() < deadline:
         time.sleep(0.2)
-    left: list[str] = []
-    for pid in pids:
-        if _alive(pid):
+    left = refused
+    for pid in signalled:
+        if process_start.check_owner(pid, identities[pid]) in (
+                process_start.OwnerCheck.ALIVE, process_start.OwnerCheck.UNKNOWN):
             left.append(f"{what[pid]}: still runs after SIGTERM")
         else:
             print(f"stopped: {what[pid]}")
@@ -661,11 +675,16 @@ def stop_rest(unit: Unit, found: Found) -> list[str]:
             left.append(f"berth reservation {key}: {failure(result)}")
         else:
             print(f"released: berth reservation {key}")
-    claims = [claim for claim in found.claims if _alive(claim.pid) and proc_start(claim.pid) == claim.proc_start]
-    what = {claim.pid: f"Mac claim {claim.what} (pid {claim.pid})" for claim in claims}
-    left += terminate([claim.pid for claim in claims], what)
+    for claim in found.claims:
+        owner = (process_start.check_owner(claim.pid, process_start.parse_start(claim.proc_start))
+                 if claim.proc_start else process_start.OwnerCheck.UNKNOWN)
+        if owner is process_start.OwnerCheck.UNKNOWN:
+            left.append(f"Mac claim {claim.what} (pid {claim.pid}): owner cannot be confirmed; kept")
+        elif owner is process_start.OwnerCheck.ALIVE:
+            left += terminate([claim.pid], {claim.pid: f"Mac claim {claim.what} (pid {claim.pid})"},
+                              recorded={claim.pid: process_start.parse_start(claim.proc_start)})
     others = [pid for pid in found.processes if _alive(pid)]
-    left += terminate(others, {pid: f"process {pid} ({_command_name(pid)})" for pid in others})
+    left += terminate(others, {pid: f"process {pid} ({_command_name(pid)})" for pid in others}, recorded={})
     return left
 
 

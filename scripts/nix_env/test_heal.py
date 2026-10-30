@@ -6,6 +6,8 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
 import socket
 import subprocess
 import sys
@@ -21,18 +23,17 @@ if TYPE_CHECKING:
     from scripts.notify import push_texts
 else:
     import push_texts
-from scripts.message import sessions
 from scripts.whoami import account
 
 
 class HealTests(NixFixture):
-    session: heal.HealSession = heal.HealSession("fixture", 811, "start-811", "worker", Path(), "idle", Path())
+    session: heal.HealSession = heal.HealSession("fixture", 811, "811", "worker", Path(), "idle", Path())
 
     @override
     def setUp(self) -> None:
         super().setUp()
         _ = self.envrc(self.work)
-        self.session = heal.HealSession("fixture", 811, "start-811", "worker", self.work, "idle", self.home / ".claude3")
+        self.session = heal.HealSession("fixture", 811, "811", "worker", self.work, "idle", self.home / ".claude3")
         _ = self.enterContext(patch.object(heal, "STATE_DIR", self.root / "journal"))
 
     def records(self) -> list[dict[str, object]]:
@@ -53,21 +54,21 @@ class HealTests(NixFixture):
             return b"DIRENV_DIR=/fixture\0PATH=/bin\0" if path == process / "environ" else real_read(path)
 
         with (patch.object(sys, "platform", "linux"),
-              patch.object(sessions, "process_start", return_value=self.session.proc_start),
+              patch.object(process_identity, "process_start", return_value=process_identity.parse_start(self.session.proc_start)),
               patch.object(Path, "stat", stat), patch.object(Path, "read_bytes", read)):
             self.assertTrue(heal.broken(self.session))
             with patch.object(Path, "read_bytes", return_value=b"IN_NIX_SHELL=impure\0"):
                 self.assertFalse(heal.broken(self.session))
 
     def test_reused_pid_never_counts_as_broken(self) -> None:
-        with (patch.object(sessions, "process_start", return_value="different-start"),
+        with (patch.object(process_identity, "process_start", return_value=process_identity.parse_start("999")),
               patch.object(Path, "read_bytes", side_effect=AssertionError("reused pid must not be inspected"))):
             self.assertFalse(heal.broken(self.session))
             self.assertIsInstance(heal.inspect(self.session), heal.Gone)
 
     def test_no_envrc_is_healthy_without_process_or_direnv_probe(self) -> None:
         (self.work / ".envrc").unlink()
-        with patch.object(sessions, "process_start", side_effect=AssertionError("no probe needed")):
+        with patch.object(process_identity, "process_start", side_effect=AssertionError("no probe needed")):
             self.assertFalse(heal.broken(self.session))
         self.assertEqual(self.direnv_calls(), [])
 
@@ -75,23 +76,23 @@ class HealTests(NixFixture):
         for number, name in enumerate((".claude", ".claude3"), 1):
             directory = self.home / name / "sessions"
             directory.mkdir(parents=True)
-            record = {"pid": 800 + number, "procStart": "fixture-start", "sessionId": f"sid-{number}",
+            record = {"pid": 800 + number, "procStart": "812", "sessionId": f"sid-{number}",
                       "name": f"worker-{number}", "messagingSocketPath": "", "updatedAt": 1,
                       "cwd": str(self.work), "status": "idle", "kind": "interactive", "entrypoint": "cli"}
             _ = (directory / f"{800 + number}.json").write_text(json.dumps(record))
             _ = (directory / "corrupt.json").write_text("{half written")
-        with patch.object(sessions, "process_start", return_value="fixture-start"):
+        with patch.object(process_identity, "process_start", return_value=process_identity.parse_start("812")):
             found = heal.list_sessions()
         self.assertEqual({item.session_id for item in found}, {"sid-1", "sid-2"})
         self.assertEqual({item.config_dir.name for item in found}, {".claude", ".claude3"})
-        with patch.object(sessions, "process_start", return_value="reused"):
+        with patch.object(process_identity, "process_start", return_value=process_identity.ProcessStartTime(999)):
             self.assertEqual(heal.list_sessions(), [])
         self.assertNotIn("NOTIFIER_SESSIONS_DIR", os.environ)
 
     def test_mac_process_arguments_cannot_pose_as_nix_environment(self) -> None:
         arguments = int(3).to_bytes(4, sys.byteorder, signed=True) + b"/bin/claude\0\0claude\0-p\0IN_NIX_SHELL=spoofed prompt\0"
         with (patch.object(sys, "platform", "darwin"),
-              patch.object(sessions, "process_start", return_value=self.session.proc_start),
+              patch.object(process_identity, "process_start", return_value=process_identity.parse_start(self.session.proc_start)),
               patch.object(account, "kern_procargs2", return_value=arguments + b"HOME=/fixture\0") as kernel):
             self.assertTrue(heal.broken(self.session))
             kernel.return_value = arguments + b"IN_NIX_SHELL=impure\0"
@@ -147,7 +148,7 @@ class HealTests(NixFixture):
         held.return_value = ""
         complete = cast(Callable[..., subprocess.CompletedProcess[str]], run.side_effect)
         with (patch.object(heal, "stop_completion", return_value=heal.StopPending(record_missing=True)) as completion,
-              patch.object(sessions, "process_start", return_value=self.session.proc_start)):
+              patch.object(process_identity, "process_start", return_value=process_identity.parse_start(self.session.proc_start))):
             run.side_effect = KeyboardInterrupt("fixture stopped before down ran")
             with self.assertRaises(KeyboardInterrupt):
                 _ = heal.sweep()
@@ -175,7 +176,7 @@ class HealTests(NixFixture):
         self.assertEqual([command[2] for command in commands], ["down", "restart"])
 
     def test_rerun_clears_unsent_stop_and_alerts_if_the_saved_process_is_gone(self) -> None:
-        for identity in (None, "reused-pid-start"):
+        for identity in (process_identity.ProcessGone(811), process_identity.ProcessStartTime(999)):
             with self.subTest(identity=identity), patch.object(heal, "STATE_DIR", self.root / str(identity)):
                 held, ensure, run = self.install_sweep([self.session])
                 held.return_value = ""
@@ -187,7 +188,7 @@ class HealTests(NixFixture):
                 run.side_effect = complete
                 with (patch.object(heal, "list_sessions", return_value=[]),
                       patch.object(heal, "stop_completion", return_value=heal.StopPending(record_missing=True)),
-                      patch.object(sessions, "process_start", return_value=identity)):
+                      patch.object(process_identity, "process_start", return_value=identity)):
                     self.assertEqual(heal.sweep(), 0)
                     self.assertEqual(heal.sweep(), 0)
                 self.assertEqual(heal.read_history()[self.session.session_id]["pending"], heal.NoPendingRestart(kind="none"))
@@ -200,11 +201,27 @@ class HealTests(NixFixture):
                 self.assertEqual(ensure.call_count, 1)
                 self.assertIn("unsent shutdown request lost its original session process", cast(str, self.records()[-1]["reason"]))
 
+    def test_unsent_stop_keeps_its_owner_and_reservation_when_identity_is_unknown(self) -> None:
+        held, ensure, run = self.install_sweep([self.session])
+        held.return_value = ""
+        with patch.object(heal, "stop_completion", return_value=heal.StopPending(record_missing=True)):
+            run.side_effect = KeyboardInterrupt("fixture interrupted before down")
+            with self.assertRaises(KeyboardInterrupt):
+                _ = heal.sweep()
+            pending = heal.read_history()[self.session.session_id]["pending"]
+            run.reset_mock()
+            with patch.object(process_identity, "process_start", side_effect=process_identity.ProcessReadError("stat denied")):
+                self.assertEqual(heal.sweep(), 0)
+                self.assertEqual(heal.read_history()[self.session.session_id]["pending"], pending)
+            run.assert_not_called()
+            self.assertEqual(ensure.call_count, 1)
+            self.assertIn("readable process identity", cast(str, self.records()[-1]["reason"]))
+
     def test_sent_stop_with_no_record_keeps_waiting_and_legacy_records_are_sent(self) -> None:
         held, ensure, run = self.install_sweep([self.session])
         held.return_value = ""
         with (patch.object(heal, "stop_completion", return_value=heal.StopPending(record_missing=True)),
-              patch.object(sessions, "process_start", side_effect=AssertionError("a sent stop must not be retried"))):
+              patch.object(process_identity, "process_start", side_effect=AssertionError("a sent stop must not be retried"))):
             self.assertEqual(heal.sweep(), 0)
             pending = heal.read_history()[self.session.session_id]["pending"]
             if pending["kind"] == "none":

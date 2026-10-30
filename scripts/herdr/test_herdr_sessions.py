@@ -18,6 +18,7 @@ from typing import TypedDict, cast, override
 from unittest.mock import MagicMock, Mock, patch
 
 import herdr
+from scripts.lib.process_start_test_support import write_stat
 import herdr_sessions
 from fake_herdr import CommandResponse
 from sessions import SessionRecord, UnreadableSessionRecord, read_session
@@ -107,7 +108,7 @@ class HerdrSessionsTests(unittest.TestCase):
     def process(self, pid: int, parent: int, argv: list[str], environment: dict[str, str]) -> None:
         directory = self.proc / str(pid)
         directory.mkdir()
-        _ = (directory / "stat").write_text(f"{pid} (fake process) S {parent} " + "0 " * 20)
+        _ = write_stat(self.proc, pid, ppid=parent, command="fake process", start_ticks=0)
         _ = (directory / "status").write_text(f"Name:\tfake\nPPid:\t{parent}\nUid:\t{os.getuid()}\n")
         _ = (directory / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
         _ = (directory / "environ").write_bytes(

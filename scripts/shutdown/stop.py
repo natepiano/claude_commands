@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Literal, Protocol, TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPTS.parent))
+from scripts.lib import process_start as process_identity
 for dependency in ("message", "production", "herdr", "lib"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
@@ -173,7 +175,7 @@ def _fresh_inventory(login: str, only: frozenset[str]) -> Inventory:
 
 def _same_process(stored: Session) -> bool:
     """Whether the recorded process still runs with its recorded start."""
-    return bool(stored["proc_start"]) and sessions.process_start(stored["pid"]) == stored["proc_start"]
+    return bool(stored["proc_start"]) and process_identity.check_owner(stored["pid"], process_identity.parse_start(stored["proc_start"])) is process_identity.OwnerCheck.ALIVE
 
 
 def fresh_session(stored: Session, report: Inventory) -> FreshSession:
@@ -207,7 +209,10 @@ def fresh_session(stored: Session, report: Inventory) -> FreshSession:
     )
     if reason == "process start mismatch":
         return {"kind": "session identity lost"}
-    if reason == "account unreadable":
+    if reason in {"account unreadable", "process identity unreadable"}:
+        return {"kind": "session account unreadable"}
+    if stored["proc_start"] and process_identity.check_owner(
+            stored["pid"], process_identity.parse_start(stored["proc_start"])) is process_identity.OwnerCheck.UNKNOWN:
         return {"kind": "session account unreadable"}
     return {"kind": "session absent"}
 

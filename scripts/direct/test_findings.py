@@ -7,7 +7,7 @@ from collections.abc import Callable
 import json
 import os
 from pathlib import Path
-from typing import cast
+from typing import TextIO, cast
 import unittest
 from unittest.mock import patch
 
@@ -281,6 +281,32 @@ class FindingsLedgerTests(FindingsLedgerFixture):
         result = self.run_failing_command("abandon", "--reason", "nothing to abandon")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No repair round is in flight", result.stderr)
+
+    def test_landed_rerun_restores_the_event_after_the_state_write(self) -> None:
+        self.write_progress_state("phase-repair")
+        finding = self.open_finding("blocker", "missing event")
+        _ = self.run_command("dispatch", "--covers", finding)
+        original = Path.open
+
+        def stop_event(path: Path, mode: str = "r", *, encoding: str | None = None,
+                       errors: str | None = None, newline: str | None = None) -> TextIO:
+            if path == self.history_file and mode == "a":
+                raise OSError("stopped before landed event")
+            return cast(TextIO, original(path, mode, encoding=encoding, errors=errors, newline=newline))
+
+        with patch.object(Path, "open", stop_event), self.assertRaisesRegex(OSError, "stopped before"):
+            _ = self.run_command("landed", at=1100)
+        self.assertEqual(self.status()["in_flight"], [])
+        self.assertFalse(any(event["event_type"] == "finding_batch_landed" for event in self.events()))
+        result = self.run_command("landed", at=1200)
+        self.assertIn("restored", result)
+        events = [event for event in self.events() if event["event_type"] == "finding_batch_landed"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["round"], 1)
+        self.assertEqual(events[0]["landed"], [finding])
+        self.assertEqual(events[0]["timestamp_epoch"], 1100)
+        self.assertEqual(self.run_command("landed", at=1300), "no repair round in flight")
+        self.assertEqual([event for event in self.events() if event["event_type"] == "finding_batch_landed"], events)
 
     def test_landed_is_quiet_when_no_repair_is_in_flight(self) -> None:
         """Implementation dispatches call it too, and must not fail because of it."""

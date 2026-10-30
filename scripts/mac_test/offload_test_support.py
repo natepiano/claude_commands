@@ -23,6 +23,12 @@ import treekey
 from offload_test_commands import COMMAND_STUB, write_shell
 
 if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
+
+if TYPE_CHECKING:
     from ..production.cli_fixture import invoke_cli
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
@@ -113,6 +119,7 @@ import os
 from pathlib import Path
 import sys
 import time
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 def main() -> int:
     root = Path(os.environ["MAC_TEST_STUB_DIR"])
@@ -124,7 +131,11 @@ def main() -> int:
         state.mkdir(parents=True, exist_ok=True)
         arguments = sys.argv[2:]
         owner_pid = int(arguments[arguments.index("--pid") + 1])
-        proc_start = Path(f"/proc/{owner_pid}/stat").read_text().rpartition(")")[2].split()[19]
+        from scripts.lib import process_start
+        start = process_start.process_start(owner_pid)
+        if isinstance(start, process_start.ProcessGone):
+            return 1
+        proc_start = start.text
         record = {"pid": owner_pid, "proc_start": proc_start, "what": "nextest hana",
                   "worktree": arguments[arguments.index("--worktree") + 1], "since": "2026-10-12T00:00:00+00:00",
                   "remote_host": arguments[arguments.index("--remote") + 1]}
@@ -481,6 +492,11 @@ raise SystemExit(offload.main())
         (scripts_directory / "buildlog").symlink_to(
             SCRIPT.parent.parent / "buildlog", target_is_directory=True
         )
+        library = scripts_directory / "lib"
+        library.mkdir()
+        for name in ("process_start.py", "py"):
+            _ = shutil.copyfile(SCRIPT.parent.parent / "lib" / name, library / name)
+        (library / "py").chmod(0o755)
         return runner
 
     def state_command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -572,7 +588,7 @@ raise SystemExit(offload.main())
         self.assertTrue(path.exists())
         record = self.remote_claim()
         self.assertEqual(record["remote_host"], host)
-        self.assertIsNone(mac_test.process_start_time(record["pid"]))
+        self.assertIsInstance(process_start.process_start(record["pid"]), process_start.ProcessGone)
         decoded = mac_test.read_run(path)
         self.assertNotIsInstance(decoded, mac_test.NoRun)
         if not isinstance(decoded, mac_test.NoRun):

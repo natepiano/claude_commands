@@ -15,6 +15,12 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
+
 import store
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -58,6 +64,7 @@ class LiveProcess:
     argv: tuple[str, ...]
     environment: dict[str, str]
     cwd: str
+    proc_root: Path = process_start.PROC_ROOT
 
 
 @dataclass(frozen=True)
@@ -103,13 +110,13 @@ def marker_path(paths: MacIdlePaths, call_id: str) -> Path:
 
 
 def read_process(entry: Path) -> LiveProcess:
-    fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
-    if fields[0] == "Z":
+    stat = process_start.read_stat(int(entry.name), entry.parent)
+    if isinstance(stat, process_start.ProcessGone) or stat.state in ("Z", "X", "x"):
         raise ValueError("process has ended")
     argv = tuple(part.decode(errors="replace") for part in (entry / "cmdline").read_bytes().split(b"\0") if part)
     environment = dict(part.decode(errors="replace").split("=", 1)
                        for part in (entry / "environ").read_bytes().split(b"\0") if b"=" in part)
-    return LiveProcess(int(entry.name), int(fields[1]), fields[19], argv, environment, str((entry / "cwd").readlink()))
+    return LiveProcess(int(entry.name), stat.ppid, stat.start.text, argv, environment, str((entry / "cwd").readlink()), entry.parent)
 
 
 def processes(proc: Path) -> dict[int, LiveProcess]:
@@ -128,7 +135,7 @@ def belongs_to(process: LiveProcess, call: VerifyCall, live: dict[int, LiveProce
     seen: set[int] = set()
     while process.pid not in seen:
         if process.pid == call.pid:
-            return process.start == call.start
+            return process_start.check_owner(process.pid, process_start.parse_start(call.start), process.proc_root) is process_start.OwnerCheck.ALIVE
         seen.add(process.pid)
         if process.parent not in live:
             return False
@@ -142,7 +149,8 @@ def waiting_evidence(call: VerifyCall, paths: MacIdlePaths, live: dict[int, Live
     for path in paths.admission.glob("*.waiting"):
         row = read_record(path)
         pid = row.get("pid")
-        if isinstance(pid, int) and pid in children and children[pid].start == row.get("start_time"):
+        if (isinstance(pid, int) and pid in children and isinstance(row.get("start_time"), str) and bool(row.get("start_time"))
+                and process_start.check_owner(pid, process_start.parse_start(str(row["start_time"])), paths.proc) is process_start.OwnerCheck.ALIVE):
             return "memory"
     if call.token_dir:
         if any(Path(call.token_dir).glob(f"*.{call.pid}")) or any(Path(call.token_dir).glob(f"*.{call.pid}.again")):
@@ -151,7 +159,8 @@ def waiting_evidence(call: VerifyCall, paths: MacIdlePaths, live: dict[int, Live
         row = read_record(Path(call.hold_waiter))
         pid = row.get("pid")
         if (row.get("call_id") == call.call_id and isinstance(pid, int) and pid in children
-                and children[pid].start == row.get("proc_start")):
+                and isinstance(row.get("proc_start"), str) and bool(row.get("proc_start"))
+                and process_start.check_owner(pid, process_start.parse_start(str(row["proc_start"])), paths.proc) is process_start.OwnerCheck.ALIVE):
             return "build_hold"
     for child in children.values():
         if (child.environment.get("BUILDLOG_CALL_ID") == call.call_id
@@ -192,7 +201,7 @@ def waiting_calls(paths: MacIdlePaths, live: dict[int, LiveProcess]) -> tuple[Ve
                 or record.state not in (step_record.StepState.WAITING_HOLD, step_record.StepState.WAITING_MAC)):
             continue
         process = live.get(record.pid)
-        if process is None or process.start != record.proc_start:
+        if process is None or process_start.check_owner(record.pid, process_start.parse_start(record.proc_start), paths.proc) is not process_start.OwnerCheck.ALIVE:
             continue
         try:
             call = registered_call(read_record(call_path(paths, record.call_id)))
@@ -212,7 +221,8 @@ def session_is_live(call: VerifyCall, paths: MacIdlePaths, live: dict[int, LiveP
         row = read_record(path)
         pid = row.get("pid")
         if (row.get("sessionId") == call.session and isinstance(pid, int)
-                and pid in live and live[pid].start == row.get("procStart")):
+                and pid in live and isinstance(row.get("procStart"), str) and bool(row.get("procStart"))
+                and process_start.check_owner(pid, process_start.parse_start(str(row["procStart"])), paths.proc) is process_start.OwnerCheck.ALIVE):
             return True
     return False
 

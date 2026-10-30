@@ -13,6 +13,8 @@ import unittest
 from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from scripts.lib.process_start_test_support import write_stat
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
@@ -339,7 +341,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         ):
             process = Path(self.env["HERDR_PROC"]) / str(pid)
             process.mkdir(parents=True)
-            _ = (process / "stat").write_text(f"{pid} (fixture) S {parent} 0 0")
+            _ = write_stat(process.parent, int(process.name), ppid=parent)
             _ = (process / "cmdline").write_bytes(("\0".join(argv) + "\0").encode())
             _ = (process / "environ").write_bytes(
                 ("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0").encode()

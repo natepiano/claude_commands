@@ -24,6 +24,8 @@ from collections.abc import Callable, Iterable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
 from typing import BinaryIO, Literal, TextIO, TypedDict, cast, final, override
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
@@ -341,7 +343,7 @@ class RestartTests(ShutdownTestCase):
         # Fixture folders are not trusted; herdr_restart_fixture puts the real trust step back.
         _ = self.enterContext(patch.object(restart, "_heal_folder_trust"))
         # Synthetic saved PIDs do not identify processes on the test machine.
-        _ = self.enterContext(patch.object(sessions, "process_start", return_value="unrelated-process-start"))
+        _ = self.enterContext(patch.object(process_identity, "process_start", return_value=process_identity.ProcessGone(0)))
         _ = self.enterContext(patch.object(sessions, "remote_control", return_value="active"))
         # Existing lifecycle fixtures start after a successful prompt submission.
         # The missing-proof regressions below restore the real sidecar reader.
@@ -1838,7 +1840,7 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(value["cwd"], owner["cwd"])
             published.append(value)
             replace(source, target)
-        with (patch.object(inventory, "_process_start", return_value="supervisor-start"),
+        with (patch.object(process_identity, "process_start", return_value=process_identity.parse_start("supervisor-start")),
               patch.object(os, "replace", side_effect=publish),
               patch.object(restart, "_herdr_launch", return_value=restart.HerdrLaunch(herdr.ServerAdopted(), SUBMITTED_PROMPT)) as launch,
               patch.object(restart, "_run", side_effect=AssertionError("in-place restart launches a window"))):
@@ -2121,7 +2123,7 @@ class RestartTests(ShutdownTestCase):
         prompt = "Resume this work.\nKeep 'quotes' and $(literal)."
         commands = CommandRecorder()
         with (patch.object(sys, "platform", "darwin"),
-              patch.object(inventory, "_process_start", return_value="reused-supervisor-pid"),
+              patch.object(process_identity, "process_start", return_value=process_identity.parse_start("reused-supervisor-pid")),
               patch.object(herdr, "start_server", return_value=herdr.ServerCreated()) as server,
               patch.object(relaunch, "write_request") as supervisor,
               patch.object(restart, "_run", commands),
@@ -2158,7 +2160,7 @@ class RestartTests(ShutdownTestCase):
         self.allow_new_herdr_server(responses, "writing")
         prompt = "Resume in the same window.\nKeep the opening prompt intact."
         with (patch.object(sys, "platform", "darwin"),
-              patch.object(inventory, "_process_start", return_value="supervisor-start"),
+              patch.object(process_identity, "process_start", return_value=process_identity.parse_start("supervisor-start")),
               patch.object(herdr, "start_server", return_value=herdr.ServerCreated()) as server,
               patch.object(restart, "_run", side_effect=AssertionError("supervised restart opened a window")),
               patch.object(conversation_pause, "record_scheduled_prompts",
@@ -2264,7 +2266,7 @@ class RestartTests(ShutdownTestCase):
                     supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902,
                         proc_start="supervisor-start")))
                 commands = CommandRecorder()
-                with (patch.object(inventory, "_process_start", return_value=actual_start),
+                with (patch.object(process_identity, "process_start", return_value=process_identity.parse_start(actual_start) if actual_start else process_identity.ProcessGone(902)),
                       patch.object(restart, "_desktop_numbers", return_value={"Production": 4}),
                       patch.object(restart, "_run", commands),
                       patch.object(restart, "_herdr_launch", return_value=restart.HerdrLaunch(herdr.ServerAdopted(), SUBMITTED_PROMPT))):
@@ -2281,7 +2283,7 @@ class RestartTests(ShutdownTestCase):
             desktop=inventory.DesktopNotInSnapshot(kind="not in snapshot"),
             supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902,
                 proc_start="supervisor-start")))
-        with (patch.object(inventory, "_process_start", return_value="supervisor-start"),
+        with (patch.object(process_identity, "process_start", return_value=process_identity.parse_start("supervisor-start")),
               patch.object(restart, "_herdr_launch", return_value=restart.HerdrLaunch(herdr.ServerAdopted(), SUBMITTED_PROMPT)) as launch,
               patch.object(restart, "_run", side_effect=AssertionError("in-place restart launches a window"))):
             _ = restart._launch_session(entry(owner), "resume default", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
@@ -2299,7 +2301,7 @@ class RestartTests(ShutdownTestCase):
             supervisor=inventory.SupervisorIdentity(kind="supervisor", pid=902,
                 proc_start="supervisor-start")))
         output = io.StringIO()
-        with (patch.object(inventory, "_process_start", return_value="supervisor-start"),
+        with (patch.object(process_identity, "process_start", return_value=process_identity.parse_start("supervisor-start")),
               patch.object(restart, "_run", side_effect=AssertionError("preview launches a window")),
               redirect_stdout(output)):
             _ = restart._launch_session(entry(owner), "preview resume", self.desktop_state, dry_run=True)  # pyright: ignore[reportPrivateUsage]
@@ -2705,7 +2707,7 @@ class RestartTests(ShutdownTestCase):
         self.create([saved])
         session = heal.HealSession(owner["session_id"], owner["pid"], owner["proc_start"], owner["name"],
                                    Path(owner["cwd"]), "idle", self.root / ".claude2")
-        with patch("scripts.message.sessions.process_start", return_value=owner["proc_start"]) as process_start:
+        with patch.object(process_identity, "process_start", return_value=process_identity.parse_start(owner["proc_start"])) as process_start:
             self.assertIsInstance(heal.stop_completion(session, LOGIN), heal.StopPending)
 
             def stopped(current: SessionShutdown) -> None:
@@ -2713,7 +2715,7 @@ class RestartTests(ShutdownTestCase):
 
             _ = record.update_session(LOGIN, owner["session_id"], stopped)
             self.assertIsInstance(heal.stop_completion(session, LOGIN), heal.StopPending)
-            process_start.return_value = ""
+            process_start.return_value = process_identity.ProcessGone(owner["pid"])
             self.assertIsInstance(heal.stop_completion(session, LOGIN), heal.StopComplete)
             self.assertIsInstance(heal.stop_completion(replace(session, proc_start="reused-pid"), LOGIN), heal.StopRefused)
 
@@ -4979,7 +4981,7 @@ class RestartTests(ShutdownTestCase):
                 registry = self.root / "sessions"
                 registry.mkdir(exist_ok=True)
                 with (patch.object(os, "kill"),
-                      patch.object(sessions, "process_start", return_value=owner["proc_start"]),
+                      patch.object(process_identity, "process_start", return_value=process_identity.parse_start(owner["proc_start"])),
                       patch.object(restart, "_launch_session") as launch,
                       redirect_stdout(io.StringIO()) as output):
                     self.assertEqual(restart.up(LOGIN, only=(owner["session_id"],)), 0)
@@ -5006,7 +5008,7 @@ class RestartTests(ShutdownTestCase):
         saved["requested_by"] = record.FromSnapshot(kind="snapshot", taken_at=STOPPED, recovery=record.RecoveryEvidenceNotRecorded(kind="not recorded"))
         with (patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(os, "kill", side_effect=PermissionError("different owner")),
-              patch.object(sessions, "process_start", return_value="new-process-start"),
+              patch.object(process_identity, "process_start", return_value=process_identity.parse_start("new-process-start")),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),
               patch.object(restart, "_retire"),
               patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)) as launch,
@@ -5020,7 +5022,7 @@ class RestartTests(ShutdownTestCase):
         saved = entry(owner)
         saved["requested_by"] = record.FromSnapshot(kind="snapshot", taken_at=STOPPED, recovery=record.RecoveryEvidenceNotRecorded(kind="not recorded"))
         with (patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
-              patch.object(os, "kill"), patch.object(sessions, "process_start", return_value="present"),
+              patch.object(os, "kill"), patch.object(process_identity, "process_start", return_value=process_identity.parse_start("present")),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),
               patch.object(restart, "_retire"),
               patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)) as launch,
@@ -5430,7 +5432,7 @@ class RestartTests(ShutdownTestCase):
         with (patch.object(restart, "_session_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "_live_session_ids", return_value=frozenset()),
               patch.object(os, "kill"),
-              patch.object(sessions, "process_start", return_value=owner["proc_start"]),
+              patch.object(process_identity, "process_start", return_value=process_identity.parse_start(owner["proc_start"])),
               patch.object(restart, "_launch_session") as launch, redirect_stdout(io.StringIO()) as output):
             self.assertEqual(restart.up(LOGIN), 0)
         launch.assert_not_called()

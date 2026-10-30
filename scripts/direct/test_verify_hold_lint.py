@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import subprocess
+import shutil
 import unittest
 from pathlib import Path
 
+from scripts.direct.verify_lint_cache_test_support import VerifyLintCacheFixture
 from scripts.direct.verify_hold_wait_test_support import (
     VERIFY,
     VerifyHoldWaitFixture,
@@ -105,6 +107,46 @@ run_nextest --package sample
         self.assertEqual(len(runs), 1)
         arguments = runs[0]["args"]
         self.assertEqual(arguments[arguments.index("--test-threads") + 1], "32")
+
+
+class VerifyLintRerunTests(VerifyLintCacheFixture):
+    def test_stopped_failure_publication_never_reuses_the_older_pass(self) -> None:
+        cache = self.enable_cache()
+        real_mv = shutil.which("mv")
+        self.assertIsNotNone(real_mv)
+        fault = self.root / "stop-failure-publication"
+        self.write_executable(self.root / "bin" / "mv", f'''import os, signal, sys
+from pathlib import Path
+fault = Path({str(fault)!r})
+if sys.argv[-1].endswith(".fail") and fault.exists():
+    if fault.read_text() == "after":
+        import subprocess
+        subprocess.run([{real_mv!r}, *sys.argv[1:]], check=True)
+    os.kill(os.getppid(), signal.SIGKILL)
+    raise SystemExit(1)
+os.execv({real_mv!r}, [{real_mv!r}, *sys.argv[1:]])
+''')
+        for stop_at in ("before", "after"):
+            with self.subTest(stop_at=stop_at):
+                _ = self.verify("lint", "sample", "--no-cache")
+                self.assertEqual(len(list(cache.glob("*.pass"))), 1)
+                _ = fault.write_text(stop_at)
+                stopped = self.invoke_verify("lint", "sample", "--no-cache", cwd=self.root, taplo_status=7)
+                self.assertLess(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+                fault.unlink()
+
+                rerun = self.invoke_verify("lint", "sample", cwd=self.root, taplo_status=7)
+                self.assertEqual(rerun.returncode, 7, rerun.stdout + rerun.stderr)
+                self.assertNotIn("PASS (recorded)", rerun.stdout)
+                if stop_at == "before":
+                    self.assert_workspace_taplo_check()
+                else:
+                    self.assertIn("FAIL (recorded)", rerun.stdout)
+                    self.assertEqual(self.taplo_calls(), [])
+                replay = self.invoke_verify("lint", "sample", cwd=self.root, taplo_status=7)
+                self.assertEqual(replay.returncode, 7, replay.stdout + replay.stderr)
+                self.assertIn("FAIL (recorded)", replay.stdout)
+                self.assertEqual(self.taplo_calls(), [])
 
 
 if __name__ == "__main__":

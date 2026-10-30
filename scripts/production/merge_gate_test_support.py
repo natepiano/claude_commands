@@ -16,6 +16,7 @@ import time
 from typing import ClassVar, ParamSpec, TypedDict, cast, override
 import unittest
 from unittest import mock
+from scripts.lib import process_start
 from scripts.production import merge_gate
 from scripts.production.cli_fixture import invoke_cli
 from scripts.direct.wait_for_test_state import wait_until
@@ -368,11 +369,7 @@ class MergeGateFixture(unittest.TestCase):
     def assert_process_stopped(self, pid: int) -> None:
         deadline = time.monotonic() + TEST_HANG_GUARD_SECS
         while True:
-            try:
-                state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-            except FileNotFoundError:
-                return
-            if state == "Z":
+            if process_start.process_state(pid) is process_start.ProcessRunState.GONE:
                 return
             if time.monotonic() >= deadline:
                 self.fail(f"gate left running child {pid}")

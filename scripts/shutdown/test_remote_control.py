@@ -10,6 +10,8 @@ import tempfile
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
 from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import patch
 
@@ -72,7 +74,7 @@ class RemoteControlTests(ShutdownTestCase):
         self.typed: list[tuple[float, str]] = []
         self.screen = ""
         self.fields: RegistryFixture = {
-            "pid": 321, "procStart": "original", "sessionId": "owner", "name": "Owner",
+            "pid": 321, "procStart": "123", "sessionId": "owner", "name": "Owner",
             "messagingSocketPath": "", "updatedAt": 1, "tmux": "owner:@1.%7",
             "formerNames": [], "status": "idle", "bridgeSessionId": "",
         }
@@ -90,7 +92,7 @@ class RemoteControlTests(ShutdownTestCase):
             "SHUTDOWN_STATE_DIR": str(self.root / "shutdown"),
         })))
         _ = self.enterContext(patch.object(Path, "home", return_value=self.root))
-        _ = self.enterContext(patch.object(sessions, "process_start", return_value="original"))
+        _ = self.enterContext(patch.object(process_identity, "process_start", return_value=process_identity.parse_start("123")))
         _ = self.enterContext(patch.object(settle, "local_machine", return_value="natedev"))
         self.clock = FakeClock()
         self.write()
@@ -104,7 +106,7 @@ class RemoteControlTests(ShutdownTestCase):
     def find_place(self, saved: sessions.SessionRecord) -> HerdrPlace:
         self.assertEqual(saved["sessionId"], "owner")
         self.assertEqual(saved["pid"], 321, "fixer must resolve the confirmed process's own pane")
-        self.assertEqual(saved.get("procStart"), "original")
+        self.assertEqual(saved.get("procStart"), "123")
         return self.place
 
     def read_screen(self, _place: HerdrPlace) -> str:
@@ -114,13 +116,13 @@ class RemoteControlTests(ShutdownTestCase):
         self.assertEqual(place, self.place)
         current = cast(dict[str, object], json.loads((self.registry / "321.json").read_text()))
         self.assertEqual(current["status"], "idle", "busy registry must never authorize input")
-        self.assertEqual(current["procStart"], "original", "replacement must never receive input")
+        self.assertEqual(current["procStart"], "123", "replacement must never receive input")
         self.typed.append((self.clock.at, text))
 
     def run_fix(self) -> tuple[remote_control.RemoteControlOutcome, str, list[RenderedPush]]:
         output = io.StringIO()
         with patch.object(settle, "alert_user") as alert, redirect_stdout(output):
-            outcome = remote_control.fix("owner", 321, "original", "trunk unit", "Owner", clock=self.clock)
+            outcome = remote_control.fix("owner", 321, "123", "trunk unit", "Owner", clock=self.clock)
         lines = output.getvalue().splitlines()
         self.assertEqual(len(lines), 1, output.getvalue())
         self.assertTrue(lines[0].startswith("trunk unit:"))
@@ -221,16 +223,17 @@ class RemoteControlTests(ShutdownTestCase):
         for replacement in ("process", "registry"):
             with self.subTest(replacement=replacement):
                 self.clock = FakeClock()
-                self.fields["procStart"] = "original"
+                self.fields["procStart"] = "123"
                 self.write()
                 def replace(at: float) -> None:
                     if replacement == "registry" and at >= 10:
                         self.fields["procStart"] = "replacement"
                         self.write()
                 self.clock.tick = replace
-                def observed_start(_pid: int) -> str:
-                    return "replacement" if replacement == "process" and self.clock.at >= 10 else "original"
-                with patch.object(sessions, "process_start", side_effect=observed_start):
+                def observed_start(pid: int, proc_root: Path) -> process_identity.ProcessStartTime:
+                    del pid, proc_root
+                    return process_identity.ProcessStartTime(456 if replacement == "process" and self.clock.at >= 10 else 123)
+                with patch.object(process_identity, "process_start", side_effect=observed_start):
                     outcome, _text, pushes = self.run_fix()
                 self.assertIsInstance(outcome, remote_control.SessionGone)
                 self.assertEqual(self.clock.at, 10.0)

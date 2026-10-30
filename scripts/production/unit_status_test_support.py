@@ -93,7 +93,7 @@ class UnitStatusFixture(unittest.TestCase):
             _ = shutil.copy2(SCRIPT.with_name(name), script.with_name(name))
         (root / "scripts/herdr").mkdir()
         _ = shutil.copy2(SCRIPT.parents[1] / "herdr/herdr.py", root / "scripts/herdr/herdr.py")
-        for name in ("user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py"):
+        for name in ("user_zone.py", "probe_session.py", "unit_runs.py", "nix_env.py", "process_start.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "lib" / name, root / "scripts/lib" / name)
         for name in ("active", "sessions"):
             (root / name).mkdir()

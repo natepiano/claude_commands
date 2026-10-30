@@ -29,7 +29,13 @@ import sys
 import tempfile
 import time
 from types import FrameType
-from typing import Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
+
+if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
@@ -195,9 +201,13 @@ class StepProgress:
 
     def __init__(self, info: StepInfo | NoStepInfo) -> None:
         self.info: StepInfo | NoStepInfo = info
-        self.leader_start: str | None = (
-            mac_test.process_start_time(info.pgid) if isinstance(info, StepInfo) else None
-        )
+        self.leader_start: process_start.ProcessStart | process_start.ProcessGone | process_start.ProcessReadError | NoStepInfo = NO_STEP_INFO
+        if isinstance(info, StepInfo):
+            try:
+                stat = process_start.read_stat(info.pgid)
+                self.leader_start = stat if isinstance(stat, process_start.ProcessGone) else stat.start
+            except process_start.ProcessReadError as error:
+                self.leader_start = error
         self.offset: int = 0
         self.pending: bytes = b""
         self.cargo_started: float | None = None
@@ -227,19 +237,13 @@ class StepProgress:
                 self.cargo_started = time.monotonic()
 
     def leader_alive(self) -> bool:
-        """The step's group leader still runs: not reaped, not a zombie, not a reused pid."""
-        if isinstance(self.info, NoStepInfo) or self.leader_start is None:
+        """Only a matching group leader permits stopping this step's group."""
+        if isinstance(self.info, NoStepInfo) or not isinstance(self.leader_start, (process_start.ProcessStartTime, process_start.ProcessStartDate)):
             return False
-        pgid = self.info.pgid
-        try:
-            stat = Path(f"/proc/{pgid}/stat").read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return False
-        fields = stat[stat.rfind(")") + 1 :].split()
-        if not fields or fields[0] == "Z" or mac_test.process_start_time(pgid) != self.leader_start:
+        if process_start.check_group_leader(self.info.pgid, self.leader_start) is not process_start.OwnerCheck.ALIVE:
             return False
         try:
-            return os.getpgid(pgid) == pgid
+            return os.getpgid(self.info.pgid) == self.info.pgid
         except OSError:
             return False
 
@@ -275,16 +279,18 @@ def read_candidate(path: Path) -> CandidateRecord | None:
 
 
 def newest_candidate(directory: Path) -> str | None:
-    """The call id of the newest live candidate (latest start, then call id).
+    """The newest candidate whose owner is not proven stale (start, then call id).
 
-    A record whose watcher no longer runs is removed.
+    Remove proven stale records. Keep records with no start identity.
     """
     newest: CandidateRecord | None = None
     for path in sorted(directory.glob("*.json")):
         record = read_candidate(path)
         if record is None:
             continue
-        if mac_test.process_start_time(record["pid"]) != record["proc_start"]:
+        if mac_test.check_recorded_owner(record["pid"], record["proc_start"]) in (
+            process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED
+        ):
             path.unlink(missing_ok=True)
             continue
         if newest is None or (record["call_started"], record["call_id"]) > (
@@ -503,9 +509,15 @@ class Watch:
         if not wanted:
             self.candidate.unlink(missing_ok=True)
         elif not self.candidate.exists():
+            try:
+                watcher_start = process_start.process_start(os.getpid())
+            except process_start.ProcessReadError:
+                return False
+            if isinstance(watcher_start, process_start.ProcessGone):
+                return False
             record: CandidateRecord = {
                 "pid": os.getpid(),
-                "proc_start": mac_test.process_start_time(os.getpid()) or "",
+                "proc_start": watcher_start.text,
                 "call_started": self.request.call_started,
                 "call_id": self.request.call_id,
             }

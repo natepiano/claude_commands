@@ -11,15 +11,14 @@ import unittest
 from unittest.mock import patch
 
 from scripts.direct import step_record as steps
+from scripts.lib.process_start_test_support import write_stat
 
 
 class StepRecordTests(unittest.TestCase):
     def test_record_lifecycle_preserves_decision_and_changes_location(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            process = root / "proc/42"
-            process.mkdir(parents=True)
-            _ = (process / "stat").write_text("42 (verify) S " + "0 " * 18 + "123 0\n")
+            _ = write_stat(root / "proc", 42, start_ticks=123)
             with patch.dict(os.environ, {"VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc")}):
                 record = steps.StepRecord("c1", 42, "123", root, "check", None,
                                           steps.MacAllowed(), steps.StepState.WAITING_HOLD, "now")
@@ -40,18 +39,29 @@ class StepRecordTests(unittest.TestCase):
     def test_dead_or_reused_process_is_stale_and_excluded(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
+            (root / "proc").mkdir()
             with patch.dict(os.environ, {"VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc")}):
                 record = steps.StepRecord("old", 42, "123", root, "build", None,
                                           steps.NatedevOnly("makes natedev artifacts"), steps.StepState.ON_NATEDEV, "now")
                 steps.write(record)
                 self.assertEqual(steps.read("old"), steps.StaleRecord("old"))
-                process = root / "proc/42"
-                process.mkdir(parents=True)
-                _ = (process / "stat").write_text("42 (verify) S " + "0 " * 18 + "456 0\n")
+                _ = write_stat(root / "proc", 42, start_ticks=456)
                 self.assertEqual(steps.read("old"), steps.StaleRecord("old"))
                 self.assertEqual(steps.live_records(), [])
                 with self.assertRaises(ValueError):
                     steps.state("old", steps.StepState.ON_MAC)
+
+    def test_unreadable_owner_keeps_the_step_record_for_a_later_read(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            _ = write_stat(root / "proc", 42, start_ticks=123)
+            with patch.dict(os.environ, {"VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc")}):
+                record = steps.StepRecord("call", 42, "123", root, "build", None,
+                                          steps.MacAllowed(), steps.StepState.ON_NATEDEV, "now")
+                steps.write(record)
+                with patch.object(Path, "read_bytes", side_effect=PermissionError("denied")):
+                    self.assertIsInstance(steps.read("call"), steps.UnreadableRecord)
+                self.assertEqual(steps.read("call"), record)
 
     def test_invalid_record_has_no_run_permission(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -61,6 +71,17 @@ class StepRecordTests(unittest.TestCase):
                     self.assertIsInstance(steps.read("broken"), steps.UnreadableRecord)
                     self.assertEqual(steps.live_records(), [])
                 self.assertIsInstance(steps.read("../outside"), steps.UnreadableRecord)
+
+    def test_blank_stored_start_is_unreadable_and_never_grants_run_permission(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            _ = write_stat(root / "proc", 42, start_ticks=123)
+            with patch.dict(os.environ, {"VERIFY_STEPS_DIR": str(root / "steps"), "VERIFY_PROC_ROOT": str(root / "proc")}):
+                record = steps.StepRecord("call", 42, "   ", root, "build", None,
+                                          steps.MacAllowed(), steps.StepState.ON_NATEDEV, "now")
+                steps.write(record)
+                self.assertIsInstance(steps.read("call"), steps.UnreadableRecord)
+                self.assertEqual(steps.live_records(), [])
 
     def test_atomic_update_leaves_only_complete_record(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

@@ -8,6 +8,7 @@ import select
 import sys
 from typing import override
 
+from scripts.lib import process_start
 from scripts.production.merge_gate_test_support import MergeGateFixture, SUITE_MODULE, TEST_HANG_GUARD_SECS
 
 
@@ -59,10 +60,7 @@ class GateSuitesFixture(MergeGateFixture):
     @override
     def assert_process_stopped(self, pid: int) -> None:
         def stopped() -> bool:
-            try:
-                return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-            except FileNotFoundError:
-                return True
+            return process_start.process_state(pid) is process_start.ProcessRunState.GONE
 
         if stopped():
             return

@@ -12,6 +12,8 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
 from typing import IO, NamedTuple, cast, override
 from unittest import mock
 
@@ -23,7 +25,6 @@ import push_texts  # noqa: E402
 import rca  # noqa: E402
 import review  # noqa: E402
 import send  # noqa: E402
-import sessions  # noqa: E402
 import showrunners  # noqa: E402
 import silence  # noqa: E402
 from user_action import NoActionRequired  # noqa: E402
@@ -138,8 +139,10 @@ class RcaTests(unittest.TestCase):
         self.addCleanup(listener.close)
         socket_path = Path(self.enterContext(short_socket_directory())) / f"{name}.sock"
         listener.bind(str(socket_path))
+        started = process_identity.process_start(os.getpid())
+        assert not isinstance(started, process_identity.ProcessGone)
         record = {"pid": os.getpid(), "name": name, "sessionId": session_id, "messagingSocketPath": str(socket_path),
-                  "updatedAt": 1, "procStart": sessions.process_start(os.getpid()) or ""}
+                  "updatedAt": 1, "procStart": started.text}
         _ = (self.root / "sessions" / f"{name}.json").write_text(json.dumps(record))
 
     def transcript(self, folder: str, session_id: str, mtime: float) -> Path:

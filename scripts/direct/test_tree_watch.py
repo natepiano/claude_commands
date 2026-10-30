@@ -2,6 +2,13 @@
 from __future__ import annotations
 
 import os
+import io
+from pathlib import Path
+import tempfile
+import time
+from unittest.mock import patch
+from scripts.direct import tree_watch
+from scripts.lib import process_start
 import shutil
 import subprocess
 import sys
@@ -16,6 +23,37 @@ from scripts.direct.tree_watch_test_support import (
 
 @final
 class TreeWatchTests(TreeWatchFixture):
+    def test_an_unreadable_parent_start_is_retried_before_watching(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            start, fired = root / "start", root / "fired"
+            _ = start.write_text("before")
+            with (patch.object(sys, "stdin", io.StringIO("{}")),
+                  patch.object(tree_watch.TreeInputs, "__init__", return_value=None),
+                  patch.object(tree_watch.TreeInputs, "keys", return_value=("", "changed")),
+                  patch.object(process_start, "process_start", side_effect=[
+                      process_start.ProcessReadError("denied"), process_start.ProcessStartTime(123)]),
+                  patch.object(process_start, "check_owner", return_value=process_start.OwnerCheck.ALIVE),
+                  patch.object(time, "sleep") as retry):
+                self.assertEqual(tree_watch.main([str(start), str(fired), "42"]), 0)
+            self.assertEqual(fired.read_text(), "changed\n")
+            retry.assert_called_once()
+
+    def test_unconfirmed_parent_is_kept_and_never_signalled(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            start, fired = root / "start", root / "fired"
+            _ = start.write_text("before")
+            with (patch.object(sys, "stdin", io.StringIO("{}")),
+                  patch.object(tree_watch.TreeInputs, "__init__", return_value=None),
+                  patch.object(tree_watch.TreeInputs, "keys", return_value=("", "changed")),
+                  patch.object(process_start, "process_start", return_value=process_start.ProcessStartTime(123)),
+                  patch.object(process_start, "check_owner", return_value=process_start.OwnerCheck.UNKNOWN),
+                  patch.object(os, "kill") as signal):
+                self.assertEqual(tree_watch.main([str(start), str(fired), "42", "--signal-parent"]), 0)
+            self.assertEqual(fired.read_text(), "changed\n")
+            signal.assert_not_called()
+
     def test_in_scope_edit_table_fires(self) -> None:
         for relative in ("sample/src/lib.rs", "dep/src/lib.rs", "sample/fixtures/input.bin",
                          "Cargo.toml", "Cargo.lock", ".cargo/config.toml",

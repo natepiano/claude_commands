@@ -13,6 +13,8 @@ import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+
+from scripts.lib import process_start as process_identity
 from typing import cast, final
 from unittest.mock import patch
 
@@ -24,7 +26,6 @@ import autocompact
 import conversation_pause
 import launch_permission
 import unit_lookup
-import sessions
 from herdr import HerdrPlace
 from scripts.accounts import accounts
 import herdr
@@ -169,9 +170,9 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.write_shutdown_record(self.shutdown_record("restarting"))
         prior = self.root / "prior-session"
         prior.mkdir()
-        started = sessions.process_start(os.getpid())
-        assert started is not None
-        self.write_resume_registry_record(started)
+        started = process_identity.process_start(os.getpid())
+        assert not isinstance(started, process_identity.ProcessGone)
+        self.write_resume_registry_record(started.text)
         document = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
         result = self.restore("alpha", prior)

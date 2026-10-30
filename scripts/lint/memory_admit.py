@@ -15,13 +15,20 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from contextlib import redirect_stderr
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, NoReturn, NotRequired, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, Protocol, TypedDict, cast
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
@@ -161,6 +168,11 @@ class MeasuredMemory:
 @dataclass(frozen=True)
 class CompilerServiceMemory(MeasuredMemory):
     """Compiler charge, without a build reservation or run-alone veto."""
+
+
+@dataclass(frozen=True)
+class UnreadableMemory:
+    """The process identity could not be read; retain its promised allowance."""
 
 
 @dataclass(frozen=True)
@@ -372,6 +384,16 @@ class QueueView:
 class ProcessIdentity:
     parent: int
     start: str
+
+
+@dataclass(frozen=True)
+class UnreadableProcessIdentity:
+    """This snapshot could not read the process; retain its memory promise."""
+
+    reason: str
+
+
+ProcessTable = Mapping[int, ProcessIdentity | UnreadableProcessIdentity]
 
 
 @dataclass(frozen=True)
@@ -707,38 +729,35 @@ def filtered_peak(repository: RepositoryIdentity, step: str, host: str, now: dat
     return ExpectedPeak(FILTERED_FLOOR, "fallback", 0)
 
 
-def process_start_time(pid: int) -> str | None:
-    try:
-        stat = (Path("/proc") / str(pid) / "stat").read_text()
-        fields = stat.rsplit(") ", 1)[1].split()
-        return fields[19] if fields[0] not in ("Z", "X") else None
-    except (OSError, IndexError):
-        return None
-
-
-def process_table(proc: Path = PROC) -> dict[int, ProcessIdentity]:
-    processes: dict[int, ProcessIdentity] = {}
+def process_table(proc: Path = PROC) -> ProcessTable:
+    processes: dict[int, ProcessIdentity | UnreadableProcessIdentity] = {}
     for entry in proc.iterdir():
         if not entry.name.isdecimal():
             continue
         try:
-            fields = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
-            if fields[0] not in ("Z", "X"):
-                processes[int(entry.name)] = ProcessIdentity(int(fields[1]), fields[19])
-        except (OSError, ValueError, IndexError):
-            continue
+            stat = process_start.read_stat(int(entry.name), proc)
+            if not isinstance(stat, process_start.ProcessGone) and stat.state not in ("Z", "X", "x"):
+                processes[int(entry.name)] = ProcessIdentity(stat.ppid, stat.start.text)
+        except process_start.ProcessReadError as error:
+            processes[int(entry.name)] = UnreadableProcessIdentity(str(error))
     return processes
 
 
-def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
-                proc: Path = PROC) -> MeasuredMemory | GoneMemory:
+def tree_memory(pid: int, start: str, processes: ProcessTable,
+                proc: Path = PROC) -> MeasuredMemory | GoneMemory | UnreadableMemory:
     """Sum resident and swapped bytes from one process table reading."""
-    identity = processes.get(pid)
-    if identity is None or identity.start != start:
+    if isinstance(processes.get(pid), UnreadableProcessIdentity):
+        return UnreadableMemory()
+    owner = process_start.check_owner(pid, process_start.parse_start(start), proc)
+    if owner in (process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED):
         return GoneMemory()
+    if owner is process_start.OwnerCheck.UNKNOWN:
+        return UnreadableMemory()
+
     children: dict[int, list[int]] = {}
     for child, identity in processes.items():
-        children.setdefault(identity.parent, []).append(child)
+        if isinstance(identity, ProcessIdentity):
+            children.setdefault(identity.parent, []).append(child)
     pending, seen, used, swapped = [pid], set[int](), 0, 0
     while pending:
         child = pending.pop()
@@ -759,12 +778,18 @@ def tree_memory(pid: int, start: str, processes: dict[int, ProcessIdentity],
     return MeasuredMemory(used, swap_bytes=swapped)
 
 
-def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIdentity],
+def step_memory(row: Reservation, now: datetime, processes: ProcessTable,
                 proc: Path = PROC) -> StepMemory:
-    identity = processes.get(row["pid"])
-    if identity is None or identity.start != row["start_time"]:
+    if isinstance(processes.get(row["pid"]), UnreadableProcessIdentity):
+        return PromisedMemory(row["need"])
+    owner = process_start.check_owner(row["pid"], process_start.parse_start(row["start_time"]), proc)
+    if owner in (process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED):
         return GoneMemory()
+    if owner is process_start.OwnerCheck.UNKNOWN:
+        return PromisedMemory(row["need"])
     reading = tree_memory(row["pid"], row["start_time"], processes, proc)
+    if isinstance(reading, UnreadableMemory):
+        return PromisedMemory(row["need"])
     if isinstance(reading, MeasuredMemory) and now.timestamp() - _epoch(row["admitted_at"]) < RAMP_SECONDS:
         if reading.bytes == 0:
             return PromisedMemory(row["need"])
@@ -773,7 +798,7 @@ def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIde
 
 
 def reservation_memory(path: Path, row: Reservation, now: datetime,
-                       processes: dict[int, ProcessIdentity], proc: Path) -> StepMemory:
+                       processes: ProcessTable, proc: Path) -> StepMemory:
     reading = step_memory(row, now, processes, proc)
     try:
         peak = int(path.with_suffix(".max").read_text())
@@ -956,14 +981,16 @@ def admission_dir(root: Path) -> Path:
 
 def live_reservations(directory: Path) -> list[tuple[Path, Reservation]]:
     live: list[tuple[Path, Reservation]] = []
+    proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
     for path in directory.glob("*.reservation"):
         try:
             row = cast(Reservation, json.loads(path.read_text()))
-            if process_start_time(row["pid"]) == row["start_time"]:
-                live.append((path, row))
-                continue
+            owner = process_start.check_owner(row["pid"], process_start.parse_start(row["start_time"]), proc)
         except (OSError, ValueError, KeyError, TypeError):
-            pass
+            continue
+        if owner not in (process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED):
+            live.append((path, row))
+            continue
         path.unlink(missing_ok=True)
         path.with_suffix(".max").unlink(missing_ok=True)
     return live
@@ -971,14 +998,16 @@ def live_reservations(directory: Path) -> list[tuple[Path, Reservation]]:
 
 def live_waiters(directory: Path) -> list[tuple[Path, Waiter]]:
     live: list[tuple[Path, Waiter]] = []
+    proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
     for path in directory.glob("*.waiting"):
         try:
             row = cast(Waiter, json.loads(path.read_text()))
-            if process_start_time(row["pid"]) == row["start_time"]:
-                live.append((path, row))
-                continue
+            owner = process_start.check_owner(row["pid"], process_start.parse_start(row["start_time"]), proc)
         except (OSError, ValueError, KeyError, TypeError):
-            pass
+            continue
+        if owner not in (process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED):
+            live.append((path, row))
+            continue
         path.unlink(missing_ok=True)
     return live
 
@@ -1217,14 +1246,18 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             live.append((path, row))
             running.append(memory)
         running.extend(sccache_memory())
-        start = process_start_time(pid)
-        mine = directory / f"{pid}-{start}.waiting"
+        try:
+            start = process_start.process_start(pid, proc)
+        except process_start.ProcessReadError as error:
+            start = error
+        start_text = start.text if isinstance(start, (process_start.ProcessStartTime, process_start.ProcessStartDate)) else ""
+        mine = directory / f"{pid}-{start_text}.waiting"
         waiting = live_waiters(directory)
         previous = next((row for path, row in waiting if path == mine), None)
         waited_from = since or now.timestamp()
         if previous is not None:
             waited_from = min(waited_from, previous["since"])
-        waiter: Waiter = {"pid": pid, "start_time": start or "", "need": peak.bytes, "since": waited_from,
+        waiter: Waiter = {"pid": pid, "start_time": start_text, "need": peak.bytes, "since": waited_from,
                           "label": f"{worktree or repo} {step} ({os.environ.get('BUILDLOG_CALLER') or 'caller'} pid {pid})"}
         waiter["test_scope"] = profile.scope
         waiter["package"] = package
@@ -1278,7 +1311,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         blocker = reservation_blocker(waiter, candidates, [row for _, row in live], running,
                                       available, total, pressure, now.timestamp(), processes, proc)
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
-        if argv and decision.state == "hold" and start is not None:
+        if argv and decision.state == "hold" and isinstance(start, (process_start.ProcessStartTime, process_start.ProcessStartDate)):
             identity = waiter_identity(step, worktree)
             waiter["session_id"], waiter["session_name"] = identity["session_id"], identity["session_name"]
             waiter["step"], waiter["folder"] = identity["step"], identity["folder"]
@@ -1287,9 +1320,9 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             write_recovery(directory, replace(recovery, next_start_at=now.timestamp() + RECOVERY_START_SECONDS))
         if argv and decision.state == "admit":
             mine.unlink(missing_ok=True)
-            if start is not None:
-                path = directory / f"{pid}-{start}-{time.time_ns()}.reservation"
-                row: Reservation = {"pid": pid, "start_time": start, "need": peak.bytes,
+            if isinstance(start, (process_start.ProcessStartTime, process_start.ProcessStartDate)):
+                path = directory / f"{pid}-{start.text}-{time.time_ns()}.reservation"
+                row: Reservation = {"pid": pid, "start_time": start.text, "need": peak.bytes,
                                     "repo": repo, "step": step, "worktree": worktree,
                                     "admitted_at": store.utc_iso(now.timestamp()), "sidecar": sidecar,
                                     "test_threads": width,
@@ -1323,8 +1356,8 @@ class WaiterIdentity(TypedDict):
 
 
 class QueueIdentityReader:
-    def __init__(self, processes: dict[int, ProcessIdentity], proc: Path = PROC) -> None:
-        self.processes: dict[int, ProcessIdentity] = processes
+    def __init__(self, processes: ProcessTable, proc: Path = PROC) -> None:
+        self.processes: ProcessTable = processes
         self.proc: Path = proc
         self.environments: dict[int, dict[str, str]] = {}
         self.names: dict[str, str] = {}
@@ -1359,7 +1392,10 @@ class QueueIdentityReader:
             env = self.environments[current]
             session = env.get("CODEX_THREAD_ID") or env.get("CLAUDE_CODE_SESSION_ID", "")
             name = name or env.get("CLAUDE_SESSION_NAME", "")
-            current = self.processes[current].parent
+            parent = self.processes[current]
+            if isinstance(parent, UnreadableProcessIdentity):
+                break
+            current = parent.parent
         if not step:
             try:
                 argv = (self.proc / str(pid) / "cmdline").read_bytes().decode(errors="replace").split("\0")
@@ -1370,15 +1406,18 @@ class QueueIdentityReader:
         return {"session_id": session, "session_name": name or self.names.get(session, ""), "step": step, "folder": folder}
 
 
-def queue_rows(directory: Path, suffix: str, processes: dict[int, ProcessIdentity]) -> list[tuple[Path, dict[str, object]]]:
+def queue_rows(directory: Path, suffix: str, processes: ProcessTable) -> list[tuple[Path, dict[str, object]]]:
     rows: list[tuple[Path, dict[str, object]]] = []
     for path in directory.glob(f"*.{suffix}"):
         try:
             row = cast(dict[str, object], json.loads(path.read_text()))
             pid = row["pid"]
-            identity = processes.get(pid) if isinstance(pid, int) else None
-            if identity is not None and identity.start == row["start_time"]:
-                rows.append((path, row))
+            start = row["start_time"]
+            if isinstance(pid, int) and isinstance(start, str) and start:
+                owner = (process_start.OwnerCheck.UNKNOWN if isinstance(processes.get(pid), UnreadableProcessIdentity)
+                         else process_start.check_owner(pid, process_start.parse_start(start), Path(os.environ.get("BUILDLOG_PROC", "/proc"))))
+                if owner not in (process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED):
+                    rows.append((path, row))
         except (OSError, ValueError, KeyError, TypeError):
             continue
     return rows
@@ -1386,7 +1425,7 @@ def queue_rows(directory: Path, suffix: str, processes: dict[int, ProcessIdentit
 
 def reservation_blocker(waiter: Waiter, waiters: list[Waiter], reservations: list[Reservation],
                         running: list[StepMemory], available: int, total: int | None,
-                        pressure: Pressure, now: float, processes: dict[int, ProcessIdentity],
+                        pressure: Pressure, now: float, processes: ProcessTable,
                         proc: Path) -> Blocker:
     """Name the unique reservation whose release would admit this waiter."""
     head = head_priority(waiters, available, total, running, now)
@@ -1462,7 +1501,7 @@ def current_blocker(waiter_path: Path) -> Blocker:
         return blocker_snapshot(waiter_path)
 
 
-def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
+def read_queue(directory: Path, processes: ProcessTable, now: float) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
     proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
     identities = QueueIdentityReader(processes, proc)
     running: list[RunningStep] = []
@@ -1649,9 +1688,11 @@ def run_action() -> None:
     _, _, meminfo, pid, sidecar, since, cached_repo, cached_step, cached_worktree, cached_need, cached_source, cached_count, *argv = sys.argv
     profile = None
     if cached_need != "-":
-        start = process_start_time(int(pid))
         try:
-            row = cast(Waiter, json.loads((store.root() / "admission" / f"{pid}-{start}.waiting").read_text()))
+            start = process_start.process_start(int(pid), Path(os.environ.get("BUILDLOG_PROC", "/proc")))
+            if isinstance(start, process_start.ProcessGone):
+                raise ValueError("waiter has ended")
+            row = cast(Waiter, json.loads((store.root() / "admission" / f"{pid}-{start.text}.waiting").read_text()))
             # An empty key is the explicit unknown identity. Old rows must refresh.
             if ("repo_identity" in row and "test_scope" in row and "estimated_at" in row
                     and (row["test_scope"] == "full"

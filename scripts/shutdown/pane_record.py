@@ -37,6 +37,8 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 SCRIPTS = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(SCRIPTS.parent))
+from scripts.lib import process_start as process_identity
 sys.path.insert(0, str(SCRIPTS / "herdr"))
 sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
@@ -153,8 +155,8 @@ def _parent(pid: int) -> int:
     if sys.platform == "darwin":
         result = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, check=False)
         return int(result.stdout)
-    stat = (PROC / str(pid) / "stat").read_text()
-    return int(stat.rsplit(")", 1)[1].split()[1])
+    stat = process_identity.read_stat(pid, PROC)
+    return 0 if isinstance(stat, process_identity.ProcessGone) else stat.ppid
 
 
 def _arguments(pid: int) -> list[str]:

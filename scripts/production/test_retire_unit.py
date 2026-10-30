@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING, Literal, cast, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.lib import process_start
+from scripts.lib.process_start_test_support import write_stat
 from scripts.astra import design_roles
 from scripts.direct import workers  # noqa: E402
 
@@ -199,6 +201,28 @@ class RetireUnitTests(unittest.TestCase):
 
     def stops(self) -> list[list[str]]:
         return [call for call in self.calls if call[:2] != ["review_pool.py", "status"]]
+
+    def test_claim_cleanup_keeps_unknown_and_never_signals_a_reused_or_gone_pid(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp/claude") as folder:
+            root = Path(folder)
+            stat = write_stat(root, 41, start_ticks=456)
+            native_check = process_start.check_owner
+
+            def check_owner(pid: int, start: process_start.ProcessStart) -> process_start.OwnerCheck:
+                return native_check(pid, start, root)
+
+            with mock.patch.object(os, "kill") as signal:
+                for mode in ("reused", "gone", "unknown"):
+                    if mode == "gone":
+                        stat.unlink()
+                    elif mode == "unknown":
+                        stat.parent.mkdir(exist_ok=True)
+                        _ = stat.write_bytes(b"broken")
+                    with mock.patch.object(process_start, "check_owner", side_effect=check_owner):
+                        remaining = retire_unit.terminate([41], {41: "claim"}, wait=0,
+                                                         recorded={41: process_start.ProcessStartTime(123)})
+                    self.assertEqual(bool(remaining), mode == "unknown")
+                signal.assert_not_called()
 
     def test_refuses_uncommitted_work_and_an_unmerged_checkpoint_and_changes_nothing(self) -> None:
         _ = (self.worktree / "late.txt").write_text("late\n", encoding="utf-8")

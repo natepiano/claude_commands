@@ -692,7 +692,7 @@ def _stop_runs(rename: StopTarget) -> None:
                 del runs[pid]
         except ProcessLookupError:
             del runs[pid]
-    left = retire_unit.terminate(sorted(runs), runs, RUN_STOP_WAIT_SECONDS)
+    left = retire_unit.terminate(sorted(runs), runs, RUN_STOP_WAIT_SECONDS, recorded={})
     if left:
         raise RenameRefused("; ".join(left))
 

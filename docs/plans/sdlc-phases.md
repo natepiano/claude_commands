@@ -427,7 +427,7 @@ For active process redesigns, as we are currently undergoing with promotions and
 - `scripts/direct/plan_history.py` — the dependency parser (`PHASE_REFERENCE_PATTERN`, `UNIT_PHASE_PREFIX`, `PLAN_UNIT_HEADER`)
 - `scripts/direct/test_plan_history.py`, `scripts/direct/test_progress_history.py` — dependency-parse tests
 
-### Phase 17 — Five rerun faults in the unit scripts clear on a rerun  · status: todo
+### Phase 17 — Five rerun faults in the unit scripts clear on a rerun  · status: done
 **Depends on:** Phase 16 (the sweep list) and Phase 14 (order only)
 
 The showrunner routed five rows of the rerun sweep (`docs/plans/sdlc-rerun-sweep.md`, checked at sdlc 097b1a0d) to phases-unit on 2026-10-29: the four rows in its phases-unit section and `scripts/direct/end_session.sh:87` from the fix-rounds section (fix-rounds-unit is stopped). Each row is a step that, if stopped at the named line, leaves a state that a rerun cannot get past or reads wrong. Line numbers are from 097b1a0d; find each by the code the row names.

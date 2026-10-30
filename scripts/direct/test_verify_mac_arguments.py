@@ -6,9 +6,16 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import final
-from scripts.build_hold import build_hold
+from typing import TYPE_CHECKING, cast, final
 from scripts.direct.verify_mac_offload_test_support import BusyClaimRecord, VerifyMacOffloadFixture, VERIFY as VERIFY
+
+import sys
+
+if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
 
 
 @final
@@ -59,7 +66,7 @@ class VerifyMacArgumentsTests(VerifyMacOffloadFixture):
     def test_busy_claim_what_reaches_call_holder_through_the_real_offload_result(self) -> None:
         state = Path(self.environment["MAC_TEST_STATE_DIR"])
         state.mkdir()
-        record: BusyClaimRecord = {"pid": os.getpid(), "proc_start": build_hold.process_start_time(os.getpid()),
+        record: BusyClaimRecord = {"pid": os.getpid(), "proc_start": cast(process_start.ProcessStart, process_start.process_start(os.getpid())).text,
                   "what": "render checks", "worktree": str(self.root),
                   "since": datetime.now(timezone.utc).isoformat()}
         _ = (state / "run.json").write_text(json.dumps(record))

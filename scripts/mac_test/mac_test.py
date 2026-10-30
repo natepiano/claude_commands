@@ -20,8 +20,14 @@ import sys
 import tempfile
 import time
 import threading
-from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, TypeGuard, TypedDict, cast
 from urllib.parse import quote
+
+if TYPE_CHECKING:
+    from ..lib import process_start
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.lib import process_start
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
@@ -60,6 +66,14 @@ class ClaimOwnerRecord(TypedDict):
     holder_session: NotRequired[str]
     idle_since: NotRequired[str]
     copy: NotRequired[bool]
+
+
+@dataclass(frozen=True)
+class NoProcessIdentityRecorded:
+    """An older record has no start identity; keep it and send no signal."""
+
+
+NO_PROCESS_IDENTITY_RECORDED = NoProcessIdentityRecorded()
 
 
 class ProcessBoundClaim(ClaimOwnerRecord):
@@ -827,24 +841,23 @@ def message_time(instant: datetime) -> str:
     return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-def process_start_time(pid: int) -> str | None:
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    closing_parenthesis = stat.rfind(")")
-    fields_after_name = stat[closing_parenthesis + 1 :].split()
-    if closing_parenthesis < 0 or len(fields_after_name) <= 19:
-        return None
-    return fields_after_name[19]
+def check_recorded_owner(pid: int, start_text: str) -> process_start.OwnerCheck | NoProcessIdentityRecorded:
+    """Decode a stored owner, preserving a missing identity from an older writer."""
+    if not start_text.strip():
+        return NO_PROCESS_IDENTITY_RECORDED
+    return process_start.check_owner(pid, process_start.parse_start(start_text))
 
 
 def run_is_live(run: RunRecord) -> bool:
-    return "remote_host" in run or process_start_time(run["pid"]) == run["proc_start"]
+    return "remote_host" in run or check_recorded_owner(
+        run["pid"], run["proc_start"]
+    ) not in (process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED)
 
 
 def run_is_kept(run: RunRecord) -> TypeGuard[RemoteJobClaim]:
-    return "remote_host" in run and process_start_time(run["pid"]) != run["proc_start"]
+    return "remote_host" in run and check_recorded_owner(
+        run["pid"], run["proc_start"]
+    ) in (process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED)
 
 
 def copy_gives_way(run: RunRecord) -> bool:
@@ -852,7 +865,7 @@ def copy_gives_way(run: RunRecord) -> bool:
 
     A kept copy claim holds leftovers like any other kept claim and never gives way.
     """
-    return run.get("copy") is True and process_start_time(run["pid"]) == run["proc_start"]
+    return run.get("copy") is True and check_recorded_owner(run["pid"], run["proc_start"]) is process_start.OwnerCheck.ALIVE
 
 
 def claim_scope(worktree: str) -> ClaimScope:
@@ -1884,12 +1897,16 @@ def requested_showrunner(name: str) -> Showrunner:
 
 
 def take_over_kept_claim(args: CliArguments, claim: HeldClaim, kept: RemoteJobClaim) -> ClaimAttempt:
-    proc_start = process_start_time(args.pid)
-    if proc_start is None:
+    try:
+        proc_start = process_start.process_start(args.pid)
+    except process_start.ProcessReadError as error:
+        print(f"cannot read claim owner: {error}", file=sys.stderr)
+        return ClaimFinished(12)
+    if isinstance(proc_start, process_start.ProcessGone):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
         return ClaimFinished(1)
     kept["pid"] = args.pid
-    kept["proc_start"] = proc_start
+    kept["proc_start"] = proc_start.text
     if args.copy:
         kept["copy"] = True
     else:
@@ -1926,13 +1943,17 @@ def claim_once(args: CliArguments, paths: StatePaths, scope: ClaimScope) -> Clai
         if not args.copy and all(copy_gives_way(claim.record) for claim in overlapping):
             return ClaimHeldByCopy(tuple(claim.record for claim in overlapping))
         return ClaimBusy(overlapping[0].record)
-    proc_start = process_start_time(args.pid)
-    if proc_start is None:
+    try:
+        proc_start = process_start.process_start(args.pid)
+    except process_start.ProcessReadError as error:
+        print(f"cannot read claim owner: {error}", file=sys.stderr)
+        return ClaimFinished(12)
+    if isinstance(proc_start, process_start.ProcessGone):
         print(f"cannot claim: process {args.pid} is not running", file=sys.stderr)
         return ClaimFinished(1)
     claimed: RunRecord = {
         "pid": args.pid,
-        "proc_start": proc_start,
+        "proc_start": proc_start.text,
         "what": args.what,
         "worktree": args.worktree,
         "since": timestamp(utc_now()),
@@ -1961,7 +1982,7 @@ def copy_yield_seconds() -> float:
 
 def stop_copy(holder: RunRecord) -> None:
     """SIGTERM a copy claim's runner, never a process that reused its pid."""
-    if process_start_time(holder["pid"]) != holder["proc_start"]:
+    if check_recorded_owner(holder["pid"], holder["proc_start"]) is not process_start.OwnerCheck.ALIVE:
         return
     try:
         os.kill(holder["pid"], signal.SIGTERM)

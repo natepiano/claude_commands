@@ -278,6 +278,28 @@ gpt-blind=low,medium,high,xhigh,max
 """
 
 
+def copy_launcher_dependencies(root: Path) -> None:
+    """Build the real script dependencies shared by both launcher fixtures."""
+    for directory, names in (
+        ("direct", ("implement.sh", "worker_name.sh", "worker_state.py",
+                    "progress_history.py", "plan_history.py", "phase_reservation.py",
+                    "recorder_state.py", "findings.py", "board.sh")),
+        ("agents", ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk",
+                    "heartbeat.sh", "heartbeat_watch.sh")),
+        ("lib", ("py", "process_start.py", "user_zone.py", "unit_runs.py", "agents_registry.py")),
+        ("production", ("production_doc.py",)),
+    ):
+        destination = root / "scripts" / directory
+        destination.mkdir(parents=True)
+        for name in names:
+            _ = shutil.copy2(DIRECT_DIR.parent / directory / name, destination / name)
+    recorder = root / "scripts" / "direct" / "progress_history.py"
+    _ = recorder.write_text(recorder.read_text().replace(
+        "from __future__ import annotations\n",
+        "from __future__ import annotations\n" + LEGACY_RECORDER_ARGUMENTS, 1,
+    ))
+
+
 class ImplementLauncherFixture(unittest.TestCase):
     """Every worker carries a kind, and the board line says which."""
 
@@ -357,41 +379,21 @@ class ImplementLauncherFixture(unittest.TestCase):
 
     def build_script_tree(self) -> Path:
         """Copy the real wrapper beside a stub agent, so nothing calls a model."""
+        copy_launcher_dependencies(self.root)
         direct_dir = self.root / "scripts" / "direct"
         agents = self.root / "scripts" / "agents"
         lib = self.root / "scripts" / "lib"
-        direct_dir.mkdir(parents=True)
-        agents.mkdir(parents=True)
-        lib.mkdir(parents=True)
-        production = self.root / "scripts" / "production"
-        production.mkdir(parents=True)
-        _ = shutil.copy2(DIRECT_DIR.parent / "production" / "production_doc.py", production / "production_doc.py")
-        # The wrapper reaches python3 through ../lib/py, resolved from its own
-        # location, so the copy needs the interpreter shim beside it too.
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "nix_env.py", lib / "nix_env.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
         home_lib = self.root / ".claude" / "scripts" / "lib"
         home_lib.mkdir(parents=True, exist_ok=True)
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", home_lib / "py")
-        for name in ("implement.sh", "worker_name.sh", "worker_state.py", "progress_history.py", "plan_history.py", "phase_reservation.py",
-                     "recorder_state.py", "findings.py", "board.sh"):
-            _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
-        recorder = direct_dir / "progress_history.py"
-        _ = recorder.write_text(recorder.read_text().replace(
-            "from __future__ import annotations\n",
-            "from __future__ import annotations\n" + LEGACY_RECORDER_ARGUMENTS, 1,
-        ))
         launcher = direct_dir / "implement.sh"
         _ = launcher.write_text(
             launcher.read_text(encoding="utf-8").replace(
                 "HEARTBEAT_INTERVAL_SECS=60", "HEARTBEAT_INTERVAL_SECS=1"
             ), encoding="utf-8",
         )
-        for name in ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk", "claude_account.sh", "heartbeat.sh", "heartbeat_watch.sh"):
-            _ = shutil.copy2(AGENTS_DIR / name, agents / name)
+        _ = shutil.copy2(AGENTS_DIR / "claude_account.sh", agents / "claude_account.sh")
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
         stub.chmod(0o755)

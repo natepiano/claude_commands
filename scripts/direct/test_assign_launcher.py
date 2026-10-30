@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+from scripts.lib import process_start
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
 from scripts.direct import workers
 from scripts.direct.recorder_fixture import invoke_recorder, communicate_launcher
@@ -393,6 +394,145 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
                 self.assertEqual(read_object(identity_path), damaged)
                 self.assertEqual(self.turn_starts, 1)
         _ = identity_path.write_text(json.dumps(identity))
+
+    def test_unreadable_claim_owner_blocks_recovery_without_removing_the_claim(self) -> None:
+        name = "project-impl"
+        _ = self.successful("implement", "--new-worker", name)
+        roster = self.assignment_records()
+        claim = self.session_dir / f"impl_claim_{name}.json"
+        saved = {"pid": 41, "start_time": 123, "worker": name, "turn_id": ""}
+        _ = claim.write_text(json.dumps(saved))
+        script = self.prepare_launcher()[0]
+        _ = script.with_suffix(".py").write_text(
+            "from scripts.direct import assign\nfrom scripts.lib import process_start\n"
+            + "def unread(pid, proc_root=process_start.PROC_ROOT):\n    raise process_start.ProcessReadError('denied')\n"
+            + "process_start.process_start = unread\nraise SystemExit(assign.main())\n")
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                result = self.launch("implement", "--to", name, script=script)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("claimed by launcher 41", result.stderr)
+                self.assertEqual(read_object(claim), saved)
+                self.assertEqual(self.assignment_records(), roster)
+                self.assertEqual(self.turn_starts, 1)
+
+    def test_reused_launcher_pid_does_not_block_the_same_worker_on_rerun(self) -> None:
+        if not Path("/proc/self/stat").is_file():
+            self.skipTest("Linux process start times required")
+        name = "project-impl"
+        _ = self.successful("implement", "--new-worker", name)
+        # A stopped launcher left its claim; its pid now belongs to this test.
+        claim = self.session_dir / f"impl_claim_{name}.json"
+        _ = claim.write_text(json.dumps({"pid": os.getpid(), "start_time": 0,
+                                        "worker": name, "turn_id": ""}))
+        observed: list[dict[str, object]] = []
+        original = self.server.respond
+
+        @mesh_fixture.bounded_fixture
+        def observe(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                saved = read_object(claim)
+                pid = saved["pid"]
+                self.assertIsInstance(pid, int)
+                assert isinstance(pid, int)
+                live = process_start.process_start(pid)
+                assert isinstance(live, process_start.ProcessStartTime)
+                start = live.ticks
+                self.assertEqual(saved.get("start_time"), start)
+                observed.append(saved)
+            return original(request)
+
+        self.server.respond = observe
+        _ = self.successful("implement", "--to", name)
+        self.assertEqual(self.turn_starts, 2)
+        self.assertEqual(len(observed), 1)
+        self.assertFalse(claim.exists())
+
+    def test_stale_active_roster_launcher_is_released_before_the_worker_is_retried(self) -> None:
+        name = "project-impl"
+        _ = self.successful("implement", "--new-worker", name)
+        for status in ("running", "waiting_capacity"):
+            with self.subTest(status=status):
+                roster_path = self.session_dir / codex_mesh.ROSTER_FILE
+                roster = self.assignment_records()
+                roster[name].update({"status": status, "launcher_pid": os.getpid(),
+                                     "launcher_start_time": 0, "turn_id": "interrupted-turn"})
+                _ = roster_path.write_text(json.dumps(roster))
+                claim = self.session_dir / f"impl_claim_{name}.json"
+                _ = claim.write_text(json.dumps({"pid": os.getpid(), "start_time": 0,
+                                                "worker": name, "turn_id": "interrupted-turn"}))
+                result = self.launch("implement", "--to", name)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(claim.exists())
+                self.assertEqual(self.assignment_records()[name]["status"], "done")
+
+    def test_stale_claim_rerun_keeps_a_newer_starting_launcher_with_the_same_pid(self) -> None:
+        name = "project-impl"
+        _ = self.successful("implement", "--new-worker", name)
+        started = process_start.process_start(os.getpid())
+        assert not isinstance(started, process_start.ProcessGone)
+        start_value = (started.ticks if isinstance(started, process_start.ProcessStartTime)
+                       else started.date)
+        roster = self.assignment_records()
+        roster[name].update({"status": "starting", "launcher_pid": os.getpid(),
+                             "launcher_start_time": start_value, "previous_status": "done"})
+        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps(roster))
+        # The old launcher stopped before release; its pid belongs to the new launcher.
+        claim = self.session_dir / f"impl_claim_{name}.json"
+        old_claim = {"pid": os.getpid(), "start_time": 0, "worker": name, "turn_id": ""}
+        _ = claim.write_text(json.dumps(old_claim))
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                result = self.launch("implement", "--to", name)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(self.assignment_records(), roster)
+                self.assertEqual(read_object(claim), old_claim)
+                self.assertEqual(self.turn_starts, 1)
+
+    def test_claims_use_ps_start_dates_when_proc_is_absent(self) -> None:
+        name = "project-impl"
+        _ = self.successful("implement", "--new-worker", name)
+        script = self.prepare_launcher()[0]
+        _ = script.with_suffix(".py").write_text(
+            "from pathlib import Path\nfrom scripts.direct import assign\n"
+            + "original = Path.stat\n"
+            + "def no_proc(path, **kw):\n    if str(path) == '/proc': raise FileNotFoundError()\n    return original(path, **kw)\n"
+            + "Path.stat = no_proc\n"
+            + "raise SystemExit(assign.main())\n")
+        binaries = self.session_dir.parent / "ps-bin"
+        binaries.mkdir()
+        ps = binaries / "ps"
+        _ = ps.write_text("#!/bin/sh\n[ \"$2\" = stat= ] && { echo S; exit 0; }\n[ \"$1 $2 $3\" = \"-o lstart= -p\" ] || exit 2\n"
+                          + "printf '%s\\n' 'Thu Oct 29 12:00:00 2026'\n")
+        ps.chmod(0o755)
+        claim = self.session_dir / f"impl_claim_{name}.json"
+        _ = claim.write_text(json.dumps({"pid": os.getpid(),
+                                        "start_time": "Wed Oct 28 12:00:00 2026",
+                                        "worker": name, "turn_id": ""}))
+        observed: list[dict[str, object]] = []
+        original = self.server.respond
+
+        @mesh_fixture.bounded_fixture
+        def observe(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "turn/start":
+                observed.append(read_object(claim))
+            return original(request)
+
+        self.server.respond = observe
+        with patch.dict(os.environ, {"PATH": str(binaries) + os.pathsep + os.environ["PATH"]}):
+            result = self.launch("implement", "--to", name, script=script)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(observed, [])
+        self.assertTrue(claim.exists())
+        _ = claim.write_text(json.dumps({"pid": 999999999, "start_time": "Thu Oct 29 12:00:00 2026",
+                                        "worker": name, "turn_id": ""}))
+        _ = ps.write_text(ps.read_text().replace("#!/bin/sh\n", "#!/bin/sh\n[ \"$4\" = 999999999 ] && exit 1\n"))
+        with patch.dict(os.environ, {"PATH": str(binaries) + os.pathsep + os.environ["PATH"]}):
+            result = self.launch("implement", "--to", name, script=script)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["start_time"], "Thu Oct 29 12:00:00 2026")
+        self.assertFalse(claim.exists())
 
     def test_a_saved_slot_keys_the_claim_and_board_for_a_full_worker_address(self) -> None:
         name = "project-impl"

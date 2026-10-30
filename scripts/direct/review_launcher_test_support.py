@@ -13,30 +13,12 @@ from pathlib import Path
 from typing import TypedDict, ClassVar, cast, override
 
 from scripts.direct.recorder_fixture import communicate_launcher, invoke_recorder
+from scripts.direct.implement_launcher_test_support import copy_launcher_dependencies
 
 
 TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
 
 DIRECT_DIR = Path(__file__).parent
-AGENTS_DIR = DIRECT_DIR.parent / "agents"
-
-LEGACY_RECORDER_ARGUMENTS = """
-# Compatibility for older launch cases whose subject is root-level artifacts.
-# The new launch-boundary tests remove this flag and use the recorder unchanged.
-import json as _fixture_json
-import os as _fixture_os
-from pathlib import Path as _FixturePath
-import sys as _fixture_sys
-if (_fixture_os.environ.get("TEST_LEGACY_LAUNCH") == "1"
-        and len(_fixture_sys.argv) > 1 and _fixture_sys.argv[1] in ("start-pass", "check-launch")):
-    if "--phase-id" not in _fixture_sys.argv:
-        _fixture_session = _FixturePath(
-            _fixture_sys.argv[_fixture_sys.argv.index("--session-dir") + 1])
-        _fixture_state = _fixture_json.loads(
-            (_fixture_session / "progress_history_state.json").read_text())
-        _fixture_sys.argv.extend(["--phase-id", _fixture_state["phase"]["id"]])
-
-"""
 
 # The wrapper calls this as: <task> readonly <working_dir> <prompt> <findings> <log>.
 # Writing both outputs and exiting immediately drives the wrapper's completion
@@ -392,41 +374,21 @@ class ReviewLauncherFixture(unittest.TestCase):
         Mesh, agent execution and pool allocation are controlled so tests spend
         no model tokens. The real heartbeat watcher uses a short interval.
         """
+        copy_launcher_dependencies(self.root)
         direct_dir = self.root / "scripts" / "direct"
         agents = self.root / "scripts" / "agents"
         lib = self.root / "scripts" / "lib"
-        direct_dir.mkdir(parents=True)
-        agents.mkdir(parents=True)
-        lib.mkdir(parents=True)
         production = self.root / "scripts" / "production"
-        production.mkdir(parents=True)
         _ = shutil.copy2(DIRECT_DIR.parent / "production" / "showrunners.py", production / "showrunners.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "production" / "production_doc.py", production / "production_doc.py")
-        # The wrapper reaches python3 through ../lib/py, resolved from its own
-        # directory.
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
         _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "probe_session.py", lib / "probe_session.py")
-        for name in (
-            "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "recorder_state.py",
-            "findings.py", "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py", "tag_inventory.py",
-        ):
+        for name in ("review.sh", "review_tree.py", "tag_inventory.py"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
-        recorder = direct_dir / "progress_history.py"
-        _ = recorder.write_text(recorder.read_text().replace(
-            "from __future__ import annotations\n",
-            "from __future__ import annotations\n" + LEGACY_RECORDER_ARGUMENTS, 1,
-        ))
         launcher = direct_dir / "review.sh"
         _ = launcher.write_text(
             launcher.read_text(encoding="utf-8").replace(
                 "HEARTBEAT_INTERVAL_SECS=60", "HEARTBEAT_INTERVAL_SECS=1"
             ), encoding="utf-8",
         )
-        for name in ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk", "heartbeat.sh", "heartbeat_watch.sh"):
-            _ = shutil.copy2(AGENTS_DIR / name, agents / name)
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
         stub.chmod(0o755)
