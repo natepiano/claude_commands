@@ -758,7 +758,7 @@ class SettleTests(ShutdownTestCase):
 
         first = self.unit_for_showrunner()
         second_owner = unit("second-unit", "Second")
-        second_owner["host"]["doc"] = "/tmp/demo-production.md"
+        unit_staff_test_support.PARENTS[second_owner["host"]["unit"]] = staff_sources.UnitProduction("demo", "/tmp/demo-production.md")
         second = session_shutdown(second_owner, then="restart")
         self.save(second)
 
