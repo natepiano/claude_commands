@@ -10,16 +10,25 @@ function tableLines(header: string[], rows: string[][], width: number): BoardLin
   if (sizes.reduce((sum, size) => sum + size, 0) + (sizes.length - 1) * 2 <= width) {
     const line = (cells: string[], bold = false) => header.map((_, index) => {
       const cell = cells[index] ?? '';
-      const padding = index === header.length - 1 ? '' : ' '.repeat(sizes[index]! - cellWidth(cell) + 2);
-      return span(cell + padding, 'default', bold ? 'bold' : 'fact');
+      const padding = ' '.repeat(sizes[index]! - cellWidth(cell));
+      const numeric = ['#', 'Promised', 'Using', 'Delta', 'Waiting since', 'Needs', 'Free'].includes(header[index]!);
+      const aligned = numeric ? padding + cell : cell + padding;
+      return span(aligned + (index === header.length - 1 ? '' : '  '), 'default', bold ? 'bold' : 'fact');
     });
     return [line(header, true), ...rows.map(row => line(row))];
   }
   return rows.flatMap((row, index) => [
     ...(index ? [[span('')]] : []),
-    ...header.flatMap((heading, cell) => wrapLine([
-      span(`${heading}: `, 'default', 'bold'), span(row[cell] ?? ''),
-    ], width, 2)),
+    ...header.flatMap((heading, cell) => {
+      const label = `${heading}: `;
+      const value = row[cell] ?? '';
+      const numeric = ['#', 'Promised', 'Using', 'Delta', 'Waiting since', 'Needs', 'Free'].includes(heading);
+      if (numeric && cellWidth(label) + cellWidth(value) <= width) {
+        return [[span(label, 'default', 'bold'),
+          span(' '.repeat(width - cellWidth(label) - cellWidth(value)) + value)]];
+      }
+      return wrapLine([span(label, 'default', 'bold'), span(value)], width, 2);
+    }),
   ]);
 }
 

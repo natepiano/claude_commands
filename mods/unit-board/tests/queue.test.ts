@@ -377,6 +377,50 @@ describe('build queue pane', () => {
 });
 
 describe('queue rendering', () => {
+  test('every wide-table text cell aligns left and numeric cell with unit aligns right', async () => {
+    const data = snapshot();
+    data.running.push(['12', 'b', 'long-unit', 'short', 'build', 'folder-long',
+      '2.0 GiB', '12.8 GiB', '-10.8 GiB', 'starting']);
+    data.waiting.push(['12', 'long-showrunner', 'r', 'second', 'test', 'long-tree', '1:45 (5 min)',
+      '2.0 GiB', '8.0 GiB', 'free memory']);
+    const lines = queueLines(data, 800);
+    for (const [header, rows] of [[data.running_header, data.running], [data.waiting_header, data.waiting]] as const) {
+      const table = lines.filter(line => line.length === header.length
+        && line.every((part, column) => part.text.trim() === header[column]));
+      expect(table.length).toBe(1);
+      const numeric = ['#', 'Promised', 'Using', 'Delta', 'Waiting since', 'Needs', 'Free'];
+      const body = rows.map(row => lines.find(line => line.length === header.length
+        && line[0]!.text.trim() === row[0] && line[3]!.text.trim() === row[3])!);
+      expect(body.every(line => !!line)).toBe(true);
+      for (let column = 0; column < header.length; column++) {
+        const cells = body.map(line => line[column]!.text);
+        if (numeric.includes(header[column]!)) {
+          expect(new Set(cells.map(cell => cellWidth(cell.trimEnd()))).size).toBe(1);
+          if (['Promised', 'Using', 'Delta', 'Needs', 'Free'].includes(header[column]!)) {
+            expect(new Set(cells.map(cell => cell.indexOf('.'))).size).toBe(1);
+          }
+        } else {
+          expect(cells.every(cell => cell === cell.trimStart())).toBe(true);
+        }
+      }
+    }
+  });
+
+  test('narrow-table numeric values keep their units together at the right edge', async () => {
+    const lines = queueLines(snapshot(), 30);
+    for (const heading of ['#', 'Promised', 'Using', 'Delta', 'Waiting since', 'Needs', 'Free']) {
+      const numeric = lines.filter(line => line[0]?.text === `${heading}: `);
+      expect(numeric.length).toBeGreaterThan(0);
+      for (const line of numeric) {
+        expect(cellWidth(line.map(part => part.text).join('').trimEnd())).toBe(30);
+        expect(line[0]!.text.startsWith(heading)).toBe(true);
+        if (['Promised', 'Using', 'Delta', 'Needs', 'Free'].includes(heading)) {
+          expect(line[1]!.text.trim()).toMatch(/^-?\d+\.\d GiB$/);
+        }
+      }
+    }
+  });
+
   for (const columns of [400, 60, 30]) {
     test(`${columns} cells keep the complete head explanation, rows and error tone`, async () => {
       const lines = queueLines(snapshot(), columns);

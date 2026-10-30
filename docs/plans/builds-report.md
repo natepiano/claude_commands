@@ -93,7 +93,7 @@ including the details to make it clear
 
 **Gotchas:** the live logs still hold old-name fields (about 70 at closeout). No code rewrites them; only the index read maps them, so a reader that opens the `.jsonl` files directly must map `FORMER_FIELDS` too.
 
-### Phase 3 — build-why says at once why the first waiting step waits, from admission's own numbers  · status: todo
+### Phase 3 — build-why says at once why the first waiting step waits, from admission's own numbers  · status: done
 
 #### Work Order
 
@@ -140,6 +140,10 @@ including the details to make it clear
 **Constraints from prior phases:** Phase 1: `build_queue.py --json` and the head line exist; the mod pane reads `--json`, so the head line's JSON field keeps its shape. Merge origin/builds first: it carries resources' Phase 12 patches B and C (peak decay) in `memory_admit.py`. Resources' Phase 14 (in review 22:0x) adds `reservation_lifetime(row, owner_live)` and keeps every signature; Phase 15 adds a test-phase peak estimate source. Also-touches resources: trial-merge and test against origin/builds-resources before the notice.
 
 **Acceptance gate:** `python3 -m unittest scripts.build_queue.test_build_why scripts.build_queue.test_build_queue scripts.lint.test_memory_admit` green (prefix `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY`); basedpyright 0/0/0 on the changed Python files. Live: `build_why.py` on natedev finishes under 1 s, and its head verdict matches `/build:queue` run at the same time.
+
+**Repairs reached (review, 2026-10-29):** `scripts/message/roster.py` and `test_roster.py` — `unit_labels_for` also resolves Codex worker thread ids from run `mesh_roster.json` records, so build-why names every holder as the full roster does (owner sdlc-roles; trial-merged clean against its tip). `mods/unit-board/hooks/queue.tsx` and its test — the user's alignment rule: every number column right-aligned with its unit in one cell, every text column left-aligned, in `/build:queue` text, the pane and build-why.
+
+Assertion-Change: scripts/build_queue/test_build_queue.py::test_empty_queue_reads_once_without_subprocess_or_wait — numeric columns right-aligned (---:) per the user's alignment rule
 
 ### Phase 4 — App launches reach the build log again, with their memory wait  · status: todo
 
