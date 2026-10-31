@@ -160,6 +160,18 @@ class PaneRecordTests(unittest.TestCase):
         self.assertEqual(evidence.read_bytes(), before)
         self.assertEqual(json.loads((self.records / "agents.json").read_text()), {})
 
+    def test_unmarked_write_does_not_recover_a_previous_launchs_staff_identity(self) -> None:
+        marked = pane_record.launch("old", "conversation", "/fixture", {
+            "STAFF_ID": "s123456789ab", "SHOWRUNNER_UNIT": "demo",
+            "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude"])
+        with mock.patch.object(pane_record, "RECORD_DIR", self.records):
+            pane_record.write("agents", marked)
+            for pane in ("new", "old"):
+                with self.subTest(pane=pane):
+                    unmarked = pane_record.launch(pane, "conversation", "/fixture", {}, ["claude"])
+                    pane_record.write("agents", unmarked)
+                    self.assertEqual(pane_record.read("agents")[pane], unmarked)
+
     def test_markless_hook_preserves_only_the_same_conversations_identity(self) -> None:
         self.env["STAFF_ID"] = "s123456789ab"
         self.assertEqual(self.start("w1:p2", "sid-alpha").returncode, 0)
