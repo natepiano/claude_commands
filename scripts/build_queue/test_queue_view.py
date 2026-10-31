@@ -18,6 +18,30 @@ from scripts.lint.memory_test_support import fake_memory_readings
 
 
 class QueueViewTests(QueueFixtureTests):
+    def test_expired_head_with_passing_checks_has_an_error_hold_at_sixty_cells(self) -> None:
+        inputs = self.fixture.inputs()
+        path, row = inputs.ordered[0]
+        inputs = replace(inputs, running=(), reservations=(), pressure=gate.NoPressureHold(),
+            host=gate.HostMemory(60 * gate.GIB, 60 * gate.GIB),
+            ordered=[(path, {**row, "need": gate.GIB, "estimated_at": NOW - 600,
+                            "priority_since": NOW - 42}), inputs.ordered[1]])
+        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(gate.GIB, 3 * gate.GIB))
+        head = reading.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        self.assertTrue(head.budget.passes)
+        self.assertTrue(head.free.passes)
+        self.assertIsInstance(head.decision.pressure, gate.NoPressureHold)
+        model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
+        lines = queue_view.render_view(model, 60)
+        rows = waiting_rows(lines)
+        self.assertTrue(rows[0].endswith("⊘ 9:18 estimate expired"), rows[0])
+        self.assertEqual(queue_view.reason_phrase(reading.view.waiting[0].reason, reading.view.waiting),
+                         "estimate expired")
+        self.assertTrue(all(terminal_width(plain([line])) <= 60 for line in lines))
+        self.assertEqual([row.index("█") for row in rows], [rows[0].index("█")] * len(rows))
+        self.assertTrue(any(span.text.endswith("estimate expired") and span.tone == "error"
+                            for line in lines for span in line))
+
     def test_live_priority_marks_and_cards_use_the_snapshot_without_bump_history(self) -> None:
         model = self.fixture.model()
         facts = model.facts

@@ -51,7 +51,8 @@ import style_footprint
 import style_proposals
 from issues import Issue, frontmatter
 from scripts.build_hold import build_hold
-from production_units import Refusal, cell_value, live_unit_table, production_field
+from production_units import Refusal, cell_value, production_field
+from unit_lookup import live_unit_table
 from proposal_issue import ApprovedDecision, decision_answer, require_generated_body
 from unit_files import changed_files, git, unit_file_holders, unit_worktrees
 from unit_plans import (AllCrates, PilotScope, crate_in_scope, delegation_context, family_plan_texts, family_pilot_scopes,
