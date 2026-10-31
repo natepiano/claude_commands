@@ -360,20 +360,16 @@ remove_step_record() {
     fi
 }
 
-# A failed step may be a process killed by earlyoom or the kernel. Keep the
-# journal query here so tests can put a journalctl stub first on PATH.
+# One classifier preserves signal-based retries and attributes wrapper-only
+# failures to an earlyoom rustc kill of the failed crate.
 memory_kill_in_journal() {
-    local started=$1 ended=$2
-    journalctl -u earlyoom --since "$started" --until "$ended" --no-pager 2>/dev/null \
-        | grep -E 'sending SIG(TERM|KILL) to process' >/dev/null && return 0
-    journalctl -k --since "$started" --until "$ended" --no-pager 2>/dev/null \
-        | grep -E 'Memory cgroup out of memory|Out of memory: Killed' >/dev/null
+    local started=$1 ended=$2 log=$3
+    "${PY:-python3}" "$VERIFY_START_DIR/memory_kill.py" "$started" "$ended" "$log"
 }
 
 step_was_killed_for_memory() {
     local log=$1 started=$2 ended=$3
-    grep -qaE 'SIGKILL|SIGTERM|signal: (9|15)' "$log" || return 1
-    memory_kill_in_journal "$started" "$ended"
+    memory_kill_in_journal "$started" "$ended" "$log"
 }
 
 run() {
@@ -392,7 +388,8 @@ run() {
             step_state local_noncompiling
         fi
         export BUILDLOG_TARGET=natedev
-        started="$(date '+%Y-%m-%d %H:%M:%S %z')"
+        buildlog_now
+        started=$BUILDLOG_NOW
         monitor=0
         [[ $- != *m* ]] || monitor=1
         set -m
@@ -448,7 +445,8 @@ run() {
             rm -f "$step_log"
             return "$status"
         fi
-        ended="$(date '+%Y-%m-%d %H:%M:%S %z')"
+        buildlog_now
+        ended=$BUILDLOG_NOW
         RUN_LAST_ATTEMPT_KILLED=0
         if grep -qaE 'SIGKILL|signal: 9' "$step_log"; then
             RUN_LAST_ATTEMPT_KILLED=1
@@ -1149,6 +1147,7 @@ if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
 fi
 if [[ ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ]]; then CACHE_DIR=""; fi
 RUN_LOG=""
+RUN_LOG_PIDS=()
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
@@ -2978,18 +2977,29 @@ note_memory_admission() {
 }
 
 admit_with_token() {
-    local waited=0
+    local waited=0 reservation_before_token token_back_at
     while :; do
+        reservation_before_token=${BUILDLOG_MEM_RESERVATION:-}
+        token_back_at=""
+        if [[ -n "$reservation_before_token" ]]; then
+            # Give memory back without losing this step's queue place. Reuse
+            # its first clock so all passes and token waits count exactly once.
+            BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM
+            buildlog_token_wait || return $?
+        fi
         acquire_token || return $?
         waited=$(( waited + TOKEN_WAITED ))
+        if [[ -n "$reservation_before_token" ]]; then
+            token_back_at=$(buildlog_memory_python -c 'import time; print(time.time())') || return $?
+        fi
         # The Mac claim hook and every poll share this admission's heartbeat.
-        with_token_renewal buildlog_wait_for_memory_only "$@" || return $?
+        BUILDLOG_MEM_TOKEN_BACK_AT=$token_back_at \
+            with_token_renewal buildlog_wait_for_memory_only "$@" || return $?
         note_memory_admission
         [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || break
         if [[ "${TOKEN_USED}" -eq 0 ]] || renew_token; then break; fi
-        # Ownership was lost before any command ran. Never wait for the token
-        # with a memory promise that could prevent its new holder from running.
-        buildlog_release_memory 0
+        # Ownership was lost before any command ran. The next pass gives
+        # memory back before waiting for its new holder's token.
         TOKEN_HELD=0
     done
     TOKEN_WAITED=$waited
@@ -3016,7 +3026,6 @@ buildlog_wait_for_memory() {
         note_memory_admission
         [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
         if ! try_token_now; then
-            buildlog_release_memory 0
             admit_with_token "$@" || return $?
         fi
     fi
@@ -3103,6 +3112,27 @@ run_log_tee() {
     trap '' INT TERM HUP
     exec tee -i -a "$RUN_LOG"
 }
+
+start_run_log() {
+    exec > >(run_log_tee)
+    RUN_LOG_PIDS+=("$!")
+    exec 2> >(run_log_tee >&2)
+    RUN_LOG_PIDS+=("$!")
+}
+
+stop_interrupted_run_log() {
+    # A tee can block on its output even after every writer closed its input.
+    # Keep readers through cleanup to avoid SIGPIPE, then reap them explicitly:
+    # they intentionally ignore group signals and cannot depend on EOF alone.
+    [[ ${#RUN_LOG_PIDS[@]} -gt 0 ]] || return 0
+    set +x
+    exec >/dev/null 2>&1
+    local pid
+    for pid in "${RUN_LOG_PIDS[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
+    for pid in "${RUN_LOG_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+    RUN_LOG_PIDS=()
+}
+
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
     # waited is part of the tree it runs on.
@@ -3111,7 +3141,7 @@ if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     fi
     RUN_LOG="${CACHE_DIR}/run.$$.log"
     : > "${RUN_LOG}"
-    exec > >(run_log_tee) 2> >(run_log_tee >&2)
+    start_run_log
 fi
 
 ACTIVITY_ACTIVE=0
@@ -3195,6 +3225,7 @@ verify_interrupted() {
     fi
     verify_cleanup interrupted
     final_pass_finish "$EXIT_STATUS"
+    stop_interrupted_run_log
     exit "$EXIT_STATUS"
 }
 trap 'verify_interrupted 2' INT

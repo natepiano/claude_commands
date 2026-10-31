@@ -81,15 +81,18 @@ class MemoryGateWaitTests(unittest.TestCase):
             "UNIT_SESSION_DIR": "", "UNIT_TEAM_ROLE": "",
             "BUILDLOG_CHECK_FAILED_FILE": "", "BUILDLOG_MEM_BLOCKER": "",
             "BUILDLOG_MEM_POLL_S": "1", "BUILDLOG_MEM_CHECK_RETRY_S": "2",
-            "BUILDLOG_MEM_WAIT_SINCE": str(int(time.time()) - 1200),
+            "BUILDLOG_MEM_WAIT_SINCE": "", "BUILDLOG_MEM_WAIT_FIRST_FILE": "",
             "BUILDLOG_BUILD_BUDGET_GIB": "21", "BUILDLOG_PEAK": "",
             "LINT_QUEUE_LEAVE_HOOK": "", "BUILDLOG_MAC_IDLE_HOOK": "",
         }
 
-    def run_wait(self, actions: str, *, launch: bool = False) -> subprocess.CompletedProcess[str]:
+    def run_wait(self, actions: str, *, launch: bool = False,
+                 rejoin: bool = False) -> subprocess.CompletedProcess[str]:
         # A deterministic shell clock exercises retry deadlines without sleeping.
         command = (
-            'set -e; source "$1"; BUILDLOG_MEM_ADMIT_SCRIPT=$2; '
+            'set -e; source "$1"; '
+            + ('BUILDLOG_MEM_WAIT_SINCE=$TEST_QUEUE_WAIT_SINCE; ' if rejoin else '')
+            + ('BUILDLOG_MEM_ADMIT_SCRIPT=$2; '
             'buildlog_memory_python() { '
             'if [[ "$1" == "$BUILDLOG_MEM_ADMIT_SCRIPT" ]]; then '
             'python3 "$1" --checker "${@:2}"; else printf "UTC\\n"; fi; }; '
@@ -98,12 +101,13 @@ class MemoryGateWaitTests(unittest.TestCase):
             'if (( sleeps > 15 )); then exit 99; fi; }; '
             'shift 2; if (( $# == 0 )); then '
             'trap \'printf "wait elapsed: %s\\n" "$BUILDLOG_MEM_WAIT_S" >&2\' EXIT; fi; '
-            'buildlog_wait_for_memory "$@"; printf "%s\\n" "$BUILDLOG_MEM_OUTCOME"'
+            'buildlog_wait_for_memory "$@"; printf "%s\\n" "$BUILDLOG_MEM_OUTCOME"')
         )
         return subprocess.run(
             ["bash", "-c", command, "test", str(Path(__file__).with_name("memory_gate.sh")),
              str(Path(__file__).resolve()), *([] if launch else ["/bin/true"])],
-            env={**self.environment, "TEST_CHECKER_ACTIONS": actions}, cwd=self.root,
+            env={**self.environment, "TEST_CHECKER_ACTIONS": actions,
+                 "TEST_QUEUE_WAIT_SINCE": str(int(time.time()) - 1200)}, cwd=self.root,
             text=True, capture_output=True, check=False, timeout=30,
         )
 
@@ -112,7 +116,7 @@ class MemoryGateWaitTests(unittest.TestCase):
                 for line in (self.root / "calls.jsonl").read_text().splitlines()]
 
     def test_unknown_source_and_failed_poll_preserve_the_real_waiting_row(self) -> None:
-        result = self.run_wait("unknown,fail,hold,admit")
+        result = self.run_wait("unknown,fail,hold,admit", rejoin=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "Granted\n")
         self.assertNotIn("step refused", result.stderr)
@@ -168,6 +172,24 @@ class MemoryGateWaitTests(unittest.TestCase):
         self.assertEqual(result.stderr.count("trying again, the step keeps its place"), 4)
         self.assertNotIn("step refused", result.stderr)
         self.assertEqual(len(self.calls()), 7)
+
+    def test_parent_queue_identity_does_not_age_a_new_launch_or_step(self) -> None:
+        parent_start = int(time.time()) - 1200
+        parent_wait = self.root / "parent-first-wait"
+        _ = parent_wait.write_text(f"{parent_start}\n")
+        self.environment.update({"BUILDLOG_MEM_WAIT_SINCE": str(parent_start),
+                                 "BUILDLOG_MEM_WAIT_FIRST_FILE": str(parent_wait),
+                                 "BUILDLOG_MEM_WAIT_LIMIT_S": "1"})
+        launch = self.run_wait("hold,fail", launch=True)
+        self.assertEqual(launch.returncode, 2, launch.stderr)
+        self.assertIn("wait elapsed: 1\n", launch.stderr)
+        (self.root / "calls.jsonl").unlink()
+        step = self.run_wait("hold,admit")
+        self.assertEqual(step.returncode, 0, step.stderr)
+        first, _ = self.calls()
+        row, = first["rows"].values()
+        self.assertGreater(row["since"], parent_start)
+        self.assertEqual(parent_wait.read_text(), f"{parent_start}\n")
 
     def test_empty_checker_error_uses_the_retry_fallback(self) -> None:
         result = self.run_wait("hold,silent-fail,admit")

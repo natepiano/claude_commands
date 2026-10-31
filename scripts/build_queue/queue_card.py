@@ -26,7 +26,7 @@ def order_check(model: QueueModel, position: int) -> Line:
     if isinstance(reason, gate.BehindOlderFit):
         return check_line(False, "queue order      " + reason_phrase(reason, model.reading.view.waiting))
     if isinstance(reason, gate.BehindHead) and isinstance(model.facts, head_facts.HeadFacts):
-        return check_line(False, "#1's turn      " + head_facts.order_text(model.facts, model.zone, include_record=False))
+        return check_line(False, "#1's turn      " + head_facts.order_text(model.facts, model.zone))
     return check_line(True, "queue order")
 
 
@@ -45,6 +45,9 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
              Span(f" · {step.step} · {step.need / gate.GIB:.1f} GiB", bold=True)))
         add((Span(f"Folder {step.folder}. Waited {age(step.since, model.reading.explanation.now)} min (since {clock(model, step.since)}). "
                   + (f"Likely start {start_text(model, position, clock_time=True)}." if estimate_minutes(model, position) else "Likely start —.")),))
+        priority = head_facts.priority_text(model.reading.explanation.priority)
+        if priority:
+            add((Span(priority),))
         add()
         checks = step_checks(model, position)
         if (isinstance(step.reason, gate.ReadyForAdmission)

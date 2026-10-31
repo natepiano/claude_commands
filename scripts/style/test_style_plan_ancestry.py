@@ -172,7 +172,11 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual(self.cell_state(read, self.sources[0]), "open")
 
         self.assertEqual(self.candidates(), ())
-        self.assertEqual(self.run_next(), (3, "waiting for structure: crates/alpha\n", ""))
+        code, output, errors = self.run_next()
+        self.assertEqual((code, errors), (3, ""))
+        self.assertTrue(output.endswith("waiting for structure: crates/alpha\n"), output)
+        self.assertIn(f"structure stays with modules: {structure} {self.sources[0]}: "
+                      + "judged at unit base; merge the style branch first\n", output)
 
     def test_modules_unit_merges_the_style_branch_first_for_a_structure_cell_judged_at_its_tip(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")

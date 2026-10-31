@@ -14,8 +14,7 @@ import sys
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
-from dataclasses import dataclass, replace
-from enum import StrEnum
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 from pathlib import Path
 from typing import Literal, NewType, Protocol, TypeVar, cast
@@ -54,29 +53,17 @@ class StaffNotFound(LookupError):
         super().__init__(f"staff member not found: {staff_id}")
 
 
-class WorkerRole(StrEnum):
-    impl = "impl"
-    test = "test"
-    fix = "fix"
-    review = "review"
-    designer = "designer"
-    reviewer = "reviewer"
-
-
 @dataclass(frozen=True)
 class WorkerName:
-    role: WorkerRole
-    number: int
+    """A launcher-safe name; assignment and holder are read from worker records."""
+
+    value: str
 
     @classmethod
     def parse(cls, name: str) -> WorkerName:
-        match = re.fullmatch(r"([a-z]+)([1-9][0-9]*)", name)
-        if match is not None:
-            try:
-                return cls(WorkerRole(match[1]), int(match[2]))
-            except ValueError:
-                pass
-        raise StaffRefused(f"invalid worker name: {name!r}; expected a worker role and positive number")
+        if re.fullmatch(r"[A-Za-z0-9._-]+", name) and name not in (".", ".."):
+            return cls(name)
+        raise StaffRefused(f"invalid worker name: {name!r}; expected launcher name characters")
 
 
 @dataclass(frozen=True)
@@ -113,6 +100,7 @@ class StaffRow:
 class StaffSnapshot:
     rows: tuple[StaffRow, ...]
     pending_retire: tuple[StaffId, ...] = ()
+    inputs: tuple[str, ...] = field(default=(), compare=False)
 
     def by_id(self, staff_id: StaffId) -> StaffRow | None:
         return _row_by_id(self.rows, staff_id)
@@ -124,6 +112,16 @@ class StaffSnapshot:
         """An omitted kind or parent leaves that field unrestricted."""
         return [row for row in self.rows if (kind is None or row.kind == kind)
                 and (parent is None or row.parent == parent)]
+
+
+@dataclass
+class RecordInputs:
+    """Attempted source-record reads for one command, including unreadable files."""
+
+    paths: set[str] = field(default_factory=set)
+
+    def __call__(self, path: Path) -> None:
+        self.paths.add(str(path.expanduser().absolute()))
 
 
 @dataclass(frozen=True)
@@ -149,7 +147,7 @@ class SeedParent:
 @dataclass(frozen=True)
 class SeedMember:
     key: str
-    kind: Literal["showrunner", "unit"]
+    kind: Kind
     name: str
     match: StaffId | NewSeedMember
     parent: SeedParent | KeepSeedParent | RootSeedParent
@@ -202,7 +200,7 @@ class SeedInput:
         for item in cast(list[object], raw_members):
             entry = _seed_fields(item, {"key", "kind", "name", "match", "parent"})
             key, kind, name, match = (entry[field] for field in ("key", "kind", "name", "match"))
-            if not isinstance(key, str) or not key or kind not in ("showrunner", "unit") or not isinstance(name, str):
+            if not isinstance(key, str) or not key or kind not in _KINDS or not isinstance(name, str):
                 raise StaffRefused("invalid seed member")
             parent_value = entry["parent"]
             if not isinstance(parent_value, dict):
@@ -326,6 +324,10 @@ def operation() -> AbstractContextManager[None]:
     return locked()
 
 
+def _parent_kinds(kind: Kind) -> tuple[Kind, ...]:
+    return ("unit", "showrunner") if kind == "worker" else ("showrunner",)
+
+
 def _validate(rows: list[StaffRow]) -> None:
     """Check the complete proposed graph before any bytes are replaced."""
     indexed: dict[StaffId, StaffRow] = {}
@@ -352,9 +354,9 @@ def _validate(rows: list[StaffRow]) -> None:
                 raise StaffRefused(f"{row.kind} {row.name} requires a parent")
         else:
             parent = indexed.get(row.parent)
-            expected = "unit" if row.kind == "worker" else "showrunner"
-            if parent is None or parent.kind != expected:
-                raise StaffRefused(f"{row.kind} {row.name} requires a {expected} parent: {row.parent}")
+            allowed = _parent_kinds(row.kind)
+            if parent is None or parent.kind not in allowed:
+                raise StaffRefused(f"{row.kind} {row.name} requires a {' or '.join(allowed)} parent: {row.parent}")
     # Once a chain is checked, every later chain reaching it is already known to end.
     checked: set[StaffId] = set()
     for row in rows:
@@ -404,7 +406,7 @@ def _load(*, initial: bool = False) -> StaffSnapshot:
     schema = fields.get("schema")
     if type(schema) is not int or schema != 1:
         raise StaffUnreadable(f"unsupported staff schema: {schema!r}")
-    return _snapshot_value(fields)
+    return replace(_snapshot_value(fields), inputs=(str(_file().absolute()),))
 
 
 def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
@@ -412,11 +414,22 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
     if not isinstance(pending, list) or any(not isinstance(item, str) or not _ID.fullmatch(item)
                                              for item in cast(list[object], pending)):
         raise StaffUnreadable("invalid pending retirement ids")
+    inputs = fields.get("inputs", [])
+    if not isinstance(inputs, list) or any(not isinstance(path, str) or not Path(path).is_absolute()
+                                         for path in cast(list[object], inputs)):
+        raise StaffUnreadable("invalid staff input paths")
     return StaffSnapshot(tuple(_rows(fields.get("rows"))),
-                         tuple(sorted({StaffId(item) for item in cast(list[str], pending)})))
+                         tuple(sorted({StaffId(item) for item in cast(list[str], pending)})),
+                         tuple(cast(list[str], inputs)))
 
 
 def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
+    # Direct worker writers run inside the caller's membership lock. Match the
+    # local API's row transaction without entering the outer lifecycle operation.
+    if arguments[:2] == ["ensure", "worker"]:
+        arguments = [*arguments, "--row-write"]
+    elif arguments[0] == "retire":
+        arguments = [*arguments, "--worker-row"]
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", OWNER_MACHINE,
                "~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py "
                + shlex.join([*arguments, "--json"])]
@@ -480,11 +493,13 @@ def _row_by_path(rows: Sequence[StaffRow], names: str) -> StaffRow | None:
         return None
     # A showrunner starts its own path even when attached to another showrunner.
     row = next((row for row in rows if row.kind == "showrunner" and row.name == parts[0]), None)
-    for kind, name in zip(_KINDS[1:], parts[1:]):
+    for name in parts[1:]:
         if row is None:
             return None
         parent = row.id
-        row = next((row for row in rows if row.kind == kind and row.parent == parent and row.name == name), None)
+        matches = [member for member in rows
+                   if member.kind != "showrunner" and member.parent == parent and member.name == name]
+        row = matches[0] if len(matches) == 1 else None
     return row
 
 
@@ -576,6 +591,15 @@ def ensure(kind: Kind, *, name: str, parent: StaffId | None = None) -> StaffRow:
     return _transaction(lambda rows: _ensure_row(rows, kind, name, parent))
 
 
+def ensure_worker(name: str, parent: StaffId) -> StaffRow:
+    """Ensure membership under staff.json.lock, after the caller's membership lock.
+
+    This writer takes no membership, operation or lifecycle lock. The caller may
+    hold membership; it must release lifecycle, inbox and roster first.
+    """
+    return ensure("worker", name=name, parent=parent)
+
+
 def rename(staff_id: StaffId, new_name: str) -> StaffRow:
     if not _is_owner():
         return _remote_row(["rename", staff_id, f"--name={new_name}"])
@@ -614,12 +638,14 @@ def retire(staff_id: StaffId) -> StaffRow | None:
     return _transaction(lambda rows: _retire_row(rows, staff_id))
 
 
-def _retire_row(rows: list[StaffRow], staff_id: StaffId) -> StaffRow | None:
+def _retire_row(rows: list[StaffRow], staff_id: StaffId, *, worker_only: bool = False) -> StaffRow | None:
     row = _row_by_id(rows, staff_id)
     if row is None:
         return None
-    if row.kind == "showrunner" and any(child.parent == row.id and child.kind == "unit" for child in rows):
-        raise StaffRefused(f"showrunner {row.name} still has units")
+    if worker_only and row.kind != "worker":
+        raise StaffRefused("row writes are for worker admission and retirement")
+    if row.kind == "showrunner" and any(child.parent == row.id and child.kind != "showrunner" for child in rows):
+        raise StaffRefused(f"showrunner {row.name} still has units or workers")
     rows[:] = [replace(member, parent=None) if member.parent == staff_id else member
                for member in rows if member.id != staff_id
                and not (row.kind == "unit" and member.parent == staff_id)]
@@ -658,8 +684,7 @@ def retire_pending() -> tuple[StaffId, ...]:
         for staff_id in ordered:
             row = _row_by_id(rows, staff_id)
             if row is not None:
-                held_kind = "worker" if row.kind == "unit" else "unit"
-                if any(child.parent == staff_id and child.kind == held_kind for child in rows):
+                if any(child.parent == staff_id and child.kind != "showrunner" for child in rows):
                     continue
                 _ = _retire_row(rows, staff_id)
             pending.remove(staff_id)
@@ -690,8 +715,8 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
                 raise StaffRefused(f"invalid seed parent reference: {key}")
             resolving.add(key)
             entry = entries[key]
-            if entry.kind not in ("showrunner", "unit"):
-                raise StaffRefused("seed cannot create workers")
+            if entry.kind not in _KINDS:
+                raise StaffRefused("invalid seed kind")
             if not isinstance(entry.match, NewSeedMember):
                 row = _required(rows, entry.match)
                 if row.kind != entry.kind:
@@ -702,11 +727,12 @@ def apply_seed(seed_input: SeedInput) -> StaffSnapshot:
                     row = _ensure_row(rows, "showrunner", entry.name, None)
             else:
                 if not isinstance(entry.parent, SeedParent):
-                    raise StaffRefused("a new seed unit requires its showrunner")
+                    raise StaffRefused(f"a new seed {entry.kind} requires its parent")
                 parent = resolve(entry.parent.key)
-                if parent.kind != "showrunner":
-                    raise StaffRefused("a seed unit requires a showrunner parent")
-                row = _ensure_row(rows, "unit", entry.name, parent.id)
+                allowed = _parent_kinds(entry.kind)
+                if parent.kind not in allowed:
+                    raise StaffRefused(f"a seed {entry.kind} requires a {' or '.join(allowed)} parent")
+                row = _ensure_row(rows, entry.kind, entry.name, parent.id)
             if any(member.id == row.id for member in resolved.values()):
                 raise StaffRefused(f"seed names a member more than once: {row.id}")
             resolved[key] = row
@@ -768,6 +794,9 @@ class _Arguments(argparse.Namespace):
     parent: str | None = None
     json: bool = False
     snapshot: bool = False
+    live: bool = False
+    row_write: bool = False
+    worker_row: bool = False
     ids: list[str] = []
 
 
@@ -776,6 +805,7 @@ def _parser() -> argparse.ArgumentParser:
     verbs = parser.add_subparsers(dest="verb", required=True)
     show = verbs.add_parser("show", help="show the production staff")
     _ = show.add_argument("--kind", choices=_KINDS)
+    _ = show.add_argument("--live", action="store_true", help="show live member identities and pool leases")
     _ = show.add_argument("--under", help="parent staff id or path")
     _ = show.add_argument("--snapshot", action="store_true", help=argparse.SUPPRESS)
     get = verbs.add_parser("get", help="find a member by id or path")
@@ -784,6 +814,7 @@ def _parser() -> argparse.ArgumentParser:
     _ = add.add_argument("kind", choices=_KINDS)
     _ = add.add_argument("--name", required=True)
     _ = add.add_argument("--parent")
+    _ = add.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
     rename_parser = verbs.add_parser("rename", help=argparse.SUPPRESS)
     _ = rename_parser.add_argument("target")
     _ = rename_parser.add_argument("--name", required=True)
@@ -793,6 +824,8 @@ def _parser() -> argparse.ArgumentParser:
     _ = move_parser.add_argument("--parent", help=argparse.SUPPRESS)
     retire_parser = verbs.add_parser("retire", help=argparse.SUPPRESS)
     _ = retire_parser.add_argument("target")
+    _ = retire_parser.add_argument("--row-write", action="store_true", help=argparse.SUPPRESS)
+    _ = retire_parser.add_argument("--worker-row", action="store_true", help=argparse.SUPPRESS)
     apply_parser = verbs.add_parser("apply-seed", help=argparse.SUPPRESS)
     defer_parser = verbs.add_parser("defer-retire", help=argparse.SUPPRESS)
     _ = defer_parser.add_argument("ids", nargs="*")
@@ -824,6 +857,8 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
         return move(StaffId(arguments.target), _parent(arguments.parent))
     if arguments.verb == "apply-seed":
         return apply_seed(SeedInput.from_json(_decode(sys.stdin.read())))
+    if arguments.row_write and _is_owner():
+        return _transaction(lambda rows: _retire_row(rows, StaffId(arguments.target), worker_only=True))
     return retire(StaffId(arguments.target))
 
 
@@ -837,10 +872,15 @@ def _main(arguments: _Arguments) -> int:
         if arguments.parent is None:
             raise StaffRefused("move needs <showrunner slug>/<unit> <new showrunner slug>")
     if arguments.verb == "show":
+        if arguments.live:
+            if not arguments.json or arguments.snapshot or arguments.kind or arguments.under:
+                raise StaffRefused("live staff requires show --json --live without filters")
+            live_command = cast(Callable[[], int], import_module("scripts.production.staff_sources").cli_live)
+            return live_command()
         if arguments.snapshot:
             record = snapshot()
             print(json.dumps({"rows": [row.to_json() for row in record.rows],
-                              "pending_retire": list(record.pending_retire)}, sort_keys=True))
+                              "pending_retire": list(record.pending_retire), "inputs": list(record.inputs)}, sort_keys=True))
             return 0
         rows = _all_rows()
         paths = _paths(rows)
@@ -869,7 +909,16 @@ def _main(arguments: _Arguments) -> int:
         else:
             _print_row(row, _paths(rows)[row.id])
         return 0
-    with operation() if _is_owner() else nullcontext():
+    if arguments.verb == "retire" and (arguments.row_write or arguments.worker_row):
+        row = by_id(StaffId(arguments.target))
+        if arguments.row_write and row is not None and row.kind != "worker":
+            raise StaffRefused("row writes are for worker admission and retirement")
+        if arguments.worker_row:
+            arguments.row_write = row is None or row.kind == "worker"
+    if arguments.row_write and not (arguments.verb == "retire" or
+                                    arguments.verb == "ensure" and arguments.kind == "worker"):
+        raise StaffRefused("row writes are for worker admission and retirement")
+    with operation() if _is_owner() and not arguments.row_write else nullcontext():
         result = _mutate(arguments)
     if isinstance(result, tuple):
         print(json.dumps(result))

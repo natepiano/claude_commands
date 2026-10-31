@@ -159,6 +159,8 @@ buildlog_release_memory() {
     rm -f "$TEST_ROOT/reservation"
     BUILDLOG_MEM_RESERVATION=""
 }
+# This fixture's admission writes a marker rather than a ledger reservation.
+buildlog_token_wait() { buildlog_release_memory; }
 # Force the admission-after-queue path, using the real board for ownership.
 try_token_now() { return 1; }
 acquire_token() {
@@ -172,6 +174,7 @@ acquire_token() {
     rm -f "$TEST_ROOT/token-wait"
 }
 buildlog_wait_for_memory_only() {
+    BUILDLOG_MEM_WAIT_FROM=${BUILDLOG_MEM_WAIT_SINCE:-$EPOCHSECONDS}
     passes=$(( passes + 1 ))
     if (( passes == 2 )); then
         cp "$BOARD_DIR/locks/cargo.d/expires" "$TEST_ROOT/original-expiry"
@@ -469,6 +472,8 @@ buildlog_memory_python() {
         else
             printf 'admit|100|100|fallback|0|0|0|0|fixture|reservation|repo|nextest|100|reserved|tree\n'
         fi
+    elif [[ "${2:-}" == token-wait ]]; then
+        printf '%s:%s\n' "$3" "$BUILDLOG_MEM_WAIT_SINCE" >> "$TMPDIR/token-handoffs"
     else
         "$HOME/.claude/scripts/lib/py" "$@"
     fi
@@ -502,6 +507,8 @@ printf '%s\n' "$acquisitions:$hold_checks" > "$TMPDIR/rechecks"
             elapsed = int((root / "elapsed").read_text())
             self.assertEqual(elapsed, 80)
             self.assertEqual(steps[0]["mem_wait_s"], elapsed)
+            self.assertEqual((root / "token-handoffs").read_text().splitlines(),
+                             ["reservation:100", "reservation:100"])
 
     def test_repeated_declined_mac_attempts_reuse_the_first_memory_wait_start(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

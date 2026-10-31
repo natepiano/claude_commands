@@ -71,8 +71,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, cast
 
 if __package__:
-    from . import store
+    from . import cgroup_capture, store
 else:
+    import cgroup_capture
     import store
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
@@ -87,6 +88,7 @@ GIT_TIMEOUT_S = 5
 RUSTC_TIMEOUT_S = 10
 LEDGER = Path.home() / ".local/state/verify/events.jsonl"
 LAUNCH_LOCK_NAME = "launches.lock"
+CPU_SIDECAR, IO_SIDECAR = ".cpu.stat", ".io.stat"
 # Adding or renaming a host requires updating the folders carried by sync.
 SYNC_HOSTS = ("natedev", "Mac", "Nates-MacBook-Pro-2023")
 
@@ -682,29 +684,34 @@ def write_step_line(pending: PendingStep) -> bool:
     return True
 
 
-def _resume_step_line(pending: PendingStep) -> bool:
-    """Scan from the saved row boundary, or byte 0 for a legacy pending step."""
-    path = _step_month_file(pending.row)
+def append_row_once(path: Path, row: Mapping[str, object], start: int = 0) -> bool:
+    """Recover an append by its fixed id while holding the same log lock."""
     added = True
     with store.locked_append(path) as handle:
-        _ = handle.seek(pending.month_row_end)
+        _ = handle.seek(start)
         for line in handle:
             try:
-                row = cast(object, json.loads(line))
+                previous = cast(object, json.loads(line))
             except ValueError:
                 continue
-            if isinstance(row, dict) and cast(dict[str, object], row).get("id") == pending.row["id"]:
+            if isinstance(previous, dict) and cast(dict[str, object], previous).get("id") == row["id"]:
                 added = False
                 break
         if added:
-            store.append_locked(handle, pending.row)
+            store.append_locked(handle, row)
     _sync_directory(path.parent)
     return added
 
 
+def _resume_step_line(pending: PendingStep) -> bool:
+    """Scan from the saved row boundary, or byte 0 for a legacy pending step."""
+    return append_row_once(_step_month_file(pending.row), pending.row, pending.month_row_end)
+
+
 def _delete_step_sources(held: Path | NoHeldLog, peak: Path | NoPeakFile,
                          phase: Path | NoTestPhaseRecord = NO_TEST_PHASE_RECORD) -> None:
-    for path in (held, peak, phase):
+    sidecars = [Path(str(peak) + suffix) for suffix in (CPU_SIDECAR, IO_SIDECAR)] if isinstance(peak, Path) else []
+    for path in (held, peak, phase, *sidecars):
         if isinstance(path, Path):
             path.unlink(missing_ok=True)
             if path.parent.is_dir():
@@ -745,6 +752,24 @@ def finish_pending_step(path: Path) -> PublishedStep:
         pending = replace(pending, row={**pending.row, **test_phase_fields(phase)}, test_phase=phase)
         _ = _save_pending_step(pending, replace_existing=True)
     return _finish_step(path, pending, _resume_step_line)
+
+
+def scope_resources(peak: str) -> cgroup_capture.StepScopeCounters:
+    """Parse raw scope sidecars; only absence may lose a reading on retry.
+
+    CPU excludes compiles run by sccache.service. Any other read failure
+    propagates so step() keeps the sources instead of publishing unavailable.
+    """
+    def sidecar(suffix: str) -> str:
+        if not peak:
+            return ""
+        try:
+            return Path(peak + suffix).read_text()
+        except FileNotFoundError:
+            return ""
+
+    return {"cpu": cgroup_capture.parse_cpu(sidecar(CPU_SIDECAR)),
+            "io": cgroup_capture.parse_io(sidecar(IO_SIDECAR))}
 
 
 def step(args: list[str]) -> None:
@@ -834,6 +859,7 @@ def step(args: list[str]) -> None:
             "tty": tty,
             "status": status,
             "rustc": None if name == "sweep" else rustc_version(argv, cwd),
+            "scope_resources": scope_resources(peak),
             "peak_mem_bytes": memory.peak_bytes if isinstance(memory.peak_bytes, int) else None,
             "mem_stall_some_s": memory.stall_some_s if isinstance(memory.stall_some_s, float) else None,
             "mem_stall_full_s": memory.stall_full_s if isinstance(memory.stall_full_s, float) else None,
@@ -978,6 +1004,15 @@ def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step
         "reserve": reserve, "why": why, "set_by": set_by,
     })
 
+
+def queue_priority(action: Literal["set", "clear"], unit: str,
+                   why: str, set_by: str, at: float, *, transition_id: str = "") -> None:
+    host = store.host_name()
+    _ = append_row_once(store.host_file(host, at), {
+        "kind": "queue_priority", "v": RECORD_VERSION,
+        "id": transition_id or f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
+        "action": action, "unit": unit, "why": why, "set_by": set_by,
+    })
 
 
 class IdleFloorTarget(TypedDict):
