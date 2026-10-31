@@ -7546,13 +7546,13 @@ class MeshCommandTests(MeshCommandFixture):
     def test_roster_status_updates_keep_the_original_launcher_start_time(self) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "starting",
             "launcher_pid": os.getpid(), "launcher_start_time": 0}})
-        codex_mesh._update_roster(str(self.session_dir), "worker", {  # pyright: ignore[reportPrivateUsage]
+        _ = codex_mesh._update_roster(str(self.session_dir), "worker", {  # pyright: ignore[reportPrivateUsage]
             "thread_id": THREAD_ID, "status": "running", "turn_id": "interrupted-turn",
         })
         self.assertEqual(self.worker_record()["launcher_start_time"], 0)
         state = codex_mesh._roster_thread(self.worker_record())  # pyright: ignore[reportPrivateUsage]
         self.assertTrue(codex_mesh._launcher_died(state))  # pyright: ignore[reportPrivateUsage]
-        codex_mesh._update_roster(str(self.session_dir), "worker", {  # pyright: ignore[reportPrivateUsage]
+        _ = codex_mesh._update_roster(str(self.session_dir), "worker", {  # pyright: ignore[reportPrivateUsage]
             "thread_id": THREAD_ID, "status": "waiting_capacity", "launcher_pid": os.getpid(),
         })
         self.assertEqual(self.worker_record()["launcher_start_time"], 0)
@@ -7562,7 +7562,7 @@ class MeshCommandTests(MeshCommandFixture):
     def test_thread_replacement_keeps_the_attached_launcher_identity(self) -> None:
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "starting",
             "launcher_pid": os.getpid(), "launcher_start_time": 0}})
-        codex_mesh._update_roster(str(self.session_dir), "worker", {  # pyright: ignore[reportPrivateUsage]
+        _ = codex_mesh._update_roster(str(self.session_dir), "worker", {  # pyright: ignore[reportPrivateUsage]
             "thread_id": "replacement-thread", "status": "starting",
         })
         self.assertEqual(self.worker_record()["launcher_start_time"], 0)
@@ -10942,6 +10942,16 @@ class DirectorLifetimeTests(MeshCommandFixture):
             "FIXTURE_SERVER_PID": str(os.getpid()), "SCRATCH_ROOT": str(root / "scratch"),
             "SCRATCH_VISIBLE_ROOT": str(root / "visible"), "SCRATCH_HOLDS": str(root / "holds.json")}
         self.patches.enter_context(patch.dict(os.environ, environment))
+        from scripts.production import fake_unit_host
+        from scripts.production.staff_test_support import isolated_staff_file, production_membership
+        # tearDown closes this stack before unittest cleanups; environment scopes must unwind together.
+        _ = self.patches.enter_context(isolated_staff_file(root / "staff.json", environment))
+        production_membership("demo", "builders")
+        host = fake_unit_host.environment(root)
+        fake_unit_host.write(host, [fake_unit_host.HostedUnit("agents", "w1:p1", {
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "builders"})])
+        fake_unit_host.place_process(host, os.getpid(), "w1:p1", session="agents", exec_shell=True)
+        self.patches.enter_context(patch.dict(os.environ, host))
         roster = {"project-impl": {"thread_id": THREAD_ID, "status": "done", "role": "impl", "launcher_pid": 0},
                   "project-test": {"thread_id": "thread-test", "status": "paused", "role": "test", "launcher_pid": 0}}
         roster_entries: dict[str, object] = dict(roster)
@@ -10991,7 +11001,7 @@ if script.endswith('remove_workers.py'):
             pathlib.Path(os.environ['FIXTURE_REAPS']).write_text('implicit sweep')
             return remove_workers.subprocess.CompletedProcess(command, 1)
         return invoke(command, *args, **kwargs)
-    with patch.object(remove_workers.subprocess, 'run', no_implicit_sweep), patch.object(remove_workers, 'DEFAULT_ROOTS', (pathlib.Path(os.environ['FIXTURE_RUN']).parent,)), patch.object(remove_workers, 'list_sessions', return_value=[]), patch.object(remove_workers, 'shutdown_held_sessions', return_value={'kind': 'held sessions', 'session_ids': set()}):
+    with patch.object(remove_workers.subprocess, 'run', no_implicit_sweep), patch.object(remove_workers, 'DEFAULT_ROOTS', (pathlib.Path(os.environ['FIXTURE_RUN']).parent,)), patch.object(remove_workers, 'list_sessions', return_value=[]):
         raise SystemExit(remove_workers.main())
 if script.endswith('codex_mesh.py'):
     def reap(pid):
@@ -11323,7 +11333,7 @@ class WorkerPauseTests(MeshCommandFixture):
         fake_unit_host.write(host, [])
         self.patches.enter_context(patch.dict(os.environ, host))
         from scripts.production.staff_test_support import isolated_staff_file, production_membership
-        _ = self.enterContext(isolated_staff_file(self.session_dir / "staff.json", {}))
+        _ = self.patches.enter_context(isolated_staff_file(self.session_dir / "staff.json", {}))
         production_membership("demo", "builders")
         respond = self.server.respond
         @bounded_fixture

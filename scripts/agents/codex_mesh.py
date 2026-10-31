@@ -4531,6 +4531,21 @@ def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep | FailedWithTh
         stream.state_change_owed = True
         return StreamStep.NEXT_FRAME
     stream.state_change_owed = False
+    if stream.resident and not stream.end_marker.exists() and not _finished_run(stream.session_dir):
+        with worker_lifecycle.lock_worker(stream.session_dir, stream.name):
+            record = _as_dict(_read_json_object(_session_path(stream.session_dir, ROSTER_FILE)).get(stream.name))
+            started = _recorded_launcher_start(record.get("launcher_start_time"))
+            # A settled turn can still owe a detached result to this resident.
+            # Discover it before treating the terminal roster as a release;
+            # a replacement launcher or an explicit end still takes precedence.
+            if (record.get("thread_id") == stream.thread_id and not record.get("adopted_to")
+                    and record.get("status") in ("done", "failed")
+                    and record.get("launcher_pid") in _stream_launcher(stream).launcher_pids
+                    and not isinstance(started, LegacyLauncherIdentity)
+                    and process_start.check_owner(_as_int(record.get("launcher_pid")), started) not in (
+                        process_start.OwnerCheck.GONE, process_start.OwnerCheck.REPLACED)
+                    and _waiting_on_detached_run(stream.session_dir, stream.name, stream.thread_id, stream.runs)):
+                return StreamStep.NEXT_FRAME
     if _stream_was_released(stream):
         return StreamStep.FINISH
     if not stream.resume_owed:
