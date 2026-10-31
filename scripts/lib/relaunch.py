@@ -32,14 +32,14 @@ def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[
         return argv, environment
     from scripts.shutdown.stop_resume import resume_message
     from scripts.herdr import herdr
-    from scripts.production import unit_marks
+    from scripts.production import session_staff
 
     place = herdr.HerdrPlace(environment.get("HERDR_SESSION", "default"),
                             environment.get("HERDR_PANE_ID", ""))
     entry = pane_record.matching_launch(place, identity)
     if entry is None:
         return argv, environment
-    entry = unit_marks.record_membership(entry)
+    entry = session_staff.record_membership(entry)
     restored = {**environment, **entry["environment"]}
     if not parsed.has_prompt:
         argv = [*argv, resume_message("the herdr server restarted")]
