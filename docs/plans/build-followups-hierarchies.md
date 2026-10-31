@@ -256,36 +256,19 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - Only `okay`/`ok` and a row id may come before `works` or `fine`, so "yes works" now returns its row (Assertion-Change in checkpoint 1afb985d).
 
 ### Phase 6 — Trace recent Hana features from choice to working, and propose one fix for the largest delay  · status: done
-**Depends on:** none. Replaces the four-week review (user, 2026-10-31: the push audit and worker cleanup are too small to matter for Hana; close them now and trace real Hana delivery instead, after `/astra_review` item 7 at `/tmp/claude/astra/20261031T114533Z-2116978/review.md`).
 
-#### Work Order
+#### As-built
 
-**Goal:** the design doc shows, for three or four recent Hana features, where the time went from the day each was chosen to the day it worked, names the largest avoidable delay across them, and proposes one fix with its owner, a one-week measure and a rollback rule.
-
-**Hana link:** direct. The trace measures Hana delivery itself, and the fix targets its largest delay.
-
-**Spec:**
-- Pick three or four user-visible Hana features that reached `origin/init/catalyst` in `~/rust/hana` between 2026-10-10 and 2026-10-31, from at least two different tool-based-ui units. Read the units and their plans from `~/rust/hana_catalyst/docs/hana/tool-based-ui-production.md` and the unit plans beside it. Prefer features the user has seen working (a change-review verdict in `~/rust/hanadocs/change-review/`, or a demo). Name why each was picked.
-- For each feature, build one timeline from records only: the day it was chosen (plan Source, a user message in `~/.local/state/message/log.jsonl`, or the first plan commit), each phase's start and checkpoint, the merge into `origin/init/catalyst`, and the day the user saw it working. Split the elapsed time into: deciding and specifying, implementation, review, repair rounds (count and time), waiting on builds or tests (queue wait apart from run time), test failures and reruns, waiting on the merge gate, waiting on the user, and idle with no record. Sources: plan git history, `progress_history.py` records and `history.py rounds` in each run folder under `/tmp/claude/unit/`, `~/.claude/scripts/buildlog` records, merge receipts, and the change-review list. A part no record covers is `not recorded`, never zero.
-- Evidence rules: build `duration_s` is step wall time, so summed hours overlap and are not machine time; a quick rerun is not proof of waste; give each number its window, source and n; label a judgment as a judgment.
-- Across the features, name the largest avoidable delay and its cause. Propose one fix: what changes, which existing unit or showrunner owns it, which current optional work shrinks to make room, how to measure it in one week, and the rule for rolling it back. No central worker allocator, fixed Hana share or required cost gate.
-- Design doc: a new section **Hana delivery trace** after **Steps** with one table per feature, the cross-feature finding and the proposal. Under Steps 1 and 4, record the 2026-10-31 re-runs and close them: push audit since 2026-10-29, 31 delivered, 1 after a failed check (priority-2, approved), 0 unapproved; `worker_owners.py report`, OwnerUnknown 0 (Baseline 51), DirectorGone 8, `end_cleanup_pending` 0, one unreadable review-pool roster. Mark the wait-holder experiment (Step 2) as running apart, not a gate for this phase.
-- Dropped (user, 2026-10-31): the findings routed here from Phase 6a (F002, F003, F007 and the unknown saved Baseline marker). No further report-formatting or push-audit work in this plan.
-- At phase end the unit director sends the proposal to the user through the showrunner as one question.
+- Replaced the four-week review (user, 2026-10-31: the push audit and worker cleanup are too small for faster Hana delivery). Built on Astra review item 7.
+- The design doc section **Hana delivery trace** follows three Hana features from choice to working: the LFO live dot (trunk bd80a1f86d, verdict C18), the cable drag plane (02f492f0a0, C68) and palette match highlighting (5ba63fd303, C70). Each table names its source, window and n; parts no record covers read `not recorded`.
+- Largest delay to target (a judgment): the palette phase's mixed repair and validation, a 17.95 h repair union over 23 fix passes, shared with other widget changes.
+- Proposal, sent to the user through sdlc as one question: a one-week widget-unit trial under the hana showrunner that carries one prioritized outcome to a working demo before optional adjacent changes join its phase, and defers the palette-footer rewrite. It names a one-week measure and a rollback rule.
+- Steps 1 and 4 closed with the 2026-10-31 re-runs (0 unapproved pushes; OwnerUnknown 0, DirectorGone 8). Step 2 runs apart. The routed Phase 6a reporting follow-ups are dropped.
 
 **Files:**
-- `docs/plans/build-followups-hierarchies-design.md` — the Hana delivery trace section, and the Step 1, 2 and 4 records
+- `docs/plans/build-followups-hierarchies-design.md` — the trace and the step closures
 
-**Workers:** `1 writer`
-- `impl` — reads the records and writes the design doc section; no code changes
-
-**State:** none.
-
-**Constraints from prior phases:** Read `~/rust/hana`, `~/rust/hana_catalyst` and `~/rust/hanadocs` only: no fetch, gc, checkout or writes there, and never `cd` into hanadocs (use absolute paths or `git -C`). No builds or tests run in this phase.
-
-**Build rules (user, 2026-10-31):** fix every failure you can see before you run again. Finish the edit round, then run the tests once; never after each small edit. After a pass, do not run again until your edits are done. While you edit, use the check command; run lint once, at the phase gate. The phase gate and merge gate still run in full, and each worker's listed tests must pass before its checkpoint. Filtered tests stay as they are.
-
-**Acceptance gate:** the section holds three or four feature timelines whose every number names its source, window and n, with `not recorded` parts named; one largest-delay finding; one proposal with owner, what shrinks, a one-week measure and a rollback rule. Steps 1 and 4 are closed with the 2026-10-31 numbers. Blind review of the doc against the records. No code changed, so no merge gate.
+**Gotchas:** old LFO and cable run folders are gone; the durable run files under `~/.local/state/plan-delegate/runs/` carry their history. No record holds first-demo time, user-blocked time or exclusive build delay, and build step hours overlap.
 
 ### Phase 7 — The baseline measure and the push audit count failed checks by one rule, and session names come from config  · status: done
 
