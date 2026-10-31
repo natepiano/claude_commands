@@ -75,6 +75,52 @@ class ScratchTests(unittest.TestCase):
                               source_commit="a" * 40, copy_commit="b" * 40, target_mode="none",
                               seed_source="", borrows_from="", **details)
 
+    def test_a_test_clone_and_its_build_output_end_with_the_task(self) -> None:
+        source = self.base / "source"
+        source.mkdir()
+        self.git(source, "init", "-q")
+        _ = (source / "asset").write_text("saved source")
+        self.git(source, "add", "asset")
+        self.git(source, "commit", "-qm", "source")
+
+        checkout = scratch.clone(source, "gate:hana-view", "camera")
+
+        self.assertTrue(checkout.is_relative_to(self.base / "scratch"))
+        self.assertEqual((checkout / "asset").read_text(), "saved source")
+        self.assertTrue((checkout / ".git").is_dir())
+        record = scratch.task_of(checkout.parent)
+        assert isinstance(record, scratch.Registered)
+        self.assertEqual(record.task, "gate:hana-view")
+        self.assertEqual(record.fields["source_path"], str(source.resolve()))
+        self.assertIs(record.fields["test_hana_clone"], True)
+        target = checkout / "target"
+        target.mkdir()
+        _ = (target / "build").write_text("disposable build output")
+        self.assertEqual(scratch.end("gate:hana-view"), [checkout.parent])
+        self.assertFalse(checkout.parent.exists())
+        self.assertEqual((source / "asset").read_text(), "saved source")
+        self.assertEqual(scratch.end("gate:hana-view"), [])
+
+    def test_a_failed_clone_still_has_a_task_that_removes_its_partial_files(self) -> None:
+        def interrupted_clone(command: list[str], *, check: bool) -> subprocess.CompletedProcess[bytes]:
+            self.assertFalse(check)
+            checkout = Path(command[-1])
+            checkout.mkdir()
+            _ = (checkout / "partial").write_text("partial clone")
+            record = scratch.task_of(checkout.parent)
+            assert isinstance(record, scratch.Registered)
+            self.assertEqual(record.task, "gate:clone-failure")
+            return subprocess.CompletedProcess(command, 1)
+
+        with mock.patch.object(subprocess, "run", side_effect=interrupted_clone):
+            with self.assertRaisesRegex(scratch.ScratchError, "clone failed"):
+                _ = scratch.clone(self.base / "source", "gate:clone-failure")
+        paths = [item.path for item in scratch.folders() if item.task == "gate:clone-failure"]
+        self.assertEqual(len(paths), 1)
+        self.assertTrue((paths[0] / "checkout" / "partial").exists())
+        self.assertEqual(scratch.end("gate:clone-failure"), paths)
+        self.assertFalse(paths[0].exists())
+
     def test_style_build_folder_helper_creates_a_stamped_cache_the_sweep_accepts(self) -> None:
         source = self.base / "source"
         source.mkdir()
@@ -313,7 +359,7 @@ class ScratchTests(unittest.TestCase):
             self.assertEqual(scratch.end("gate:copy"), [])
         program = ("import fcntl,sys; f=open(sys.argv[1],'a'); fcntl.flock(f,fcntl.LOCK_SH); "
                    "print('ready',flush=True); sys.stdin.read()")
-        process: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", program, str(path / ".claude-busy")],
+        process: subprocess.Popen[str] = subprocess.Popen([sys.executable, "-c", program, str(scratch.busy_path(path))],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         try:
             assert process.stdout is not None
@@ -367,7 +413,7 @@ class ScratchTests(unittest.TestCase):
             self.assertEqual(scratch.copy_folder(linked), path)
             scratch.register_copy(linked, task="gate:copy", owner_unit="maker-unit", source_path=str(self.base),
                                   source_commit="a", copy_commit="b", target_mode="none", seed_source="", borrows_from="")
-            with scratch.copy_lock(linked), (path / scratch.BUSY).open("r") as probe:
+            with scratch.copy_lock(linked), scratch.busy_path(path).open("r") as probe:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
@@ -495,14 +541,14 @@ class ScratchTests(unittest.TestCase):
         path = self.copy()
         (path / scratch.RECORD).unlink()
         self.assertIsInstance(scratch.lifetime(path), scratch.Unknown)
-        self.assertFalse((path / scratch.BUSY).exists())
+        self.assertFalse(scratch.busy_path(path).exists())
 
     def test_removal_claims_an_absent_busy_mark_before_a_late_holder_can_start(self) -> None:
         path = self.copy()
-        self.assertFalse((path / scratch.BUSY).exists())
+        self.assertFalse(scratch.busy_path(path).exists())
         with scratch.removal_lock(path) as idle:
             self.assertTrue(idle)
-            with (path / scratch.BUSY).open("a") as late_holder:
+            with scratch.busy_path(path).open("a") as late_holder:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(late_holder, fcntl.LOCK_SH | fcntl.LOCK_NB)
             scratch.remove_marked(path, scratch.remove)
@@ -512,7 +558,7 @@ class ScratchTests(unittest.TestCase):
         path = self.copy()
 
         def remove_after_late_holder_attempt(folder: Path) -> None:
-            (folder / scratch.BUSY).unlink()
+            scratch.busy_path(folder).unlink()
             with self.assertRaises(scratch.ScratchError):
                 with scratch.copy_lock(folder):
                     self.fail("a holder entered a copy whose removal had started")

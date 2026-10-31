@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,7 @@ class CommandEvent(TypedDict):
     command: str
     args: list[str]
     claimed: bool
+    input: str
 
 
 COMMAND_STUB = r'''
@@ -48,6 +50,7 @@ event = {
     "command": command,
     "args": arguments,
     "claimed": (Path(os.environ["MAC_TEST_STATE_DIR"]) / "run.json").exists(),
+    "input": sys.stdin.read() if command == "ssh" and "cat >" in arguments[-1] else "",
 }
 with (state / "events.jsonl").open("a", encoding="utf-8") as output:
     output.write(json.dumps(event) + "\n")
@@ -84,11 +87,26 @@ if arguments[-1:] == ["true"] and "-o" in arguments:
 
 remote = arguments[-1]
 clone_head = state / "clone-head"
+if "hanas.py stop-checkout " in remote:
+    (state / "cleanup-called").write_text("called\n", encoding="utf-8")
+    status = int(os.environ.get("MAC_RUN_CLEANUP_STATUS", "0"))
+    if status == 0 and os.environ.get("MAC_RUN_CONFIRM_STOP", "1") == "1":
+        print("hanas: checkout clear")
+        (state / "checkout-clear").write_text("confirmed\n", encoding="utf-8")
+    print(f"mac_exit={status}")
+    raise SystemExit(0)
+if "scratch.py end " in remote:
+    if not (state / "checkout-clear").exists():
+        print("task end before confirmed exit", file=sys.stderr)
+        raise SystemExit(98)
+    print("mac_exit=0")
+    raise SystemExit(0)
+if "scratch.py clone " in remote:
+    print(os.environ["MAC_RUN_CHECKOUT"])
+    print("mac_exit=0")
+    raise SystemExit(0)
 if "checkout -q --detach" in remote:
     clone_head.write_text(os.environ["MAC_RUN_SHA"], encoding="utf-8")
-if "rm -f /tmp/mac_run.bundle" in remote and "pkill -f" in remote:
-    (state / "cleanup-called").write_text("called\n", encoding="utf-8")
-    raise SystemExit(int(os.environ.get("MAC_RUN_CLEANUP_STATUS", "0")))
 if (
     os.environ.get("MAC_RUN_HOLD_BUILD") == "1"
     and "cargo build -q -p hana" in remote
@@ -104,7 +122,7 @@ if "; echo mac_exit=$?" in remote:
     status = 142 if "perl -e" in remote else 0
     print(f"mac_exit={status}")
     raise SystemExit(0)
-if "git -C rust/hana_catalyst_mac rev-parse HEAD" in remote:
+if "git -C " in remote and "rev-parse HEAD" in remote:
     print(
         clone_head.read_text(encoding="utf-8") if clone_head.exists()
         else os.environ.get("MAC_RUN_CLONE_DESCENDANT", os.environ["MAC_RUN_SHA"])
@@ -191,6 +209,7 @@ class MacRunTests(unittest.TestCase):
             "MAC_TEST_CONFIG": str(self.config_path),
             "MAC_RUN_STUB_STATE": str(self.stub_state),
             "MAC_RUN_SHA": SHA,
+            "MAC_RUN_CHECKOUT": str(self.home / "scratch" / "gate-mac-run-private" / "checkout"),
             "HANA_TEST_PURPOSE": "Mac launch coordination",
             "TMPDIR": str(self.temp_directory),
         }
@@ -433,6 +452,88 @@ class MacRunTests(unittest.TestCase):
         self.assert_claim_released()
         self.assert_no_build_started()
 
+    def test_missing_purpose_refuses_before_ssh(self) -> None:
+        for purpose in (None, "", " \t "):
+            with self.subTest(purpose=purpose):
+                self.clear_events()
+                if purpose is None:
+                    _ = self.environment.pop("HANA_TEST_PURPOSE", None)
+                else:
+                    self.environment["HANA_TEST_PURPOSE"] = purpose
+                result = self.mac_run()
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("HANA_TEST_PURPOSE", result.stderr)
+                self.assertEqual(self.events(), [])
+                self.assert_claim_released()
+
+    def test_scratch_clone_launch_keeps_purpose_and_owner(self) -> None:
+        purpose = "camera's $(touch PURPOSE_INJECTION); frame & light"
+        for explicit_owner in (False, True):
+            with self.subTest(explicit_owner=explicit_owner):
+                self.clear_events()
+                owner = "director's $(touch OWNER_INJECTION)" if explicit_owner else "resources director"
+                result = self.mac_run(extra={
+                    "HANA_TEST_PURPOSE": purpose,
+                    "SHOWRUNNER_UNIT_ID": "resources director",
+                    "HANA_TEST_OWNER": owner if explicit_owner else "",
+                })
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                remote = [event for event in self.events() if event["command"] == "ssh"]
+                creation = next(event for event in remote if "scratch.py clone " in event["args"][-1])
+                create_words = shlex.split(creation["args"][-1])
+                task = create_words[create_words.index("--task") + 1]
+                self.assertRegex(task, rf"^gate:mac-run-{SHA}-\d+$")
+                self.assertIn("--name", create_words)
+                launch = next(event["input"] for event in remote if event["input"])
+                self.assertIn(f"cd {self.environment['MAC_RUN_CHECKOUT']}", launch)
+                line = next(line for line in launch.splitlines() if line.startswith("HANA_TEST_PURPOSE="))
+                words = shlex.split(line)
+                self.assertIn(f"HANA_TEST_PURPOSE={purpose}", words)
+                self.assertIn(f"HANA_TEST_OWNER={owner}", words)
+                self.assertIn(f"{self.environment['MAC_RUN_CHECKOUT']}/target/debug/hana", words)
+                # Evaluate the original label assignments with Zsh, replacing only the launched program.
+                labels = line.partition(" BEVY_ASSET_ROOT=")[0]
+                evaluated = subprocess.run(
+                    ["zsh", "-f", "-c", labels + " " + shlex.join([
+                        sys.executable, "-c", "import os,json; print(json.dumps([os.environ['HANA_TEST_PURPOSE'], os.environ['HANA_TEST_OWNER']]))"
+                    ])], cwd=self.root, env=self.environment, capture_output=True, text=True, check=False)
+                self.assertEqual(evaluated.returncode, 0, evaluated.stderr)
+                self.assertEqual(json.loads(evaluated.stdout), [purpose, owner])
+                self.assertFalse((self.root / "PURPOSE_INJECTION").exists())
+                self.assertFalse((self.root / "OWNER_INJECTION").exists())
+                ends = [event for event in remote if f"scratch.py end --task {task}" in event["args"][-1]]
+                self.assertEqual(len(ends), 1)
+                self.assertTrue(ends[0]["claimed"])
+                self.assert_claim_released()
+
+    def test_task_end_requires_confirmed_exit_and_failed_stops_keep_the_checkout(self) -> None:
+        for stop_status, confirm in ((0, "1"), (23, "0"), (0, "0")):
+            with self.subTest(stop_status=stop_status, confirm=confirm):
+                self.clear_events()
+                (self.stub_state / "checkout-clear").unlink(missing_ok=True)
+                result = self.mac_run(extra={"MAC_RUN_CLEANUP_STATUS": str(stop_status),
+                                             "MAC_RUN_CONFIRM_STOP": confirm})
+                events = self.events()
+                stop = [event for event in events if event["command"] == "ssh"
+                        and "hanas.py stop-checkout " in event["args"][-1]]
+                self.assertEqual(len(stop), 1, events)
+                self.assertTrue(stop[0]["claimed"])
+                words = shlex.split(stop[0]["args"][-1])
+                self.assertEqual(words[words.index("stop-checkout") + 1].rstrip(";"),
+                                 self.environment["MAC_RUN_CHECKOUT"])
+                ended = [event for event in events if event["command"] == "ssh"
+                         and "scratch.py end --task " in event["args"][-1]]
+                if stop_status == 0 and confirm == "1":
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual(len(ended), 1, events)
+                    self.assertLess(events.index(stop[0]), events.index(ended[0]))
+                    self.assertTrue(ended[0]["claimed"])
+                else:
+                    self.assertEqual(ended, [], events)
+                    self.assertIn(self.environment["MAC_RUN_CHECKOUT"], result.stderr)
+                    self.assertIn("kept checkout", result.stderr.lower())
+                self.assert_claim_released()
+
     def test_signals_clean_remote_work_before_releasing_claim(self) -> None:
         for signal_number, cleanup_status in (
             (signal.SIGTERM, 0),
@@ -444,6 +545,7 @@ class MacRunTests(unittest.TestCase):
                 self.clear_events()
                 (self.stub_state / "build-started").unlink(missing_ok=True)
                 (self.stub_state / "cleanup-called").unlink(missing_ok=True)
+                (self.stub_state / "checkout-clear").unlink(missing_ok=True)
                 process = self.start_mac_run(
                     extra={
                         "MAC_RUN_HOLD_BUILD": "1",
@@ -469,7 +571,7 @@ class MacRunTests(unittest.TestCase):
                     if event["command"] == "ssh"
                     and any(
                         "rm -f /tmp/mac_run.bundle" in argument
-                        and "pkill -f" in argument
+                        and "[c]argo build" in argument
                         for argument in event["args"]
                     )
                 ]
@@ -488,9 +590,27 @@ class MacRunTests(unittest.TestCase):
                 )
                 remote = cleanup["args"][-1]
                 self.assertIn("[c]argo build", remote)
-                self.assertIn("[h]ana_catalyst_mac/target/debug/", remote)
+                checkout = self.environment["MAC_RUN_CHECKOUT"]
+                self.assertIn(f'{checkout}|{checkout}/*)', remote)
                 self.assertIn("/tmp/mac_run_hana.command", remote)
                 self.assertIn("/tmp/mac_run_hana.status", remote)
+                events = self.events()
+                stops = [event for event in events if event["command"] == "ssh"
+                         and "hanas.py stop-checkout " in event["args"][-1]]
+                self.assertEqual(len(stops), 1, events)
+                self.assertTrue(stops[0]["claimed"])
+                words = shlex.split(stops[0]["args"][-1])
+                self.assertEqual(words[words.index("stop-checkout") + 1].rstrip(";"), checkout)
+                self.assertLess(events.index(cleanup), events.index(stops[0]))
+                ends = [event for event in events if event["command"] == "ssh"
+                        and "scratch.py end --task " in event["args"][-1]]
+                if cleanup_status == 0:
+                    self.assertEqual(len(ends), 1, events)
+                    self.assertLess(events.index(stops[0]), events.index(ends[0]))
+                    self.assertTrue(ends[0]["claimed"])
+                else:
+                    self.assertEqual(ends, [], events)
+                    self.assertIn("process exit not confirmed", errors)
                 self.assert_claim_released()
 
 

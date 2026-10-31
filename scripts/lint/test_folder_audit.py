@@ -6,8 +6,10 @@ the tmp sweep owns empty temp folders."""
 from __future__ import annotations
 
 import os
+import fcntl
 import socket
 import subprocess
+import sys
 import time
 import unittest
 from collections.abc import Generator, Iterator
@@ -95,7 +97,248 @@ class FolderAuditTests(unittest.TestCase):
         _ = self.enterContext(unittest.mock.patch.object(os, "scandir", side_effect=recorded_scan))
         state = self.root / "state"
         self.enterContext(unittest.mock.patch.dict(os.environ, {"FOLDER_SWEEP_STATE_DIR": str(state),
-                                                                "SCRATCH_HOLDS": str(state / "holds.json")}))
+                                                                "SCRATCH_HOLDS": str(state / "holds.json"),
+                                                                "SCRATCH_ROOT": str(self.root / "scratch"),
+                                                                "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
+                                                                "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
+                                                                "HANAS_CONFIG": str(self.root / "hanas.conf"),
+                                                                "MAC_TEST_CONFIG": str(self.root / "mac_test.conf")}))
+        _ = (self.root / "hanas.conf").write_text("clone_max_hours=2.5\n")
+        _ = (self.root / "mac_test.conf").write_text("free_floor_gib=8\n")
+
+    def clone_folder(self, name: str, hours: float, *, dirty: bool = False) -> Path:
+        source = self.root / "clone-source"
+        if not source.exists():
+            source.mkdir()
+            git(source, "init", "-q")
+            _ = (source / "asset").write_text("saved source")
+            _ = (source / ".gitignore").write_text("target/\n")
+            git(source, "add", "asset", ".gitignore")
+            git(source, "commit", "-qm", "source")
+        checkout = scratch.clone(source, f"gate:{name}", name)
+        if dirty:
+            _ = (checkout / "asset").write_text("unsaved source")
+        (checkout / "target").mkdir()
+        _ = (checkout / "target" / "build").write_text("build output")
+        age(checkout.parent, hours / 24)
+        return checkout.parent
+
+    def judge_clones(self, paths: list[Path], *, mac: bool = False,
+                     free_space: int = 16 * 1024**3, removing: bool = True) -> dict[Path, str]:
+        (self.root / "proc").mkdir(exist_ok=True)
+        return folder_audit.judge([(path, changed(path)) for path in paths], time.time(), removing,
+                                  proc=str(self.root / "proc"), sockets=str(self.root / "unix"),
+                                  mac=mac, free_space=lambda _: free_space)
+
+    def test_clone_age_comes_from_runtime_config_without_changing_other_folders_limits(self) -> None:
+        old = self.clone_folder("old", 3)
+        young = self.clone_folder("young", 2)
+        ordinary = folder(self.temp / "ordinary", 3 / 24)
+
+        outcomes = self.judge_clones([young, ordinary, old])
+
+        self.assertEqual(outcomes[old], folder_audit.REMOVED)
+        self.assertFalse(old.exists())
+        self.assertTrue(young.exists())
+        self.assertTrue(ordinary.exists())
+        _ = (self.root / "hanas.conf").write_text("clone_max_hours=1\n")
+        self.assertEqual(self.judge_clones([young])[young], folder_audit.REMOVED)
+        self.assertFalse(young.exists())
+
+    def test_below_the_mac_floor_removes_the_oldest_idle_clone_until_space_recovers(self) -> None:
+        younger = self.clone_folder("younger", 0.25)
+        older = self.clone_folder("older", 0.5)
+        (self.root / "proc").mkdir()
+        checked_paths: list[Path] = []
+
+        def free_space(path: Path) -> int:
+            checked_paths.append(path)
+            return 8 * 1024**3 if not older.exists() else 0
+
+        outcomes = folder_audit.judge(
+            [(path, changed(path)) for path in (younger, older)], time.time(), True,
+            proc=str(self.root / "proc"), sockets=str(self.root / "unix"), mac=True, free_space=free_space)
+
+        self.assertEqual(outcomes[older], folder_audit.REMOVED)
+        self.assertFalse(older.exists())
+        self.assertTrue(younger.exists())
+        self.assertGreaterEqual(len(checked_paths), 2)
+
+    def test_mac_floor_uses_its_runtime_config_and_does_not_apply_on_linux(self) -> None:
+        clone = self.clone_folder("floor", 0.25)
+        self.assertTrue(clone.exists())
+        _ = self.judge_clones([clone], mac=False, free_space=0)
+        self.assertTrue(clone.exists())
+        _ = self.judge_clones([clone], mac=True, free_space=9 * 1024**3)
+        self.assertTrue(clone.exists())
+        _ = (self.root / "mac_test.conf").write_text("free_floor_gib=10\n")
+        outcomes = self.judge_clones([clone], mac=True, free_space=9 * 1024**3)
+        self.assertEqual(outcomes[clone], folder_audit.REMOVED)
+        self.assertFalse(clone.exists())
+
+    def test_below_the_mac_floor_dirty_clone_loses_only_its_target(self) -> None:
+        clone = self.clone_folder("dirty-clone", 0.25, dirty=True)
+        checkout = clone / "checkout"
+        before = (clone / scratch.RECORD).read_bytes()
+
+        _ = self.judge_clones([clone], mac=True, free_space=16 * 1024**3)
+        self.assertTrue((checkout / "target" / "build").exists())
+
+        outcomes = self.judge_clones([clone], mac=True, free_space=0)
+
+        self.assertEqual(outcomes[clone], folder_audit.TARGET_REMOVED)
+        self.assertFalse((checkout / "target").exists())
+        self.assertEqual((checkout / "asset").read_text(), "unsaved source")
+        self.assertTrue((checkout / ".git").is_dir())
+        self.assertEqual((clone / scratch.RECORD).read_bytes(), before)
+        _ = self.judge_clones([clone], mac=True, free_space=0)
+        self.assertEqual((checkout / "asset").read_text(), "unsaved source")
+
+    def test_clone_cleanup_keeps_process_hold_socket_and_busy_lock_guards(self) -> None:
+        used = self.clone_folder("used-clone", 3)
+        held = self.clone_folder("held-clone", 3)
+        listening = self.clone_folder("socket-clone", 3)
+        busy = self.clone_folder("busy-clone", 3)
+        pid = self.root / "proc" / "12"
+        pid.mkdir(parents=True)
+        (pid / "cwd").symlink_to(used / "checkout")
+        _ = scratch.hold(held, "gate:keep-clone", "test")
+        server = socket.socket(socket.AF_UNIX)
+        self.addCleanup(server.close)
+        server.bind(str(listening / "socket"))
+        _ = (self.root / "unix").write_text(
+            f"Num RefCount Protocol Flags Type St Inode Path\n0: 2 0 10000 1 1 7 {listening / 'socket'}\n")
+        with (busy / scratch.BUSY).open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            outcomes = self.judge_clones([used, held, listening, busy], mac=True, free_space=0)
+        self.assertEqual(outcomes[used], "pid 12 works in it")
+        self.assertEqual(outcomes[held], folder_audit.HELD)
+        self.assertEqual(outcomes[listening], folder_audit.LIVE_SOCKET)
+        for path in (used, held, listening, busy):
+            self.assertTrue((path / "checkout" / "target" / "build").exists(), path)
+
+    def test_a_held_clone_lock_keeps_normal_and_linked_checkouts_clean(self) -> None:
+        clone = self.clone_folder("clean-lock", 3)
+        checkout = clone / "checkout"
+        linked = self.rust / "linked-clone"
+        git(checkout, "worktree", "add", "-q", "--detach", str(linked), "HEAD")
+        for path in (checkout, linked):
+            with self.subTest(path=path):
+                self.assertEqual(tmp_sweep.git_work(path), tmp_sweep.GitWork.SAVED)
+                with scratch.removal_lock(path) as idle:
+                    self.assertTrue(idle)
+                    self.assertEqual(tmp_sweep.git_work(path), tmp_sweep.GitWork.SAVED)
+                    with scratch.judgment_lock(path) as available:
+                        self.assertFalse(available)
+                    self.assertFalse((path / scratch.BUSY).exists())
+                self.assertEqual(tmp_sweep.git_work(path), tmp_sweep.GitWork.SAVED)
+
+    def test_audit_finds_young_clones_in_an_explicit_scratch_root_below_the_mac_floor(self) -> None:
+        clone = self.clone_folder("discover", 0.25)
+        (self.root / "proc").mkdir()
+        found = folder_audit.audit(
+            self.rust, [], frozenset[str](), time.time(), files=[], removing=True,
+            proc=str(self.root / "proc"), sockets=str(self.root / "unix"), mac=True,
+            free_space=lambda _: 0, clone_roots=[self.root / "scratch"])
+        self.assertIn((clone, folder_audit.REMOVED), [(entry.path, entry.outcome) for entry in found])
+        self.assertFalse(clone.exists())
+
+    def test_canonical_clone_paths_keep_private_tmp_lsof_and_hold_guards(self) -> None:
+        used = self.clone_folder("alias-used", 3)
+        held = self.clone_folder("alias-held", 3)
+        private_tmp = self.root / "macfs" / "private" / "tmp"
+        private_tmp.mkdir(parents=True)
+        (private_tmp / "claude").mkdir()
+        real_root = private_tmp / "claude" / "scratch"
+        _ = (self.root / "scratch").rename(real_root)
+        alias = self.root / "macfs" / "tmp"
+        alias.symlink_to(private_tmp, target_is_directory=True)
+        used = real_root / used.name
+        held = real_root / held.name
+        _ = scratch.hold(held, "gate:keep-alias", "test")
+        output = f"p42\nfcwd\nn{used / 'checkout'}\n"
+        lsof = self.root / "fake-lsof"
+        _ = lsof.write_text(f"#!{sys.executable}\nprint({output!r}, end='')\n")
+        lsof.chmod(0o755)
+        with unittest.mock.patch.object(tmp_sweep, "LSOF", (str(lsof),)):
+            found = folder_audit.audit(
+                self.rust, [], frozenset[str](), time.time(), files=[], removing=True,
+                proc=str(self.root / "missing-proc"), sockets=str(self.root / "unix"),
+                clone_roots=[alias / "claude" / "scratch"], mac=True, free_space=lambda _: 0)
+        outcomes = {entry.path: entry.outcome for entry in found}
+        self.assertEqual(outcomes[used], "pid 42 works in it")
+        self.assertEqual(outcomes[held], folder_audit.HELD)
+        for path in (used, held):
+            self.assertTrue((path / "checkout" / "target" / "build").exists())
+
+    def test_standing_mac_clone_has_no_age_or_floor_exemption(self) -> None:
+        expected = folder_audit.expected_rust_names()
+        self.assertIsNotNone(expected)
+        (self.root / "proc").mkdir()
+        for mode in ("age", "floor", "dirty"):
+            with self.subTest(mode=mode):
+                parent = self.clone_folder(f"standing-{mode}", 3 if mode == "age" else 0.25,
+                                           dirty=mode == "dirty")
+                standing = self.rust / "hana_catalyst_mac"
+                _ = (parent / "checkout").rename(standing)
+                age(standing, (3 if mode == "age" else 0.25) / 24)
+                found = folder_audit.audit(
+                    self.rust, [], expected, time.time(), files=[], removing=True,
+                    proc=str(self.root / "proc"), sockets=str(self.root / "unix"),
+                    clone_roots=[], mac=True, free_space=lambda _: 16 * 1024**3 if mode == "age" else 0)
+                outcomes = {entry.path: entry.outcome for entry in found}
+                self.assertEqual(outcomes[standing], folder_audit.TARGET_REMOVED if mode == "dirty"
+                                 else folder_audit.REMOVED)
+                if mode == "dirty":
+                    self.assertEqual((standing / "asset").read_text(), "unsaved source")
+                    self.assertTrue((standing / ".git").is_dir())
+                    self.assertFalse((standing / "target").exists())
+                else:
+                    self.assertFalse(standing.exists())
+
+    def test_audit_resumes_a_stopped_git_deletion_after_live_and_hold_checks(self) -> None:
+        clone = self.clone_folder("partial-git-removal", 3)
+        checkout = clone / "checkout"
+
+        def stop_during_git_delete(path: str) -> None:
+            self.assertEqual(Path(path), clone)
+            (checkout / ".git" / "HEAD").unlink()
+            raise RuntimeError("stopped during git deletion")
+
+        with unittest.mock.patch.object(tmp_sweep, "delete_tree", side_effect=stop_during_git_delete):
+            with self.assertRaisesRegex(RuntimeError, "stopped during git deletion"):
+                _ = self.judge_clones([clone])
+        self.assertIsInstance(scratch.pending_removal(clone), scratch.Registered)
+        self.assertTrue(clone.exists())
+        _ = scratch.hold(clone, "gate:keep-partial", "test")
+        outcomes = self.judge_clones([clone], mac=True, free_space=0)
+        self.assertEqual(outcomes[clone], folder_audit.HELD)
+        self.assertTrue(clone.exists())
+        _ = scratch.release(clone)
+        pid = self.root / "proc" / "42"
+        pid.mkdir()
+        (pid / "cwd").symlink_to(checkout)
+        outcomes = self.judge_clones([clone], mac=True, free_space=0)
+        self.assertEqual(outcomes[clone], "pid 42 works in it")
+        self.assertTrue(clone.exists())
+        (pid / "cwd").unlink()
+        found = folder_audit.audit(
+            self.rust, [], frozenset[str](), time.time(), files=[], removing=True,
+            proc=str(self.root / "proc"), sockets=str(self.root / "unix"),
+            clone_roots=[self.root / "scratch"], mac=True, free_space=lambda _: 0)
+        self.assertIn((clone, folder_audit.REMOVED), [(entry.path, entry.outcome) for entry in found])
+        self.assertFalse(clone.exists())
+        self.assertIsInstance(scratch.pending_removal(clone), scratch.NotRegistered)
+
+    def test_unavailable_process_inventory_keeps_an_overdue_clone_and_its_target(self) -> None:
+        clone = self.clone_folder("unknown-use", 3)
+        with unittest.mock.patch.object(tmp_sweep, "LSOF", (str(self.root / "no-lsof"),)):
+            outcomes = folder_audit.judge(
+                [(clone, changed(clone))], time.time(), True,
+                proc=str(self.root / "no-proc"), sockets=str(self.root / "no-sockets"),
+                mac=True, free_space=lambda _: 0)
+        self.assertEqual(outcomes[clone], tmp_sweep.NO_PROC)
+        self.assertTrue((clone / "checkout" / "target" / "build").exists())
 
     def test_copies_root_keeps_an_old_open_phase_copy(self) -> None:
         import json

@@ -224,13 +224,52 @@ def register_copy(path: Path, *, task: str, owner_unit: str, source_path: str, s
     _ = update_record(path, registered)
 
 
+@dataclass(frozen=True)
+class GitDirectory:
+    path: Path
+
+
+@dataclass(frozen=True)
+class NoGitDirectory:
+    pass
+
+
+def git_directory(repo: Path) -> GitDirectory | NoGitDirectory:
+    """Resolve the checkout's Git metadata, including a linked worktree's pointer."""
+    marker = repo / ".git"
+    if marker.is_dir() and not marker.is_symlink():
+        return GitDirectory(marker)
+    try:
+        line = marker.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return NoGitDirectory()
+    if not line.startswith("gitdir:"):
+        return NoGitDirectory()
+    pointer = line.removeprefix("gitdir:").strip()
+    if not pointer or "\n" in pointer:
+        return NoGitDirectory()
+    found = repo / pointer
+    return GitDirectory(found) if found.is_dir() else NoGitDirectory()
+
+
+def busy_path(path: Path) -> Path:
+    """One busy-lock location; Git metadata keeps the lock out of saved source."""
+    git = git_directory(path)
+    if isinstance(git, GitDirectory):
+        return git.path / BUSY
+    if os.path.lexists(path / ".git"):
+        raise OSError(f"{path}: cannot locate Git metadata for its busy lock")
+    return path / BUSY
+
+
 @contextmanager
 def copy_lock(path: Path) -> Generator[None]:
     folder = copy_folder(path)
     if folder is None:
         yield
         return
-    lock = os.open(folder / BUSY, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    mark = busy_path(folder)
+    lock = os.open(mark, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_SH)
         with copy_record_lock(folder):
@@ -238,7 +277,7 @@ def copy_lock(path: Path) -> Generator[None]:
             # Recheck after the record lock too: deletion can finish while it waits.
             held = os.fstat(lock)
             try:
-                present = (folder / BUSY).stat(follow_symlinks=False)
+                present = mark.stat(follow_symlinks=False)
             except FileNotFoundError as error:
                 raise ScratchError(f"{folder}: copy was removed before its busy lock was acquired") from error
             if (held.st_dev, held.st_ino) != (present.st_dev, present.st_ino):
@@ -327,11 +366,16 @@ def busy_locks(path: Path, *, create: bool) -> Generator[bool]:
     held: list[int] = []
     acquired = True
     try:
-        folder = copy_folder(path)
-        marks = dict.fromkeys((path / BUSY, path.parent / BUSY, *((folder / BUSY,) if folder is not None else ())))
         try:
-            for mark in marks:
-                creating = create and mark.parent in (path, folder) and mark.parent.is_dir() and not mark.parent.is_symlink()
+            folder = copy_folder(path)
+            owners = dict.fromkeys((path, path.parent, *((folder,) if folder is not None else ())))
+            marks: dict[Path, bool] = {}
+            for owner in owners:
+                mark = busy_path(owner)
+                marks[mark] = create and owner in (path, folder) and owner.is_dir() and not owner.is_symlink()
+                # Locks left by older callers still protect their work. Never create them in a checkout.
+                _ = marks.setdefault(owner / BUSY, False)
+            for mark, creating in marks.items():
                 if not creating and not os.path.lexists(mark):
                     continue
                 try:
@@ -572,6 +616,20 @@ def new(task: str = "", word: str = "", visible: bool = False, now: float | None
     path.mkdir()
     write_record(path, task, moment)
     return path
+
+
+def clone(source: Path, task: str = "", word: str = "hana", now: float | None = None) -> Path:
+    """Make a task-owned test clone. Publish its task before Git can leave a partial copy."""
+    path = new(task, word, now=now)
+    _ = update_record(path, lambda record: {
+        **(record.fields if isinstance(record, Registered) else {}),
+        "test_hana_clone": True, "source_path": str(source.resolve()),
+    })
+    checkout = path / "checkout"
+    result = subprocess.run(["git", "clone", "--quiet", "--", str(source), str(checkout)], check=False)
+    if result.returncode:
+        raise ScratchError(f"clone failed; its task still owns the partial folder {path}")
+    return checkout
 
 
 def adopt(source: Path, task: str, word: str = "", visible: bool = False, now: float | None = None) -> Path:
@@ -1090,7 +1148,7 @@ def chosen_task(arguments: argparse.Namespace) -> str:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog="scratch.py", description="Scratch folders that belong to a task.")
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("new", "adopt", "hold"):
+    for name in ("new", "clone", "adopt", "hold"):
         command = commands.add_parser(name)
         if name != "new":
             _ = command.add_argument("path")
@@ -1117,6 +1175,8 @@ def main(argv: list[str]) -> int:
     try:
         if command == "new":
             print(new(chosen_task(arguments), cast(str, arguments.name), cast(bool, arguments.visible)))
+        elif command == "clone":
+            print(clone(Path(cast(str, arguments.path)), chosen_task(arguments), cast(str, arguments.name)))
         elif command == "adopt":
             print(adopt(Path(cast(str, arguments.path)), chosen_task(arguments), cast(str, arguments.name),
                         cast(bool, arguments.visible)))

@@ -93,7 +93,7 @@ class MergeGateResourcesTests(GateSuitesFixture):
         admitted = False
 
         def assert_busy() -> None:
-            with (self.checkout / ".claude-busy").open("r") as lock:
+            with scratch.busy_path(self.checkout).open("r") as lock:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 

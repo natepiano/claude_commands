@@ -1269,7 +1269,7 @@ The Phase 26 checkpoint did not name two narrowed assertions; this phase's check
 
 **Ruled out:** A second Darwin environment lexer; roster-dependent discovery; unknown ports alone proving test ownership; failed environment reads proving absence or safety; failed signals proving exit; signalling reused pids; stopping sweep at its first failure.
 
-### Phase 44 — Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor  · status: todo
+### Phase 44 — Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor  · status: done
 **Depends on:** Phase 43
 
 **Approved:** builds showrunner 2026-10-31, the same design, its phase 3.

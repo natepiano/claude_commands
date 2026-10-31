@@ -18,7 +18,9 @@ folder mtimes and each git repo's HEAD, index and HEAD log, so a commit counts. 
 change-time scan also checks mtime and ctime throughout the tree, so copying files with preserved
 mtimes starts a new idle period. Removal requires WIDE_IDLE_SECONDS (7 days) without a change.
 
-A named folder idle for REMOVE_AFTER_SECONDS is removed when all of these are true:
+A loose clone uses clone_max_hours from hanas.conf; other folders use REMOVE_AFTER_SECONDS.
+On the Mac, free_floor_gib from mac_test.conf can select younger idle clones too, oldest first.
+Under that floor, unsaved clones lose only target. These rules share all of the following keeps:
 
   * no open hold (`scratch.py hold`) names it, a folder in it, or a folder that holds it;
   * no process works in it, holds a file in it open or maps one (one /proc scan; lsof on the Mac);
@@ -44,9 +46,11 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import stat
+import shutil
 import subprocess
 import sys
 import time
@@ -58,9 +62,11 @@ from typing import cast
 
 import tmp_sweep
 from tmp_sweep import SYSTEM_TEMP_NAMES, SYSTEM_TEMP_PREFIXES, TEMPFILE_NAME
+from tmp_sweep import ProcessUsesUnavailable as ProcessUsesUnavailable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import scratch  # noqa: E402
+from config_values import config_values  # noqa: E402
 
 RUST_ROOTS_FILE = Path(__file__).resolve().parents[2] / "config" / "rust_roots.txt"
 RUST_SCRATCH_NAME = "scratch"
@@ -96,6 +102,78 @@ WOULD_REMOVE = "would remove"
 HELD = "a hold keeps it"
 TOO_LARGE = "too many entries to read"
 LIVE_SOCKET = "a live process binds a socket in it"
+TARGET_REMOVED = "removed target; kept unsaved source"
+WOULD_REMOVE_TARGET = "would remove target; keep unsaved source"
+
+
+@dataclass(frozen=True)
+class ClonePolicy:
+    max_idle_seconds: float
+    free_floor_bytes: float
+
+
+def clone_policy() -> ClonePolicy:
+    """Read clone age and the Mac floor at use, without a second set of defaults."""
+    config = Path(__file__).resolve().parents[2] / "config"
+
+    def number(file: str, override: str, key: str) -> float:
+        path = os.environ.get(override) or str(config / file)
+        values = config_values(path)
+        try:
+            value = float(values[key])
+        except (KeyError, ValueError) as error:
+            raise ValueError(f"{path}: {key} needs a finite non-negative number") from error
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{path}: {key} needs a finite non-negative number")
+        return value
+
+    return ClonePolicy(number("hanas.conf", "HANAS_CONFIG", "clone_max_hours") * 3600,
+                       number("mac_test.conf", "MAC_TEST_CONFIG", "free_floor_gib") * 1024**3)
+
+
+def is_clone(path: Path) -> bool:
+    """A registered test clone (also when partial), or a loose independent Git clone."""
+    record = scratch.task_of(path)
+    if isinstance(record, scratch.Registered) and record.fields.get("test_hana_clone") is True:
+        return True
+    return (path / ".git").is_dir() and not (path / ".git").is_symlink()
+
+
+def test_clones(roots: list[Path]) -> list[Path]:
+    """Only registered test clones under protected scratch roots belong to this audit."""
+    found: list[Path] = []
+    for root in roots:
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            record = scratch.task_of(entry)
+            if isinstance(record, scratch.Registered) and record.fields.get("test_hana_clone") is True:
+                found.append(entry)
+    return found
+
+
+def free_bytes(path: Path) -> int:
+    return shutil.disk_usage(path).free
+
+
+def remove_clone_targets(path: Path, removing: bool) -> str:
+    """Keep unsaved source. Delete only build output from its independent clones."""
+    targets = [repo / "target" for repo in scratch.repos(path)
+               if (repo / "target").is_dir() and not (repo / "target").is_symlink()]
+    if not targets:
+        return tmp_sweep.GitWork.UNSAVED.value
+    if not removing:
+        return WOULD_REMOVE_TARGET
+    try:
+        for target in targets:
+            tmp_sweep.delete_tree(str(target))
+    except OSError as error:
+        return f"target removal failed: {error}"
+    return TARGET_REMOVED
 
 
 @dataclass(frozen=True)
@@ -161,20 +239,6 @@ def _walk(path: Path, depth: int) -> Iterator[os.DirEntry[str]]:
                 continue
 
 
-def _git_dir(repo: Path) -> Path | None:
-    marker = repo / ".git"
-    if marker.is_dir():
-        return marker
-    try:
-        line = marker.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return None
-    if not line.startswith("gitdir:"):
-        return None
-    found = Path(line.removeprefix("gitdir:").strip())
-    return found if found.is_absolute() else repo / found
-
-
 def last_change(path: Path) -> float | str:
     """The newest mtime in path (see the module text), or TOO_LARGE."""
     newest = _mtime(path)
@@ -186,9 +250,9 @@ def last_change(path: Path) -> float | str:
         except OSError:
             continue
     for repo in scratch.repos(path):
-        git_dir = _git_dir(repo)
-        if git_dir is not None:
-            newest = max([newest, *(_mtime(git_dir / name) for name in GIT_TIME_FILES)])
+        git = scratch.git_directory(repo)
+        if isinstance(git, scratch.GitDirectory):
+            newest = max([newest, *(_mtime(git.path / name) for name in GIT_TIME_FILES)])
     return newest
 
 
@@ -317,10 +381,10 @@ def remove(path: Path, changed: float, now: float) -> str:
                     os.replace(temporary, record)
                 finally:
                     temporary.unlink(missing_ok=True)
-            tmp_sweep.delete_tree(str(path))
+            scratch.remove_marked(path, lambda folder: tmp_sweep.delete_tree(str(folder)))
             if sources:
                 finish_pending_prune(record, PendingWorktreePrune(path, sources))
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except (OSError, ValueError, scratch.ScratchError, subprocess.SubprocessError) as error:
             return f"removal failed: {error}"
 
     log = state_dir() / REMOVED_LOG
@@ -334,10 +398,17 @@ def remove(path: Path, changed: float, now: float) -> str:
 
 
 def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str = tmp_sweep.PROC_DIR,
-          sockets: str = UNIX_SOCKETS) -> dict[Path, str]:
-    """What happens to each loose folder: LISTED when it is not yet REMOVE_AFTER_SECONDS idle, else
-    why it stays, else REMOVED (WOULD_REMOVE when not `removing`)."""
-    due = [path for path, changed in found if now - changed >= REMOVE_AFTER_SECONDS]
+          sockets: str = UNIX_SOCKETS, *, mac: bool | None = None,
+          free_space: Callable[[Path], int] | None = None) -> dict[Path, str]:
+    """Apply the same keep checks to aged folders and clones selected by age or Mac floor."""
+    policy = clone_policy()
+    on_mac = sys.platform == "darwin" if mac is None else mac
+    space = free_bytes if free_space is None else free_space
+    clones = {path for path, _ in found if is_clone(path)}
+    pending = {path for path, _ in found if isinstance(scratch.pending_removal(path), scratch.Registered)}
+    due = [path for path, changed in found
+           if now - changed >= (policy.max_idle_seconds if path in clones else REMOVE_AFTER_SECONDS)
+           or on_mac and path in clones or path in pending]
     outcomes = {path: LISTED for path, _ in found}
     if not due:
         return outcomes
@@ -347,19 +418,40 @@ def judge(found: list[tuple[Path, float]], now: float, removing: bool, proc: str
                     if isinstance(uses, tmp_sweep.ProcessUsesKnown) else {})
     bound = bound_sockets(sockets)
     changed = dict(found)
-    for path in due:
+    for path in sorted(due, key=lambda candidate: changed[candidate]):
+        try:
+            below_floor = on_mac and path in clones and space(path) < policy.free_floor_bytes
+        except OSError as error:
+            outcomes[path] = f"free space cannot be read: {error}"
+            continue
+        if path in clones and now - changed[path] < policy.max_idle_seconds and not below_floor and path not in pending:
+            continue
         if held(path, holds):
             outcomes[path] = HELD
-        elif isinstance(uses, tmp_sweep.ProcessUsesUnavailable):
+            continue
+        if isinstance(uses, tmp_sweep.ProcessUsesUnavailable):
             outcomes[path] = tmp_sweep.NO_PROC
-        elif str(path) in used_entries:
+            continue
+        if str(path) in used_entries:
             outcomes[path] = used_entries[str(path)]
-        elif live_socket(path, bound):
+            continue
+        if live_socket(path, bound):
             outcomes[path] = LIVE_SOCKET
-        elif (git := tmp_sweep.git_work(path)) is not tmp_sweep.GitWork.SAVED:
-            outcomes[path] = git.value
-        else:
-            outcomes[path] = remove(path, changed[path], now) if removing else WOULD_REMOVE
+            continue
+        with scratch.removal_lock(path) if removing else scratch.judgment_lock(path) as idle:
+            if not idle:
+                outcomes[path] = "busy: .claude-busy is locked"
+                continue
+            # This certificate was published only after the original Git check.
+            # A partial deletion can no longer pass that check, but all live-use guards still apply.
+            resuming = isinstance(scratch.pending_removal(path), scratch.Registered)
+            git = tmp_sweep.GitWork.SAVED if resuming else tmp_sweep.git_work(path)
+            if git is not tmp_sweep.GitWork.SAVED:
+                outcomes[path] = (remove_clone_targets(path, removing)
+                                  if below_floor and git is tmp_sweep.GitWork.UNSAVED else git.value)
+            else:
+                outcomes[path] = remove(path, changed[path], now) if removing else WOULD_REMOVE
+
     return outcomes
 
 
@@ -419,19 +511,24 @@ def _mtime(path: Path) -> float:
 
 def audit(rust: Path, temps: list[Path], expected: frozenset[str] | None, now: float,
           files: list[Path] | None = None, removing: bool = False, proc: str = tmp_sweep.PROC_DIR,
-          sockets: str = UNIX_SOCKETS) -> list[Loose]:
+          sockets: str = UNIX_SOCKETS, *, clone_roots: list[Path] | None = None,
+          mac: bool | None = None, free_space: Callable[[Path], int] | None = None) -> list[Loose]:
     if removing:
         resume_pending_prunes()
     changes: dict[Path, float | str] = {}
-    for entry in candidates(rust, temps, expected):
+    discovered = candidates(rust, temps, expected) + test_clones([scratch.root()] if clone_roots is None else clone_roots)
+    # macOS reports /private/tmp in lsof even when discovery started through /tmp.
+    # Resolve once at discovery, before age, hold, process, socket and lock checks.
+    for entry in dict.fromkeys(entry.resolve() for entry in discovered):
         when = last_change(entry)
         if isinstance(when, float):
-            change = tmp_sweep.last_change(str(entry), tmp_sweep.Limit(now - MIN_AGE_SECONDS, LISTED))
+            minimum_age = 0 if is_clone(entry) else MIN_AGE_SECONDS
+            change = tmp_sweep.last_change(str(entry), tmp_sweep.Limit(now - minimum_age, LISTED))
             when = change if isinstance(change, str) else max(when, change[0])
         changes[entry] = when
     found = [(entry, when) for entry, when in changes.items()
-             if isinstance(when, float) and when and now - when >= MIN_AGE_SECONDS]
-    outcomes = judge(found, now, removing, proc, sockets)
+             if isinstance(when, float) and when and (is_clone(entry) or now - when >= MIN_AGE_SECONDS)]
+    outcomes = judge(found, now, removing, proc, sockets, mac=mac, free_space=free_space)
     too_large = [entry for entry, when in changes.items() if when == TOO_LARGE]
     named_paths = [entry for entry, _ in found] + too_large
     sessions = transcripts() if files is None and named_paths else (files or [])
@@ -442,8 +539,9 @@ def audit(rust: Path, temps: list[Path], expected: frozenset[str] | None, now: f
 
 def message(folders: list[Loose]) -> str:
     shown = "; ".join(f"{folder.path} ({folder.outcome})" for folder in folders)
-    return (f"folder audit: loose folder(s) you made: {shown}. The audit removes a loose folder after 7 idle "
-            + "days unless a hold, a running process or unsaved git work keeps it. Move each you need into a "
+    return (f"folder audit: loose folder(s) you made: {shown}. The audit uses hanas.conf clone_max_hours "
+            + "for clones and 7 idle days for other folders. The Mac floor can remove idle clones sooner, "
+            + "or just their targets when source is unsaved. Holds and live processes keep them. Move each you need into a "
             + "task's scratch (`~/.claude/scripts/lib/py ~/.claude/scripts/lib/scratch.py adopt <path> --task "
             + "<task>`) or hold it (`scratch.py hold <path> --reason <why>`). Make new scratch only with "
             + "`scratch.py new`.")
@@ -474,7 +572,11 @@ def main(argv: list[str]) -> int:
                                ("/tmp", "/tmp/claude", os.environ.get("TMPDIR", "")) if path))
     now = time.time()
     removing = armed()
-    loose = audit(Path(os.path.realpath(Path.home() / "rust")), temps, expected, now, removing=removing)
+    try:
+        loose = audit(Path(os.path.realpath(Path.home() / "rust")), temps, expected, now, removing=removing)
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"folder audit: {error}", file=sys.stderr)
+        return 2
     by_maker: dict[str, list[Loose]] = {}
     for folder in loose:
         age = (now - folder.changed) / 86400 if folder.changed else float("nan")

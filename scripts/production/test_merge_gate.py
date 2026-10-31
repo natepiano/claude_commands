@@ -13,6 +13,7 @@ import re
 from typing import cast, final
 from contextlib import redirect_stdout
 from unittest import mock
+from scripts.lib import scratch
 from scripts.production import change_review, merge_gate
 from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 
@@ -29,7 +30,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
 
         def suites(repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
             self.assertEqual(repo, checkout)
-            with (repo / ".claude-busy").open("a") as contender:
+            with scratch.busy_path(repo).open("a") as contender:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 fcntl.flock(contender, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -44,7 +45,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         excludes = (checkout / ".git/info/exclude").read_text().splitlines()
         self.assertEqual(excludes.count("/.claude-busy"), 1)
         self.assertEqual(excludes.count("/.scratch.json"), 1)
-        with (checkout / ".claude-busy").open("a") as contender:
+        with scratch.busy_path(checkout).open("a") as contender:
             fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:

@@ -273,6 +273,50 @@ class HanasTests(unittest.TestCase):
         self.assertEqual(errors, "")
         self.assertFalse((self.root / "remote-signals").exists())
 
+    def test_checkout_cleanup_scopes_unreadable_environments_to_its_processes(self) -> None:
+        from scripts.lint import folder_audit, tmp_sweep
+
+        checkout = self.root / "scratch" / "checkout"
+        checkout.mkdir(parents=True)
+        self.mac_environment_failure = True
+        for case, process_checkout, inventory_index in (
+            ("unrelated", self.root / "user-hana", 0),
+            ("matching first inventory", checkout, 0),
+            ("matching final inventory", checkout, 1),
+            ("nested checkout", checkout / "nested", 0),
+            ("global inventory failure", self.root / "user-hana", 0),
+        ):
+            with self.subTest(case=case):
+                self.mac_output = f"201 {MAC_STARTED} 00:45 {process_checkout}/target/debug/hana\n"
+                collection = hanas.collect_processes(self.local_rows, self.ssh)
+                self.assertEqual(len(collection[0]), 1)
+                self.assertEqual(len(collection[1]), 1)
+                if case == "global inventory failure":
+                    collection[1].append("mac: process table unavailable")
+                inventories: list[tuple[list[hanas.HanaProcess], list[str]]] = (
+                    [collection, collection] if inventory_index == 0 else [([], []), collection]
+                )
+                output, errors = io.StringIO(), io.StringIO()
+                with (
+                    redirect_stdout(output), redirect_stderr(errors),
+                    mock.patch.object(hanas, "collect_processes", side_effect=inventories) as collect,
+                    mock.patch.object(hanas, "stop_process", side_effect=AssertionError("unreadable process signalled")) as stop,
+                    mock.patch.object(folder_audit, "process_uses", return_value=tmp_sweep.ProcessUsesKnown([])) as uses,
+                ):
+                    code = hanas.main(["stop-checkout", str(checkout)])
+                stop.assert_not_called()
+                if case == "unrelated":
+                    self.assertEqual((code, output.getvalue(), errors.getvalue()),
+                                     (0, "hanas: checkout clear\n", ""))
+                    self.assertEqual(collect.call_count, 2)
+                    uses.assert_called_once_with([checkout.resolve()])
+                else:
+                    self.assertNotEqual(code, 0)
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertIn("process table unavailable" if case == "global inventory failure"
+                                  else "mac:201: environment unknown", errors.getvalue())
+                    uses.assert_not_called()
+
     def test_each_configured_exempt_port_requires_labels_or_agent_environment(self) -> None:
         _ = self.process(101, {"BRP_EXTRAS_PORT": "31002"})
         base = self.local_rows()[0]

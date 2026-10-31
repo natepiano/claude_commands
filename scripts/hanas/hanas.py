@@ -23,6 +23,7 @@ PROC_ROOT = Path("/proc")
 sys.path.insert(0, str(ROOT))
 # offload shares sibling modules with its CLI; keep that existing import boundary.
 sys.path.insert(0, str(ROOT / "scripts" / "mac_test"))
+sys.path.insert(0, str(ROOT / "scripts" / "lint"))
 
 from scripts.lint.config_values import config_values
 
@@ -252,6 +253,10 @@ def remote_environment(pid: int, ssh_runner: Callable[[list[str]], subprocess.Co
     return environment
 
 
+def environment_problem(row: HanaProcess, status: EnvironmentUnknown) -> str:
+    return f"{row.machine}:{row.pid}: environment unknown: {status.cause}"
+
+
 def collect_processes(
     local_source: Callable[[], list[HanaProcess]] = local_processes,
     ssh_runner: Callable[[list[str]], subprocess.CompletedProcess[str]] = run_ssh,
@@ -278,7 +283,7 @@ def collect_processes(
             problems.append("mac: unreachable or process inventory could not be read")
     for row in rows:
         if isinstance(row.environment_status, EnvironmentUnknown):
-            problems.append(f"{row.machine}:{row.pid}: environment unknown: {row.environment_status.cause}")
+            problems.append(environment_problem(row, row.environment_status))
     return sorted(rows, key=lambda row: (row.machine, row.pid)), problems
 
 
@@ -332,7 +337,7 @@ def stop_process(
     platform: str | None = None,
 ) -> None:
     if isinstance(row.environment_status, EnvironmentUnknown):
-        raise ValueError(f"{row.machine}:{row.pid}: environment unknown: {row.environment_status.cause}; stop could not be confirmed")
+        raise ValueError(f"{environment_problem(row, row.environment_status)}; stop could not be confirmed")
     if not is_test_hana(row, config):
         raise ValueError(f"{row.machine}:{row.pid}: user Hana is exempt")
     host = sys.platform if platform is None else platform
@@ -366,6 +371,37 @@ def row_text(row: HanaProcess) -> str:
             f"purpose {row.purpose or 'unlabelled'} age {row.age_seconds / 3600:.2f} h checkout {row.checkout}")
 
 
+def stop_checkout(checkout: Path, config: HanasConfig) -> None:
+    """Confirm test Hanas exited and no process still uses a checkout before its task ends."""
+    checkout = checkout.resolve()
+
+    def checkout_processes() -> list[HanaProcess]:
+        rows, problems = collect_processes()
+        unrelated_environment_problems = {
+            environment_problem(row, row.environment_status)
+            for row in rows
+            if isinstance(row.environment_status, EnvironmentUnknown)
+            and not row.checkout.resolve().is_relative_to(checkout)
+        }
+        relevant_problems = [problem for problem in problems if problem not in unrelated_environment_problems]
+        if relevant_problems:
+            raise ValueError("; ".join(relevant_problems))
+        return [row for row in rows if row.checkout.resolve().is_relative_to(checkout)]
+
+    for row in checkout_processes():
+        stop_process(row, config)
+    if checkout_processes():
+        raise ValueError(f"{checkout}: Hana exit could not be confirmed")
+    # Reuse the audit's host-aware process-use scan for builds and examples too.
+    from scripts.lint.folder_audit import ProcessUsesUnavailable, process_uses
+    uses = process_uses([checkout])
+    if isinstance(uses, ProcessUsesUnavailable):
+        raise ValueError(f"{checkout}: process use could not be read")
+    if any(Path(path).resolve().is_relative_to(checkout) for path, _, _ in uses.paths):
+        raise ValueError(f"{checkout}: a process still uses the checkout")
+    print("hanas: checkout clear")
+
+
 class Arguments(argparse.Namespace):
     command: str = ""
     target: str = ""
@@ -378,11 +414,16 @@ def main(argv: list[str] | None = None) -> int:
     _ = commands.add_parser("list")
     stop = commands.add_parser("stop")
     _ = stop.add_argument("target", help="natedev:<pid|port> or mac:<pid|port>")
+    checkout = commands.add_parser("stop-checkout")
+    _ = checkout.add_argument("target", help="local checkout whose test Hanas must exit before removal")
     sweep = commands.add_parser("sweep")
     _ = sweep.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv, namespace=Arguments())
     try:
         config = read_config()
+        if args.command == "stop-checkout":
+            stop_checkout(Path(args.target), config)
+            return 0
         rows, problems = collect_processes()
         for problem in problems:
             print(problem)

@@ -787,12 +787,14 @@ files for a small fix checkpoint. Log each point and its result. Pass
 in the background: `HANA_TEST_PURPOSE="CI promotion smoke" zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
 It builds, checks hana stays up 60 s, and stops it, then builds and runs each
 demo example (list in the script) for 20 s with the command you would type, so
-each starts at once from the clone `~/rust/hana_catalyst_mac`. Exit 3 means the
+each starts from a task-owned scratch clone. The script ends its `gate:` task
+and removes the clone when the run ends. Exit 3 means the
 Mac is unreachable: skip it. Exit 9 means the Mac is blocked, busy with a test,
 or its coordination state cannot be read: skip the run; it is not an outage.
 It never gates a merge; a failure (7 hana, 8 an example) goes to the unit whose
-merge it was. Never skip it: the user demos
-from that clone. User, 2026-10-04, 2026-10-05 and 2026-10-06.
+merge it was. Never skip it. For a separate test clone on either machine,
+use `scratch.py clone <source> --task gate:<id>` and `scratch.py end --task gate:<id>`
+when the test ends; a phase task must name a real phase.
 </CIPoint>
 
 ---
