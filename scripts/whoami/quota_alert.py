@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.process_failure import failure_detail
+from scripts.message.send import OutcomeHeader, parse_outcome
 from scripts.whoami import note_file
 
 from scripts.lib import agents_registry  # noqa: E402
@@ -1510,7 +1512,11 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
         return str(error)
     if done.returncode == 0:
         return None
-    return " ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split())
+    # send.py's QUEUED outcome keeps its own header: refusal_watch treats a queued copy as delivered.
+    outcome = parse_outcome(done.stdout)
+    if done.returncode == 1 and isinstance(outcome, OutcomeHeader) and outcome.outcome == "queued":
+        return " ".join(f"QUEUED: {outcome.detail}".split())
+    return " ".join(failure_detail(done).split())
 
 
 @dataclass(frozen=True)
@@ -1541,7 +1547,7 @@ def tell_user(push: RenderedPush) -> PushDelivery:
         return PushFailed(str(error))
     if done.returncode == 0:
         return PushSent()
-    return PushFailed(" ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split()))
+    return PushFailed(" ".join(failure_detail(done).split()))
 
 
 def deliver(jobs: list[Job]) -> list[str | None]:

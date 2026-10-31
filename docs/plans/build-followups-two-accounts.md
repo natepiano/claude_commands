@@ -2972,21 +2972,35 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 
 **Ruled out:** `--ci-base` (removed); validation in the production checkout; a shared cargo target folder with the checkout (a merge gate builds there at the same time); a second copy of the CI-run lookup or `cancel_prior_runs`.
 
-### Phase 101e — One helper reports a failed command's output  · status: todo
+### Phase 101e — One helper reports a failed command's output  · status: done
 
-**Depends on:** Phase 101c (the helper).
+#### As-built
 
-#### Work Order
+- `failure_detail(result: subprocess.CompletedProcess[str], *, lines: int = 20) -> str` in `scripts/lib/process_failure.py` is the one way to describe a failed command. It returns labelled tails of both streams, `stderr: …` first and then `stdout: …`, each cut to the last `lines` lines. It omits an empty stream. When both streams are empty, it returns `exit <code>`. A `lines` value below 1 raises `ValueError`.
+- All 24 non-test modules that had a local `stderr.strip() or stdout.strip()` fallback (either order) now call `failure_detail`. `waiting.detail` stays as a one-call wrapper.
+- Callers keep their command-name prefix (`send.py: …`, `mesh: …`) in front of `failure_detail(result)`, so each message still names its source.
+- A scan test walks every non-test `.py` file under `scripts/` with `ast` and fails on a stream fallback outside `process_failure.py`. Conditions that test both streams (`if result.stdout.strip() or result.stderr.strip()`) do not match.
 
-**Goal:** No caller loses a failure's cause behind stderr noise. `result.stderr.strip() or result.stdout.strip()` appears 41 times in 22 non-test modules. Each copy drops stdout whenever stderr holds any text. Natedev showrunner ruling, 2026-10-30: current, after 101d.
+**Files:**
+- `scripts/lib/process_failure.py` — `failure_detail`
+- `scripts/lib/test_process_failure.py` — the scan test and the helper's output tests
+- `scripts/production/unit_status_test_support.py` — the fixed list of lib files the unit-status fixture copies; includes `process_failure.py`
+- `scripts/production/` — 9 callers: `add_unit`, `codex_winddown`, `dailies_input`, `merge_checkpoint`, `merge_gate`, `production_lifecycle`, `unit_move`, `update_registration`, `waiting`
+- `scripts/{bevy_upgrade,build_hold,direct,herdr,lib,lint,message,nightly_review,shutdown,style,whoami}/` — the other 15 callers; their tests expect the `stderr:`/`stdout:` labels
 
-**Spec:**
-- Every non-test copy calls `scripts/lib/process_failure.py`'s helper. Local wrappers such as `waiting.detail` go away or become one call to it.
-- A check keeps new copies out: a test or lint scan of `scripts/` fails on the pattern outside the helper.
-- No caller's other behavior changes.
+**Gotchas:** `unit_status_test_support.py` copies lib files into its fixture by a fixed list. A new lib helper that a copied module imports must join that list, or the unit-status suites fail on import.
 
-**Files:** the 22 modules (list them from `grep -rln 'stderr.strip() or' scripts --include=*.py`), the scan test, and any test that asserts the old text.
+**Ruled out:** a local `stderr or stdout` fallback at a call site, because it drops one stream; the scan test fails on it.
 
-**Workers:** 2 writers split by folder + 1 tester.
+### Phase 101f — A queued quota alert counts as delivered again  · status: done
 
-**Acceptance gate:** each touched module's suite passes; basedpyright 0/0/0 on each changed file and its callers; the scan test fails on a planted copy.
+#### As-built
+
+- `quota_alert.relay` reads `send.py`'s result with `scripts.message.send.parse_outcome`. For a QUEUED outcome (exit 1) it returns `QUEUED: <why>`, so `refusal_watch` treats a queued cleared-hold notice as delivered and enqueues it once. Every other failure still uses `failure_detail`.
+- The add-showrunner refusal test expects the labelled herdr stream: `herdr session list: stderr: …`.
+
+**Files:**
+- `scripts/whoami/quota_alert.py` — `relay` keeps send.py's QUEUED header
+- `scripts/production/test_add_showrunner.py` — the herdr refusal text
+
+**Gotchas:** `refusal_watch` decides "queued" from the text `not delivered: QUEUED:` in the delivery outcome line. A change to `relay`'s text breaks that check.

@@ -545,7 +545,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.herdr_overrides["--session default session list --json"] = CommandResponse(
             code=1, stdout="", stderr="fixture cannot list herdr sessions")
         result = self.run_command("kid")
-        self.refused(result, "herdr session list: fixture cannot list herdr sessions")
+        self.refused(result, "herdr session list: stderr: fixture cannot list herdr sessions")
         self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
 
     def test_child_opens_its_tab_in_a_shared_server_that_already_runs(self) -> None:

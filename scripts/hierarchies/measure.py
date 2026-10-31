@@ -192,7 +192,7 @@ class WaitCandidate:
 
     @property
     def label(self) -> str:
-        return f"run={self.run}; phase={self.phase}; instance={self.instance}; cwd={self.working_dir}"
+        return f"run={self.run}; phase={self.phase}; instance={self.instance}; cwd={self.working_dir or 'not recorded'}"
 
 
 @dataclass(frozen=True)
@@ -992,10 +992,23 @@ def holder_rows(
 
 
 def candidate_summary(candidates: Sequence[WaitCandidate]) -> str:
-    counts: dict[str, int] = {}
-    for candidate in candidates:
-        counts[candidate.label] = counts.get(candidate.label, 0) + 1
-    return " | ".join(label + (f" ({count} times)" if count > 1 else "") for label, count in counts.items())
+    return " | ".join(dict.fromkeys(candidate.label for candidate in candidates))
+
+
+def collapse_wait_rows(
+    rows: Sequence[log_records.MeasureRow], source: str, identity_kind: str,
+) -> list[log_records.MeasureRow]:
+    groups: dict[tuple[str, str], list[log_records.MeasureRow]] = {}
+    for row in rows:
+        groups.setdefault((row.measure, row.value), []).append(row)
+    collapsed: list[log_records.MeasureRow] = []
+    for grouped in groups.values():
+        first = grouped[0]
+        count = sum(row.n for row in grouped)
+        quantity = replace(first.quantity, amount=count) if isinstance(first.quantity, log_records.Diagnostic) else first.quantity
+        collapsed.append(replace(first, n=count, source=source + "; " + identity_kind + ": "
+                                 + ", ".join(row.source for row in grouped), quantity=quantity))
+    return collapsed
 
 
 def hana_wait_rows(
@@ -1056,21 +1069,29 @@ def hana_wait_rows(
     for reason, identities in missing_reasons.items():
         rows.append(log_records.MeasureRow("Hana wait coverage / HistoryNotRecorded", reason, len(identities),
                                            window.label, source + "; phases: " + ", ".join(identities), quantity=log_records.NotRecorded(reason), event_source=EventSource.WAITS))
+    phase_rows: list[log_records.MeasureRow] = []
     for phase in uncertain:
         if isinstance(phase.state, UncertainWaitCoverage):
             detail = phase.state.reason + "; candidates: " + candidate_summary(phase.state.candidates)
-            rows.append(log_records.MeasureRow("Hana wait coverage / UncertainCoverage", detail, 1, window.label, f"{phase.run}/{phase.instance}", quantity=log_records.Diagnostic(1, detail), event_source=EventSource.WAITS))
+            phase_rows.append(log_records.MeasureRow("Hana wait coverage / UncertainCoverage", detail, 1, window.label, f"{phase.run}/{phase.instance}", quantity=log_records.Diagnostic(1, detail), event_source=EventSource.WAITS))
+    rows.extend(collapse_wait_rows(phase_rows, source, "phases"))
     if isinstance(history, HanaWaitHistory) and history.attribution_misses:
+        miss_rows: list[log_records.MeasureRow] = []
         misses = history.attribution_misses
         for miss in misses:
             detail = miss.reason + "; candidates: " + candidate_summary(miss.candidates)
-            rows.append(log_records.MeasureRow("Hana wait attribution / Unresolved", detail, 1, window.label, miss.wait_id, quantity=log_records.Diagnostic(1, detail), event_source=EventSource.WAITS))
+            miss_rows.append(log_records.MeasureRow("Hana wait attribution / Unresolved", detail, 1, window.label, miss.wait_id, quantity=log_records.Diagnostic(1, detail), event_source=EventSource.WAITS))
+        rows.extend(collapse_wait_rows(miss_rows, source, "waits"))
     if isinstance(history, HanaWaitHistory):
+        origin_rows: list[log_records.MeasureRow] = []
         for origin in history.unresolved_origins:
-            rows.append(log_records.MeasureRow("Hana wait origin / UnresolvedPhaseOrigin", origin.reason, 1,
+            origin_rows.append(log_records.MeasureRow("Hana wait origin / UnresolvedPhaseOrigin", origin.reason, 1,
                                                window.label, f"{origin.run}/{origin.instance}", quantity=log_records.Diagnostic(1, origin.reason), event_source=EventSource.WAITS))
+        rows.extend(collapse_wait_rows(origin_rows, source, "phases"))
+        problem_rows: list[log_records.MeasureRow] = []
         for problem in history.problems:
-            rows.append(log_records.MeasureRow("Hana wait / source problem", problem.reason, 1, window.label, problem.source, quantity=log_records.Diagnostic(1, problem.reason), event_source=EventSource.WAITS))
+            problem_rows.append(log_records.MeasureRow("Hana wait / source problem", problem.reason, 1, window.label, problem.source, quantity=log_records.Diagnostic(1, problem.reason), event_source=EventSource.WAITS))
+        rows.extend(collapse_wait_rows(problem_rows, source, "waits"))
     return rows
 
 
