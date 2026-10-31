@@ -269,11 +269,11 @@ class QueueFixture(ExitStack):
         write_lines(self.directory / "anon_peaks.jsonl", lines, tail=tail)
 
     def inputs(self) -> gate.QueueInputs:
-        """Resolve the fixed 10:46 queue once, including raw pressure and limits."""
+        """Resolve the fixed 10:46 queue once, including raw pressure."""
         return gate.gather_queue_inputs(self.directory, gate.process_table(self.proc), NOW)
 
     def read(self) -> gate.QueueRead:
-        return gate.queue_read_from(self.inputs())
+        return gate.read_queue_pass(self.directory, gate.process_table(self.proc), NOW)
 
     def model(self) -> queue_view.QueueModel:
         reading = self.read()

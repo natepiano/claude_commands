@@ -32,6 +32,20 @@ TEST_HANG_GUARD_SECS = 300
 
 @final
 class StyleLedgerRecordsTests(LedgerTestCase):
+    def test_tree_entries_share_commit_and_bare_tree_inventory(self) -> None:
+        path = self.sources[0]
+        _ = self.git("update-index", "--chmod=+x", path)
+        tree = self.git("write-tree")
+        commit = self.git("commit-tree", tree, "-p", self.initial_tip, "-m", "inventory")
+        inventory = style_ledger.tree_entries(self.repo, tree)
+        self.assertEqual(inventory, style_ledger.tree_entries(self.repo, commit))
+        self.assertEqual(inventory[path].mode, "100755")
+        self.assertEqual(inventory[path].kind, "blob")
+        cache = style_ledger.GitReadCache(self.repo)
+        self.assertEqual(inventory, cache.tip(commit).entries)
+        contents = dict(style_ledger.blob_contents(self.repo, {path: inventory[path].object}))
+        self.assertEqual(contents[path], (self.repo / path).read_bytes())
+
     def test_metadata_only_rule_edit_accepts_pin_and_keeps_cell_current_but_body_edit_does_not(self) -> None:
         rule_id = self.rule("metadata")
         path = self.rule_dir / "metadata.md"
