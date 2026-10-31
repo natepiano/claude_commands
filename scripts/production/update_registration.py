@@ -48,6 +48,7 @@ else:
     from scripts.usage import agents_log
 
 from scripts.lib import names
+from scripts.lib.process_failure import failure_detail
 
 
 class InstancePresent(NamedTuple):
@@ -248,7 +249,7 @@ class RegistrationFailure(Exception):
 def command(step: str, arguments: list[str], *, cwd: Path | None = None) -> str:
     result = subprocess.run(arguments, cwd=cwd, capture_output=True, text=True, check=False)
     if result.returncode:
-        raise RegistrationFailure(step, result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
+        raise RegistrationFailure(step, failure_detail(result))
     return result.stdout.strip()
 
 
@@ -264,7 +265,7 @@ def instance(name: str) -> InstancePresent | InstanceAbsent:
         return InstancePresent(result.stdout.strip())
     if "no instance" in result.stdout + result.stderr or "no such instance" in result.stdout + result.stderr:
         return InstanceAbsent()
-    raise RegistrationFailure("notifier", result.stderr.strip() or result.stdout.strip() or f"status exit {result.returncode}")
+    raise RegistrationFailure("notifier", f"status: {failure_detail(result)}")
 
 
 class ScheduledUpdates(NamedTuple):

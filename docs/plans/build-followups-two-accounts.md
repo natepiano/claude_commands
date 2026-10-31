@@ -2916,4 +2916,78 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 - `scripts/accounts/test_accounts.py` — acceptance cases and the leading-dash server regression.
 - `docs/accounts.md` — the MCP line and `mcp-projects`.
 
-**Gotchas:** The accounts suite fails two `test_cutover_home` tests when run from a real home (they reach the showrunner registry); run it with a scratch `HOME`. An add-on to fix those tests is pending.
+**Gotchas:** Before Phase 101b, the accounts suite failed two `test_cutover_home` tests when run from a real home; Phase 101b fixed that.
+
+### Phase 101b — The accounts tests pass when run from a real home  · status: done
+
+**Depends on:** Phase 101 (order only; both edit `scripts/accounts/test_accounts.py`).
+
+#### As-built
+
+- `scripts/accounts/home_test_support.scratch_account_home(home, environment, *, clear=True)` is the one fixture that sets a test's `HOME`. It also enters `scripts/production/showrunner_registry_test_support.scratch_showrunner_registry(home)`, because `showrunners.py` computes its registry, sessions and notifier folders from `Path.home()` at import.
+- Nine accounts test files use it in place of their own `HOME` patches: `test_accounts`, `test_cutover_home`, `test_launch_accounts`, `test_moves`, `test_new_account`, `test_next_moves`, `test_refusal_watch`, `test_refusals`, `test_role_map`. No product change, no assertion change.
+- The suite passes from the real home and from a scratch `HOME` (835 tests).
+
+**Files:**
+- `scripts/accounts/home_test_support.py` — the fixture.
+- `scripts/accounts/test_*.py` (nine files above) — callers.
+
+### Phase 101c — A failed CI point names its cause  · status: done
+
+**Depends on:** none (order only).
+
+#### As-built
+
+- `scripts/lib/process_failure.failure_detail(result, *, lines=20)` returns the last `lines` lines of stderr and of stdout, each labelled (`stderr: …`, `stdout: …`), stderr first, an empty stream left out, and `exit <code>` when both are empty.
+- `ci_points.py` uses it in `required`, the validation step and the review watch; `merge_checkpoint.push_validate` uses it for its validate_and_push failure. `report()` joins the lines with `; `, so each step is still one line. A validation failure with no output now reads `exit <code>`, not `validation failed`.
+- 37 other copies of the old pattern remain; Phase 101e moves them.
+
+**Files:**
+- `scripts/lib/process_failure.py`, `scripts/lib/test_process_failure.py` — helper and its tests.
+- `scripts/production/ci_points.py`, `scripts/production/merge_checkpoint.py` — callers.
+- `scripts/production/test_ci_points.py` — memory-wait stderr with the failing check on stdout.
+
+### Phase 101d — A CI point validates one fixed commit  · status: done
+
+#### As-built
+
+- `ci_points.py ci start` records the merge branch tip and validates it in a private `git clone --shared --no-checkout` copy under the state dir, with `CARGO_TARGET_DIR=<copy>/target`. The production checkout is never the validation tree. The copy is removed when the run ends, pass or fail.
+- `validate_and_push.sh --validate-only` runs validation in the copy and makes at most one fix commit there. It does not push.
+- Publish runs under `merge_checkpoint.merge_lock`: it fetches the copy's `HEAD` into the production checkout, does a guarded `git merge --ff-only`, then runs `push_direct.sh --publish-only <sha>`, which prints `<sha> pushed` or `<sha> contained`.
+- The publish rule: if `origin/<merge branch>` contains the sha, the run passes and nothing is pushed. A fix commit is pushed only when it fast-forwards `origin/<merge branch>`. Otherwise the run fails with `merge branch moved during validation`. Nothing is ever force-pushed.
+- After the lock is released, `push_direct.sh --follow-published <sha> <state>` runs the hook, the CI-run lookup and the cancellation of older runs (`CANCEL_PRIOR` env). The validation report line follows the publish receipt. Failures keep `failure_detail`.
+
+**Files:**
+- `scripts/production/ci_points.py` — the fixed sha, the copy, publish under `merge_lock`, the report line.
+- `scripts/validate_and_push/push_direct.sh` — the one publish rule (`--publish-only`), the follow step (`--follow-published`), `cancel_prior_runs`.
+- `scripts/validate_and_push/validate_and_push.sh` — `--validate-only`.
+- `scripts/production/test_ci_points.py` — copy, contained, fast-forward, moved-branch, retry and lock-wait cases.
+
+**Binds later work:** The publish rule and the cancellation of older runs live only in `push_direct.sh`; other callers use them there. A fix commit reaches the local merge branch through the fetch and `--ff-only` merge under `merge_lock`, so the local branch and `origin` stay equal. The outcomes `pushed`, `contained` and `merge branch moved during validation` show in the CI point's validation line.
+
+**Gotchas:**
+- A push of a fix commit from the copy alone leaves the local merge branch stale: collect rejects it, a rerun makes a second fix, and a later merge-gate push is refused. The fix must go through the checkout under the lock.
+- A retry after a failed publish starts with the local branch at fix F; the publish rule fast-forwards `origin` to F.
+- Copy disk use, peak memory and the fresh-target build time are not yet measured. They are measured at the first real CI point and reported to the showrunner.
+
+**Ruled out:** `--ci-base` (removed); validation in the production checkout; a shared cargo target folder with the checkout (a merge gate builds there at the same time); a second copy of the CI-run lookup or `cancel_prior_runs`.
+
+### Phase 101e — One helper reports a failed command's output  · status: done
+
+#### As-built
+
+- `failure_detail(result: subprocess.CompletedProcess[str], *, lines: int = 20) -> str` in `scripts/lib/process_failure.py` is the one way to describe a failed command. It returns labelled tails of both streams, `stderr: …` first and then `stdout: …`, each cut to the last `lines` lines. It omits an empty stream. When both streams are empty, it returns `exit <code>`. A `lines` value below 1 raises `ValueError`.
+- All 24 non-test modules that had a local `stderr.strip() or stdout.strip()` fallback (either order) now call `failure_detail`. `waiting.detail` stays as a one-call wrapper.
+- Callers keep their command-name prefix (`send.py: …`, `mesh: …`) in front of `failure_detail(result)`, so each message still names its source.
+- A scan test walks every non-test `.py` file under `scripts/` with `ast` and fails on a stream fallback outside `process_failure.py`. Conditions that test both streams (`if result.stdout.strip() or result.stderr.strip()`) do not match.
+
+**Files:**
+- `scripts/lib/process_failure.py` — `failure_detail`
+- `scripts/lib/test_process_failure.py` — the scan test and the helper's output tests
+- `scripts/production/unit_status_test_support.py` — the fixed list of lib files the unit-status fixture copies; includes `process_failure.py`
+- `scripts/production/` — 9 callers: `add_unit`, `codex_winddown`, `dailies_input`, `merge_checkpoint`, `merge_gate`, `production_lifecycle`, `unit_move`, `update_registration`, `waiting`
+- `scripts/{bevy_upgrade,build_hold,direct,herdr,lib,lint,message,nightly_review,shutdown,style,whoami}/` — the other 15 callers; their tests expect the `stderr:`/`stdout:` labels
+
+**Gotchas:** `unit_status_test_support.py` copies lib files into its fixture by a fixed list. A new lib helper that a copied module imports must join that list, or the unit-status suites fail on import.
+
+**Ruled out:** a local `stderr or stdout` fallback at a call site, because it drops one stream; the scan test fails on it.

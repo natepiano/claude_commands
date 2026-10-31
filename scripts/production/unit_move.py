@@ -25,6 +25,7 @@ import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import pane_record  # noqa: E402
+from scripts.lib.process_failure import failure_detail  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json  # noqa: E402
 
 BERTH_KEY = "cargoBerthTarget"
@@ -48,7 +49,7 @@ def git(checkout: Path, *arguments: str) -> str:
     result = subprocess.run(["git", "-C", str(checkout), *arguments], capture_output=True,
                             text=True, check=False)
     if result.returncode:
-        raise RenameRefused(f"git {' '.join(arguments)}: {result.stderr.strip() or result.stdout.strip()}")
+        raise RenameRefused(f"git {' '.join(arguments)}: {failure_detail(result)}")
     return result.stdout.rstrip("\n")
 
 
