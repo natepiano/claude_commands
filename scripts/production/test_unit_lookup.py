@@ -203,6 +203,59 @@ print(observed.row.id)
         grouped, _ = unit_marks.session_unit_marks([record], self.environment)
         self.assertIsInstance(grouped.units["show"]["alpha-unit"].claude, LiveClaude)
 
+    def test_live_staffed_session_without_any_launch_agrees_across_readers_and_worker_queue(self) -> None:
+        from scripts.production import unit_marks
+        from scripts.message import unit_labels
+        import session_pane
+
+        owner = unit_membership("show", "alpha-unit")
+        fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
+        self.claude("alpha", "w4:p1", session_id="staffed-conversation")
+        registry = self.records / f"{os.getpid()}.json"
+        _ = registry.write_bytes((self.records / "alpha-1.json").read_bytes())
+        session = sessions.read_session(registry)
+        assert not isinstance(session, sessions.UnreadableSessionRecord)
+        self.assertFalse((self.root / "pane-records/agents.json").exists())
+        found = unit_lookup.marked_units("show")
+        self.assertIsInstance(found["alpha-unit"].claude, LiveClaude)
+        self.assertEqual(found["alpha-unit"].staff_id, owner.id)
+        self.assertEqual(session_pane.session_place("staffed-conversation"), herdr.HerdrPlace("agents", "w4:p1"))
+        grouped, _ = unit_marks.session_unit_marks([session], self.environment)
+        self.assertEqual(grouped.units["show"]["alpha-unit"].staff_id, owner.id)
+        run_root = self.root / "runs"
+        run = run_root / "older-run"
+        run.mkdir(parents=True)
+        _ = (run / "director").write_text("staffed-conversation")
+        _ = (run / "mesh_roster.json").write_text(json.dumps({"fix": {"thread_id": "worker-thread", "status": "running"}}))
+        registered = [{"slug": "show", "session": "runner", "socket": "", "zone": "UTC", "doc": "/unused"}]
+        with (mock.patch.object(unit_labels, "newest_sessions", return_value=[session]),
+              mock.patch.object(unit_labels, "registered_showrunners", return_value=registered),
+              mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("queue must read files only"))):
+            labels = unit_labels.unit_labels_for(["staffed-conversation", "worker-thread"],
+                {**self.environment, "ROSTER_RUN_ROOT": str(run_root)})
+        self.assertEqual(labels["staffed-conversation"], unit_labels.UnitLabels("alpha", "show", "alpha"))
+        self.assertEqual(labels["worker-thread"], unit_labels.UnitLabels("fix", "show", "alpha"))
+
+    def test_repair_creates_the_missing_live_launch_from_staff_and_rerun_writes_nothing(self) -> None:
+        from scripts.production import unit_marks
+        from scripts.shutdown import pane_record
+
+        owner = unit_membership("show", "alpha-unit")
+        fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
+        self.claude("alpha", "w4:p1", session_id="staffed-conversation")
+        _ = (self.records / f"{os.getpid()}.json").write_bytes((self.records / "alpha-1.json").read_bytes())
+        with mock.patch.object(pane_record, "PROC", self.root / "proc"):
+            changes = unit_marks.repair_marks()
+            self.assertEqual(len(changes), 1)
+            entry = pane_record.read("agents")["w4:p1"]
+            self.assertEqual(entry["session_id"], "staffed-conversation")
+            self.assertEqual(entry["environment"], {"STAFF_ID": owner.id,
+                "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+            path = pane_record.record_path("agents")
+            before = path.read_bytes(), path.stat().st_mtime_ns
+            self.assertEqual(unit_marks.repair_marks(), [])
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
     def renamed_production(self) -> None:
         for name in ("trunk-unit", "other-unit", "first-unit", "second-unit", "third-unit"):
             _ = unit_membership("new", name)

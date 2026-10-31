@@ -297,6 +297,7 @@ class UnitWatchdogTests(unittest.TestCase):
         entry = pane_record.read("shared")["alpha"]
         self.assertFalse(entry.get("ended", False))
         self.assertEqual((entry["session_id"], entry["config_dir"]), ("alpha", str(config)))
+        self.assertEqual(entry["environment"]["SHOWRUNNER_UNIT_ID"], "alpha")
         self.die("alpha")
         for minute in (0, 2, 4):
             _ = self.pass_at(minute)
