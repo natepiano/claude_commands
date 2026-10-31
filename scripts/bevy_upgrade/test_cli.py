@@ -441,7 +441,7 @@ class CliTests(CliFixture):
                 self.env.update({"SEND_EXIT": str(code), "SEND_OUTCOME": outcome})
                 result = self.run_cli("check", "--scheduled")
                 self.assert_silent_check(result)
-                self.assertEqual(result.stderr, f"bevy_upgrade: the showrunner was not told: {outcome}\n")
+                self.assertEqual(result.stderr, f"bevy_upgrade: the showrunner was not told: stdout: {outcome}\n")
                 self.assertEqual(self.read_record()["announced"], baseline)
 
 
@@ -658,7 +658,7 @@ class CliTests(CliFixture):
                 self.env.update({"SEND_EXIT": str(code), "SEND_OUTCOME": outcome})
                 result = self.run_cli("check", "--scheduled")
                 self.assert_silent_check(result)
-                self.assertEqual(result.stderr, f"bevy_upgrade: the showrunner was not told: {outcome}\n")
+                self.assertEqual(result.stderr, f"bevy_upgrade: the showrunner was not told: stdout: {outcome}\n")
                 self.assertIsNone(self.read_record()["closed"])
                 self.assertEqual(self.read_record()["announced"], baseline)
                 self.assertFalse(any(args[0] == "remove" for args in self.tool_args("notifier")))
@@ -782,7 +782,7 @@ class CliTests(CliFixture):
         self.assertEqual(result.returncode, 0)
         self.assertIn("| Dependency | Our pin | crates.io | Git | State | Next |", result.stdout)
         self.assertEqual(result.stderr,
-                         "bevy_upgrade: could not retire the queued message: FAILED: retirement unavailable\n")
+                         "bevy_upgrade: could not retire the queued message: stdout: FAILED: retirement unavailable\n")
         self.assertEqual((self.root / "save-calls").read_text(), "saved\n")
         self.assertEqual(len(self.retire_calls()), 1)
         self.assertEqual(self.retire_calls()[0]["announced"], self.read_record()["announced"])

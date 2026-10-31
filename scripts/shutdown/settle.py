@@ -41,7 +41,7 @@ import shutdown_record as store
 from shutdown_record import CheckoutMove, SessionShutdown, SessionStopIssue, TimerRestore, ShutdownContinuation, ReadinessCheck
 from remote import other_machine, run_remote
 from scripts.production import staff_sources
-import showrunners
+from scripts.production import showrunners
 import sessions
 import stop as stop_work
 from user_zone import user_zone

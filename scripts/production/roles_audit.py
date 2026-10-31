@@ -25,8 +25,9 @@ import tokenize
 from typing import Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import production_units
-import showrunners
+from scripts.production import showrunners
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from code_kind import is_test_code  # noqa: E402

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run named herdr sessions without choosing accounts or answering dialogs.
 
-Process discovery reads HERDR_PANE_ID only in descendants of listening herdr servers
+Process discovery resolves launch pane keys against the live panes of listening herdr servers
 and members of those servers' dedicated systemd units, including handoff survivors.
 In shared scopes, the server's preserved pane shell PIDs recover orphaned trees.
 Live-checked with herdr 0.9.0 in throwaway session herdr-libcheck: panes set
@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from process_failure import failure_detail
 import nix_env as nix_env
 
 if TYPE_CHECKING:
@@ -887,7 +888,7 @@ def require_success(result: subprocess.CompletedProcess[str], context: str) -> N
     if result.returncode == 0:
         return
     code = ""
-    detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+    detail = failure_detail(result)
     for text in (result.stderr, result.stdout):
         try:
             error = json_object(decode_object(text, context).get("error"), context)
@@ -1344,13 +1345,12 @@ class Herdr:
         from scripts.production import staff
 
         membership = staff.initial_snapshot() if record is None else record
-        parent = next((row for row in membership.find(kind="showrunner") if row.name == name), None)
-        unit_names: set[str] = {row.name for row in membership.find(kind="unit", parent=parent.id)} if parent else set()
-        unit_panes = unit_director_panes(self.session, herdr_processes(), membership)
+        classifier = UnitTabClassifier(self.session, herdr_processes(), membership)
         unit_director_titles = {
             json_text(tab.get("label"), "herdr tab label") for tab in tabs
-            if tab.get("label") in unit_names
-            or any(pane in unit_panes for pane in panes_of.get(json_text(tab.get("tab_id"), "herdr tab id"), []))}
+            if isinstance(classifier.classify(
+                name if isinstance(name, str) else "", json_text(tab.get("label"), "herdr tab label"),
+                panes_of.get(json_text(tab.get("tab_id"), "herdr tab id"), [])), UnitTab)}
         titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
         unsaved: list[SavedName] = []
         kept = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), unsaved)
@@ -2706,6 +2706,85 @@ def server_environment(name: str) -> dict[str, str]:
         raise HerdrFailure(f"{context}: cannot read process environment") from error
 
 
+class _PaneListStatus(Enum):
+    READABLE = "readable"
+    UNREADABLE = "unreadable"
+
+
+class _LivePanePlaces:
+    """One server read, with retained shell identities for panes whose ids changed."""
+
+    def __init__(self, session: str) -> None:
+        self.session: str = session
+        self.panes: dict[str, PaneIdentity] = {}
+        self.pane_list_status: _PaneListStatus = _PaneListStatus.UNREADABLE
+        try:
+            self.panes = {pane["pane_id"]: pane for pane in Herdr(session).panes()}
+        except (HerdrFailure, OSError, ValueError):
+            pass
+        else:
+            self.pane_list_status = _PaneListStatus.READABLE
+        self.shell_places: dict[int, HerdrPlace] = {}
+        self.shells_read: bool = False
+
+    def shells(self) -> dict[int, HerdrPlace]:
+        if self.pane_list_status is _PaneListStatus.UNREADABLE:
+            return {}
+        if not self.shells_read:
+            self.shells_read = True
+            for pane in self.panes:
+                try:
+                    info = json_object(Herdr(self.session).result("pane", "process-info", "--pane", pane)
+                                       .get("process_info"), "herdr pane process info")
+                except HerdrFailure:
+                    continue
+                shell = info.get("shell_pid")
+                if isinstance(shell, int) and not isinstance(shell, bool) and shell > 0:
+                    self.shell_places[shell] = HerdrPlace(self.session, pane)
+        return self.shell_places
+
+    def place(self, pid: int, environment: dict[str, str], parent: Callable[[int], int]) -> HerdrPlace | NotInHerdr:
+        launch_pane = environment.get("HERDR_PANE_ID", "")
+        if not launch_pane or environment.get("TMUX_PANE"):
+            return NotInHerdr()
+        if self.pane_list_status is _PaneListStatus.UNREADABLE:
+            return HerdrPlace(self.session, launch_pane)
+        if launch_pane in self.panes:
+            return HerdrPlace(self.session, self.panes[launch_pane]["pane_id"])
+        shells = self.shells()
+        seen: set[int] = set()
+        while pid > 1 and pid not in seen:
+            if pid in shells:
+                return shells[pid]
+            seen.add(pid)
+            try:
+                pid = parent(pid)
+            except (OSError, ValueError, IndexError):
+                break
+        return NotInHerdr()
+
+
+_live_pane_reader: ContextVar[Callable[[str], _LivePanePlaces]] = ContextVar(
+    "herdr_live_pane_reader", default=_LivePanePlaces)
+
+
+@contextmanager
+def pane_snapshot() -> Generator[Callable[[str], list[PaneIdentity]]]:
+    """Share live panes and retained shells; yield the pane reader for report display."""
+    reader = cache(_live_pane_reader.get())
+    token = _live_pane_reader.set(reader)
+    try:
+        yield lambda session: [pane.copy() for pane in reader(session).panes.values()]
+    finally:
+        _live_pane_reader.reset(token)
+
+
+def _process_parent(pid: int) -> int:
+    stat = (_proc_root() / str(pid) / "stat").read_text()
+    return int(stat[stat.rindex(")") + 1:].split()[1])
+
+
+@pane_snapshot()
 def herdr_place_of(pid: int) -> HerdrPlace | NotInHerdr:
     if _platform() == "darwin":
         return next((process.place for process in herdr_processes() if process.pid == pid), NotInHerdr())
@@ -2720,9 +2799,11 @@ def herdr_place_of(pid: int) -> HerdrPlace | NotInHerdr:
     except OSError:
         return NotInHerdr()
     session = _process_sessions(candidates, _live_server_processes(candidates)).get(pid, "")
-    return HerdrPlace(session, pane) if session else NotInHerdr()
+    return (_live_pane_reader.get()(session).place(pid, environment, _process_parent)
+            if session else NotInHerdr())
 
 
+@pane_snapshot()
 def herdr_places() -> dict[int, HerdrPlace]:
     """Every herdr process's place from one scan, by pid: herdr_place_of for many pids at once."""
     if _platform() == "darwin":
@@ -2737,9 +2818,9 @@ def herdr_places() -> dict[int, HerdrPlace]:
             environment = _process_environment(_proc_root() / str(pid))
         except OSError:
             continue
-        pane = environment.get("HERDR_PANE_ID", "")
-        if pane and not environment.get("TMUX_PANE"):
-            places[pid] = HerdrPlace(session, pane)
+        place = _live_pane_reader.get()(session).place(pid, environment, _process_parent)
+        if isinstance(place, HerdrPlace):
+            places[pid] = place
     return places
 
 
@@ -2802,22 +2883,7 @@ def _systemd_cgroups(process: Path) -> list[tuple[str, Path]]:
 
 def _pane_shell_pids(session: str) -> list[int]:
     """Read the shell identities retained in the live server's PTY runtimes."""
-    try:
-        client = Herdr(session)
-        panes = client.panes()
-    except HerdrFailure:
-        return []
-    shells: list[int] = []
-    for pane in panes:
-        try:
-            info = json_object(client.result("pane", "process-info", "--pane", pane["pane_id"])
-                               .get("process_info"), "herdr pane process info")
-        except HerdrFailure:
-            continue
-        shell = info.get("shell_pid")
-        if isinstance(shell, int) and not isinstance(shell, bool) and shell > 0:
-            shells.append(shell)
-    return shells
+    return list(_live_pane_reader.get()(session).shells())
 
 
 def pane_scopes(groups: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
@@ -2853,8 +2919,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
     children: dict[int, list[Path]] = {}
     for process in candidates:
         try:
-            stat = process.joinpath("stat").read_text()
-            parent = int(stat[stat.rindex(")") + 1:].split()[1])
+            parent = _process_parent(int(process.name))
             children.setdefault(parent, []).append(process)
         except (OSError, ValueError, IndexError):
             continue
@@ -3067,11 +3132,12 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
             if isinstance(by_pid[pid].arguments, UnreadableProcessArguments):
                 continue
             environment = darwin_process_environment(pid)
-            pane = environment.get("HERDR_PANE_ID", "")
-            if environment.get("TMUX_PANE") or not pane:
+            place = _live_pane_reader.get()(session).place(
+                pid, environment, lambda ident: by_pid[ident].parent if ident in by_pid else 0)
+            if isinstance(place, NotInHerdr):
                 continue
             marks = {key: environment[key] for key in MEMBER_MARKS if key in environment}
-            processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks,
+            processes.append(HerdrProcess(pid, place, marks,
                                           Path(by_pid[pid].executable).name, _darwin_process_cwd(pid)))
         except (HerdrFailure, subprocess.TimeoutExpired):
             continue
@@ -3082,13 +3148,47 @@ def has_unit_marks(environment: dict[str, str]) -> bool:
     return all(environment.get(mark) for mark in UNIT_MARKS)
 
 
-def unit_director_panes(session: str, processes: Sequence[HerdrProcess], record: staff.StaffSnapshot) -> set[str]:
-    """The session's panes whose durable identity names a recorded unit."""
-    units = {row.id for row in record.find(kind="unit")}
-    return {process.place.pane for process in processes
-            if process.place.session == session and process.marks.get("STAFF_ID") in units}
+@dataclass(frozen=True)
+class UnitTab:
+    """A tab's unit identity and its current staff parent."""
+
+    row: staff.StaffRow
+    parent: staff.StaffRow
 
 
+@dataclass(frozen=True)
+class OtherTab:
+    """The tab has no recorded unit identity or matching workspace membership."""
+
+
+class UnitTabClassifier:
+    """Share the staff identity and workspace/title join between ordering and listing."""
+
+    by_pane: dict[str, UnitTab]
+    by_workspace: dict[str, dict[str, UnitTab]]
+
+    def __init__(self, session: str, processes: Sequence[HerdrProcess], record: staff.StaffSnapshot) -> None:
+        parents = {row.id: row for row in record.find(kind="showrunner")}
+        units: dict[str, UnitTab] = {row.id: UnitTab(row, parents[row.parent]) for row in record.find(kind="unit")
+                                     if row.parent is not None and row.parent in parents}
+        self.by_pane = {process.place.pane: units[ident] for process in processes
+                        if process.place.session == session and (ident := process.marks.get("STAFF_ID")) in units}
+        self.by_workspace = {}
+        for unit in units.values():
+            self.by_workspace.setdefault(unit.parent.name, {})[unit.row.name] = unit
+
+    def has_unit_title(self, title: str) -> bool:
+        """Whether a title needs its workspace resolved before it can be classified."""
+        return any(title in units for units in self.by_workspace.values())
+
+    def classify(self, workspace: str, title: str, panes: Sequence[str]) -> UnitTab | OtherTab:
+        for pane in panes:
+            if pane in self.by_pane:
+                return self.by_pane[pane]
+        return self.by_workspace.get(workspace, {}).get(title, OtherTab())
+
+
+@pane_snapshot()
 def _scan_herdr_processes() -> list[HerdrProcess]:
     if _platform() == "darwin":
         return _darwin_herdr_processes()
@@ -3104,8 +3204,8 @@ def _scan_herdr_processes() -> list[HerdrProcess]:
             if process.stat().st_uid != os.getuid():
                 continue
             environment = _process_environment(process)
-            pane = environment.get("HERDR_PANE_ID", "")
-            if environment.get("TMUX_PANE") or not pane:
+            place = _live_pane_reader.get()(session).place(pid, environment, _process_parent)
+            if isinstance(place, NotInHerdr):
                 continue
             arguments = _process_arguments(process)
             if not arguments:
@@ -3118,7 +3218,7 @@ def _scan_herdr_processes() -> list[HerdrProcess]:
             except (OSError, ValueError, RuntimeError) as error:
                 cwd = UnreadableCwd(str(error))
             marks = {key: environment[key] for key in MEMBER_MARKS if key in environment}
-            processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks, Path(arguments[0]).name, cwd))
+            processes.append(HerdrProcess(pid, place, marks, Path(arguments[0]).name, cwd))
         except (OSError, ValueError, RuntimeError):
             continue
     return processes

@@ -906,10 +906,10 @@ class WaitRecordsTest(unittest.TestCase):
     def test_candidate_cells_count_distinct_notes_in_first_seen_order(self) -> None:
         first: log_records.JsonObject = {"run_id": "hana-run", "phase_id": "4", "phase_instance_id": "hana-phase"}
         second: log_records.JsonObject = {"run_id": "hana-run", "phase_id": "5", "phase_instance_id": "hana-next"}
-        first_label = "run=hana-run; phase=4; instance=hana-phase; cwd="
-        second_label = "run=hana-run; phase=5; instance=hana-next; cwd="
-        for candidates, expected in (([first] * 6, first_label + " (6 times)"),
-                                     ([first, second, first], first_label + " (2 times) | " + second_label)):
+        first_label = "run=hana-run; phase=4; instance=hana-phase; cwd=not recorded"
+        second_label = "run=hana-run; phase=5; instance=hana-next; cwd=not recorded"
+        for candidates, expected in (([first] * 6, first_label),
+                                     ([first, second, first], first_label + " | " + second_label)):
             with self.subTest(expected=expected):
                 phase = wait_phase_fixture("UncertainCoverage")
                 phase.update(reason="ambiguous coverage", candidates=candidates, recorded_wait_n=0)
@@ -917,12 +917,129 @@ class WaitRecordsTest(unittest.TestCase):
                 missing["wait_attribution"] = {"state": "UnresolvedAttribution", "reason": "ambiguous attribution",
                                                 "candidates": candidates}
                 history = m.parse_wait_report(wait_report_fixture(self.window, [missing], [phase]))
-                rows = m.hana_wait_rows(history, self.window, ())
+                output = log_records.blocks("Waits", m.hana_wait_rows(history, self.window, ()))
+                rows = read_report_blocks(output)
                 for label, reason in (("Hana wait coverage / UncertainCoverage", "ambiguous coverage"),
                                       ("Hana wait attribution / Unresolved", "ambiguous attribution")):
                     cells = [row for row in rows if row.measure == label]
                     self.assertEqual([(row.value, row.n) for row in cells],
                                      [(reason + "; candidates: " + expected, 1)])
+
+    def test_full_wait_report_collapses_twenty_six_phases_and_three_waits_without_merging_other_reasons(self) -> None:
+        candidates: list[log_records.JsonObject] = [
+            {"run_id": "hana-run", "phase_id": str(index), "phase_instance_id": f"candidate-{index}",
+             "working_dir": "" if index == 0 else f"/archive/hana-{index}"}
+            for index in range(6)
+        ]
+        phases: list[log_records.JsonObject] = []
+        for index in range(26):
+            phase = wait_phase_fixture("UncertainCoverage")
+            phase.update(phase_instance_id=f"phase-{index}", reason="overlapping phase records",
+                         candidates=candidates * 26)
+            phases.append(phase)
+        different = wait_phase_fixture("UncertainCoverage")
+        different.update(phase_instance_id="different-phase", reason="another coverage reason", candidates=candidates)
+        phases.append(different)
+        waits: list[log_records.JsonObject] = []
+        for index in range(4):
+            wait = wait_fixture(f"miss-{index}", "WaitingForUser", self.start)
+            wait["wait_attribution"] = {
+                "state": "UnresolvedAttribution", "reason": "ambiguous owner" if index < 3 else "different owner",
+                "candidates": candidates * 26,
+            }
+            waits.append(wait)
+        history = m.parse_wait_report(wait_report_fixture(self.window, waits, phases))
+        rows = m.hana_wait_rows(history, self.window, ())
+        sources = m.BaselineSources([], [], [], [], [], notification_report([], [], self.window),
+                                    [], [], [], [], [], [], history)
+        output = m.render(sources, self.window, self.window.until, full=True)
+        parsed = read_report_blocks(output)
+        shared_source = "progress_history.py waits; phase starts and wait starts in window; completed durations only"
+        labels = [f"run=hana-run; phase={index}; instance=candidate-{index}; cwd="
+                  + ("not recorded" if index == 0 else f"/archive/hana-{index}") for index in range(6)]
+        detail = " | ".join(labels)
+        grouped_phases = [row for row in parsed if row.measure == "Hana wait coverage / UncertainCoverage"]
+        self.assertEqual(grouped_phases, [
+            log_records.MeasureRow("Hana wait coverage / UncertainCoverage",
+                                   "overlapping phase records; candidates: " + detail, 26, self.window.label,
+                                   shared_source + "; phases: "
+                                   + ", ".join(f"hana-run/phase-{index}" for index in range(26))),
+            log_records.MeasureRow("Hana wait coverage / UncertainCoverage",
+                                   "another coverage reason; candidates: " + detail, 1, self.window.label,
+                                   shared_source + "; phases: hana-run/different-phase"),
+        ])
+        attribution = [row for row in parsed if row.measure == "Hana wait attribution / Unresolved"]
+        self.assertEqual(attribution, [
+            log_records.MeasureRow("Hana wait attribution / Unresolved", "ambiguous owner; candidates: " + detail,
+                                   3, self.window.label, shared_source + "; waits: miss-0, miss-1, miss-2"),
+            log_records.MeasureRow("Hana wait attribution / Unresolved", "different owner; candidates: " + detail,
+                                   1, self.window.label, shared_source + "; waits: miss-3"),
+        ])
+        original = next(row for row in rows if row.measure == "Hana wait coverage / UncertainCoverage")
+        for measure, quantities in (
+            ("Hana wait coverage / UncertainCoverage", [
+                log_records.Diagnostic(26, "overlapping phase records; candidates: " + detail),
+                log_records.Diagnostic(1, "another coverage reason; candidates: " + detail),
+            ]),
+            ("Hana wait attribution / Unresolved", [
+                log_records.Diagnostic(3, "ambiguous owner; candidates: " + detail),
+                log_records.Diagnostic(1, "different owner; candidates: " + detail),
+            ]),
+        ):
+            with self.subTest(measure=measure):
+                self.assertEqual([row.quantity for row in rows if row.measure == measure], quantities)
+        self.assertEqual(original.source, shared_source + "; phases: "
+                         + ", ".join(f"hana-run/phase-{index}" for index in range(26)))
+        self.assertEqual(len(history.phases), 27)
+        self.assertEqual(len(history.attribution_misses), 4)
+        self.assertNotRegex(output, r"\(\d+ times\)")
+        self.assertNotRegex(output, r"cwd=(?:\s*\||\s*$)")
+        self.assertEqual(phone_overflow_lines(output), [])
+
+    def test_unresolved_origins_and_source_problems_group_only_equal_reasons(self) -> None:
+        phases: list[log_records.JsonObject] = []
+        waits: list[log_records.JsonObject] = []
+        for index in range(4):
+            phase = wait_phase_fixture()
+            phase.update(run_id="unknown-run", phase_instance_id=f"unknown-{index}", unit="unknown-unit")
+            for field in ("plan_doc", "production", "repository"):
+                phase[field] = {"state": "NotRecorded", "reason": "origin absent" if index < 3 else "older origin absent"}
+            phases.append(phase)
+            wait = wait_fixture(f"bad-{index}", "invalid-kind" if index < 3 else "other-invalid-kind", self.start)
+            waits.append(wait)
+        history = m.parse_wait_report(wait_report_fixture(self.window, waits, phases))
+        diagnostics = m.hana_wait_rows(history, self.window, ())
+        output = log_records.blocks("Wait diagnostics", diagnostics)
+        rows = read_report_blocks(output)
+        source = "progress_history.py waits; phase starts and wait starts in window; completed durations only"
+        origins = [row for row in rows if row.measure == "Hana wait origin / UnresolvedPhaseOrigin"]
+        self.assertEqual(origins, [
+            log_records.MeasureRow("Hana wait origin / UnresolvedPhaseOrigin", "; ".join(["origin absent"] * 3),
+                                   3, self.window.label,
+                                   source + "; phases: unknown-run/unknown-0, unknown-run/unknown-1, unknown-run/unknown-2"),
+            log_records.MeasureRow("Hana wait origin / UnresolvedPhaseOrigin", "; ".join(["older origin absent"] * 3),
+                                   1, self.window.label, source + "; phases: unknown-run/unknown-3"),
+        ])
+        problems = [row for row in rows if row.measure == "Hana wait / source problem"]
+        self.assertEqual(problems, [
+            log_records.MeasureRow("Hana wait / source problem", "unknown wait kind: invalid-kind", 3,
+                                   self.window.label, source + "; waits: wait bad-0, wait bad-1, wait bad-2"),
+            log_records.MeasureRow("Hana wait / source problem", "unknown wait kind: other-invalid-kind", 1,
+                                   self.window.label, source + "; waits: wait bad-3"),
+        ])
+        for measure, quantities in (
+            ("Hana wait origin / UnresolvedPhaseOrigin", [
+                log_records.Diagnostic(3, "; ".join(["origin absent"] * 3)),
+                log_records.Diagnostic(1, "; ".join(["older origin absent"] * 3)),
+            ]),
+            ("Hana wait / source problem", [
+                log_records.Diagnostic(3, "unknown wait kind: invalid-kind"),
+                log_records.Diagnostic(1, "unknown wait kind: other-invalid-kind"),
+            ]),
+        ):
+            with self.subTest(measure=measure):
+                self.assertEqual([row.quantity for row in diagnostics if row.measure == measure], quantities)
+        self.assertEqual(phone_overflow_lines(output), [])
 
     def test_completed_wait_with_unresolved_supplier_adds_no_hana_minutes(self) -> None:
         reason = "supplier address is not recorded"

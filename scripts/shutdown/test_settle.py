@@ -54,8 +54,6 @@ if TYPE_CHECKING:
 else:
     import review
 import stop as stop_work
-# The module settle imports by its own path entry: a separate object from the package import below.
-import showrunners as settle_showrunners
 from scripts.accounts import accounts, moves, outage_alerts
 from scripts.whoami import usage_store
 from scripts.production import showrunners
@@ -75,7 +73,6 @@ def setUpModule() -> None:
     _ = unittest.enterModuleContext(patch.object(herdr, "security_session", return_value=herdr.NotMacSession()))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
-    _ = unittest.enterModuleContext(patch.object(settle_showrunners, "NOTIFIER_STATE_DIR", root))
 
 
 class SentCall(TypedDict):
@@ -454,7 +451,7 @@ class SettleTests(ShutdownTestCase):
         saved = self.unit_for_showrunner()
         with (
             self.rerun_fixtures(machine_inventory([saved["session"]])),
-            patch.object(settle_showrunners, "current_name", return_value="fixture-runner"),
+            patch.object(showrunners, "current_name", return_value="fixture-runner"),
         ):
             with patch.object(settle, "send_message", side_effect=Killed):
                 with self.assertRaises(Killed):
@@ -543,7 +540,7 @@ class SettleTests(ShutdownTestCase):
         saved = self.unit_for_showrunner()
         with (
             self.rerun_fixtures(machine_inventory([saved["session"]])),
-            patch.object(settle_showrunners, "current_name", return_value="fixture-runner"),
+            patch.object(showrunners, "current_name", return_value="fixture-runner"),
         ):
             with patch.object(settle, "send_message", side_effect=Killed):
                 with self.assertRaises(Killed):
@@ -661,7 +658,7 @@ class SettleTests(ShutdownTestCase):
 
         with (
             self.rerun_fixtures(machine_inventory([saved["session"]])),
-            patch.object(settle_showrunners, "current_name", return_value="fixture-runner"),
+            patch.object(showrunners, "current_name", return_value="fixture-runner"),
             patch.object(settle, "send_message", side_effect=send_message),
             patch.object(subprocess, "run", side_effect=deliver),
         ):
@@ -702,7 +699,7 @@ class SettleTests(ShutdownTestCase):
             return subprocess.CompletedProcess(command, code, output, "")
 
         with (
-            patch.object(settle_showrunners, "current_name", return_value="fixture-runner"),
+            patch.object(showrunners, "current_name", return_value="fixture-runner"),
             patch.object(subprocess, "run", side_effect=deliver) as sender,
         ):
             self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
@@ -745,7 +742,7 @@ class SettleTests(ShutdownTestCase):
 
         with (
             self.rerun_fixtures(machine_inventory([first["session"], second["session"]])),
-            patch.object(settle_showrunners, "current_name", return_value="fixture-runner"),
+            patch.object(showrunners, "current_name", return_value="fixture-runner"),
             patch.object(restart_work, "restart_failed_liveness", return_value=restart_work.SessionNotLive()),
         ):
             for saved in (first, second):
@@ -2066,7 +2063,7 @@ class SettleTests(ShutdownTestCase):
     def test_unit_showrunner_is_told_once_before_the_stop_and_once_when_back(self) -> None:
         saved = self.unit_for_showrunner()
         with (
-            patch.object(settle_showrunners, "current_name", return_value="runner") as named,
+            patch.object(showrunners, "current_name", return_value="runner") as named,
             patch.object(settle, "send_message", return_value={"kind": "sent"}) as send,
             patch.object(stop_work, "stop_session", side_effect=ignoring_idle_reason(unchanged)),
         ):
@@ -2094,7 +2091,7 @@ class SettleTests(ShutdownTestCase):
         self.save(stop)
         self.assertIsInstance(shutdown_record.forget_session(LOGIN, "unit", "natedev"), shutdown_record.SessionForgotten)
         with (
-            patch.object(settle_showrunners, "current_name", return_value="runner"),
+            patch.object(showrunners, "current_name", return_value="runner"),
             patch.object(settle, "send_message", return_value={"kind": "sent"}) as send,
         ):
             settle.tell_showrunners_outcome([back])
@@ -2104,7 +2101,7 @@ class SettleTests(ShutdownTestCase):
         saved = self.unit_for_showrunner(then="stop")
         with (
             patch.object(restart_work, "restart_failed_liveness", return_value=restart_work.SessionNotLive()),
-            patch.object(settle_showrunners, "current_name", return_value="runner"),
+            patch.object(showrunners, "current_name", return_value="runner"),
             patch.object(settle, "send_message", return_value={"kind": "sent"}) as send,
         ):
             settle.tell_showrunner_stopping(saved)
@@ -2127,7 +2124,7 @@ class SettleTests(ShutdownTestCase):
         self.assertIn("retired; /showrunner:resume_unit brings it back.",
                       settle._settle_text(saved, owner))  # pyright: ignore[reportPrivateUsage]
         self.assertIn("retired; /showrunner:resume_unit brings it back.", settle.holdout_line(saved))
-        with (patch.object(settle_showrunners, "current_name", return_value="runner"),
+        with (patch.object(showrunners, "current_name", return_value="runner"),
               patch.object(settle, "send_message", return_value={"kind": "sent"}) as send):
             settle.tell_showrunner_stopping(saved)
         self.assertEqual(self.sent(send), ("runner",
@@ -2140,7 +2137,7 @@ class SettleTests(ShutdownTestCase):
             _ = current.pop("why", None)
             _ = current.pop("target", None)
         saved = shutdown_record.update_session(LOGIN, "unit", user_stop)
-        with (patch.object(settle_showrunners, "current_name", return_value="runner"),
+        with (patch.object(showrunners, "current_name", return_value="runner"),
               patch.object(settle, "send_message", return_value={"kind": "sent"}) as send):
             settle.tell_showrunner_stopping(saved)
         self.assertEqual(self.sent(send), ("runner", "Unit is stopping: requested by the user",
@@ -2152,7 +2149,7 @@ class SettleTests(ShutdownTestCase):
         self.save(other)
         saved = self.unit_for_showrunner()
         with (
-            patch.object(settle_showrunners, "current_name", return_value=""),
+            patch.object(showrunners, "current_name", return_value=""),
             patch.object(settle, "send_message", return_value={"kind": "sent"}) as send,
         ):
             settle.tell_showrunner_stopping(other)
@@ -2172,7 +2169,7 @@ class SettleTests(ShutdownTestCase):
                     current["showrunner_told"] = settle.SHOWRUNNER_TOLD_STOPPING
                 saved = shutdown_record.update_session(LOGIN, "unit", failed)
                 with (patch.object(restart_work, "restart_failed_liveness", return_value=observed) as liveness,
-                      patch.object(settle_showrunners, "current_name", return_value="runner"),
+                      patch.object(showrunners, "current_name", return_value="runner"),
                       patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as send):
                     settle.tell_showrunners_outcome([saved])
                     liveness.assert_called_once_with(saved)
@@ -2209,7 +2206,7 @@ class SettleTests(ShutdownTestCase):
         with (patch.object(restart_work, "clear_running_on_target",
                            return_value=restart_work.TargetCheck([saved], [])),
               patch.object(restart_work, "restart_failed_liveness", return_value=restart_work.SessionLive()) as liveness,
-              patch.object(settle_showrunners, "current_name", return_value="runner"),
+              patch.object(showrunners, "current_name", return_value="runner"),
               patch.object(settle, "run_remote", return_value=(0, "[]")),
               patch.object(settle, "send_message", return_value=settle.MessageSent(kind="sent")) as send,
               patch.object(settle, "alert_user", return_value=True) as alert):
