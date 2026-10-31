@@ -38,7 +38,7 @@ ForwardedSession = AddressableSession | UnaddressableSession
 def forwarded_sessions() -> list[ForwardedSession]:
     identity = roster.sender_identity(os.environ)
     result = roster.roster(os.environ, roster.ThisMachine())
-    for problem in result.problems:
+    for problem in result.diagnostics:
         print(f"top_level: roster: {problem}", file=sys.stderr)
     # Select the newest running record before checking its socket, as the
     # roster does, so an older reachable process never replaces it.

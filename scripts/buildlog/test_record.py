@@ -189,6 +189,21 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(row["idle_targets"], targets)
         self.assertIsInstance(row["id"], str)
 
+    def test_floor_scan_preserves_takeable_bytes_and_reason_only_where_supplied(self) -> None:
+        targets: list[recorder.IdleFloorTarget] = [
+            {"folder": "/trees/whole/target", "last_use": START - 7200, "bytes": 65536},
+            {"folder": "/trees/linked/target", "last_use": START - 60, "bytes": 65536,
+             "takeable_bytes": 0, "reason": "links outside the target"},
+        ]
+        recorder.floor_scan(7 << 30, 10 << 30, targets, START)
+        row, = self.records()
+        self.assertEqual(row["idle_targets"], [
+            {"folder": "/trees/whole/target", "last_use": START - 7200, "bytes": 65536},
+            {"folder": "/trees/linked/target", "last_use": START - 60, "bytes": 65536,
+             "takeable_bytes": 0, "reason": "links outside the target"},
+        ])
+        self.assertEqual(row["shortfall"], 3 << 30)
+
     def test_queue_priority_events_keep_action_and_user_scope_in_the_build_log(self) -> None:
         at = float(START)
         for offset, action in enumerate(("set", "set", "clear")):
