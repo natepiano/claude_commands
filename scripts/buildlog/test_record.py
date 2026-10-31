@@ -175,6 +175,21 @@ class RecordTests(unittest.TestCase):
             found += [cast(Record, json.loads(line)) for line in path.read_text().splitlines()]
         return found
 
+    def test_floor_scan_records_free_space_shortfall_and_the_idle_target_inventory(self) -> None:
+        targets: list[recorder.IdleFloorTarget] = [
+            {"folder": "/trees/older/target", "last_use": START - 7200, "bytes": 123456},
+            {"folder": "/trees/recent/target", "last_use": START - 60, "bytes": 789012},
+        ]
+        recorder.floor_scan(7 << 30, 10 << 30, targets, START)
+        row, = self.records()
+        self.assertEqual((row["kind"], row["v"], row["host"], row["at"]),
+                         ("floor_scan", recorder.RECORD_VERSION, store.host_name(), store.utc_iso(START)))
+        self.assertEqual((row["free_after_scan"], row["floor"], row["shortfall"]),
+                         (7 << 30, 10 << 30, 3 << 30))
+        self.assertEqual(row["idle_targets"], targets)
+        self.assertIsInstance(row["id"], str)
+
+
     def handoff(self) -> Path:
         path = self.base / "handoff.log"
         _ = shutil.copyfile(TESTDATA / "nextest.txt", path)

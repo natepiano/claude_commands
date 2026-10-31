@@ -87,17 +87,17 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
                 0, charged=reason.charged, budget=reason.budget, budget_passes=False)
         elif isinstance(reason, gate.NeedsMemory):
             decision = gate.AdmissionDecision("hold", reason.threshold, reason.growth, reason.reserve,
-                0, free_passes=False, head_need=reason.head_need)
+                0, free_passes=False)
         elif isinstance(reason, gate.MemoryPressure):
             decision = gate.AdmissionDecision("hold", step.need + view.reserve, view.promised,
                                                       view.reserve, 0, pressure=reason)
         elif isinstance(reason, gate.ReadingUnavailable):
             host = reason
         first = gate.HeadExplanation(step, gate.NeedSourceNotRecorded(), decision,
-            gate.BudgetCheck(decision.charged, step.need, decision.head_need, decision.budget,
-                decision.budget - step.need - decision.head_need, decision.budget_passes),
+            gate.BudgetCheck(decision.charged, step.need, decision.budget,
+                decision.budget - step.need, decision.budget_passes),
             gate.FreeCheck(view.available, step.need, decision.reserve, decision.promised,
-                decision.head_need, decision.threshold, decision.free_passes),
+                decision.threshold, decision.free_passes),
             order, False, gate.NoBump())
     explanation = gate.QueueExplanation(view.now, host, running,
         gate.QueueMemoryTotals(sum(step.charged for step in running), sum(step.measured for step in running), view.promised),
@@ -321,9 +321,9 @@ class HeadFactsTests(unittest.TestCase):
             self.fail("fixture needs a head")
         for order, priority, expected in (
             (gate.StrictUntil(NOW + 125), True,
-             "strict until 07:02:05 (2 min 5 s left): younger steps wait"),
+             "younger steps may use 20.0 GiB of the budget until 07:02 (2 min 5 s left)"),
             (gate.BackfillUntil(NOW + 65), True,
-             "backfill until 07:01:05 (1 min 5 s left): younger steps that fit may start"),
+             "younger steps may start until 07:01 (1 min 5 s left)"),
             (gate.StrictUntil(NOW + 125), False,
              "no head priority: younger steps that fit may start"),
             (gate.BackfillUntil(NOW + 65), False,
@@ -333,6 +333,20 @@ class HeadFactsTests(unittest.TestCase):
                 explanation = replace(reading.explanation, head=replace(head, order=order, has_priority=priority))
                 facts = self.facts(replace(reading, explanation=explanation))
                 self.assertEqual(head_facts.order_text(facts, ZONE), expected)
+
+    def test_strict_order_has_no_room_when_head_needs_the_whole_budget(self) -> None:
+        reading = head_reading()
+        head = reading.explanation.head
+        if not isinstance(head, gate.HeadExplanation):
+            self.fail("fixture needs a head")
+        for need in (21, 22):
+            with self.subTest(need=need):
+                waiting = replace(head.waiter, need=need * gate.GIB)
+                explanation = replace(reading.explanation, head=replace(
+                    head, waiter=waiting, order=gate.StrictUntil(NOW + 125), has_priority=True))
+                facts = self.facts(replace(reading, explanation=explanation))
+                self.assertEqual(head_facts.order_text(facts, ZONE),
+                    "younger steps wait until 07:02 (2 min 5 s left)")
 
     def test_token_wait_is_unknown_without_a_record(self) -> None:
         facts = self.facts(head_reading(fields={"priority_since": NOW - 154}))
