@@ -304,6 +304,7 @@ class UsageReadOutcome(str, Enum):
     HELD = "held"
     OK = "ok"
     STALE_TOKEN = "stale_token"
+    NO_LOGIN_TOKEN = "no_login_token"
     REFUSED_401 = "refused_401"
     RATE_LIMITED_429 = "rate_limited_429"
     ERROR = "error"
@@ -801,7 +802,9 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
                 report.quota_problem = "Weekly quota: not read (stale token; a Claude session on this account refreshes it)"
                 return report
         if not token:
-            raise RuntimeError("usage credentials unavailable")
+            report.usage_read_outcome = UsageReadOutcome.NO_LOGIN_TOKEN
+            report.quota_problem = "Weekly quota: not read (no login token; start a Claude session on this account)"
+            return report
         request = urllib.request.Request(
             "https://api.anthropic.com/api/oauth/usage",
             headers={"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"},

@@ -3004,3 +3004,17 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 - `scripts/production/test_add_showrunner.py` — the herdr refusal text
 
 **Gotchas:** `refusal_watch` decides "queued" from the text `not delivered: QUEUED:` in the delivery outcome line. A change to `relay`'s text breaks that check.
+
+### Phase 101g — The Mac account board shows no false problems, and Codex launches on the Mac  · status: done
+
+Showrunner ruling 2026-10-31 06:29 EDT: one phase, order 2, 3, 1; the user asked for the Mac fix at 06:30. Item 0 came from the Mac board at 06:33.
+
+**Work Specification**
+
+0. **MCP home scope.** The `~` row compares the `~/.claude` project in `~/.claude`'s file with the `~/.claudeN` project in the account's file. Claude keys a project by its working folder, so both sides must read the same project: the `~/.claude` folder. Today the Mac shows `claudeN turns blender on in 1 project` for all four accounts after each account turned blender off in the `~/.claude` project.
+2. **Codex on the Mac.** `~/.codex` and `~/.codex2` hold the same login. The printed step `cutover-home codex2` refuses because `~/.codex2/auth.json` exists, so `codex` and `codex2` do not launch, and status lists codex2 twice. When the numbered home already holds the same login, `cutover-home` journals `~/.codex/auth.json` away (undo puts it back) instead of refusing. Status lists one row per login. Find and fix why `codex` and `codex2` do not launch. Never read or print auth.json contents; compare logins only through the code that already does so.
+3. **Credit reading age.** `_credit_reading` takes a reading of any age; the Mac's usage store is stale since 2026-10-16 because the snapshot timer is Linux-only. Give the reading an age limit: an older reading is named stale with its time, never shown as current. Give the Mac a current reading from this repo (the board fetches one when the stored reading is too old, or another one-place source).
+1. **MCP repair command.** An MCP difference prints `mcp-projects <label> <server> <direction>`, a lister. Print instead one command that makes the account match `~/.claude` for that server (atomic rewrite, same mode, a backup beside the file), and keep the lister only if a caller needs it.
+4. **No login token (found live on the Mac).** claude1, claude2 and claude4 hold a keychain entry with no access token. The read showed "usage read failed; next try in 2 min", a retry that cannot work. It now has its own outcome, `NO_LOGIN_TOKEN`, with the cause "no login token" and the step "start a session on it" (or "log in on it by hand" after a failed renewal). The expired-token step no longer promises a notes pass, which the Mac does not have.
+
+**As-built:** home row compares the `~/.claude` project in both files; `mcp-repair <label> <server>` matches an account to `~/.claude` for one server (dated backup, atomic write, a missing file created 0600); `cutover-home` archives a same-login `~/.codex/auth.json` through its journal, undo restores it; status shows one row per login; credit readings older than ten minutes show as stale with their time, and status reads Codex credits live when they are stale; `NO_LOGIN_TOKEN` as above. Review: two lenses, then one fix round (F001 missing-file repair, F002 no-token outcome), closure approved.

@@ -35,6 +35,7 @@ from zoneinfo import ZoneInfo
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader, installed_program
+from scripts.lib import atomic_file
 from scripts.production import showrunners
 from scripts.agents import codex_mesh
 from scripts.message import roster
@@ -2586,9 +2587,9 @@ class AccountsTests(unittest.TestCase):
 
         expected = (
             "claude2 turns brp off in 1 project where ~/.claude does not: "
-            + "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off",
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp",
             "claude2 turns account-only on in 1 project where ~/.claude does not: "
-            + "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 account-only on",
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 account-only",
         )
         for arguments in ((), ("status", "--json"), ("status", "--stored"), ("status", "--stored", "--json")):
             with self.subTest(arguments=arguments, tty=tty, helper_note=helper_note):
@@ -2949,10 +2950,10 @@ class AccountsTests(unittest.TestCase):
         config = self.write_mcp_configuration(self.home / ".claude2", ("brp",),
                                               {path: ["brp"] for path in projects})
         before = (baseline.read_bytes(), config.read_bytes())
-        command = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off"
+        command = "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp"
         self.assert_mcp_readout([f"claude2 turns brp off in 3 projects where ~/.claude does not: {command}"])
-        # Execute the printed command's account CLI arguments in the scratch HOME.
-        code, output, error = self.run_cli(*shlex.split(command)[2:])
+        # The lister remains read-only; the printed repair is covered separately.
+        code, output, error = self.run_cli("mcp-projects", "claude2", "brp", "off")
         self.assertEqual((code, error), (0, ""))
         self.assertCountEqual(output.splitlines(), projects)
         self.assertEqual((baseline.read_bytes(), config.read_bytes()), before)
@@ -2968,8 +2969,9 @@ class AccountsTests(unittest.TestCase):
         lines = [line for line in output.splitlines() if line.startswith(prefix)]
         self.assertEqual(len(lines), 1)
         command = lines[0].removeprefix(prefix)
-        self.assertEqual(self.run_cli(*shlex.split(command)[2:]), (0, project + "\n", ""))
-        self.assertEqual(shlex.split(command)[2:], ["mcp-projects", "--", "claude2", "-brp", "off"])
+        self.assertEqual(self.run_cli(*shlex.split(command)[2:]), (0, "", ""))
+        self.assertEqual(shlex.split(command)[2:], ["mcp-repair", "--", "claude2", "-brp"])
+        self.assertEqual(self.run_cli("mcp-projects", "--", "claude2", "-brp", "off"), (0, "", ""))
 
     def test_matching_mcp_configuration_has_no_difference_line_or_project_output(self) -> None:
         self.login_directory("claude2", "fixture@notexample.com")
@@ -2979,6 +2981,109 @@ class AccountsTests(unittest.TestCase):
         self.assert_mcp_readout([])
         for direction in ("off", "on"):
             self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", direction), (0, "", ""))
+
+    def test_mcp_home_scope_ignores_the_numbered_folders_different_project(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        _ = self.write_mcp_configuration(self.main_dir, ("blender",), {str(self.main_dir): ["blender"]})
+        _ = self.write_mcp_configuration(self.home / ".claude2", ("blender",), {
+            str(self.main_dir): ["blender"], str(self.home / ".claude2"): [],
+        })
+        self.assert_mcp_readout([])
+
+    def test_printed_mcp_repair_matches_both_directions_with_backup_and_mode(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        enabled, disabled, agreed = (str(self.root / name) for name in ("enabled", "disabled", "agreed"))
+        baseline = self.write_mcp_configuration(self.main_dir, ("brp",), {
+            str(self.main_dir): [], enabled: [], disabled: ["brp"], agreed: ["brp"],
+        })
+        config = self.write_mcp_configuration(self.home / ".claude2", ("brp", "keep"), {
+            str(self.main_dir): ["brp"], enabled: ["brp"], disabled: [], agreed: ["brp"],
+        })
+        config.chmod(0o640)
+        original, seed = config.read_bytes(), baseline.read_bytes()
+        code, output, error = self.run_cli("status", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        lines = [line for line in output.splitlines() if line.startswith("claude2 turns brp ")]
+        self.assertEqual(len(lines), 2)
+        command = lines[0].split(": ", 1)[1]
+        self.assertEqual(self.run_cli(*shlex.split(command)[2:]), (0, "", ""))
+        for direction in ("off", "on"):
+            self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", direction), (0, "", ""))
+        backups = list(config.parent.glob(".claude.json.mcp-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), original)
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o640)
+        self.assertEqual(config.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(baseline.read_bytes(), seed)
+        document = cast(McpConfigurationFixture, json.loads(config.read_text()))
+        self.assertEqual(document["oauthAccount"]["emailAddress"], "fixture@notexample.com")
+        self.assertIn("keep", document["mcpServers"])
+        self.assertEqual(document["projects"][agreed]["disabledMcpServers"], ["brp"])
+        repaired = config.read_bytes()
+        self.assertEqual(self.run_cli(*shlex.split(command)[2:]), (0, "", ""))
+        self.assertEqual(config.read_bytes(), repaired)
+        self.assertEqual(list(config.parent.glob(".claude.json.mcp-backup-*")), backups)
+
+    def test_failed_atomic_mcp_repair_keeps_the_original_and_its_backup(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        _ = self.write_mcp_configuration(self.main_dir, ("brp",), {})
+        config = self.write_mcp_configuration(self.home / ".claude2", (), {})
+        before = config.read_bytes()
+        with patch.object(atomic_file, "write_text_atomic", side_effect=OSError("fixture publish failure")):
+            code, output, error = self.run_cli("mcp-repair", "claude2", "brp")
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("fixture publish failure", error)
+        self.assertEqual(config.read_bytes(), before)
+        backups = list(config.parent.glob(".claude.json.mcp-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), before)
+
+    def test_printed_mcp_repair_creates_a_missing_configuration_privately(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        project = str(self.root / "baseline-only")
+        baseline = self.write_mcp_configuration(self.main_dir, ("brp",), {project: ["brp"]})
+        seed = baseline.read_bytes()
+        config = self.home / ".claude2/.claude.json"
+        config.unlink()
+        code, output, error = self.run_cli("status", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        line = next(line for line in output.splitlines() if line.startswith("claude2 turns brp off "))
+        self.assertEqual(self.run_cli(*shlex.split(line.split(": ", 1)[1])[2:]), (0, "", ""))
+        self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", "off"), (0, "", ""))
+        self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", "on"), (0, "", ""))
+        self.assertEqual(list(config.parent.glob(".claude.json.mcp-backup-*")), [])
+        self.assertEqual(baseline.read_bytes(), seed)
+
+    def test_missing_mcp_repair_preserves_a_configuration_created_during_publication(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        _ = self.write_mcp_configuration(self.main_dir, ("brp",), {})
+        config = self.home / ".claude2/.claude.json"
+        config.unlink()
+        create = atomic_file.create_text_atomic
+
+        def competing_create(path: Path, text: str) -> bool:
+            _ = config.write_text('{"keep": true}\n')
+            return create(path, text)
+
+        with patch.object(atomic_file, "create_text_atomic", side_effect=competing_create):
+            code, output, error = self.run_cli("mcp-repair", "claude2", "brp")
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("changed during repair", error)
+        self.assertEqual(config.read_text(), '{"keep": true}\n')
+
+    def test_mcp_repair_refuses_a_linked_configuration_without_touching_its_target(self) -> None:
+        self.login_directory("claude2", "fixture@notexample.com")
+        config = self.home / ".claude2/.claude.json"
+        target = self.root / "untouched.json"
+        _ = config.rename(target)
+        config.symlink_to(target)
+        before = target.read_bytes()
+        code, output, error = self.run_cli("mcp-repair", "claude2", "brp")
+        self.assertEqual((code, output), (1, ""))
+        self.assertIn("linked", error)
+        self.assertEqual(target.read_bytes(), before)
+        self.assertEqual(list(config.parent.glob(".claude.json.mcp-backup-*")), [])
 
     def test_mcp_project_in_one_file_compares_against_the_other_global_servers(self) -> None:
         self.login_directory("claude2", "fixture@notexample.com")
@@ -2991,7 +3096,7 @@ class AccountsTests(unittest.TestCase):
                                                   {project: ["brp"]} if account_only else {})
                 self.assert_mcp_readout([
                     f"claude2 turns brp {direction} in 1 project where ~/.claude does not: "
-                    + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp {direction}"])
+                    + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp"])
                 self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", direction),
                                  (0, project + "\n", ""))
 
@@ -3002,7 +3107,7 @@ class AccountsTests(unittest.TestCase):
         _ = self.write_mcp_configuration(self.home / ".claude2", (), {})
         self.assert_mcp_readout([
             "claude2 turns brp off in 2 projects where ~/.claude does not: "
-            + "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off"])
+            + "~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp"])
         code, output, error = self.run_cli("mcp-projects", "claude2", "brp", "off")
         self.assertEqual((code, error), (0, ""))
         self.assertCountEqual(output.splitlines(), ["~", project])
@@ -3022,7 +3127,7 @@ class AccountsTests(unittest.TestCase):
         _ = self.write_mcp_configuration(self.home / ".claude2", ("brp", "docs"), {project: ["brp", "docs"]})
         self.assert_mcp_readout([
             f"claude2 turns {server} off in 1 project where ~/.claude does not: "
-            + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 {server} off"
+            + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 {server}"
             for server in ("brp", "docs")])
         for server in ("brp", "docs"):
             self.assertEqual(self.run_cli("mcp-projects", "claude2", server, "off"), (0, project + "\n", ""))
@@ -3034,7 +3139,7 @@ class AccountsTests(unittest.TestCase):
         _ = self.write_mcp_configuration(self.home / ".claude2", ("brp",), {turned_on: [], turned_off: ["brp"]})
         self.assert_mcp_readout([
             f"claude2 turns brp {direction} in 1 project where ~/.claude does not: "
-            + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp {direction}"
+            + f"~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp"
             for direction in ("off", "on")])
         for direction, project in (("off", turned_off), ("on", turned_on)):
             self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", direction), (0, project + "\n", ""))
@@ -3054,8 +3159,8 @@ class AccountsTests(unittest.TestCase):
                     self.assertEqual((code, error), (0, ""))
                     lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags else output.splitlines())
                     if readable:
-                        self.assertIn("claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off", lines)
-                        self.assertIn("claude2 turns account-only on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 account-only on", lines)
+                        self.assertIn("claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp", lines)
+                        self.assertIn("claude2 turns account-only on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 account-only", lines)
                     else:
                         self.assertTrue(any("MCP configuration" in line and "~/.claude.json" in line
                                             and "Expecting property name" in line for line in lines))
@@ -3064,7 +3169,7 @@ class AccountsTests(unittest.TestCase):
                         status = next(item for item in accounts.account_statuses() if item.label == "claude2")
                         self.assertEqual(tuple(problem.path for problem in status.mcp_baseline_problems), (baseline,))
 
-    def test_mcp_comparison_uses_each_home_project_scope(self) -> None:
+    def test_mcp_comparison_uses_the_same_home_project_scope(self) -> None:
         self.login_directory("claude2", "fixture@notexample.com")
         baseline = agent_accounts.claude_config_file(self.main_dir)
         config = self.home / ".claude2/.claude.json"
@@ -3072,14 +3177,14 @@ class AccountsTests(unittest.TestCase):
             str(self.main_dir): {"mcpServers": {"brp": {}}, "disabledMcpServers": ["brp"]}}}))
         for enabled in (False, True):
             _ = config.write_text(json.dumps({"oauthAccount": {"emailAddress": "fixture@notexample.com"},
-                "projects": {str(config.parent): {"mcpServers": {"brp": {}} if enabled else {}}}}))
+                "projects": {str(self.main_dir): {"mcpServers": {"brp": {}} if enabled else {}}}}))
             for flags in ((), ("--json",)):
                 with self.subTest(enabled=enabled, flags=flags):
                     code, output, error = self.run_cli("status", "--stored", *flags)
                     self.assertEqual((code, error), (0, ""))
                     lines = (cast(accounts.StatusDocument, json.loads(output))["problems"] if flags else output.splitlines())
                     if enabled:
-                        self.assertIn("claude2 turns brp on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp on", lines)
+                        self.assertIn("claude2 turns brp on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp", lines)
                         self.assertEqual(self.run_cli("mcp-projects", "claude2", "brp", "on"), (0, "~\n", ""))
                     else:
                         self.assertFalse(any("mcpServers differ" in line for line in lines))
@@ -3104,7 +3209,7 @@ class AccountsTests(unittest.TestCase):
                         self.assertFalse(any("mcpServers differ" in line for line in lines))
                         self.assertFalse(any(line.startswith("claude2 turns ") for line in lines))
                     else:
-                        self.assertIn("claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off", lines)
+                        self.assertIn("claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp", lines)
 
     def test_selected_roles_name_the_missing_account_cause_once(self) -> None:
         for label in ("claude2", "claude3"):
@@ -3263,8 +3368,8 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertRegex(stdout, r"\| ~/\.claude2 +\| claude2 +\|")
         self.assertIn("claude2: unclassified entries; mystery-cache; check these entries in ~/.claude2; keep private files in this home", stdout.splitlines())
-        self.assertIn("claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off", stdout.splitlines())
-        self.assertIn("claude2 turns account-only on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 account-only on", stdout.splitlines())
+        self.assertIn("claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp", stdout.splitlines())
+        self.assertIn("claude2 turns account-only on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 account-only", stdout.splitlines())
 
     def test_claude_feedback_telemetry_and_atomic_write_temps_stay_private_after_setup(self) -> None:
         self.write_main_config()
@@ -4775,6 +4880,38 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual([row[3] for row in rows], ["80%", "5%"])
         self.assertEqual([row[6] for row in rows], ["7", "13"])
 
+    def test_stale_credits_are_named_and_refreshed_even_with_a_recent_weekly_reading(self) -> None:
+        self.write_note("codex1", "credits@example.invalid")
+        home = self.home / ".codex1"
+        self.codex_login("credits@example.invalid", home)
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(days=15)
+        reset = now + timedelta(days=3)
+        usage_store.save([agent_accounts.Report("Codex", email="credits@example.invalid",
+            quotas=[agent_accounts.Quota("Weekly", 100, reset)], credit_balance="12345")], old)
+        stored = usage_store.load()
+        usage = stored[usage_store.key("Codex", "credits@example.invalid")]
+        if "weekly" not in usage:
+            self.fail("fixture must save its weekly reading")
+        usage["weekly"]["at"] = now.isoformat()
+        _ = usage_store.store_file().write_text(json.dumps(stored))
+        code, output, error = self.run_cli("status", "--stored", "--json")
+        self.assertEqual((code, error), (0, ""))
+        row = cast(accounts.StatusDocument, json.loads(output))["accounts"][0]
+        self.assertIsNone(row["credits"])
+        self.assertFalse(row["credits_in_use"])
+        code, table, error = self.run_cli("status", "--stored")
+        self.assertEqual((code, error), (0, ""))
+        self.assertIn(f"stale since {old:%Y-%m-%d %H:%M %Z}", table)
+        self.assertNotIn("12,345", table)
+        self.codex_reads.assert_not_awaited()
+        self.codex_reads.return_value = agent_accounts.Report("Codex", email="credits@example.invalid",
+            quotas=[agent_accounts.Quota("Weekly", 100, reset)], credit_balance="9")
+        code, output, error = self.run_cli("status", "--json")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(cast(accounts.StatusDocument, json.loads(output))["accounts"][0]["credits"], 9)
+        self.codex_reads.assert_awaited_once_with(home)
+
     # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
     def test_status_detail_prints_codex_check_problems_below_the_table(self) -> None:
@@ -4849,6 +4986,35 @@ class AccountsTests(unittest.TestCase):
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):
             self.assertEqual(accounts.renew_login("claude2"),
                              accounts.LoginRenewalFailed("usage still shows an expired login"))
+        self.live[accounts.account_dir("claude2")].usage_read_outcome = agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0)):
+            self.assertEqual(accounts.renew_login("claude2"),
+                             accounts.LoginRenewalFailed("usage still shows no login token"))
+
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_missing_login_token_has_an_actionable_cause_in_table_and_json_on_both_machines(self) -> None:
+        self.login_directory("claude2", "idle@example.invalid")
+        at = datetime(2026, 10, 22, 15, 11, tzinfo=timezone.utc)
+        usage_store.save([agent_accounts.Report("Claude", email="idle@example.invalid",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN)], at)
+        for platform in ("darwin", "linux"):
+            for failed in (False, True):
+                path = accounts.login_renewals_file()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _ = path.write_text(json.dumps({"claude2": {"at": at.isoformat(), "outcome": "failed",
+                    "detail": "probe exited with status 7"}} if failed else {}))
+                cause = "no login token" + ("; a probe session at 08:11 failed" if failed else "")
+                step = "log in on it by hand" if failed else "start a session on it"
+                expected = f"claude2: usage unavailable; {cause}; {step}"
+                for flags in ((), ("--json",)):
+                    with self.subTest(platform=platform, failed=failed, flags=flags), patch.object(sys, "platform", platform):
+                        code, output, error = self.run_cli("status", "--stored", *flags)
+                        self.assertEqual((code, error), (0, ""))
+                        self.assertIn(expected, output)
+                        self.assertNotIn("next try", output)
+                        self.assertNotIn("next notes pass", output)
+        self.live_reads.assert_not_called()
 
     # Reserved fixtures model provider accounts in this status test.
     @patch.object(accounts, "is_test_login", new=provider_fixture_login)
@@ -4867,7 +5033,7 @@ class AccountsTests(unittest.TestCase):
                 for arguments in (("status", "--stored"), ("status", "--stored", "--json")):
                     code, output, error = self.run_cli(*arguments)
                     self.assertEqual((code, error), (0, ""))
-                    self.assertIn("login token expired; the next notes pass renews it", output)
+                    self.assertIn("login token expired; start a session on it", output)
         self.live_reads.assert_not_called()
 
     # Reserved fixtures model provider accounts in this status test.
@@ -4896,7 +5062,7 @@ class AccountsTests(unittest.TestCase):
         old = datetime(2001, 1, 2, 13, 29, tzinfo=timezone.utc)
         cases = (
             (agent_accounts.UsageReadOutcome.STALE_TOKEN,
-             "login token expired; the next notes pass renews it"),
+             "login token expired; start a session on it"),
             (agent_accounts.UsageReadOutcome.REFUSED_401,
              "the usage service did not accept this login; start a session on it to check it"),
             (agent_accounts.UsageReadOutcome.RATE_LIMITED_429,
@@ -4944,8 +5110,8 @@ class AccountsTests(unittest.TestCase):
              "the usage service did not accept this login; start a session on it to check it",
              "the usage service did not accept this login; start a session on it to check it"),
             (agent_accounts.UsageReadOutcome.STALE_TOKEN,
-             "login token expired; the next notes pass renews it",
-             "login token expired; the next notes pass renews it"),
+             "login token expired; start a session on it",
+             "login token expired; start a session on it"),
         )
         for outcome, with_reading, without_reading in cases:
             for has_reading, reason in ((True, with_reading), (False, without_reading)):
@@ -7277,7 +7443,7 @@ class StatusProblemCauseTests(unittest.TestCase):
 
     def test_duplicate_home_diagnostic_is_one_line_when_both_rows_have_one_account(self) -> None:
         statuses = self.codex_inventory(duplicate=True)
-        self.assertEqual([status.label for status in statuses], ["codex1", "codex1"])
+        self.assertEqual([status.label for status in statuses], ["codex1"])
         reading = self.status_with([], statuses, usage_store.StoredUsage())
         lines = [line for line in reading.notes if "login is stored in two homes" in line]
         self.assertEqual(len(lines), 1)
@@ -7316,7 +7482,9 @@ class StatusProblemCauseTests(unittest.TestCase):
 
     def test_startup_observation_does_not_own_another_homes_service_failure(self) -> None:
         statuses = self.codex_inventory(duplicate=True)
-        failed, other = statuses
+        failed = statuses[0]
+        other = replace(failed, home=self.home / ".codex2", folder="~/.codex2")
+        statuses = [failed, other]
         read = datetime(2026, 10, 29, 1, 14, tzinfo=timezone.utc)
         startup = agent_accounts.CodexStartupFailure(failed.home, "accounts.py setup codex1")
         for outcome in (agent_accounts.UsageReadOutcome.OK, agent_accounts.UsageReadOutcome.ERROR,
@@ -7381,8 +7549,8 @@ class StatusProblemCauseTests(unittest.TestCase):
         reading = self.status_with([status], [], usage_store.StoredUsage(), detail=True)
         expected = (
             "claude2: unclassified entries; mystery-cache; check these entries in ~/.claude2; keep private files in this home",
-            "claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off",
-            "claude2 turns account-only on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 account-only on",
+            "claude2 turns brp off in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 brp",
+            "claude2 turns account-only on in 1 project where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-repair claude2 account-only",
         )
         problems = cast(list[str], json.loads(accounts.render_status_json(reading))["problems"])
         for line in expected:
