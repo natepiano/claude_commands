@@ -86,7 +86,7 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 #### As-built
 
 - `scripts/buildlog/moments.py` is the one place for build moments and the hana set:
-  - `MOMENTS` holds 6 fixed moments (herdr cgroup move, baloo off, hana opt-level 1, hana Bevy dylib, the floor sweep, Build rules 1). Moment 1 carries sdlc's week baseline; the floor sweep carries sdlc's clone repeat figures. Moment 2 is one new `MOMENTS` entry when its hash lands.
+  - `MOMENTS` holds 6 fixed moments (herdr cgroup move, baloo off, hana opt-level 1, hana Bevy dylib, the floor sweep, Build rules 1); Phase 3 adds a seventh. Moment 1 carries sdlc's week baseline; the floor sweep carries sdlc's clone repeat figures. Moment 2 is one new `MOMENTS` entry when its hash lands.
   - `HANA_CTE` is the one hana set: sdlc's `nat` predicate, with sessions and calls classified over each measured window, natedev only.
   - `MetricKey` names each metric; `RATE_ROWS` lists the rate rows.
   - `window_rates(connection, start, end, *, phases=())` makes one SQL population read and one Python pass for every row. A step with a NULL session or cwd counts in the totals but never pairs.
@@ -136,8 +136,10 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 ### Phase 3 — The build report splits build rates at the queue test-phase charge  · status: done
 **Depends on:** Phase 1
 
-2026-10-31 16:36 EDT (the showrunner): set a moment at about 16:36 EDT; queue's test-phase charge and one decision pass are on main (2a819dfd).
+#### As-built
 
-- Add one `BuildMoment` to `MOMENTS` in `scripts/buildlog/moments.py`: `datetime(2026, 10, 31, 20, 36, tzinfo=UTC)`, name `"Queue test-phase charge (2a819dfd)"`, scope `"all"`, no sdlc baseline.
-- This is not Moment 2. Moment 2 stays phases-unit's prompt and lint change, added when its hash arrives.
-- `buildlog moments` shows the new moment with a thin after window until a day of data exists.
+- `MOMENTS` in `scripts/buildlog/moments.py` gains `BuildMoment(2026-10-31 20:36 UTC, "Queue test-phase charge (2a819dfd)", "all")`, 16:36 EDT, with no sdlc baseline. The showrunner set it when queue's test-phase charge and one decision pass reached main.
+- It is not Moment 2. Moment 2 stays phases-unit's prompt and lint change.
+- `buildlog moments` shows it as the newest section, with Build rules 1 (Moment 1) as its before window. Its after window is thin until a day of data exists.
+
+**Files:** `scripts/buildlog/moments.py`; `scripts/buildlog/test_moments.py` (the pinned moment order).
