@@ -15,7 +15,7 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
@@ -25,8 +25,6 @@ import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import pane_record  # noqa: E402
-if TYPE_CHECKING:
-    from scripts.shutdown import shutdown_record
 from rename_state import RenameRefused, read_json, write_json  # noqa: E402
 
 BERTH_KEY = "cargoBerthTarget"
@@ -311,7 +309,7 @@ def unit_pane(found: unit_lookup.MarkedUnit | None, _production: str) -> UnitPan
     return UnitPane(found.unit, found.place, shell)
 
 
-def close_unit_pane(pane: UnitPane | None, _saved: shutdown_record.SessionShutdown | None = None) -> None:
+def close_unit_pane(pane: UnitPane | None) -> None:
     """Close the unit's exact session-qualified pane after the caller stops the unit."""
     if pane is None:
         return

@@ -958,12 +958,10 @@ def _unit_argv(record: SessionShutdown, *, source_fallback: bool = False) -> lis
     if row_plan is not None and production_units.plan_cell_is_retired(row_plan):
         raise UnitRetired(f"{host['unit']} is retired in the Units table of {parent.doc}")
     plan_arguments: list[str]
-    if row_plan in ("standby", "permanent"):
-        plan_arguments = ["--" + row_plan]
-    elif row_plan:
-        plan_arguments = ["--plan", row_plan]
+    if row_plan:
+        plan_arguments = production_units.plan_arguments(row_plan)
     elif recorded_plan is not None and recorded_plan["kind"] == "plan":
-        plan_arguments = ["--plan", recorded_plan["path"]]
+        plan_arguments = production_units.plan_arguments(recorded_plan["path"])
     else:
         raise NoUnitPlan(f"{host['unit']} has no Plan in the Units table of {parent.doc} and no run record")
     note_path = _note_path(record, session["session_id"])
@@ -2523,10 +2521,6 @@ def relaunch_session(
     if dry_run:
         _ = launch_entry(record, restart_support.record_time(), desktop_state, dry_run=True)
         return record
-    if record["progress"]["kind"] != "restarting" and _unfinished_cleanup(record) and not recovery_store.legacy_tmux_leftovers(record) and record["session"]["session_id"] not in _live_session_ids():
-        command = restart_support.shutdown_command("restart", record["login"], "--here", "--only", record["session"]["session_id"])
-        mark_restart_failed(record, f"owner cleanup not confirmed; in a terminal on {record['machine']}: {command}")
-        return record
     try:
         current, claimed = _claim_relaunch(record)
     except NoLiveRecord:
@@ -2537,6 +2531,32 @@ def relaunch_session(
     claim = current["progress"]
     if claim["kind"] != "restarting":
         return current
+    if (_unfinished_cleanup(current) and not recovery_store.legacy_tmux_leftovers(current)
+            and current["session"]["session_id"] not in _live_session_ids()):
+        reason = ""
+        try:
+            cleanup = stop_resume.stop(current["session"]["session_id"])
+            if isinstance(cleanup, stop_resume.SessionNotFound):
+                # The tab reader proved no pane; registry absence alone cannot prove the saved Claude exited.
+                observed = _owner_liveness(current["session"])
+                if isinstance(observed, SessionLivenessUnknown):
+                    reason = observed.reason
+                elif isinstance(observed, SessionLive):
+                    reason = f"recorded Claude pid {current['session']['pid']} is still running"
+            elif isinstance(cleanup, stop_resume.StopFailed):
+                reason = cleanup.reason
+        except (OSError, RuntimeError, ValueError) as error:
+            reason = _error_reason(error)
+        if reason:
+            command = restart_support.shutdown_command("restart", current["login"], "--here", "--only", current["session"]["session_id"])
+            mark_restart_failed(current, f"owner cleanup not confirmed: {reason}; in a terminal on {current['machine']}: {command}")
+            return current
+        def cleaned(changing: SessionShutdown) -> None:
+            if not _same_relaunch_claim(current, changing):
+                raise OSError("restart claim changed during owner cleanup")
+            changing["stop_issues"] = [issue for issue in changing["stop_issues"]
+                if not (issue["kind"] == "unit session left running" and issue["cause"] == "stop not confirmed")]
+        current = update_session(current["login"], current["session"]["session_id"], cleaned)
     outcome = _launch_entry_safely(current, claim["at"], desktop_state)
     if isinstance(outcome, EntryLaunched) and outcome.relaunching_pending_timers:
         def reset_pending(changing: SessionShutdown) -> None:

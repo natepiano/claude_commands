@@ -178,15 +178,11 @@ def refusals(unit: RetiredUnit) -> list[str]:
     return refused
 
 
-def plan_arguments(unit: RetiredUnit) -> list[str]:
-    return [f"--{unit.plan}"] if unit.plan in ("standby", "permanent") else ["--plan", unit.plan]
-
-
 def launch_command(unit: RetiredUnit) -> list[str]:
     if not unit.session_id:
         raise Refused(f"{unit.name}: its Units row names no session to resume")
     return [sys.executable, str(ADD_UNIT), "--production", str(unit.production.doc), unit.name,
-            "--resume", unit.session_id, "--cwd", str(resume_folder(unit)), *plan_arguments(unit)]
+            "--resume", unit.session_id, "--cwd", str(resume_folder(unit)), *production_units.plan_arguments(unit.plan)]
 
 
 def make_worktree(unit: RetiredUnit) -> None:

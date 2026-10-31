@@ -286,7 +286,7 @@ class HealTests(NixFixture):
         commands = [cast(list[str], call.args[0]) for call in run.call_args_list]
         self.assertEqual(sum(command[2] == "resume" for command in commands), 1)
         self.assertEqual(sum("--need" in command for command in commands), 1)
-        self.assertFalse(any(entry["action"] == "resume" for entry in self.records()))
+        self.assertFalse(any(entry["action"] == "restart" for entry in self.records()))
         self.assertEqual(heal.read_history()[self.session.session_id]["pending"]["kind"], "launching")
         push = commands[-1]
         values = dict(push[index + 1].split("=", 1) for index, word in enumerate(push) if word == "--value")

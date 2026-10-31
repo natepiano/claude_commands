@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_support import linux_process_fixture, registry_confirmation, ShutdownSendLeaf, ShutdownTestCase
 import inventory
+import pane_record
 import shutdown_record
 import sessions
 import remote_control
@@ -2481,7 +2482,7 @@ class RestartTests(ShutdownTestCase):
         saved["stop_issues"] = [issue]
         self.create([saved])
         with (patch.object(restart, "_live_session_ids", return_value=frozenset()),
-              patch.object(stop_resume, "stop", return_value=saved) as cleanup,
+              patch.object(stop_resume, "stop", return_value=stop_resume.StopFailed("owner", "still running")) as cleanup,
               patch.object(restart, "_launch_entry_safely", return_value=restart.EntrySettled()) as launch,
               redirect_stdout(io.StringIO()) as output):
             _ = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
@@ -6322,34 +6323,65 @@ class RestartTests(ShutdownTestCase):
             self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
         self.assertEqual(self.files(), before)
 
-    def test_relaunch_retries_unconfirmed_herdr_unit_cleanup_before_launch(self) -> None:
-        saved = entry(unit("owner", session_host="herdr", session_name="herdr-owner"))
+    def unit_with_unconfirmed_cleanup(self, *timers: TimerRestore) -> SessionShutdown:
+        saved = entry(unit("owner"), timers=list(timers))
         saved["stop_issues"] = [shutdown_record.UnitSessionLeftRunning(
             kind="unit session left running", at=STOPPED, host="herdr",
             session_name="herdr-owner", cause="stop not confirmed",
         )]
         self.create([saved])
-        with (patch.object(stop_resume, "stop") as cleanup,
-              patch.object(restart, "_launch_session") as launch,
+        return saved
+
+    def test_relaunch_retries_unconfirmed_herdr_unit_cleanup_before_launch(self) -> None:
+        saved = self.unit_with_unconfirmed_cleanup()
+        events: list[str] = []
+        def cleanup(identity: str) -> stop_resume.Stopped:
+            self.assertEqual(identity, "owner")
+            events.append("cleanup")
+            return stop_resume.Stopped(identity, saved["session"]["pid"])
+        def launch(*_args: object, **_options: object) -> restart.SessionLaunched:
+            events.append("launch")
+            return restart.SessionLaunched(SUBMITTED_PROMPT)
+        with (patch.object(restart, "_retire"),
+              patch.object(stop_resume, "stop", side_effect=cleanup),
+              patch.object(restart, "_launch_session", side_effect=launch),
               patch.object(restart, "_live_session_ids", return_value=frozenset())):
             current = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
-        cleanup.assert_not_called()
-        launch.assert_not_called()
-        self.assertEqual(current["stop_issues"], saved["stop_issues"])
-        progress = current["progress"]
-        assert progress["kind"] == "restart failed"
-        self.assertIn("owner cleanup not confirmed", progress["reason"])
+        self.assertEqual(events, ["cleanup", "launch"])
+        self.assertEqual(current["stop_issues"], [])
 
+
+    def test_missing_pane_cleanup_uses_the_recorded_process_before_relaunch(self) -> None:
+        for observed in (restart.SessionNotLive(), sessions.LiveSessionProcess(301),
+                         restart.SessionLivenessUnknown("saved process unreadable")):
+            with (self.subTest(observed=observed), patch.dict(os.environ, {
+                    "SHUTDOWN_STATE_DIR": str(self.root / type(observed).__name__),
+            })):
+                saved = self.unit_with_unconfirmed_cleanup()
+                with (patch.object(restart, "_retire"),
+                      patch.object(restart, "_live_session_ids", return_value=frozenset()),
+                      patch.object(pane_record, "seed"),
+                      patch.object(pane_record, "read", return_value={}),
+                      patch.object(herdr.Herdr, "panes", return_value=[]) as panes,
+                      patch.object(sessions, "session_liveness", return_value=restart.SessionNotLive()),
+                      patch.object(sessions, "process_liveness", return_value=observed) as process,
+                      patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)) as launch):
+                    current = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
+                if isinstance(observed, restart.SessionNotLive):
+                    launch.assert_called_once()
+                    self.assertEqual(current["stop_issues"], [])
+                    self.assertEqual(current["progress"]["kind"], "restarting")
+                    process.assert_called_once_with(saved["session"]["pid"], saved["session"]["proc_start"])
+                else:
+                    launch.assert_not_called()
+                    self.assertEqual(current["progress"]["kind"], "restart failed")
+                    self.assertEqual(current["stop_issues"], saved["stop_issues"])
+                panes.assert_called_once()
 
     def test_unconfirmed_cleanup_prevents_launch_and_timer_restore(self) -> None:
-        saved = entry(unit("owner"), timers=[TimerRestore(instance="timer", was_enabled=True)])
-        saved["stop_issues"] = [shutdown_record.UnitSessionLeftRunning(
-            kind="unit session left running", at=STOPPED, host="herdr",
-            session_name="herdr-owner", cause="stop not confirmed",
-        )]
-        self.create([saved])
+        saved = self.unit_with_unconfirmed_cleanup(TimerRestore(instance="timer", was_enabled=True))
         from scripts.shutdown import stop_resume
-        with patch.object(stop_resume, "stop", return_value=saved), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_launch_session") as launch, patch.object(restart_support, "run_notifier") as timers:
+        with patch.object(stop_resume, "stop", return_value=stop_resume.StopFailed("owner", "still running")), patch.object(restart, "_live_session_ids", return_value=frozenset()), patch.object(restart, "_launch_session") as launch, patch.object(restart_support, "run_notifier") as timers:
             current = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
         launch.assert_not_called()
         timers.assert_not_called()
@@ -6377,6 +6409,23 @@ class RestartTests(ShutdownTestCase):
             self.assertIn(LOGIN, line)
             self.assertIn("--only owner", line)
             self.assertIn("~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py", line)
+
+    def test_a_failed_cleanup_retry_can_succeed_on_the_next_restart(self) -> None:
+        saved = self.unit_with_unconfirmed_cleanup()
+        with (patch.object(restart, "_retire"),
+              patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
+              patch.object(restart, "_live_session_ids", return_value=frozenset()),
+              patch.object(stop_resume, "stop", side_effect=[stop_resume.StopFailed("owner", "still running"),
+                                                           stop_resume.NotRunning("owner")]),
+              patch.object(restart, "_launch_session", return_value=restart.SessionLaunched(SUBMITTED_PROMPT)) as launch):
+            first = restart.relaunch_session(saved, dry_run=False, desktop_state=self.desktop_state)
+            self.assertEqual(first["progress"]["kind"], "restart failed")
+            self.assertEqual(first["stop_issues"], saved["stop_issues"])
+            launch.assert_not_called()
+            second = restart.relaunch_session(self.stored_record(), dry_run=False, desktop_state=self.desktop_state)
+        launch.assert_called_once()
+        self.assertEqual(second["progress"]["kind"], "restarting")
+        self.assertEqual(second["stop_issues"], [])
 
     def test_unreachable_peer_restart_prints_scoped_retry_in_peer_terminal(self) -> None:
         cases = (

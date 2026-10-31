@@ -119,6 +119,16 @@ class MoveTest(unittest.TestCase):
         rename_checkout.checkout("demo")
         self.assertEqual(self.git(self.new, "rev-parse", "HEAD"), self.git(self.new, "rev-parse", "origin/work"))
 
+    def test_checkout_ignores_its_coordinator_but_still_resumes_after_the_move(self) -> None:
+        with (mock.patch.object(unit_move, "processes_inside", return_value=[os.getpid()]),
+              mock.patch.object(rename_checkout, "_session_records", return_value=[]),
+              mock.patch.object(stop_resume, "stop", return_value=stop_resume.Stopped("s-1", 1)),
+              mock.patch.object(stop_resume, "resume", return_value=stop_resume.Resumed("s-1", "p1", "claude2")) as resumed):
+            rename_checkout.checkout("demo")
+        self.assertFalse(self.old.exists())
+        self.assertTrue(self.new.exists())
+        resumed.assert_called_once_with("s-1", why="showrunner checkout moved")
+
     def test_checkout_refuses_when_the_shutdown_record_lacks_the_move(self) -> None:
         with (mock.patch.object(stop_resume, "stop") as stop,
               mock.patch.object(rename_checkout, "_session_records", return_value=[{"session": {"session_id": "s-1"}}])):

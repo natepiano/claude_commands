@@ -4,10 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
-from typing import cast, final
+from typing import TYPE_CHECKING, cast, final
+from unittest.mock import patch
+import rename_unit
+import add_unit
+from scripts.production.cli_fixture import parse_arguments
+if TYPE_CHECKING:
+    from scripts.shutdown import shutdown_record
+else:
+    import shutdown_record
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -21,6 +30,28 @@ from scripts.production.rename_unit_test_support import UnitRenameFixture
 
 @final
 class UnitRenameSessionsTests(UnitRenameFixture):
+
+    def test_recordless_rename_relaunch_is_a_valid_add_unit_request(self) -> None:
+        rename = rename_unit.plan("demo", "alpha", "gamma", self.root / "scratch")
+        rename.session_id = "sid-alpha"
+        for mode in ("docs/plans/alpha.md", "standby", "permanent"):
+            with self.subTest(mode=mode):
+                text = self.doc.read_text().replace("alpha-unit | docs/plans/alpha.md", "gamma-unit | " + mode)
+                self.write(self.doc, text)
+                def launch(command: list[str], **_options: object) -> subprocess.CompletedProcess[str]:
+                    options = parse_arguments(add_unit.main, command[2:])
+                    self.assertIsNotNone(options)
+                    assert options is not None
+                    request = add_unit.launch_request(options)
+                    self.assertIsInstance(request.session, add_unit.ResumedSession)
+                    self.assertEqual(request.unit_id, "gamma-unit")
+                    return subprocess.CompletedProcess(command, 0, "", "")
+                with (patch.object(shutdown_record, "find_session", return_value=None),
+                      patch.object(subprocess, "run", side_effect=launch),
+                      patch.object(rename_unit, "_await_live") as observed):
+                    rename_unit._relaunch(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
+                observed.assert_called_once_with(rename)
+                self.write(self.doc, text.replace("gamma-unit | " + mode, "alpha-unit | docs/plans/alpha.md"))
 
     def moved_unit_with_leftover_marks(self) -> None:
         _ = self.seed_record()

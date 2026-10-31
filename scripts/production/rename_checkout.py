@@ -62,7 +62,7 @@ def _move_git(old: Path, new: Path) -> None:
         raise RenameRefused(f"{new} already exists")
     if (old / ".git").is_dir():
         raise RenameRefused(f"{old} is a main worktree; git moves only a linked worktree")
-    if running := unit_move.processes_inside(old):
+    if running := [pid for pid in unit_move.processes_inside(old) if pid != os.getpid()]:
         raise RenameRefused(f"processes still work in {old}: {', '.join(map(str, running))}")
     _ = _git(old, "worktree", "move", str(old), str(new))
     _ = _git(new, "worktree", "repair")

@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 import io
+import argparse
 import os
 from pathlib import Path
 import signal
@@ -15,6 +16,29 @@ import sys
 from types import ModuleType
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
+
+
+class _Parsed(Exception):
+    """Stop a real CLI immediately after argument parsing."""
+
+
+def parse_arguments(main: Callable[[list[str]], int], arguments: list[str]) -> argparse.Namespace | None:
+    """Run only the CLI's real parser; return its options without running a handler."""
+    parse = argparse.ArgumentParser.parse_args
+    options: argparse.Namespace | None = None
+    def parse_only(parser: argparse.ArgumentParser, args: list[str] | None = None,
+                   namespace: argparse.Namespace | None = None) -> argparse.Namespace:
+        nonlocal options
+        options = parse(parser, args, namespace)
+        raise _Parsed
+    with patch.object(argparse.ArgumentParser, "parse_args", parse_only), redirect_stderr(io.StringIO()):
+        try:
+            _ = main(arguments)
+        except _Parsed:
+            return options
+        except SystemExit:
+            return None
+    return None
 
 
 def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str],

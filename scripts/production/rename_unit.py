@@ -888,9 +888,13 @@ def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
         if shutdown_record.find_session(rename.account, rename.session_id) is not None:
             run_shutdown("restart", "--only", rename.session_id)
         else:
+            rows = production_units.unit_table(Path(rename.doc).read_text(encoding="utf-8").splitlines())
+            row = next((row for row in rows if production_units.cell_value(row["Unit"]) == rename.new), None)
+            if row is None or not (plan := production_units.cell_value(row.get("Plan", ""))):
+                raise RenameRefused(f"{rename.new}: no Plan in {rename.doc}")
             result = subprocess.run([sys.executable, str(Path(add_unit.__file__)),
-                "--production", rename.doc, rename.new, "--resume", rename.session_id,
-                "--cwd", rename.new_worktree, "--session-name", unit_names.stem(rename.new)],
+                "--production", rename.doc, rename.new, *production_units.plan_arguments(plan),
+                "--resume", rename.session_id, "--cwd", rename.new_worktree],
                 capture_output=True, text=True, check=False)
             if result.returncode:
                 raise RenameRefused((result.stderr or result.stdout).strip())

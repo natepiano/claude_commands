@@ -1109,6 +1109,14 @@ land a phase sooner. Each design check covers every view of the change at once
       checks and shots for both run on the combined tree.
 </CrossUnitChange>
 
+<StopResume>
+Stop a local session with `agents stop SESSION`. Resume it in its own tab with
+`agents resume SESSION --why "reason"`. Move one session or a group with
+`accounts.py move SESSION_OR_GROUP claudeN --why "reason"`; it stops all selected
+sessions, then resumes each on that account with one message to continue its work
+and its existing workers. See `commands/shutdown.md`.
+</StopResume>
+
 ---
 
 

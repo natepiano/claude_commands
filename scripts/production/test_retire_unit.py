@@ -4,7 +4,6 @@ pool and build_hold are recording stand-ins, and the unit's Claude sessions are 
 writes: nothing real stops."""
 from __future__ import annotations
 
-import argparse
 import io
 import json
 import os
@@ -13,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast, final, override
 from unittest import mock
@@ -45,6 +44,7 @@ else:
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.shutdown import shutdown, stop_resume
 from scripts.production import staff
+from scripts.production.cli_fixture import parse_arguments
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
 # The fixture replaces the lookup; a test of the lookup itself puts it back.
@@ -65,28 +65,6 @@ def session(session_id: str, name: str, pid: int) -> SessionRecord:
     return SessionRecord(pid=pid, sessionId=session_id, name=name, messagingSocketPath="/nonexistent.sock",
                          updatedAt=0, tmux="", formerNames=[])
 
-
-class _Parsed(Exception):
-    """Raised after shutdown.py's parser accepts a command line, before anything runs."""
-
-
-def shutdown_parses(arguments: list[str]) -> bool:
-    """Whether shutdown.py's own parser takes this command line; nothing runs."""
-    parse = argparse.ArgumentParser.parse_args
-
-    def parse_only(parser: argparse.ArgumentParser, args: list[str] | None = None,
-                   namespace: argparse.Namespace | None = None) -> argparse.Namespace:
-        _ = parse(parser, args, namespace)
-        raise _Parsed
-
-    with mock.patch.object(argparse.ArgumentParser, "parse_args", parse_only), redirect_stderr(io.StringIO()):
-        try:
-            _ = shutdown.main(arguments)
-        except _Parsed:
-            return True
-        except SystemExit:
-            return False
-    return False
 
 @final
 class RetireUnitTests(unittest.TestCase):
@@ -460,7 +438,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertIn("forget", [call[0] for call in calls])
         for arguments in calls:
             with self.subTest(arguments=arguments):
-                self.assertTrue(shutdown_parses(arguments), f"shutdown.py refuses {arguments}")
+                self.assertIsNotNone(parse_arguments(shutdown.main, arguments), f"shutdown.py refuses {arguments}")
 
     def test_retires_a_unit_with_a_seat_a_worker_and_a_reviewer(self) -> None:
         code, output = self.retire()
