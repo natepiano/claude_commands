@@ -1540,7 +1540,7 @@ def read_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
         doc = Path(runner["doc"])
         lines = read_source(str(doc), lambda: doc.read_text(encoding="utf-8").splitlines(), [], problems, event_source=log_records.SourceNotApplicable.STATE)
         repo = read_source(str(doc), lambda: production_units.production_field(lines, "Repository"), "repository not recorded", problems, event_source=log_records.SourceNotApplicable.STATE)
-        rows = read_source(str(doc), lambda: production_units.live_unit_table(lines, runner["slug"]), [], problems, event_source=log_records.SourceNotApplicable.STATE)
+        rows = read_source(str(doc), lambda: unit_lookup.live_unit_table(lines, runner["slug"]), [], problems, event_source=log_records.SourceNotApplicable.STATE)
         for row in rows:
             tree = production_units.cell_value(row.get("Worktree", ""))
             name = production_units.cell_value(row.get("Unit", ""))

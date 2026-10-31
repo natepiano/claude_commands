@@ -54,10 +54,31 @@ class ProductionNameTests(unittest.TestCase):
 
 @final
 class LifecycleTests(LifecycleFixture):
+    def test_open_excludes_the_log_once_and_rerun_keeps_the_shared_exclude_file(self) -> None:
+        result = self.run_lifecycle("open", "--no-ci", "--session", "test-showrunner")
+        self.assert_step(result, "ok")
+        exclude = self.checkout / self.git("rev-parse", "--git-common-dir") / "info/exclude"
+        before = exclude.read_bytes(), exclude.stat().st_mtime_ns, self.log.read_bytes()
+        self.assertEqual(exclude.read_text().splitlines().count("production.log"), 1)
+        self.assertEqual(self.git("check-ignore", "production.log"), "production.log")
+        self.assertEqual(self.git("ls-files", "production.log"), "")
+        again = self.run_lifecycle("open", "--no-ci", "--session", "test-showrunner")
+        self.assert_step(again, "ok")
+        self.assertEqual((exclude.read_bytes(), exclude.stat().st_mtime_ns, self.log.read_bytes()), before)
+
+    def test_open_refuses_a_log_negated_by_gitignore_without_publishing_it(self) -> None:
+        self.write(self.checkout / ".gitignore", "!production.log\n")
+        _ = self.git("add", ".gitignore")
+        _ = self.git("commit", "-m", "Negate log exclusion")
+        result = self.run_lifecycle("open", "--no-ci", "--session", "test-showrunner")
+        self.assert_step(result, "failed")
+        self.assertIn("production.log", result.stdout)
+        self.assertFalse(self.log.exists())
+
     @override
     def setUp(self) -> None:
         super().setUp()
-        _ = self.staff.write_document({"schema": 1, "rows": []})
+        _ = self.staff.write_document({"schema": 2, "rows": []})
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", self.state / "notifier"))
 
     @override
