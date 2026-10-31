@@ -409,34 +409,21 @@ Checkpoints c0377368 and 4751eb55 on `natedev-verify-cancel`.
 
 ### Phase 13 — Stop the Mac copy watcher when verify ends before the watcher starts  · status: done
 
-**Origin:** builds showrunner, 2026-10-31 00:3x EDT, add-on. Branch `natedev-verify-cancel` (carries Phases 9 and 10), worktree `/home/natepiano/worktrees/claude-build-followups-verify-cancel`, merged with origin/builds 1de3f51c at f133fa6e.
+#### As-built
 
-**Depends on:** Phase 10 (same `verify.sh` stop path).
+Checkpoint be7ffc50 on `natedev-verify-cancel`.
 
-#### Work Order
-
-**Source:** builds, 2026-10-31. `copy_watch.py`'s `Wakeup` stops on parent loss: it saves `os.getppid()` when it starts and stops when that value changes. When `verify.sh` dies before the watcher saves it, the saved value is already the new parent (init or a subreaper), so the watcher never sees the loss and runs on.
-
-**Goal:** the watcher always stops when the `verify.sh` process that started it is gone, also when that process ended before the watcher started.
-
-**Spec:**
-
-1. Reproduce first: a test starts the watcher with a parent that has already exited (or exits before the watcher reads its parent), and shows the watcher keeps running.
-2. `verify.sh` `start_copy_watch` passes the pid of the shell that starts the watcher (`--parent-pid`). Use the pid that is the watcher's real parent at start (in a subshell that is not `$$`); say in the summary which value you pass and why.
-3. `Wakeup` takes that pid from the arguments in place of its own `os.getppid()` read, and stops when `os.getppid()` differs from it, at its first check. No second parent check, no sweep.
-4. A missing `--parent-pid` is an argument error, not a fallback.
+- `start_copy_watch` in `verify.sh` passes the launching shell's pid as `--parent-pid`: `BASHPID`, because `$$` stays the outer shell's pid in a subshell. Bash 3.2 has no `BASHPID`; there an exec'd child `sh` prints its `PPID`.
+- `copy_watch.py` `Wakeup(read_fd, parent_pid)` and `wakeup_on_signals(parent_pid)` take that pid from the arguments. `Wakeup.stop_requested` stops when `os.getppid()` differs from it, also at the first check, so a watcher whose `verify.sh` ended before the watcher started stops at once.
+- `--parent-pid` is a required argument; without it the watcher exits 2 (argparse error) and writes no result.
 
 **Files:**
 - `scripts/direct/verify.sh` — `start_copy_watch`
-- `scripts/mac_test/copy_watch.py` — `Wakeup` and the argument
-- `scripts/mac_test/test_copy_watch.py` — the gap test
+- `scripts/mac_test/copy_watch.py` — `Wakeup`, `wakeup_on_signals`, `--parent-pid`
+- `scripts/mac_test/test_copy_watch.py` — `assert_parent_loss_stops_watcher(before_start=True)`; `test_parent_already_exited_before_watcher_initializes` (fails on f133fa6e), `test_missing_parent_pid_is_an_argument_error`
 
-**Workers:** 1 writer.
+**Gotchas:**
+- The gap test's wrapper waits for the reparent, then runs `os.execv` with the real watcher command. `runpy.run_path` inside `python -c` does not put `scripts/mac_test` on `sys.path`, so that form passes only with `PYTHONPATH` set and fails in the merge gate.
+- Watch item: one `test_verify_hold_signals` TERM run had 2 run-log tees alive at 5.2 s under load; the rerun passed. A repeat points at the Phase 10 stop path.
 
-**State:** none.
-
-**Constraints from prior phases:** Phase 10's stop path (`verify_interrupted`) and its tests stay as they are. Phase 1b (main worktree, not yet committed) changes other parts of `copy_watch.py` (the shared process-start reader); keep this change inside `Wakeup`, its argument and `start_copy_watch`, so the two merge cleanly.
-
-**Acceptance gate:**
-- The gap test fails on f133fa6e and passes after the change; a normal parent loss after start still stops the watcher (existing test passes unchanged).
-- Every `scripts/mac_test/test_*` module and `scripts.direct.test_verify_hold_signals` pass; basedpyright `0 errors, 0 warnings, 0 notes` on the changed Python files; `bash -n` and shellcheck on `verify.sh` with no new findings; the merge gate passes.
+**Ruled out:** `$$` as the parent pid; a fallback to `os.getppid()` when `--parent-pid` is missing; a second parent check or a sweep.
