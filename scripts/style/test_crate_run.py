@@ -475,6 +475,111 @@ class CrateRunTests(CargoProjectTests):
         with self.assertRaisesRegex(bulk.BulkRenameError, "shared or cross-crate"):
             owners.require(".", ("src/child.rs",))
 
+    def test_cross_package_mount_shares_only_its_module_descendants(self) -> None:
+        for path, text in {
+            "src/mounted.rs": 'mod child; #[path="explicit.rs"] mod renamed; mod inline { mod nested; }',
+            "src/child.rs": "mod leaf;",
+            "src/child/leaf.rs": "pub fn leaf() {}",
+            "src/explicit.rs": "pub fn explicit() {}",
+            "src/inline/nested.rs": "pub fn nested() {}",
+            "src/unrelated.rs": "pub fn unrelated() {}",
+            "beta/src/lib.rs": '#[path="../../src/mounted.rs"] mod shared;',
+        }.items():
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _ = target.write_text(text + "\n")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "mount one file with module descendants")
+        owners = self.ownership()
+        for path in ("src/mounted.rs", "src/child.rs", "src/child/leaf.rs",
+                     "src/explicit.rs", "src/inline/nested.rs"):
+            with self.subTest(path=path):
+                self.assertEqual(owners.owners[path], {".", "beta"})
+                with self.assertRaisesRegex(bulk.BulkRenameError, "shared or cross-crate"):
+                    owners.require(".", (path,))
+        owners.require(".", ("src/lib.rs", "src/unrelated.rs"))
+        # A second propagation (as target discovery performs) must preserve flat-child lookup.
+        owners.propagate()
+        self.assertEqual(dict(owners.uncertain), {})
+        owners.require(".", ("src/unrelated.rs",))
+
+    def test_unproved_mounted_descendants_refuse_only_the_declaring_file(self) -> None:
+        for source in ('#[cfg_attr(feature="alternate", path="alternate.rs")] mod child;',
+                       '#[path=env!("CHILD")] mod child;',
+                       'mod child;'):
+            with self.subTest(source=source):
+                _ = (self.repo / "src/mounted.rs").write_text(source + "\n")
+                _ = (self.repo / "src/unrelated.rs").write_text("pub fn unrelated() {}\n")
+                _ = (self.repo / "beta/src/lib.rs").write_text(
+                    '#[path="../../src/mounted.rs"] mod shared;\n')
+                _ = self.git("add", ".")
+                _ = self.git("commit", "-qm", "unproved mounted descendants")
+                owners = self.ownership()
+                self.assertIn("src/mounted.rs", owners.uncertain)
+                self.assertNotIn("src/unrelated.rs", owners.uncertain)
+                with self.assertRaisesRegex(bulk.BulkRenameError, "ambiguous shared-source ownership"):
+                    owners.require(".", ("src/mounted.rs",))
+                owners.require(".", ("src/lib.rs", "src/unrelated.rs"))
+
+    def test_unproved_sibling_keeps_every_proved_shared_descendant(self) -> None:
+        for failed in ('#[cfg(any())] mod missing;',
+                       '#[cfg_attr(feature="alternate", path="alternate.rs")] mod missing;',
+                       '#[path=env!("CHILD")] mod missing;'):
+            for declarations in ("mod child; " + failed, failed + " mod child;"):
+                with self.subTest(declarations=declarations):
+                    for path, source in {
+                        "src/lib.rs": "mod child;",
+                        "src/mounted.rs": declarations,
+                        "src/child.rs": "mod leaf;",
+                        "src/child/leaf.rs": "pub fn leaf() {}",
+                        "beta/src/lib.rs": '#[path="../../src/mounted.rs"] mod shared;',
+                    }.items():
+                        target = self.repo / path
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        _ = target.write_text(source + "\n")
+                    _ = self.git("add", ".")
+                    _ = self.git("commit", "-qm", "mixed module evidence")
+                    owners = self.ownership()
+                    self.assertIn("src/mounted.rs", owners.uncertain)
+                    for path in ("src/child.rs", "src/child/leaf.rs"):
+                        self.assertEqual(owners.owners[path], {".", "beta"})
+                        with self.assertRaisesRegex(bulk.BulkRenameError, "shared or cross-crate"):
+                            owners.require(".", (path,))
+
+    def test_inline_path_mount_shares_only_its_actual_child_routes(self) -> None:
+        for path, source in {
+            "src/lib.rs": "",
+            "src/shared/child.rs": "mod leaf;",
+            "src/shared/child/leaf.rs": "pub fn leaf() {}",
+            "src/shared/explicit.rs": "pub fn explicit() {}",
+            "src/shared/unrelated.rs": "pub fn unrelated() {}",
+            "beta/src/lib.rs": ('#[path="../../src/shared"] mod shared { '
+                                + 'mod child; #[path="explicit.rs"] mod renamed; }'),
+        }.items():
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _ = target.write_text(source + "\n")
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "inline mount with shared child routes")
+        owners = self.ownership()
+        for path in ("src/shared/child.rs", "src/shared/child/leaf.rs", "src/shared/explicit.rs"):
+            self.assertIn(path, owners.reachable(("beta/src/lib.rs",)))
+            self.assertEqual(owners.owners[path], {".", "beta"})
+            with self.assertRaisesRegex(bulk.BulkRenameError, "shared or cross-crate"):
+                owners.require(".", (path,))
+        self.assertEqual(dict(owners.uncertain), {})
+        owners.require(".", ("src/lib.rs", "src/shared/unrelated.rs"))
+        # The rename-layout owner still refuses inline paths in its strict mode.
+        with self.assertRaisesRegex(bulk.BulkRenameError, "out-of-line module"):
+            _ = bulk.module_file_paths(Path("beta/src/lib.rs"), owners.sources["beta/src/lib.rs"])
+        # A conditional route cannot leave its potential loaded targets editable.
+        _ = (self.repo / "beta/src/lib.rs").write_text(
+            '#[cfg_attr(feature="shared", path="../../src/shared")] mod shared { mod child; }\n')
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "unproved inline mount")
+        with self.assertRaisesRegex(bulk.BulkRenameError, "unproved inline mount"):
+            self.ownership().require(".", ("src/shared/child.rs",))
+
     def test_shared_source_boundary_runs_before_planner_overlay(self) -> None:
         _ = (self.repo / "beta/src/lib.rs").write_text('include_str!("../../src/lib.rs");\n')
         _ = self.git("add", ".")
@@ -541,6 +646,72 @@ class CrateRunTests(CargoProjectTests):
         owners.require(".", ("src/lib.rs",))
         owners.require("beta", ("beta/src/lib.rs",))
 
+    def test_invoked_builtin_include_alias_preserves_shared_source_edge(self) -> None:
+        for imported in ("std::include_str as source", "core::{include_bytes as source}",
+                         "std::include as source"):
+            with self.subTest(imported=imported):
+                _ = (self.repo / "beta/src/lib.rs").write_text(
+                    f'use {imported}; const CODE: &str = source!("../../src/lib.rs");\n')
+                _ = self.git("add", ".")
+                _ = self.git("commit", "-qm", "invoked builtin loader alias")
+                owners = self.ownership()
+                self.assertIn("src/lib.rs", owners.edges["beta/src/lib.rs"])
+                self.assertEqual(owners.owners["src/lib.rs"], {".", "beta"})
+                with self.assertRaisesRegex(bulk.BulkRenameError, "shared or cross-crate"):
+                    owners.require(".", ("src/lib.rs",))
+        _ = (self.repo / "beta/src/lib.rs").write_text(
+            'use std::include_str as source; const CODE: &str = source!(dynamic);\n')
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "nonliteral invoked alias")
+        with self.assertRaisesRegex(bulk.BulkRenameError, "nonliteral include_str"):
+            self.ownership().require("beta", ("beta/src/lib.rs",))
+
+    def test_cfg_predicate_path_data_is_not_a_loader(self) -> None:
+        _ = (self.repo / "beta/src/lib.rs").write_text("\n".join((
+            '#[cfg(path = "not_a_source.rs")] pub fn f() {}',
+            '#[cfg_attr(path = "also_data.rs", allow(dead_code))] pub fn g() {}',
+            '#[tool::metadata(path = "metadata.rs")] pub fn h() {}', "")))
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "path predicates are data")
+        owners = self.ownership()
+        self.assertEqual(dict(owners.uncertain), {})
+        self.assertEqual(owners.edges, {})
+        owners.require("beta", ("beta/src/lib.rs",))
+
+    def test_qualified_and_chained_loader_imports_keep_literal_edges(self) -> None:
+        for source in (
+            'mod loaders { pub use std::include_str as source; } '
+            + 'const CODE: &str = loaders::source!("../../src/lib.rs");',
+            'use std::include_str; use include_str as source; '
+            + 'const CODE: &str = source!("../../src/lib.rs");',
+            'mod loaders { pub use core::{include_bytes as source}; } '
+            + 'use self::loaders as renamed; use renamed::source as code; '
+            + 'const CODE: &[u8] = code!("../../src/lib.rs");',
+            'mod loaders { pub use std::include as source; } '
+            + 'crate::loaders::source!("../../src/lib.rs");',
+            'use ::std as library; use library::include_str as source; '
+            + 'const CODE: &str = source!("../../src/lib.rs");',
+            'mod loaders { pub use std as system; } '
+            + 'const CODE: &str = loaders::system::include_str!("../../src/lib.rs");',
+            'mod loaders { pub use std as system; } '
+            + 'const CODE: &str = self::loaders::system::include_str!("../../src/lib.rs");',
+        ):
+            with self.subTest(source=source):
+                _ = (self.repo / "beta/src/lib.rs").write_text(source + "\n")
+                _ = self.git("add", ".")
+                _ = self.git("commit", "-qm", "qualified or chained source loader")
+                owners = self.ownership()
+                self.assertIn("src/lib.rs", owners.edges["beta/src/lib.rs"])
+                self.assertEqual(owners.owners["src/lib.rs"], {".", "beta"})
+                with self.assertRaisesRegex(bulk.BulkRenameError, "shared or cross-crate"):
+                    owners.require(".", ("src/lib.rs",))
+                _ = (self.repo / "beta/src/lib.rs").write_text(
+                    source.replace('"../../src/lib.rs"', 'dynamic') + "\n")
+                _ = self.git("add", ".")
+                _ = self.git("commit", "-qm", "unproved qualified or chained source loader")
+                with self.assertRaisesRegex(bulk.BulkRenameError, "nonliteral include"):
+                    self.ownership().require("beta", ("beta/src/lib.rs",))
+
     def test_unreachable_uncertainty_does_not_refuse_selected_crate(self) -> None:
         _ = (self.repo / "beta/src/lib.rs").write_text('include!(concat!(env!("OUT_DIR"), "/code.rs"));\n')
         _ = self.git("add", ".")
@@ -585,6 +756,94 @@ class CrateRunTests(CargoProjectTests):
         self.assertEqual([row.reason for row in self.authority.bulk_refusals(ticket)], [reason])
         self.assertIn("let number", self.git("show", self.destination + ":src/lib.rs"))
         self.assertIn("let old", self.git("show", self.destination + ":src/uncertain.rs"))
+
+    def test_admission_refusal_survives_later_planning_abort(self) -> None:
+        def abort(_checkout: Path, _ledger: ledger_api.Ledger, _base: str,
+                  selected: run.Selection, _availability: run.PlanningFileAvailability,
+                  _definition: rules.Rule) -> run.PlannedEdits:
+            self.assertEqual([finding.path for finding in selected.findings], ["src/lib.rs"])
+            raise bulk.BulkRenameError("later planning abort")
+        self.assert_admission_refusal_survives_abort(abort, fixture_execute, "later planning abort")
+
+    def test_admission_refusal_survives_later_validation_abort(self) -> None:
+        with mock.patch.object(run, "validate", side_effect=bulk.BulkRenameError("later validation abort")):
+            self.assert_admission_refusal_survives_abort(renamed, fixture_execute, "later validation abort")
+
+    def test_planner_refusal_survives_post_plan_base_abort_before_claim_release(self) -> None:
+        self.freeze(paths=("src/lib.rs",))
+        identity = self.batch.read()["crates"]["bulk_sample"]["selected"][0]["id"]
+        reason = "planner refused bad"
+        expected = [{"finding_id": identity, "reason": reason}]
+
+        patching = mock.patch.object(run, "require_base",
+                                     side_effect=bulk.BulkRenameError("canonical base moved"))
+
+        def planned(_checkout: Path, _ledger: ledger_api.Ledger, _base: str,
+                    selected: run.Selection, _availability: run.PlanningFileAvailability,
+                    _definition: rules.Rule) -> run.PlannedEdits:
+            self.assertEqual([finding.finding_id for finding in selected.findings], [identity])
+            # The next base check fails only after the planner has returned its refusal.
+            _ = patching.start()
+            return run.PlannedEdits((), (bulk.Refusal(identity, reason),))
+
+        drop = self.authority.ticket_drop_batch
+        def dropped(ticket: str, owner: ledger_api.BatchOwner) -> None:
+            self.assertEqual(self.batch.read()["refusals"], expected)
+            self.assertEqual([(row.finding_id, row.reason)
+                              for row in self.authority.bulk_refusals(ticket)],
+                             [(identity, reason)])
+            drop(ticket, owner)
+        try:
+            with mock.patch.object(
+                    self.authority, "ticket_drop_batch", side_effect=dropped) as dropping:
+                result = self.batch.advance(
+                    "bulk_sample", planned, self.commands, available, fixture_execute)
+        finally:
+            _ = patching.stop()
+        record = result["crates"]["bulk_sample"]
+        self.assertEqual(record["stage"], crates.CrateStage.ABANDONED)
+        self.assertEqual(record.get("error"), "canonical base moved")
+        self.assertEqual(result["refusals"], expected)
+        self.assertEqual(self.batch.read()["refusals"], expected)
+        self.assertEqual(dropping.call_count, 1)
+        assert "tickets" in record
+        ticket = record["tickets"][identity]
+        self.assertEqual([(row.finding_id, row.reason)
+                              for row in self.authority.bulk_refusals(ticket)],
+                         [(identity, reason)])
+
+    def assert_admission_refusal_survives_abort(self, planner: crates.Planner,
+                                               executor: crates.PlanExecutor, error: str) -> None:
+        _ = (self.repo / "src/uncertain.rs").write_text(
+            (self.repo / "src/lib.rs").read_text() + 'include!(dynamic);\n')
+        _ = self.git("add", ".")
+        _ = self.git("commit", "-qm", "early refusal then abort")
+        self.base, self.tree = self.git("rev-parse", "HEAD"), self.git("rev-parse", "HEAD^{tree}")
+        _ = self.git("update-ref", self.destination, self.base)
+        self.authority.set_tip(self.base)
+        self.freeze(shared_proposal=True, paths=("src/lib.rs", "src/uncertain.rs"))
+        frozen = self.batch.read()["crates"]["bulk_sample"]
+        identity = next(item["id"] for item in frozen["selected"] if item["path"] == "src/uncertain.rs")
+        reason = "ambiguous shared-source ownership: src/uncertain.rs: nonliteral include source loader"
+        expected = [{"finding_id": identity, "reason": reason}]
+        drop = self.authority.ticket_drop_batch
+        def dropped(ticket: str, owner: ledger_api.BatchOwner) -> None:
+            self.assertEqual(self.batch.read()["refusals"], expected)
+            self.assertEqual([(row.finding_id, row.reason) for row in self.authority.bulk_refusals(ticket)],
+                             [(identity, reason)])
+            drop(ticket, owner)
+        with mock.patch.object(self.authority, "ticket_drop_batch", side_effect=dropped) as dropping:
+            result = self.batch.advance("bulk_sample", planner, self.commands, available, executor)
+        record = result["crates"]["bulk_sample"]
+        self.assertEqual(record["stage"], crates.CrateStage.ABANDONED)
+        self.assertEqual(record.get("error"), error)
+        self.assertEqual(result["refusals"], expected)
+        self.assertEqual(self.batch.read()["refusals"], expected)
+        self.assertEqual(dropping.call_count, 1)
+        assert "tickets" in record
+        ticket = record["tickets"][identity]
+        self.assertEqual([(row.finding_id, row.reason) for row in self.authority.bulk_refusals(ticket)],
+                         [(identity, reason)])
 
     def test_final_uncertain_loader_refuses_only_its_edit_group(self) -> None:
         _ = (self.repo / "src/second.rs").write_bytes((self.repo / "src/lib.rs").read_bytes())
