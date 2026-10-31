@@ -189,7 +189,7 @@ Dropped 2026-10-30 by its own rule: no module that natedev's condition allows to
 
 **Ruled out:** a table refresh on outside writes during one call — every writer uses the store path.
 
-### Phase 6b — The queue grace reaches child processes in tests  · status: todo
+### Phase 6b — The queue grace reaches child processes in tests  · status: done
 **Depends on:** Phase 6; models' compaction repair 2 checkpoint (met: 99d7b894)
 
 Source: devtools-unit diagnosis, 2026-10-30; models-unit's go, 2026-10-30. `QUEUE_GRACE_SECS = 3.0` (`scripts/agents/codex_mesh.py:306`, used at about line 2978) makes `follow` wait 3 s after each turn. `MeshCommandFixture` patches it to 0.0 in the test process (`scripts/agents/test_codex_mesh.py:831`), but `direct/test_assign_launcher.py` runs codex_mesh as a child process, so the child still waits: 3 s per dispatch. Goal: codex_mesh reads the grace from one env var at use (default 3.0), and `MeshCommandFixture` sets that env var where it patches the constant now. Build on models' checkpoint, which rewrites much of both files; send models the diff for those two files before the merge. The Work Order is written when the hash arrives.

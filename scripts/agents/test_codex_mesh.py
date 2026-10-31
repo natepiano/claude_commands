@@ -922,9 +922,9 @@ class MeshCommandFixture(unittest.TestCase):
             "DESIGN_ROLES_STATE": str(self.session_dir / "design-roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.session_dir / "design-ownership"),
             "UNIT_RUN_DIR": "", "PLAN_DELEGATE_RUN_DIR": "", "PLAN_DELEGATE_BOARD_DIR": "",
+            "CODEX_MESH_QUEUE_GRACE_SECS": "0",
         })))
         _ = self.patches.callback(set_environment("USAGE_STATE_DIR", str(self.session_dir / "usage-state")))
-        _ = self.patches.enter_context(patch.object(codex_mesh, "QUEUE_GRACE_SECS", 0.0))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_capacity_clock", self.clock, create=True))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_capacity_sleep", self.wait, create=True))
 
@@ -1951,8 +1951,55 @@ class RecordedTurnSettingsTests(unittest.TestCase):
 
 
 @final
+class QueueGraceSettingsTests(unittest.TestCase):
+    def test_unset_or_empty_grace_keeps_the_production_window(self) -> None:
+        with patch.dict(os.environ):
+            _ = os.environ.pop("CODEX_MESH_QUEUE_GRACE_SECS", None)
+            self.assertEqual(codex_mesh.queue_grace_secs(), 3.0)
+            os.environ["CODEX_MESH_QUEUE_GRACE_SECS"] = ""
+            self.assertEqual(codex_mesh.queue_grace_secs(), 3.0)
+
+    def test_grace_reads_each_environment_change(self) -> None:
+        for value in ("0", "0.125", "2.5"):
+            with self.subTest(value=value), patch.dict(os.environ, {"CODEX_MESH_QUEUE_GRACE_SECS": value}):
+                self.assertEqual(codex_mesh.queue_grace_secs(), float(value))
+
+    def test_invalid_grace_is_refused_with_its_configuration_name(self) -> None:
+        for value in ("invalid", "-1", "nan", "inf", "-inf", " "):
+            with (
+                self.subTest(value=value),
+                patch.dict(os.environ, {"CODEX_MESH_QUEUE_GRACE_SECS": value}),
+                self.assertRaisesRegex(SystemExit, "CODEX_MESH_QUEUE_GRACE_SECS"),
+            ):
+                _ = codex_mesh.queue_grace_secs()
+
+
+@final
 class MeshCommandTests(MeshCommandFixture):
     """Launcher and recovery behavior against the shared bounded fake server."""
+
+    def test_child_inherits_zero_queue_grace_without_waiting_for_a_frame(self) -> None:
+        script = """
+import contextlib
+import sys
+import time
+from unittest.mock import patch
+from scripts.agents import codex_mesh
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
+with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as client:
+    with patch.object(client, "next_frame", side_effect=AssertionError("child opened a queue grace wait")):
+        more_work = codex_mesh._more_work_coming(client, sys.argv[2], time.time() + TEST_HANG_GUARD_SECS)
+    assert not more_work, "an empty idle thread was reported as queued work"
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(self.server.port), THREAD_ID],
+            cwd=Path(codex_mesh.__file__).resolve().parents[2], env=os.environ.copy(),
+            capture_output=True, text=True, timeout=TEST_HANG_GUARD_SECS,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.methods("thread/queue/list")), 1)
+        self.assertEqual(len(self.methods("thread/read")), 1)
 
     def test_accelerated_reader_preserves_wire_order_around_an_rpc_reply(self) -> None:
         notices = [_notice(f"notice/{name}", {}) for name in ("A", "B", "C")]
@@ -10234,6 +10281,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.server.respond = trailing_status
         check_more_work = codex_mesh._more_work_coming  # pyright: ignore[reportPrivateUsage]
         finish_stream = codex_mesh._finish_stream  # pyright: ignore[reportPrivateUsage]
+        queue_grace = codex_mesh.queue_grace_secs
         next_frame = codex_mesh.Client.next_frame
         read = codex_mesh.Client._read  # pyright: ignore[reportPrivateUsage]
         grace_active = False
@@ -10291,7 +10339,8 @@ class FollowEventRegressionTests(MeshCommandFixture):
             return finish_stream(stream)
 
         with (
-            patch.object(codex_mesh, "QUEUE_GRACE_SECS", SingleGraceWindow(0.05)),
+            patch.dict(os.environ, {"CODEX_MESH_QUEUE_GRACE_SECS": "0.05"}),
+            patch.object(codex_mesh, "queue_grace_secs", side_effect=lambda: SingleGraceWindow(queue_grace())),
             patch.object(codex_mesh, "_more_work_coming", wraps=observed_more_work) as more_work,
             patch.object(codex_mesh.Client, "next_frame", new=observed_next_frame),
             patch.object(codex_mesh.Client, "_read", new=observed_read),
