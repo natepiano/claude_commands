@@ -200,6 +200,10 @@ only I can bump
 
 **Ruled out:** a second inputs type beside `QueueInputs`; a `queue_decision` call per row (a full walk to read one row).
 
+### Phase 4b — The build budget is a config value, 24 GiB for a one-day trial  · status: done
+
+As built (fe2f920a, on origin/builds cc16b3fe, 2026-10-31): `[memory] build_budget_gib=24` in `config/lint.conf`. One reader, `memory_admit.build_budget_bytes()`: `BUILDLOG_BUILD_BUDGET_GIB` wins, then the config value, then `FALLBACK_BUILD_BUDGET_BYTES` (21 GiB) for a missing or invalid value; read at each check. `head_facts`, `queue_view`, `build_why`, `AdmissionDecision` and the expected-peak cap call it. Tests pin the budget by env. Showrunner ask; the user approved 24 for a one-day trial.
+
 ### Phase 5 — The queue service, its socket protocol and its client exist and pass in-process tests; no build uses them yet  · status: todo
 **Depends on:** Phase 4
 **Blocked by:** none. This phase adds files only and changes no caller and no admission (builds showrunner, 2026-10-31).
