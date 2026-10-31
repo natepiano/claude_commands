@@ -21,6 +21,13 @@ SCRIPTS = VERIFY.parent.parent
 TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
 
 
+def workspace_taplo_script(source: str) -> str:
+    """Extract the production formatter for fixtures that run part of verify."""
+    return "workspace_taplo() (" + source.split(
+        "workspace_taplo() (", 1,
+    )[1].split("\n)\n", 1)[0] + "\n)\n"
+
+
 class CargoInvocation(TypedDict):
     args: list[str]
 
@@ -348,9 +355,7 @@ if __name__ == "__main__":
 
     def invoke_workspace_taplo(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         """Exercise the production formatter without simulating a remote build hold."""
-        formatter = "workspace_taplo() (" + VERIFY.read_text(encoding="utf-8").split(
-            "workspace_taplo() (", 1,
-        )[1].split("\n)\n", 1)[0] + "\n)\n"
+        formatter = workspace_taplo_script(VERIFY.read_text(encoding="utf-8"))
         return subprocess.run(
             ["bash", "-c", 'set -euo pipefail\nrun() { "$@"; }\n' + formatter
              + 'workspace_taplo "$@"', "taplo-fixture", *arguments],
