@@ -4059,7 +4059,7 @@ class MeshCommandTests(MeshCommandFixture):
         starts = self.methods("turn/start")
         self.assertEqual([_as_test_dict(request["params"]).get("threadId") for request in starts], [THREAD_ID])
         inputs = cast(list[dict[str, object]], _as_test_dict(starts[0]["params"])["input"])
-        self.assertEqual([item["text"] for item in inputs], ["next launch prompt", "Run finished: verify.sh check"])
+        self.assertEqual([item["text"] for item in inputs], ["Run finished: verify.sh check", "next launch prompt"])
         pending = cast(codex_mesh.WorkerPendingMessages,
                        json.loads((self.session_dir / "worker.pending.json").read_text(encoding="utf-8")))
         self.assertEqual((pending["thread_id"], pending["messages"]), (THREAD_ID, []))
@@ -8350,6 +8350,31 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(pending["messages"], [])
         self.assertIs(pending["accepting_messages"], False)
 
+    def test_new_task_is_the_last_input_after_held_messages(self) -> None:
+        _ = self.prepare_refusing_account()
+        room = refusals.ReadingWindow(100, refusals.NoResetKnown(), datetime.now(timezone.utc))
+        held = ["First held message: end your turn", "Run finished: second held message"]
+        for preserved in (False, True):
+            for continuation in (False, True):
+                with self.subTest(preserved_work=preserved, continuation_owed=continuation):
+                    self.write_pool_roster({"worker": {
+                        "thread_id": THREAD_ID, "status": "done", "port": self.server.port,
+                        "preserved_work": preserved, "continuation_owed": continuation,
+                    }})
+                    for message in held:
+                        code, _output, errors = self.run_mesh([
+                            "send", "--to", "worker", "--message", message])
+                        self.assertEqual((code, errors), (0, ""))
+                    self.server.requests.clear()
+                    with patch.object(refusals, "stored_reading", return_value=refusals.FreshReading(
+                            room, refusals.NoWindow(), "")):
+                        self.assertEqual(self.run_follow("New task"), (0, ""))
+                    starts = self.methods("turn/start")
+                    self.assertEqual(len(starts), 1)
+                    params = _as_test_dict(starts[0]["params"])
+                    expected = [*held, *(["Continue where you stopped."] if continuation else []), "New task"]
+                    self.assertEqual(params["input"], [{"type": "text", "text": text} for text in expected])
+
     def test_send_after_launcher_closes_inbox_is_held_until_follow_after_its_prompt(self) -> None:
         sent: list[int] = []
         output = io.StringIO()
@@ -8379,7 +8404,7 @@ class MeshCommandTests(MeshCommandFixture):
         params = _as_test_dict(starts[0].get("params"))
         self.assertEqual(params["threadId"], THREAD_ID)
         inputs = cast(list[dict[str, object]], params["input"])
-        self.assertEqual([item["text"] for item in inputs], ["next dispatch prompt", message])
+        self.assertEqual([item["text"] for item in inputs], [message, "next dispatch prompt"])
         pending = cast(codex_mesh.WorkerPendingMessages, json.loads(pending_path.read_text()))
         self.assertEqual(pending["messages"], [])
         self.assertIs(pending["accepting_messages"], False)
@@ -8768,7 +8793,7 @@ class MeshCommandTests(MeshCommandFixture):
         starts = [request for request in new.requests if request.get("method") == "turn/start"]
         self.assertEqual(len(starts), 1)
         inputs = cast(list[dict[str, object]], _as_test_dict(starts[0].get("params"))["input"])
-        self.assertEqual([item["text"] for item in inputs], ["next launch prompt", *messages])
+        self.assertEqual([item["text"] for item in inputs], [*messages, "next launch prompt"])
         pending = cast(codex_mesh.WorkerPendingMessages, json.loads((self.session_dir / "worker.pending.json").read_text()))
         self.assertEqual(pending["messages"], [])
         self.assertIs(pending["accepting_messages"], False)
@@ -11475,7 +11500,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
         starts = self.methods("turn/start")
         self.assertEqual(len(starts), 1, starts)
         inputs = cast(list[dict[str, object]], _as_test_dict(starts[0]["params"])["input"])
-        ordered = ["Run finished: preserved verification passed", "preserved local task",
+        ordered = ["preserved local task", "Run finished: preserved verification passed",
                    "Continue where you stopped.", "new assignment"]
         self.assertEqual([item.get("text") for item in inputs], ordered)
         self.assertEqual(self.methods("thread/start"), [])

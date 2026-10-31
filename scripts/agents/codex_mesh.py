@@ -5558,13 +5558,18 @@ def _move_idle_worker(
                         {"thread_id": thread_id, "status": "starting", "port": port},
                         RosterActiveLauncher(thread_id, (client.launcher_pid, os.getpid()))):
                         raise SystemExit(f"codex_mesh: {name}: roster ownership changed before continuation")
-                    if previous.get("preserved_work"):
+                    if previous.get("preserved_work") and not message:
+                        # Preserve the existing result-first recovery order when
+                        # there is no new assignment. New tasks retain held order.
                         messages.sort(key=lambda text: 0 if text.startswith(("Run finished:", "Run ended with no result:")) else 1)
-                        inputs = [*messages, *(["Continue where you stopped."] if owes_continuation else []),
-                                  *([message] if message else [])]
-                    else:
-                        inputs = (["Continue where you stopped.", *([message] if message else []), *messages] if owes_continuation
-                                  else [message, *messages] if message else messages)
+                    inputs = list(messages)
+                    if owes_continuation:
+                        # Without an assignment, ordinary recovery still leads
+                        # with continuation; every new task follows all held text.
+                        continuation_at = len(inputs) if message or previous.get("preserved_work") else 0
+                        inputs.insert(continuation_at, "Continue where you stopped.")
+                    if message:
+                        inputs.append(message)
                     cleanup = WorkerTurnCleanup(port, thread_id)
                     turn_id = _start_turn(moved, args, thread_id, _worker_sandbox(args, session_dir, name),
                                           inputs[0], tuple(inputs[1:]))
