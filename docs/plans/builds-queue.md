@@ -208,6 +208,15 @@ As built (fe2f920a, on origin/builds cc16b3fe, 2026-10-31): `[memory] build_budg
 
 As built (b20effdf, on origin/builds e2773be6, 2026-10-31; builds showrunner, urgent): a `verify.sh lint` in a worktree from before Phase 4b ran its own `memory_admit.py` and wrote budget 21 into `admission/queue.json`, so `/build:queue` showed 21.0 or 24.0 at random. `QueueInputs` has no `limits`; `queue_read_from(inputs, limits)` takes them from its caller, and the private `_queue_read_live` resolves them once per reading for `queue_read` and `read_queue_pass`. The snapshot is version 2; a version-1 snapshot reads as absent and the reader takes the bounded locked read. A check from an old tree still decides its own step with its own budget until that tree merges builds.
 
+### Phase 4d — Phase 4 carries resources Phase 26: merge of builds at e2773be6  · status: todo
+**Depends on:** Phase 4, resources Phase 26 (on origin/builds e2773be6)
+**Blocked by:** none.
+
+#### Work Order
+
+**Goal:** merge `origin/builds` into builds-queue. Phase 4 (930fd7ea, the one decision pass) is not on builds yet, and resources Phase 26 landed first, so this branch carries Phase 26's changes into Phase 4 under option B (one copy each): no head_since, queue order from `priority_rank`, the bump runs `priority set`, the waiter row stays during a token wait. Conflicts: `memory_admit.py`, `queue_view.py`, `test_queue_view.py`, `test_queue_card.py`, `golden/card_4.txt`.
+**Acceptance:** test_memory_admit, the build_queue modules and their callers pass; basedpyright clean on changed files.
+
 ### Phase 5 — The queue service, its socket protocol and its client exist and pass in-process tests; no build uses them yet  · status: todo
 **Depends on:** Phase 4
 **Blocked by:** none. This phase adds files only and changes no caller and no admission (builds showrunner, 2026-10-31).
