@@ -146,12 +146,19 @@ Removing a hard link in another target does not change this check.
 The pass stops when successful deletions cover
 the shortfall.
 
-`recent_minutes=60` in `[sweep]` of `config/lint.conf` puts targets used in the
-last hour after all older targets. Recent output can go when the older output
-cannot meet the floor. The per-target budget sweep uses the same rule for build
-units: older units first, then recent units. Within each group, whole days
-since last use come first, then oldest compile time. Orphaned
-copies and the separate rustdoc index limit keep their existing rules.
+The floor takes the least recently used idle target first, then orders build
+units within that target by use. Recent targets are not held back. After each
+scan that finds free space under the floor, it writes one `floor_scan`
+build-log row; a dry run writes none. The row records `at`, `free_after_scan` (bytes),
+`floor` (bytes), `shortfall` (bytes), and `idle_targets` in oldest-first order.
+Each idle target has `folder`, `last_use` (epoch seconds), and `bytes` (allocated
+file bytes measured in the scan). These rows keep the scan's capacity and use
+evidence for later replay.
+
+`recent_minutes=60` orders only build units inside one target under its budget:
+older units first, then recent units. Within each group, whole days since last
+use come first, then oldest compile time. Orphaned copies and the separate
+rustdoc index limit keep their existing rules.
 
 The timed tmp sweep keeps top-level `/tmp/claude` entries and direct
 `unit`/`delegate` run folders without recorded end evidence until they are

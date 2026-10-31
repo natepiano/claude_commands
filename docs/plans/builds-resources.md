@@ -932,12 +932,14 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Ruled out:**
 - Skip one argument per option: it files `--redirect-warnings <file>` under the file.
 
-### Phase 29 — The floor sweep keeps targets used in the last hours  · status: todo
+### Phase 29 — The floor sweep keeps targets used in the last hours  · status: done
 **Depends on:** Phase 33 (checkpointed, `5c9b01fd`, same file `scripts/lint/sweep.py`) and Phase 34 (checkpointed, `efccbe4e`: it removed the unused shared build folder and changed `scratch.py`, `test_sweep.py` and `build-targets.md`). Spec 1 (the replay) changes no repository file and can start at once. Merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24, 32, 31, 33 and 34 are checkpointed; serial memory chain 26 → 15 → 27 → 20 → 11 → 17 → 18 → 19 → 8; **29** runs beside the chain and joins before 11.
 
 #### Work Order
 
-**Goal:** the floor sweep takes no target used in the last N hours while older targets can meet the floor, so a clone that waits hours between builds keeps its build output. (The shared hana folder budget left this phase: builds reversed the shared build folder on 2026-10-30, and Phase 34 removes it; copies seed their own build folders.) Measurement (natedev, 2026-10-27 13:00 to 2026-10-30 10:05 EDT; `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/cold_builds/cause_66.md` and `report.md` there): 127 builds compiled 400 or more crates in a tree that had built the same command at the same commit before. 75 of them (1,189 compile min) came after a floor take of that tree's target between the two builds, 42 of these (791 min) with no other build between. 17 (243 min) came after a budget take. `hold_floor` takes idle clone targets first and keeps only targets used in the last 60 min (`recent_minutes`) for last, so a clone that waits more than 1 h between builds loses its output first.
+**Goal (corrected by the builds ruling, 2026-10-30):** the disk floor takes the least recently used idle target first, with no recency window, and each scan under the floor writes one `floor_scan` build-log row: the free space after the scan, the floor, the shortfall and the idle targets oldest first (folder, last use, bytes). The replay showed the window could not change the order: a target used inside the window is always newer than every target outside it, so the old window key and the last-use key always agreed and the order was least recently used first at any N. So the floor has no `floor_recent_hours` key and no window, the docs make no savings claim, and `recent_minutes` orders only the units inside one target at its budget. The `floor_scan` rows measure what the floor takes, for the cold builds below. Specs 1–4 below are the original order; the ruling replaces Spec 2's window and key, Spec 3's window tests and Spec 4's N.
+
+**Original goal:** the floor sweep takes no target used in the last N hours while older targets can meet the floor, so a clone that waits hours between builds keeps its build output. (The shared hana folder budget left this phase: builds reversed the shared build folder on 2026-10-30, and Phase 34 removes it; copies seed their own build folders.) Measurement (natedev, 2026-10-27 13:00 to 2026-10-30 10:05 EDT; `/tmp/claude/unit/abea5ffb-4b99-499e-ae41-7ebb04630f9f/cold_builds/cause_66.md` and `report.md` there): 127 builds compiled 400 or more crates in a tree that had built the same command at the same commit before. 75 of them (1,189 compile min) came after a floor take of that tree's target between the two builds, 42 of these (791 min) with no other build between. 17 (243 min) came after a budget take. `hold_floor` takes idle clone targets first and keeps only targets used in the last 60 min (`recent_minutes`) for last, so a clone that waits more than 1 h between builds loses its output first.
 
 **Spec:**
 
@@ -969,6 +971,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - `config/lint.conf` — Spec 2, the `[sweep]` section only (hub file, owner verify-unit; resources-unit owns its `[sweep]` section).
 - `docs/as-built/build-targets.md` — Spec 4.
 - `docs/as-built/build-memory-admission.md` — Spec 4, the floor Order bullet.
+- `scripts/buildlog/record.py` and `scripts/buildlog/test_record.py` — the `floor_scan` writer beside `sweep_trim` and its test (ruling; owner report-unit).
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — the replay and its report (run folder), `sweep.py`, `config/lint.conf` (`[sweep]` only) and both as-built docs.
@@ -977,7 +980,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Acceptance gate:**
 - `env -C <tree> python3 -m unittest discover -s scripts/lint -p test_sweep.py` passes, including the existing busy and style-lock tests and the Phase 33 damaged-intent tests; `basedpyright --pythonpath ~/.local/state/merge-gate/typecheck-venv/bin/python` over `scripts/lint/sweep.py` and `scripts/lint/test_sweep.py` reports `0 errors, 0 warnings, 0 notes`.
 - The replay report names N and the cold builds and compile minutes N stops (of 75 and 1,189 in the window, and per day). The checkpoint notice carries its table.
-- Change-Review line: a floor take keeps targets used in the last N hours | on natedev, copy `~/.claude/config/lint.conf` to a scratch file, set its `sweep_free_floor_gib.natedev` 50 GiB above the free space that `df -h ~` shows, and type `LINT_CONFIG_FILE=<copy> ~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --dry-run` | each `the floor would take … last used <when>` line names a target last used more than N hours ago (the phase report gives N)
+- Change-Review line (ruling): the disk floor takes the least recently used target first and records each scan | on natedev, copy `~/.claude/config/lint.conf` to a scratch file, set its `sweep_free_floor_gib.natedev` 50 GiB above the free space that `df -h ~` shows, and type `LINT_CONFIG_FILE=<copy> ~/.claude/scripts/lib/py ~/.claude/scripts/lint/sweep.py --floor-only --dry-run` | the `the floor would take … last used <when>` lines go from the oldest last use to the newest; a dry run writes no `floor_scan` row (a real take under the floor writes one, with the shortfall and the idle targets oldest first)
 
 ### Phase 30 — Waiting steps start in queue order  · status: done
 
