@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from scripts.production import showrunners
 import showrunner_tree
 import unit_lookup
+from scripts.production import staff
 from production_units import Production, read_production
 from production_units import Refusal, cell_value, live_unit_table, production_field, unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
@@ -298,12 +299,13 @@ def bounded_bevy_update(text: str) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-def units_from_doc(lines: list[str], slug: str) -> tuple[UnitRow, ...]:
-    live_rows = live_unit_table(lines, slug)
+def units_from_doc(lines: list[str], slug: str, *, record: staff.StaffSnapshot | None = None) -> tuple[UnitRow, ...]:
+    record = record if record is not None else staff.snapshot()
+    live_rows = live_unit_table(lines, slug, record=record)
     if unit_table(lines) and not live_rows:
         raise DailiesFailure("production", "no live units: every Units row is retired")
     try:
-        marked = unit_lookup.marked_units(slug)
+        marked = unit_lookup.marked_units(slug, record=record)
     except OSError as error:
         raise DailiesFailure("production", f"the unit sessions could not be looked up: {error}") from error
     try:
@@ -763,7 +765,7 @@ def last_report_path(slug: str) -> Path:
     return showrunners.SHOWRUNNER_STATE_DIR / slug / LAST_REPORT
 
 
-def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool) -> JsonMap:
+def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool, record: staff.StaffSnapshot | None = None) -> JsonMap:
     """One production directly below this one: its saved report, and what waits on the user in it and below it."""
     fields: JsonMap = {"name": child, "expand": expand}
     path = last_report_path(child)
@@ -779,7 +781,7 @@ def child_fields(child: str, now: datetime, zone: ZoneInfo, *, expand: bool) -> 
         fields["report"] = saved
     waiting = 0
     unreadable: list[str] = []
-    for slug in (child, *showrunner_tree.descendants_of(child)):
+    for slug in (child, *showrunner_tree.descendants_of(child, record=record)):
         try:
             waiting += len(due(read_outstanding(outstanding_file(slug)), now))
         except (InputError, OSError, ValueError):
@@ -851,13 +853,14 @@ def run(args: argparse.Namespace) -> int:
     at = cast(str | None, args.at)
     render_state = cast(Path, args.render_state)
     expand = cast(list[str], args.expand)
+    staff_record = staff.snapshot()
     production = read_production(production_path)
     # Before any state is read: a showrunner started before the state move gets its state copied here.
     for line in adopt_moved_state(production):
         print(f"state-dir: ok — {line}", file=sys.stderr)
     now, _ = local_now(str(production.zone), "--zone", at)
     lines = production.doc.read_text(encoding="utf-8").splitlines()
-    units = units_from_doc(lines, production.slug)
+    units = units_from_doc(lines, production.slug, record=staff_record)
     table_state = phase_tables(production.doc, production.zone)
     if isinstance(table_state, PhaseTablesUnavailable):
         report("phase tables", "unavailable", table_state.reason)
@@ -1029,17 +1032,17 @@ def run(args: argparse.Namespace) -> int:
     report("merge branch", "ok", "pushed" if pushed else "not pushed")
     result: JsonMap = {"length": length, "zone": str(production.zone), "units": units_out, "topics": topics_out,
                        "doc": str(production.doc)}
-    root = showrunner_tree.root_of(production.slug)
+    root = showrunner_tree.root_of(production.slug, record=staff_record)
     if root != production.slug:
         result["reports_to"] = root
-    children = showrunner_tree.children_of(production.slug)
+    children = showrunner_tree.children_of(production.slug, record=staff_record)
     strangers = [name for name in expand if name != EXPAND_ALL and name not in children]
     if strangers:
         raise DailiesFailure("expand", f"{', '.join(strangers)}: not directly below {production.slug}; "
                              + (f"choose from {', '.join(children)} or {EXPAND_ALL}" if children
                                 else "no production reports to it"))
     if children:
-        result["children"] = [child_fields(child, now, production.zone, expand=EXPAND_ALL in expand or child in expand)
+        result["children"] = [child_fields(child, now, production.zone, expand=EXPAND_ALL in expand or child in expand, record=staff_record)
                               for child in children]
         report("children", "ok", f"{len(children)} below: {', '.join(children)}")
     # A bad config line costs only the counts line, never the report.
