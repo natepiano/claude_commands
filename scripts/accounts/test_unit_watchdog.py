@@ -792,6 +792,31 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual([argv[3] for argv in self.commands], ["claude4"])
         self.assertIn("restarted on claude4", self.notices[0])
 
+    def test_standing_by_unit_recovers_after_grace_while_finished_run_stays_down(self) -> None:
+        _ = self.add_unit("standing")
+        _ = self.add_unit("finished")
+        self.finished.add("finished")
+        self.write_doc()
+        (self.runs / "standing.jsonl").unlink()
+        self.assertIs(unit_lookup.run_state(self.home / "standing"), unit_lookup.UnitState.STANDING_BY)
+        self.assertIs(unit_lookup.run_state(self.home / "finished"), unit_lookup.UnitState.RUN_FINISHED)
+        self.die("standing", "finished")
+
+        _ = self.pass_at(0)
+        state = unit_watchdog._read_state()  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(set(state), {"standing"})
+        self.assertEqual(state["standing"]["first_seen"], NOW.isoformat())
+        self.assertEqual(self.pending, [])
+        self.assertEqual(self.commands, [])
+
+        _ = self.pass_at(2)
+        self.assertEqual(len(self.pending), 1)
+        self.assertEqual(self.commands, [])
+        _ = self.pass_at(4)
+        self.assertEqual(self.commands, [["resume", "standing", "--to", "claude4", "--only", "standing"]])
+        self.assertEqual({entry["sessionId"] for entry in self.fixture.live}, {"standing"})
+        self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
+
     def test_user_stop_retired_finished_and_in_progress_units_are_not_restarted(self) -> None:
         for name in ("user-stop", "retired", "finished", "waiting"):
             _ = self.add_unit(name)

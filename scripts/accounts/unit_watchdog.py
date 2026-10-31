@@ -305,7 +305,7 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                     unit = production_units.cell_value(row.get("Unit", ""))
                     try:
                         worktree = production_units.cell_value(row.get("Worktree", ""))
-                        if not worktree or runs.state(Path(worktree)) != unit_lookup.UnitState.RUNNING:
+                        if not worktree or runs.state(Path(worktree)) is unit_lookup.UnitState.RUN_FINISHED:
                             continue
                         found = observed.get(unit)
                         if found is None:
