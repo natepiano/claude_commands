@@ -762,7 +762,10 @@ def worker_use(guarded: dict[str, RunKeepReason]) -> WorkerUse:
                     record = cast(object, json.loads(text))
                     if not isinstance(record, dict):
                         continue
-                    cwd = cast(dict[str, object], record).get("cwd", "")
+                    fields = cast(dict[str, object], record)
+                    if fields.get("status") != "running":
+                        continue
+                    cwd = fields.get("cwd", "")
                     if not isinstance(cwd, str) or (cwd and not os.path.isabs(cwd)):
                         raise ValueError("worker working folder unreadable")
                     if cwd:
