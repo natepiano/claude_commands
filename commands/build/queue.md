@@ -1,5 +1,5 @@
 ---
-description: Show running and waiting build steps, or move a waiting step to the head. Args - `[bump <position|session|folder>]`.
+description: Show running and waiting build steps; bump is off. Args - `[bump <position|session|folder>]`.
 ---
 
 With `unit-board@nate-local`, `/build:queue [close|bump <selector>]` opens or controls the Build queue pane without a model turn. Run `/reload-plugins` in a session started before the mod change.
@@ -10,4 +10,4 @@ For the full reason the head waits, run `build-why` at a terminal (`~/.claude/sc
 
 Show the head explanation above Waiting. It names budget holders with charged and measured memory, or the free-memory or pressure hold; `Stalled:` means the head waited at least 15 min while free memory covers its need.
 
-`bump <position|session|folder>` moves one waiting step to the head for the next admission. Any session or the user may run it. Memory limits still apply. An unknown or ambiguous match changes nothing; use its position, shown Session name, full session id, recorded session name, folder path or folder name. The result and build log name who moved which step. Use `/build:status` for holds and target state.
+`bump <position|session|folder>` moves nothing and exits 3 with one stdout line and no stderr: `build queue: only the user can bump; bump is off until /showrunner:bump sets queue priority`. Waiting steps that fit keep room in queue order; a younger step held by that room shows `behind older step <label>`. Use `/build:status` for holds and target state.

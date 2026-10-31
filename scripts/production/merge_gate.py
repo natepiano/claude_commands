@@ -31,18 +31,22 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from collections.abc import Generator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
 import fcntl
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -60,6 +64,8 @@ from scripts.build_targets import build_targets  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.lib import scratch  # noqa: E402
+from scripts.lint import memory_admit  # noqa: E402
 
 # Full-tree basedpyright peaked at 4065 MiB on 2026-10-30: its 4878 MiB reservation
 # leaves room for modules beside it under this cap.
@@ -89,13 +95,14 @@ SLOW_MODULE_FLOOR_S = 60.0
 MODULE_HISTORY_RUNS = 5
 MEMORY_SAMPLE_SECONDS = 0.25
 SETTINGS_BLOB = "b3466859"
-# Python restores these dispositions before exec, including an inherited SIG_IGN.
-# No preexec_fn is needed, and the suite receives signals as a normal foreground job.
+# Restore dispositions and the mask in every child, including types. The runner
+# defers cancellation until the child is registered for cleanup.
 SUITE_BOOTSTRAP = """import os, signal, sys
 for disposition in signal.valid_signals():
     if disposition not in (signal.SIGKILL, signal.SIGSTOP):
         signal.signal(disposition, signal.SIG_DFL)
-os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+os.execvp(sys.argv[1], sys.argv[1:])
 """
 
 
@@ -180,6 +187,7 @@ class RunningGateJob:
     module: str
     # Set when the runner kills the job for its memory or time limit.
     killed_for: str = ""
+    cpu_slot: SharedCPUSlot | NoSharedCPU = field(default_factory=lambda: NoSharedCPU())
     peak_memory_mib: float = 0.0
     kind: GateJobKind = GateJobKind.TEST_MODULE
 
@@ -240,6 +248,187 @@ class SampledRSSAdmission:
 
 class GateRefused(Exception):
     """A gate precondition or operation failed; no later step may run."""
+
+
+@dataclass(frozen=True)
+class NoSharedCPU:
+    pass
+
+
+@dataclass(frozen=True)
+class WaitingForCPU:
+    pass
+
+
+@dataclass
+class SharedCPUSlot:
+    descriptor: int
+    token: bytes
+    returned: bool = False
+
+    def release(self) -> None:
+        if not self.returned:
+            with defer_cleanup_signals():
+                if os.write(self.descriptor, self.token) != 1:
+                    raise GateRefused("could not return the shared CPU slot")
+                self.returned = True
+
+
+@contextmanager
+def defer_cleanup_signals() -> Generator[None]:
+    """Keep ownership changes atomic with respect to runner cancellation."""
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+    try:
+        yield
+    finally:
+        _ = signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+@dataclass
+class SharedCPUPool:
+    descriptor: int
+    owned: list[SharedCPUSlot] = field(default_factory=list)
+
+    def try_acquire(self) -> SharedCPUSlot | WaitingForCPU:
+        with defer_cleanup_signals():
+            # CUSE devices need not honor O_NONBLOCK in the same way as pipes.
+            if not select.select([self.descriptor], [], [], 0)[0]:
+                return WaitingForCPU()
+            try:
+                token = os.read(self.descriptor, 1)
+            except BlockingIOError:
+                return WaitingForCPU()
+            if not token:
+                raise GateRefused("shared CPU pool returned no byte")
+            slot = SharedCPUSlot(self.descriptor, token)
+            self.owned.append(slot)
+            return slot
+
+
+@contextmanager
+def shared_cpu_pool() -> Generator[SharedCPUPool | NoSharedCPU]:
+    path = Path(os.environ.get("BUILDLOG_JOBSERVER_FIFO", "/dev/steve"))
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        yield NoSharedCPU()
+        return
+    except OSError as error:
+        raise GateRefused(f"shared CPU pool {path}: {error}") from error
+    pool = SharedCPUPool(descriptor)
+    try:
+        mode = os.fstat(descriptor).st_mode
+        if not (stat.S_ISFIFO(mode) or stat.S_ISCHR(mode)):
+            raise GateRefused(f"shared CPU pool is not a FIFO or character device: {path}")
+        yield pool
+    finally:
+        with defer_cleanup_signals():
+            try:
+                for slot in pool.owned:
+                    slot.release()
+            finally:
+                os.close(descriptor)
+
+
+def atomic_sample(path: Path, value: str) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        _ = temporary.write_text(value)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@dataclass
+class GateReservation:
+    path: Path
+    peak_bytes: int = 0
+    wave_at: float = 0.0
+    status: int = 1
+
+    def observe(self, peak_mib: float, current_mib: float) -> None:
+        peak = int(peak_mib * (1 << 20))
+        now = datetime.now(UTC).timestamp()
+        if peak > self.peak_bytes:
+            atomic_sample(self.path.with_suffix(".max"), f"{peak}\n")
+            self.peak_bytes = peak
+            atomic_sample(self.path.with_suffix(".wave"), f"{peak} {int(now)}\n")
+            self.wave_at = now
+        elif self.peak_bytes and current_mib * (1 << 20) >= self.peak_bytes / 2 and now - self.wave_at >= 60:
+            atomic_sample(self.path.with_suffix(".wave"), f"{self.peak_bytes} {int(now)}\n")
+            self.wave_at = now
+
+
+def gate_wait_reasons(result: memory_admit.CheckResult) -> tuple[str, ...]:
+    """Describe why admission holds, without treating changing samples as a new reason."""
+    decision = result.decision
+    if isinstance(decision.pressure, memory_admit.MemoryPressure):
+        if decision.pressure.next_start_at:
+            return ("memory pressure recovery",)
+        if decision.pressure.swap_used_percent > memory_admit.SWAP_USED_LIMIT:
+            return ("swap memory pressure",)
+        return ("memory pressure",)
+    if isinstance(result.head_reason, memory_admit.BehindOlderFit):
+        return (memory_admit.older_fit_text(result.head_reason),)
+    reasons: list[str] = []
+    if result.head_need:
+        reasons.append(f"queue head {result.head_label}")
+    if decision.charged + result.peak.bytes > decision.budget:
+        reasons.append("build memory budget")
+    if result.available < decision.threshold:
+        reasons.append("free memory")
+    return tuple(reasons) or ("admission refresh",)
+
+
+@contextmanager
+def gate_reservation(repo: Path, cap_mib: int, temporary: Path, hold: BuildHoldWait) -> Generator[GateReservation]:
+    root = memory_admit.store.root()
+    pid = os.getpid()
+    sidecar = temporary / "gate.scope"
+    _ = sidecar.write_text("")
+    profile: memory_admit.GateProfile | memory_admit.StepProfile = memory_admit.GateProfile(
+        str(Path.home() / ".claude"), str(repo.resolve()), cap_mib * (1 << 20),
+        memory_admit.NoGateHistory(cap_mib * (1 << 20)))
+    previous_need = 0
+    previous_reasons: tuple[str, ...] = ()
+    reported_at = 0.0
+    try:
+        while True:
+            hold.wait_until_free()
+            diagnostics = io.StringIO()
+            try:
+                with redirect_stderr(diagnostics):
+                    result = memory_admit.check(
+                        Path(os.environ.get("BUILDLOG_MEMINFO", "/proc/meminfo")), pid, str(sidecar),
+                        ["merge-gate"], root=root, profile=profile)
+            except Exception as error:
+                lines = diagnostics.getvalue().splitlines()
+                raise GateRefused(lines[-1] if lines else str(error)) from error
+            profile = result.profile
+            if result.decision.state == "admit":
+                if not isinstance(result.reservation, memory_admit.Reserved):
+                    raise GateRefused("memory admission did not return a gate reservation")
+                reservation = GateReservation(result.reservation.path)
+                try:
+                    yield reservation
+                finally:
+                    memory_admit.release(reservation.path, reservation.status, root=root)
+                return
+            now = time.monotonic()
+            reasons = gate_wait_reasons(result)
+            if (result.peak.bytes != previous_need or reasons != previous_reasons or now - reported_at >= 60):
+                print(f"Gate memory wait: {result.peak.bytes / memory_admit.GIB:.3f} GiB needed; "
+                      + "; ".join(reasons), flush=True)
+                previous_need, previous_reasons, reported_at = result.peak.bytes, reasons, now
+            time.sleep(1.0)
+    finally:
+        memory_admit.cancel_waiter(pid, root=root)
+        # Also cover a stop after the checker publishes a reservation but before
+        # it returns it to this context. The sidecar identifies this gate alone.
+        for path, row in memory_admit.live_reservations(memory_admit.admission_dir(root)):
+            if row["pid"] == pid and row["sidecar"] == str(sidecar):
+                memory_admit.release(path, 1, root=root)
+        sidecar.unlink(missing_ok=True)
 
 
 @dataclass
@@ -532,7 +721,8 @@ def start_gate_job(suite: str, path: Path, argv: Sequence[str], repo: Path,
     output = log.open("w+")
     started = time.monotonic()
     try:
-        process = subprocess.Popen(argv, cwd=repo, env=environment, stdin=subprocess.DEVNULL,
+        process = subprocess.Popen([sys.executable, "-c", SUITE_BOOTSTRAP, *argv],
+                                   cwd=repo, env=environment, stdin=subprocess.DEVNULL,
                                    stdout=output, stderr=subprocess.STDOUT, text=True,
                                    start_new_session=True)
     except BaseException:
@@ -822,12 +1012,6 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     results: list[GateJobResult] = []
     first_runs: dict[tuple[str, str], GateJobResult] = {}
     rerunning = False
-    types_python = typecheck_python() if type_dirs else ""
-    if isinstance(types_python, Path):
-        pending.appendleft(GateJobRequest("types", repo / "basedpyright", "basedpyright", GateJobKind.TYPE_CHECK))
-    elif types_python:
-        results.append(GateJobResult("types", "basedpyright", 1, 0.0, types_python, kind=GateJobKind.TYPE_CHECK))
-    requests = {(job.kind, job.suite, job.module): job for job in pending}
     suite_started: dict[str, float] = {}
     suite_finished: dict[str, float] = {}
     admission = SampledRSSAdmission(memory_cap_mib)
@@ -837,8 +1021,16 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
     maximum_load = starting_load
     began = time.monotonic()
     python = os.environ.get("MERGE_GATE_PYTHON", sys.executable)
-    with tempfile.TemporaryDirectory(prefix="merge-gate-", dir=tmpfs) as temporary:
+    with (tempfile.TemporaryDirectory(prefix="merge-gate-", dir=tmpfs) as temporary,
+          gate_reservation(repo, memory_cap_mib, Path(temporary), hold) as reservation,
+          shared_cpu_pool() as cpu_pool):
         environment = {**os.environ, "TMPDIR": temporary}
+        types_python = typecheck_python() if type_dirs else ""
+        if isinstance(types_python, Path):
+            pending.appendleft(GateJobRequest("types", repo / "basedpyright", "basedpyright", GateJobKind.TYPE_CHECK))
+        elif types_python:
+            results.append(GateJobResult("types", "basedpyright", 1, 0.0, types_python, kind=GateJobKind.TYPE_CHECK))
+        requests = {(job.kind, job.suite, job.module): job for job in pending}
         try:
             while pending or running:
                 now = time.monotonic()
@@ -847,6 +1039,7 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     sample = process_memory_mib({os.getpid(), *(job.process.pid for job in running)})
                     admission.observe(time.monotonic(), sample.get(os.getpid(), 0.0),
                                       {job.process.pid: sample.get(job.process.pid, 0.0) for job in running})
+                    reservation.observe(admission.peak_mib, admission.latest_mib)
                     for job in running:
                         measured = sample.get(job.process.pid, 0.0)
                         job.peak_memory_mib = max(job.peak_memory_mib, measured)
@@ -867,6 +1060,9 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                         if not running:
                             hold.wait_until_free()
                         break
+                    slot = cpu_pool.try_acquire() if isinstance(cpu_pool, SharedCPUPool) else cpu_pool
+                    if isinstance(slot, WaitingForCPU):
+                        break
                     request = pending.popleft()
                     suite, path = request.suite, request.path
                     root = Path(tempfile.mkdtemp(prefix=f"{suite}-{path.stem}-", dir=temporary))
@@ -878,12 +1074,14 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     argv = ([os.environ.get("MERGE_GATE_BASEDPYRIGHT", "basedpyright"), "--pythonpath", str(types_python),
                              *type_dirs]
                             if request.kind is GateJobKind.TYPE_CHECK else
-                            [*scope_prefix, python, "-c", SUITE_BOOTSTRAP, "-m", "unittest", "discover", "-s", str(path.parent), "-p", path.name])
-                    if request.kind is GateJobKind.TYPE_CHECK:
-                        job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
-                    else:
-                        job = start_gate_job(suite, path, argv, repo, job_environment, log)
-                    running.append(job)
+                            [*scope_prefix, python, "-m", "unittest", "discover", "-s", str(path.parent), "-p", path.name])
+                    with defer_cleanup_signals():
+                        if request.kind is GateJobKind.TYPE_CHECK:
+                            job = start_gate_job(suite, path, argv, repo, job_environment, log, kind=request.kind)
+                        else:
+                            job = start_gate_job(suite, path, argv, repo, job_environment, log)
+                        job.cpu_slot = slot
+                        running.append(job)
                     if job.kind is GateJobKind.TEST_MODULE:
                         _ = suite_started.setdefault(suite, job.started)
                     admission.reserve(job.process.pid, recorded_peaks.reservation_mib(request))
@@ -896,7 +1094,11 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                         status = job.process.poll()
                     if status is None:
                         continue
-                    result = finish_gate_job(job, status)
+                    try:
+                        result = finish_gate_job(job, status)
+                    finally:
+                        if isinstance(job.cpu_slot, SharedCPUSlot):
+                            job.cpu_slot.release()
                     running.remove(job)
                     admission.release(job.process.pid)
                     if status < 0 and not job.killed_for and not result.tripwire_tripped and not hold.admits():
@@ -940,13 +1142,17 @@ def run_suites(repo: Path, memory_cap_mib: int = DEFAULT_MEMORY_CAP_MIB, type_di
                     time.sleep(0.05)
         finally:
             # Only terminate groups created by this runner. Reap them before tmpfs cleanup.
-            for job in running:
-                kill_job_group(job)
-                job.output.close()
+            with defer_cleanup_signals():
+                for job in running:
+                    kill_job_group(job)
+                    job.output.close()
+                    if isinstance(job.cpu_slot, SharedCPUSlot):
+                        job.cpu_slot.release()
             save_measures(timings_path, timings)
             save_measures(types_peaks_path, types_peaks)
             save_measures(module_peaks_path, module_peaks)
             save_measures(history_path, history)
+        reservation.status = int(admission.peak_mib > memory_cap_mib or any(result.returncode for result in results))
     elapsed = time.monotonic() - began - (hold.seconds - initial_hold_seconds)
     ending_load = one_minute_load()
     maximum_load = max(maximum_load, ending_load)
@@ -1036,6 +1242,72 @@ def require_clean_promotion(repo: Path) -> None:
         raise GateRefused("promotion refused: " + (result.stdout.strip() or result.stderr.strip()))
 
 
+
+@dataclass(frozen=True)
+class RecordedPush:
+    """The gate's exact local commit and the source and base that produced it."""
+
+    base: str
+    commit: str
+    source_commit: str
+
+
+@dataclass(frozen=True)
+class NoRecordedPush:
+    pass
+
+
+def push_record_path(repo: Path, operation: str, source: str) -> Path:
+    directory = Path(os.environ.get("MERGE_GATE_PASSED_DIR", "~/.local/state/merge-gate")).expanduser()
+    identity = json.dumps([str(repo.resolve()), operation, source]).encode()
+    return directory / "push-recovery" / (hashlib.sha256(identity).hexdigest() + ".json")
+
+
+def read_push_record(path: Path) -> RecordedPush | NoRecordedPush:
+    try:
+        value = cast(object, json.loads(path.read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return NoRecordedPush()
+    except (OSError, ValueError) as error:
+        raise GateRefused(f"push recovery record {path}: {error}") from error
+    if isinstance(value, dict):
+        fields = cast(dict[str, object], value)
+        hashes = [fields.get(key) for key in ("base", "commit", "source_commit")]
+        if all(isinstance(item, str) and re.fullmatch(r"[0-9a-f]{40,64}", item) for item in hashes):
+            return RecordedPush(*(cast(str, item) for item in hashes))
+    raise GateRefused(f"invalid push recovery record: {path}")
+
+
+def write_push_record(path: Path, record: RecordedPush) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Publish one complete record before changing refs or attempting a push.
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            json.dump({"base": record.base, "commit": record.commit,
+                       "source_commit": record.source_commit}, output)
+            output.flush()
+            os.fsync(output.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def checkpoint_retry_origin(repo: Path, origin: str, checkpoint: str) -> str:
+    """Trust only this checkpoint's recorded merge, with its original parents."""
+    record = read_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint))
+    if isinstance(record, NoRecordedPush):
+        return origin
+    head = checked_git(repo, "rev-parse", "HEAD")
+    if head != record.commit or record.source_commit != checkpoint:
+        return origin
+    parents = checked_git(repo, "rev-list", "--parents", "-n", "1", head).split()
+    if (parents != [record.commit, record.base, checkpoint]
+            or checked_git(repo, "rev-parse", origin) != record.base):
+        return origin
+    return record.commit
+
+
 def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WAIT_S,
             release_lock_poll_s: float = 0.2) -> None:
     main_repo = Path(str(args.main_repo)).expanduser().resolve()
@@ -1046,14 +1318,25 @@ def promote(args: GateArguments, *, release_lock_wait_s: float = RELEASE_LOCK_WA
     if checked_git(main_repo, "branch", "--show-current") != "main":
         raise GateRefused("promotion checkout must be on main")
     fetch_branches(main_repo, "main", args.merge_branch)
-    if checked_git(main_repo, "rev-parse", "HEAD") != checked_git(main_repo, "rev-parse", "origin/main"):
-        raise GateRefused("main HEAD differs from origin/main")
+    head = checked_git(main_repo, "rev-parse", "HEAD")
+    origin = checked_git(main_repo, "rev-parse", "origin/main")
+    path = push_record_path(main_repo, "promotion", args.merge_branch)
+    target = checked_git(main_repo, "rev-parse", f"origin/{args.merge_branch}")
+    if head != origin:
+        record = read_push_record(path)
+        if (not isinstance(record, RecordedPush) or head != record.commit
+                or record.source_commit != record.commit
+                or git(main_repo, "merge-base", "--is-ancestor", origin, head).returncode
+                or git(main_repo, "merge-base", "--is-ancestor", head, target).returncode):
+            raise GateRefused("main HEAD differs from origin/main")
+        target = record.commit
     if git(main_repo, "merge-base", "--is-ancestor", "origin/main", f"origin/{args.merge_branch}").returncode:
         raise GateRefused("main is not an ancestor of the merge branch")
-    check_settings(main_repo, f"origin/{args.merge_branch}", str(args.settings_blob))
+    check_settings(main_repo, target, str(args.settings_blob))
     hold.wait_until_free()
     require_clean_promotion(main_repo)
-    _ = checked_git(main_repo, "merge", "--ff-only", f"origin/{args.merge_branch}")
+    write_push_record(path, RecordedPush(origin, target, target))
+    _ = checked_git(main_repo, "merge", "--ff-only", target)
     _ = checked_git(main_repo, "push", "origin", "main")
     promoted = checked_git(main_repo, "rev-parse", "HEAD")
     # Retain shell expansion of ~, while quoting arbitrary non-home paths.
@@ -1142,8 +1425,9 @@ def merge_checkpoint(args: GateArguments) -> int:
         raise GateRefused("checkout is not on the merge branch")
     fetch_branches(repo, args.merge_branch, args.unit_branch)
     baseline = checked_git(repo, "rev-parse", "HEAD")
-    check_local_doc_commits(repo, f"origin/{args.merge_branch}")
     checkpoint = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.checkpoint}^{{commit}}")
+    origin = f"origin/{args.merge_branch}"
+    check_local_doc_commits(repo, checkpoint_retry_origin(repo, origin, checkpoint))
     previous = checked_git(repo, "rev-parse", "--verify", "--end-of-options", f"{args.previous_checkpoint}^{{commit}}")
     if git(repo, "merge-base", "--is-ancestor", checkpoint, f"origin/{args.unit_branch}").returncode:
         raise GateRefused("checkpoint is not on origin unit branch")
@@ -1165,6 +1449,10 @@ def merge_checkpoint(args: GateArguments) -> int:
             abort = git(repo, "merge", "--abort")
             raise GateRefused(f"merge failed; conflicts: {conflicts or '(none)'}; {result.stderr.strip()}"
                               + (f"; abort failed: {abort.stderr.strip()}" if abort.returncode else ""))
+        merged = checked_git(repo, "rev-parse", "HEAD")
+        if merged != baseline:
+            write_push_record(push_record_path(repo, "checkpoint", origin + ":" + checkpoint),
+                              RecordedPush(baseline, merged, checkpoint))
         suites = run_suites(repo, int(args.memory_cap_mib), args.type_dirs, float(args.module_time_limit_s),
                             source="checkpoint", full=args.full)
         if not suites.passed:
@@ -1346,7 +1634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if missing:
             parser.error(f"required: {', '.join('--' + name for name in missing)}")
     try:
-        with rollback_signals():
+        with rollback_signals(), scratch.copy_lock(Path(args.repo).expanduser().resolve()):
             if args.nightly:
                 return nightly(args)
             if args.tests_only:
