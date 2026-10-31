@@ -217,12 +217,14 @@ def lookup_slug(slug: str) -> str:
 
 def production_members(record: staff.StaffSnapshot, sources: MemberSources) -> dict[str, tuple[staff.StaffRow, ...]]:
     """All recorded unit children, including those with no pane or local worktree."""
-    runners = sources.showrunner_members(record)
+    active_runners = {row.id for row in staff.active(record, "showrunner")}
+    runners = {slug: row for slug, row in sources.showrunner_members(record).items() if row.id in active_runners}
     # A timer is not required for an offline production whose short name is its slug.
     mapped = {row.id for row in runners.values()}
-    runners.update({row.name: row for row in record.find(kind="showrunner")
+    runners.update({row.name: row for row in staff.active(record, "showrunner")
                     if row.id not in mapped and row.name not in runners})
-    return {slug: tuple(record.find(kind="unit", parent=row.id)) for slug, row in runners.items()}
+    return {slug: tuple(unit for unit in staff.active(record, "unit") if unit.parent == row.id)
+            for slug, row in runners.items()}
 
 
 def group_marked_units(marked: Iterable[tuple[str, MarkedUnit]], *,

@@ -393,7 +393,7 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
     except staff.StaffUnreadable as error:
         print(f"board_json: {error}", file=sys.stderr)
         return NoBoardSubtree()
-    if root is None:
+    if root is None or root not in staff.active(record, "showrunner"):
         return NoBoardSubtree()
     by_slug = {runner["slug"]: runner for runner in showrunners.registered_showrunners()}
     slugs = {row.id: slug for slug, row in members.items()}
@@ -404,7 +404,7 @@ def resolve(production: str, session: str = "") -> BoardSubtree | NoBoardSubtree
             slug = slugs.get(row.id, "")
             if slug in by_slug:
                 boards.append(by_slug[slug])
-        level = sorted((child for row in level for child in record.find(kind="showrunner", parent=row.id)),
+        level = sorted((child for row in level for child in staff.active(record, "showrunner") if child.parent == row.id),
                        key=lambda row: slugs.get(row.id, row.name))
     return BoardSubtree(record, tuple(boards))
 

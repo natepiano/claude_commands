@@ -24,7 +24,7 @@ from production_units import read_production
 from fake_unit_host import HostedUnit
 
 
-from scripts.production import production_doc, staff
+from scripts.production import production_doc, staff, unit_config
 from scripts.production.staff_test_support import unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture, SCRIPT
 
@@ -54,6 +54,32 @@ class ProductionNameTests(unittest.TestCase):
 
 @final
 class LifecycleTests(LifecycleFixture):
+    def test_wrap_refuses_a_permanent_child_before_any_file_or_staff_change(self) -> None:
+        runner, alpha, beta, child, permanent = self.permanent_staff_tree()
+        before = self.doc.read_bytes(), self.staff.staff_file.read_bytes(), self.calls()
+        result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("permanent child nightly-unit: transfer it before wrapping", result.stdout)
+        self.assertTrue(self.alpha.is_dir())
+        self.assertTrue(self.beta.is_dir())
+        self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes(), self.calls()), before)
+        for row in (runner, alpha, beta, child, permanent):
+            self.assertEqual(staff.by_id(row.id), row)
+
+    def test_wrap_missing_config_refuses_before_parking_or_removing_any_unit(self) -> None:
+        runner, alpha, beta, child = self.staff_tree()
+        (self.beta / ".unit.toml").unlink()
+        before = self.doc.read_bytes(), self.staff.staff_file.read_bytes()
+        with mock.patch.object(unit_config, "park", side_effect=AssertionError("park before complete preparation")):
+            result = self.run_lifecycle("wrap", "--no-ci")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(str(self.beta / ".unit.toml"), result.stdout)
+        self.assertTrue(self.alpha.is_dir())
+        self.assertTrue(self.beta.is_dir())
+        self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes()), before)
+        for row in (runner, alpha, beta, child):
+            self.assertEqual(staff.by_id(row.id), row)
+
     def test_open_excludes_the_log_once_and_rerun_keeps_the_shared_exclude_file(self) -> None:
         result = self.run_lifecycle("open", "--no-ci", "--session", "test-showrunner")
         self.assert_step(result, "ok")
@@ -113,7 +139,8 @@ class LifecycleTests(LifecycleFixture):
     def staff_tree(self) -> tuple[staff.StaffRow, staff.StaffRow, staff.StaffRow, staff.StaffRow]:
         self.merged_units()
         top = staff.ensure("showrunner", name="top")
-        runner = staff.ensure("showrunner", name="old-showrunner", parent=top.id)
+        runner = next(row for row in staff.find(kind="showrunner") if row.name == "old-showrunner")
+        runner = staff.move(runner.id, top.id)
         alpha = staff.ensure("unit", name="alpha", parent=runner.id)
         beta = staff.ensure("unit", name="beta", parent=runner.id)
         child = staff.ensure("showrunner", name="kid", parent=runner.id)

@@ -422,6 +422,18 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(entries["director"].director, roster.DirectsUnit("unit-one"))
         self.assertEqual(reads.call_count, 1)
 
+    def test_backfilled_retired_rows_leave_full_roster_and_fast_session_labels_unchanged(self) -> None:
+        before = self._entries()
+        wanted = ["sid-director", "sid-runner"]
+        labels = roster.unit_labels_for(wanted, self.environment)
+        old = unit_membership("alpha", "retired-unit")
+        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        historical = showrunner_relationship("wrapped")
+        _ = staff.set_doc(historical.id, staff.WrappedDoc("natedev", self.root / "wrapped-production.md"))
+        self.assertEqual(self._entries(), before)
+        self.assertEqual(roster.unit_labels_for(wanted, self.environment), labels)
+        self.assertIsNotNone(staff.by_id(old.id))
+
     def test_session_labels_read_the_staff_owner_once(self) -> None:
         with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
             labels = roster.unit_labels_for(["sid-director", "sid-runner"], self.environment)

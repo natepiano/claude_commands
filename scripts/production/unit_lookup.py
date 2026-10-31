@@ -109,7 +109,7 @@ def unit_metadata(record: staff.StaffSnapshot, sources: MemberSources, *,
                 direct[local[name].id] = cells
             else:
                 orphans.setdefault(name, []).append((slug, cells))
-    units = record.find(kind="unit")
+    units = staff.active(record, "unit")
     for row in units:
         if row.id in direct:
             continue

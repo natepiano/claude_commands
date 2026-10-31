@@ -53,6 +53,18 @@ class ProductionFixture:
 
 
 class BoardJsonTests(unittest.TestCase):
+    def test_wrapped_child_is_not_a_board_descendant_even_when_its_timer_and_parent_remain(self) -> None:
+        root = self.production("root")
+        child = self.production("wrapped", running=False)
+        self.attach(child.slug, root.slug)
+        old = next(row for row in staff.find(kind="showrunner") if row.name == child.slug)
+        _ = staff.set_doc(old.id, staff.WrappedDoc("natedev", child.document))
+        _, documents = self.generate("--production", root.slug)
+        self.assertEqual([document["production"] for document in documents], [root.slug])
+        retained = staff.by_id(old.id)
+        assert retained is not None
+        self.assertEqual(retained.parent, old.parent)
+
     root: Path = Path()
     history: Path = Path()
     run_root: Path = Path()

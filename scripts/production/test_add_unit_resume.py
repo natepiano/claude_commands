@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 import production_units
 from unit_lookup import ProductionMembers, unit_is_retired
-from scripts.production import staff
+from scripts.production import staff, unit_config
 import launch_permission
 import unit_lookup
 import sessions
@@ -43,6 +43,24 @@ def setUpModule() -> None:
 
 @final
 class AddUnitResumeTests(AddUnitTestCase):
+    def test_resume_preserves_existing_config_settings_and_launches_with_the_same_staff_id(self) -> None:
+        self.commit_prepared_row(self.unit_row())
+        worktree = self.root / "project-alpha"
+        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        row = unit_membership("build-followups", "alpha-unit")
+        row = staff.set_worktree(row.id, staff.PresentWorktree("natedev", worktree))
+        saved = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/given.md")),
+                                      unit_config.AppPort(8123), ("nightly-review", "build-check"))
+        unit_config.write(worktree, saved)
+        path = worktree / ".unit.toml"
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        _ = self.successful("alpha", "--resume", "session-123", "--cwd", str(worktree))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(unit_config.read(worktree), saved)
+        self.assertEqual(staff.by_id(row.id), row)
+        self.assertEqual(self.pane_environment()["STAFF_ID"], row.id)
+        self.assertEqual(self.git("ls-files", ".unit.toml", cwd=worktree), "")
+
     def test_unreadable_staff_refuses_resume_before_closing_its_stopped_pane(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
@@ -225,6 +243,11 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(self.pane_environment()[unit_lookup.UNIT_MARK], "alpha-unit")
         self.assertIn(str(prior), self.opened())
         self.assertIn("attached session-123 as alpha-unit: one process, pid 202", result.stdout)
+        row = unit_membership("build-followups", "alpha-unit")
+        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", self.root / "project-alpha"))
+        self.assertEqual(self.pane_environment()["STAFF_ID"], row.id)
+        self.assertEqual(unit_config.read(self.root / "project-alpha"),
+                         unit_config.UnitConfig(unit_config.PermanentPlan(), unit_config.NoAppPort(), ()))
 
     def test_attach_requires_cwd_supported_mode_and_exclusive_session_flag(self) -> None:
         document, head = self.doc.read_text(), self.git("rev-parse", "HEAD")

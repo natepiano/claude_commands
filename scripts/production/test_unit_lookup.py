@@ -45,6 +45,40 @@ class UnitLookupTests(unittest.TestCase):
     records: Path = Path()
     environment: dict[str, str] = {}
 
+    def test_production_members_excludes_removed_children_and_wrapped_parents_but_keeps_raw_identity(self) -> None:
+        live = unit_membership("current", "live-unit")
+        retired = unit_membership("current", "retired-unit")
+        historical = unit_membership("wrapped", "historical-unit")
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        assert historical.parent is not None
+        _ = staff.set_doc(historical.parent, staff.WrappedDoc("natedev", self.root / "archive.md"))
+        record = staff.snapshot()
+        sources = unit_lookup.MemberSources({}, ())
+        self.assertEqual(unit_lookup.production_members(record, sources), {"current": (live,), "show": ()})
+        self.assertIsNotNone(record.by_id(retired.id))
+        self.assertEqual(unit_lookup.unit_row("retired-unit", record, staff_id=retired.id).id, retired.id)
+
+    def test_retired_names_are_explicitly_listed_while_active_membership_excludes_the_retained_row(self) -> None:
+        retired = unit_membership("show", "retired-unit")
+        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
+        lines = ["## Units", "| Unit | Plan | Worktree | Branch | Port | Owns |",
+                 "| --- | --- | --- | --- | --- | --- |",
+                 "| retired-unit | old.md | /missing | old | — | scripts |"]
+        with mock.patch.object(unit_lookup, "member_sources", return_value=unit_lookup.MemberSources({}, ())):
+            self.assertFalse(unit_lookup.ProductionMembers("show", record=staff.snapshot()).has("retired-unit"))
+            self.assertEqual(unit_lookup.retired_units(lines, "show", record=staff.snapshot()), {"retired-unit"})
+
+    def test_removed_same_name_does_not_make_an_active_units_orphan_metadata_ambiguous(self) -> None:
+        live = unit_membership("receiving", "alpha-unit")
+        old = unit_membership("former", "alpha-unit")
+        _ = staff.set_worktree(old.id, staff.RemovedWorktree("natedev", self.root / "old"))
+        cells = {"Unit": "alpha-unit", "Plan": "plan.md", "Worktree": "/live", "Branch": "alpha"}
+        lines = ["| Unit | Plan | Worktree | Branch |", "| --- | --- | --- | --- |",
+                 "| alpha-unit | plan.md | /live | alpha |"]
+        metadata = unit_lookup.unit_metadata(staff.snapshot(), unit_lookup.MemberSources({}, ()),
+                                             documents={"old-doc": lines})
+        self.assertEqual(metadata, {live.id: cells})
+
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))

@@ -16,6 +16,7 @@ from dataclasses import FrozenInstanceError, replace
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
 from multiprocessing.synchronize import Barrier
+from pathlib import Path
 from typing import cast
 from unittest import mock
 
@@ -52,6 +53,114 @@ def concurrent_ensure(
 
 
 class StaffTests(StaffTestCase):
+    def test_admission_publishes_identity_and_location_once_without_a_setter_window(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc")
+        location = staff.PresentWorktree("natedev", self.root / "models")
+        original = os.replace
+        publications: list[dict[str, object]] = []
+
+        def observe(temporary: Path, destination: Path) -> None:
+            original(temporary, destination)
+            if destination == self.staff_file:
+                publications.append(cast(dict[str, object], json.loads(self.staff_file.read_text())))
+
+        with (mock.patch.object(os, "replace", side_effect=observe),
+              mock.patch.object(staff, "set_worktree", side_effect=AssertionError("second write"))):
+            unit = staff.ensure("unit", name="models", parent=runner.id, worktree=location)
+        self.assertEqual(len(publications), 1)
+        published = cast(list[dict[str, object]], publications[0]["rows"])
+        self.assertEqual(next(row for row in published if row["id"] == unit.id), unit.to_json())
+        self.assertEqual(unit.worktree, location)
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(staff.ensure("unit", name="models", parent=runner.id, worktree=location), unit)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
+    def test_admission_fills_unfilled_locations_but_refuses_wrong_kind_duplicates_and_resurrection(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.root / "doc.md"))
+        blank = staff.ensure("unit", name="models", parent=runner.id)
+        location = staff.PresentWorktree("natedev", self.root / "models")
+        filled = staff.ensure("unit", name="models", parent=runner.id, worktree=location)
+        self.assertEqual(filled, replace(blank, worktree=location))
+        self.assert_refused(lambda: staff.ensure("showrunner", name="wrong", worktree=location))
+        self.assert_refused(lambda: staff.ensure("unit", name="wrong", parent=runner.id, doc=runner.doc))
+        self.assert_refused(lambda: staff.ensure("unit", name="duplicate", parent=runner.id, worktree=location))
+        self.assert_refused(lambda: staff.ensure("unit", name="models", parent=runner.id,
+                                               worktree=staff.PresentWorktree("natedev", self.root / "other")))
+        removed = staff.set_worktree(filled.id, staff.RemovedWorktree(location.machine, location.path))
+        self.assert_refused(lambda: staff.ensure("unit", name="models", parent=runner.id, worktree=location))
+        self.assertEqual(staff.by_id(removed.id), removed)
+
+    def test_remote_admission_sends_the_location_in_the_owner_transaction(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc")
+        with self.machine("mac"):
+            location = staff.PresentWorktree("mac", self.root / "mac-models")
+            unit = staff.ensure("unit", name="models", parent=runner.id, worktree=location)
+            self.assertEqual(unit.worktree, location)
+            self.assertEqual(staff.by_id(unit.id), unit)
+            self.assertFalse(self.mac_file.exists())
+        self.assertEqual(staff.by_id(unit.id), unit)
+
+    def test_active_filters_removed_and_wrapped_rows_but_raw_identity_keeps_every_state(self) -> None:
+        runners = [staff.ensure("showrunner", name=name, doc=doc) for name, doc in (
+            ("unfilled", staff.DocUnfilled()),
+            ("live", staff.LiveDoc("natedev", self.root / "live.md")),
+            ("wrapped", staff.WrappedDoc("natedev", self.root / "archive.md")))]
+        units = [staff.ensure("unit", name=name, parent=runners[0].id, worktree=worktree)
+                 for name, worktree in (("unfilled", staff.WorktreeUnfilled()),
+                     ("present", staff.PresentWorktree("natedev", self.root / "present")),
+                     ("removed", staff.RemovedWorktree("natedev", self.root / "removed")))]
+        record = staff.snapshot()
+        self.assertCountEqual(staff.active(record, "unit"), units[:2])
+        self.assertCountEqual(staff.active(record, "showrunner"), runners[:2])
+        for row in (*runners, *units):
+            self.assertEqual(record.by_id(row.id), row)
+        self.assertEqual(record.by_path("unfilled/removed"), units[2])
+        self.assertCountEqual(record.find(), [*runners, *units])
+
+    def test_local_and_remote_retire_refuse_owners_and_remove_only_the_selected_worker(self) -> None:
+        runner, unit, worker = self.tree()
+        for machine in ("natedev", "mac"):
+            with self.subTest(machine=machine), self.machine(machine):
+                for row in (runner, unit):
+                    self.assert_refused(lambda: staff.retire(row.id))
+        self.assertEqual(staff.retire(worker.id), worker)
+        self.assertEqual(staff.by_id(unit.id), unit)
+        self.assertEqual(staff.by_id(runner.id), runner)
+
+    def test_pending_retirement_keeps_ids_and_edges_and_waits_for_workers_and_known_locations(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc", doc=staff.LiveDoc("natedev", self.root / "doc.md"))
+        child = staff.ensure("showrunner", name="child", parent=runner.id)
+        unit = staff.ensure("unit", name="models", parent=runner.id,
+                            worktree=staff.PresentWorktree("natedev", self.root / "models"))
+        worker = staff.ensure_worker("impl1", unit.id)
+        staff.defer_retire((runner.id, unit.id, child.id))
+        self.assertCountEqual(staff.retire_pending(), (runner.id, unit.id, child.id))
+        self.assertEqual(staff.by_id(worker.id), worker)
+        _ = staff.retire(worker.id)
+        self.assertEqual(staff.retire_pending(), (child.id,))
+        self.assertEqual(staff.by_id(unit.id), replace(unit, worktree=staff.RemovedWorktree("natedev", self.root / "models")))
+        self.assertEqual(staff.by_id(runner.id), replace(runner, doc=staff.WrappedDoc("natedev", self.root / "doc.md")))
+        self.assertEqual(staff.by_id(child.id), child)
+        before = self.staff_file.read_bytes()
+        self.assertEqual(staff.retire_pending(), (child.id,))
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_seed_retirement_retains_the_removed_row_and_cannot_reactivate_it_from_stale_membership(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc")
+        unit = staff.ensure("unit", name="models", parent=runner.id,
+                            worktree=staff.PresentWorktree("natedev", self.root / "models"))
+        retirement = staff.SeedInput((), (staff.SeedRetirement(unit.id, runner.id),))
+        record = staff.apply_seed(retirement)
+        removed = replace(unit, worktree=staff.RemovedWorktree("natedev", self.root / "models"))
+        self.assertEqual(record.by_id(unit.id), removed)
+        self.assertEqual(record.by_id(runner.id), runner)
+        before = self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns
+        self.assertEqual(staff.apply_seed(retirement).by_id(unit.id), removed)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+        stale = staff.SeedInput((staff.SeedMember("unit", "unit", unit.name, unit.id, staff.KeepSeedParent()),))
+        self.assertEqual(staff.apply_seed(stale).by_id(unit.id), removed)
+        self.assertEqual((self.staff_file.read_bytes(), self.staff_file.stat().st_mtime_ns), before)
+
     def test_schema_one_rewrites_as_two_without_inventing_worktrees_or_docs(self) -> None:
         runner, unit, worker = self.tree()
         _ = self.write_document({"schema": 1, "rows": [row.to_json() for row in (runner, unit, worker)]})

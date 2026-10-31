@@ -39,6 +39,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -47,6 +48,7 @@ from typing import TYPE_CHECKING, NamedTuple, cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.production import staff, staff_sources
+from scripts.lib import tunables
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
@@ -79,9 +81,6 @@ MESH = SCRIPTS / "agents" / "codex_mesh.py"
 BUILD_HOLD = SCRIPTS / "build_hold" / "build_hold.py"
 MAC_CLAIMS = Path.home() / ".local/state/mac-test/claims"
 WAIT_MINUTES = 20.0
-POLL_SECONDS = 10.0
-# How long a process has to exit after SIGTERM before it is reported as still running.
-TERM_WAIT_SECONDS = 10.0
 # A run's folder of detached-run records (codex_mesh.DETACHED_RUNS_DIR).
 DETACHED_RUNS = "mesh_runs"
 RETIRED_NOTE = "(retired {date}, worktree removed{session})"
@@ -135,11 +134,20 @@ class Found(NamedTuple):
     processes: tuple[int, ...]
 
 
+def configured_seconds(key: str) -> float:
+    """Read each retirement limit when it is used, without a fallback value."""
+    path = Path(os.environ.get("PRODUCTION_CONFIG", SCRIPTS.parent / "config/production.conf"))
+    value = tunables.number(path, key, minimum=0, maximum=float("inf"))
+    if value <= 0:
+        raise tunables.TunableUnusable(f"{path}: {key} must be greater than zero")
+    return value
+
+
 def run(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     """One command, without this session's id: shutdown then finds the account that holds the unit."""
     environment = {key: value for key, value in os.environ.items() if key != "CLAUDE_CODE_SESSION_ID"}
     return subprocess.run(argv, pass_fds=staff.operation_fds(), cwd=cwd, env=environment, capture_output=True, text=True, check=False,
-                          timeout=900)
+                          timeout=configured_seconds("RETIRE_COMMAND_TIMEOUT_SECONDS"))
 
 
 def failure(result: subprocess.CompletedProcess[str]) -> str:
@@ -202,6 +210,8 @@ def refusals(unit: Unit) -> list[str]:
 
     A merge of the merge branch into the unit carries nothing of the unit's own, so only commits
     that are not merges count."""
+    for key in ("RETIRE_COMMAND_TIMEOUT_SECONDS", "RETIRE_TERM_WAIT_SECONDS", "RETIRE_POLL_SECONDS"):
+        _ = configured_seconds(key)
     found: list[str] = []
     try:
         marked = unit_lookup.marked_unit(unit.production.slug, unit.name)
@@ -449,11 +459,13 @@ def transcript_resume_folder(transcript: Path) -> Path:
     raise Refused(f"transcript {transcript} has no cwd matching its project folder {transcript.parent.name}")
 
 
-def director_resume_folder(session_id: str) -> Path:
+def director_resume_folder(session_id: str, *, dependencies: Callable[[Path], None] | None = None) -> Path:
     transcripts = transcript_locations(session_id)
     if len(transcripts) != 1:
         places = ", ".join(str(path.parent) for path in transcripts) or "none"
         raise Refused(f"no account has the transcript of session {session_id} in exactly one project folder; found: {places}")
+    if dependencies is not None:
+        dependencies(transcripts[0])
     return transcript_resume_folder(transcripts[0])
 
 
@@ -555,7 +567,12 @@ def stop_sessions(unit: Unit, found: Found, wait_minutes: float, known_ids: froz
 
 
 def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) -> list[str]:
-    """SIGTERM each pid; one alive after `wait` seconds (TERM_WAIT_SECONDS) comes back as still running."""
+    """SIGTERM each pid, observing the configured wait and poll limits."""
+    duration = configured_seconds("RETIRE_TERM_WAIT_SECONDS")
+    poll = configured_seconds("RETIRE_POLL_SECONDS")
+    if wait is not None:
+        duration = min(duration, max(0, wait))
+    deadline = time.monotonic() + duration
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -563,9 +580,11 @@ def terminate(pids: list[int], what: dict[int, str], wait: float | None = None) 
             continue
         except PermissionError as error:
             what[pid] += f": {error}"
-    deadline = time.monotonic() + (TERM_WAIT_SECONDS if wait is None else wait)
-    while any(_alive(pid) for pid in pids) and time.monotonic() < deadline:
-        time.sleep(0.2)
+    while any(_alive(pid) for pid in pids):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll, remaining))
     left: list[str] = []
     for pid in pids:
         if _alive(pid):
@@ -748,7 +767,8 @@ def _main(argv: list[str]) -> int:
         return retire(unit, cast(float, options.wait_minutes))
     except (staff.StaffRefused, staff.StaffUnreadable):
         raise
-    except (Refused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError) as error:
+    except (Refused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError,
+            tunables.TunableUnusable, subprocess.SubprocessError) as error:
         print(f"refused: {error}")
         return 1
 

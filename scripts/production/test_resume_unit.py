@@ -30,7 +30,8 @@ import pane_record
 
 from scripts.production.staff_test_support import CHECKOUT, PROCESS_TIMEOUT, StaffTestCase
 from scripts.lib.atomic_file import write_text_atomic
-from scripts.production import staff
+from scripts.production import staff, unit_config
+from scripts.production.staff_test_support import unit_membership
 
 RUN_COMMAND = retire_unit.run
 
@@ -56,6 +57,25 @@ class ResumeUnitTests(unittest.TestCase):
     configs: list[Path] = []
     calls: list[list[str]] = []
     launch_code: int = 0
+
+    def test_neither_config_refuses_with_the_backfill_instruction_before_any_change(self) -> None:
+        self.staff.register_production("alpha", self.doc)
+        row = unit_membership("alpha", "alpha-unit")
+        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
+        before = self.doc.read_bytes(), self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD")
+        for flags in ((), ("--dry-run",)):
+            with self.subTest(flags=flags):
+                code, output = self.resume(*flags)
+                self.assertEqual(code, 1, output)
+                self.assertEqual(output, f"alpha-unit: no .unit.toml in {self.worktree} or "
+                                 + f"~/.local/state/staff/units/{row.id}.toml; run staff_sources.py fill --retired "
+                                 + "or ask the showrunner\n")
+                self.assertFalse(self.worktree.exists())
+                self.assertEqual(unit_config.place(row.id, self.worktree), unit_config.Nowhere())
+                self.assertEqual(self.calls, [])
+                self.assertEqual((self.doc.read_bytes(), self.staff.staff_file.read_bytes(),
+                                  git(self.checkout, "rev-parse", "HEAD")), before)
+
 
     @override
     def setUp(self) -> None:
@@ -138,16 +158,31 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertIn("alpha-unit resumed", output)
 
     def test_resume_unit_rerun(self) -> None:
-        original = add_unit.ensure_staff_unit
+        self.staff.register_production("alpha", self.doc)
+        row = unit_membership("alpha", "alpha-unit")
+        row = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", self.worktree))
+        saved = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
+            unit_config.AppPort(1), ("scripts",),
+            unit_config.RetiredSession("2026-10-20", DIRECTOR,
+                unit_config.RecordedStartFolder(self.worktree), unit_config.Branch("alpha-branch")))
+        unit_config.write_parked(row.id, saved)
+        parked = unit_config.parked_path(row.id)
+        retained = parked.read_bytes(), parked.stat().st_mtime_ns
+        original = staff.set_worktree
         for after in (False, True):
-            def interrupted(production: Production, unit: str) -> staff.StaffRow:
+            def interrupted(identity: staff.StaffId,
+                            worktree: staff.PresentWorktree | staff.RemovedWorktree) -> staff.StaffRow:
                 if after:
-                    _ = original(production, unit)
+                    _ = original(identity, worktree)
                 raise RuntimeError("stopped at staff step")
-            with mock.patch.object(add_unit, "ensure_staff_unit", side_effect=interrupted):
+            with mock.patch.object(staff, "set_worktree", side_effect=interrupted):
                 with self.assertRaisesRegex(RuntimeError, "stopped at staff step"):
                     _ = self.resume()
-            self.assertFalse(self.worktree.exists())
+            self.assertTrue(self.worktree.is_dir())
+            self.assertEqual(unit_config.read(self.worktree),
+                             unit_config.UnitConfig(saved.plan, saved.port, saved.responsibilities))
+            self.assertEqual((parked.read_bytes(), parked.stat().st_mtime_ns), retained)
+            self.assertEqual(self.calls, [])
         code, output = self.resume()
         self.assertEqual(code, 0, output)
         rows = staff.find(kind="unit")

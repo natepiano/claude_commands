@@ -467,6 +467,7 @@ class AddUnitTestCase(ShutdownTestCase):
             _ = parser.add_argument("--" + flag, type=int if flag == "port" else str)
         _ = parser.add_argument("--standby", action="store_true")
         _ = parser.add_argument("--permanent", action="store_true")
+        _ = parser.add_argument("--responsibility", action="append", default=[])
         _ = parser.add_argument("--check", action="store_true")
         _ = parser.add_argument("--probe", action="store_true")
         _ = parser.add_argument("--source-fallback", action="store_true")

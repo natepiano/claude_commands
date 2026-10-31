@@ -829,6 +829,10 @@ class StopResumeTests(unittest.TestCase):
             self.assertEqual(stop_resume.resume("alpha", why="maintenance"), stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude3"))
 
     def test_move_stops_then_runs_the_target_account_in_the_same_pane(self) -> None:
+        identity = "s123456789ab"
+        self.entry["environment"]["STAFF_ID"] = identity
+        pane_record.write("agents", self.entry)
+        tab = dict(self.client.rows[0])
         self.live.side_effect = [sessions.LiveSessionProcess(123), sessions.LiveSessionProcess(123),
                                  sessions.SessionNotLive(), sessions.SessionNotLive()]
         self.process.side_effect = [sessions.LiveSessionProcess(123), sessions.SessionNotLive()]
@@ -838,6 +842,14 @@ class StopResumeTests(unittest.TestCase):
         command = self._typed(cast(tuple[str, ...], self.start.call_args.args))
         self.assertEqual(command[command.index("exec") + 1], "claude4")
         self.assertIn("moved from claude3 to claude4", command[-1])
+        self.assertIn(f"STAFF_ID={identity}", command)
+        refresh = pane_record.launch("w1:p2", "sid-alpha", str(self.root),
+                                     {"CLAUDE_CONFIG_DIR": str(self.root / ".claude4")}, ["claude", "--resume", "sid-alpha"])
+        pane_record.write("agents", refresh)
+        self.assertEqual(pane_record.read("agents")["w1:p2"]["environment"]["STAFF_ID"], identity)
+        self.assertEqual(self.client.rows[0], tab)
+        self.assertEqual(self.client.closed, [])
+        self.assertEqual(self.client.started, [])
 
     def test_move_of_a_stopped_session_resumes_but_a_failed_stop_does_not(self) -> None:
         self.assertEqual(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4"))
