@@ -25,16 +25,18 @@ from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import change_review
 import scratch  # on the path once change_review has put scripts/lib there
-from showrunners import canonical_slug
+from scripts.production.showrunners import canonical_slug
 from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import progress_history  # noqa: E402
 from scripts.production import production_doc  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
+from scripts.lib.process_failure import failure_detail  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
@@ -875,7 +877,7 @@ def push_validate(production: Production, fix_commit: str, may_undo: bool, cance
     try:
         result = subprocess.run(command, cwd=production.checkout, capture_output=True, text=True, check=False)
         if result.returncode:
-            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            detail = failure_detail(result)
             raise Stop("push", "failed", detail, "repair the push failure and send a new checkpoint")
     except (Stop, OSError):
         if may_undo:

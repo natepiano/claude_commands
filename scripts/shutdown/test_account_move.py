@@ -27,9 +27,8 @@ import inventory
 import shutdown_record
 import sessions
 import settle
-import showrunners
+from scripts.production import showrunners
 import launch_permission
-from importlib import import_module
 from scripts.whoami import account
 from scripts.whoami import agent_accounts
 from scripts.accounts import accounts, refusals
@@ -61,8 +60,7 @@ class AccountMoveTests(ShutdownTestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
         })))
         del context
-        _ = self.enterContext(patch.object(import_module("showrunners"), "NOTIFIER_STATE_DIR", self.root / "notifier"))
-        _ = self.enterContext(patch.object(import_module("scripts.production.showrunners"), "NOTIFIER_STATE_DIR", self.root / "notifier"))
+        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(patch.object(agent_accounts, "user_zone", return_value=timezone.utc))
         self.moves = FakeSessionMoves()
         _ = self.enterContext(patch.object(stop_resume, "move_sessions", side_effect=self.moves))

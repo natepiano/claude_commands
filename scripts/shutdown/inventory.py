@@ -42,7 +42,7 @@ import detection_rules
 import herdr
 import sessions
 from sessions import process_start as _process_start
-import showrunners
+from scripts.production import showrunners
 import unit_lookup
 from scripts.whoami.account import Account, label_for
 

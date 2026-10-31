@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib.atomic_file import write_text_atomic
 from zoneinfo import ZoneInfo
 
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 import unit_lookup
 from production_units import Production, read_production
