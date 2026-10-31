@@ -11,6 +11,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, replace
@@ -25,6 +26,7 @@ from scripts.lib import atomic_file  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
 
 OWNER_MACHINE = "natedev"
+OPERATION_LOCK_TIMEOUT_SECONDS = 30.0
 StaffId = NewType("StaffId", str)
 Kind = Literal["showrunner", "unit", "worker"]
 _KINDS: tuple[Kind, ...] = ("showrunner", "unit", "worker")
@@ -261,6 +263,41 @@ def _joined_operation(path: Path) -> bool:
         return False
 
 
+def _operation_lock_holder(path: Path) -> str:
+    """Read the kernel's current flock owner; inherited locks can outlive that pid."""
+    try:
+        target = path.stat()
+        for line in Path("/proc/locks").read_text(encoding="utf-8").splitlines():
+            fields = line.split()
+            if len(fields) < 6 or fields[1:4] != ["FLOCK", "ADVISORY", "WRITE"]:
+                continue
+            major, minor, inode = fields[5].split(":")
+            if (int(major, 16), int(minor, 16), int(inode)) == (
+                os.major(target.st_dev), os.minor(target.st_dev), target.st_ino
+            ) and int(fields[4]) > 0:
+                return f"pid {fields[4]}"
+    except (OSError, ValueError):
+        pass
+    return "holder pid unavailable"
+
+
+def _wait_for_operation_lock(descriptor: int, path: Path) -> None:
+    started = time.monotonic()
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            elapsed = time.monotonic() - started
+            remaining = OPERATION_LOCK_TIMEOUT_SECONDS - elapsed
+            if remaining <= 0:
+                raise StaffRefused(
+                    f"staff operation lock {path}: {_operation_lock_holder(path)}; " +
+                    f"refused after {elapsed:.2f}s (limit {OPERATION_LOCK_TIMEOUT_SECONDS:.2f}s)"
+                ) from None
+            time.sleep(min(0.05, remaining))
+
+
 def operation() -> AbstractContextManager[None]:
     """Order source changes, joining only a proven inherited operation lock."""
     @contextmanager
@@ -273,7 +310,7 @@ def operation() -> AbstractContextManager[None]:
             try:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 lock = resources.enter_context(path.open("a", encoding="utf-8"))
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                _wait_for_operation_lock(lock.fileno(), path)
             except OSError as error:
                 raise StaffUnreadable(f"staff operation: {error}") from error
             previous = os.environ.get("STAFF_OPERATION_FD")

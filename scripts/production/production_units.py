@@ -70,6 +70,11 @@ def unit_table(lines: list[str]) -> list[dict[str, str]]:
     return [dict(zip(headings, row_cells(row), strict=False)) for row in rows]
 
 
+def plan_arguments(plan: str) -> list[str]:
+    """Translate a Units Plan cell into add_unit's launch mode."""
+    return ["--" + plan] if plan in ("standby", "permanent") else ["--plan", plan]
+
+
 def plan_cell_is_retired(plan_cell: str) -> bool:
     """Return whether a Plan cell begins with the retired marker."""
     return re.match(r"^\s*\(?retired\b", plan_cell) is not None

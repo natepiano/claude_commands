@@ -154,6 +154,12 @@ class HanaMerge:
     at: datetime
 
 
+@dataclass(frozen=True)
+class HanaTrunkMerges:
+    merges: tuple[HanaMerge, ...]
+    source: str
+
+
 class WaitKind(Enum):
     QUOTA = "WaitingForQuotaRefusal"
     CAPACITY = "WaitingForMemoryOrSlot"
@@ -432,7 +438,7 @@ class BaselineSources:
     rankings: list[IssueRank]
     waiting: list[WaitingItem]
     problems: list[log_records.SourceProblem]
-    merges: list[HanaMerge] | MergeHistoryNotRecorded = MergeHistoryNotRecorded.MISSING
+    merges: HanaTrunkMerges | MergeHistoryNotRecorded = MergeHistoryNotRecorded.MISSING
     wait_history: HanaWaitHistory | HistoryNotRecorded = HistoryNotRecorded()
     receipts: tuple[MergeReceipt, ...] | HistoryNotRecorded = HistoryNotRecorded("merge receipts not recorded")
 
@@ -1125,7 +1131,7 @@ def receipt_for_merge(merge: HanaMerge, receipts: Sequence[MergeReceipt]) -> Mer
 
 def receipt_rows(
     receipts: Sequence[MergeReceipt] | HistoryNotRecorded,
-    merges: Sequence[HanaMerge] | MergeHistoryNotRecorded, window: log_records.Window,
+    merges: HanaTrunkMerges | MergeHistoryNotRecorded, window: log_records.Window,
 ) -> list[log_records.MeasureRow]:
     source = "progress_history merge_receipts.jsonl; exact project, target branch and merge commit"
     if isinstance(receipts, HistoryNotRecorded):
@@ -1140,7 +1146,7 @@ def receipt_rows(
     if isinstance(merges, MergeHistoryNotRecorded):
         rows.append(log_records.MeasureRow("Hana merge receipts / origin/init/catalyst", "not recorded (merge history not recorded)", 0, window.label, source, quantity=log_records.NotRecorded("merge history not recorded"), event_source=EventSource.RECEIPTS))
         return rows
-    selected_merges = {merge.commit: merge for merge in merges if window.contains(merge.at)}
+    selected_merges = {merge.commit: merge for merge in merges.merges if window.contains(merge.at)}
     matched = 0
     for merge in selected_merges.values():
         result = receipt_for_merge(merge, recorded)
@@ -1306,16 +1312,50 @@ def issue_flow(found: Sequence[issues.Issue], window: log_records.Window) -> lis
     return rows
 
 
-def read_hana_merges(repo: Path) -> list[HanaMerge]:
-    result = subprocess.run(
-        ["git", "-C", str(repo), "log", "--first-parent", "--merges", "--format=%H%x09%cI", "origin/init/catalyst"],
-        check=True, capture_output=True, text=True,
-    )
+def read_hana_merges(repo: Path) -> HanaTrunkMerges:
+    return walk_hana_trunk(repo)
+
+
+def walk_hana_trunk(repo: Path) -> HanaTrunkMerges:
+    ref = "refs/remotes/origin/init/catalyst"
+    def git(*arguments: str) -> str:
+        return subprocess.run(["git", "-C", str(repo), *arguments], check=True,
+                              capture_output=True, text=True).stdout
+
+    tips = list(dict.fromkeys(git("reflog", "show", "--format=%H", ref).splitlines()))
+    commits: dict[str, tuple[tuple[str, ...], datetime]] = {}
+    for line in git("log", "--topo-order", "--format=%H%x09%P%x09%cI", ref).splitlines():
+        commit, parents, at = line.split("\t")
+        commits[commit] = (tuple(parents.split()), log_records.required_time(at))
+    current = next(iter(commits))
     merges: list[HanaMerge] = []
-    for line in result.stdout.splitlines():
-        commit, at = line.split("\t", 1)
-        merges.append(HanaMerge(commit, log_records.required_time(at)))
-    return merges
+    recorded: list[str] = []
+    if current in tips:
+        recorded.append(current)
+    for older in tips:
+        if older == current or older not in commits:
+            continue
+        allowed = set(git("rev-list", "--ancestry-path", f"{older}..{current}").splitlines())
+        if current not in allowed:
+            continue
+        allowed.add(older)
+        recorded.append(older)
+        while current != older:
+            parents, at = commits[current]
+            if len(parents) > 1:
+                merges.append(HanaMerge(current, at))
+            current = next(parent for parent in parents if parent in allowed)
+    while True:
+        parents, at = commits[current]
+        if len(parents) > 1:
+            merges.append(HanaMerge(current, at))
+        if not parents:
+            break
+        current = parents[0]
+    limit = (f"trunk path from {len(recorded)} recorded tips back to {commits[recorded[-1]][1].isoformat()}; "
+             "first parent before that; git expires reflog entries after 90 days") if recorded else "no recorded tips; first parent only"
+    return HanaTrunkMerges(tuple(merges), "git origin/init/catalyst merge commits; local ref; commit time; no fetch; "
+                           + limit)
 
 
 def hana_repository(units: Sequence[Unit]) -> Path:
@@ -1328,11 +1368,11 @@ def hana_repository(units: Sequence[Unit]) -> Path:
     raise FileNotFoundError("Hana repository not found through local Git common directories")
 
 
-def merge_flow(merges: Sequence[HanaMerge] | MergeHistoryNotRecorded, window: log_records.Window) -> list[log_records.MeasureRow]:
-    source = "git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch"
+def merge_flow(merges: HanaTrunkMerges | MergeHistoryNotRecorded, window: log_records.Window) -> list[log_records.MeasureRow]:
     if isinstance(merges, MergeHistoryNotRecorded):
-        return [log_records.MeasureRow("Hana merges / origin/init/catalyst", "not recorded", 0, window.label, source, quantity=log_records.NotRecorded("merge history not recorded"), event_source=EventSource.MERGES)]
-    selected = {merge.commit: merge for merge in merges if window.contains(merge.at)}
+        return [log_records.MeasureRow("Hana merges / origin/init/catalyst", "not recorded", 0, window.label, merges.value, quantity=log_records.NotRecorded("merge history not recorded"), event_source=EventSource.MERGES)]
+    selected = {merge.commit: merge for merge in merges.merges if window.contains(merge.at)}
+    source = merges.source
     rows = [log_records.MeasureRow("Hana merges / origin/init/catalyst", str(len(selected)), len(selected), window.label, source,
         quantity=log_records.EventValue(len(selected), events=tuple(log_records.TimedAmount(merge.at) for merge in selected.values()),
             population=tuple(merge.at for merge in selected.values())), event_source=EventSource.MERGES)]
@@ -1774,7 +1814,7 @@ def load_window_sources(window: log_records.Window, notifications: push_audit.Au
     problems.extend(worker_problems)
     problems.extend(log_records.SourceProblem("session roster", problem, event_source=log_records.SourceNotApplicable.STATE) for problem in roster_problems)
     problems.extend(token_problems)
-    def load_merges() -> list[HanaMerge] | MergeHistoryNotRecorded:
+    def load_merges() -> HanaTrunkMerges | MergeHistoryNotRecorded:
         return read_hana_merges(hana_repository(units))
 
     merges = read_source("Hana origin/init/catalyst merge log", load_merges, MergeHistoryNotRecorded.MISSING, problems, event_source=EventSource.MERGES)
