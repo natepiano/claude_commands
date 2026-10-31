@@ -1603,6 +1603,32 @@ class RestartTests(ShutdownTestCase):
                 self.assertLess(calls.index(focus), calls.index(closed))
                 self.assertEqual([row for row in calls if row[2:4] == ["workspace", "close"]], [closed])
 
+    def test_claude_restore_adopts_a_server_without_taking_focus(self) -> None:
+        owner, _, log = self.herdr_restart_fixture()
+        with patch.object(herdr, "restore_server", return_value=herdr.ServerAdopted()):
+            result = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+        self.assertIsInstance(result, restart.SessionLaunched)
+        calls = self.herdr_calls(log)
+        self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in calls), 1)
+        self.assertFalse(any(row[2:4] in (["workspace", "focus"], ["workspace", "close"]) for row in calls))
+
+    def test_claude_restore_focuses_and_cleans_startup_workspaces_only_for_its_new_window(self) -> None:
+        owner, responses, log = self.herdr_restart_fixture()
+        self.configure_mac_bootstrap(responses, "writing")
+        self.configure_startup_shell(responses, "writing")
+        state = restart.DesktopLaunchState(session_kind=herdr.NonDesktopSession())
+        with patch.object(sys, "platform", "darwin"), patch.object(herdr, "_PLATFORM", "darwin"):
+            for _ in range(2):
+                result = restart._launch_session(entry(owner), "restart", state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
+                self.assertIsInstance(result, restart.SessionLaunched)
+        calls = self.herdr_calls(log)
+        self.assertEqual(sum(row[2:4] == ["agent", "start"] for row in calls), 2)
+        focus = ["--session", "writing", "workspace", "focus", "w2"]
+        closed = ["--session", "writing", "workspace", "close", "w9"]
+        self.assertEqual([row for row in calls if row[2:4] == ["workspace", "focus"]], [focus])
+        self.assertEqual([row for row in calls if row[2:4] == ["workspace", "close"]], [closed])
+        self.assertLess(calls.index(focus), calls.index(closed))
+
     def configure_startup_shell(self, responses: Path, name: str) -> None:
         replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
         workspace, pane = startup_shell("w9")
@@ -2533,7 +2559,7 @@ class RestartTests(ShutdownTestCase):
         self.assertFalse(any(row[2:4] == ["pane", "close"] for row in calls))
         self.assertEqual(len([row for row in calls if row[2:4] == ["workspace", "create"]]), 1)
 
-    def test_adopted_server_focuses_the_restored_workspace_and_preserves_the_attached_shell(self) -> None:
+    def test_adopted_server_preserves_focus_and_the_attached_shell(self) -> None:
         owner, responses, log = self.herdr_restart_fixture()
         replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
         replies["--session writing pane list"] = {"stdout": json.dumps({"result": {
@@ -2551,9 +2577,8 @@ class RestartTests(ShutdownTestCase):
             self.assertIsInstance(result, restart.SessionLaunched)
             calls = self.herdr_calls(log)
             focus = ["--session", "writing", "workspace", "focus", "w2"]
-            self.assertIn(focus, calls)
-            prompted = next(row for row in calls if row[2:4] == ["agent", "prompt"])
-            self.assertLess(calls.index(prompted), calls.index(focus))
+            self.assertNotIn(focus, calls)
+            self.assertEqual([row[-1] for row in calls if row[2:4] == ["agent", "prompt"]], ["restart"])
             self.assertFalse(any(row[2:4] in (["workspace", "close"], ["pane", "close"])
                                  for row in calls))
 
@@ -2562,7 +2587,7 @@ class RestartTests(ShutdownTestCase):
         replies = cast(dict[str, CommandResponse | list[CommandResponse]], json.loads(responses.read_text()))
         replies["--session writing workspace focus w2"] = {"stdout": "", "code": 1, "stderr": "focus refused"}
         _ = responses.write_text(json.dumps(replies))
-        with (patch.object(herdr, "start_server", return_value=herdr.ServerAdopted()),
+        with (patch.object(herdr, "restore_server", return_value=herdr.WindowServerCreated()),
               patch.object(herdr, "stop_session") as stop, redirect_stdout(io.StringIO()) as output):
             result = restart._launch_session(entry(owner), "restart", self.desktop_state, dry_run=False)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(result, restart.SessionLaunched)
