@@ -26,7 +26,6 @@ from zoneinfo import ZoneInfo
 import sweep
 from test_memory_admit import HISTORY_APPEND_STOPS, stop_history_append
 if TYPE_CHECKING:
-    from . import memory_admit
     from ..build_hold import build_hold
     from ..buildlog import record, store
     from ..lib import scratch
@@ -36,7 +35,6 @@ if TYPE_CHECKING:
     from ..notify.push_texts import RenderedPush, catalog, render, render_entry
     from ..notify.user_action import ActionRequired
 else:
-    from scripts.lint import memory_admit
     import build_hold
     import record
     import scratch
@@ -1312,24 +1310,6 @@ with open(sys.argv[1], 'a') as lock:
         self.assertFalse(output.exists())
         row, = self.trim_rows()
         self.assertEqual((row["folder"], row["extent"], row["cause"]), (str(target), "whole", "floor take"))
-
-    def test_helper_created_shared_folder_is_discovered_without_rustc_info_or_copy_record(self) -> None:
-        base = self.base()
-        source = base / "source"
-        source.mkdir()
-        with (mock.patch.dict(os.environ, {"SCRATCH_SHARED_BUILD_ROOT": str(base / "shared-builds")}),
-              mock.patch.object(memory_admit, "git_identity", return_value=(
-                  memory_admit.RepositoryIdentity("example.invalid/team/sample", "sample"), str(source)))):
-            result = scratch.shared_build_folder(source)
-        assert isinstance(result, scratch.SharedBuildFolder)
-        output = unit(result.path / "debug", "deps", "app", APP, time.time() - DAY)
-        shutil.rmtree(source)
-        self.assertFalse((result.path / sweep.RUSTC_INFO).exists())
-        self.assertEqual(sweep.target_dirs([str(base)]), [str(result.path)])
-        with mock.patch.object(sweep, "held_cargo_lock_files", return_value=set()):
-            status, _ = self.hold(base, 10 * GIB, [10 * GIB - 1, 10 * GIB])
-        self.assertEqual(status, 0)
-        self.assertFalse(output.exists())
 
     def test_partial_unlink_failure_still_records_successfully_freed_bytes(self) -> None:
         for caller in ("budget", "floor"):

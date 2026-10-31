@@ -125,24 +125,24 @@ Own what a build may use and when it starts: memory admission and the memory que
 
 #### As-built
 
-- `scratch.shared_build_folder(source: Path) -> SharedBuildFolder(path, repo_identity) | NoSharedBuildFolder(reason)` is the one mapping from repository to its shared Cargo build folder. No caller sets the path as `CARGO_BUILD_BUILD_DIR`: the builds showrunner reversed its 02:42 word on 2026-10-30, because the verify-copies measurement (case D) spent 68.7 of 69.0 s on the shared folder's build lock, so `copies.py` seeds each copy's own build folder. Phase 34 removes the shared folder. The key is `memory_admit.git_identity(...)`'s repository key, so the path names its repository with no copy record: `$SCRATCH_SHARED_BUILD_ROOT` (default `~/.cache/claude-builds`) plus the URL-quoted key. An `UnknownRepository` gets `NoSharedBuildFolder`, and that clone keeps its own target. The folder lives past any one task.
+- The per-repository shared Cargo build folder (`scratch.shared_build_folder`) was built here and removed by Phase 34: the builds showrunner reversed its 02:42 word on 2026-10-30, because the verify-copies measurement (case D) spent 68.7 of 69.0 s on the shared folder's build lock, so `copies.py` seeds each copy's own build folder. A copy record no longer writes `shared_target`; old records still load.
 - `scratch.mark_cargo_cache(target)` writes `CACHEDIR.TAG` and refreshes the one use stamp. `scratch.USE_STAMP`, `CACHE_TAG`, `STYLE_TARGET_NAME` and `STYLE_LOCK_NAME` are the only spellings of these names.
 - `style_sync.py` keeps its one `style-sync-target` per repository past task end and keeps its `sync.lock`.
-- The sweeps treat a shared folder as one target with its own last use. `sweep.lock_trees(trees) -> TargetLocksAcquired(held) | TargetLockBusy(path)` takes Cargo's locks and, for a style target, `sync.lock`, without a wait. The busy check expands Cargo `build.build-dir` templates (`{workspace-root}`, `{cargo-cache-home}`, `{workspace-path-hash}`); an unknown template keeps the whole Cargo cache busy.
+- The sweeps treat each target as one unit with its own last use. `sweep.lock_trees(trees) -> TargetLocksAcquired(held) | TargetLockBusy(path)` takes Cargo's locks and, for a style target, `sync.lock`, without a wait. The busy check expands Cargo `build.build-dir` templates (`{workspace-root}`, `{cargo-cache-home}`, `{workspace-path-hash}`); an unknown template keeps the whole Cargo cache busy.
 - `record.sweep_trim(folder: str, bytes_freed: int, extent: Literal["whole", "partial"], cause: Literal["budget take", "floor take"], at: float) -> None` appends one `kind` `"sweep_trim"` build-log row (`host`, `at`, `folder`, `bytes_freed`, `extent`, `cause`). `sweep.record_sweep_removal` is its one call site; the budget take and the floor take call it once per target take. `bytes_freed` counts only `ConfirmedDeletion` bytes. `extent` is `whole` when the take leaves no build unit or incremental dir of the target. A dry run writes no row. A failed write prints to stderr and the sweep goes on.
 - Each take is write-ahead: a `TrimTake` intent under the floor record's `trims/` folder lasts until its row is in the build log, and `recover_pending_trims` publishes a stopped take on the next run.
 - `rebuilds` reads trims from `sweep_trim` rows through the same build-log read as its steps, and merges them with the journal and legacy `removals.jsonl` rows. Nothing writes `removals.jsonl`.
 - Rebuild attribution still keys steps by workspace. The shared-folder attribution through the build step row's `target_dir` and `repo_identity`, and `repo_identity` on the trim row, do not exist yet.
 
 **Files:**
-- `scripts/lib/scratch.py` — the shared folder mapping, `mark_cargo_cache` and the shared names.
+- `scripts/lib/scratch.py` — `mark_cargo_cache` and the shared cache names (the shared folder mapping was removed by Phase 34).
 - `scripts/style/style_sync.py` — the retained shared style target.
 - `scripts/lint/sweep.py` — one-target sweep, `lock_trees`, Cargo build-dir templates, `TrimTake`, `recover_pending_trims`, `record_sweep_removal`, the `rebuilds` trim reader.
 - `scripts/buildlog/record.py` — `sweep_trim`.
-- `docs/as-built/build-targets.md` — the shared folder and the trim row.
+- `docs/as-built/build-targets.md` — the trim row (the shared folder text was removed by Phase 34).
 - `scripts/lib/test_scratch.py`, `scripts/style/test_style_sync.py`, `scripts/lint/test_sweep.py` — tests.
 
-**Binds later work:** shared-folder work finds the folder through `scratch.shared_build_folder` only. The `sweep_trim` row has no `repo_identity` until the step-row attribution reader lands. Trim recovery accounting extends `TrimTake.log_offset`, `recover_pending_trims` and `store.read_last_whole_row_end` / `store.last_whole_row_end`; a stop between `reclaim` and the row append, and a cut-short row, are not yet covered.
+**Binds later work:** the `sweep_trim` row has no `repo_identity` until the step-row attribution reader lands. Trim recovery accounting extends `TrimTake.log_offset`, `recover_pending_trims` and `store.read_last_whole_row_end` / `store.last_whole_row_end`; a stop between `reclaim` and the row append, and a cut-short row, are not yet covered.
 
 **Gotchas:**
 - `ConfirmedDeletion.removed` counts removals apart from bytes: a delete of a hard-linked file frees 0 bytes but is still a trim.
@@ -828,6 +828,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 6. **Docs.** `docs/as-built/build-memory-admission.md`: the Waiters paragraph (queue order in backfill, `head_since`), the Queue order paragraph (queue priority replaces bump) and the token record.
 
 **Constraints from prior phases:**
+- Queue-unit's /build:queue view (builds showrunner 2026-10-30: this phase merges after it): row marks come from `queue_view.py` `is_moved(model, position)` and `move_mark(model, position)` over `QueueModel` (`origin/builds-queue`). "Became first" (`HeadSince`) reaches the view's up arrow and countdown through that one function and its model; write no second mark or countdown writer. Merge `origin/builds` before the checkpoint and resolve the queue order text there. Only the user owns queue order: priority replaces bump as Spec 2 says, and no command lets a session move a step.
 - Phase 10: the blocker lookup reuses `decide` and `queue_decision`; no second rule.
 - Phase 20 (later) makes one head policy function; this phase's backfill rule and `head_since` go in `queue_decision` and the queue pass, so Phase 20 moves them with the rest.
 - Report 4e (`be391b7a`) landed `scripts/build_queue/head_facts.py`: `read_head_facts` (:326) reads `head_since` from the first waiter row (:334), and `_token_gap` (:241) reads `token_left_at` and `token_back_at` from `queue_times.jsonl`, by these names; keep them. Tell queue-unit at the checkpoint.
@@ -1069,7 +1070,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Gotchas:** an intent time is checked with `store.utc_iso` at read time; a millisecond epoch passes a range check and fails only at publication.
 
-### Phase 34 — The unused shared build folder goes  · status: todo
+### Phase 34 — The unused shared build folder goes  · status: done
 
 Follow-up of the Phase 4 reversal. On 2026-10-30 the builds showrunner reversed its 02:42 word: the verify-copies measurement (case D) spent 68.7 of 69.0 s waiting on the shared folder's build lock, so the copies rule picks seed and `copies.py` has no shared mode. `scratch.shared_build_folder` has no consumer, so it goes.
 
@@ -1095,5 +1096,5 @@ Follow-up of the Phase 4 reversal. On 2026-10-30 the builds showrunner reversed 
 **Workers:** `1 writer`
 
 **Acceptance gate:**
-- `python3 -m unittest discover -s scripts/lib -p test_scratch.py` and `-s scripts/lint -p test_sweep.py` pass; basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`; `grep -rn 'shared_build_folder\|shared_target' scripts docs/as-built` finds only the old-record reader and its test.
+- `python3 -m unittest discover -s scripts/lib -p test_scratch.py` and `-s scripts/lint -p test_sweep.py` pass; basedpyright on the changed Python files reads `0 errors, 0 warnings, 0 notes`; `grep -rn 'shared_build_folder\|shared_target' scripts docs/as-built` finds only the old-record test and unrelated account-link and style-sync names.
 - Change-Review line: none — an unused helper goes; nothing on screen changes.

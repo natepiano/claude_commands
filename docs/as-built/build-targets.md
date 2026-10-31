@@ -221,20 +221,13 @@ the log does not record that connection. Journal retention also limits the evide
 
 ### Copy records and lifetime
 
-`scratch.shared_build_folder(source)` returns `SharedBuildFolder(path,
-repo_identity)`, a folder a caller can set as `CARGO_BUILD_BUILD_DIR`. No caller
-uses it: `copies.py` seeds each copy's own build folder, because the
-verify-copies measurement (2026-10-30, case D) spent 68.7 of 69.0 s waiting on
-the shared folder's build lock. A later resources phase removes it. It calls
-`memory_admit.git_identity` only when used. The repository key alone names the
-folder under `~/.cache/claude-builds` (`SCRATCH_SHARED_BUILD_ROOT` overrides the
-root); each use updates the folder's one `.lint-sweep-used` stamp. An unknown
-repository returns `NoSharedBuildFolder(reason)` and keeps its own build folder.
-The shared folder outlives individual copy tasks, uses Cargo's build locks and
-is swept as one target by its own last use. A copy record can name its shared
-target; ending the copy never removes that target. The existing
-`style-sync-target` also outlives its production task and keeps `sync.lock`
-across checkout creation, lint and cleanup.
+Copies seed their own build folders. The unused per-repository Cargo folder
+helper was removed: the verify-copies measurement (2026-10-30, case D) spent
+68.7 of 69.0 s waiting on that folder's build lock. New copy records do not
+write its path; old records still load and the old field has no effect.
+The `style-sync-target` still outlives its production task and keeps
+`sync.lock` across checkout creation, lint and cleanup. The sweep still reads
+Cargo's general `build.build-dir` templates.
 
 `/tmp/claude/copies` is a kept root, with copies at `<pair>/<copy>`. The tmp sweep judges each copy separately and removes an empty pair; the folder audit and scratch guard keep the root. `scratch.register_copy` writes `.scratch.json` atomically with source path and commit, copy commit, target mode, seed source, borrowed git directory, owner unit, task, land target and copy identity. A phase record also names its run directory and phase id. Registration, renew, hand-over, task end and removal use one read/change/publish path under the copy's record lock. Only `.scratch.json` and `.claude-busy` are excluded in the copy's own Git exclude file; ordinary untracked files keep the copy.
 
