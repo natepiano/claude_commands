@@ -221,8 +221,9 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual([(ticket.files, ticket.rules, ticket.cells) for ticket in batches], [
             (("crates/alpha/Cargo.toml",), (manifest,), ((manifest, "crates/alpha"),)),
         ])
-        self.assertFalse(any(ticket.crate == "crates/alpha" for ticket in
-                             self.candidates("modules", ("crates/alpha/Cargo.toml",))))
+        held_batches = [ticket for ticket in self.candidates("modules", ("crates/alpha/Cargo.toml",))
+                        if ticket.crate == "crates/alpha"]
+        self.assertEqual(held_batches, batches)
         self.record(manifest, "crates/alpha", self.tip)
         self.write(self.sources[0], "pub fn changed() {}\n")
         self.tip = self.commit()
