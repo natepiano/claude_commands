@@ -107,56 +107,27 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 ### Phase 2 — The build report shows memory figures before and after the build budget raise  · status: done
 **Depends on:** Phase 1
 
-#### Work Order
+#### As-built
 
-**Goal:** the before-and-after report answers whether raising the build budget from 21 to 24 GiB (user approved, a one-day trial) changed memory pressure. It prints earlyoom kills (builds and others), the full memory stall, the memory wait p90 and memory-kill retries, before and after the moment the raise is live on main. The raise is a separate moment from Build rules 1 (06:50 EDT), which sits close to it, and the report names that overlap.
-
-**Spec:**
-- **A separate memory moment.** `moments.py` gets one more entry, `Build budget 21 → 24 GiB`, at the instant the showrunner sends. Until that time is known the entry is typed as not live: the report prints `Build budget 21 → 24 GiB: not live yet` in place of its table, and the director later swaps in the instant as a one-line change. Tests use their own fixture instants. It is on its own track: it does not cut the windows of the build moments, and the build moments do not cut its windows. Its before window is the 7 days before it, cut only at an earlier memory moment; its after window runs to the next memory moment or the report end. The type makes the track explicit (no flag a reader must remember); `comparison_windows` stays the one window rule, applied per track. Moment 1's after window is unchanged by this entry.
-- **The overlap, named.** Under the memory moment's table, print one line naming each build moment inside its before or after window, with its date and time, for example `Overlap: Build rules 1 (2026-10-31 06:50 EDT) is inside the before window, 2.2 h before this moment.`
-- **Memory rows.** The memory moment prints its own table (Before, After, Change) with these rows; the build-rate and p50 tables do not print for it:
-  1. earlyoom kills per day, builds: kills whose earlyoom line carries the build kill level, `build_oom_score_adj` in `config/lint.conf` (500 today; `invoke.sh` sets the build scope from the same key, with no new process on the hot path; build steps and sccache, per the kill order in `docs/as-built/build-memory-admission.md`), plus kills at any other adj whose cmdline program sits under a `/target/` folder (a build or test binary run outside the build gate, which gets the sessions' 200). Print `N (M outside the build gate)`;
-  2. earlyoom kills per day, others: every other kill (sessions' tools, CI at 100, the desktop);
-  3. full memory stall: % of sampled time, from the machine `stall_full_us` counter deltas over natedev's 60 s samples;
-  4. memory wait p90: the 90th percentile of `mem_wait_s` over natedev steps started in the window that have `mem_wait_s` recorded, zero waits included;
-  5. memory-kill retries per day: `sum(mem_kills) - sum(mem_kill_stopped)` over natedev calls started in the window, with the stopped calls (`mem_kill_stopped = 1`) in brackets.
-  When the journal cannot be read (the Mac, or journalctl fails), rows 1 and 2 print `unavailable`. A window shorter than 1 day prints `thin`, as the rate tables do.
-- **One reader each, no copies.**
-  - earlyoom: `memory.py` gets one function that returns the window's kills as a typed list (time, pid, command, `oom_score_adj` or none, cmdline or none) or the journal-unavailable value, built on `journal_messages` and the `EARLYOOM` pattern (extended to capture `oom_score_adj`). `window_report` uses it too, and its output stays the same.
-  - stall: reuse `report.sample_counter_deltas(..., window=UsageWindow(start, end), natedev_only=True)`; resets, boot changes and gaps stay unknown as they are today.
-  - The memory figures live where they can use these readers without an import cycle.
-- **Definitions.** Add each memory row's definition to the section's definitions, once.
-- **On demand.** `buildlog moments` and `buildlog report` both show the memory moment. No timer and no notifier.
+- `scripts/buildlog/moments.py` puts each moment on a track (`MomentTrack.BUILD` or `MomentTrack.MEMORY`, a class variable of the type, not a flag):
+  - `MemoryMoment(at, name)` is a live memory moment. The live entry is `MemoryMoment(2026-10-31 13:33 UTC, "Build budget 21 → 24 GiB (e791376e)")`, 09:33 EDT.
+  - `PendingMemoryMoment(name)` is a memory moment with no live time. The report prints `<name>: not live yet` in place of its table.
+  - `comparison_windows` is still the one window rule, applied once per track. A memory moment never cuts a build moment's windows, and a build moment never cuts a memory moment's windows.
+- `scripts/buildlog/memory.py`: `earlyoom_kills(start, end)` returns a typed list of `EarlyoomKill` (time, pid, command, `oom_score_adj`, cmdline) or `JournalUnavailable` (the Mac, or journalctl fails). A kill is a build kill when its `oom_score_adj` equals `build_oom_score_adj`, or when its cmdline program is under `/target/` (outside the build gate). The program is the cmdline text before the first space. `window_report` uses the same reader, and its output is unchanged.
+- `scripts/buildlog/report.py`: a memory moment prints its own table (Before, After, Change) with these rows: earlyoom kills/day for builds as `N (M outside the build gate)`, earlyoom kills/day for others, full memory stall %, memory wait p90, and memory-kill retries/day with the stopped calls in brackets. An unreadable journal prints `unavailable` for the kill rows. Under the table, one overlap line names each build moment inside its windows, with date and time. The first memory moment's before column reads `no earlier memory moment`. `MIN_RATE_WINDOW_DAYS` is the one thin-window limit for the rate and memory tables. `buildlog moments` and `buildlog report` both show the memory moment.
+- `config/lint.conf` holds `build_oom_score_adj=500` under `[build]`, the one build kill level:
+  - `invoke.sh` reads it once, when it sources `lint_config.sh` (shell builtins only, no new process, 0.9 ms per source). A `declare -F` guard keeps `invoke.sh` working with an older reader that lacks the function.
+  - Python reads it through `scripts/lint/config_values.py` (`build_oom_score_adj()`).
+  - An absent key gives 500 with no message. A present invalid value prints a warning and gives 500.
+- Live on natedev, the week before Build rules 1 reads 54 builds kills (9 outside the build gate) and 0 others. `buildlog moments` runs in 3.0–4.1 s. The buildlog suites (220 tests), the invoke scope suite (22 tests) and the 124 test files that reach `invoke.sh` pass.
 
 **Files:**
-- `scripts/buildlog/moments.py`
-- `scripts/buildlog/memory.py`
-- `scripts/buildlog/report.py`
-- `scripts/buildlog/test_moments.py`
-- `scripts/buildlog/test_report.py`
-- `scripts/buildlog/test_memory_window.py`
-- `config/lint.conf`
-- `scripts/lint/invoke.sh`
-- `scripts/lint/lint_config.sh`
-- `scripts/lint/config_values.py`
-- `scripts/lint/test_invoke_scope.py`
+- `scripts/buildlog/moments.py` — `MomentTrack`, `MemoryMoment`, `PendingMemoryMoment`, the per-track window rule
+- `scripts/buildlog/memory.py` — `earlyoom_kills`, `EarlyoomKill`, `BUILD_OOM_SCORE_ADJ`
+- `scripts/buildlog/report.py` — the memory moment table, overlap lines, `MIN_RATE_WINDOW_DAYS`
+- `config/lint.conf` — `build_oom_score_adj` under `[build]`
+- `scripts/lint/lint_config.sh`, `scripts/lint/invoke.sh` — the shell reader and the build scope's kill level
+- `scripts/lint/config_values.py` — the Python reader
+- `scripts/buildlog/test_moments.py`, `scripts/buildlog/test_report.py`, `scripts/buildlog/test_memory_window.py`, `scripts/lint/test_invoke_scope.py` — tests
 
-**Workers:** impl3 writes `moments.py`, `memory.py`, `report.py`, `config/lint.conf`, `invoke.sh`, `lint_config.sh` and `config_values.py`. test2 writes the `test_moments.py`, `test_report.py`, `test_memory_window.py` and `test_invoke_scope.py` changes.
-
-**Acceptance gate:**
-- `basedpyright` on each slot's files reads 0 errors, 0 warnings, 0 notes.
-- `python3 -m unittest scripts.buildlog.test_moments scripts.buildlog.test_report scripts.buildlog.test_memory_window` passes, with a stubbed journal and fixture indexes that cover:
-  - the builds/others split (adj 500; adj 200 with a `/target/` program, counted as builds outside the gate; adj 200 without one; a line with no adj);
-  - journal unavailable;
-  - the stall share across a boot change;
-  - p90 with zero waits; retries with a stopped call;
-  - the memory moment's windows: not cut at Moment 1, and Moment 1's after window not cut at the memory moment;
-  - the overlap line;
-  - `window_report`'s earlyoom lines unchanged.
-- Live check by the director on natedev: for the week 2026-10-24 06:50 to 2026-10-31 06:50 EDT, the earlyoom reader returns 54 builds kills (9 outside the build gate) and 0 others (a manual journal count: 45 at adj 500; 9 at adj 200, all test binaries under `target/`); `buildlog moments` prints the memory table and the overlap line in under 5 s.
-
-**Constraints:**
-- Workers make no worktree commits.
-- Tests never read the live index, journal or progress history, and never write any of them.
-- Tests run with `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD`.
-- Build rules from 2026-10-31: fix every failure you can see before you rerun, and do not run a test after each small edit. After a pass, do not run again until your edits are done. Run basedpyright once, at the end.
+**Gotchas:** earlyoom joins argv with spaces and no shell quotes, so only the text before the first space is the program. A journal that cannot be read is `unavailable`, never zero.
