@@ -24,6 +24,7 @@ import argparse
 import dataclasses
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -725,8 +726,13 @@ def stop_unit(rename: StopTarget, _save: Callable[[], None]) -> None:
                 _ = shutdown_record.update_session(saved["login"], identity,
                     lambda current: current.update(progress=shutdown_record.SessionStopped(
                         kind="stopped", at=datetime.now(UTC).isoformat(timespec="seconds"))))
-    if any(saved["stop_issues"] for saved in records):
-        raise RenameRefused(f"{rename.old}: old worker cleanup is incomplete; needs a clean stop")
+    # Only the deleted conductor wrote stop issues; name the one command that settles its record.
+    for saved in records:
+        if saved["stop_issues"]:
+            settle = shlex.join(["python3", "scripts/shutdown/shutdown.py", "forget",
+                                 saved["session"]["session_id"], "--account", saved["label"]])
+            raise RenameRefused(f"{rename.old}: an old stop record has unresolved cleanup issues; settle it: "
+                                + f"cd ~/.claude && {settle}")
     _stop_runs(rename)
     unit_move.close_unit_pane(pane)
 
