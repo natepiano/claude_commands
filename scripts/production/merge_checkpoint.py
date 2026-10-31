@@ -25,13 +25,14 @@ from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import NamedTuple, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import change_review
 import scratch  # on the path once change_review has put scripts/lib there
-from showrunners import canonical_slug
+from scripts.production.showrunners import canonical_slug
 from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import progress_history  # noqa: E402
 from scripts.production import production_doc  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402

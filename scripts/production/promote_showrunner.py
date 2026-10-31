@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import completion_receipt, staff, staff_sources
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
@@ -36,7 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from atomic_file import write_text_atomic
 
 import add_showrunner
-import showrunners
+from scripts.production import showrunners
 import unit_effort
 import unit_lookup
 import sessions

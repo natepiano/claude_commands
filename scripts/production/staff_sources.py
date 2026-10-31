@@ -9,11 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 # These source modules still use sibling imports; keep their existing module identity.
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import production_units  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import unit_names  # noqa: E402
 from scripts.production import staff  # noqa: E402
 from scripts.shutdown import pane_record  # noqa: E402

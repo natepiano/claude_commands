@@ -21,6 +21,8 @@ import unittest
 from collections.abc import Callable
 from contextlib import closing, redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TypedDict, cast, final, override
 from unittest import mock
 
@@ -28,7 +30,7 @@ import style_sync
 import scratch
 import style_ledger
 import style_rules
-import showrunners
+from scripts.production import showrunners
 from scripts.direct import test_verify_lint_scope as verify_fixture
 
 

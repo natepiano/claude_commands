@@ -733,7 +733,7 @@ HerdrDestination = RecordedHerdrPane | SharedHerdrTab
 def herdr_space(session: Session) -> str:
     """The shared session's workspace for a Claude session: its production's, else `ad-hoc`."""
     if session["kind"] == "showrunner":
-        from showrunners import herdr_space as production_space, production_slug
+        from scripts.production.showrunners import herdr_space as production_space, production_slug
         return production_space(production_slug(session["doc"]), session["doc"])
     return "ad-hoc"
 
@@ -2848,7 +2848,7 @@ def progress_line(action: str, name: str, detail: str = "") -> None:
 
 
 def _restore_workspace_names(records: Sequence[SessionShutdown]) -> frozenset[str]:
-    from showrunners import herdr_space as production_space
+    from scripts.production.showrunners import herdr_space as production_space
     names: set[str] = set()
     for saved in records:
         owner = saved["session"]
