@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import herdr  # noqa: E402
 import pane_record  # noqa: E402
 import sessions  # noqa: E402
+from scripts.production import unit_marks  # noqa: E402
 from scripts.shutdown.stop_resume import resume_arguments  # noqa: E402
 from scripts.whoami.account import named_account_environment  # noqa: E402
 
@@ -58,6 +59,7 @@ def skip_reason(pane: herdr.TabSession, entry: pane_record.PaneLaunch | None, li
 def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession, entry: pane_record.PaneLaunch) -> None:
     if not isinstance(client.pane_activity(pane.pane_id), herdr.PaneAtShell):
         raise herdr.HerdrFailure("the pane runs a program")
+    entry = unit_marks.record_membership(entry)
     environment = {**entry["environment"], **named_account_environment(Path(entry["config_dir"]))}
     title = pane.label or entry["name"]
     launched = herdr.launch_agent(session, pane.workspace, title, entry["cwd"], environment, "claude",

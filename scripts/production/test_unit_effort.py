@@ -26,9 +26,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import agents_registry  # noqa: E402
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
-RULE_TOP = "──── review-pool ──────────"
+RULE_TOP = "──── review ──────────"
 RULE = "───────────────────────────"
-STATUS = "  natedev | claude3 | review-pool | 189,709 | Opus 5.5 xhigh"
+STATUS = "  natedev | claude3 | review | 189,709 | Opus 5.5 xhigh"
 EMPTY = f"{RULE_TOP}\n\x1b[39m❯ \n{RULE}\n{STATUS}"
 
 
@@ -93,7 +93,7 @@ class UnitEffortTests(unittest.TestCase):
             "CODEX_CATALOG_SYNC_STATE_FILE": str(synced)}))
         _ = self.enterContext(mock.patch.object(unit_lookup, "live_session", return_value=True))
         units = [
-            HostedUnit("review-pool", "w1:p1", {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "review-pool-unit"}, EMPTY),
+            HostedUnit("review", "w1:p1", {"SHOWRUNNER_UNIT": "build-followups", "SHOWRUNNER_UNIT_ID": "review-unit"}, EMPTY),
             HostedUnit("widget", "w2:p1", {"SHOWRUNNER_UNIT": "tool-based-ui", "SHOWRUNNER_UNIT_ID": "widget-unit"}, screen("❯ my draft")),
             HostedUnit("trunk", "w3:p1", {"SHOWRUNNER_UNIT": "tool-based-ui", "SHOWRUNNER_UNIT_ID": "trunk-unit"}, screen("❯ \x1b[2mtry this\x1b[22m")),
             HostedUnit("notes", "w4:p1", {}, EMPTY),
@@ -125,7 +125,7 @@ class UnitEffortTests(unittest.TestCase):
         code, out, _ = self.run_main("high", "--check")
         self.assertEqual(code, 0)
         self.assertEqual(out.splitlines(), [
-            "review-pool: would send",
+            "review: would send",
             "trunk: would send",
             "widget: skipped — a draft is in its input line",
             "registry: production.director would be opus:high (now opus:xhigh)",
@@ -138,7 +138,7 @@ class UnitEffortTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.splitlines()[-1], "registry: production.director is now opus:high (was opus:xhigh)")
         self.assertIn("widget: skipped — a draft is in its input line", out)
-        self.assertEqual(self.sent(), [["--session", "review-pool", "agent", "prompt", "w1:p1", "/effort high"],
+        self.assertEqual(self.sent(), [["--session", "review", "agent", "prompt", "w1:p1", "/effort high"],
                                        ["--session", "trunk", "agent", "prompt", "w3:p1", "/effort high"]])
         self.assertEqual(self.director_row(), "director=opus:high")
 

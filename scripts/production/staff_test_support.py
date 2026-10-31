@@ -93,7 +93,7 @@ def source_environment(source: Path) -> dict[str, str]:
         ("HERDR_PANE_RECORD_DIR", "panes"), ("NOTIFIER_SESSIONS_DIR", "sessions"),
         ("XDG_CONFIG_HOME", "config"),
         ("UNIT_WORKERS_STATE", "unit-workers"), ("ROSTER_RUN_ROOT", "runs"),
-        ("REVIEW_POOL_STATE", "review-pool"), ("ASTRA_ROLES_STATE", "astra-roles"),
+        ("ASTRA_ROLES_STATE", "astra-roles"),
         ("DESIGN_ROLES_STATE", "design-roles"), ("DESIGN_OWNERSHIP_STATE", "design-ownership"),
     )}
 
@@ -379,18 +379,6 @@ class StaffTestCase(unittest.TestCase):
                                family=family, staff_id=staff_id)
         return path
 
-    def pool_reviewer(self, slug: str, name: str, thread: str, *, unit: str = "", busy_pid: int = 0) -> Path:
-        """A legacy pool source whose holder is its production, independent of its lease."""
-        path = Path(os.environ["REVIEW_POOL_STATE"]) / slug / "pool.json"
-        self.write_json(path, {
-            "generation": 1, "templates": {}, "next_index": {"code": 2},
-            "reviewers": {name: {
-                "type": "code", "thread_id": thread, "prime_hash": "fixture", "reviews": 0,
-                "lease": {"unit": unit, "ordinal": 1} if unit else None,
-                "busy_pid": busy_pid or None, "last_allocated": 1,
-            }},
-        })
-        return path
 
     def astra_worker(self, run: Path, name: str, thread: str, manager: str) -> Path:
         """A live mesh Astra hold, using the same run roster as ordinary workers."""

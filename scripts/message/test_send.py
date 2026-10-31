@@ -3242,6 +3242,14 @@ class PeerSendTests(ShutdownTestCase):
         self.assertEqual(self.ssh_calls(), [])
         self.assertEqual(self.relayed + self.mesh_calls + self.daemon_calls, [])
 
+    def test_peer_durable_warnings_allow_a_clean_name_miss_and_print_once(self) -> None:
+        warning = 'durable role /fixture/design.json: missing or invalid repository'
+        os.environ['SSH_SNAPSHOT'] = roster.RosterSnapshot(roster.Roster([], [], [warning])).encode()
+        status, output, errors = self.run_main('bare missing')
+        self.assertEqual(status, 0, output + errors)
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(errors.splitlines(), [f'send.py: roster: warning: {roster.remote.other_machine()}: {warning}'])
+
     def test_an_address_can_resolve_on_peer_even_when_a_local_source_failed(self) -> None:
         self.local = roster.Roster([], ["worker source unreadable"])
         self.peer([self.row("peer", "codex:peer")])
@@ -3372,7 +3380,6 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             "ROSTER_RUN_ROOT": str(self.root / "runs"),
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership"),
-            "REVIEW_POOL_STATE": str(self.root / "review-pool"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
         }, clear=True)))
 

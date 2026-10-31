@@ -29,6 +29,7 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
 import herdr
 import pane_record
 from scripts.shutdown import folder_trust
+from scripts.production import unit_marks
 from scripts.shutdown.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
     ClaudeUp as ClaudeUp, ResumePending as ResumePending, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
@@ -281,6 +282,7 @@ def _resume_once(session: str, *, why: str, to: str | None = None, requester: st
             return ResumeFailed(identity, "Claude was closed by hand")
         if not entry.get("flags_read", False):
             return ResumeFailed(identity, "pane launch flags are unknown")
+        entry = unit_marks.record_membership(entry)
         from inventory import codex_seats
         import unit_runs
 
@@ -583,14 +585,15 @@ def _resumed_launcher_command(command: list[str], seat: str, prompt: str) -> str
     index = next((i for i, arg in enumerate(command) if Path(arg).name in {"implement.sh", "review.sh"}), -1)
     if index < 0:
         return None
-    # Launchers accept option/value pairs followed by session_dir, cwd, prompt_file.
+    # Retain supported task options; saved commands may predate the current launcher.
+    supported = {"--phase", "--lens"} if Path(command[index]).name == "review.sh" else {"--phase", "--fix-cause"}
     position = index + 1
     options: list[str] = []
     while position < len(command) and command[position].startswith("--"):
         if position + 1 >= len(command):
             return None
         option, value = command[position], command[position + 1]
-        if option not in {"--slot", "--pool", "--lease", "--to"}:
+        if option in supported:
             options.extend((option, value))
         position += 2
     arguments = command[position:]

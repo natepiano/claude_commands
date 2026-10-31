@@ -21,7 +21,7 @@ STATE_HISTORY = (
     "unit-history/runs/", "unit-history/review_turns/", "plan-delegate/runs/", "plan-delegate/review_turns/", "model-study/", "claude-model-study/",
     "screenshot-analysis/", "plan-backlog/", "usage-model/", "style-backups/", "style/",
     # Build logs, hook trial records, the feature log, review prompts, verify events and shell history.
-    "buildlog/", "mul-add-hook/", "fn-length-hook/", "claude/feature-log/", "review-pool/", "verify/", "zsh/",
+    "buildlog/", "mul-add-hook/", "fn-length-hook/", "claude/feature-log/", "verify/", "zsh/",
     # Rebuilt from its sources on the next board refresh.
     "unit-board/",
     # Copies of queued prompt texts, which the pause hook matches exactly against each prompt that

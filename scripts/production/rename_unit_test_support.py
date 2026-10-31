@@ -126,7 +126,6 @@ class UnitRenameFixture(StaffTestCase):
             "STALL_WATCH_STATE_DIR": str(self.root / "state/stall-watch"),
             # No waits by default: a test that needs one sets it.
             "RENAME_UNIT_STOP_WAIT": "0", "RENAME_UNIT_LIVE_WAIT": "0",
-            "REVIEW_POOL_STATE": str(self.root / "state/review-pool"),
             "DESIGN_ROLES_STATE": str(self.root / "state/astra/design-roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "state/astra/design-ownership"),
             "SHOWRUNNERS_CONFIG": str(config / "showrunners.json"),
@@ -195,10 +194,6 @@ class UnitRenameFixture(StaffTestCase):
     def seed_state(self) -> None:
         old = self.rust / "claude-demo-alpha"
         self.write(self.stall_path("alpha-unit"), '{"stretch": 17}\n')
-        self.write(self.root / "state/review-pool/demo/pool.json", json.dumps({"generation": 1, "reviewers": {
-            name: {"type": "codex", "thread_id": f"thread-{name}", "prime_hash": "h",
-                   "lease": {"unit": unit, "ordinal": 3}, "busy_pid": None, "reviews": 2}
-            for name, unit in (("r1", "alpha-unit"), ("r2", "mul_add-unit"))}}))
         run = self.root / "history/runs/run-1.jsonl"
         self.write(run, "\n".join(json.dumps(event) for event in (
             {"event_type": "run_started", "run_started_at": 1, "working_dir": str(old),

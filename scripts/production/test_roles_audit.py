@@ -725,12 +725,6 @@ class SourceCheckTests(unittest.TestCase):
                 with self.subTest(term=item.name, definition=definition):
                     self.assertTrue((root / definition.split("#", 1)[0]).is_file(), definition)
 
-    def test_retired_pool_name_flags_a_new_use_outside_its_kept_contexts(self) -> None:
-        root = Path(__file__).resolve().parents[2]
-        terms = audit.parse_terms((root / "scripts/production/role_terms.toml").read_text(encoding="utf-8"))
-        uses = audit.check_retired(terms, (audit.LiveFile("docs/new-review.md", "Use the review pool."),))
-        self.assertEqual([(use.path, use.line, use.name) for use in uses],
-                         [("docs/new-review.md", 1, "review pool")])
 
     def test_retired_design_role_names_fail_the_live_source_check(self) -> None:
         repository = Path(__file__).resolve().parents[2]

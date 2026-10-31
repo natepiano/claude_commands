@@ -14,7 +14,9 @@ import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import MagicMock, patch
@@ -26,6 +28,7 @@ from scripts.accounts import role_map  # noqa: E402
 from scripts.agents import codex_mesh  # noqa: E402
 from scripts.lib.code_kind import is_test_code  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
+from scripts.astra.design_role_test_support import write_empty_binding_record
 from scripts.astra.design_roles import resolve_holder as resolve_current_holder  # noqa: E402
 from scripts.astra.design_roles import release_servers as release_design_servers  # noqa: E402
 from scripts.message import sessions  # noqa: E402
@@ -185,6 +188,140 @@ class DurableRolesTests(unittest.TestCase):
         self.assertEqual(self.launches, [("designer", "thread-designer")])
         self.assertEqual(len(list((self.root / "ownership/placements").glob("*.json"))), 1)
         self.assertEqual(len(list((self.root / "roles").glob("*/design.json"))), 1)
+
+    def test_cli_open_without_checkout_saves_the_resolved_binding_repository(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = design_roles.main(['open', '--repository', 'fixture-repo', '--document', 'design.md',
+                '--role', 'designer', '--production', 'demo', '--unit', 'design-unit', '--area', 'design',
+                '--run-directory', str(self.run_a), '--phase', '1', '--output-path', 'design.md'])
+        self.assertEqual(code, 0, output.getvalue())
+        design_id = output.getvalue().strip().removesuffix('/designer')
+        design = design_roles.read_design(design_id)
+        self.assertEqual(design.binding, self.binding(self.run_a))
+        self.assertEqual(self.instance(design, 'designer').lifecycle, design_roles.RoleOpen('thread-designer'))
+
+    def test_save_refuses_an_empty_binding_repository_without_changing_the_record(self) -> None:
+        design = self.open_designer()
+        path = design_roles.design_directory(design.placement.design_id) / 'design.json'
+        before = path.read_bytes()
+        with self.assertRaisesRegex(design_roles.RoleRefused, 'repository'):
+            design_roles._save(replace(design, binding=replace(self.binding(self.run_a), repository='')))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_sweeps_skip_an_unrelated_bad_binding_and_keep_processing_valid_roles(self) -> None:
+        bad = write_empty_binding_record(self.repository, design_roles.UnitHolder('other', 'other-unit'))
+        design = self.open_designer()
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(design_roles.held_document(Path(design.document)), design)
+            design_roles.unbind_run(str(self.run_a))
+            unbound = design_roles.read_design(design.placement.design_id)
+            self.assertIsInstance(unbound.binding, design_roles.DesignUnbound)
+            design_roles.move_holder(design.holder, design_roles.UnitHolder('demo', 'next-unit'), reason='unit transfer')
+            moved = design_roles.read_design(design.placement.design_id)
+            self.assertEqual(moved.holder, design_roles.UnitHolder('demo', 'next-unit'))
+            with patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+                design_roles.end_holder('demo', 'next-unit')
+        ended = design_roles.read_design(design.placement.design_id)
+        self.assertEqual(self.instance(ended, 'designer').lifecycle, design_roles.RoleEnded('thread-designer'))
+        self.assertEqual(errors.getvalue().splitlines(), [f'warning: {bad}: missing or invalid repository'] * 4)
+        self.assertTrue(bad.is_file())
+
+    def test_sweeps_refuse_a_matching_bad_record_with_a_live_role(self) -> None:
+        holder = design_roles.UnitHolder('demo', 'design-unit')
+        operations: tuple[Callable[[], object], ...] = (
+            lambda: design_roles.end_holder('demo', 'design-unit'),
+            lambda: design_roles.move_holder(holder, design_roles.UnitHolder('demo', 'next-unit'), reason='unit transfer'),
+            lambda: design_roles.unbind_run(str(self.run_a)),
+            lambda: design_roles.held_document(self.repository / 'broken-design.md'),
+        )
+        lifecycles = (design_roles.RoleOpen('held-thread'), design_roles.RolePausedForMove('held-thread'),
+                      design_roles.RoleNeedsRecovery('held-thread', 'lost acknowledgement'))
+        for lifecycle in lifecycles:
+            for operation in operations:
+                with self.subTest(lifecycle=lifecycle, operation=operation):
+                    bad = write_empty_binding_record(self.repository, holder, lifecycle=lifecycle,
+                                                     run_directory=str(self.run_a))
+                    before = bad.read_bytes()
+                    with self.assertRaisesRegex(design_roles.RoleRefused, 'live held role needs recovery'):
+                        _ = operation()
+                    self.assertEqual(bad.read_bytes(), before)
+                    bad.unlink()
+
+    def test_document_lookup_warns_once_for_invalid_json_and_keeps_the_valid_design(self) -> None:
+        design = self.open_designer()
+        bad = write_empty_binding_record(self.repository, design_roles.UnitHolder('other', 'other-unit'))
+        _ = bad.write_text('{"holder":\n')
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            found = design_roles.held_document(Path(design.document))
+        self.assertEqual(found, design)
+        self.assertEqual(len(errors.getvalue().splitlines()), 1)
+        self.assertIn(f'warning: {bad}: ', errors.getvalue())
+
+    def test_holder_checks_skip_bad_unrelated_records_and_keep_valid_failures(self) -> None:
+        holder = design_roles.UnitHolder('demo', 'design-unit')
+        bad = write_empty_binding_record(self.repository, design_roles.UnitHolder('other', 'other-unit'),
+                                         lifecycle=design_roles.RoleOpen('unrelated-thread'))
+        design = self.open_designer()
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            failures = design_roles.holder_failures(holder)
+        self.assertEqual(failures, [str(design_roles.design_directory(design.placement.design_id) / 'design.json')
+                                    + ': holder still names design-unit'])
+        self.assertEqual(errors.getvalue().splitlines(), [f'warning: {bad}: missing or invalid repository'])
+        errors = io.StringIO()
+        with redirect_stderr(errors), design_roles.record_operation():
+            design_roles.move_holder(holder, design_roles.UnitHolder('other', 'design-unit'), reason='unit transfer')
+            self.assertEqual(design_roles.holder_failures(holder), [])
+        self.assertEqual(errors.getvalue().splitlines(), [f'warning: {bad}: missing or invalid repository'])
+
+    def test_holder_checks_refuse_only_matching_bad_live_roles(self) -> None:
+        holder = design_roles.UnitHolder('demo', 'design-unit')
+        lifecycles = (design_roles.RoleNotOpened(), design_roles.RoleEnded('ended-thread'),
+                      design_roles.RoleOpen('held-thread'), design_roles.RolePausedForMove('held-thread'),
+                      design_roles.RoleNeedsRecovery('held-thread', 'lost acknowledgement'))
+        for lifecycle in lifecycles:
+            with self.subTest(lifecycle=lifecycle):
+                bad = write_empty_binding_record(self.repository, holder, lifecycle=lifecycle)
+                before = bad.read_bytes()
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    failures = design_roles.holder_failures(holder)
+                if isinstance(lifecycle, (design_roles.RoleNotOpened, design_roles.RoleEnded)):
+                    self.assertEqual(failures, [])
+                    self.assertEqual(errors.getvalue().splitlines(), [f'warning: {bad}: missing or invalid repository'])
+                else:
+                    self.assertEqual(failures, [f'{bad}: missing or invalid repository; live held role needs recovery'])
+                    self.assertEqual(errors.getvalue(), '')
+                self.assertEqual(bad.read_bytes(), before)
+                bad.unlink()
+
+    def test_record_operation_warns_once_across_holders_and_warns_again_on_retry(self) -> None:
+        stranded = design_roles.UnitHolder('unrelated', 'stranded-unit')
+        bad = write_empty_binding_record(self.repository, stranded, lifecycle=design_roles.RoleOpen('stranded-thread'))
+        second = write_empty_binding_record(self.repository, design_roles.ShowrunnerHolder('unrelated'))
+        design = self.open_designer()
+        holders = (
+            (design_roles.ShowrunnerHolder('demo'), design_roles.ShowrunnerHolder('renamed')),
+            (design_roles.UnitHolder('demo', 'design-unit'), design_roles.UnitHolder('renamed', 'design-unit')),
+            (design_roles.UnitHolder('demo', 'other-unit'), design_roles.UnitHolder('renamed', 'other-unit')),
+        )
+        for _attempt in range(2):
+            errors = io.StringIO()
+            with redirect_stderr(errors), design_roles.record_operation():
+                with design_roles.record_operation():
+                    for old, new in holders:
+                        design_roles.move_holder(old, new, reason='production rename')
+                        self.assertEqual(design_roles.holder_failures(old), [])
+                self.assertEqual(design_roles.holder_failures(stranded),
+                                 [f'{bad}: missing or invalid repository; live held role needs recovery'])
+            self.assertCountEqual(errors.getvalue().splitlines(), [
+                f'warning: {path}: missing or invalid repository' for path in (bad, second)])
+        moved = design_roles.read_design(design.placement.design_id)
+        self.assertEqual(moved.holder, design_roles.UnitHolder('renamed', 'design-unit'))
+        self.assertEqual(moved.placement.generation, 2)
 
     def test_unregistered_repository_refusal_names_the_register_command(self) -> None:
         store = self.root / "ownership/repositories.json"
@@ -913,7 +1050,10 @@ class DurableRolesTests(unittest.TestCase):
     def test_adoption_with_only_accepted_turn_settings_preserves_the_thread_and_pending_text(self) -> None:
         self.assert_adoption_preserves_thread_and_pending_text({"turn_model": "gpt-fixture", "turn_effort": "xhigh"})
 
-    def assert_adoption_preserves_thread_and_pending_text(self, settings: dict[str, str]) -> None:
+    def test_cli_adopt_without_checkout_saves_the_resolved_binding_repository(self) -> None:
+        self.assert_adoption_preserves_thread_and_pending_text({'model': 'gpt-fixture', 'effort': 'xhigh'}, through_cli=True)
+
+    def assert_adoption_preserves_thread_and_pending_text(self, settings: dict[str, str], *, through_cli: bool = False) -> None:
         source = self.root / "old-run"
         source.mkdir()
         name, thread = "original-designer-alias", "original-thread"
@@ -963,9 +1103,20 @@ class DurableRolesTests(unittest.TestCase):
             self.assertEqual(cast(dict[str, object], fenced[name]["transferring_role"])["adoption_id"], "transfer-one")
             self.assertFalse(list((self.root / "roles").glob("*/design.json")))
             release_fails = False
-            adopted = design_roles.adopt("fixture-repo", "design.md", "designer", design_roles.UnitHolder("demo", "design-unit"),
-                                  "design", source_mesh=str(source), name=name, thread_id=thread,
-                                  adoption_id="transfer-one", binding=self.binding(self.run_a))
+            if through_cli:
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = design_roles.main(['adopt', '--repository', 'fixture-repo', '--document', 'design.md',
+                        '--role', 'designer', '--production', 'demo', '--unit', 'design-unit', '--area', 'design',
+                        '--source-mesh', str(source), '--name', name, '--thread-id', thread, '--adoption-id', 'transfer-one',
+                        '--run-directory', str(self.run_a), '--phase', '1', '--output-path', 'design.md'])
+                self.assertEqual(code, 0, output.getvalue())
+                adopted = design_roles.read_design(output.getvalue().strip().removesuffix('/designer'))
+                self.assertEqual(adopted.binding, self.binding(self.run_a))
+            else:
+                adopted = design_roles.adopt("fixture-repo", "design.md", "designer", design_roles.UnitHolder("demo", "design-unit"),
+                                      "design", source_mesh=str(source), name=name, thread_id=thread,
+                                      adoption_id="transfer-one", binding=self.binding(self.run_a))
             before = len(methods)
             retried = design_roles.adopt("fixture-repo", "design.md", "designer", design_roles.UnitHolder("demo", "design-unit"),
                                   "design", source_mesh=str(source), name=name, thread_id=thread,
