@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find the paths an assigned or pooled review changed in its working tree.
+"""Find the paths a unit's review changed in its working tree.
 
 `baseline` records HEAD and, for each path `git status` names, its HEAD, index and worktree
 entries. `changes` compares every path that was dirty before or after the turn, or that HEAD

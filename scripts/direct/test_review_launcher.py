@@ -21,6 +21,17 @@ from scripts.direct.wait_for_test_state import wait_until
 
 
 class ReviewLauncherPassTests(support.ReviewLauncherFixture):
+    def test_own_claim_refusal_removes_a_stale_review_slot(self) -> None:
+        session = self.start_implementation("stale-review-slot")
+        self.finish_implementation(session)
+        slot = session / "review_slot_contract"
+        _ = slot.write_text("review2\n", encoding="utf-8")
+        _ = self.open_worker(session, name="fixture-review", role="review", status="running")
+        result = subprocess.run(self.unit_review_command(session), env=self.environment(), capture_output=True,
+                                text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(slot.exists())
+
     def test_rerun_lens_uses_review_slot_and_its_own_findings_file(self) -> None:
         session = self.start_implementation("rerun-slot")
         self.finish_implementation(session)
@@ -266,13 +277,12 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
             (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
         )
 
-    def test_without_a_named_worker_the_unit_reviewer_runs_and_keeps_its_thread(self) -> None:
+    def test_unit_reviewer_runs_and_keeps_its_thread(self) -> None:
         session_dir = self.start_implementation("fresh")
         self.finish_implementation(session_dir)
 
         result = subprocess.run(
-            ["bash", str(self.review_script), "--pool", "code", "--lease", "builders:3:broad:1",
-             *self.review_command(session_dir, "", "")[2:]],
+            self.unit_review_command(session_dir, ""),
             check=False,
             capture_output=True,
             text=True,
@@ -294,6 +304,20 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         self.assertEqual(
             (session_dir / "review_status").read_text(encoding="utf-8"), "reviewed\n"
         )
+
+    def test_removed_review_options_refuse_before_any_review_starts(self) -> None:
+        for flag in ("--pool", "--lease"):
+            with self.subTest(flag=flag):
+                session = self.start_implementation("removed-option-" + flag[2:])
+                self.finish_implementation(session)
+                command = self.review_command(session, "contract", "")
+                command[2:2] = [flag, "unused"]
+                result = subprocess.run(command, capture_output=True, text=True, check=False,
+                                        env=self.environment(), timeout=TEST_HANG_GUARD_SECS)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), ["ERROR: unknown review option '" + flag + "'."])
+                self.assertFalse((session / "mesh_roster.json").exists())
+                self.assertEqual(self.turn_records(session), [])
 
     def test_paused_reviewer_receives_followup_on_its_recorded_thread(self) -> None:
         session_dir = self.start_implementation("paused-review")

@@ -5,7 +5,11 @@ import json
 import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
+from enum import Enum
+
+if TYPE_CHECKING:
+    from scripts.production.session_labels import StaffLabels
 
 import sessions
 from place import HerdrPlace
@@ -59,27 +63,43 @@ def matching_launch(entries: Mapping[str, PaneLaunch], place: HerdrPlace, sessio
     return entry
 
 
+class StaffLabelsRead(Enum):
+    PENDING = "pending"
+    UNAVAILABLE = "unavailable"
+
+
 class RecordedLabels:
     """One discovery read: each terminal's launch file is opened at most once."""
 
-    def __init__(self) -> None:
+    def __init__(self, membership: StaffLabels | StaffLabelsRead = StaffLabelsRead.PENDING) -> None:
         self.entries: dict[str, dict[str, PaneLaunch]] = {}
+        self.membership: StaffLabels | StaffLabelsRead = membership
 
     def resolve(self, pid: int, environment: Mapping[str, str],
                 placement: Callable[[], object]) -> dict[str, str]:
-        if environment.get("SHOWRUNNER_UNIT_ID") and environment.get("STAFF_ID"):
-            return dict(environment)
-        place = placement()
-        if not isinstance(place, HerdrPlace):
+        if environment.get("STAFF_ID"):
             return dict(environment)
         record = sessions.read_session(sessions.sessions_dir() / f"{pid}.json")
         if (isinstance(record, sessions.UnreadableSessionRecord) or record["pid"] != pid
                 or not sessions.running_session(record)):
             return dict(environment)
-        if place.session not in self.entries:
-            self.entries[place.session] = read(record_directory() / f"{place.session}.json")
-        entry = matching_launch(self.entries[place.session], place, record["sessionId"])
-        if entry is None:
-            return dict(environment)
-        saved = entry.get("environment", {})
-        return {**{key: value for key, value in saved.items() if key in MEMBER_MARKS}, **environment}
+        values = dict(environment)
+        place = placement()
+        if isinstance(place, HerdrPlace):
+            if place.session not in self.entries:
+                self.entries[place.session] = read(record_directory() / f"{place.session}.json")
+            entry = matching_launch(self.entries[place.session], place, record["sessionId"])
+            if entry is not None:
+                values = {**{key: value for key, value in entry.get("environment", {}).items()
+                             if key in MEMBER_MARKS}, **values}
+        if self.membership is StaffLabelsRead.PENDING:
+            from scripts.production import staff
+            from scripts.production.session_labels import StaffLabels
+
+            try:
+                self.membership = StaffLabels.read()
+            except (staff.StaffUnreadable, OSError, ValueError):
+                self.membership = StaffLabelsRead.UNAVAILABLE
+        if not isinstance(self.membership, StaffLabelsRead):
+            values = self.membership.environment(values, record["sessionId"], record["name"])
+        return values

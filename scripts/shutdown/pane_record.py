@@ -45,6 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import herdr  # noqa: E402
 import pane_launch
+import sessions
 from pane_launch import PaneLaunch as PaneLaunch
 from probe_session import PROBE_ENV  # noqa: E402
 
@@ -302,6 +303,19 @@ def _process_environment(pid: int) -> dict[str, str]:
     if sys.platform == "darwin":
         return _mac_record(pid)[1]
     return _environment((PROC / str(pid) / "environ").read_bytes().split(b"\0"))
+
+
+def running_launch(record: sessions.SessionRecord, place: herdr.HerdrPlace, cwd: str) -> PaneLaunch:
+    """Capture one verified live Claude using the existing argv and environment readers."""
+    if not sessions.running_session(record):
+        raise ValueError(f"{record['sessionId']}: Claude is no longer running")
+    environment = _process_environment(record["pid"])
+    arguments = _arguments(record["pid"])
+    if not herdr.is_claude_process(arguments):
+        raise ValueError(f"{record['sessionId']}: process is not Claude")
+    entry = launch(place.pane, record["sessionId"], cwd, environment, arguments)
+    entry["name"] = record["name"]
+    return entry
 
 
 def _conversation_of(config_dir: str, pid: int) -> str:

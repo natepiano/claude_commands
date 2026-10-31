@@ -1,6 +1,6 @@
 """Own run membership, worker operations and server maintenance flocks.
 
-Order: ledger, design/pool, membership, future staff, lifecycle, server, inbox, roster.
+Order: ledger, design, membership, future staff, lifecycle, server, inbox, roster.
 
 An operation owns this lock through its server effects and final publication,
 but releases it before watching a turn. Nested acquisition is a programming

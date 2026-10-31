@@ -59,10 +59,10 @@ from typing import BinaryIO, Callable, Literal, TextIO, TypedDict, cast, final, 
 from unittest.mock import MagicMock, call, patch
 
 from scripts.agents import codex_mesh, worker_lifecycle
-from scripts.direct import assign, plan_history, progress_history, review_pool, worker_state, workers as unit_workers
+from scripts.direct import assign, plan_history, progress_history, worker_state, workers as unit_workers
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.lib import atomic_file, nix_env
-from scripts.message import process_table, sessions, roster as message_roster
+from scripts.lib import atomic_file, nix_env, unit_runs
+from scripts.message import process_table, sessions, unit_labels, roster as message_roster
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
 from scripts.astra import astra_work, design_roles
@@ -1721,6 +1721,21 @@ class MeshCommandFixture(unittest.TestCase):
             "production": "natedev", "unit": "models-unit", "working_dir": str(self.session_dir),
         }))
 
+    @contextlib.contextmanager
+    def thread_title_context(self) -> Generator[None, None, None]:
+        from scripts.production.staff_test_support import isolated_staff_file, production_membership
+
+        _ = (self.session_dir / unit_runs.DIRECTOR_FILE).write_text("title-director", encoding="utf-8")
+        place = unit_labels.ProductionPlace(unit_labels.ProductionWithoutRunningShowrunner("sdlc"),
+                                            unit_labels.DirectsUnit("roles-unit"))
+        runner = {"session": "", "socket": "", "slug": "sdlc", "zone": "UTC",
+                  "doc": str(self.session_dir / "production.md")}
+        with isolated_staff_file(self.session_dir / "staff.json", {}), \
+                patch.object(message_roster, "_registered_showrunners", return_value=[runner]), \
+                patch.object(message_roster, "_production_places", return_value={"title-director": place}):
+            production_membership("sdlc", "roles-unit")
+            yield
+
 
 @final
 class WorkerShownNameTests(MeshCommandFixture):
@@ -1815,25 +1830,6 @@ class AtomicWorkerStateTests(MeshCommandFixture):
             _ = action()
         self.assertEqual(type(caught.exception).__name__, "WorkerStateUnreadable")
         self.assertIn(str(path), str(caught.exception))
-
-    def test_review_pool_contention_obeys_the_active_operation_deadline(self) -> None:
-        self.lifecycle_clock.freeze()
-        pool = review_pool.ProductionPool(self.session_dir / "review-pool")
-        pool.directory.mkdir()
-        path = pool.directory / "pool.lock"
-        with path.open("a") as holder:
-            KERNEL_FLOCK(holder, fcntl.LOCK_EX)
-            with (self.expire_contended_lock(path, 1),
-                  patch.object(worker_lifecycle, "time", self.lifecycle_clock),
-                  worker_lifecycle.operation_deadline(timeout=0.1)):
-                with self.assertRaises(worker_lifecycle.OperationDeadlineExpired):
-                    with pool.locked():
-                        self.fail("contended pool lock was acquired")
-            KERNEL_FLOCK(holder, fcntl.LOCK_UN)
-        with pool.locked() as state:
-            state.generation = 7
-        with pool.locked(write=False) as state:
-            self.assertEqual(state.generation, 7)
 
     def test_claim_lock_deadline_precedes_identity_migration(self) -> None:
         path = self.session_dir / "impl_worker_claim.lock"
@@ -2459,7 +2455,7 @@ class ShutdownDeadlineTests(MeshCommandFixture):
     def test_lock_acquisitions_use_the_shared_deadline_primitive(self) -> None:
         sources = (Path(codex_mesh.__file__), Path(worker_lifecycle.__file__),
                    Path(unit_workers.__file__), Path(design_roles.__file__), Path(progress_history.__file__),
-                   Path(assign.__file__), Path(review_pool.__file__), Path(worker_state.__file__))
+                   Path(assign.__file__), Path(worker_state.__file__))
         bypasses: list[str] = []
         unsafe_writes: list[str] = []
         for path in sources:
@@ -5063,10 +5059,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.worker_record()["role"], "impl")
 
     def test_thread_titles_follow_assignment_at_each_turn_without_renaming_the_worker(self) -> None:
-        roster = message_roster
-        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
-                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
-        with patch.object(roster, "_pool_context", return_value=place):
+        with self.thread_title_context():
             self.assertEqual(self.run_start(), (0, ""))
             self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
                 "threadId": THREAD_ID, "name": "sdlc · roles · worker worker"})
@@ -5081,10 +5074,7 @@ class MeshCommandTests(MeshCommandFixture):
                           for request in self.methods("turn/start")], [THREAD_ID])
 
     def test_display_rename_reaches_the_next_thread_title_without_changing_record_identity(self) -> None:
-        roster = message_roster
-        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
-                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
-        with patch.object(roster, "_pool_context", return_value=place):
+        with self.thread_title_context():
             self.assertEqual(self.run_start(), (0, ""))
             before = dict(self.worker_record())
             with patch.object(names, "runtime_names", return_value=fixture_names(worker="builder")):
@@ -5096,18 +5086,13 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(set(self.roster()), {"worker"})
 
     def test_unplaced_thread_keeps_its_address_as_title(self) -> None:
-        roster = message_roster
-        with patch.object(roster, "_pool_context", return_value=(roster.NoShowrunner(), roster.NoDirector(), "")):
-            self.assertEqual(self.run_start(), (0, ""))
+        self.assertEqual(self.run_start(), (0, ""))
         self.assertEqual(self.methods("thread/name/set")[-1]["params"], {"threadId": THREAD_ID, "name": "worker"})
         self.assertEqual(self.worker_record()["role"], "impl")
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
 
     def test_prime_and_fork_send_shown_titles_and_keep_mesh_addresses(self) -> None:
-        roster = message_roster
-        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
-                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
-        with patch.object(roster, "_pool_context", return_value=place):
+        with self.thread_title_context():
             result, output, errors = self.run_mesh(self.prime_cli())
             self.assertEqual((result, output, errors), (0, f"{THREAD_ID}\n", ""))
             self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
@@ -5152,12 +5137,9 @@ class MeshCommandTests(MeshCommandFixture):
                                      (design_id, role, THREAD_ID))
 
     def test_resume_fallback_sets_shown_title_and_retains_assignment(self) -> None:
-        roster = message_roster
         self.write_pool_roster({"worker": {"thread_id": "old-thread", "status": "done", "role": "impl"}})
         self.failing_method = "thread/resume"
-        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
-                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
-        with patch.object(roster, "_pool_context", return_value=place):
+        with self.thread_title_context():
             self.assertEqual(self.run_follow(), (0, ""))
         titles = self.methods("thread/name/set")
         self.assertTrue(titles)
@@ -16314,7 +16296,7 @@ class WorkersHomeTests(unittest.TestCase):
                     self.assertEqual(environment["UNIT_RUN_DIR"], str(self.session_dir))
 
     def test_a_server_outside_the_run_roots_keeps_the_callers_environment(self) -> None:
-        # A review pool's mesh directory serves many units' turns, so it names no run.
+        # A server directory outside the run roots has no run identity.
         with patch.object(codex_mesh, "RUN_ROOTS", (self.home,)):
             self.assertNotIn("UNIT_RUN_DIR", self.started_environment({}))
 

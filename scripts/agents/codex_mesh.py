@@ -1532,13 +1532,18 @@ def roster_access_policy(record: Mapping[str, object]) -> ThreadAccessPolicy | W
     return WorkerLaunchPolicy()
 
 
+def _store_reviewer_policy(entry: dict[str, object], *, new_reviewer: bool = False) -> dict[str, object]:
+    if "access_policy" not in entry and not entry.get("held_design_id"):
+        if new_reviewer or isinstance(roster_access_policy(entry), ReadOnlyReviewer):
+            entry["access_policy"] = {"kind": "ReadOnlyReviewer"}
+    return entry
+
+
 def _migrate_legacy_reviewers(roster: dict[str, object]) -> dict[str, object]:
     for name, value in roster.items():
         entry = _as_dict(value)
-        if "access_policy" not in entry and not entry.get("held_design_id"):
-            if isinstance(roster_access_policy(entry), ReadOnlyReviewer):
-                entry["access_policy"] = {"kind": "ReadOnlyReviewer"}
-                roster[name] = entry
+        if entry:
+            roster[name] = _store_reviewer_policy(entry)
     return roster
 
 
@@ -1596,7 +1601,8 @@ def _write_roster_record(handle: worker_lifecycle.WorkerStateFile, roster: dict[
     elif isinstance(size, NotMeasuredSinceCompaction):
         stored["context_tokens"] = "not_measured_since_compaction"
     stored["revision"] = _roster_revision(previous).value + 1
-    roster[name] = stored
+    roster[name] = _store_reviewer_policy(
+        stored, new_reviewer=previous.get("thread_id") != record["thread_id"] and stored.get("role") == "review")
     handle.publish(json.dumps(roster, indent=2, sort_keys=True))
 
 
@@ -2971,9 +2977,8 @@ def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
 
     A worker's hooks and verify.sh runs read the run from UNIT_RUN_DIR. The caller's copy
     cannot be trusted: implement.sh exports it only after its claim step, whose `compact` call may
-    already have started this server. A run folder is known here, so the server names it itself. A
-    review pool's mesh directory, or any other mesh directory, is not a run: one pool server
-    serves the turns of many units, so it keeps the caller's environment unchanged.
+    already have started this server. A run folder is known here, so the server names it itself.
+    A mesh directory outside the run roots keeps the caller's environment unchanged.
     """
     environment = {**os.environ, "CODEX_HOME": str(workers_home)}
     context = _design_context(session_dir)

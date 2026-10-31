@@ -13,7 +13,6 @@ import sys
 import tempfile
 import time
 import unittest
-from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple, cast, override
@@ -53,7 +52,7 @@ class MeshRunsTests(unittest.TestCase):
         self.session = self.root / "unit" / "run-1"
         self.session.mkdir(parents=True)
         _ = self.stack.enter_context(patch.object(mesh_runs, "RUN_ROOTS", (self.root / "unit",)))
-        self.stack.enter_context(patch.dict(os.environ, {"REVIEW_POOL_STATE": str(self.root / "pool"),
+        self.stack.enter_context(patch.dict(os.environ, {
                                                         "DESIGN_ROLES_STATE": str(self.root / "astra/design-roles"),
                                                         "BUILDLOG_SCOPE": "0"}))
         self.sent = []
@@ -93,22 +92,12 @@ class MeshRunsTests(unittest.TestCase):
         self.assertIn("durable result", str(pending))
         self.assertEqual(self.sent, [])
 
-    def test_an_adopted_unit_reviewer_starts_detached_runs_without_opening_the_archive(self) -> None:
-        archive = self.root / "pool"
+    def test_an_adopted_unit_reviewer_starts_detached_runs_from_its_current_owner(self) -> None:
         _ = (self.session / codex_mesh.ROSTER_FILE).write_text(json.dumps({"unit-review": {
             "thread_id": "adopted-thread", "status": "running", "role": "review",
             "launcher_pid": os.getpid(), "unit_ledger": str(self.root / "unit-workers/ledger.json"),
         }}))
-        original_glob = Path.glob
-
-        def refuse_archive(path: Path, pattern: str, *, case_sensitive: bool | None = None,
-                           recurse_symlinks: bool = False) -> Iterator[Path]:
-            if path.is_relative_to(archive):
-                raise AssertionError(f"detached run inspected the archive: {path}")
-            return original_glob(path, pattern, case_sensitive=case_sensitive, recurse_symlinks=recurse_symlinks)
-
-        with patch.object(Path, "glob", refuse_archive):
-            caller = mesh_runs.caller_from_environment({"CODEX_THREAD_ID": "adopted-thread"})
+        caller = mesh_runs.caller_from_environment({"CODEX_THREAD_ID": "adopted-thread"})
         self.assertEqual(caller, mesh_runs.MeshCaller(str(self.session), "unit-review", "adopted-thread"))
 
     def test_detached_run_caller_uses_the_current_owner_instead_of_an_earlier_adopted_entry(self) -> None:

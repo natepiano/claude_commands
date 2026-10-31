@@ -483,11 +483,19 @@ def codex_unit_labels(
         return {}
     names = {record["sessionId"]: record["name"] for record in records}
     labels: dict[str, UnitLabels] = {}
-    for run in live_runs(roots, set(names), problems):
+    runs = {run.path: run for run in live_runs(roots, set(names), problems)}
+    for path in matches:
+        owner = unit_runs.director(path)
+        if owner in names:
+            _ = runs.setdefault(path, LiveRun(path, DirectorSession(owner)))
+    for run in runs.values():
         if run.path not in matches:
             continue
-        if isinstance(run.director, DirectorSession) and run.director.session_id in names:
-            place = places.get(run.director.session_id)
+        owner = unit_runs.director(run.path)
+        director_id = owner if owner in names else (run.director.session_id
+            if isinstance(run.director, DirectorSession) else "")
+        if director_id in names:
+            place = places.get(director_id)
             showrunner: ShowrunnerRelationship = place.showrunner if place is not None else NoShowrunner()
             director: DirectorRelationship = place.director if place is not None else NoDirector()
         else:
