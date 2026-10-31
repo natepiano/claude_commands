@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -133,18 +133,19 @@ class MemberSources:
         return found
 
 
-def member_sources() -> MemberSources:
+def member_sources(*, dependencies: Callable[[Path], None] | None = None) -> MemberSources:
     import herdr
     from scripts.shutdown import pane_record
 
-    session = herdr.shared_session()
+    session = herdr.shared_session(dependencies=dependencies)
     try:
-        launches = pane_record.read_strict(session)
+        launches = pane_record.read_strict(session, dependencies=dependencies)
     except OSError as error:
         raise staff.StaffUnreadable(f"{pane_record.record_path(session)}: {error}") from error
     except ValueError as error:
         raise staff.StaffUnreadable(str(error)) from error
-    sources = showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.SKIP)
+    sources = showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.SKIP,
+                                       dependencies=dependencies)
     return MemberSources({source.timer.slug: source for source in sources}, tuple(launches.values()))
 
 
@@ -223,10 +224,11 @@ def production_members(record: staff.StaffSnapshot, sources: MemberSources) -> d
 
 
 def group_marked_units(marked: Iterable[tuple[str, MarkedUnit]], *,
-                       record: staff.StaffSnapshot | None = None) -> MarkedProductions:
+                       record: staff.StaffSnapshot | None = None,
+                       sources: MemberSources | None = None) -> MarkedProductions:
     """Join panes to the recorded parent; refuse ambiguous legacy names and duplicate panes."""
     record = record if record is not None else staff.snapshot()
-    sources = member_sources()
+    sources = sources if sources is not None else member_sources()
     membership = production_members(record, sources)
     parents = {row.id: slug for slug, rows in membership.items() for row in rows}
     found: dict[str, dict[staff.StaffId, list[MarkedUnit]]] = {}

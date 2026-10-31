@@ -523,19 +523,53 @@ Inserted 2026-10-30 (sdlc showrunner, from the 3d contract review).
 
 **Acceptance gate:** no code reads a Branch or Worktree cell; the affected suites pass; basedpyright 0/0; a real `rename_unit.py plan` and `add_unit.py --check` on a real unit print the computed names.
 
-### Phase 3l — Workers on the staff record; production_tree removed  · status: todo
+### Phase 3l — Workers on the staff record (staff side)  · status: done
 
 **Depends on:** 3g — 3g is the fix for today's handler pane; this phase replaces the reader it fixes.
 
 Inserted 2026-10-30. User (via the sdlc showrunner): "production_tree.py must go away" and "codex can be started and stopped the same way as with claude resumes by name or id". The sdlc showrunner accepted this design on 2026-10-30.
 
+Split 2026-10-31 (unit director, packaging): this phase is the staff side: the worker rows with their writer, names, parents and seed, and the handler command. The call sites, the live reads, the owner fields, the one stop and resume path, the handler switch and the removal of `production_tree.py` are Phase 3n, which waits for the models unit's F024 checkpoint.
+
 #### Work Order
 
-**Goal:** every worker is a staff member. The handler reads who reports to whom from one staff command. A Codex worker is stopped and resumed by the same path as a Claude session, by name or staff id. `production_tree.py` is gone.
+**Goal:** every worker is a staff member, and one staff command prints who reports to whom for the handler.
 
 **Spec:**
 
-1. **Worker rows.** Each worker gets a new staff id from `staff.ensure` (`s…`, as every other row), kind `worker`, a name and a parent. The Codex thread id is a run detail: a replaced thread (`codex_mesh.py` `_resume_worker_thread` replacement start, a fresh thread after a failed compaction) keeps its row. **One record holds a worker's thread id** (sdlc showrunner, 2026-10-30: no copies of one fact): the unit ledger entry, keyed by staff id. Every other record keys by staff id and looks the thread up there (holders listed by the models unit):
+1. **Worker rows.** Each worker gets a new staff id from `staff.ensure` (`s…`, as every other row), kind `worker`, a name and a parent. The row holds no thread id: a replaced thread (`codex_mesh.py` `_resume_worker_thread` replacement start, a fresh thread after a failed compaction) keeps its row. `WorkerName.parse` (`staff.py:70`) accepts the live names (`impl`, `impl2`, `<project>-impl`, the Astra instance names). A worker's parent is a unit, or a showrunner for a showrunner-held Astra role (today `staff.py:317` refuses it). One writer, `staff.ensure_worker` and `staff.retire`. Its lock sits after the run-level membership lock and before lifecycle (models unit, F024, 2026-10-31), so the Phase 3n call sites can call it while they hold membership. A pool reviewer's parent is the pool's holder, never the unit that leases it. A unit move or rename keeps the rows, because the unit's row id does not change. A rerun-safe seed adds rows for the workers open now, from the unit ledgers, rosters, the review pool and the Astra records; a second run changes nothing.
+2. **One handler command:** `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py show --json --live` prints `{"schema": 2, "inputs": [<absolute path of every file this run read>], "members": [{"id", "kind", "name", "parent": <an id in this list, null only for the root showrunner>, "role": showrunner|unit|impl|test|review|fix|astra-designer|astra-reviewer, "identity": {"claude": <session id>} | {"codex": <thread id>}, "pool": {"state": busy|idle, "serves": <staff id or null>}}]}`. `pool` is present only on review-pool members; no other member carries a state. Agreed with handler-unit 2026-10-30: one tagged identity, parents inside the list, `inputs` so the handler keeps no copy of the file list, Astra roles kept in the output (the handler skips roles it does not know).
+
+**Files:**
+- `scripts/production/staff.py` — `ensure_worker`, worker `retire`, `WorkerName.parse`, worker parents, `show --json --live`
+- `scripts/production/staff_sources.py` — the rerun-safe worker seed read from the unit ledgers, rosters, review pool and Astra records
+- `scripts/direct/workers.py` — one live unit-director read shared with the seed
+- `scripts/production/unit_lookup.py`, `scripts/production/showrunners.py`, `scripts/herdr/herdr.py`, `scripts/shutdown/pane_record.py`, `scripts/message/sessions.py`, `scripts/lib/unit_runs.py` — each reader reports the files it read, for `inputs`
+- `scripts/production/staff_test_support.py`, `scripts/production/update_registration_test_support.py`
+- `scripts/production/test_staff.py`
+- `scripts/production/test_staff_sources.py`
+
+**Acceptance gate:** the affected suites pass; basedpyright 0/0; `staff.py show --json --live` prints schema 2 on a fixture staff record; a second seed run changes nothing.
+
+### Phase 3n — Workers on the staff record (call sites); production_tree removed  · status: todo
+
+**Depends on:** 3l, and the models unit's F024 checkpoint (the lock order and the `stop` path).
+
+Split from 3l on 2026-10-31; the same user ask and the same sdlc acceptance as 3l.
+
+#### Work Order
+
+**Goal:** each worker open and end point writes the worker's staff row. The handler reads who reports to whom from the 3l staff command. A Codex worker is stopped and resumed by the same path as a Claude session, by name or staff id. `production_tree.py` is gone.
+
+**Spec:**
+
+1. **Call sites.** `staff.ensure_worker` and `staff.retire` (Phase 3l) are called from each one open and end point:
+   - Codex: open `codex_mesh.open_unit_worker` and `start`; end `codex_mesh end`, `stop` (`_mark_all_roster_ended`), `workers.end_unit`; adoption `workers.adopt` moves the parent to the adopting unit.
+   - Claude workers (production_tree's `_claude_edges` today): their one open point in `implement.sh` / `assign.sh` and their one end point, `remove_workers.py`.
+   - Astra roles: `design_roles.open_role` and `design_roles.end`.
+   - Pool reviewers: the row's parent is the pool's holder, never the unit that leases it. The current lease is a live detail, shown as who the reviewer serves now.
+   Lock order (models unit, F024, 2026-10-31): "unit ledger, design/pool, membership, lifecycle, inbox, roster". At each admission and retirement point, `ensure_worker` / `retire` run while the run-level membership lock is held, after the lifecycle, inbox and roster locks are released, so a bulk stop cannot run between the roster write and the staff row. A staff lock is never held while membership is taken; the lock-order guard in `test_codex_mesh` checks it. These call sites start from models' F024 checkpoint.
+2. **One record holds a worker's thread id** (sdlc showrunner, 2026-10-30: no copies of one fact): the unit ledger entry, keyed by staff id. Every other record keys by staff id and looks the thread up there (holders listed by the models unit):
    - the run roster (`mesh_roster.json`): staff id, server and run details; no thread id.
    - the held-message inbox (`_pending_for_thread`, one file per thread today; a mismatch drops held messages with no error): one file per staff id.
    - `mesh_retired.json`: removed. A replaced or ended thread is a `replaced` / `ended` event in the unit ledger (`note_backend` already logs `replaced`), and run end reads the threads to close from those events.
@@ -543,26 +577,16 @@ Inserted 2026-10-30. User (via the sdlc showrunner): "production_tree.py must go
    - the review pool records: staff id.
    - the design roles' held threads (`design_roles.py:139-149`, `:1288`): staff id.
    - the shutdown pause records (`shutdown_record.py:486`): staff id.
-   Two copies stay, both Codex's own and outside these scripts: the app-server's thread store, and the `CODEX_THREAD_ID` that Codex sets in its worker's environment. progress_history and usage keep old thread ids as history, not as a live fact. Lock order (models unit, F024, 2026-10-31): "unit ledger, design/pool, membership, lifecycle, inbox, roster". At each admission and retirement point, `ensure_worker` / `retire` run while the run-level membership lock is held, after the lifecycle, inbox and roster locks are released, so a bulk stop cannot run between the roster write and the staff row. A staff lock is never held while membership is taken; a lock of staff.py's own sits after membership and before lifecycle, and the lock-order guard in `test_codex_mesh` checks it. These call sites start from models' F024 checkpoint. `WorkerName.parse` (`staff.py:70`) accepts the live names (`impl`, `impl2`, `<project>-impl`, the Astra instance names). A worker's parent is a unit, or a showrunner for a showrunner-held Astra role (today `staff.py:317` refuses it). One writer, `staff.ensure_worker` and `staff.retire`, is called from each one open and end point:
-   - Codex: open `codex_mesh.open_unit_worker` and `start`; end `codex_mesh end`, `stop` (`_mark_all_roster_ended`), `workers.end_unit`; adoption `workers.adopt` moves the parent to the adopting unit.
-   - Claude workers (production_tree's `_claude_edges` today): their one open point in `implement.sh` / `assign.sh` and their one end point, `remove_workers.py`.
-   - Astra roles: `design_roles.open_role` and `design_roles.end`.
-   - Pool reviewers: the row's parent is the pool's holder, never the unit that leases it. The current lease is a live detail, shown as who the reviewer serves now.
-   A unit move or rename keeps the rows, because the unit's row id does not change. A rerun-safe seed adds rows for the workers open now, from the unit ledgers, rosters, the review pool and the Astra records; a second run changes nothing.
-2. **Busy and idle are read live, never stored:** the server pid, the pool's `busy_pid`, the Astra exec pid. `astra_roles.py:248` reads a stored roster status today; that stops.
-3. **Owner fields go.** The rosters and the unit ledger keep thread and run details only. The run `director` file, the pool's `lease.unit` and the Astra record's `manager` stop answering who owns a worker; staff answers it.
-4. **One stop and one resume path.** `shutdown.py stop <name|staff id>` and `resume <name|staff id>` take a worker as they take a Claude session. For a Codex worker, stop pauses its thread and resume follows or reopens it on its account. This replaces, as paths anyone runs: the resume message's seat lines (`implement.sh --to <seat>`, `stop_resume.py:313`), `workers.pause_run` / `pause_unit`, and `codex_mesh reopen` / `resume-account-move --to`. `move_sessions` and `stop_session` go through the same per-member path. The old commands stay as internals only: no user or skill text names them, no second caller reaches them, and a check fails on any new caller.
-5. **One handler command:** `~/.claude/scripts/lib/py ~/.claude/scripts/production/staff.py show --json --live` prints `{"schema": 2, "inputs": [<absolute path of every file this run read>], "members": [{"id", "kind", "name", "parent": <an id in this list, null only for the root showrunner>, "role": showrunner|unit|impl|test|review|fix|astra-designer|astra-reviewer, "identity": {"claude": <session id>} | {"codex": <thread id>}, "pool": {"state": busy|idle, "serves": <staff id or null>}}]}`. `pool` is present only on review-pool members; no other member carries a state. Agreed with handler-unit 2026-10-30: one tagged identity, parents inside the list, `inputs` so the handler keeps no copy of the file list, Astra roles kept in the output (the handler skips roles it does not know). The handler switches its reader in step (`cargo-handler` `hierarchy.rs:602-690`, the exact argv match at `command_inputs.rs:212-217`, the config line in `~/.config/cargo-handler/config.toml`).
-6. **Delete `production_tree.py`,** `test_production_tree.py`, the `design_roles.py:510` import (`showrunner_sessions` moves to the staff live read) and every doc that names it (`showrunner-automation.md`, `long-lived-workers.md`, `sdlc-roles.md`, this plan's mentions). No wrapper or copy remains.
+   Two copies stay, both Codex's own and outside these scripts: the app-server's thread store, and the `CODEX_THREAD_ID` that Codex sets in its worker's environment. progress_history and usage keep old thread ids as history, not as a live fact.
+3. **Busy and idle are read live, never stored:** the server pid, the pool's `busy_pid`, the Astra exec pid. `astra_roles.py:248` reads a stored roster status today; that stops.
+4. **Owner fields go.** The rosters and the unit ledger keep thread and run details only. The run `director` file, the pool's `lease.unit` and the Astra record's `manager` stop answering who owns a worker; staff answers it.
+5. **One stop and one resume path.** `shutdown.py stop <name|staff id>` and `resume <name|staff id>` take a worker as they take a Claude session. For a Codex worker, stop pauses its thread and resume follows or reopens it on its account. This replaces, as paths anyone runs: the resume message's seat lines (`implement.sh --to <seat>`, `stop_resume.py:313`), `workers.pause_run` / `pause_unit`, and `codex_mesh reopen` / `resume-account-move --to`. `move_sessions` and `stop_session` go through the same per-member path. The old commands stay as internals only: no user or skill text names them, no second caller reaches them, and a check fails on any new caller. Each stop and each resume is safe to run twice: the rerun changes nothing, keeps the same tab, pane and terminal, and exits 0 (user, 2026-10-31); the proof shows the rerun.
+6. **Handler switch.** The handler switches its reader in step (`cargo-handler` `hierarchy.rs:602-690`, the exact argv match at `command_inputs.rs:212-217`, the config line in `~/.config/cargo-handler/config.toml`).
+7. **Delete `production_tree.py`,** `test_production_tree.py`, the `design_roles.py:510` import (`showrunner_sessions` moves to the staff live read) and every doc that names it (`showrunner-automation.md`, `long-lived-workers.md`, `sdlc-roles.md`, this plan's mentions). No wrapper or copy remains.
 
 **Owners:** `codex_mesh.py` and `workers.py` are the models unit's: herdr workers write the call sites, and models reviews the diff before the merge. `stop` / `_mark_all_roster_ended` overlaps models' open follow-up F024, so tell models before that function changes. `stop_resume.py` and `shutdown.py` are the shutdown unit's: shutdown writes its side against the herdr resolver (name or staff id → Claude session | Codex worker | not found), on its branch after its p7 merges (p7 deletes `stop.py` and `stop_session`). The handler reader is handler-unit's.
 
-**Files:**
-- `scripts/production/staff.py` — `ensure_worker`, worker `retire`, `WorkerName.parse`, worker parents, `show --json --live`
-- `scripts/production/staff_sources.py` — the rerun-safe worker seed read from the unit ledgers, rosters, review pool and Astra records
-- `scripts/production/staff_test_support.py`
-- `scripts/production/test_staff.py`
-- `scripts/production/test_staff_sources.py`
+**Files:** to be listed at phase start from the call sites above, with their tests and the docs item 7 names.
 
 **Acceptance gate:** no file names `production_tree`; the affected suites pass; basedpyright 0/0; the real handler pane shows every session and worker correct after a real unit move and a real new worker; one real Codex worker is stopped and resumed by name and by staff id.
 

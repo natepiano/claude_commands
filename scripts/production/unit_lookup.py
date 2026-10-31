@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -25,7 +25,7 @@ sys.path.insert(0, str(MESSAGE.parents[1]))
 import herdr  # noqa: E402
 import sessions  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
-from sessions import UnreadableSessionRecord, live_session, read_session  # noqa: E402
+from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
 from scripts.production import staff  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 
@@ -242,7 +242,8 @@ class UnreadAt(NamedTuple):
     unplaced: RecordsRead | RecordsPartlyUnread
 
 
-def _claudes(processes: list[herdr.HerdrProcess]) -> tuple[dict[int, LiveClaude], UnreadAt]:
+def _claudes(processes: list[herdr.HerdrProcess], *,
+             running: Sequence[SessionRecord] | None = None) -> tuple[dict[int, LiveClaude], UnreadAt]:
     """Newest live Claude record per pid, and the panes whose record could not be read.
 
     Claude names each record after its pid. A record that cannot be read for a pid that no longer runs,
@@ -250,28 +251,36 @@ def _claudes(processes: list[herdr.HerdrProcess]) -> tuple[dict[int, LiveClaude]
     many exit at once. It makes only its own pane unknown, never every pane.
     """
     places = {process.pid: process.place for process in processes}
-    try:
-        paths = sorted(path for path in sessions_dir().iterdir() if path.suffix == ".json")
-    except OSError as error:
-        return {}, UnreadAt({}, RecordsPartlyUnread(f"cannot list session records: {error}"))
+    entries: Iterable[Path | SessionRecord]
+    if running is None:
+        try:
+            entries = sorted(path for path in sessions_dir().iterdir() if path.suffix == ".json")
+        except OSError as error:
+            return {}, UnreadAt({}, RecordsPartlyUnread(f"cannot list session records: {error}"))
+    else:
+        entries = running
     newest: dict[int, tuple[int, LiveClaude]] = {}
     unread: dict[HerdrPlace, str] = {}
     unplaced: RecordsRead | RecordsPartlyUnread = RecordsRead()
-    for path in paths:
-        record = read_session(path)
-        if isinstance(record, UnreadableSessionRecord):
-            pid = int(path.stem) if path.stem.isdigit() else None
-            if pid is not None and (not path.exists() or not _pid_runs(pid)):
-                continue
-            # A record that Claude is writing reads complete a moment later.
+    for entry in entries:
+        if isinstance(entry, Path):
+            path = entry
             record = read_session(path)
             if isinstance(record, UnreadableSessionRecord):
-                place = None if pid is None else _place_of(pid, places)
-                if pid is None:
-                    unplaced = RecordsPartlyUnread("one or more session records could not be read")
-                elif place is not None:
-                    unread[place] = f"the session record of pid {pid} could not be read"
-                continue
+                pid = int(path.stem) if path.stem.isdigit() else None
+                if pid is not None and (not path.exists() or not _pid_runs(pid)):
+                    continue
+                # A record that Claude is writing reads complete a moment later.
+                record = read_session(path)
+                if isinstance(record, UnreadableSessionRecord):
+                    place = None if pid is None else _place_of(pid, places)
+                    if pid is None:
+                        unplaced = RecordsPartlyUnread("one or more session records could not be read")
+                    elif place is not None:
+                        unread[place] = f"the session record of pid {pid} could not be read"
+                    continue
+        else:
+            record = entry
         if not live_session(record):
             # A running registered Claude with no messaging socket cannot be
             # called absent. Preserve the existing fail-closed unknown state.
@@ -323,11 +332,11 @@ def _herdr_marked(claudes: dict[int, LiveClaude], unread: UnreadAt,
         yield slug, MarkedUnit(unit, claude, place, process.pid, process.command, staff_id)
 
 
-def observed_unit_marks() -> tuple[tuple[str, MarkedUnit], ...]:
+def observed_unit_marks(*, running: Sequence[SessionRecord] | None = None) -> tuple[tuple[str, MarkedUnit], ...]:
     """Read pane marks for stop and cleanup checks, including former staff names."""
     try:
         processes = herdr.herdr_processes()
-        claudes, unread = _claudes(processes)
+        claudes, unread = _claudes(processes, running=running)
         return tuple(_herdr_marked(claudes, unread, processes))
     except herdr.HerdrFailure as error:
         raise OSError(str(error)) from error
@@ -347,10 +356,12 @@ def marked_units(slug: str, *, record: staff.StaffSnapshot | None = None) -> dic
     return found.units.get(slug, {})
 
 
-def marked_unit(slug: str, name: str, *, record: staff.StaffSnapshot | None = None) -> MarkedUnit | None:
+def marked_unit(slug: str, name: str, *, record: staff.StaffSnapshot | None = None,
+                sources: MemberSources | None = None,
+                running: Sequence[SessionRecord] | None = None) -> MarkedUnit | None:
     """One unit of the production. Unreadable herdr, or this unit's mark on two sessions, raises OSError."""
     slug = _lookup_slug(slug)
-    found = every_marked_unit(record=record)
+    found = group_marked_units(observed_unit_marks(running=running), record=record, sources=sources)
     if fault := found.faults.get(slug, {}).get(name):
         raise OSError(fault)
     return found.units.get(slug, {}).get(name)
