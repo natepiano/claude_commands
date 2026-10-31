@@ -438,22 +438,14 @@ Source: Phase 7e closure review (F002), moved here under the landing rule (model
 
 ### Phase 7j — The retire dry run names the saved ref  · status: done
 
-Source: Phase 7i live-proof dry run on tool-based-ui `assembly` (tip 5f9b7b22837a, not on init/catalyst): the dry run printed `would delete: branch` with no save line, and its `would mark:` note had no ref and tip.
+#### As-built
 
-#### Work Order
-
-**Goal:** `retire_unit.py --dry-run` shows the save that a real run makes, so a showrunner sees the work is kept before it retires.
-
-**Spec:**
-1. When the branch has commits the merge branch lacks, the dry run prints `would save: <full tip> to origin <ref>` before the remove lines, where `<ref>` is `refs/retired/<staff id>` (or the ref already in the note). It reads only: no push, fetch into refs, or note write.
-2. Its `would mark:` line shows the note a real run writes, ref and tip included.
-3. A tip that diverges from a saved ref prints the same refusal a real run gives.
-4. With no unmerged commits, output is unchanged.
+- `retire_unit.py --dry-run` prints `would save: <full tip> to origin <ref>` before the remove lines when the branch has commits the merge branch lacks; `<ref>` is `refs/retired/<staff id>` or the ref already in the note. Its `would mark:` note carries the ref and tip. With no unmerged commits, the output is unchanged.
+- The dry run and a real run decide the tip through one path, `plan_saved_branch`: an origin tip not yet fetched is saved, and a tip that diverges from a saved ref gets the same refusal in both.
+- The dry run writes nothing: no push, no ref, no note, no FETCH_HEAD.
 
 **Files:**
-- `scripts/production/retire_unit.py`
-- `scripts/production/test_retire_unit.py`
+- `scripts/production/retire_unit.py` — dry-run save line, read-only object fetch
+- `scripts/production/test_retire_unit.py` — dry-run tests
 
-**Workers:** 1 writer + 1 tester (impl: retire_unit.py; test: test_retire_unit.py)
-
-**Acceptance gate:** test_retire_unit.py tests for items 1-4 (each fails without the change); retire 47+ OK; basedpyright 0/0/0; live: dry run on `assembly` prints the save line.
+**Gotchas:** the read-only fetch is `git fetch --no-write-fetch-head --refmap= -q origin <ref>` with no destination refspec, then resolves the sha `ls-remote` advertised; `--refmap=` stops configured tracking-ref updates.
