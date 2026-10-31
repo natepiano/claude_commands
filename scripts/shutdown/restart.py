@@ -1183,10 +1183,7 @@ def _herdr_launch(
             opening=herdr.OpeningPrompt(parts.opening_prompt,
                 herdr.SessionTranscript(config_dir, session["session_id"])), timeout_ms=90_000)
         pane, outcome = launched.pane, launched.outcome
-        if isinstance(server, (herdr.ServerAdopted, herdr.WindowServerCreated)):
-            focused = _focus_restored_pane(client, pane, session["name"])
-            if focused and isinstance(server, herdr.WindowServerCreated):
-                _close_startup_workspaces(client, pane)
+        _present_restored_pane(server, client, pane, session["name"])
         if isinstance(parts.conversation, StartFreshConversation):
             print(f"{session['name']}: no conversation to resume; started a new one")
         return HerdrLaunch(server, outcome if isinstance(outcome, (herdr.PromptSubmitted, herdr.PromptNotSubmitted))
@@ -1218,6 +1215,15 @@ def _leave_recorded_session(name: str, recorded: str, pane: str) -> None:
             client.close_pane(pane)
     except (herdr.HerdrFailure, OSError, subprocess.SubprocessError) as error:
         print(f"{name} restart issue: herdr session {recorded} left open: {error}")
+
+
+def _present_restored_pane(
+    server: herdr.ServerCreated | herdr.ServerAdopted | herdr.WindowServerCreated,
+    client: herdr.Herdr, pane: str, name: str,
+) -> None:
+    """Focus and clean up only the window this launch created."""
+    if isinstance(server, herdr.WindowServerCreated) and _focus_restored_pane(client, pane, name):
+        _close_startup_workspaces(client, pane)
 
 
 def _focus_restored_pane(client: herdr.Herdr, pane: str, name: str) -> bool:
@@ -2742,9 +2748,7 @@ def _launch_codex_snapshot(
     launched = herdr.launch_prepared_agent(name, herdr_space(owner), title, prepared_environment,
         kind="codex", agent=title, agent_arguments=arguments, opening=herdr.NoOpeningPrompt(), timeout_ms=90_000)
     pane = launched.pane
-    focused = _focus_restored_pane(herdr.Herdr(name), pane, owner["name"])
-    if focused and isinstance(server, herdr.WindowServerCreated):
-        _close_startup_workspaces(herdr.Herdr(name), pane)
+    _present_restored_pane(server, herdr.Herdr(name), pane, owner["name"])
     _acknowledge_restored_snapshots(owner["session_id"])
     if isinstance(server, herdr.WindowServerCreated):
         return SessionLaunched()
