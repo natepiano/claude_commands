@@ -39,6 +39,27 @@ class OverridesRefused:
     line: str
 
 
+def is_installed_file(script: Path, relative: str, home: Path) -> bool:
+    try:
+        return os.path.samefile(script, home / ".claude" / "scripts" / relative)
+    except OSError:
+        return False
+
+
+def require_checkout(script: Path) -> None:
+    home = user_home()
+    installed_root = home / ".claude" / "scripts"
+    try:
+        relative = script.resolve().relative_to(installed_root.resolve())
+    except ValueError:
+        return
+    if is_installed_file(script, str(relative), home):
+        raise RuntimeError(
+            f"{script.name}: this suite runs from a checkout, not from the installed scripts under "
+            + f"{installed_root}; run it from a worktree."
+        )
+
+
 def refusal(
     script: Path, relative: str, home: Path, environment: Mapping[str, str]
 ) -> OverridesAllowed | OverridesRefused:
@@ -56,10 +77,7 @@ def refusal(
         name = "HOME"
 
     installed_root = home / ".claude" / "scripts"
-    try:
-        if not os.path.samefile(script, installed_root / relative):
-            return OverridesAllowed()
-    except OSError:
+    if not is_installed_file(script, relative, home):
         return OverridesAllowed()
     return OverridesRefused(
         f"{script.name}: {name} is set to '{environment[name]}'; "

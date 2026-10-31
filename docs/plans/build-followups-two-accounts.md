@@ -2939,7 +2939,7 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 #### As-built
 
 - `scripts/lib/process_failure.failure_detail(result, *, lines=20)` returns the last `lines` lines of stderr and of stdout, each labelled (`stderr: …`, `stdout: …`), stderr first, an empty stream left out, and `exit <code>` when both are empty.
-- `ci_points.py` uses it in `required`, the validation step and the review watch; `merge_checkpoint.push_validate` uses it for its validate_and_push failure. `report()` joins the lines with `; `, so each step is still one line. A validation failure with no output now reads `exit <code>`, not `validation failed`.
+- `ci_points.py` uses it in `required` and the review watch; `merge_checkpoint.push_validate` uses it for its validate_and_push failure. `report()` joins the lines with `; `, so each step is still one line. Since Phase 101i, CI-point validation saves both streams in `<state dir>/ci_validation.log` and reports `step <label> failed; log <path>`, or `exit <code>, no step named; log <path>` without a failure marker.
 - 37 other copies of the old pattern remain; Phase 101e moves them.
 
 **Files:**
@@ -2955,7 +2955,7 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 - `validate_and_push.sh --validate-only` runs validation in the copy and makes at most one fix commit there. It does not push.
 - Publish runs under `merge_checkpoint.merge_lock`: it fetches the copy's `HEAD` into the production checkout, does a guarded `git merge --ff-only`, then runs `push_direct.sh --publish-only <sha>`, which prints `<sha> pushed` or `<sha> contained`.
 - The publish rule: if `origin/<merge branch>` contains the sha, the run passes and nothing is pushed. A fix commit is pushed only when it fast-forwards `origin/<merge branch>`. Otherwise the run fails with `merge branch moved during validation`. Nothing is ever force-pushed.
-- After the lock is released, `push_direct.sh --follow-published <sha> <state>` runs the hook, the CI-run lookup and the cancellation of older runs (`CANCEL_PRIOR` env). The validation report line follows the publish receipt. Failures keep `failure_detail`.
+- After the lock is released, `push_direct.sh --follow-published <sha> <state>` runs the hook, the CI-run lookup and the cancellation of older runs (`CANCEL_PRIOR` env). The successful validation report line follows the publish receipt. Command failures keep `failure_detail` except validation itself: its combined output stays in `<state dir>/ci_validation.log` after copy removal, and its failure line names the last failing step (or exit code when unnamed) and that log.
 
 **Files:**
 - `scripts/production/ci_points.py` — the fixed sha, the copy, publish under `merge_lock`, the report line.
@@ -3016,3 +3016,9 @@ Showrunner ruling 2026-10-31 06:29 EDT; user asked for the Mac fix at 06:30.
 User 2026-10-31 07:5x EDT: claude3 showed a red dot on the Mac board while signed in.
 
 **As-built:** launchd job `account-usage` (`/etc/nixos/modules/darwin/account-usage.nix`, every 120 s, at login, Aqua session) runs `agent_notes.py usage-only`, which reads usage and sends no alerts and changes no routing; a read that cannot reach credentials (signed-out CLI answer, exit 1 over ssh) records CREDENTIALS_UNAVAILABLE and keeps the last good outcome. Review: two lenses found F001 (signed-out exit 1 still stored ERROR); one fix round; closure approved.
+
+### Phase 101i — A failed CI point names its failing step and log  · status: done · b3a0ca39
+
+Showrunner defect 2026-10-31 09:3x EDT, reported by hana: the validation line opened with memory-wait lines and hid a killed nextest; no log was kept.
+
+**As-built:** `ci_start` writes validation's stdout and stderr, in order, to `<state dir>/ci_validation.log`, replaced at each start and kept after the copy is removed. A failure reads `validation: failed — step <label> failed; log <path>` from the last `!!! VALIDATION FAILED at step: <label> !!!` line (`validate_ci.sh` `run_step`), or `exit <code>, no step named; log <path>`. The scan uses `errors="replace"`, so bytes that are not UTF-8 never hide the step. An `OSError` stays a `PointFailure("validation", …)`. `merge_checkpoint.push_validate` keeps `failure_detail`. Review: two lenses found F001 (strict UTF-8 scan); one fix round; closure approved.

@@ -682,24 +682,28 @@ def write_step_line(pending: PendingStep) -> bool:
     return True
 
 
-def _resume_step_line(pending: PendingStep) -> bool:
-    """Scan from the saved row boundary, or byte 0 for a legacy pending step."""
-    path = _step_month_file(pending.row)
+def append_row_once(path: Path, row: Mapping[str, object], start: int = 0) -> bool:
+    """Recover an append by its fixed id while holding the same log lock."""
     added = True
     with store.locked_append(path) as handle:
-        _ = handle.seek(pending.month_row_end)
+        _ = handle.seek(start)
         for line in handle:
             try:
-                row = cast(object, json.loads(line))
+                previous = cast(object, json.loads(line))
             except ValueError:
                 continue
-            if isinstance(row, dict) and cast(dict[str, object], row).get("id") == pending.row["id"]:
+            if isinstance(previous, dict) and cast(dict[str, object], previous).get("id") == row["id"]:
                 added = False
                 break
         if added:
-            store.append_locked(handle, pending.row)
+            store.append_locked(handle, row)
     _sync_directory(path.parent)
     return added
+
+
+def _resume_step_line(pending: PendingStep) -> bool:
+    """Scan from the saved row boundary, or byte 0 for a legacy pending step."""
+    return append_row_once(_step_month_file(pending.row), pending.row, pending.month_row_end)
 
 
 def _delete_step_sources(held: Path | NoHeldLog, peak: Path | NoPeakFile,
@@ -978,6 +982,15 @@ def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step
         "reserve": reserve, "why": why, "set_by": set_by,
     })
 
+
+def queue_priority(action: Literal["set", "clear"], unit: str,
+                   why: str, set_by: str, at: float, *, transition_id: str = "") -> None:
+    host = store.host_name()
+    _ = append_row_once(store.host_file(host, at), {
+        "kind": "queue_priority", "v": RECORD_VERSION,
+        "id": transition_id or f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
+        "action": action, "unit": unit, "why": why, "set_by": set_by,
+    })
 
 
 class IdleFloorTarget(TypedDict):

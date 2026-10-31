@@ -74,7 +74,7 @@ class BuildWhyTests(unittest.TestCase):
         self.head_path = self.waiter(500, "inspectors-fix", 11.8, 122)
         self.change_head(need_source="measured", need_runs=7, test_threads=8,
                          test_scope="filtered", package="hana_inspectors",
-                         filters=["test(one)", "test(two)"], holds_younger=True,
+                         filters=["test(one)", "test(two)"],
                          priority_since=NOW - 120)
         for number in range(16):
             _ = self.waiter(600 + number, f"younger-{number}", number + 1, 20 - number)
@@ -156,6 +156,17 @@ class BuildWhyTests(unittest.TestCase):
         self.assertNotIn("still leaves", final)
         result = gate.head_after_steps_end(gate.explain_queue(), (0,))
         self.assertIsInstance(result, gate.HeadAdmitsAfterEnd)
+
+    def test_order_rule_shows_the_queue_priority_from_its_snapshot(self) -> None:
+        from dataclasses import replace
+        reading = gate.locked_queue_read()
+        priority: gate.QueuePriority = {"unit": "resources", "why": "work", "set_at": NOW,
+            "set_by": "showrunner"}
+        reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
+        facts = head_facts.read_head_facts(reading)
+        lines = build_why.render_explanation(reading.explanation, user_zone(), {}, facts)
+        order, = [line for line in lines if line.startswith("Order rule:")]
+        self.assertIn("queue priority: resources (the user's bump)", order)
 
     def test_override_free_memory_terms_add_up_to_its_printed_threshold(self) -> None:
         self.reset_running(available=23, need=12)
@@ -494,15 +505,23 @@ class BuildWhyTests(unittest.TestCase):
     def test_four_head_facts_follow_first_in_line_in_the_specified_order(self) -> None:
         write_bumps(NOW, [bump_line(NOW - 1)])
         output = self.output()
-        prefixes = ("First in line:", "Head for:", "Bumps since it joined at",
+        prefixes = ("First in line:", "Bumps since it joined at",
                     "Order rule:", "Cargo token waits:")
         positions = [output.index(prefix) for prefix in prefixes]
         self.assertEqual(positions, sorted(positions))
-        self.assertEqual(self.line(output, "Head for:"), "Head for: unknown")
+        self.assertNotIn("Head for:", output)
         joined = datetime.fromtimestamp(NOW - 122 * 60, user_zone()).strftime("%H:%M:%S")
         self.assertEqual(self.line(output, "Bumps since it joined"),
                          f"Bumps since it joined at {joined}: 1")
         self.assertEqual(self.line(output, "Cargo token waits:"), "Cargo token waits: unknown")
+
+    def test_legacy_head_clock_does_not_replace_the_total_queue_wait(self) -> None:
+        self.change_head(head_state="head", head_since=NOW - 125)
+        output = self.output()
+        self.assertIn("waiting 122 min", output)
+        self.assertNotIn("Head for:", output)
+        self.assertNotIn("became first", output)
+        self.assertNotIn("head_since", output)
 
     def test_token_gaps_only_show_current_waiting_runs(self) -> None:
         since = NOW - 122 * 60
@@ -583,10 +602,13 @@ class BuildWhyTests(unittest.TestCase):
                 self.assertNotIn("may use", line)
 
     def test_backfill_and_position_bump_report_the_admission_deadlines(self) -> None:
-        self.change_head(priority_since=NOW - 630, bump_order=-1)
+        self.change_head(priority_since=NOW - 630)
+        priority: gate.QueuePriority = {"unit": "inspectors-fix", "why": "user work", "set_at": NOW - 630,
+            "set_by": "showrunner"}
+        _ = (self.directory / "queue_priority.json").write_text(json.dumps(priority))
         output = self.output()
         self.assertRegex(output, r"younger steps may start until 21:52.*1 min 30 s left")
-        self.assertIn("bumped by position at 21:40", output)
+        self.assertIn("queue priority: inspectors-fix (the user's bump)", output)
 
     def test_pressure_hold_and_recovery_spacing_are_explicit(self) -> None:
         _ = (self.root / "pressure").write_text("full avg10=11.00 avg60=0.00 avg300=0.00 total=0\n")
