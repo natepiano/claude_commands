@@ -41,7 +41,7 @@ Two additions to the build log. The first is a "Tests per edit" section in the d
 
 ### Rust release check
 
-**Hook.** `cli.hourly()` runs `sync.sync`, `ci.ci`, then `rust_release.check_release`, each in its own `try`. A job that raises prints one line, goes to `store.note_error("hourly <name>")` and sets exit 1; the others still run. `index.update()` runs last. The check runs with all defaults:
+**Hook.** `cli.hourly()` runs `sync.sync`, `vault_pull.vault`, `ci.ci`, the screenshot scan, then `rust_release.check_release`, each in its own `try`. A job that raises prints one line, goes to `store.note_error("hourly <name>")` and sets exit 1; the others still run. `index.update()` runs last. The check runs with all defaults:
 
 ```python
 def check_release(*, fetch_channel=fetch_channel_file, read_pin=pinned_version,
