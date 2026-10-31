@@ -2,9 +2,9 @@
 Folder /home/natepiano/rust/cargo-liner/repo. Waited 37 min (since 10:09). Likely start ~10:51.
 
 Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.
-  #1 ↑  tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40; from #1 by
+  #1    tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40; from #1 by
       work-lead at 10:46
-  #2 ↑  tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40
+  #2    tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40
   #3    tool-based-ui · hana-migration mend  joined 10:07, 2 min before it
   Moved-up steps go first, then the longest wait. It joined 2nd of the steps waiting now.
 

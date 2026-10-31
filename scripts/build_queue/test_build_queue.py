@@ -100,6 +100,25 @@ class QueueTests(unittest.TestCase):
                     self.assertIn(expected, plain([line]))
                     self.assertTrue(any(span.tone == "error" and "✗" in span.text for span in line))
 
+    def test_expired_head_json_paints_the_same_sixty_column_error_as_inline(self) -> None:
+        _ = self.fixture.waiter(500, "id-expired", "expired")
+        inputs = self.fixture.inputs()
+        path, row = inputs.ordered[0]
+        reading = memory_admit.queue_read_from(replace(inputs, pressure=memory_admit.NoPressureHold(),
+            ordered=[(path, {**row, "estimated_at": NOW - 600})]))
+        status, output, errors = self.invoke(reading, "--json", "--columns", "60")
+        self.assertEqual((status, errors), (0, ""))
+        data = cast(QueueLines, json.loads(output))
+        pane = self.snapshot_text(data)
+        status, inline, errors = self.invoke(reading, "--columns", "60")
+        self.assertEqual((status, errors), (0, ""))
+        self.assertIn("░" * 21, inline)
+        self.assertEqual(pane, inline.rstrip("\n").replace("░", "█"))
+        self.assertIn("estimate expired", pane)
+        self.assertTrue(all(terminal_width(line) <= 60 for line in pane.splitlines()))
+        self.assertTrue(any(span.get("tone") == "error" and "estimate expired" in span["text"]
+                            for line in data["lines"] for span in line))
+
     def test_busy_read_is_bounded_for_plain_card_and_pane_json(self) -> None:
         directory = self.fixture.directory
         for cache in ("missing", "corrupt"):

@@ -169,7 +169,7 @@ only I can bump
 - A snapshot whose non-compiler running steps do not match its reservation count reads as absent. Legacy reservation rows get `test_threads` and `call_id` set to `None`.
 - Importing `roster` from `build_why.py` adds about 80 ms; import the label reader from `scripts.message.unit_labels`.
 
-### Phase 4 — One decision pass decides for every waiting step, and the check and the queue read both call it  · status: todo
+### Phase 4 — One decision pass decides for every waiting step, and the check and the queue read both call it  · status: done
 **Depends on:** Phase 3
 **Blocked by:** resources-unit Phases 30, 31, 32 and 26 merged on `origin/builds` (32 is there at `8a71f222`; in its chain 24 Part B comes before 26). This phase lands before resources Phase 15. Tell resources-unit through berth when it starts and when it lands.
 **Estimate:** about 7 h of worker time.
@@ -418,7 +418,7 @@ Source: S3 of `docs/plans/builds-queue-service-design.md` (with §3 Decisions st
    4. `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/admission_client.py view` answers from the live service.
    5. `/build:hold release`.
 4. **Callers.**
-   - `memory_gate.sh`: `buildlog_wait_for_memory` runs one foreground `admission_client.py admit ...` and reads its `admitted` line. `buildlog_release_memory` runs `admission_client.py release`, `buildlog_give_back_memory` runs `give-back`, and the width call runs `width`. Today's wait line form (`buildlog_memory_line_inner` and the `printf` lines in `buildlog_wait_for_memory`) and the leave-hook loop (`LINT_QUEUE_LEAVE_HOOK`, else `BUILDLOG_MAC_IDLE_HOOK`, run every 5 s; a success closes the connection and exits as `LeftQueue`) move into `admission_client.py`, one function each, and the shell copies go. The client prints the same lines as today from the `wait` messages, and `memory_gate.sh` keeps today's exit codes for admitted, refused and left.
+   - `memory_gate.sh`: `buildlog_wait_for_memory` runs one foreground `admission_client.py admit ...` and reads its `admitted` line. `buildlog_release_memory` runs `admission_client.py release`, `buildlog_give_back_memory` runs `give-back`, and the width call runs `width`. Today's wait line form (`buildlog_memory_line_inner` and the `printf` lines in `buildlog_wait_for_memory`) and the leave-hook loop (`LINT_QUEUE_LEAVE_HOOK`, else `BUILDLOG_MAC_IDLE_HOOK`, run every 5 s; a success closes the connection and exits as `LeftQueue`) move into `admission_client.py`, one function each, and the shell copies go. The client prints the same lines as today from the `wait` messages, and `memory_gate.sh` keeps today's exit codes for admitted, refused and left. Phase 7's wait rules move with the loop and stay true: no closed list of `source` values; a failed check while a step waits prints one line and tries again, refusing only after `BUILDLOG_MEM_CHECK_RETRY_S` (60 s) of failures; the launch wait limit applies on the retry path too; the waiter row and its `since` stay. `test_memory_gate_wait.py` moves to the client and keeps its assertions.
    - `invoke.sh` :288: the `.max` path comes from the `admitted` line (`max_path`), not from `${BUILDLOG_MEM_RESERVATION%.reservation}`. `BUILDLOG_MEM_RESERVATION` holds the reservation id, not a file path. The sampler `buildlog_sample_anon` does not change.
    - `verify.sh`: the cancel path (:1171–1181) drops its reservation list, because the owner's end releases. The give-back call site keeps the name `buildlog_give_back_memory`.
    - `pre-tool-use-brp-launch-gate.sh`: runs `admission_client.py launch`.
@@ -448,7 +448,7 @@ No-copies rule (user, 2026-10-30): one place for each thing. A second copy of se
 - `scripts/build_queue/admission_protocol.py` — `admission_socket_path` calls the override guard
 - `scripts/build_queue/build_why.py`, `scripts/build_queue/build_queue.py`, `commands/build/queue.md` — `queue_read()` as the service adapter, `mine`, `priority`, `admit_head`, the `AdmissionUnavailable` output; the `queue busy; try again` line goes (owner queue-unit)
 - `scripts/build_queue/queue_view.py` — the stale header tone goes (owner queue-unit)
-- `scripts/lint/memory_gate.sh` — the client calls; the wait line form and the leave-hook loop go (owner resources-unit)
+- `scripts/lint/memory_gate.sh` — the client calls; the wait line form and the leave-hook loop go (owner queue-unit since Phase 7)
 - `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — `launch` (owner resources-unit)
 - `scripts/build_hold/build_hold.py` — `admitted_processes` (owner resources-unit)
 - `scripts/build_hold/override_guard.py`, `scripts/build_hold/override_guard.sh` — `ADMISSION_SOCKET` (owner resources-unit)

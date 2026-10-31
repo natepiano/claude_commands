@@ -11,6 +11,36 @@ from scripts.lint import memory_admit as gate
 
 
 class QueueCardTests(QueueFixtureTests):
+    def test_expired_follower_prints_estimate_before_its_own_resource_checks(self) -> None:
+        inputs = self.fixture.inputs()
+        path, row = inputs.ordered[1]
+        reading = gate.queue_read_from(replace(inputs, ordered=[inputs.ordered[0],
+            (path, {**row, "estimated_at": NOW - 600})]))
+        model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
+        text = plain(queue_card.render_card(model, [2], 400))
+        self.assertIn("✗ estimate       expired at 10:36; refreshes on its next poll", text)
+        self.assertLess(text.index("✗ estimate"), text.index("build budget:"))
+        self.assertLess(text.index("✗ estimate"), text.index("free memory"))
+
+    def test_strict_room_follower_that_fits_has_a_passing_order_check(self) -> None:
+        inputs = self.fixture.inputs()
+        path, head = inputs.ordered[0]
+        follower_path, follower = inputs.ordered[1]
+        reading = gate.queue_read_from(replace(inputs,
+            host=gate.HostMemory(10 * gate.GIB, 60 * gate.GIB), pressure=gate.NoPressureHold(),
+            running=(replace(inputs.running[0], promise=gate.GIB, measured=gate.MeasuredMemory(gate.GIB)),),
+            reservations=({**inputs.reservations[0], "need": gate.GIB},), ordered=[
+                (path, {**head, "need": 15 * gate.GIB, "holds_younger": True, "priority_since": NOW - 60}),
+                (follower_path, {**follower, "need": gate.GIB})]))
+        self.assertIsInstance(reading.view.waiting[1].reason, gate.ReadyForAdmission)
+        from scripts.build_queue import queue_view
+        self.assertEqual(queue_view.reason_phrase(reading.view.waiting[1].reason, reading.view.waiting),
+                         "starts at the next check")
+        model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
+        text = plain(queue_card.render_card(model, [2], 400))
+        self.assertIn("✓ queue order", text)
+        self.assertNotIn("younger steps wait", text)
+
     def test_head_and_fourth_card_match_the_captured_goldens(self) -> None:
         model = self.fixture.model()
         for position in (1, 4):
@@ -69,7 +99,7 @@ class QueueCardTests(QueueFixtureTests):
         assert isinstance(facts, head_facts.HeadFacts)
         model = replace(model, facts=replace(facts, bump_records=()))
         text = plain(queue_card.render_card(model, [4], 400))
-        self.assertIn("#1 ↑  tool-based-ui · cables · work-lead nextest  joined 10:40, 30 min after it", text)
+        self.assertIn("#1    tool-based-ui · cables · work-lead nextest  joined 10:40, 30 min after it", text)
         self.assertNotIn("0 min before it", text)
 
     def test_session_selector_prints_each_step_as_a_card_with_a_blank_separator(self) -> None:

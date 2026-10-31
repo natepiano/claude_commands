@@ -147,16 +147,20 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
                           limits=gate.AdmissionLimits(21 * gate.GIB, view.reserve))
         followers.append(gate.LineWaiter(step, own.state == "admit", own,
                                          *gate.decision_checks(own, step.need, view.available)))
+    ordered: list[tuple[Path, gate.Waiter]] = [(Path(f"{step.pid}-{step.pid}.waiting"),
+        {"pid": step.pid, "start_time": str(step.pid), "need": step.need, "since": step.since,
+         "session_id": step.session_id, "session_name": step.session_name,
+         "step": step.step, "folder": step.folder}) for step in view.waiting]
+    inputs = gate.QueueInputs(ordered, view.running, (),
+        gate.HostMemory(view.available, gate.UnknownHostTotal()), gate.NoPressureHold(),
+        gate.NoRecoverySpacing(), gate.AdmissionLimits(21 * gate.GIB, view.reserve),
+        gate.NoHeadAdmissionOverride(), view.now)
     explanation = gate.QueueExplanation(view.now, host, running,
         gate.QueueMemoryTotals(sum(step.charged for step in running), sum(step.measured for step in running), view.promised),
         first, gate.WaitingLine(tuple(followers), len(followers), sum(row.fits_now for row in followers),
             min((row.waiter.need for row in followers), default=0),
             max((row.waiter.need for row in followers), default=0),
-            min((row.waiter.since for row in followers), default=view.now)))
-    ordered: list[tuple[Path, gate.Waiter]] = [(Path(f"{step.pid}-{step.pid}.waiting"),
-        {"pid": step.pid, "start_time": str(step.pid), "need": step.need, "since": step.since,
-         "session_id": step.session_id, "session_name": step.session_name,
-         "step": step.step, "folder": step.folder}) for step in view.waiting]
+            min((row.waiter.since for row in followers), default=view.now)), inputs)
     return gate.QueueRead(view, explanation, ordered)
 
 

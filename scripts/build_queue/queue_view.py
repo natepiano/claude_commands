@@ -95,11 +95,6 @@ def waiting_moves(model: QueueModel, position: int) -> tuple[head_facts.BumpReco
     return model.moves.waiting[position - 1]
 
 
-def is_moved(model: QueueModel, position: int) -> bool:
-    return (isinstance(model.facts, head_facts.HeadFacts) and isinstance(model.facts.bumps, head_facts.BumpHistory)
-            and has_move_priority(model, position))
-
-
 def has_move_priority(model: QueueModel, position: int) -> bool:
     return model.reading.ordered[position - 1][1].get("bump_order", 0) < 0
 
@@ -143,6 +138,8 @@ def check_lines(checks: gate.HeadExplanation | gate.LineWaiter | gate.ReadingUna
 
 def reason_phrase(reason: gate.WaitReason, waiting: Sequence[gate.WaitingStep]) -> str:
     match reason:
+        case gate.EstimateExpired():
+            return "estimate expired"
         case gate.ReadingUnavailable():
             return "memory reading unavailable"
         case gate.MemoryPressure():
@@ -196,7 +193,9 @@ def head_status(model: QueueModel, budget: int) -> Line:
         result += (Span(" "), Span(countdown(head.order.deadline, model.reading.explanation.now),
                                    tone, until=head.order.deadline))
     reason = head.waiter.reason
-    if isinstance(reason, gate.ReadingUnavailable):
+    if isinstance(reason, gate.EstimateExpired):
+        result += (Span(" estimate expired", "error"),)
+    elif isinstance(reason, gate.ReadingUnavailable):
         result += (Span(" no reading", "error"),)
     elif isinstance(reason, gate.MemoryPressure) or isinstance(head.decision.pressure, gate.MemoryPressure):
         result += (Span(" pressure", "error"),)
