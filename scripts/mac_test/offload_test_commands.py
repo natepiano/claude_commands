@@ -76,6 +76,14 @@ await_release() {
     IFS= read -r -t "$TEST_HANG_GUARD_SECS" reply <> "$root/$1" || exit 98
 }
 if [[ $command == rsync ]]; then
+    if [[ ${*: -2:1} == *:*/ ]]; then
+        printf 'started\n' > "$root/pull-started"
+        if (( ${hold_pull:-0} )); then await_release continue-copy; fi
+        destination=${!#}
+        mkdir -p -- "$destination"
+        printf '%s' "${fetch_contents:-image bytes}" > "$destination/shot.png"
+        exit "${pull_status:-0}"
+    fi
     printf 'started\n' > "$root/copy-started"
     if (( hold_copy )); then await_release continue-copy; fi
     exit "$rsync_status"
@@ -85,6 +93,15 @@ if [[ $command != ssh ]]; then
     exit 99
 fi
 remote=${!#}
+if [[ $remote == *fetch_kib=* ]]; then
+    if (( ${hold_fetch_probe:-0} )); then
+        printf 'started\n' > "$root/fetch-probe-started"
+        await_release continue-copy
+    fi
+    printf '%s\n' "${fetch_answer:-fetch_kib=4
+rc=0}"
+    exit "${fetch_probe_status:-0}"
+fi
 if [[ $remote == *'select_leftovers()'* && $remote == *lsof* ]]; then
     printf 'called\n' > "$root/cleanup-called"
     if (( hold_cleanup )); then

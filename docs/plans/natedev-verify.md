@@ -427,3 +427,152 @@ Checkpoint be7ffc50 on `natedev-verify-cancel`.
 - Watch item: one `test_verify_hold_signals` TERM run had 2 run-log tees alive at 5.2 s under load; the rerun passed. A repeat points at the Phase 10 stop path.
 
 **Ruled out:** `$$` as the parent pid; a fallback to `os.getppid()` when `--parent-pid` is missing; a second parent check or a sweep.
+
+### Phase 14 — Run a test step on the Mac only, with named variables and a folder brought back  · status: done
+
+**Origin:** two builds showrunner add-ons, joined into one phase (2026-10-31). (1) A test step that runs on the Mac only and never falls back to natedev. Tell performance when it is on main. (2) hana Phase 34: when `HANA_TOOLTIP_PLACEMENT_SHOTS` is set, hana test fixtures save PNGs. A Mac test run names the environment variables it forwards and the folder it fetches back. Tell hana when it is on main. This phase runs in worktree `claude-build-followups-verify-cancel`, branch `natedev-verify-cancel`.
+
+**Depends on:** Phase 13 (same branch, HEAD 17a556b7, which holds Phases 9, 10 and 13 and origin/builds b43cf221). It does not depend on Phase 1b. Its edits stay apart from 1b's hunks (Constraints).
+
+#### Work Order
+
+**Source:** builds showrunner add-ons, 2026-10-31.
+
+**Goal:** `verify.sh test <package> --mac "<why>"` runs the step on the Mac only. It waits while the Mac is busy, never runs on natedev, and refuses in one line that names the cause for every other Mac answer. On a Mac-only call, `--env NAME` sends named variables to the Mac test, and `--fetch <folder>` copies one folder back to natedev. Each forward goes through the one existing path: `try_mac_test`, then `offload.py run`, then `remote_test_command`.
+
+**Spec:**
+
+1. Flags. Like `--local`, each flag can be anywhere after the verb. The parse loop removes it from `ARGS`, so no flag enters `tree_key`, the cargo words or the call record's `command`.
+   - `--mac "<why>"` sets `MAC_ONLY=1` and `MAC_REASON`. The why is required, with the same rule as `--local`: when it is missing, blank or starts with `--`, verify exits 2. This keeps `--local`'s form. Each run prints the why in its first routing line, so the run log shows why natedev was not used.
+   - `--env NAME` can be given more than once. It forwards the value that NAME has in verify.sh's own environment (`NAME=value verify.sh test …`). A value never goes on verify.sh's argv, so it never enters the call's command, the cache key or a record. It does pass in the ssh remote command, which must carry it to the Mac. A variable that is not named never goes to the Mac. This is true now, and a test keeps it true.
+   - `--fetch <folder>` can be given once. The folder is relative to the repository root, which is the mirror root on the Mac. One folder serves hana's need. A second `--fetch` is refused.
+2. Refusals in verify.sh. Each one happens before any work and before the eligibility check. Each one exits 2 with one stderr line, and starts no runner, no cargo and no call record, like the `--local` refusals. These are the only policy checks:
+   - `verify.sh: --mac needs a reason: --mac "<why this test must run on macOS>".`
+   - `verify.sh: --mac applies only to test.`
+   - `verify.sh: --mac and --local cannot be used together.`
+   - `verify.sh: --env and --fetch need --mac "<why>".` The reason: without `--mac`, the step can run on natedev or as a copy, and neither of those paths forwards or fetches anything.
+   - `verify.sh: --env <NAME>: not a variable name.` NAME must match `^[A-Za-z_][A-Za-z0-9_]*$`. A missing NAME gets the same line form.
+   - `verify.sh: --env <NAME>: the runner sets it, or it changes what Cargo builds; it is not forwarded.` Refused names: `PATH`, `HOME`, `MACOSX_DEPLOYMENT_TARGET`, `RUSTFLAGS`, `RUSTDOCFLAGS`, and every name with the prefix `BUILDLOG_`, `LINT_`, `CARGO_`, `RUSTC`, `NEXTEST_`, `DYLD_`, `MAC_TEST_` or `VERIFY_`. The reasons: the remote command sets some of these names. Cargo and nextest names change the build or the test scope, and they also change the Mac build output for later runs. `DYLD_` names change what the loader loads.
+   - `verify.sh: --env <NAME>: not set here; set it on the call (NAME=value verify.sh …).` The test is `${!NAME+x}`. An empty value is allowed.
+   - `verify.sh: --fetch needs a folder relative to the repository root, such as target/shots.` and `verify.sh: --fetch is given twice; name one folder.`
+   - `verify.sh: --fetch <folder>: not a plain relative folder.` This refuses a leading `/` or `-`, an empty, `.` or `..` part, and any character other than letters, digits, `.`, `_`, `-` and `/`. One trailing `/` is removed first.
+   - `verify.sh: --fetch <folder>: git does not ignore it; name a folder the tests write, such as one under target/.` The check is `git -C <top level> check-ignore -q -- <folder>/`. An ignored folder is never in the tree key, the tree watch or the copy to the Mac. So the fetch and the Mac-side removal in Spec 6 cannot change a judged tree.
+3. Mac-only routing. This is in `route_test_without_renewal` only. Do not edit the `route_test` wrapper.
+   - `initialize_step_record`: a `natedev_only <reason>` answer refuses the call (Spec 4). The Mac reach and disk probe in `eligible` already finds an unreachable Mac at this point.
+   - In the target loop, skip a natedev row (settings `-`), as `STEP_FORCE_MAC` does. Under `--mac`, `BUILDLOG_LOCAL_REASON` stays unset.
+   - After each `try_mac_test`: a pass or a failure ends the call as it does today. `declined`/`busy` goes into the retry list through `remember_mac_retry`. Every other result refuses the call (Spec 4).
+   - Retry loop under `MAC_ONLY`. Do not call `check_routing_hold` or `local_release_wait.py`. Open `phase_wait_start hold "Mac busy"`, set `ROUTING_WAIT_STARTED`, and wait with a background Bash `sleep "${BUILD_TARGETS_POLL_S:-15}"` held in `HOLD_WAITER_PID`. Then use the existing free-now hook and `try_mac_test` attempt. Print `verify.sh: Mac only (<why>): waiting for the Mac (busy); natedev runs nothing for this call.` once.
+   - The step's queue place is its step record in state `waiting_mac` plus this poll. The first waiter whose claim succeeds gets the Mac. This phase adds no order among waiters. A Mac-only claim is a non-copy claim, so a running copy gives way to it and it never gives way to anything. The normal copy rules apply, with no change.
+   - Main flow: after `route_test`, a `MAC_ONLY` call that is still running refuses with `runner`. This covers a missing runner file and an empty retry list, so the call can never reach the local path, the cargo token or the memory queue.
+4. Refusal during a call. `mac_only_refuse <word>` prints `verify.sh: test --mac refused: <text>; nothing ran on natedev.` It calls `note_event failed "$SECONDS" 0 "" 0 2` and exits 2. Texts:
+   - `blocked`: "the Mac is blocked (/build:status names the holder and when it lifts)". offload's `blocked by <holder>: <for>` line shows above it, as it does today.
+   - `unreachable`: "the Mac cannot be reached (/build:status --probe)".
+   - `backoff`: "the Mac was unreachable a short time ago (retry backoff)".
+   - `disk`: "the Mac is below its free-space floor".
+   - `off`: "Mac offload is off".
+   - `repo`: "this repository has no Mac setting".
+   - `linux_only`: "<package> is Linux only on the Mac".
+   - `state`: "the Mac claim state cannot be read".
+   - `copy`: "the tree copy to the Mac failed".
+   - `no_tests`: "no test matched on the Mac".
+   - `lost`: "the link to the Mac dropped during the run".
+   - `runner`: "the Mac runner gave no usable result".
+   - Any other eligibility text is printed as it is.
+
+   The record keeps the `BUILDLOG_MAC*` values that `try_mac_test` set (`declined`/`<word>`/seconds, `lost`, or `declined`/`runner`). `target` stays empty because nothing ran. An eligibility refusal records `mac=declined`, `mac_s=0`, and `mac_reason` = the excluded Mac row's reason when that reason is one of offload's decline words, else `state`. This keeps `mac_outcome.offload_record` able to read every refusal row.
+5. Cache. A `--mac` call reuses only a pass record marked `host=mac`. This is the reverse of the `--local` rule, at the same line in `cache_lookup`. A call with `--env` or `--fetch` empties `CACHE_DIR` after it is set, so it reads no record and writes none. A forwarded variable is not part of the key, and a reused pass would fetch nothing.
+6. offload.py arguments and the remote command.
+   - `run` gets `--env NAME` (append) and `--fetch FOLDER`. `main` refuses them, as argparse errors, for a verb other than `nextest` and with `--copy`. It also refuses a NAME that does not match the Spec 2 pattern or is unset, and a folder that fails the Spec 2 character and part rule. These guards are for the shell text that offload builds. The policy checks stay in verify.sh.
+   - `OffloadRequest` gets `environment: tuple[tuple[str, str], ...] = ()` and `fetch: FetchFolder | NoFetch`. These are named types, not `str | None`.
+   - `remote_test_command` puts `NAME=<shlex-quoted value>` for each forwarded pair after `cd <mirror> &&` and before the fixed assignments. When a name repeats, the later one wins, so a fixed one always wins.
+   - With a fetch, the command runs `rm -rf -- <folder> &&` before the lint call, so only this run's files come back. The cleanup is `echo mac_cleanup=kept`, so a disk cleanup below the floor cannot remove a folder under `target/` before the fetch. The next run without `--fetch` cleans up as usual.
+   - Without `--env` and `--fetch`, the command is byte-equal to today's command.
+7. offload.py fetch. In `claimed_run`, after `stream_mac_run` returns a `ReportedMacStatus` (pass, failure or no tests) and before the claim is released:
+   - One ssh call, limited by `probe_timeout_s`, reads `du -sk` of the mirror folder: `fetch_kib=<n>`/`rc=0`, or `fetch=missing`/`rc=0`.
+   - When the size is over `fetch_limit_mib`, nothing is fetched. `fetch_limit_mib` is read with `positive_number`, default 512.
+   - Otherwise the call runs `rsync -rlp --safe-links -e "ssh <ssh_options>" <host>:<mirror>/<folder>/ <state>/fetched/<call id>.partial/<folder>/`. Then `os.replace` moves `<call id>.partial` to `<call id>`. `<state>` is `state_directory()` on natedev (`~/.local/state/mac-test`).
+   - Overwrite rule: none. Each call gets its own folder, and an existing destination is a failure.
+   - Before the fetch, entries under `fetched/` (`.partial` included) whose mtime is more than 14 days old are removed.
+   - A failure or a signal removes the `.partial` folder.
+   - Results: `Fetched(path, kib) | FetchMissing | FetchTooLarge(kib, limit_mib) | FetchFailed(reason) | FetchNotRun`. `FetchNotRun` is for a lost or declined run.
+   - Printed lines: `mac_test: fetched <folder> from the Mac to <path> (<kib> KiB)`, or `mac_test: nothing fetched: <reason>`.
+8. Wire. When `--fetch` was given, `write_result` adds `fetch=fetched|missing|too_large|failed|not_run`. No other result changes. `try_mac_test` passes `--env NAME` for each name in order and `--fetch <folder>`, and reads `fetch=`. A missing `fetch=` line on a fetch call counts as `failed`.
+   - On a Mac pass whose fetch word is not `fetched`, verify prints `verify.sh: FAIL: the tests passed on the Mac, but --fetch <folder> brought nothing back (<word>).` It records `mac=passed_full` or `passed_filter`, outcome `failed`, status 2, and exits 2.
+   - On a Mac failure, the call exits with the runner's status as it does today. A fetch after a failed run still runs, and its line shows.
+9. Stops.
+   - A link drop during the run is `lost`. offload's leftover check and claim rules do not change. The fetch does not run, and verify refuses (`lost`).
+   - TERM, INT or HUP during the Mac-only wait goes to `hold_interrupted`. It ends the `sleep`, records `interrupted` and exits 128 + signal.
+   - During the run or the fetch, `forward_mac_runner_signal` does not change. offload stops ssh or rsync, removes the `.partial` folder, checks leftovers and releases only when their end is confirmed.
+   - Tests that a process on the Mac stops (for example `mac_exit=143`) are a Mac failure with that status.
+10. Record. This phase adds no build-log field and does not edit `scripts/buildlog/`. A Mac-only pass or failure is recorded as any Mac run (`mac=passed_full|passed_filter|failed`, `target=mac`, `mac_s`, Mac steps with `caller=verify-mac`). Forwarded names, values and the fetched folder are not recorded. The why appears only in the run log.
+11. Docs.
+    - verify.sh header: add the usage line for `--mac`/`--env`/`--fetch` beside `--local`. Add "or a Mac-only call refused" to exit code 2. Change the comment above the parse loop.
+    - `docs/as-built/mac-test-offload.md`:
+      - the `verify.sh test` section: flags, refusals, wait, cache
+      - the offload runner section: `--env`, `--fetch`, the `fetch=` line, `mac_cleanup=kept` on a fetch run
+      - Invariants: a Mac-only call never falls back
+      - Config: `fetch_limit_mib` is not set, so the limit is 512
+    - `commands/build/mac.md` "Taking the Mac for a job of your own": add one line that says a test that must run on macOS uses `verify.sh test <package> --mac "<why>"`, not a claim of its own.
+
+**Files:**
+- `scripts/direct/verify.sh` — header usage and exit codes, flag parse and refusals, `CACHE_DIR` for `--env`/`--fetch`, `cache_lookup` host rule, `try_mac_test` runner arguments and `fetch=` word, `route_test_without_renewal` Mac-only branch, `mac_only_refuse`, main-flow guard after `route_test`
+- `scripts/mac_test/offload.py` — `--env`, `--fetch`, `OffloadRequest.environment` and `.fetch`, `remote_test_command`, the fetch step in `claimed_run`, the fetch result types, `write_result`'s `fetch=` line, `OffloadConfig.fetch_limit_mib`
+- `scripts/mac_test/offload_test_commands.py` — `COMMAND_STUB`: the size-check answer and a pull `rsync` that writes the files the fixture gives
+- `scripts/mac_test/test_offload_forward.py` — new: remote command, argument refusals, each fetch result, order before release, signal during pull, prune
+- `scripts/direct/verify_mac_offload_test_support.py` — the fake runner writes `fetch=<word>` from `TEST_RUNNER_FETCH`
+- `scripts/direct/test_verify_mac_only.py` — new: busy wait then pass, each refusal line, eligibility refusal, cache rules, runner arguments, fetch word, TERM during the wait, missing runner
+- `docs/as-built/mac-test-offload.md` — Spec 11
+- `commands/build/mac.md` — Spec 11
+
+**Workers:** 2 writers. The Spec fixes the interface: runner arguments in Spec 6 and 8, and the `fetch=` line.
+- `offload` — `scripts/mac_test/offload.py`, `scripts/mac_test/offload_test_commands.py`, `scripts/mac_test/test_offload_forward.py`.
+- `verify` — `scripts/direct/verify.sh` (hub), `scripts/direct/verify_mac_offload_test_support.py`, `scripts/direct/test_verify_mac_only.py`, both docs. It reuses `VerifyMacOffloadFixture` and `wait_for_marker_exit`, with no second fixture or waiter.
+
+**State:**
+- New natedev folders `~/.local/state/mac-test/fetched/<call id>/<folder>`, removed after 14 days at the next fetch.
+- On the Mac, a fetch run removes `<mirror>/<folder>` before its tests, and it keeps the mirror's `target` folder for that run.
+- No new build-log field, and no verify cache record for `--env` or `--fetch` calls.
+
+**Constraints from prior phases:**
+- Phase 1b (todo, not committed in the main worktree `natedev-verify`) changes these regions:
+  - In `verify.sh`: `STEP_OWNER_PY` (`sys.path` argument, `identity`) and the `STEP_OWNER_PY` call in `buildlog_exec`.
+  - All of `mac_test.py`, `copy_watch.py`, `test_copy_watch.py` and `test_mac_test.py`.
+  - In `offload_test_support.py`: the `process_start` import, `CLAIM_STUB`'s start read and the kept-claim assertion.
+
+  This phase edits none of these regions or files. Its `verify.sh` hunks are in the header, the parse loop, `CACHE_DIR`/`cache_lookup`, `try_mac_test`, the body of `route_test_without_renewal` and the main flow after `route_test`. It does not edit the `route_test` wrapper. New stub fixture keys are set from `test_offload_forward.py` (the stub reads `fixture.sh`), not in `offload_test_support.py`'s `setUp`.
+- Phase 9: verify.sh starts no new Python, and any inline Python names itself. The Mac-only wait uses Bash `sleep` and the existing free-now hook. `test_verify_python_starts` stays at 40 rows.
+- Phase 10: a group stop after routing goes through `verify_interrupted` only. During routing, `hold_interrupted` ends `HOLD_WAITER_PID`, so the Mac-only `sleep` is held there. The three group-stop tests in `test_verify_hold_signals.py` pass unchanged.
+- Phase 13: `start_copy_watch` and `copy_watch.py` do not change. A Mac-only call never starts a copy watch.
+- Phase 7: a refused claim keeps a natedev run waiting in place, and `claim --from-pid` adoption does not change. A Mac-only call never enters the memory wait or takes the cargo token, because the token is taken after `route_test`.
+- Phase 8 (todo) names a holder for each verify wait. The Mac-only wait opens with the existing `phase_wait_start hold` key, so Phase 8 finds it there.
+- `build_targets.py` and `scripts/buildlog/` belong to other units. Read them, do not edit them.
+
+**Acceptance gate:**
+- Reproduce first. Before any code change, add two tests on 17a556b7 and record that both fail, with their output, in the phase report:
+  - `test_verify_mac_only`'s case: the Mac answers busy, then passes. `verify.sh test sample --mac "<why>"` must have no natedev run and end as a Mac pass.
+  - `test_offload_forward`'s case: `offload.py run --env NAME` puts `NAME=<value>` in the remote command.
+- `test_verify_mac_only` passes:
+  - Busy then pass: the call waits, then passes on the Mac. There are 0 natedev runs, and the record has `mac=passed_full`, `target=mac` and `hold_wait_s > 0`.
+  - Each Spec 2 line is exact, with exit 2, no runner, no cargo and no call record.
+  - Each Spec 4 word gives its one line, exit 2, no natedev run and no retry. An eligibility `natedev_only unreachable` refuses before any runner start.
+  - A Mac failure exits with the runner's status.
+  - A `--mac` call does not reuse a natedev pass and does reuse a `host=mac` pass. A `--env`/`--fetch` call reads and writes no record.
+  - The runner gets `--env` for each name in order, and `--fetch`.
+  - A pass with `fetch=missing` exits 2 with `mac=passed_full` and outcome `failed`.
+  - TERM during the wait gives exit 143, `interrupted`, and nothing left behind (`assert_nothing_outlives`).
+- `test_offload_forward` passes:
+  - Forwarded assignments come before the fixed ones, and the fixed ones do not change. A variable that is set but not named is not in the command. A value with spaces, quotes and a newline keeps its bytes. Without the flags, the command is byte-equal to today's.
+  - `rm -rf -- <folder> &&` and `mac_cleanup=kept` appear only with `--fetch`.
+  - Each argparse refusal.
+  - `fetched`: files under `<state>/fetched/<call id>/<folder>`, no `.partial` left. `missing`, `too_large` (with `fetch_limit_mib` set), `failed` (`.partial` removed) and `not_run`.
+  - The fetch comes before the claim release.
+  - SIGTERM during the pull rsync gives exit 143 and removes `.partial`.
+  - The 14-day prune.
+- These pass unchanged:
+  - In `scripts/direct`: `test_verify_mac_offload`, `test_verify_mac_local`, `test_verify_mac_local_arguments`, `test_verify_mac_arguments`, `test_verify_mac_routing`, `test_verify_mac_results`, `test_verify_mac_retry_hold`, `test_verify_mac_signals`, `test_verify_tree_cancel_mac`, `test_verify_hold_signals`, `test_verify_python_starts`.
+  - In `scripts/mac_test`: `test_offload`, `test_offload_lifecycle`, `test_offload_cleanup*`, `test_copy_watch`, `test_mac_test`.
+- basedpyright gives 0 errors, 0 warnings, 0 notes on each changed Python file: `offload.py`, `offload_test_commands.py`, `test_offload_forward.py`, `verify_mac_offload_test_support.py`, `test_verify_mac_only.py`. It gives the same on offload.py's callers: `copy_watch.py`, `mac_test.py`, `audit.py`, `offload_test_support.py`, `offload_cleanup_test_support.py`, `scripts/buildlog/mac_report.py`, `scripts/build_targets/build_targets.py`, `scripts/build_targets/targets.py`. Read the last line, because `basedpyright scripts/mac_test` exits 3 on a clean pass.
+- `bash -n scripts/direct/verify.sh` passes, and `shellcheck scripts/direct/verify.sh` has no new findings.
+- Live check, after `build_hold.py status` shows no natedev or Mac hold of another session: `verify.sh test <small Mac-enabled package> --mac "phase 14 live check"` passes on the Mac, and the build log shows no natedev nextest step for that call.
+- Merge gate: `~/.claude/scripts/lib/py ~/.claude/scripts/production/merge_gate.py --tests-only --checkout <tree>` passes on the tree merged with origin/builds.
+- When the phase is on main, tell performance: Mac-only calls are normal Mac rows, and refusals are `declined`/`<word>` with outcome `failed` and status 2. Tell hana: the flag form, that `--fetch` is relative to the repository root while nextest runs each test in its package folder, the landing path, and the 512 MiB limit.

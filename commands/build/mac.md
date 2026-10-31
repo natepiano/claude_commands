@@ -21,7 +21,7 @@ Run `block`, `unblock`, and `status` with the sandbox off; they write state, cal
 
 ## Taking the Mac for a job of your own
 
-Start the job on natedev. `verify.sh test` and `mac_run.sh` claim for themselves; do not claim before calling them.
+Start the job on natedev. `verify.sh test` and `mac_run.sh` claim for themselves; do not claim before calling them. A test that must run on macOS uses `verify.sh test <package> --mac "<why>"`, without a separate claim.
 
 Before the first remote command, run `python3 ~/.claude/scripts/mac_test/mac_test.py claim --pid $$ --what '<job>' --worktree <repo dir> --wait <seconds>`. The claim is that repository's (`--worktree` defaults to the current directory; outside any repository it claims the whole Mac): another repository's job can run beside it, a second job of the same repository cannot. Continue only after exit 0: 10 means blocked, 11 means busy, and 12 means state unreadable; use the recovery above. When done, run `python3 ~/.claude/scripts/mac_test/mac_test.py release --pid $$`, which removes every claim that pid holds.
 

@@ -277,6 +277,10 @@ raise SystemExit(0)
 
 GIT_STUB = r'''#!/bin/bash
 has() { local word; for word in "$@"; do [[ "$word" == "$wanted" ]] && return 0; done; return 1; }
+wanted=check-ignore
+if has "$@"; then
+    case "${!#}" in target/*) exit 0 ;; *) exit 1 ;; esac
+fi
 wanted=rev-parse
 if has "$@"; then
     wanted='HEAD^{tree}'
@@ -380,6 +384,8 @@ event = {
 with (root / "runner-events.jsonl").open("a", encoding="utf-8") as output:
     output.write(json.dumps(event) + "\n")
 (root / "runner-started").write_text("started\n", encoding="utf-8")
+forwarded_names = [arguments[index + 1] for index, word in enumerate(arguments) if word == "--env"]
+(root / "forwarded-environment.json").write_text(json.dumps({name: os.environ.get(name) for name in forwarded_names}))
 
 attempt = len((root / "runner-events.jsonl").read_text().splitlines())
 last_decline = arguments[arguments.index("--last-decline") + 1] if "--last-decline" in arguments else ""
@@ -434,7 +440,8 @@ else:
     result.write_text(
         "mac=" + mode + "\n"
         + "reason=" + reason + "\n"
-        + "seconds=" + os.environ.get("TEST_RUNNER_SECONDS", "3.25") + "\n",
+        + "seconds=" + os.environ.get("TEST_RUNNER_SECONDS", "3.25") + "\n"
+        + ("fetch=" + os.environ["TEST_RUNNER_FETCH"] + "\n" if "TEST_RUNNER_FETCH" in os.environ else ""),
         encoding="utf-8",
     )
 if mode == "declined":
