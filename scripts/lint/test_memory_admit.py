@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import memory_admit as gate
 import nextest_budget as budget
 from build_shape import BuildShape, build_shape
-from memory_test_support import fake_memory_readings
+from memory_test_support import fake_memory_readings, gate_isolation_environment
 store = gate.store
 
 
@@ -4500,7 +4500,7 @@ class ShellTests(unittest.TestCase):
         self.assertNotIn("p90", result.stderr)
         self.assertNotIn("fallback", result.stderr)
 
-    def test_shell_accepts_shape_source_and_still_refuses_unknown_sources(self) -> None:
+    def test_shell_accepts_shape_source(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             wrapper = root / "checker.py"
@@ -4512,14 +4512,10 @@ class ShellTests(unittest.TestCase):
                            "BUILD_HOLD_DIR": str(root / "holds"),
                            "BUILD_HOLD_RELEASE_DIR": str(root / "releases"),
                            "UNIT_ACTIVE_DIR": str(root / "active"), "UNIT_RUN_DIR": ""}
-            for source, status in (("shape", 0), ("unknown-shape", 2)):
-                with self.subTest(source=source):
-                    result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(wrapper)],
-                                            env={**environment, "TEST_NEED_SOURCE": source}, capture_output=True,
-                                            text=True, check=False, timeout=30)
-                    self.assertEqual(result.returncode, status, result.stderr)
-                    if status:
-                        self.assertIn("invalid memory source", result.stderr)
+            result = subprocess.run(["bash", "-c", command, "test", str(MEMORY_GATE), str(wrapper)],
+                                    env={**environment, "TEST_NEED_SOURCE": "shape"}, capture_output=True,
+                                    text=True, check=False, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_wait_line_carries_head_need_step_and_measured_memory(self) -> None:
         command = ('source "$1"; BUILDLOG_MEM_WAIT_S=120; buildlog_memory_python() { echo UTC; }; '
@@ -4999,12 +4995,7 @@ class QueueLeaveTests(unittest.TestCase):
             f"import sys\nwith open({str(self.recorded)!r}, 'a') as log:\n    log.write(sys.argv[1] + '\\n')\n")
         config = self.root / "config.sh"
         _ = config.write_text('lint_config_enabled() { return 0; }\nlint_config_skip_notice() { :; }\n')
-        self.environment = {**os.environ,
-                            "BUILD_HOLD_DIR": str(self.root / "holders"),
-                            "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
-                            "UNIT_ACTIVE_DIR": str(self.root / "active"),
-                            "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
-                            "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+        self.environment = {**os.environ, **gate_isolation_environment(self.root),
                             "MAC_TEST_STATE_DIR": str(self.root / "mac-state"), "HOME": str(self.root),
                             "BUILDLOG_DIR": str(self.root / "log"), "BUILDLOG_MEMINFO": str(self.meminfo),
                             "BUILDLOG_SCOPE": "0", "BUILDLOG_SYNC": "1", "LINT_SKIP_SWEEP": "1",

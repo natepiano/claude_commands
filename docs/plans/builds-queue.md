@@ -498,7 +498,7 @@ No-copies rule (user, 2026-10-30): one place for each thing. A second copy of se
 - The notice has `also touches` lines for `memory_admit.py`, `test_memory_admit.py`, `memory_gate.sh`, `pre-tool-use-brp-launch-gate.sh`, `build_hold.py`, `override_guard.py`, `override_guard.sh` and their tests (resources-unit reviewed the diff; trial-merged against `origin/builds-resources`); `invoke.sh`, `verify.sh`, `mac_idle.py` and their tests (verify-unit, against `origin/natedev-verify`); `merge_gate.py`, `stop.py` and their tests (the natedev showrunner, against `origin/natedev`); `push_catalog.py` and `queue.test.ts` (natedev messaging-unit and unit-board-unit, against `origin/natedev`); and `outage_alerts.py` if it changed (its owner as the builds showrunner names it).
 - Change-Review line: builds wait on the queue service, and the polling admission is gone | on natedev while steps wait, type `/build:queue`, then run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/admission_client.py view` | the queue answers in under a quarter second, and each waiting step's output shows the same wait line as before.
 
-### Phase 7 — A promote never refuses a step that already waits for memory  · status: todo
+### Phase 7 — A promote never refuses a step that already waits for memory  · status: done
 **Depends on:** none. It lands first, alone, in its own promote on top of Phase 3's checkpoint, before Phase 4 (builds showrunner, 2026-10-31: a wrong result, ahead of the other queue phases). Phase 6 deletes this wait loop; until then this fix holds.
 **Estimate:** about 1 h of worker time.
 
