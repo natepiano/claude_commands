@@ -9,6 +9,16 @@ from push_texts import ActionTemplate, NoActionNeeded, PushExample, PushText, Se
 
 
 ENTRIES = (
+    PushText("vault.stopped", "buildlog", "note", "Mac vault copy is not updating",
+        ActionTemplate("{action}"),
+        "The hourly job that updates the hanadocs vault on the Mac skipped it. {reason} It tries again each hour and sends no more alerts until an update works. Until then, the Mac copy stays out of date.",
+        (PushExample("tracked_changes", {"reason": "Some files in ~/rust/hanadocs on the Mac have changes that are not committed.", "action": "In a terminal on the Mac, commit or discard the changes in ~/rust/hanadocs."}),
+         PushExample("branch", {"reason": "~/rust/hanadocs on the Mac is not on the main branch.", "action": "In a terminal on the Mac, switch ~/rust/hanadocs to the main branch."}),
+         PushExample("diverged", {"reason": "The Mac copy has commits that GitHub does not have, so a safe update is not possible.", "action": "In a terminal on the Mac, push the commits in ~/rust/hanadocs to GitHub."}),
+         PushExample("untracked", {"reason": "An update would replace a file on the Mac that git does not track.", "action": "In a terminal on the Mac, move the untracked file that blocks the hanadocs update out of ~/rust/hanadocs. Run git -C ~/rust/hanadocs merge --ff-only origin/main to see its name."}),
+         PushExample("unreachable", {"reason": "natedev could not reach the Mac for more than 24 hours.", "action": "Wake the Mac and connect it to the network."}),
+         PushExample("command", {"reason": "The update failed with an error the job does not know.", "action": "In the Claude session named natedev, ask it to read the vault update error in the hourly log."})),
+        purpose="The Mac vault cannot update. One alert is sent until a pull succeeds."),
     PushText("nix_heal.failed", "nix-heal", "blocked", "{session} builds will fail: no nix shell",
         ActionTemplate("On {machine}, fix the nix shell in {cwd}, then restart {session}"),
         "The nix shell for {session}'s worktree did not load, so its builds will fail. "
