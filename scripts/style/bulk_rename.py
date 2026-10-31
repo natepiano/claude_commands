@@ -87,6 +87,7 @@ class FileRenames:
     refusals: tuple[Refusal, ...]
     related: tuple[RenamedDocument, ...] = ()
     dependencies: frozenset[str] = frozenset()
+    proof_dependencies: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1118,6 +1119,13 @@ class RunSourceIndex:
             self.names[source] = source_name_index(self.tokens(source))
         return self.names[source].get(name.removeprefix("r#"), ())
 
+    def originally_named(self, path: Path, name: str) -> frozenset[Path]:
+        """Restoring an earlier overlay can reintroduce a destination-name reference."""
+        _ = self.coverage(path)
+        original = self.packages[crate_directory(path)]
+        assert isinstance(original, CrateSourceCoverage)
+        return frozenset(document.path for document in original.documents if self.named(document.source, name))
+
     def module_layout(self, path: Path, parsed: BindingText) -> tuple[ModuleLoadingSite, ...]:
         key = (path, parsed.source)
         if key in self.layouts:
@@ -1388,7 +1396,7 @@ def collapsed_field_shorthands(sources: RunSourceIndex, document: DocumentEdits,
 
 
 def verify_rename_references(server: RenameServer, path: Path, offset: int, rename: BindingRename,
-                             replacements: Sequence[tuple[DocumentEdits, str]]) -> None:
+                             replacements: Sequence[tuple[DocumentEdits, str]]) -> frozenset[Path]:
     """Accept only preserved definitions; restore all server overlays on every failed proof."""
     declaration_document, declaration_text = next((document, edited) for document, edited in replacements
                                                   if document.path == path)
@@ -1403,6 +1411,8 @@ def verify_rename_references(server: RenameServer, path: Path, offset: int, rena
     inspected = [*replacements, *((document, document.source)
                                  for document in crate_name_documents(server, path, rename.new, tuple(changed_paths))
                                  if document.path not in changed_paths)]
+    proof_dependencies = set(server.sources.originally_named(path, rename.new))
+    proof_dependencies.update(document.path for document, _ in inspected)
     for document, edited in inspected:
         checks: list[ReferenceMustResolve] = []
         collapsed = collapsed_field_shorthands(server.sources, document, edited, rename) if document.edits else ()
@@ -1420,6 +1430,8 @@ def verify_rename_references(server: RenameServer, path: Path, offset: int, rena
             line = document.source.count("\n", 0, point) + 1
             if isinstance(answer, DefinitionUnavailable):
                 raise BulkRenameError(f"rename resolution unavailable for {rename.new!r} at line {line} in {document.path.name}: {answer.reason}")
+            targets = (answer.field, answer.binding) if isinstance(answer, FieldShorthandTargets) else (answer,)
+            proof_dependencies.update(Path(unquote(urlparse(target.uri).path)) for target in targets)
         for point, answer in zip(untouched, answers[:len(untouched)], strict=True):
             if isinstance(answer, DefinitionUnavailable):
                 raise AssertionError("unavailable definitions were refused above")
@@ -1458,17 +1470,57 @@ def verify_rename_references(server: RenameServer, path: Path, offset: int, rena
         for document, _ in replacements:
             server.open(document.path, document.source)
         raise
+    return frozenset(proof_dependencies)
 
 
 def file_edits_preserved(file: FileRenames, after: str) -> bool:
-    """Formatting may change whitespace only, never RA's tokens or the approved comments."""
+    """Keep significant tokens and attached comment paragraphs across rustfmt.
+
+    Only commas/braces and line wrapping of a plain comment paragraph may
+    differ. Markdown structure, hard breaks and block comments remain exact.
+    """
+    def formatted_evidence(source: str) -> tuple[tuple[style_footprint.Token, ...], tuple[tuple[int, str], ...]]:
+        spans = style_footprint.token_spans(source)
+        tokens: list[style_footprint.Token] = []
+        comments: list[tuple[int, str]] = []
+        previous_end = 0
+        paragraph = ""
+        marker = ""
+        for index, end in enumerate((*(span.start for span in spans), len(source))):
+            lines = [(raw, re.fullmatch(r"(///(?!/)|//!|//(?![/!])) ?(.*)", raw.lstrip()))
+                     for raw in source[previous_end:end].splitlines() if raw.strip()]
+            structured = any(not match or raw.endswith(("  ", "\\")) or (match and re.match(
+                r"(?:[ \t]|[#>*|]|`{3}|~{3}|[-+] |[0-9]+[.)] |\[.*\]:|<)", match[2]))
+                             for raw, match in lines)
+            for raw, match in lines:
+                line = raw.strip()
+                body = match[2] if match else ""
+                plain = bool(not structured and match and body)
+                if plain and match:
+                    if paragraph and marker != match[1]:
+                        comments.append((len(tokens), marker + " " + paragraph))
+                        paragraph = ""
+                    marker = match[1]
+                    paragraph = (paragraph + " " + body) if paragraph else body
+                else:
+                    if paragraph:
+                        comments.append((len(tokens), marker + " " + paragraph))
+                        paragraph = ""
+                    comments.append((len(tokens), line))
+            if paragraph:
+                comments.append((len(tokens), marker + " " + paragraph))
+                paragraph = ""
+            if index < len(spans):
+                span = spans[index]
+                if span.token.value not in {",", "{", "}"}:
+                    tokens.append(span.token)
+                previous_end = span.end
+        return tuple(tokens), tuple(comments)
+
     try:
-        before_spans, after_spans = style_footprint.token_spans(file.edited), style_footprint.token_spans(after)
+        return formatted_evidence(file.edited) == formatted_evidence(after)
     except style_footprint.UnreadableTokenSpans:
         return False
-    return (tuple(span.token for span in before_spans) == tuple(span.token for span in after_spans)
-            and style_footprint.comment_gaps(file.edited, before_spans, lambda text: text)
-            == style_footprint.comment_gaps(after, after_spans, lambda text: text))
 
 
 def parameter_comments(source: str, declaration: RenameDeclaration, rename: BindingRename) -> BindingComments | NoBindingScope:
@@ -1518,6 +1570,7 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
     kept: list[KeptRename] = []
     offsets = {finding.finding_id: declaration.offset for finding, declaration in located}
     changed: dict[Path, RenamedDocument] = {}
+    proof_dependencies: set[str] = set()
     occupied: dict[Path, list[tuple[int, int]]] = defaultdict(list)
     root = path
     for _ in Path(relative).parts:
@@ -1570,7 +1623,7 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
             check_files(tuple(document.path.relative_to(root).as_posix() for document in documents))
             # Validate every document before changing any server document.
             replacements = [(document, apply_edits(document.source, document.edits)) for document in documents]
-            verify_rename_references(server, path, offset, rename, replacements)
+            reads = verify_rename_references(server, path, offset, rename, replacements)
         except (BulkRenameError, OSError, UnicodeError, ValueError) as error:
             refused.append(Refusal(finding.finding_id, str(error)))
             continue
@@ -1592,9 +1645,10 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
                     except BulkRenameError:
                         offsets[identity] = -1
         kept.append(KeptRename(finding, declaration.scope.kind, 0))
+        proof_dependencies.update(target.relative_to(root).as_posix() for target in reads if target.is_relative_to(root))
     return FileRenames(relative, source, current, tuple(kept), tuple(refused),
                        tuple(document for target, document in changed.items() if target != path),
-                       frozenset(document.path for document in changed.values()))
+                       frozenset(document.path for document in changed.values()), frozenset(proof_dependencies))
 
 
 def combine_file_renames(files: Sequence[FileRenames]) -> tuple[FileRenames, ...]:
@@ -1608,7 +1662,9 @@ def combine_file_renames(files: Sequence[FileRenames]) -> tuple[FileRenames, ...
                                                 document.edited,
                                                 (*(previous.kept if previous else ()), *(file.kept if own else ())),
                                                 (*(previous.refusals if previous else ()), *(file.refusals if own else ())),
-                                                dependencies=(previous.dependencies if previous else frozenset[str]()) | file.dependencies)
+                                                dependencies=(previous.dependencies if previous else frozenset[str]()) | file.dependencies,
+                                                proof_dependencies=(previous.proof_dependencies if previous else frozenset[str]())
+                                                                   | file.proof_dependencies)
     return tuple(merged.values())
 
 
@@ -1732,6 +1788,9 @@ class BatchIntent:
                 raise ValueError("invalid batch owner")
             self.batch_id = batch_id
             files = object_fields(value["files"])
+            formatted = object_list(value.get("formatter_restored_paths", []))
+            if not all(isinstance(name, str) and name in files for name in formatted):
+                raise ValueError("invalid formatter restoration paths")
             tickets = object_list(value["tickets"])
             if not all(isinstance(ticket, str) for ticket in tickets):
                 raise ValueError("invalid tickets")
@@ -1755,7 +1814,12 @@ class BatchIntent:
                 if not isinstance(before, str) or not isinstance(after, str):
                     raise ValueError("invalid source bytes")
                 data = bytes.fromhex(before)
-                if hashlib.sha256(data).hexdigest() != digest or target.read_bytes() not in (data, bytes.fromhex(after)):
+                current = target.read_bytes()
+                preserved = current in (data, bytes.fromhex(after))
+                if not preserved and name in formatted:
+                    original = data.decode("utf-8")
+                    preserved = file_edits_preserved(FileRenames(name, original, original, (), ()), current.decode("utf-8"))
+                if hashlib.sha256(data).hexdigest() != digest or not preserved:
                     raise self.refuse(f"{name}: bytes do not match the recorded edit")
                 originals[target] = data
             # Check the whole set before restoring any file. Repeated recovery accepts before bytes too.
