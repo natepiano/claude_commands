@@ -14,7 +14,7 @@ import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Literal, cast, override
 from unittest.mock import MagicMock, patch
@@ -34,6 +34,15 @@ from scripts.whoami import agent_accounts  # noqa: E402
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 Role = Literal["designer", "reviewer"]
+
+
+def damage_binding_repository(design: design_roles.HeldDesign) -> Path:
+    """Plant the historical writer defect in an otherwise valid private record."""
+    path = design_roles.design_directory(design.placement.design_id) / "design.json"
+    fields = cast(dict[str, object], json.loads(path.read_text()))
+    cast(dict[str, object], fields["binding"])["repository"] = ""
+    _ = path.write_text(json.dumps(fields))
+    return path
 
 
 class LiveDesignRoleNamesTests(unittest.TestCase):
@@ -348,6 +357,255 @@ class DurableRolesTests(unittest.TestCase):
         if isinstance(header, astra_work.AstraWork):
             self.assertEqual(header.work, astra_work.phase_work(self.run_b, "1"))
         self.assertEqual(len(self.releases), 1)
+
+    def test_open_with_a_phase_and_no_checkout_saves_the_design_repository(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = design_roles.main(["open", "--repository", "fixture-repo", "--document", "design.md",
+                "--role", "designer", "--production", "demo", "--unit", "design-unit", "--area", "design",
+                "--run-directory", str(self.run_a), "--phase", "1", "--output-path", "design.md"])
+        self.assertEqual(code, 0, output.getvalue())
+        design = design_roles.read_design(output.getvalue().strip().split("/")[0])
+        self.assertEqual(design.binding, self.binding(self.run_a))
+
+    def test_unbind_repairs_an_empty_repository_and_a_retry_writes_nothing(self) -> None:
+        design = self.open_designer()
+        path = damage_binding_repository(design)
+        command = ["rebind", design.placement.design_id, "--expected-generation", "1",
+                   "--unbind", "--reason", "repair historical binding"]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(design_roles.main(command), 0)
+        repaired = design_roles.read_design(design.placement.design_id)
+        self.assertIsInstance(repaired.binding, design_roles.DesignUnbound)
+        self.assertEqual(repaired.placement.generation, 2)
+        self.assertEqual(repaired.roles, design.roles)
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        releases = list(self.releases)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(design_roles.main(command), 0)
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertEqual(self.releases, releases)
+
+    def test_rebind_to_a_checkout_repairs_an_empty_binding_repository(self) -> None:
+        design = self.open_designer()
+        _ = damage_binding_repository(design)
+        with redirect_stdout(io.StringIO()):
+            code = design_roles.main(["rebind", design.placement.design_id, "--expected-generation", "1",
+                "--checkout", str(self.repository), "--run-directory", str(self.run_b), "--phase", "1",
+                "--output-path", "design.md", "--reason", "repair phase binding"])
+        self.assertEqual(code, 0)
+        repaired = design_roles.read_design(design.placement.design_id)
+        self.assertEqual(repaired.binding, self.binding(self.run_b))
+        self.assertEqual(repaired.placement.generation, 2)
+        self.assertEqual(repaired.roles, design.roles)
+
+    def test_binding_repair_still_refuses_a_stale_generation(self) -> None:
+        design = self.open_designer()
+        path = damage_binding_repository(design)
+        before = path.read_bytes()
+        error = io.StringIO()
+        with redirect_stderr(error):
+            code = design_roles.main(["rebind", design.placement.design_id, "--expected-generation", "0",
+                                      "--unbind", "--reason", "stale repair"])
+        self.assertEqual(code, 2)
+        self.assertIn("stale binding generation", error.getvalue())
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.releases, [])
+
+    def test_checkout_repair_without_output_paths_keeps_the_existing_paths(self) -> None:
+        design = self.open_designer()
+        _ = damage_binding_repository(design)
+        with redirect_stdout(io.StringIO()):
+            code = design_roles.main(["rebind", design.placement.design_id, "--expected-generation", "1",
+                "--checkout", str(self.repository), "--run-directory", str(self.run_b), "--phase", "1",
+                "--reason", "repair without replacing output paths"])
+        self.assertEqual(code, 0)
+        repaired = design_roles.read_design(design.placement.design_id)
+        self.assertEqual(repaired.binding, self.binding(self.run_b))
+        self.assertEqual(repaired.placement.generation, 2)
+        self.assertEqual(repaired.roles, design.roles)
+
+    def test_invalid_rebind_target_is_refused_before_any_lifecycle_effect(self) -> None:
+        design = self.open_designer()
+        path = damage_binding_repository(design)
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        invalid_bindings = (
+            design_roles.DesignBoundToPhase(str(self.run_b), "1", str(self.repository), ()),
+            design_roles.DesignBoundToPhase("", "1", str(self.repository), ("design.md",)),
+            design_roles.DesignBoundToPhase(str(self.run_b), "", str(self.repository), ("design.md",)),
+        )
+        for binding in invalid_bindings:
+            with self.subTest(binding=binding):
+                operations: list[str] = []
+
+                def authority(operation: str, payload: dict[str, object]) -> dict[str, object]:
+                    operations.append(operation)
+                    return self.authority(operation, payload)
+
+                with patch.object(design_roles, "authority_request", side_effect=authority), \
+                        self.assertRaises(design_roles.RoleRefused):
+                    _ = design_roles.rebind(design.placement.design_id, expected_generation=1,
+                                           reason="invalid target", binding=binding)
+                self.assertNotIn("advance", operations)
+                self.assertEqual(self.releases, [])
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+                self.assertFalse((path.parent / "transition.json").exists())
+
+    def assert_interrupted_repair_finishes_publication(self, stop_at: str) -> None:
+        design = self.open_designer()
+        path = damage_binding_repository(design)
+        directory = path.parent
+        mesh = design_roles.mesh_directory(design.placement.design_id)
+        command = ["rebind", design.placement.design_id, "--expected-generation", "1",
+                   "--unbind", "--reason", "finish interrupted repair"]
+        atomic = design_roles._atomic  # pyright: ignore[reportPrivateUsage]
+
+        def interrupt(target: Path, value: object) -> None:
+            if target.name == stop_at and target.name != "design.json":
+                raise OSError("publication interrupted")
+            atomic(target, value)
+            if target.name == stop_at:
+                raise OSError("publication interrupted")
+
+        with patch.object(design_roles, "_atomic", side_effect=interrupt), \
+                redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
+            self.assertEqual(design_roles.main(command), 2)
+        committed = design_roles.read_design(design.placement.design_id)
+        self.assertEqual(committed.placement.generation, 2)
+        self.assertIsInstance(committed.binding, design_roles.DesignUnbound)
+        if stop_at == "design_context.json":
+            # The earlier writer removed this marker before publishing the context.
+            (directory / "transition.json").unlink(missing_ok=True)
+        # Force recovery to prove it republishes the census, rather than reading an old hold.
+        (self.root / "holds/thread-designer.json").unlink(missing_ok=True)
+        output, error = io.StringIO(), io.StringIO()
+        with redirect_stdout(output), redirect_stderr(error):
+            code = design_roles.main(command)
+        self.assertEqual(code, 0, error.getvalue())
+        self.assertEqual(output.getvalue().splitlines(),
+                         [f"{design.placement.design_id} rebound at generation 2"])
+        repaired = design_roles.read_design(design.placement.design_id)
+        self.assertEqual(repaired, committed)
+        self.assertEqual(self.releases, [design.placement.design_id])
+        context = cast(dict[str, object], json.loads((mesh / "design_context.json").read_text()))
+        self.assertEqual(context["generation"], 2)
+        self.assertEqual(context["binding"], {"kind": "DesignUnbound"})
+        self.assertEqual([record["thread_id"] for record in astra_roles.live_roles()], ["thread-designer"])
+        self.assertFalse((directory / "transition.json").exists())
+        unchanged = {item: (item.read_bytes(), item.stat().st_mtime_ns)
+                     for item in (path, mesh / "design_context.json", self.root / "holds/thread-designer.json")}
+        releases = list(self.releases)
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(design_roles.main(command), 0)
+        self.assertEqual({item: (item.read_bytes(), item.stat().st_mtime_ns) for item in unchanged}, unchanged)
+        self.assertEqual(self.releases, releases)
+
+    def test_repair_retry_finishes_publication_after_the_design_save(self) -> None:
+        self.assert_interrupted_repair_finishes_publication("design.json")
+
+    def test_repair_retry_finishes_a_failed_launch_context_publication(self) -> None:
+        self.assert_interrupted_repair_finishes_publication("design_context.json")
+
+    def test_repair_retry_finishes_a_failed_census_publication(self) -> None:
+        self.assert_interrupted_repair_finishes_publication("serving_home.json")
+
+    def test_binding_repair_does_not_accept_other_record_damage(self) -> None:
+        design = self.open_designer()
+        path = damage_binding_repository(design)
+        original = cast(dict[str, object], json.loads(path.read_text()))
+        for defect in ("missing repository", "null repository", "invalid schema", "invalid role"):
+            with self.subTest(defect=defect):
+                fields = cast(dict[str, object], json.loads(json.dumps(original)))
+                binding = cast(dict[str, object], fields["binding"])
+                if defect == "missing repository":
+                    del binding["repository"]
+                elif defect == "null repository":
+                    binding["repository"] = None
+                elif defect == "invalid schema":
+                    fields["schema"] = 999
+                else:
+                    cast(list[dict[str, object]], fields["roles"])[0]["role"] = "invalid"
+                _ = path.write_text(json.dumps(fields))
+                before = path.read_bytes()
+                with redirect_stderr(io.StringIO()):
+                    code = design_roles.main(["rebind", design.placement.design_id, "--expected-generation", "1",
+                                              "--unbind", "--reason", "must not mask other damage"])
+                self.assertEqual(code, 2)
+                self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.releases, [])
+
+    def test_other_record_verbs_refuse_the_damaged_path_and_binding_field(self) -> None:
+        design = self.open_designer()
+        path = damage_binding_repository(design)
+        before = path.read_bytes()
+        instance = design.placement.design_id + "/designer"
+        prompt = self.root / "repair-prompt.md"
+        _ = prompt.write_text("Keep the design identity.\n")
+        common = ["--repository", "fixture-repo", "--document", "design.md", "--role", "designer",
+                  "--production", "demo", "--unit", "design-unit", "--area", "design"]
+        commands = [
+            ["open", *common],
+            ["resume", instance, "--prompt-file", str(prompt)], ["end", instance], ["recover", instance],
+            ["unbind-run", str(self.run_a)],
+            ["rebind", design.placement.design_id, "--expected-generation", "1", "--reason", "no repair target"],
+        ]
+        for command in commands:
+            with self.subTest(command=command[0]):
+                error = io.StringIO()
+                with redirect_stderr(error), redirect_stdout(io.StringIO()):
+                    code = design_roles.main(command)
+                self.assertEqual(code, 2, error.getvalue())
+                self.assertEqual(error.getvalue().splitlines(),
+                                 [f"design_roles: {path}: missing or invalid binding.repository"])
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_other_unit_scans_skip_a_damaged_record_with_one_named_diagnostic(self) -> None:
+        design = self.open_designer()
+        path = damage_binding_repository(design)
+        before = path.read_bytes()
+        error = io.StringIO()
+        with redirect_stderr(error):
+            design_roles.end_holder("demo", "other-unit")
+        self.assertEqual(error.getvalue().splitlines(),
+                         [f"design_roles: {path}: missing or invalid binding.repository"])
+        error = io.StringIO()
+        with redirect_stderr(error):
+            failures = design_roles.holder_failures(design_roles.UnitHolder("demo", "other-unit"))
+        self.assertEqual(failures, [])
+        self.assertEqual(error.getvalue().splitlines(),
+                         [f"design_roles: {path}: missing or invalid binding.repository"])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.releases, [])
+
+    def test_holding_unit_scans_keep_the_damaged_record_as_a_named_refusal(self) -> None:
+        design = self.open_designer()
+        path = damage_binding_repository(design)
+        with self.assertRaises(design_roles.RoleRefused) as error:
+            design_roles.end_holder("demo", "design-unit")
+        self.assertEqual(str(error.exception), f"{path}: missing or invalid binding.repository")
+        self.assertEqual(design_roles.holder_failures(design.holder),
+                         [f"{path}: missing or invalid binding.repository"])
+
+    def test_adoption_retry_refuses_a_damaged_record_by_path_and_field(self) -> None:
+        self.assert_adoption_preserves_thread_and_pending_text({"model": "gpt-fixture", "effort": "xhigh"})
+        paths = list((self.root / "roles").glob("*/design.json"))
+        self.assertEqual(len(paths), 1)
+        design = design_roles.read_design(paths[0].parent.name)
+        path = damage_binding_repository(design)
+        before = path.read_bytes()
+        error = io.StringIO()
+        with redirect_stderr(error), redirect_stdout(io.StringIO()):
+            code = design_roles.main(["adopt", "--repository", "fixture-repo", "--document", "design.md",
+                "--role", "designer", "--production", "demo", "--unit", "design-unit", "--area", "design",
+                "--source-mesh", str(self.root / "old-run"), "--name", "original-designer-alias",
+                "--thread-id", "original-thread", "--adoption-id", "transfer-one"])
+        self.assertEqual(code, 2)
+        self.assertEqual(error.getvalue().splitlines(),
+                         [f"design_roles: {path}: missing or invalid binding.repository"])
+        self.assertEqual(path.read_bytes(), before)
 
     def test_pending_messages_clear_only_after_successful_turn_acceptance(self) -> None:
         design = self.open_designer()
@@ -714,6 +972,59 @@ class DurableRolesTests(unittest.TestCase):
 
     def test_a_unit_transfer_moves_the_holder_to_the_receiving_production(self) -> None:
         self.check_holder_move(design_roles.UnitHolder("demo", "design-unit"), design_roles.UnitHolder("other", "design-unit"))
+
+    def assert_holder_move_skips_another_units_damaged_record(self, *, rename: bool) -> None:
+        damaged = self.open_designer()
+        path = damage_binding_repository(damaged)
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        _ = (self.repository / "moving.md").write_text("# Moving design\n")
+        holder = design_roles.UnitHolder("demo", "moving-unit")
+        moving = design_roles.open_role("fixture-repo", "moving.md", "designer", holder, "moving",
+                                       binding=self.binding(self.run_a))
+        destination = design_roles.UnitHolder("demo", "renamed-unit") if rename else \
+            design_roles.UnitHolder("receiving", "moving-unit")
+        error = io.StringIO()
+        if rename:
+            checkout = self.root / "renamed-checkout"
+            _ = self.repository.rename(checkout)
+            with redirect_stderr(error):
+                design_roles.rename_holder("demo", "moving-unit", "renamed-unit",
+                                           str(self.repository), str(checkout))
+        else:
+            checkout = self.repository
+            with redirect_stderr(error):
+                design_roles.move_holder(holder, destination, reason="unit transfer")
+        current = design_roles.read_design(moving.placement.design_id)
+        self.assertEqual(current.holder, destination)
+        self.assertEqual(current.repository, str(checkout))
+        self.assertEqual(current.placement.generation, 2)
+        self.assertEqual(current.roles, moving.roles)
+        self.assertEqual(error.getvalue().splitlines(),
+                         [f"design_roles: {path}: missing or invalid binding.repository"])
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+        self.assertNotIn(damaged.placement.design_id, self.releases)
+
+    def test_unit_rename_skips_another_units_damaged_record(self) -> None:
+        self.assert_holder_move_skips_another_units_damaged_record(rename=True)
+
+    def test_unit_transfer_skips_another_units_damaged_record(self) -> None:
+        self.assert_holder_move_skips_another_units_damaged_record(rename=False)
+
+    def test_holder_move_refuses_its_own_damaged_record_by_path_and_field(self) -> None:
+        design = self.open_designer()
+        path = damage_binding_repository(design)
+        before = path.read_bytes()
+        for operation in ("rename", "transfer"):
+            with self.subTest(operation=operation), self.assertRaises(design_roles.RoleRefused) as error:
+                if operation == "rename":
+                    design_roles.rename_holder("demo", "design-unit", "renamed-unit",
+                                               str(self.repository), str(self.repository))
+                else:
+                    design_roles.move_holder(design.holder, design_roles.UnitHolder("receiving", "design-unit"),
+                                             reason="unit transfer")
+            self.assertEqual(str(error.exception), f"{path}: missing or invalid binding.repository")
+            self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.releases, [])
 
     def test_a_production_rename_moves_the_showrunner_holder(self) -> None:
         self.check_holder_move(design_roles.ShowrunnerHolder("demo"), design_roles.ShowrunnerHolder("renamed"))

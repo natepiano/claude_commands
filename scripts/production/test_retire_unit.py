@@ -19,6 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from scripts.astra import design_roles
+from scripts.astra.test_design_roles import damage_binding_repository
 from scripts.direct import workers  # noqa: E402
 
 import add_unit
@@ -507,6 +508,27 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(self.doc.read_bytes(), before)
         self.assertTrue(self.worktree.is_dir())
         self.assertEqual(git(self.checkout, "branch", "--list", "--format=%(refname:short)", "alpha-branch"), "alpha-branch")
+
+    def test_a_damaged_role_held_by_the_unit_refuses_retirement_by_record_and_field(self) -> None:
+        design = design_roles.HeldDesign(
+            design_roles.DesignPlacement("00000000-0000-4000-8000-000000000071", "natedev", 1),
+            "fixture-repo", str(self.worktree), str(self.worktree / "work.txt"), "design",
+            "2026-10-31T12:00:00+00:00", design_roles.UnitHolder("alpha", "alpha-unit"),
+            design_roles.DesignBoundToPhase(str(self.run_folder), "1", str(self.worktree), ("work.txt",)),
+            (design_roles.RoleInstance("designer", "alpha-designer", design_roles.RoleNotOpened()),
+             design_roles.RoleInstance("reviewer", "alpha-reviewer", design_roles.RoleNotOpened())))
+        design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        path = damage_binding_repository(design)
+        before = self.doc.read_bytes(), path.read_bytes()
+
+        code, output = self.retire()
+
+        self.assertEqual(code, 1, output)
+        self.assertIn(f"held role cleanup: {path}: missing or invalid binding.repository", output)
+        self.assertEqual((self.doc.read_bytes(), path.read_bytes()), before)
+        self.assertTrue(self.worktree.is_dir())
+        self.assertEqual(git(self.checkout, "branch", "--list", "--format=%(refname:short)", "alpha-branch"),
+                         "alpha-branch")
 
     def test_a_stopped_director_is_found_by_its_newest_interactive_transcript(self) -> None:
         self.marked = None

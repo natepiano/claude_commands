@@ -233,3 +233,162 @@ Dropped 2026-10-30 by its own rule: no module that natedev's condition allows to
 Source: Phase 7 repair round 4 (landing rule; showrunner ruling 2026-10-31). Astra review `/tmp/claude/astra/20261031T113652Z-318765/review.md` items 1-3. Phase 7's per-base intersection hides a branch-made removal of an assertion whose text differs per base. Distinguishing test (clean tree, no conflicts, one test name): fork with `self.assertEqual(value, 1)`; pushed U changes it to `2`; P changes another file; merge U and P and replace the assertion with `pass`; add an unrelated commit. With no `--base` and `--head HEAD`, the guard must give exactly one blocking removal of `self.assertEqual(value, 2)`. The same hole covers a working-tree or index removal of an assertion whose text the merge changed (Phase 7 round 4 tried a HEAD-to-tree supplement; it double-counted after a rename merge, and Astra review `/tmp/claude/astra/20261031T121403Z-1704209/review.md` lists the owner, replacement and grouping edges a fix must handle): the guard must give exactly one blocking removal with HEAD's spelling, and its count on the tree or index must never exceed the `--base HEAD` count for local changes. Design inputs: Phase 7 round 3's merge-tree fold (saved in the Phase 7 run folder as `round3_wip/assertion_guard.py`), and that its whole-path conflict fallback reports imported removals. natedev-verify's explicit multi-`--base` tests require intersection semantics: the Work Order must name each one it changes. The Work Order is written when the phase starts.
 
 **From the Phase 7 plan review (architect, 2026-10-31):** The count limit covers only duplicate representations of local changes: a committed removal plus an unrelated local removal stays 2 blocking. Acceptance adds a distant header conflict where production already removed one assertion and the branch removes another (imported excluded, branch kept), and the same in the pending-merge and index case. The printed owner is HEAD's current test name; a ruling clears exactly that occurrence, and an identical assertion in another test stays blocking. Constraints: `commit_bases` stays the one selector; the commit hook keeps its HEAD/index and pending-merge behavior; explicit and VERIFY_ASSERTION_BASE bases keep their list and order; the shared revision cache and the CPU test (`test_large_diff_guard_call_uses_less_than_one_cpu_second`) stay; the lint cache-key test proves a changed comparison input invalidates a cached green lint. **Workers:** 1 writer + 1 tester. impl: `scripts/direct/assertion_guard.py`, `scripts/direct/tree_watch.py`. test: `test_assertion_guard_revisions.py`, `assertion_guard_test_support.py`, `test_verify_lint_guard_key.py`, `verify_assertion_guard_test_support.py`.
+
+#### Work Order
+
+**Goal:** with no explicit base, the assertion guard compares HEAD, the index or the working tree against one combined base, the merge of its bases, so a branch-made removal of an assertion whose text the merge changed counts once, with HEAD's spelling, and nothing the bases already removed or changed counts at all.
+
+**Spec:**
+- Combined base. When `commit_bases` returns more than one base and none was given by `--base` or `VERIFY_ASSERTION_BASE`, `run` builds one combined tree with `git merge-tree --write-tree` over those bases (folding them in order; the Phase 7 round 3 fold in `/tmp/claude/unit/fe59e5e3-0e2d-4361-a843-3881414f5f2e/phases/7/round3_wip/assertion_guard.py` is a design input) and compares the target against that tree in one pass. One base needs no fold. `commit_bases` stays the one selector.
+- Conflicts. A path the fold reports as conflicted is compared against each base and intersected for that path only (Phase 7's `intersect_findings`), never by a whole-path fallback that reports imported removals. A distant header conflict where production removed one assertion and the branch removes another gives the branch's removal only, for commit, index and pending-merge judgments.
+- Local changes. Index and working-tree judgments compare against the same combined tree; no HEAD-to-tree supplement exists. The tree/index count is never above the `--base HEAD` count for the same local change; a committed removal plus an unrelated local removal stays 2 blocking.
+- Owners and rulings. The printed owner is HEAD's current test name. A ruling clears exactly that occurrence; an identical assertion in another test stays blocking (identical assertions in `test_a` and `test_b`, `test_a`'s removed in a commit and `test_b`'s locally, a ruling for `test_b`: `test_a`'s removal stays blocking). The count limit is over the final reported blockers, after `aggregate_test_removals` and rulings.
+- Explicit bases. `--base` and `VERIFY_ASSERTION_BASE` keep their list, their order and Phase 7's per-base intersection. Name in the summary every natedev-verify multi-`--base` test whose expectation changes; the aim is none.
+- Keep: the commit hook's HEAD/index and pending-merge behavior, the shared `RevisionSourceCache`, `test_large_diff_guard_call_uses_less_than_one_cpu_second`, and the lint cache key in `tree_watch.py` (a changed comparison input, the combined tree included, invalidates a cached green lint).
+- New regressions, each red on 4b353c42: (a) the plan's distinguishing test above (fork `assertEqual(value, 1)`; pushed U changes it to `2`; P changes another file; merge U and P, replace the assertion with `pass`; add an unrelated commit; no `--base`, `--head HEAD` gives exactly one blocking removal of `self.assertEqual(value, 2)`); (b) the same removal made in the index and in the working tree instead, one blocker with HEAD's spelling each; (c) production renames `test_old` to `test_new`, the merge weakens `assertEqual(value, 1)` to `assertTrue(value)`, then a local removal: one blocker; (d) the header-conflict case; (e) the `test_a`/`test_b` ruling case; (f) a base test with two assertions whose signature HEAD changes, deleted in the tree: one grouped `test removed` blocker. Keep `test_local_removal_after_production_test_rename_is_counted_once` and the changed-spelling regression near `test_assertion_guard_revisions.py:1185` (one removal with HEAD's spelling in both modes).
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — the combined base, the per-path conflict intersection, local judgments against the combined tree
+- `scripts/direct/tree_watch.py` — the lint cache key carries the combined comparison input
+- `scripts/direct/test_assertion_guard_revisions.py` — regressions (a)-(f)
+- `scripts/direct/assertion_guard_test_support.py` — shared fixture steps for those histories
+- `scripts/direct/test_verify_lint_guard_key.py` — the cache key test for the combined input
+- `scripts/direct/verify_assertion_guard_test_support.py` — the one fake guard, if its surface changes
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `scripts/direct/assertion_guard.py`, `scripts/direct/tree_watch.py`
+- `test` — `scripts/direct/test_assertion_guard_revisions.py`, `scripts/direct/assertion_guard_test_support.py`, `scripts/direct/test_verify_lint_guard_key.py`, `scripts/direct/verify_assertion_guard_test_support.py`, from this Spec alone
+
+**State:** none
+
+**Constraints from prior phases:** Phase 7 As-built above (one selector, one comparison path, owner-free identity). Phase 7 round 4's HEAD supplement double-counted after a rename merge; Astra reviews `/tmp/claude/astra/20261031T113652Z-318765/review.md` and `/tmp/claude/astra/20261031T121403Z-1704209/review.md` list the owner, replacement and grouping edges. Inspectors HEAD 03fafc1d6c with no `--base` gives 1 blocking; `~/rust/cargo-liner` `--base e21d5b93^ --head e21d5b93` gives `assertion guard: 73 blocking`; both must hold.
+
+**Acceptance gate:** from the worktree root, `python3 -m unittest scripts.direct.test_assertion_guard scripts.direct.test_assertion_guard_revisions scripts.direct.test_assertion_guard_strings scripts.direct.test_verify_assertion_guard scripts.direct.test_verify_assertion_guard_fake scripts.direct.test_verify_lint_guard_key` green, with (a)-(f) red on 4b353c42; `basedpyright` on each slot's files `0 errors, 0 warnings, 0 notes`; the director reruns the Inspectors and cargo-liner figures above and puts them in the checkpoint notice.
+
+### Phase 7d — Small fixes fast-track to main  · status: todo
+**Depends on:** none (the nightly job, nixos branch `claude-nightly-tests`, went to the showrunner first)
+
+Source: the user via the sdlc showrunner, 2026-10-31: "yes i want a fast track" for fixes a unit director could make "in 2 minutes", and "a fast track can be followed by the standard process just to make sure things are in good shape". Showrunner ruling 2026-10-31 on devtools-unit's 10-line design: accepted, with these changes: the fast check never uses `merge_gate.py` and never waits on a queue or a running gate (target: minutes); a lock is held only for the push; settings.json, hooks and `scripts/lib/py` are refused; the nightly stays: a red run messages the sdlc showrunner by the existing path, and the showrunner acts and tells the user (showrunner ruling 2026-10-31 dropped the user push and Phase 7c); devtools-unit edits the rule lines in its own checkpoint (`--also` in the notice).
+
+#### Work Order
+
+**Goal:** one command lets a unit director push a small fix to `~/.claude` main in minutes, and the same fix then gets the unit's next blind review and the next merge gate with no step a director can skip.
+
+**Spec:**
+- Command: `~/.claude/scripts/lib/py ~/.claude/scripts/production/fast_track.py --unit <unit> --production <production doc> --why "<one line>" <path>...`, run from the director's own `~/.claude` worktree. `--production` is the doc named in the unit's plan header; its `Promote:` field gives the promotion targets (director's call, 2026-10-31: the approved shape had no way to find them). It takes the uncommitted changes of the named paths against HEAD (new files included). It refuses, exit 2 and nothing pushed: no change, a path outside the repo, a refused path, a limit exceeded.
+- Config `config/fast_track.conf`, read at use, no defaults in code (a missing or invalid key refuses and names the key): `max_changed_lines`, `max_files`, `check_time_limit_seconds`, `max_push_attempts`, `refused_paths` (globs). Refused paths: `settings.json`, `scripts/hooks/`, `scripts/lib/py`, the staff record and every script that writes it, the account move, rename and shutdown scripts, `scripts/production/merge_gate.py`, `scripts/production/merge_checkpoint.py`, `scripts/direct/verify.sh`, `scripts/production/build_hold.py`, `scripts/production/fast_track.py` and `config/fast_track.conf`. Name each exact path in the summary.
+- Copy: fetch origin main, `git clone --shared` into a temporary folder (its own git directory; never a worktree, never a copied `.git` pointer), check out origin/main detached, `git apply --3way` the patch. A conflict refuses with nothing pushed.
+- Fast check, in the copy, under `check_time_limit_seconds`, with no build queue, memory queue or merge gate: (1) each changed Python file's direct test modules (`<dir>/test_<stem>.py`, `<dir>/test_<stem>_*.py`, and a changed test module itself), each run the merge gate's way from the copy root: `python3 -m unittest discover -s <dir> -p <file>` in the environment `merge_gate.test_module_environment` builds (`merge_gate.py:1094-1101`; import it, do not copy it, and never run the gate or its queues), with `HERDR_BIN=/nonexistent/herdr` and without `PYTHONUNBUFFERED`, `REFUSAL_WATCH_INVENTORY`, `STAFF_OPERATION_FD`; (2) an import of each changed module as a package (`python3 -c "import scripts.<pkg>.<mod>"` from the copy root); (3) `basedpyright <changed Python files>`, passing only on the `0 errors, 0 warnings, 0 notes` footer. No full-suite fallback. Over the limit: stop the check's process group and refuse with "over the fast-track time limit; use the normal path".
+- Commit in the copy: subject `fast-track(<unit>): <why>`, trailer `Fast-Track: <unit>`.
+- Push: one short lock, `<git common dir>/main-push.lock`, held only from the final fetch to the end of the push; `git push origin HEAD:main`, fast-forward only. When origin/main moved: fetch, re-apply, rerun the fast check, push again, at most `max_push_attempts` times. The fast check runs outside the lock.
+- The lock in `merge_checkpoint.py` (one helper, one place, used by both): `push_git` fetches and merges origin/main into the merge branch, and `promote_local_checkout` then fast-forwards main to that tip and pushes it. A fast fix that lands between those two steps makes the tip lack it, so the main push is refused (current code, `merge_checkpoint.py:867-976`). So `run` and `run_handoff` hold the lock from `push_git`'s fetch of origin/main (or the start of `push_validate`) to the end of promotion's last `git push origin main`, or to the end of the merge-branch push when the production has no promotion. Tests run before that span, so they are never held. Name the measured span length in the summary.
+- Promote: the existing path in `merge_checkpoint.py`. Split the checkout and Mac loop of `promote()` into one function that takes the promotion, the branch and the tip, and call it from `promote()` and from `fast_track.py` with branch `main` and the pushed commit. `promote_local_checkout(checkout, "main", tip)` fast-forwards each local checkout and finds nothing unpushed; `pull_mac_checkout` pulls the Mac. `merge_gate.py --promote-only --merge-branch main` refuses this case (`merge_gate.py:1358-1366`: local main behind origin/main) and is not used; do not edit `merge_gate.py`. A promotion failure after the push prints what failed and exits 1; the push stays, and a rerun promotes again (`already on main` path).
+- Worktree: after a successful push, restore the named paths in the director's worktree to HEAD (new files removed): main has them, and the next merge of the merge branch brings them.
+- Record and rerun: `${FAST_TRACK_STATE_DIR:-~/.local/state/fast-track}/records.jsonl`, one row per push: patch sha256, unit, commit, why, UTC time, `review: pending`. A rerun of a pushed patch, or a rerun after the restore, runs the promotion again (no change when it is done; it finishes a promotion that failed), prints `already on main at <short commit>` and exits 0.
+- Follow-up review, automatic: `scripts/direct/review.sh` adds the unit's pending fast-track commits' diffs to every broad review prompt it sends for that unit (`fast_track.py --pending --unit <unit>` prints them), and when that review pass finishes it marks those rows `reviewed` with the pass. A finding goes through the normal ledger and repair. The merge gate needs nothing new: merge branches take main at their next push.
+- One exception in one place: new `commands/unit/fast_track.md` defines `<FastTrack/>` (who may use it, the command, the limits by config key, the follow-up). Add it to the TagReferenceContract table in `commands/unit/direct.md`, and add "except <FastTrack/>" to: `commands/unit/direct.md` CoreContract lines 155-156 (no implementation code), 157-161 (no other commit) and 164-165 (never the default branch); `docs/production_format.md` ProductionUnit item 4, lines 318-319; `commands/showrunner/produce.md` line 1162.
+
+**Files:**
+- `scripts/production/fast_track.py` — the command and `--pending`
+- `config/fast_track.conf` — limits and refused paths
+- `scripts/production/merge_checkpoint.py` — the shared main-push lock around promotion's main push
+- `scripts/direct/review.sh` — pending fast-track diffs in broad reviews; rows marked reviewed
+- `commands/unit/fast_track.md`, `commands/unit/direct.md`, `docs/production_format.md`, `commands/showrunner/produce.md` — the one exception
+- `scripts/production/test_fast_track.py` — the command's tests
+- `scripts/production/test_merge_checkpoint_promotion.py` — the lock in promotion
+- `scripts/direct/test_review_launcher.py` — the pending diffs and the reviewed mark
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `fast_track.py`, `config/fast_track.conf`, `merge_checkpoint.py`, `review.sh`, the four docs
+- `test` — `test_fast_track.py`, `test_merge_checkpoint_promotion.py`, `test_review_launcher.py`, from this Spec alone
+
+**State:** `~/.local/state/fast-track/records.jsonl` (rows per push); `<git common dir>/main-push.lock`.
+
+**Acceptance gate:** from the worktree root, `python3 -m unittest discover -s scripts/production -p test_fast_track.py`, the same for `test_merge_checkpoint_promotion.py`, and `python3 -m unittest discover -s scripts/direct -p test_review_launcher.py` green, covering: each refusal and its exit 2, each config key missing and invalid, a conflicting patch, origin/main moving between check and push (re-apply, re-check, push), the time limit, a rerun (exit 0, no change), the worktree restore, the record row, `--pending`, and a review pass marking rows reviewed. `basedpyright` on each slot's Python files `0 errors, 0 warnings, 0 notes`. Live, by the director: one real small fix through the command to main, then the same command again (exit 0, `already on main`); a fast fix landing while a real `merge_checkpoint` runs, with that merge's promotion still finishing, and the showrunner's 08:54 gate result as the second case. Put the timings in the checkpoint notice.
+
+### Phase 7e — Every process-group kill checks its pid  · status: todo
+**Depends on:** Phase 7d (checkpoint order only: two caller files are in its list)
+
+Source: the sdlc showrunner and natedev, 2026-10-31. Both natedev-wide stops today (11:53:50, 11:59:21) most likely came from `os.killpg` with a mocked pid: `MagicMock.__index__` is 1, and `killpg(1)` is `kill(-1)`, SIGTERM to every process of the user.
+
+#### Work Order
+
+**Goal:** no code path in this repo can signal a process group with a pid that is not a real one, and a new raw `os.killpg` fails a guard.
+
+**Spec:**
+1. New `scripts/lib/process_group.py` holds one check and one send: it refuses a pid that is not a real `int` (a `bool` or a mock is refused), a pid of 1 or less, and the caller's own process group (`os.getpgrp()`). A refusal raises and sends nothing.
+2. Every non-test `os.killpg` caller uses it: codex_mesh, rust_release, hana_shot, detached, copy_watch, send, fast_track, merge_gate, style_sync, quota_alert, and any other the search finds. Test helpers and fixtures that send a real group signal use it too. A caller keeps its own `ProcessLookupError` handling.
+3. Shell group kills use the module's CLI, so there is one check: `verify.sh:2529` (Python in a heredoc), `verify.sh:1156` and `:2815` (`kill -- "-$RUN_STEP_PID"`), `board.sh:285`, `smoke_launch.sh:62,64`, and any other the search finds. Keep each `verify.sh` edit to the call line: it runs in every gate (natedev, 2026-10-31).
+4. One guard test fails on a new raw `os.killpg` or an unguarded shell group kill, anywhere under `scripts/`, except the one send in `process_group.py`.
+5. models-unit's guard at `codex_mesh.py:3111` uses this check: no second copy.
+6. `scripts/production/fast_track.py` and `scripts/production/merge_checkpoint_test_support.py` are in Phase 7d's list. The writer switches their calls too. Phase 7d's checkpoint carries those two edits, so this phase checkpoints after Phase 7d.
+
+**Files:**
+- `scripts/lib/process_group.py` — the one check and the one send, with a small CLI for shell callers
+- `scripts/lib/test_process_group.py` — the check's tests and the guard over `scripts/`
+- `scripts/agents/codex_mesh.py`, `scripts/buildlog/rust_release.py`, `scripts/hana_shot/hana_shot.py`, `scripts/lib/detached.py`, `scripts/mac_test/copy_watch.py`, `scripts/message/send.py`, `scripts/production/merge_gate.py`, `scripts/style/style_sync.py`, `scripts/whoami/quota_alert.py` — Python callers
+- `scripts/direct/verify.sh`, `scripts/direct/board.sh`, `scripts/production/smoke_launch.sh` — shell callers and Python inside shell
+- `scripts/direct/recorder_fixture.py`, `scripts/direct/verify_token_wait_test_support.py`, `scripts/mac_test/offload_test_support.py` — test support that signals a real group
+- `scripts/agents/test_heartbeat.py`, `scripts/direct/test_implement_launcher.py`, `scripts/direct/test_implement_launcher_claims.py`, `scripts/direct/test_review_launcher_delivery.py`, `scripts/lib/test_detached.py`, `scripts/lib/test_relaunch.py`, `scripts/mac_test/test_copy_watch.py`, `scripts/message/test_notifier.py`, `scripts/prioritize/tests/test_run_watcher.py`, `scripts/production/test_mac_run.py`, `scripts/production/test_merge_gate_suites_signals.py`, `scripts/screen_record/test_screen_record.py`, `scripts/style/test_style_sync.py`, `scripts/whoami/test_quota_alert_cancellation.py` — tests that patch `os.killpg` or signal a group
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `process_group.py` and every non-test caller above, the 7d pair included
+- `test` — `test_process_group.py`, the test support files and the test files, from this Spec alone
+
+**State:** none.
+
+**Acceptance gate:** tests with `os.killpg` patched show that a MagicMock pid, a `bool`, 0, 1, a negative pid and the caller's own group each raise and send nothing, and a real child's group passes to the patched send. The guard test fails on a planted raw call in a temporary tree. No test sends a real signal to prove the refusal, and nothing replays the failure.
+
+### Phase 7f — A damaged design-role record names itself and stops no other unit  · status: done
+**Depends on:** none
+
+Source: the sdlc showrunner, 2026-10-31. Role record `b8288785` (devtools-unit, 7b assertion-guard) has `binding.repository: ""`. Every reader refuses it with `missing or invalid repository`: `retire_unit.py` for berth-unit stops, `send.py` prints the error, and `design_roles.py rebind` and `end` refuse it too, so no supported command can repair it. Cause: `open` and `adopt` with `--run-directory` and `--phase` and no `--checkout` bind the phase to `argument('checkout')`, the empty string (`design_roles.py:1558`).
+
+#### Work Order
+
+**Goal:** no writer saves a design-role record its own reader refuses, `design_roles.py` can repair a record that is damaged that way, and one damaged record stops only the unit that holds it.
+
+**Spec:**
+1. `open` and `adopt` bind a phase to `--checkout` when given, else to the design's repository. The write path refuses a phase binding with an empty repository, so no command can save one again.
+2. `design_roles.py rebind <id> --unbind`, and `rebind <id> --checkout <path> --run-directory <dir> --phase <id>`, repair a record whose only defect is an empty phase-binding repository. The generation check and the lock stay. Every other verb still refuses the record, and the refusal names the record's path and the bad field.
+3. The retire check skips a damaged record that the unit being retired does not hold, with one stderr line that names the record's path and field: `end_holder` and `holder_failures`. A damaged record held by the unit being retired, renamed or moved still refuses that operation, with the same named line. The roster and staff scans are messaging-unit's (showrunner, 2026-10-31), not this phase's.
+4. A rerun changes nothing: a second `rebind --unbind` on a repaired record exits 0 with one line and writes nothing.
+
+**Files:**
+- `scripts/astra/design_roles.py` — the phase-binding writer, the repair path in `rebind`, the named refusal, and the retire check's scans
+- `scripts/astra/test_design_roles.py`, `scripts/production/test_retire_unit.py` — regression tests
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `design_roles.py`
+- `test` — the two test files, from this Spec alone
+
+**State:** design-role records under `~/.local/state/astra/design-roles/` (tests use a temporary state root only).
+
+**Acceptance gate:** tests with a temporary state root show: `open` with a phase and no `--checkout` saves the design's repository; a planted record with an empty binding repository is repaired by `rebind --unbind` and by `rebind --checkout`, and a rerun writes nothing; `end_holder` and `holder_failures` for another unit each skip the planted record with one named line, and the holding unit's retire still refuses it by name. Live check, from this phase's tree once its tests pass (the block is urgent): `scripts/astra/design_roles.py rebind b8288785-7704-4041-aab5-9e1d6eccaddb --expected-generation 1 --unbind --reason ...` exits 0, a rerun exits 0 and writes nothing, and `retire_unit.py` for berth-unit and for natedev's bevy-upgrade no longer names the record.
+
+### Phase 7g — Run cleanup and the role list skip another unit's damaged record  · status: todo
+**Depends on:** Phase 7f (same file; it checkpoints first)
+
+Source: the sdlc showrunner, 2026-10-31. Phase 7f review found that `unbind_run()` and `list_roles()` in `design_roles.py` read every record strictly. One damaged record of any unit stops a run's cleanup unbind, and `list` prints the error on stdout.
+
+#### Work Order
+
+**Goal:** a run's cleanup unbind and the role list are not stopped by another unit's damaged record.
+
+**Spec:**
+1. `unbind_run()` uses the holder-aware scan from Phase 7f: another holder's damaged record is skipped with the one named stderr line; a damaged record bound to the run being unbound still refuses by name.
+2. `list_roles()` skips a damaged record with the same one named stderr line, and nothing about it goes to stdout.
+3. A rerun changes nothing: a second `unbind-run` of the same run exits 0 and writes nothing.
+4. From Phase 7f review (F003): a `rebind` repair interrupted with no transition marker, whose retry then fails to publish the census, must not report success on the next retry: the retry finishes the census publication first (`design_roles.py:993`).
+
+**Files:**
+- `scripts/astra/design_roles.py` — `unbind_run()`, `list_roles()` and the markerless repair retry
+- `scripts/astra/test_design_roles.py` — regression tests
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `design_roles.py`
+- `test` — `test_design_roles.py`, from this Spec alone
+
+**State:** design-role records (tests use a temporary state root only).
+
+**Acceptance gate:** tests with a temporary state root and a planted damaged record of another unit show that `unbind-run` unbinds this run's records, prints one named stderr line, and exits 0; a rerun writes nothing; `list` prints the named line on stderr and nothing about the record on stdout.
