@@ -117,7 +117,7 @@ import sys
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast
@@ -134,6 +134,7 @@ if TYPE_CHECKING:
     from ..whoami.account import named_account_environment
 import push_texts  # noqa: E402
 import rca  # noqa: E402
+import repeat_guard  # noqa: E402
 import review  # noqa: E402
 import silence  # noqa: E402
 from user_zone import user_zone  # noqa: E402
@@ -275,7 +276,7 @@ LogEntry = TypedDict("LogEntry", {"time": str, "machine": str, "from": str, "to"
                                   "summary": str, "text": str, "outcome": Outcome, "detail": str,
                                   "via": NotRequired[Literal["postmaster", "relay", "queue"]],
                                   "postmaster": NotRequired[Literal["delivered", "unresolved"] | postmaster.PostmasterMiss],
-                                  "seconds": NotRequired[float]})
+                                  "seconds": NotRequired[float], "human": NotRequired[bool], "receiver": NotRequired[str]})
 
 
 class SocketRecoveryAttempt(TypedDict):
@@ -334,6 +335,7 @@ class Message:
     text: str
     key: str | None
     shown_sender: str = ""
+    human: bool = False
 
     def __post_init__(self) -> None:
         if not self.shown_sender:
@@ -446,6 +448,7 @@ class Result(NamedTuple):
     outcome: Outcome
     detail: str
     failure: FailureText = NO_FAILED_PUSH
+    receiver: str = ""
 
 
 @dataclass(frozen=True)
@@ -597,6 +600,9 @@ class Options(NamedTuple):
     # The sending script retires its own emergency push.
     self_clearing: bool = False
     shown_sender: ShownSender | SenderNotResolved = SenderNotResolved()
+    human: bool = False
+    no_accounting: bool = False
+    report_recipient: bool = False
 
     @property
     def to(self) -> str:
@@ -959,23 +965,24 @@ def clear_check(timeout: float = CHECK_TIMEOUT_S) -> tuple[int, list[str]]:
 
 def append_record(path: Path, entry: LogEntry | SocketRecoveryAttempt, *, durable: bool = False) -> None:
     """Append under the state lock; recovery records must survive a stopped drain."""
-    with locked(), path.open("a", encoding="utf-8") as handle:
-        _ = handle.write(json.dumps(entry) + "\n")
-        if durable:
-            handle.flush()
-            os.fsync(handle.fileno())
+    with locked():
+        repeat_guard.append_jsonl(path, entry, durable=durable)
 
 
 def log(message: Message, result: Result, at: datetime, route: Route = NO_CLAUDE_ROUTE) -> None:
-    entry: LogEntry = {"time": at.isoformat(), "machine": machine(), "from": message.sender, "to": message.to,
+    entry: LogEntry = {"time": at.isoformat(), "machine": machine(), "from": message.sender, "to": result.receiver or message.to,
                        "key": message.key, "summary": message.text.strip().splitlines()[0] if message.text.strip()
                        else "", "text": message.text, "outcome": result.outcome, "detail": result.detail}
+    entry["human"] = message.human
     if isinstance(route, ClaudeRoute):
         entry["via"] = route.via
         entry["postmaster"] = route.postmaster
         entry["seconds"] = round(route.seconds, 3)
-    append_record(STATE / "log.jsonl", entry,
-                  durable=message.key is not None and message.key.startswith("socket-recovery:"))
+    try:
+        append_record(STATE / "log.jsonl", entry,
+                      durable=message.key is not None and message.key.startswith("socket-recovery:"))
+    except Exception as error:
+        repeat_guard.warn(f"message accounting: {error}")
 
 
 # ---------------------------------------------------------------------------
@@ -1404,21 +1411,25 @@ def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | No
         cwd: Path | None = None) -> tuple[int | None, str, str]:
     """Run command; (exit code or None on timeout, stdout, stderr).
 
-    A timeout stops the whole process group, so a relay's children go with it.
+    A timeout stops the process group. Notice deliveries instead inherit their
+    supervisor's group, whose whole-job deadline also stops descendants.
     """
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, env=env, cwd=cwd, start_new_session=True) as process:
+                          text=True, env=env, cwd=cwd, start_new_session=os.environ.get("SEND_REPEAT_NOTICE_JOB") != "1") as process:
         try:
             out, err = process.communicate(stdin, timeout=timeout)
             return process.returncode, out, err
         except subprocess.TimeoutExpired:
             for sig, wait in ((signal.SIGTERM, KILL_GRACE), (signal.SIGKILL, None)):
                 try:
-                    os.killpg(process.pid, sig)
+                    if os.environ.get("SEND_REPEAT_NOTICE_JOB") == "1":
+                        process.send_signal(sig)
+                    else:
+                        os.killpg(process.pid, sig)
                 except ProcessLookupError:
                     pass
                 try:
-                    out, err = process.communicate(timeout=wait)
+                    out, err = process.communicate(timeout=KILL_GRACE if wait is None and os.environ.get("SEND_REPEAT_NOTICE_JOB") == "1" else wait)
                     return None, out, err
                 except subprocess.TimeoutExpired:
                     continue
@@ -1568,12 +1579,16 @@ def relay_plan(message: Message) -> RelayPlan:
 
 def codex(message: Message, session_dir: str, timeout: float) -> Result:
     command = [sys.executable, str(CODEX_MESH), "send", "--session-dir", session_dir, "--to", message.to,
-               "--message", agent_text(message)]
+               "--no-accounting", "--report-recipient", "--guard-text", message.text, "--from", message.sender, "--message", agent_text(message),
+               *(["--human"] if message.human else [])]
     code, out, err = run(command, "", timeout)
+    receiver, err = recipient_report(err)
+    if code == 4:
+        return Result("held", one_line(out), receiver=receiver)
     if code == 0:
-        return Result("sent", one_line(out) or "queued on the codex thread")
+        return Result("sent", one_line(out) or "queued on the codex thread", receiver=receiver)
     why = one_line(err or out) or ("timed out" if code is None else f"exit {code}")
-    return Result("failed", f"codex_mesh.py send: {why}")
+    return Result("failed", f"codex_mesh.py send: {why}", receiver=receiver)
 
 
 def codex_session(
@@ -1729,12 +1744,26 @@ def deliver_template_fix(text_id: str, recipient: str, text: str) -> None:
         log_template_fix_error(text_id, str(error))
 
 
+def recipient_report(errors: str) -> tuple[str, str]:
+    """Internal forwards report their resolved address without owning another log row."""
+    receiver = ""
+    diagnostics: list[str] = []
+    for line in errors.splitlines():
+        if line.startswith("SEND_RECIPIENT: "):
+            receiver = line.removeprefix("SEND_RECIPIENT: ")
+        else:
+            diagnostics.append(line)
+    return receiver, "\n".join(diagnostics)
+
+
 def remote(message: Message, host: str, options: Options) -> Result:
-    """Run this script on host; its own log and queue record the attempt there."""
-    forwarded = ["--here", "--to", message.to, "--from", message.sender, "--summary", message.summary,
+    """Forward delivery and queue ownership; this invocation owns its accounting."""
+    forwarded = ["--no-accounting", "--report-recipient", "--here", "--to", message.to, "--from", message.sender, "--summary", message.summary,
                  "--timeout", f"{options.timeout:g}"]
     if message.to != USER:
         forwarded += ["--forwarded-shown-sender", message.shown_sender]
+    if options.human:
+        forwarded += ["--human"]
     if message.key is not None:
         forwarded += ["--key", message.key]
     if message.to == USER:
@@ -1760,6 +1789,7 @@ def remote(message: Message, host: str, options: Options) -> Result:
         forwarded += ["--repeat-minutes", "0"]
     command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, f"{'CLAUDE_PID= ' if message.to == USER else ''}{REMOTE} {shlex.join(forwarded)}"]
     code, out, err = run(command, message.text, options.timeout + KILL_GRACE + 30)
+    receiver, err = recipient_report(err)
     failure: FailureText = NO_FAILED_PUSH
     if message.to == USER and "send.py: failed push JSON: " in err:
         if isinstance(options.action, NoUserRecipient):
@@ -1773,7 +1803,7 @@ def remote(message: Message, host: str, options: Options) -> Result:
     detail = parsed.detail
     if parsed.payload:
         detail += "\n" + parsed.payload
-    return Result(parsed.outcome, f"on {host}: {detail}", failure)
+    return Result(parsed.outcome, f"on {host}: {detail}", failure, receiver)
 
 
 # ---------------------------------------------------------------------------
@@ -1968,6 +1998,9 @@ def parse(argv: list[str]) -> Options:
     _ = parser.add_argument("--value", action="append", default=[], help="registry template key=value")
     _ = parser.add_argument("--answerable", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--from", dest="sender", help="the sender name the recipient sees")
+    _ = parser.add_argument("--human", action="store_true", help="the message was written by a person, including a verbatim human relay")
+    _ = parser.add_argument("--no-accounting", action="store_true", help=argparse.SUPPRESS)
+    _ = parser.add_argument("--report-recipient", action="store_true", help=argparse.SUPPRESS)
     _ = parser.add_argument("--forwarded-shown-sender", help=argparse.SUPPRESS)
     _ = parser.add_argument("--summary", help="SendMessage's short label, default the first line; the title to `user`")
     _ = parser.add_argument("--priority", choices=("0", "1", "2"), help=argparse.SUPPRESS)
@@ -2079,6 +2112,8 @@ def parse(argv: list[str]) -> Options:
                       file=optional_str(get["file"]), answerable=get["answerable"] is True, text_id=text_id, values=tuple(raw_values),
                       commands=tuple(commands), clears_when=optional_str(get["clears_when"]) or "",
                       self_clearing=get["self_clearing"] is True,
+                      human=get["human"] is True, no_accounting=get["no_accounting"] is True,
+                      report_recipient=get["report_recipient"] is True,
                       shown_sender=ShownSender(forwarded_sender) if forwarded_sender is not None else SenderNotResolved())
     if options.to == USER and (options.summary is None or isinstance(options.selection, MeshWorker)):
         parser.error("--to user needs --summary, its title, and takes no --codex")
@@ -2194,7 +2229,7 @@ def send(options: Options) -> Result:
     key = user_emergency_key(sender, summary) if emergency and options.key is None else options.key
     display = (options.shown_sender.text if isinstance(options.shown_sender, ShownSender)
                else sender_shown_name(sender, observed) if options.to != USER else sender)
-    message = Message(destination, sender, summary, text, key, display)
+    message = Message(destination, sender, summary, text, key, display, options.human)
     started = now()
     # An emergency push repeats on the phone until the user acknowledges it, it is retired, or it
     # expires: with no --repeat-minutes, a send with its key inside that lifetime is skipped.
@@ -2208,12 +2243,19 @@ def send(options: Options) -> Result:
     held = None if refused else wrong_template(options, "\n".join((summary, text, action_text)))
     skip = None if refused or held is not None else claim(message, window, started, live=live)
     log_route: Route = NO_CLAUDE_ROUTE
+    guarded = repeat_guard.Decision()
+    if not refused and held is None and skip is None and not isinstance(route, (RecipientLookupFailed, CodexWorkerRecipient, RemoteDelivery)):
+        guarded = repeat_guard.check(STATE / "repeats", repeat_guard.Attempt(
+            sender, repeat_guard.recipient_identity(destination, thread_id=route.thread_id if isinstance(route, CodexSessionRecipient) else ""),
+            text, machine(), started.timestamp(), options.human or sender.casefold() == USER or options.to == USER))
     if refused:
         result = Result("refused", NO_CLEAR_STEP)
     elif held is not None:
         result = Result("held", held)
     elif skip is not None:
         result = Result("skipped", skip)
+    elif guarded.held:
+        result = Result("held", f"repeat guard: copy {guarded.copies} held; owner and user notices queued")
     elif isinstance(route, RecipientLookupFailed):
         result = Result("failed", route.reason)
     elif isinstance(route, RemoteDelivery):
@@ -2232,6 +2274,7 @@ def send(options: Options) -> Result:
             message.text,
             message.key,
             message.shown_sender,
+            message.human,
         )
         result = codex(transport, route.session_dir, options.timeout)
     elif isinstance(route, CodexSessionRecipient):
@@ -2293,12 +2336,73 @@ def send(options: Options) -> Result:
                                    sent=started.isoformat(), expires=(started + emergency_lifetime()).isoformat()))
     if message.to == USER and (result.outcome == "failed" or (result.outcome == "held" and isinstance(result.failure, FailedPush))):
         result = user_failure(message, options.action, result, options.need)
-    log(message, result, started, log_route)
-    return result
+    if not options.no_accounting:
+        log(message, result, started, log_route)
+    if options.report_recipient:
+        print("SEND_RECIPIENT: " + (result.receiver or message.to), file=sys.stderr)
+    return result._replace(receiver="")
+
+
+def repeat_notice_owner(sender: str) -> str:
+    """Use the roster's existing ownership join, then rca's showrunner resolution."""
+    import roster
+    observed = roster.roster(os.environ, roster.ThisMachine())
+    matches = _recipient_matches(sender, observed.entries)
+    if len(matches) == 1 and isinstance(matches[0].showrunner, roster.UnderShowrunner):
+        return rca.owner_address(matches[0].showrunner.production)
+    return rca.owner_address("")
+
+
+def deliver_repeat_notice(state: repeat_guard.SenderState, notice: repeat_guard.Notice,
+                          limits: repeat_guard.Limits) -> repeat_guard.NoticeOutcome:
+    """Only the notifier invokes this slow path, outside every guard lock."""
+    if notice.kind == "phone":
+        push = push_texts.render(repeat_guard.PHONE_TEXT, sender=state.sender,
+                                 copies=str(notice.copies), receivers=str(notice.receivers), host=state.host)
+        arguments = push_texts.user_send_argv(push, sender=repeat_guard.NOTICE_SENDER,
+                                             timeout=limits.notice_timeout_seconds)
+    else:
+        first = datetime.fromtimestamp(notice.first, timezone.utc).isoformat()
+        last = datetime.fromtimestamp(notice.last, timezone.utc).isoformat()
+        text = (f"Message flood from {state.sender} on {state.host}: {notice.copies} copies to "
+                + f"{notice.receivers} sessions, first {first}, last {last}.\n"
+                + f"Text: {notice.text}\nRepeated copies are held; distinct texts still arrive. Find the sender's cause.")
+        arguments = [sys.executable, str(Path(__file__).resolve()), "--to", repeat_notice_owner(state.sender), "--from", repeat_guard.NOTICE_SENDER,
+                     "--text", text]
+    arguments += ["--key", "repeat:" + notice.id + ":" + notice.kind, "--repeat-minutes", "0"]
+    code, out, err = run(arguments, "", limits.notice_timeout_seconds)
+    if code == 0 and out.startswith("SENT:"):
+        return "delivered"
+    if (code == 1 and out.startswith("QUEUED:")) or (code == 0 and out.startswith("KEPT:")):
+        return "queued"
+    print(f"repeat notice {notice.kind}: {one_line(err or out)}", file=sys.stderr)
+    # At-least-once: abnormal termination and SKIPPED never prove acceptance.
+    return "unknown" if code is None or code < 0 or out.startswith("SKIPPED:") or code == 0 else "failed"
+
+
+def attempt_repeat_notice(state: repeat_guard.SenderState, notice: repeat_guard.Notice,
+                          limits: repeat_guard.Limits) -> repeat_guard.NoticeOutcome:
+    """Discovery and delivery share one attempt budget in the supervised job group."""
+    request = json.dumps({"state": asdict(state), "id": notice.id, "kind": notice.kind, "limits": asdict(limits)})
+    code, out, err = run([sys.executable, str(Path(__file__).resolve()), "repeat-notice-attempt"],
+                         request, limits.notice_timeout_seconds)
+    if code == 0 and out.strip() in ("delivered", "queued", "failed", "unknown"):
+        return cast(repeat_guard.NoticeOutcome, out.strip())
+    repeat_guard.warn("notice attempt: " + one_line(err or out or "interrupted"))
+    return "unknown"
 
 
 def main(argv: list[str]) -> int:
     match argv:
+        case ["repeat-notices"]:
+            repeat_guard.drain(Path(os.environ.get("SEND_REPEAT_STATE", str(STATE / "repeats"))), attempt_repeat_notice, now().timestamp(),
+                               cleanup_seconds=2 * KILL_GRACE)
+        case ["repeat-notice-attempt"]:
+            request = as_dict(loads(sys.stdin.read()))
+            state = repeat_guard.decode(json.dumps(request["state"]))
+            notice = next(item for item in state.notices if (item.id, item.kind) == (request["id"], request["kind"]))
+            limits = repeat_guard.Limits(**cast(dict[str, int], request["limits"]))
+            print(deliver_repeat_notice(state, notice, limits))
         case ["template-fix", failure_json]:
             template_fix_notice(as_dict(loads(failure_json)))
         case ["template-fix-deliver", text_id, recipient, text]:
