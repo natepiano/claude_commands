@@ -1879,12 +1879,16 @@ route_test() {
 # the run's hold folder, so the EXIT trap removes both, and both names carry
 # the run's pid for tmp_sweep.py when a kill skips the trap.
 start_copy_watch() {
+    # $$ stays the outer shell's pid in a subshell. Bash 3.2 has no BASHPID;
+    # an exec'd child shell reports this launching shell through its PPID.
+    local parent_pid="${BASHPID:-$(exec sh -c 'printf "%s\n" "$PPID"')}"
     COPY_WATCH_DIR="$(mktemp -d "${HOLD_WAIT_DIR:-${TMPDIR:-/tmp}}/verify-copy.$$.XXXXXX")"
     VERIFY_STEP_INFO_FILE="$COPY_WATCH_DIR/step"
     local watch_args=(--info "$VERIFY_STEP_INFO_FILE" --result "$COPY_WATCH_DIR/result"
         --runner "$MAC_RUNNER" --settings "$MAC_LEAVE_SETTINGS"
         --repo-root "$(git rev-parse --show-toplevel)" --package "$PKG"
-        --call-id "$BUILDLOG_CALL_ID" --call-started "$VERIFY_CALL_STARTED")
+        --call-id "$BUILDLOG_CALL_ID" --call-started "$VERIFY_CALL_STARTED"
+        --parent-pid "$parent_pid")
     if [[ "$FILTER_RUN" -eq 1 ]]; then
         watch_args+=(--filter-run)
     fi

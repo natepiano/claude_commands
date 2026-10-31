@@ -407,7 +407,7 @@ Checkpoints c0377368 and 4751eb55 on `natedev-verify-cancel`.
 
 **Ruled out:** a sweep that cleans up after a stop, or a second cancel path beside `verify_interrupted`.
 
-### Phase 13 — Stop the Mac copy watcher when verify ends before the watcher starts  · status: todo
+### Phase 13 — Stop the Mac copy watcher when verify ends before the watcher starts  · status: done
 
 **Origin:** builds showrunner, 2026-10-31 00:3x EDT, add-on. Branch `natedev-verify-cancel` (carries Phases 9 and 10), worktree `/home/natepiano/worktrees/claude-build-followups-verify-cancel`, merged with origin/builds 1de3f51c at f133fa6e.
 

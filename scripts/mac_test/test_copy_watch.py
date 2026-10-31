@@ -157,7 +157,7 @@ class LineKindTests(unittest.TestCase):
 class WakeupTests(unittest.TestCase):
     def test_unknown_repository_checks_parent_within_one_second(self) -> None:
         with mock.patch.object(os, "getppid", return_value=100) as parent:
-            wakeup = copy_watch.Wakeup(7)
+            wakeup = copy_watch.Wakeup(7, 100)
 
             def parent_exits(readers: list[int], writers: list[int], errors: list[int],
                              timeout: float) -> tuple[list[int], list[int], list[int]]:
@@ -373,6 +373,7 @@ class CopyWatchProcessTests(unittest.TestCase):
             "--info", str(self.info), "--result", str(self.result), "--runner", str(self.runner),
             "--settings", str(self.root / "mac.conf"), "--repo-root", str(self.repository),
             "--package", "sample", "--call-id", "v-call", "--call-started", call_started,
+            "--parent-pid", str(os.getpid()),
         ]
         if filter_run:
             arguments.append("--filter-run")
@@ -585,7 +586,7 @@ class CopyWatchProcessTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5.0)
         self.assertEqual(self.result.read_text(), "copy=\ncopy_s=\ncopy_count=\nnatedev_s_at_end=\n")
 
-    def assert_parent_loss_stops_watcher(self, *, running_copy: bool) -> None:
+    def assert_parent_loss_stops_watcher(self, *, running_copy: bool, before_start: bool = False) -> None:
         if not running_copy:
             claims = self.state / "claims"
             claims.mkdir(parents=True)
@@ -593,29 +594,45 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = self.start_step()
         self.result = self.root / "removed-results" / "result"
         self.result.parent.mkdir()
+        if before_start:
+            self.result.parent.rmdir()
         # The watcher and its runner inherit this parent's output pipe. EOF
         # proves they closed it; cleanup owns only this new process group.
+        # The delayed wrapper enters the real watcher only after reparenting.
         parent: subprocess.Popen[str] = subprocess.Popen([
             sys.executable, "-c",
-            "import signal, subprocess, sys\n"
-            + "child = subprocess.Popen(sys.argv[1:])\n"
+            "import os, signal, subprocess, sys\n"
+            + "sys.argv[sys.argv.index('--parent-pid') + 1] = str(os.getpid())\n"
+            + ("child = subprocess.Popen([sys.executable, '-c', "
+               + repr("import os, sys, time\n"
+                      + "parent = int(sys.argv[1])\n"
+                      + "while os.getppid() == parent: time.sleep(0.01)\n"
+                      + "os.execv(sys.executable, [sys.executable, *sys.argv[3:]])\n")
+               + ", str(os.getpid()), *sys.argv[1:]])\n"
+               if before_start else "child = subprocess.Popen(sys.argv[1:])\n")
             + "print(child.pid, flush=True)\n"
-            + "signal.pause()\n",
+            + ("" if before_start else "signal.pause()\n"),
             *self.watcher_arguments(),
         ], env={**self.environment, "TEST_COPY_MODES": "hold"},
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
         try:
             assert parent.stdout is not None
             watcher_pid = int(cast(str, parent.stdout.readline()))
-            _ = (self.root / "compile").write_text("go\n")
-            if running_copy:
-                self.wait_until((self.root / "runner-ready").exists, "the copy to run")
-            else:
-                self.wait_until(self.candidate().exists, "the watcher to be ready")
-            self.result.parent.rmdir()
+            if not before_start:
+                _ = (self.root / "compile").write_text("go\n")
+                if running_copy:
+                    self.wait_until((self.root / "runner-ready").exists, "the copy to run")
+                else:
+                    self.wait_until(self.candidate().exists, "the watcher to be ready")
+                self.result.parent.rmdir()
             started = time.monotonic()
-            parent.kill()
-            output, _ = parent.communicate(timeout=4.0)
+            if not before_start:
+                parent.kill()
+            try:
+                output, _ = parent.communicate(timeout=4.0)
+            except subprocess.TimeoutExpired:
+                self.fail(f"watcher {watcher_pid} still runs after parent {parent.pid} exited "
+                          + f"(parent status {parent.poll()}, group {parent.pid})")
             self.assertLess(time.monotonic() - started, 4.0)
             self.assertNotIn("Traceback", output)
             self.assertTrue(self.result.exists())
@@ -634,6 +651,19 @@ class CopyWatchProcessTests(unittest.TestCase):
 
     def test_parent_killed_stops_a_running_copy(self) -> None:
         self.assert_parent_loss_stops_watcher(running_copy=True)
+
+    def test_parent_already_exited_before_watcher_initializes(self) -> None:
+        self.assert_parent_loss_stops_watcher(running_copy=False, before_start=True)
+
+    def test_missing_parent_pid_is_an_argument_error(self) -> None:
+        arguments = self.watcher_arguments()
+        index = arguments.index("--parent-pid")
+        del arguments[index:index + 2]
+        result = subprocess.run(arguments, env=self.environment, capture_output=True,
+                                text=True, timeout=HANG_GUARD_S)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("--parent-pid", result.stderr)
+        self.assertFalse(self.result.exists())
 
 
 if __name__ == "__main__":

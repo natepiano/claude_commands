@@ -67,6 +67,7 @@ class CliArguments(argparse.Namespace):
         self.package: str = ""
         self.call_id: str = ""
         self.call_started: str = ""
+        self.parent_pid: int = 0
         self.filter_run: bool = False
         self.nextest_words: list[str] = []
 
@@ -387,9 +388,9 @@ def poll_seconds() -> float:
 class Wakeup:
     """Stop on TERM, HUP, INT or parent loss; signals end sleep at once."""
 
-    def __init__(self, read_fd: int) -> None:
+    def __init__(self, read_fd: int, parent_pid: int) -> None:
         self.read_fd: int = read_fd
-        self.parent_pid: int = os.getppid()
+        self.parent_pid: int = parent_pid
         self.stopped: bool = False
 
     @property
@@ -421,11 +422,11 @@ def note_child(signal_number: int, frame: FrameType | None) -> None:
 
 
 @contextmanager
-def wakeup_on_signals() -> Generator[Wakeup, None, None]:
+def wakeup_on_signals(parent_pid: int) -> Generator[Wakeup, None, None]:
     read_fd, write_fd = os.pipe()
     os.set_blocking(read_fd, False)
     os.set_blocking(write_fd, False)
-    wakeup = Wakeup(read_fd)
+    wakeup = Wakeup(read_fd, parent_pid)
     names = [signal.SIGTERM, signal.SIGHUP]
     if signal.getsignal(signal.SIGINT) != signal.SIG_IGN:
         names.append(signal.SIGINT)
@@ -585,6 +586,7 @@ def parser() -> argparse.ArgumentParser:
                  "--call-started"):
         _ = root.add_argument(name, required=True)
     _ = root.add_argument("--filter-run", action="store_true")
+    _ = root.add_argument("--parent-pid", type=int, required=True)
     _ = root.add_argument("nextest_words", nargs=argparse.REMAINDER)
     return root
 
@@ -618,8 +620,9 @@ def request_from_arguments(arguments: CliArguments) -> WatchRequest:
 
 def main() -> int:
     override_guard.refuse_overrides(Path(__file__), "mac_test/copy_watch.py")
-    request = request_from_arguments(parser().parse_args(namespace=CliArguments()))
-    with wakeup_on_signals() as wakeup, tempfile.TemporaryDirectory(prefix="copy-watch.") as work:
+    arguments = parser().parse_args(namespace=CliArguments())
+    request = request_from_arguments(arguments)
+    with wakeup_on_signals(arguments.parent_pid) as wakeup, tempfile.TemporaryDirectory(prefix="copy-watch.") as work:
         repository = offload.repository_identity(request.repo_root)
         if isinstance(repository, offload.UnknownRepository):
             report = wait_for_stop(wakeup)
