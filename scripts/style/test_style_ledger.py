@@ -23,7 +23,7 @@ import style_ledger
 from approved_renames import AppliedInCode
 
 
-from ledger_test_support import (LedgerTestCase, LedgerStatus, PARENT_FILE)
+from ledger_test_support import (remove_generation_schema, LedgerTestCase, LedgerStatus, PARENT_FILE)
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -89,6 +89,113 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             contender.result(timeout=TEST_HANG_GUARD_SECS)
         self.assertTrue(acquired.is_set(), "refill lock was not released on context exit")
 
+    def assert_generation_backfill(
+        self, rows: tuple[tuple[str, str, str, str], ...], expected: dict[str, str],
+        invalidations: tuple[tuple[int, str], ...] = (),
+    ) -> None:
+        """Upgrade distinct historical evidence through the real constructor transaction."""
+        with self.ledger() as ledger:
+            database = ledger.database
+        with closing(sqlite3.connect(database)) as connection, connection:
+            remove_generation_schema(connection)
+            for id, (rule, blob, at, verdict) in enumerate(rows, 1):
+                _ = connection.execute(
+                    'INSERT INTO judgments(id,rule,rule_blob,input_scope,input_fingerprint,path,"commit",'
+                    + "verdict,verdict_detail,ticket,worker,recorded_at) VALUES (?,?,?,'file','input','path','tip',?,'','outside',?,?)",
+                    (id, rule, blob, verdict, str(id), at))
+            _ = connection.executemany("INSERT INTO invalidated_held_judgments VALUES (?,?)", invalidations)
+            _ = connection.execute("UPDATE schema_version SET version=29")
+        with style_ledger.Ledger(self.repo, database):
+            pass
+        with closing(sqlite3.connect(database)) as connection:
+            self.assertEqual(dict(cast(list[tuple[str, str]], connection.execute("SELECT rule,rule_blob FROM rule_generations").fetchall())), expected)
+            self.assertEqual(connection.execute("SELECT DISTINCT generation FROM rule_generations").fetchall(), [(0,)])
+            invalidated = {style_ledger.base_rule(rows[id - 1][0]) for id, at in invalidations
+                           if rows[id - 1][2] == at}
+            self.assertEqual(connection.execute("SELECT id,generation FROM judgments ORDER BY id").fetchall(),
+                             [(id, -1 if style_ledger.base_rule(rule) in invalidated and verdict != "removed" else 0)
+                              for id, (rule, _, _, verdict) in enumerate(rows, 1)])
+            self.assertEqual(connection.execute("SELECT id FROM active_judgments ORDER BY id").fetchall(),
+                             [(id,) for id, (rule, _, _, verdict) in enumerate(rows, 1)
+                              if style_ledger.base_rule(rule) not in invalidated or verdict == "removed"])
+
+    def test_generation_backfill_ranks_once_without_correlated_scan(self) -> None:
+        with closing(sqlite3.connect(":memory:")) as connection:
+            _ = connection.execute("CREATE TABLE judgments(rule TEXT,rule_blob TEXT,recorded_at TEXT,id INTEGER)")
+            _ = connection.execute("CREATE TABLE rule_generations(rule TEXT,rule_blob TEXT,generation INTEGER)")
+            insert = next(statement for statement in style_ledger.MIGRATIONS[30].split(";")
+                          if statement.strip().startswith("INSERT INTO rule_generations"))
+            plan = cast(list[tuple[int, int, int, str]], connection.execute("EXPLAIN QUERY PLAN " + insert).fetchall())
+            self.assertFalse(any("CORRELATED" in detail for _, _, _, detail in plan), plan)
+
+    def test_generation_backfill_timestamp_tie_uses_higher_id_blob(self) -> None:
+        self.assert_generation_backfill((("rule", "first", "2", "clean"), ("rule", "second", "2", "held")),
+                                        {"rule": "second"})
+
+    def test_generation_backfill_newer_timestamp_wins_over_higher_id(self) -> None:
+        self.assert_generation_backfill((("rule", "newer", "3", "clean"), ("rule", "older", "2", "held")),
+                                        {"rule": "newer"})
+
+    def test_generation_backfill_partitions_uncovered_component_with_its_base_rule(self) -> None:
+        self.assert_generation_backfill((("rule", "base", "1", "clean"),
+                                         ("rule#uncovered", "component", "2", "held")), {"rule": "component"})
+
+    def test_generation_backfill_ranks_removed_and_invalidated_rows_and_keeps_barriers(self) -> None:
+        self.assert_generation_backfill((("rule", "clean", "1", "clean"),
+                                         ("rule#uncovered", "held", "2", "held"),
+                                         ("rule", "removed", "3", "removed")), {"rule": "removed"}, ((2, "2"),))
+
+    def test_generation_backfill_invalidation_requires_matching_timestamp(self) -> None:
+        self.assert_generation_backfill((("rule", "clean", "1", "clean"),
+                                         ("rule#uncovered", "held", "2", "held")), {"rule": "held"}, ((2, "old"),))
+
+    def test_generation_backfill_preserves_embedded_marker_and_removes_one_suffix(self) -> None:
+        self.assert_generation_backfill((("rule#uncovered.md", "embedded", "1", "clean"),
+                                         ("rule.md", "other", "2", "held"),
+                                         ("rule#uncovered#uncovered", "once", "3", "held")),
+                                        {"rule#uncovered.md": "embedded", "rule.md": "other", "rule#uncovered": "once"},
+                                        ((1, "1"),))
+
+    def test_live_generation_writer_and_reconciliation_preserve_embedded_marker(self) -> None:
+        rule = self.rule("embedded#uncovered-marker")
+        rule_file = self.rule_dir / "embedded#uncovered-marker.md"
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean", ticket="outside", worker="old")
+            _ = rule_file.write_text(rule_file.read_text() + "Changed body.\n")
+            ledger.record(rule, self.sources[0], self.initial_tip, self.blob(rule), "clean", ticket="outside", worker="fresh")
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            self.assertEqual(next(ledger.cells(rule)).state, "current")
+            self.assertEqual(tuple(judgment.rule_blob for judgment in ledger._judgments(rule, self.sources[0])), (self.blob(rule),))  # pyright: ignore[reportPrivateUsage]
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT rule,generation FROM rule_generations").fetchall(), [(rule, 1)])
+
+    def test_generation_migration_preserves_prior_withdrawals_and_invalidations(self) -> None:
+        rule = self.rule("legacy-generation")
+        path = self.sources[0]
+        rule_file = self.rule_dir / "legacy-generation.md"
+        original = rule_file.read_text()
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            blob = self.blob(rule)
+            ledger.record(rule, path, self.initial_tip, blob, "clean", ticket="outside", worker="clean")
+            finding = ledger.hold(rule, path, 1, "violation", "rename", "old", "new", blob, "outside")
+            ledger.record(rule, path, self.initial_tip, blob, "held", ticket="outside", worker="held")
+            _ = rule_file.write_text(original + "Body B.\n")
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            database = ledger.database
+        with closing(sqlite3.connect(database)) as connection, connection:
+            remove_generation_schema(connection)
+            _ = connection.execute("INSERT INTO invalidated_held_judgments SELECT id,recorded_at FROM judgments WHERE verdict='held'")
+            _ = connection.execute("UPDATE schema_version SET version=29")
+        _ = rule_file.write_text(original)
+        with self.ledger() as ledger:
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+            self.assertNotEqual(next(ledger.cells(rule)).state, "current")
+            self.assertIsInstance(ledger.named_held((finding.finding_id,))[0].state, style_ledger.Withdrawn)
+            ledger.record(rule, path, self.initial_tip, blob, "clean", ticket="outside", worker="clean")
+            self.assertEqual(next(ledger.cells(rule)).state, "current")
+
     def test_migration_27_upgrades_copies_at_25_and_26_and_is_repeatable(self) -> None:
         rule = self.rule("pipeline")
         ledger = self.ledger()
@@ -108,6 +215,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                 database = self.root / f"existing-copy-{version}.sqlite"
                 with closing(sqlite3.connect(ledger.database)) as source, closing(sqlite3.connect(database)) as copy:
                     source.backup(copy)
+                    remove_generation_schema(copy)
                     _ = copy.executescript("""
                         DROP INDEX tickets_one_assigned;
                         DROP TABLE ticket_predecessors;
@@ -120,7 +228,8 @@ class StyleLedgerRecordsTests(LedgerTestCase):
                     _ = copy.execute("UPDATE schema_version SET version=?", (version,))
                     copy.commit()
                     rows = copy.execute("SELECT * FROM tickets").fetchall()
-                    judgments = copy.execute("SELECT * FROM judgments").fetchall()
+                    # Migration 30 appends the initial generation to each preserved historical row.
+                    judgments = copy.execute("SELECT *,0 FROM judgments").fetchall()
                 for _ in range(2):
                     with style_ledger.Ledger(self.repo, database):
                         pass
@@ -1242,6 +1351,7 @@ class StyleLedgerRecordsTests(LedgerTestCase):
             _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("DROP TABLE refill_results")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            remove_generation_schema(connection)
             _ = connection.execute("UPDATE schema_version SET version=8")
             connection.commit()
         migrated = self.ledger()

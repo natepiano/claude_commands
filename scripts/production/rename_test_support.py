@@ -18,6 +18,8 @@ from collections.abc import Callable, Generator, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from types import SimpleNamespace
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.astra import design_roles
 from scripts.direct import workers
 from scripts.lib.socket_test_support import short_socket_directory
@@ -31,7 +33,7 @@ import production_units
 import rename
 import rename_unit
 import rename_state
-import showrunners
+from scripts.production import showrunners
 import stall_watch
 import tidy_wrapped
 import unit_move
@@ -84,7 +86,8 @@ from pathlib import Path
 
 sys.argv = sys.argv[1:]
 sys.path.insert(0, str(Path(sys.argv[0]).resolve().parent))
-import showrunners
+sys.path.insert(0, str(Path(sys.argv[0]).resolve().parents[2]))
+from scripts.production import showrunners
 
 notifier = Path(os.environ["NOTIFIER_STATE_DIR"])
 old_timer = notifier / "showrunner-old"
@@ -277,7 +280,6 @@ def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members
     _ = case.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
     _ = case.enterContext(isolated_source_readers())
     for name, attribute, reader in (
-        ("showrunners", "socket_for", FIXTURE_SOCKET_FOR),
         ("scripts.production.showrunners", "socket_for", FIXTURE_SOCKET_FOR),
         ("unit_lookup", "marked_units", FIXTURE_MARKED_UNITS),
         ("scripts.production.unit_lookup", "marked_units", FIXTURE_MARKED_UNITS),

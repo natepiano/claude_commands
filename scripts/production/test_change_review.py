@@ -18,9 +18,11 @@ from pathlib import Path
 from typing import override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 from change_review import Invisible, Malformed, Visible
 
@@ -146,7 +148,7 @@ class ListTest(unittest.TestCase):
             self.assertEqual(change_review.list_path(doc), stale)
 
     def test_a_child_production_takes_its_root_showrunners_name(self) -> None:
-        import showrunners
+        from scripts.production import showrunners
 
         names = {"build-followups": "natedev"}
 

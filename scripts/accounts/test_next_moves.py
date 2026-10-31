@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import tempfile
 import unittest
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, role_map
 from scripts.whoami import run_out
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "whoami"))
@@ -25,7 +25,7 @@ class NextMovesTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True)))
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {}, clear=True)))
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.home / "quota_alert.json"))
         _ = self.enterContext(patch.object(role_map, "is_role_map_host", return_value=True))
         _ = self.enterContext(patch.object(role_map, "ssh_role_map", side_effect=AssertionError("unexpected ssh")))

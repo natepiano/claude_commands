@@ -6,7 +6,6 @@ from collections.abc import Callable, Generator
 from dataclasses import dataclass
 import json
 import contextlib
-from importlib import import_module
 import os
 from pathlib import Path
 import shutil
@@ -17,6 +16,9 @@ import time
 from typing import ClassVar, ParamSpec, TypedDict, cast, override
 import unittest
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lint import memory_admit
 from scripts.lint.memory_test_support import fake_memory_readings
 from scripts.production import merge_gate
@@ -513,17 +515,15 @@ class MergeGateFixture(unittest.TestCase):
                 text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
         from scripts.production import showrunners
 
-        # change_review also imports this sibling by its script-local name.
-        # Restore both import identities' HOME-derived paths after each call.
+        # Restore the registry's HOME-derived paths after each call.
         home = Path(self.environment["HOME"])
         with contextlib.ExitStack() as scope:
-            for module in (showrunners, import_module("showrunners")):
-                for name, value in {
-                    "NOTIFIER_STATE_DIR": Path(self.environment["NOTIFIER_STATE_DIR"]),
-                    "SESSIONS_DIR": home / ".claude/sessions",
-                    "SHOWRUNNER_STATE_DIR": home / ".local/state/showrunner",
-                }.items():
-                    _ = scope.enter_context(mock.patch.object(module, name, value))
+            for name, value in {
+                "NOTIFIER_STATE_DIR": Path(self.environment["NOTIFIER_STATE_DIR"]),
+                "SESSIONS_DIR": home / ".claude/sessions",
+                "SHOWRUNNER_STATE_DIR": home / ".local/state/showrunner",
+            }.items():
+                _ = scope.enter_context(mock.patch.object(showrunners, name, value))
             return invoke_cli(merge_gate, lambda: merge_gate.main(arguments), arguments,
                               self.environment, self.root)
 

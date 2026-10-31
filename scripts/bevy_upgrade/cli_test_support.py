@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import upgrade_record as upgrade_record
 import bevy_upgrade
 import upstream
-import showrunners
+from scripts.production import showrunners
 from cli_fixture import invoke_cli
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
@@ -278,7 +278,7 @@ class CliFixture(unittest.TestCase):
             + "        return fetch(url)\n"
             + "    return traced_fetch\n"
             + ("upstream.fixture_fetch = traced_factory\n" if count_saves else "")
-            + "import bevy_upgrade\nimport upgrade_record\nimport showrunners\n"
+            + "import bevy_upgrade\nimport upgrade_record\nfrom scripts.production import showrunners\n"
             + "showrunners.current_address = lambda slug: os.environ['TEST_SHOWRUNNER_ADDRESS']\n"
             + "save = upgrade_record.save\n"
             + "def counted_save(current: upgrade_record.Record) -> None:\n"

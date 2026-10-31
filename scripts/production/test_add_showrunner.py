@@ -17,12 +17,13 @@ from types import SimpleNamespace
 from typing import cast, override
 from unittest.mock import patch
 
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts import accounts
 from scripts.production import add_showrunner
 import production_units
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 from scripts.whoami import usage_store
 import herdr as runtime

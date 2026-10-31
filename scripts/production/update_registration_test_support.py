@@ -17,10 +17,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, TypedDict, cast, override
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import update_registration
 registration = update_registration
-import showrunners as showrunners
+from scripts.production import showrunners as showrunners
 import dailies_render as dailies_render
 from production_units import read_production as read_production
 from scripts.production.cli_fixture import invoke_cli

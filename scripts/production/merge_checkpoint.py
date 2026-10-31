@@ -26,18 +26,20 @@ from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from typing import Literal, NamedTuple, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import change_review
 import scratch  # on the path once change_review has put scripts/lib there
-from showrunners import canonical_slug
+from scripts.production.showrunners import canonical_slug
 from production_units import Production, read_production
 from production_units import Refusal, cell_value, production_field, unit_table
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.direct import progress_history  # noqa: E402
 from scripts.production import production_doc  # noqa: E402
 from scripts.lib.probe_session import PROBE_ENV  # noqa: E402
 from scripts.lib.atomic_file import write_text_atomic  # noqa: E402
 import sessions  # noqa: E402
+from scripts.lib.process_failure import failure_detail  # noqa: E402
 
 # /zone queues a change for the Mac while it is offline; a promotion's Mac pull sends it.
 ZONE_SCRIPT = Path(__file__).resolve().parents[1] / "lib/zone.py"
@@ -224,7 +226,7 @@ def git(checkout: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 def good(result: subprocess.CompletedProcess[str], step: str) -> str:
     if result.returncode:
-        raise Stop(step, "failed", result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}",
+        raise Stop(step, "failed", failure_detail(result),
                    "the showrunner will inspect the failed command")
     return result.stdout.strip()
 
@@ -618,7 +620,7 @@ def conflicts(request: MergeRequest) -> None:
                  request.production.merge_branch, request.commit)
     if result.returncode:
         if result.returncode == 1:
-            raise Stop("conflicts", "held", "conflict: " + (result.stdout.strip() or result.stderr.strip()),
+            raise Stop("conflicts", "held", "conflict: " + failure_detail(result),
                        "merge the merge branch on your unit branch, resolve conflicts, and send a new hash")
         raise Stop("conflicts", "failed", result.stderr.strip() or f"merge-tree exit {result.returncode}",
                    "the showrunner will inspect the merge-tree failure")
@@ -902,7 +904,7 @@ def push_validate(production: Production, fix_commit: str, may_undo: bool, cance
     try:
         result = subprocess.run(command, cwd=production.checkout, capture_output=True, text=True, check=False)
         if result.returncode:
-            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            detail = failure_detail(result)
             raise Stop("push", "failed", detail, "repair the push failure and send a new checkpoint")
     except (Stop, OSError):
         if may_undo:
@@ -1049,7 +1051,7 @@ def record(request: MergeRequest, merge_head: str, tests_green: str) -> None:
             command.extend(("--excluded", request.excluded))
         result = subprocess.run(command, cwd=request.production.checkout, capture_output=True, text=True, check=False)
         if result.returncode:
-            raise Stop("record", "failed", result.stderr.strip() or result.stdout.strip(),
+            raise Stop("record", "failed", failure_detail(result),
                        "the showrunner will repair the review record and rerun")
         if result.stdout.startswith("kept "):
             detail = result.stdout.strip() + "; " + detail
@@ -1087,7 +1089,7 @@ def notify_style(checkout: Path, branch: str, tip: str) -> None:
             capture_output=True, text=True, check=False, timeout=30,
         )
         if result.returncode or result.stdout.strip() or result.stderr.strip():
-            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            detail = failure_detail(result)
             print("style sync: " + detail.replace("\n", "; "), flush=True)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print("style sync: " + str(error).replace("\n", "; "), flush=True)
@@ -1535,7 +1537,7 @@ def record_handoff_merge(request: ChildHandoffRequest, merge_head: str) -> None:
             capture_output=True, text=True, check=False, timeout=30,
         )
         if result.returncode:
-            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            detail = failure_detail(result)
             print("hand-off ledger: " + detail.replace("\n", "; "), flush=True)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print("hand-off ledger: " + str(error).replace("\n", "; "), flush=True)
@@ -1553,7 +1555,7 @@ def acknowledge_handoff(request: ChildHandoffRequest, merge_head: str) -> None:
             "--timeout", "10",
         ], capture_output=True, text=True, check=False, timeout=15)
         if result.returncode:
-            raise Refusal(result.stderr.strip() or result.stdout.strip() or f"send.py exited {result.returncode}")
+            raise Refusal(f"send.py: {failure_detail(result)}")
     except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
         print("hand-off acknowledgment: " + " ".join(str(error).splitlines()), flush=True)
 

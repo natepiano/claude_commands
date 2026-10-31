@@ -554,7 +554,7 @@ class DailiesInputTests(DailiesInputFixture):
         self.env["DAILIES_PHASE_TABLE_FAIL"] = "show"
         built = self.run_builder()
         self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
-        self.assertIn("phase tables: unavailable — show could not read records", built.stdout)
+        self.assertIn("phase tables: unavailable — stderr: show could not read records", built.stdout)
         self.assertEqual(cast(dict[str, object], self.unit()["eta"])["time"], "23:40")
 
         self.open_phase_record()
@@ -1670,7 +1670,7 @@ class DailiesInputTests(DailiesInputFixture):
                 self.assertIsInstance(unavailable["unavailable"], str)
                 self.assertTrue(unavailable["unavailable"])
                 if error:
-                    self.assertEqual(unavailable, {"unavailable": error})
+                    self.assertEqual(unavailable, {"unavailable": f"summary: stderr: {error}"})
                 parsed = dailies_render.parse_child_report(saved, "saved", ZoneInfo("America/Los_Angeles"))
                 self.assertIsInstance(parsed.style, dailies_render.StyleSummaryUnavailable)
 

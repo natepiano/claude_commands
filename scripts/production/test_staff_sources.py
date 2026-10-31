@@ -9,12 +9,17 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, staff_sources
 from scripts.production.staff_test_support import SOURCES_SCRIPT, FixtureMachine, StaffTestCase
 from scripts.shutdown import pane_record
 import herdr
-import showrunners
+from scripts.production import showrunners
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 import showrunner_tree
 

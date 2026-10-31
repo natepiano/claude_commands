@@ -17,17 +17,20 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_unit_host
-import showrunners
+from scripts.production import showrunners
 from sessions import SessionRecord
 from fake_unit_host import HostedUnit
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import staff
 from scripts.production.staff_test_support import StaffTestCase
 from scripts.production.rename_test_support import bind_staff_fixture
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 SCRIPT = Path(__file__).with_name("showrunners.py")

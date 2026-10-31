@@ -12,11 +12,15 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.lib.socket_test_support import short_socket_directory
 import fake_unit_host
-import showrunners
+from scripts.production import showrunners
 import unit_lookup
 import herdr
 import sessions
@@ -24,7 +28,6 @@ from fake_herdr import herdr_listener
 from fake_unit_host import HostedUnit
 from sessions import SessionRecord
 from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 SCRIPT = Path(__file__).with_name("unit_lookup.py")
 

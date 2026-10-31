@@ -80,7 +80,7 @@ class MergeGateTypesTests(GateSuitesFixture):
         self.write(self.state / "uv-fails", "fail")
         result = self.run_gate()
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("basedpyright: RED\ntype-check venv missing: fixture: no network; build it with: ", result.stdout)
+        self.assertIn("basedpyright: RED\ntype-check venv missing: stderr: fixture: no network; build it with: ", result.stdout)
         self.assertIn(" pip install --python ", result.stdout)
         self.assertEqual([call for call in self.calls() if call["tool"] == "basedpyright"], [])
         self.assertRegex(result.stdout, r"(?m)^lib: OK \d+\.\d+s$")

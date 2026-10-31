@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, TypedDict, cast, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import build_hold
 import unit_runs
 from sessions import SessionRecord
@@ -1210,8 +1212,8 @@ class ReleaseDeliveryTests(IsolatedBuildHoldTest):
         entry = build_hold.new_entry("session-a", "shared name")
         for code, expected in (
             (0, build_hold.ReleaseDelivered()), (1, build_hold.ReleaseQueued()),
-            (2, build_hold.ReleaseSendFailed("recipient refused")),
-            (3, build_hold.ReleaseSendFailed("recipient refused")),
+            (2, build_hold.ReleaseSendFailed("send.py: stderr: recipient refused")),
+            (3, build_hold.ReleaseSendFailed("send.py: stderr: recipient refused")),
         ):
             with self.subTest(code=code):
                 result = subprocess.CompletedProcess([], code, "", "recipient refused")

@@ -16,6 +16,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import nightly_review
 from scripts.whoami import account
 from scripts.accounts import accounts
@@ -75,6 +77,10 @@ class NightlyReviewTests(unittest.TestCase):
         copied = self.root / "copy/scripts/nightly_review/nightly_review.py"
         copied.parent.mkdir(parents=True)
         _ = shutil.copyfile(nightly_review.__file__, copied)
+        library = copied.parents[1] / "lib"
+        library.mkdir()
+        _ = shutil.copyfile(Path(nightly_review.__file__).resolve().parents[1] / "lib/process_failure.py",
+                            library / "process_failure.py")
         whoami = copied.parents[1] / "whoami"
         whoami.mkdir()
         _ = (whoami / "account.py").write_text("def process_config_dir(pid): pass\n")
@@ -224,7 +230,7 @@ class TonightTests(NightlyReviewTests):
 
     def test_a_refused_start_names_add_units_reason_and_sends_nothing(self) -> None:
         lines, calls = self.tonight([None], [done(code=1, stderr="claude3 is shut down")])
-        self.assertEqual(lines, [f"{SESSION}: not started: claude3 is shut down"])
+        self.assertEqual(lines, [f"{SESSION}: not started: stderr: claude3 is shut down"])
         self.assertEqual(len(calls), 1)
 
     def test_a_night_with_no_production_holding_the_unit_is_skipped(self) -> None:

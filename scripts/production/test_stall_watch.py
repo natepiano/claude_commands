@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
-
 import fcntl
 import hashlib
 import json
@@ -19,8 +17,13 @@ from types import ModuleType
 from unittest import mock
 from datetime import datetime
 from pathlib import Path
+
 from typing import cast, override
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
@@ -33,7 +36,6 @@ import stall_watch
 import context_usage
 import rca
 from cli_fixture import invoke_cli
-from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
 SCRIPT = Path(__file__).with_name("stall_watch.py")
@@ -389,7 +391,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
 
     def test_one_tick_reads_run_records_once_across_productions_and_units(self) -> None:
         import stall_watch
-        import showrunners
+        from scripts.production import showrunners
         import unit_lookup as lookup
         runners: list[showrunners.Showrunner] = []
         for slug in ("first", "second"):
@@ -1195,7 +1197,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
 
     def test_detached_processes_share_one_slug_resolution_per_work_check(self) -> None:
         import stall_watch
-        import showrunners
+        from scripts.production import showrunners
 
         doc = self.root / "showrunner-production.md"
         _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())

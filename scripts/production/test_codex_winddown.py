@@ -16,16 +16,18 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from typing import cast, override
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib.socket_test_support import short_socket_directory
 import broadcast
 import codex_winddown
 import fake_unit_host
 import fake_showrunner
-import showrunners
+from scripts.production import showrunners
 import roster
 from process_table import Process
 from sessions import SessionRecord
-from showrunners import Showrunner
+from scripts.production.showrunners import Showrunner
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
 MESH = "/run/current-system/sw/bin/python3 /home/u/.claude/scripts/direct/../agents/codex_mesh.py"
