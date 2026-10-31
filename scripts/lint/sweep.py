@@ -2428,7 +2428,7 @@ def hold_floor(
         for group, freed in chosen:
             root = tree_targets[group.build_tree]
             taken[root] = taken.get(root, 0) + freed
-        for root, size in sorted(taken.items(), key=lambda item: (-item[1], item[0])):
+        for root, size in taken.items():
             if size:
                 verb = "would take" if dry_run else "took"
                 print(f"lint sweep: the floor {verb} {gib(size)} from {root},"

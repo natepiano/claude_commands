@@ -2691,6 +2691,30 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
         self.assertFalse(older.exists())
         self.assertTrue(scratch.exists())
 
+    def test_floor_report_lists_targets_in_take_order_in_both_modes(self) -> None:
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                base = self.base()
+                now = time.time()
+                targets: list[Path] = []
+                outputs: list[Path] = []
+                for position, name in enumerate(("oldest", "middle", "newest")):
+                    tree, output = cargo_target(base, name, APP, now - (3 - position) * DAY)
+                    _ = output.write_bytes(os.urandom(65536 * (position + 1)))
+                    targets.append(tree.parent)
+                    outputs.append(output)
+                shortfall = sum(sweep.directory_blocks(str(target)) for target in targets)
+
+                status, report = self.hold(base, 10 * GIB, [10 * GIB - shortfall, 10 * GIB], dry_run)
+
+                self.assertEqual(status, 0)
+                verb = "would take" if dry_run else "took"
+                lines = [line for line in report.splitlines()
+                         if line.startswith(f"lint sweep: the floor {verb} ")]
+                self.assertEqual([line.split(" from ", 1)[1].split(", last used ", 1)[0]
+                                  for line in lines], [str(target) for target in targets])
+                self.assertEqual([output.exists() for output in outputs], [dry_run] * 3)
+
     def test_floor_takes_recent_output_when_older_output_cannot_meet_the_floor(self) -> None:
         base = self.base()
         now = time.time()

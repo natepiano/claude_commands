@@ -1078,3 +1078,36 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Gotchas:** `scripts/direct/verify.sh` prints no `is held by` line of its own; the line comes only from `build_targets.py`.
 
 **Ruled out:** a change in `verify.sh` — it has no held-by line to fix.
+
+### Phase 36 — The floor's dry-run lines show the takes in take order, and a suite run from the installed copy stops with one line  · status: done
+**Depends on:** Phase 29 (floor take order, `floor_scan` row); Phase 35 (installed-script guard text in `docs/as-built/build-targets.md`)
+
+**Approved:** builds showrunner 2026-10-31: C643 returns as a small wrong result (item 1); "make the one clear line … one shared check in the test support that every guarded suite imports … do it beside Phase 36, then tell verify" (item 2). The guard stays as built: a copy is the rule (`docs/as-built/build-targets.md` :87, :266).
+
+#### Work Order
+
+**Goal:** (1) The floor's per-target lines say what the floor does: they come in take order, oldest use first, on a dry run and a real run. (2) A guarded test suite run from the installed copy (`~/.claude/scripts`) stops once with one line that says to run it from a checkout, instead of 24 failures that read as breakage.
+
+Measured 2026-10-31 (builds probe `probe_floor_order.py`): a dry run of `hold_floor` on three scratch targets (oldest use smallest, newest largest) printed newest, middle, oldest. The takes and the `floor_scan` row are in take order; only the print sorts by bytes taken, largest first (`scripts/lint/sweep.py` :2432, `sorted(taken.items(), key=lambda item: (-item[1], item[0]))`). Measured 2026-10-31: `python3 -m unittest discover -s scripts/lint -p test_memory_admit.py` run inside `~/.claude` fails 24 of 324 with `memory_gate.sh: BUILD_HOLD_DIR is set to '…'; the installed scripts under /home/natepiano/.claude/scripts do not run with it.`; the same file passes 324 of 324 from a checkout.
+
+**Spec:**
+
+1. **Lines in take order.** In `sweep.py`'s floor report, print one line per target in the order the floor first took from it (the order of `chosen`, which `shrink_floor` returns in take order: least recently used target first), summed per target as now. Keep the line text, the `would take` / `took` verb, the zero-size skip and every other line unchanged. Regression test in `scripts/lint/test_sweep.py`, from the probe's case: three scratch targets, oldest use smallest and newest use largest, a shortfall that takes from all three; assert the three lines come oldest, middle, newest, on a dry run and on a real run. It fails on the current tree.
+2. **One stop for a suite run from the installed copy.** Add one check to `scripts/build_hold/override_guard.py`, beside `refusal()` and `user_home()`, that a test support module calls with its own file: when that file is under `<user_home()>/.claude/scripts` (same file, links followed, the home from the account database as the guard already does), it raises one error at import with one line, `<suite file>: this suite runs from a checkout, not from the installed scripts under <home>/.claude/scripts; run it from a worktree.` A checkout copy passes with no file read beyond the path check. Reuse the guard's own home lookup and installed-path test; write no second copy. It must not skip: a skipped suite reads as passed in a gate, so the stop is an error the run reports.
+   - Wire it into the shared test support that this unit's guarded suites import: `scripts/lint/memory_test_support.py` (reaches `test_memory_admit.py` with no edit there) and `scripts/build_hold/build_hold_test_support.py`. A guarded suite in `scripts/build_hold/`, `scripts/build_targets/` or `scripts/lint/` that sets a variable from `BUILD_OVERRIDE_VARIABLES`, meets the refusal from `~/.claude`, and imports neither module gets one import line of the check. Do not edit `scripts/lint/test_memory_admit.py` (Phase 26 holds it), `scripts/lint/test_invoke_scope.py` (verify-unit owns `invoke.sh` and its routing tests; director ruling 2026-10-31) or any `scripts/direct/`, `scripts/production/`, `scripts/mac_test/` or `scripts/hooks/` file: their owners import the same check after this lands (the notice tells verify).
+   - Tests in `scripts/build_hold/test_override_guard.py`: an installed-path file (a fake account home with a copied `.claude/scripts` tree, as the guard tests already build) raises the one line; a checkout path passes.
+3. **Docs.** `docs/as-built/build-targets.md` (installed-script guard section, the Tests bullet at :266): name the check and its line. `docs/as-built/build-memory-admission.md` :357 ("one line per target that lost output, largest first") becomes take order, oldest use first; the director makes this one-line edit at the checkpoint and stages only its hunk, because Phase 26 holds that file.
+
+**Files:**
+- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py` — item 1.
+- `scripts/build_hold/override_guard.py`, `scripts/build_hold/test_override_guard.py` — item 2, the one check and its tests.
+- `scripts/lint/memory_test_support.py`, `scripts/build_hold/build_hold_test_support.py` — item 2 wiring.
+- `scripts/build_hold/`, `scripts/build_targets/` — item 2 wiring of a guarded suite that imports neither support module.
+- `scripts/lint/test_nextest_budget.py`, `scripts/lint/test_nextest_width.py` — item 2 wiring (and `test_sweep.py` above), only if the suite meets the refusal and imports neither support module.
+- `docs/as-built/build-targets.md` — item 3. `docs/as-built/build-memory-admission.md` :357 — item 3, director edit at checkpoint.
+
+**Workers:** `1 writer + 1 tester`
+
+**Gotchas:** run every suite from the worktree. The installed copy is main's, so a run from `~/.claude` shows the new line only after this lands on main: workers prove item 2 with the fake-account-home tests, and the director runs one wired suite from `~/.claude` as the live try once main carries it.
+
+**Ruled out:** removing or loosening the installed-script guard (builds 2026-10-31: the guard stays); a skip in place of the error.

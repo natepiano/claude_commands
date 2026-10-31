@@ -22,6 +22,11 @@ from unittest import mock
 import build_hold
 import hold_enforcer
 
+from override_guard import require_checkout
+
+require_checkout(Path(__file__))
+
+
 if TYPE_CHECKING:
     from ..direct import step_record
 else:
