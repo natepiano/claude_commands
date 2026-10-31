@@ -46,6 +46,7 @@ from remote import other_machine, run_remote
 import restart_support
 import inventory as stop_work
 import restart as restart_work
+import herdr
 from scripts.shutdown import stop_resume
 import remote_control
 from scripts.whoami import note_file
@@ -447,6 +448,8 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False, re
         owner = saved["session"]
         local[owner["session_id"]] = _SelectableSession(owner["session_id"], owner["name"], saved["machine"])
     if recovery:
+        for entry in restart_work.restart_launches(login, all_accounts=False):
+            local[entry["session_id"]] = _SelectableSession(entry["session_id"], entry["name"], local_machine)
         snapshot = recovery_store.read_snapshot(login)
         if not isinstance(snapshot, recovery_store.NoRecoverySnapshot):
             for item in snapshot["sessions"]:
@@ -744,6 +747,8 @@ def main(arguments: list[str] | None = None) -> int:
     )
     stop_command = commands.add_parser("stop", help="end one local tab's Claude; leave its workers alone")
     _ = stop_command.add_argument("session")
+    down_command = commands.add_parser("down", help="stop local Claude sessions together, retaining them for restart")
+    _ = down_command.add_argument("--only", metavar="ID|NAME[,ID|NAME...]")
     resume_command = commands.add_parser("resume", help="resume a local session in its own tab")
     _ = resume_command.add_argument("session")
     _ = resume_command.add_argument("--why", required=True)
@@ -825,6 +830,12 @@ def _terminal_accounts(options: CommandLine) -> TerminalAccountSelection:
                       for saved in all_session_records()}
         candidates.update({held["login"].casefold(): Account("claude", held["login"], held["label"])
                            for held in all_account_holds()})
+        for entry in restart_work.restart_launches():
+            selected_account = restart_work.launch_account(entry)
+            if isinstance(selected_account, restart_work.FailedSessionRestart):
+                unavailable.append(f"{selected_account.name}: restart failed: {selected_account.reason}")
+                continue
+            candidates[selected_account.login.casefold()] = selected_account
         for snapshot in recovery_store.all_snapshots():
             if snapshot["sessions"]:
                 tool = "codex" if all(item["agent"] == "codex" for item in snapshot["sessions"]) else "claude"
@@ -860,7 +871,7 @@ def _terminal_accounts(options: CommandLine) -> TerminalAccountSelection:
 
 
 def _restart_item_running(item: str) -> bool:
-    """Skip a live session on any account when no shutdown record owns it."""
+    """Skip a live session only when no retained restart source needs dispatch."""
     import sessions
 
     matches = [owner for owner in sessions.live_sessions()
@@ -868,6 +879,8 @@ def _restart_item_running(item: str) -> bool:
     if len(matches) != 1:
         return False
     identity = matches[0]["sessionId"]
+    if restart_work.restart_launches(ids=(identity,)):
+        return False
     if any(saved["session"]["session_id"] == identity for saved in all_session_records()):
         return False
     print(f"{matches[0]['name']}: already running; skipped")
@@ -967,6 +980,18 @@ def _all_accounts(options: CommandLine) -> int:
 
 
 def _dispatch(options: CommandLine) -> int:
+    if options.command == "down":
+        try:
+            outcomes = stop_resume.down(_only_ids(options.only))
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            print(f"shutdown: down failed: {error}", file=sys.stderr)
+            return 1
+        status = 0
+        for outcome in outcomes:
+            print(stop_resume.down_result_line(outcome))
+            if isinstance(outcome, (stop_resume.StopFailed, stop_resume.SessionNotFound)):
+                status = 1
+        return status
     if options.command in {"stop", "resume"}:
         result = (stop_resume.stop(options.session) if options.command == "stop"
                   else stop_resume.resume(options.session, why=options.why, to=options.resume_to))
@@ -989,8 +1014,8 @@ def _dispatch(options: CommandLine) -> int:
         except (InvalidRecord, InvalidInventory, OSError, ValueError) as error:
             print(f"shutdown: {error}", file=sys.stderr)
             return 1
-    if (options.command in {"restart", "status"}
-            and options.account is None and not os.environ.get("CLAUDE_CODE_SESSION_ID")):
+    if (options.command in {"restart", "status"} and options.account is None
+            and (options.command == "restart" or not os.environ.get("CLAUDE_CODE_SESSION_ID"))):
         return _all_accounts(options)
 
     if options.command == "remote-control":

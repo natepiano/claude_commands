@@ -33,6 +33,7 @@ from scripts.shutdown.stop_results import (
     Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
     ClaudeUp as ClaudeUp, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
     SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
+    DownHandedOff as DownHandedOff, DownResult as DownResult, down_result_line as down_result_line,
 )
 import sessions
 if TYPE_CHECKING:
@@ -107,6 +108,80 @@ def stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         except (OSError, ValueError) as error:
             return StopFailed(result.session_id, f"Claude stopped, but its intentional stop could not be saved: {error}")
     return result
+
+
+def down(only: Sequence[str] = ()) -> list[DownResult]:
+    """Stop local Claudes concurrently, retaining explicit restart intent in their launches."""
+    client = herdr.Herdr(herdr.shared_session())
+    entries = pane_record.latest_launches()
+    pane_entries = pane_record.read_strict(client.session)
+    names: dict[str, str] = {}
+    for pane in client.panes():
+        entry = pane_entries.get(pane["pane_id"])
+        identity = pane["session_id"] or (entry["session_id"] if entry is not None else "")
+        if identity and not (entry is not None and entry.get("ended", False)
+                             and not entry.get("restart_after_down", False)):
+            names[identity] = pane.get("label") or identity
+    for entry in entries.values():
+        if entry.get("restart_after_down", False):
+            _ = names.setdefault(entry["session_id"], entry["name"])
+    names.update({entry["sessionId"]: entry["name"] for entry in sessions.running_sessions()})
+    selected: list[str] = []
+    for item in only:
+        candidates = {**{identity: entry["name"] for identity, entry in entries.items()}, **names}
+        matches = [item] if item in candidates else [identity for identity, name in candidates.items() if name == item]
+        if len(matches) != 1:
+            raise ValueError(f"{item}: {'several sessions match' if matches else 'no local session'}")
+        selected.extend(matches)
+    selected = list(dict.fromkeys(selected if only else names))
+    if not selected:
+        return []
+    unmarked = [identity for identity in selected
+                if identity not in entries or not entries[identity].get("restart_after_down", False)]
+    if unmarked:
+        _record_launches(unmarked)
+    prepared: list[str] = []
+    failures: dict[str, StopFailed] = {}
+    for identity in selected:
+        try:
+            entry = pane_record.launch_for_session(identity)
+            if entry is None:
+                raise ValueError("no pane launch entry; cannot retain this session for restart")
+            pane_record.prepare_down(client.session, entry["pane_id"], identity)
+            prepared.append(identity)
+        except (OSError, ValueError) as error:
+            failures[identity] = StopFailed(identity, str(error))
+    if os.environ.get("CLAUDE_CODE_SESSION_ID") in prepared:
+        try:
+            _detach(["down", "--", *prepared], "down")
+            return [failures[identity] if identity in failures else DownHandedOff(identity) for identity in selected]
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            return [failures[identity] if identity in failures else StopFailed(identity, f"cannot hand off down: {error}")
+                    for identity in selected]
+
+    def stop_for_restart(identity: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
+        try:
+            if identity in failures:
+                return failures[identity]
+            entry = pane_record.launch_for_session(identity)
+            if entry is None:
+                return StopFailed(identity, "no pane launch entry; cannot retain this session for restart")
+            live = sessions.session_liveness(identity)
+            if isinstance(live, sessions.SessionLivenessUnknown):
+                return StopFailed(identity, live.reason)
+            if isinstance(live, sessions.SessionNotLive):
+                if not entry.get("ended", False):
+                    pane_record.end(client.session, entry["pane_id"], identity)
+                return NotRunning(identity)
+            result = _stop(identity)
+            if isinstance(result, (Stopped, NotRunning)):
+                pane_record.end(client.session, entry["pane_id"], identity)
+            return result
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            return StopFailed(identity, str(error))
+
+    with ThreadPoolExecutor(max_workers=len(selected)) as pool:
+        return list(pool.map(stop_for_restart, selected))
 
 
 def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
@@ -240,13 +315,22 @@ def resume(session: str, *, why: str, to: str | None = None, requester: str = ""
             identity = tab.session_id
             entry = pane_record.read(client.session).get(tab.pane_id)
         live = sessions.session_liveness(identity)
-        if isinstance(live, sessions.LiveSessionProcess):
-            return ResumeFailed(identity, "Claude is still running")
         if isinstance(live, sessions.SessionLivenessUnknown):
             return ResumeFailed(identity, live.reason)
         if entry is None or entry["session_id"] != identity:
             return ResumeFailed(identity, "pane launch entry does not match the session")
-        if restore_missing and entry.get("ended", False):
+        if isinstance(live, sessions.LiveSessionProcess):
+            if isinstance(tab, SessionNotFound):
+                return ResumeFailed(identity, "running Claude has no matching pane")
+            from scripts.accounts import accounts
+
+            label = accounts.claude_config_label(Path(entry["config_dir"]))
+            if to is not None and to != label:
+                return ResumeFailed(identity, f"Claude is still running on {label}")
+            if entry.get("ended", False) or entry.get("restart_after_down", False):
+                pane_record.resumed(client.session, tab.pane_id, identity)
+            return ClaudeUp(identity, tab.pane_id, label)
+        if restore_missing and entry.get("ended", False) and not entry.get("restart_after_down", False):
             return ResumeFailed(identity, "Claude was closed by hand")
         if not entry.get("flags_read", False):
             return ResumeFailed(identity, "pane launch flags are unknown")
@@ -301,6 +385,7 @@ def resume(session: str, *, why: str, to: str | None = None, requester: str = ""
             generation = sessions.process_start(live.pid)
             if not generation:
                 return ResumeFailed(identity, f"process identity unreadable for pid {live.pid}")
+            pane_record.resumed(client.session, tab.pane_id, identity)
             _detach(["stay", "--session", identity, "--pane", tab.pane_id,
                      "--account", label, "--pid", str(live.pid), "--generation", generation, "--why", why,
                      *(["--requester", requester] if requester else [])], "stay")
@@ -588,6 +673,10 @@ def main(argv: list[str] | None = None) -> int:
     _ = batch.add_argument("--warn-seconds", type=int, default=0)
     _ = batch.add_argument("--log", type=Path, required=True)
     _ = batch.add_argument("sessions", nargs="+")
+    down_batch = commands.add_parser("down")
+    _ = down_batch.add_argument("--requester", default="")
+    _ = down_batch.add_argument("--log", type=Path, required=True)
+    _ = down_batch.add_argument("sessions", nargs="+")
     stay = commands.add_parser("stay")
     for option in ("session", "pane", "account", "generation"):
         _ = stay.add_argument("--" + option, required=True)
@@ -599,6 +688,12 @@ def main(argv: list[str] | None = None) -> int:
     # Even a directly invoked batch must not hand itself off a second time.
     _ = os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
     log = cast(Path, args.log)
+    if cast(str, args.command) == "down":
+        with log.open("a", encoding="utf-8") as output:
+            outcomes = down(cast(list[str], args.sessions))
+            for outcome in outcomes:
+                _ = output.write(down_result_line(outcome) + "\n")
+        return int(any(isinstance(outcome, (StopFailed, SessionNotFound)) for outcome in outcomes))
     if cast(str, args.command) == "stay":
         with log.open("a", encoding="utf-8") as output, redirect_stdout(output):
             cause = _check_stay(cast(str, args.session), cast(str, args.pane), cast(str, args.account),

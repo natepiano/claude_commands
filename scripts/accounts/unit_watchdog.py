@@ -95,6 +95,11 @@ class RecoverySource:
     identity: str
 
 
+@dataclass(frozen=True)
+class IntentionallyStoppedUnit:
+    """The newest launch forbids watchdog recovery until an explicit resume."""
+
+
 def _state_file() -> Path:
     return Path.home() / ".local/state/accounts/unit_watchdog.json"
 
@@ -154,8 +159,8 @@ def _write_state(state: dict[str, DownOutage]) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> dict[tuple[str, str], RecoverySource]:
-    sources: dict[tuple[str, str], RecoverySource] = {}
+def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> dict[tuple[str, str], RecoverySource | IntentionallyStoppedUnit]:
+    sources: dict[tuple[str, str], RecoverySource | IntentionallyStoppedUnit] = {}
     newest: dict[tuple[str, str], pane_record.PaneLaunch] = {}
     for entry in sorted(pane_record.launches(), key=lambda item: item["written_at"]):
         marks = entry["environment"]
@@ -166,7 +171,8 @@ def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> d
         # The newest launch also records an intentional /exit. It supersedes older entries.
         newest[key] = entry
     for key, entry in newest.items():
-        if entry.get("ended", False):
+        if entry.get("ended", False) or entry.get("restart_after_down", False):
+            sources[key] = IntentionallyStoppedUnit()
             continue
         production, unit = key
         try:
@@ -188,7 +194,8 @@ class ResumeUnit(Protocol):
 def _restart(label: str, identity: str, source: str) -> str:
     """Resume only the launch that was queued; a changed launch cancels stale work."""
     try:
-        current = next((item for item in _sources().values() if item.session["session_id"] == identity), None)
+        current = next((item for item in _sources().values()
+                        if isinstance(item, RecoverySource) and item.session["session_id"] == identity), None)
         if current is None or current.identity != source or current.label != label:
             return "unit pane launch changed; recovery refused"
         live = sessions.session_liveness(identity)
@@ -337,6 +344,8 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                                     lines.append(showrunners.tell(runner["slug"], f"unit-watchdog-{claude.session_id}-{now.isoformat()}", text))
                                 continue
                         source = sources.get((runner["slug"], unit))
+                        if isinstance(source, IntentionallyStoppedUnit):
+                            continue
                         if source is None:
                             for key, outage in state.items():
                                 context = outage.get("alert_context")

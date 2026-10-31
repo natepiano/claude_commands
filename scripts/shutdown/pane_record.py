@@ -68,6 +68,7 @@ class PaneLaunch(TypedDict):
     # False when the launch flags could not be read: a restore refuses it.
     flags_read: bool
     ended: NotRequired[bool]
+    restart_after_down: NotRequired[bool]
     written_at: str
 
 
@@ -121,10 +122,12 @@ def launches() -> list[PaneLaunch]:
 
 def launch_for_session(session_id: str) -> PaneLaunch | None:
     """Read a conversation's newest launch, including account moves and intentional exits."""
-    matches = [entry for entry in launches() if entry["session_id"] == session_id]
-    if not matches:
-        return None
-    return max(matches, key=lambda entry: entry["written_at"])
+    return latest_launches().get(session_id)
+
+
+def latest_launches() -> dict[str, PaneLaunch]:
+    """One current launch per conversation, including moves and intentional exits."""
+    return {entry["session_id"]: entry for entry in sorted(launches(), key=lambda item: item["written_at"])}
 
 
 @contextmanager
@@ -151,15 +154,39 @@ def write(session: str, launch: PaneLaunch) -> None:
         _save(session, entries)
 
 
+def prepare_down(session: str, pane_id: str, session_id: str) -> None:
+    """Persist restart intent before a signal, without claiming that Claude has exited."""
+    with _locked(session):
+        entries = read_strict(session)
+        entry = entries.get(pane_id)
+        if entry is None or entry["session_id"] != session_id:
+            raise ValueError(f"{session_id}: pane launch changed before its down intent could be saved")
+        if not entry.get("restart_after_down", False):
+            entry["restart_after_down"] = True
+            _save(session, entries)
+
+
 def end(session: str, pane_id: str, session_id: str) -> None:
     """Mark the pane's entry ended when it is still this conversation's."""
     with _locked(session):
-        entries = read(session)
+        entries = read_strict(session)
         entry = entries.get(pane_id)
         if entry is None or entry["session_id"] != session_id:
             return
         entry["ended"] = True
         _save(session, entries)
+
+
+def resumed(session: str, pane_id: str, session_id: str) -> None:
+    """Clear intentional-stop marks only for the conversation confirmed running here."""
+    with _locked(session):
+        entries = read_strict(session)
+        entry = entries.get(pane_id)
+        if entry is not None and entry["session_id"] == session_id:
+            entry["ended"] = False
+            _ = entry.pop("restart_after_down", None)
+            entry["written_at"] = datetime.now(timezone.utc).isoformat()
+            _save(session, entries)
 
 
 def forget_unit(unit_id: str) -> list[str]:

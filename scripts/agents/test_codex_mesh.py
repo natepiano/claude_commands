@@ -9785,7 +9785,7 @@ if script.endswith('remove_workers.py'):
             pathlib.Path(os.environ['FIXTURE_REAPS']).write_text('implicit sweep')
             return remove_workers.subprocess.CompletedProcess(command, 1)
         return invoke(command, *args, **kwargs)
-    with patch.object(remove_workers.subprocess, 'run', no_implicit_sweep), patch.object(remove_workers, 'DEFAULT_ROOTS', (pathlib.Path(os.environ['FIXTURE_RUN']).parent,)), patch.object(remove_workers, 'list_sessions', return_value=[]), patch.object(remove_workers, 'shutdown_held_sessions', return_value={'kind': 'held sessions', 'session_ids': set()}):
+    with patch.object(remove_workers.subprocess, 'run', no_implicit_sweep), patch.object(remove_workers, 'DEFAULT_ROOTS', (pathlib.Path(os.environ['FIXTURE_RUN']).parent,)), patch.object(remove_workers, 'list_sessions', return_value=[]):
         raise SystemExit(remove_workers.main())
 if script.endswith('codex_mesh.py'):
     def reap(pid):

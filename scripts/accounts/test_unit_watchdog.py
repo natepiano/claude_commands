@@ -358,7 +358,9 @@ class UnitWatchdogTests(unittest.TestCase):
     def queued_unit(self) -> unit_watchdog.RecoverySource:
         _ = self.add_unit("alpha")
         self.die("alpha")
-        return unit_watchdog._sources()[("fixture", "alpha")]  # pyright: ignore[reportPrivateUsage]
+        source = unit_watchdog._sources()[("fixture", "alpha")]  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(source, unit_watchdog.RecoverySource)
+        return source
 
     def test_newest_moved_launch_decides_recovery_account_after_one_tick(self) -> None:
         _ = self.add_unit("alpha")
@@ -451,6 +453,7 @@ class UnitWatchdogTests(unittest.TestCase):
         entry["config_dir"] = str(accounts.account_dir("claude2"))
         pane_record.write("shared", entry)
         source = unit_watchdog._sources()[("fixture", "alpha")]  # pyright: ignore[reportPrivateUsage]
+        assert isinstance(source, unit_watchdog.RecoverySource)
         failure, launches = self.recover_queued(source)
         self.assertEqual(failure, "")
         self.assertEqual(len(launches), 1)
@@ -460,13 +463,15 @@ class UnitWatchdogTests(unittest.TestCase):
     def test_queued_recovery_refuses_a_changed_or_ended_pane_launch(self) -> None:
         source = self.queued_unit()
         original = pane_record.read("shared")["alpha"]
-        for change in ("written_at", "ended", "account", "cwd"):
+        for change in ("written_at", "ended", "restart_after_down", "account", "cwd"):
             with self.subTest(change=change):
                 entry = original.copy()
                 if change == "written_at":
                     entry["written_at"] = (NOW + timedelta(days=100)).isoformat()
                 elif change == "ended":
                     entry["ended"] = True
+                elif change == "restart_after_down":
+                    entry["restart_after_down"] = True
                 elif change == "account":
                     entry["config_dir"] = str(accounts.account_dir("claude2"))
                 else:
@@ -837,6 +842,45 @@ class UnitWatchdogTests(unittest.TestCase):
         _ = self.pass_at(4)
         self.assertEqual(self.commands, [["resume", "standing", "--to", "claude4", "--only", "standing"]])
         self.assertEqual({entry["sessionId"] for entry in self.fixture.live}, {"standing"})
+        self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
+
+    def test_down_intent_without_ended_mark_prevents_recovery_until_live_restart_reconciles(self) -> None:
+        _ = self.add_unit("alpha")
+        entry = pane_record.read("shared")["alpha"]
+        entry["restart_after_down"] = True
+        pane_record.write("shared", entry)
+        self.die("alpha")
+        self.assertEqual(self.pass_at(0), [])
+        self.assertEqual(self.pass_at(2), [])
+        self.assertEqual(self.pass_at(4), [])
+        self.assertEqual(self.pending, [])
+        self.assertEqual(self.commands, [])
+        pane_record.resumed("shared", "alpha", "alpha")
+        _ = self.pass_at(6)
+        _ = self.pass_at(8)
+        _ = self.pass_at(10)
+        self.assertEqual(len(self.commands), 1)
+
+    def test_down_ends_a_unit_launch_and_watchdog_leaves_it_closed(self) -> None:
+        _ = self.add_unit("alpha")
+        with (patch.object(stop_resume, "_record_launches"),
+              patch.object(herdr, "shared_session", return_value="shared"),
+              patch.object(herdr.Herdr, "panes", return_value=[herdr.PaneIdentity(
+                  pane_id="alpha", workspace_id="w1", label="alpha", session_id="alpha")]),
+              patch.object(sessions, "running_sessions", return_value=[]),
+              patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped("alpha", 123)) as stopped):
+            outcomes = stop_resume.down(["alpha"])
+        self.assertEqual(outcomes, [stop_resume.Stopped("alpha", 123)])
+        stopped.assert_called_once_with("alpha")
+        entry = pane_record.read("shared")["alpha"]
+        self.assertIs(entry.get("ended"), True)
+        self.assertTrue(entry.get("restart_after_down", False))
+        self.die("alpha")
+        self.assertEqual(self.pass_at(0), [])
+        self.assertEqual(self.pass_at(2), [])
+        self.assertEqual(self.pass_at(4), [])
+        self.assertEqual(self.pending, [])
+        self.assertEqual(self.commands, [])
         self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
 
     def test_user_stop_retired_finished_and_in_progress_units_are_not_restarted(self) -> None:
