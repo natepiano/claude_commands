@@ -63,94 +63,43 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 
 ## Phases
 
-### Phase 0 — The builds merge keeps report-unit's head times on queue-unit's new admission reader  · status: todo
+### Phase 0 — The builds merge keeps report-unit's head times on queue-unit's new admission reader  · status: done
+**Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** the phase-start merge of origin/builds 50c45192 lands with report-unit's unlanded phase 8 (b261673a: head times, cargo-token waits, sccache rows) ported into queue-unit's refactored admission reader, so the showrunner can merge builds-report without a conflict.
-
-**Spec:**
-- Keep queue-unit's structure (`exclusive_queue`, `gather_queue_inputs` → `QueueInputs` → `queue_read_from`, the lock-free snapshot) as the base. Port `head_since` and its write under the admission lock onto it, with one live-row ordering. Keep the cargo-token left and back times in `memory_gate.sh`.
-- Keep every test from both sides. Merge both sides' as-built text so it matches the merged code.
+- The phase-start merge of origin/builds is in the branch. report-unit's phase 8 work (head times, cargo-token waits, sccache rows) sits on queue-unit's lock-free admission reader (`exclusive_queue`, `gather_queue_inputs` → `QueueInputs` → `queue_read_from`).
+- `queue_rows()` owns the one waiter order. `write_head_since()` writes `head_since` and runs under the admission lock.
+- `memory_gate.sh` keeps the cargo-token left and back times.
+- The tests of both sides stay. The suite runs 514 tests and they pass; basedpyright reads 0 errors, 0 warnings, 0 notes.
 
 **Files:**
-- `scripts/lint/memory_admit.py`
-- `scripts/lint/memory_gate.sh`
-- `scripts/lint/test_memory_admit.py`
-- `scripts/build_queue/test_build_queue.py`
-- `scripts/build_queue/test_build_why.py`
-- `docs/as-built/build-memory-admission.md`
-- `docs/as-built/unit-board.md`
-
-**Workers:** impl3 writes `memory_admit.py`, `memory_gate.sh` and the two as-built docs. test2 writes `test_memory_admit.py`, `test_build_queue.py` and `test_build_why.py`.
-
-**Acceptance gate:**
-- No conflict markers remain.
-- `python3 -m unittest scripts.lint.test_memory_admit scripts.build_queue.test_build_queue scripts.build_queue.test_head_facts scripts.build_queue.test_build_why` passes.
-- `basedpyright` on each slot's Python files reads 0 errors, 0 warnings, 0 notes.
+- `scripts/lint/memory_admit.py` — the admission reader, with `queue_rows()` and `write_head_since()`
+- `scripts/lint/memory_gate.sh` — cargo-token left and back times
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_queue/test_build_why.py` — both sides' tests
+- `docs/as-built/build-memory-admission.md`, `docs/as-built/unit-board.md` — the merged as-built text
 
 ### Phase 1 — The build report compares build rates before and after each build moment  · status: done
+**Depends on:** Phase 0
 
-#### Work Order
+#### As-built
 
-**Goal:** one command answers whether the new build rules cut build load. It prints per-day rates before and after Moment 1 (and Moment 2 when it lands), split at every natedev build event, the floor sweep and every power profile change, with the clone rebuilds on their own rows. It uses the comparison the Power profile section uses today; that section becomes the general one.
-
-**Spec:**
-- **One list of moments.** A new module `scripts/buildlog/moments.py` holds `MOMENTS`, a typed tuple. Each moment has:
-  - its UTC instant;
-  - a short name;
-  - a scope (`all` or `hana`);
-  - an optional typed sdlc baseline, for a moment that carries quoted "before" or "after" figures.
-
-  Entries:
-
-  | Moment | Time | Scope |
-  | --- | --- | --- |
-  | herdr cgroup move | 2026-10-28 09:01 EDT | all |
-  | baloo content indexing off | 2026-10-28 09:24 EDT | all |
-  | hana opt-level 1 | 2026-10-29 02:59 EDT | hana |
-  | hana Bevy dylib | 2026-10-29 05:33 EDT | hana |
-  | Floor sweep (e3b8e391) | 2026-10-29 14:26 EDT | all |
-  | Build rules 1 (Moment 1) | 2026-10-31 06:50 EDT | all |
-
-  Moment 1 carries sdlc's figures for the week before it: run hours 708, hana 595; wait hours 2125, hana 1329; hana nextest 246/day, 16% reruns, 46% queue-hidden repeats, 62% failed; hana clippy 160/day; load ratios 12.9 nextest and 8.4 clippy per phase (134 phases); same-worker reruns after a pass 221 runs and 33.3 h, fail then fail 50–55 h; clone rebuilds 805 runs, 231 of 327 nextest hours. The floor sweep carries sdlc's clone repeat figures: 52.7% before, 29.8% after, 124 clone rebuilds after. Moment 2 is added as one entry when its hash lands. Power profile changes stay observed from `samples` (`profile_changes`) and merge into the same ordered list at read time. Nothing else lists moments.
-- **One hana set.** `moments.py` holds the one definition of the hana set, sdlc's SQL: a step is hana when its repo, repo_path, repo_identity, cwd, worktree, branch, target_folder, argv or build_base contains `hana`, `tool-based-ui`, `catalyst` or `fairy_dust` (case-insensitive); or when its repo is not cargo-liner, cargo-handler, cargo-tile, cargo-berth, bevy_brp or .claude, and its session or unit_session is majority-hana, or its call is a hana call. The exact SQL is in the run's `phases/1/sdlc_recheck.sql` (view `nat`); copy its predicate, with the window as a parameter. Sessions and calls are classified over the window being measured. Every rate row and every window uses this one set. The report names it once.
-- **One comparison.** Generalize `power_profile_section` into one section, `### Before and after`, over the merged list, newest first. Keep today's per-kind p50 table for each moment as it is: kind, caller, rebuild class, runs and p50 on each side, and Change with `MIN_PROFILE_RUNS`. Keep its window rule: before = 7 days, cut at the previous moment; after = up to the next moment or the report end. No second copy of the window logic.
-- **Rates per window.** For each moment, add a rates table beside the p50 table, with Before/day, After/day and Change. Rows (hana rows use the hana set; a hana-scoped moment shows hana rows only):
-  1. run hours, all and hana; wait hours (`mem_wait_s`), all and hana;
-  2. hana nextest steps per day and % failed (`status <> 0`);
-  3. reruns: % of hana nextest steps whose start is 0–10 min after the previous nextest step's end in the same folder (cwd without `/target/verify-doc`);
-  4. queue-hidden repeats: % of hana nextest steps whose submit (start − `mem_wait_s`) is at most 600 s after the previous nextest step's end in the same folder, with a different call_id;
-  5. same-worker reruns: hana nextest steps whose submit is at most 60 min after the previous nextest step's end in the same session. Two rows: after a pass (both passed), runs/day and hours/day; fail then fail (both failed), runs/day and hours/day;
-  6. hana clippy steps per day;
-  7. load ratios: hana nextest steps and hana clippy steps in the window, each over the natedev `phase_finished` events in the window whose working_dir matches the hana set's name patterns;
-  8. clone rebuilds, on their own rows: hana nextest steps with `crates_compiled >= 300` per day, their nextest hours per day, and clone repeats: % of clone rebuilds whose previous nextest step in the same session was also a clone rebuild that ended at most 4 h before.
-- **Definitions.** Print each definition once under the section: natedev only; the hana set (named, in one line); run hours count every step kind, sweep included; each rate row's definition above; phases come from natedev's progress history only, and the Mac's phases are not counted; per-day = total ÷ window days. A window shorter than 1 day prints `thin` beside its rates.
-- **sdlc's figures.** For Moment 1, also print the 7-day baseline before it. Wherever an sdlc figure exists for a row, print it beside ours as `ours (sdlc N)` when they differ by more than 5% (relative). Under the table, print one note: fail then fail differs (ours about 80 h, sdlc 50–55 h); load ratios differ because sdlc's 134 phases include the Mac.
-- **On demand.** Add `buildlog moments [YYYY-MM-DD]` to print only this section; it is fast and reads the index read-only. `buildlog report` prints the same section in place of Power profile. No timer and no notifier.
+- `scripts/buildlog/moments.py` is the one place for build moments and the hana set:
+  - `MOMENTS` holds 6 fixed moments (herdr cgroup move, baloo off, hana opt-level 1, hana Bevy dylib, the floor sweep, Build rules 1). Moment 1 carries sdlc's week baseline; the floor sweep carries sdlc's clone repeat figures. Moment 2 is one new `MOMENTS` entry when its hash lands.
+  - `HANA_CTE` is the one hana set: sdlc's `nat` predicate, with sessions and calls classified over each measured window, natedev only.
+  - `MetricKey` names each metric; `RATE_ROWS` lists the rate rows.
+  - `window_rates(connection, start, end, *, phases=())` makes one SQL population read and one Python pass for every row. A step with a NULL session or cwd counts in the totals but never pairs.
+  - `phase_events()` reads `unit_runs.history_root()/runs`, natedev only.
+  - `comparison_windows(moments, end)` is the one window rule: before = 7 days, cut at the previous moment; after = up to the next moment or the report end. A fixed moment shows while its after window reaches into the last 7 days. Observed profile changes keep the 7-day rule.
+- `report.py`: `moments_section()` prints `### Before and after` and replaces the Power profile section in `buildlog report`. `report_end(day, now)` = min(now, day end), and `ci_freshness` uses it too. Each moment keeps the p50 table and adds a rates table. sdlc's figure prints beside ours when the two differ by more than 5%. The definitions and notes print once.
+- `cli.py`: `buildlog moments [YYYY-MM-DD]` prints only that section, read-only, in about 2-4 s.
+- Over sdlc's window 2026-10-24T10:40:20Z..2026-10-31T10:33:06Z the live numbers match the recheck within 1%: hana wait 1328.75 h, clippy 160.5/day, 1723 nextest / 1123 clippy steps, reruns 16.19%, queue-hidden 45.73%, after a pass 218 runs / 33.72 h.
 
 **Files:**
-- `scripts/buildlog/moments.py`
-- `scripts/buildlog/report.py`
-- `scripts/buildlog/cli.py`
-- `scripts/buildlog/test_moments.py`
-- `scripts/buildlog/test_report.py`
+- `scripts/buildlog/moments.py` — moments, hana set, rate rows, windows, phase events
+- `scripts/buildlog/report.py` — `moments_section`, `report_end`
+- `scripts/buildlog/cli.py` — `buildlog moments`
+- `scripts/buildlog/test_moments.py` — fixture tests for moments, the hana set, rates and windows
+- `scripts/buildlog/test_report.py` — the Before and after section in the report
 
-**Workers:** impl3 writes `moments.py`, `report.py` and `cli.py`. test2 writes `test_moments.py` and the `test_report.py` changes.
-
-**Acceptance gate:**
-- `basedpyright` on each slot's files reads 0 errors, 0 warnings, 0 notes.
-- `python3 -m unittest scripts.buildlog.test_moments scripts.buildlog.test_report` passes, with fixture indexes and a fixture progress history that cover:
-  - the merge of a profile change into the moment order;
-  - the hana set: a direct match, a majority-hana session, a hana call, and an excluded repo;
-  - each rate row, each definition, `thin`, and `ours (sdlc N)`;
-  - the cut at the previous moment;
-  - the clone rows and clone repeats;
-  - a hana-scoped moment, which shows hana rows only.
-- Live check by the director: `buildlog moments` on natedev prints, for sdlc's window (2026-10-24T10:40:20Z to 2026-10-31T10:33:06Z) read through the same functions, within 1% of the recheck: hana wait 1329.0 h; hana clippy 160.4/day; 1724 hana nextest and 1123 hana clippy steps; reruns 16.2%; queue-hidden repeats 45.8%; same-worker after a pass 218 runs and 33.7 h. It finishes in under 5 s.
-
-**Constraints:**
-- Workers make no worktree commits.
-- Tests never read the live index or progress history, and never write either.
-- Tests run with `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD`.
-- Build rules from 2026-10-31: fix every failure you can see before you rerun, and do not run a test after each small edit. After a pass, do not run again until your edits are done. Run basedpyright once, at the end.
+**Ruled out:** a one-line moment heading — it would change 4 existing assertions.
