@@ -219,38 +219,28 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 **Ruled out:** an id-list cap in text output; renaming the recorded "(N times)" text in measure.py.
 
 ### Phase 6c — A later push never changes a closed window's Hana merge count  · status: done
-**Depends on:** Phase 6b's checkpoint.
 
-#### Work Order
+#### As-built
 
-**Goal:** `measure.py` counts the merges on the Hana trunk (`origin/init/catalyst`) along the trunk's own path, so a later fast-forward onto a unit checkpoint never changes a closed window's count (change row C616).
-
-**Hana link:** direct. The Hana merge rate is the measure Phase 6 judges each trial step by.
-
-**Spec:**
-- Defect: `read_hana_merges` runs `git log --first-parent --merges origin/init/catalyst`. At 2026-10-30 16:58 EDT a push fast-forwarded the trunk onto a unit checkpoint (`13d66b20c7`, first parent on the unit's own branch; the trunk tip `cac4a24bc4` is the second parent of `5a4499be53`). From the new tip, first parent walks the unit's `merge(...): init/catalyst at …` commits. `compare --after 2026-10-23T17:37:00+00:00..2026-10-30T17:37:00+00:00` gave 20 merges at the `cac4a24bc4` tip and 15 at later tips.
-- The trunk path: read the recorded tips of `refs/remotes/origin/init/catalyst` from its reflog, newest first (`git reflog show --format=%H%x09%gD …` or `git log -g`), and drop repeats. Walk from the current tip toward the next older recorded tip. At each commit take the first parent when the older tip is that parent or its ancestor; otherwise take the other parent that holds the older tip. When the older tip is reached, go on toward the next one. When no recorded tip is older, follow first parent to the root. A recorded tip that is not an ancestor of the newer one (a force push) is skipped.
-- Cost: one `git rev-list --ancestry-path <older>..<newer>` per pair of recorded tips gives the commits the walk may take; one `git log --format=%H %P %cI` read gives parents and times. No `git merge-base` call per commit. The pass over a 90-day history stays under 2 s on natedev.
-- The merges counted are the merge commits on the trunk path. `HanaMerge` and every reader of it (`merge_flow`, `receipt_rows`, `compare`) keep their types.
-- The `Hana merges` source text names the limit: `trunk path from <N> recorded tips back to <oldest tip time>; first parent before that; git expires reflog entries after 90 days`. With no reflog, the source says `no recorded tips; first parent only` and the count is first parent as today.
-- `merge_receipts.jsonl` is not a source here: it holds no Hana trunk receipt and starts 2026-10-29. No second record of merges is written.
+- `walk_hana_trunk` counts the merges on the Hana trunk (`origin/init/catalyst`) along the trunk's own path. A later fast-forward onto a unit checkpoint does not change a closed window's count.
+- The walk reads the recorded tips from the trunk reflog, newest first, and drops repeats. It runs one `git log --topo-order` and one `git rev-list --ancestry-path` per tip pair. Between two tips it takes the first parent when that parent is in the ancestry set, else the other parent. It skips a tip that is not an ancestor of the newer tip (a force push). Before the oldest recorded tip it follows the first parent.
+- `HanaTrunkMerges` is a frozen value: a `merges` tuple of `HanaMerge` and a `source` text. `read_hana_merges` calls `walk_hana_trunk`. `merge_flow` and `receipt_rows` read its source.
+- The source text is `...; no fetch; trunk path from <N> recorded tips back to <oldest tip time>; first parent before that; git expires reflog entries after 90 days`. With no reflog it is `no recorded tips; first parent only`.
+- Live on natedev, `compare --before 2026-10-13T17:24..2026-10-20T17:24 --after 2026-10-23T17:37Z..2026-10-30T17:37Z` prints before 15.0/week, after 20.0/week. The read takes 0.27 s.
 
 **Files:**
-- `scripts/hierarchies/measure.py` — `read_hana_merges`, the trunk path walk, the `Hana merges` source text
-- `scripts/hierarchies/test_measure.py` — the fast-forward fixture and its tests
+- `scripts/hierarchies/measure.py` — `walk_hana_trunk`, `HanaTrunkMerges`, `HanaMerge`, the merge row source text
+- `scripts/hierarchies/test_measure.py` — a Git fixture helper; tests for a fast-forward onto a unit checkpoint, a force push, repeated tips and no reflog
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `measure.py`: the trunk path walk and the source text
-- `test` — `test_measure.py`: a temporary Git repository with a trunk ref and its reflog, a unit branch that merges the trunk in, and a fast-forward of the trunk onto the unit checkpoint. The window count is the same before and after the fast-forward. Also: a skipped force-push tip, no reflog (first parent and its source text), and the source text naming the tip count and oldest tip time.
+**Binds later work:** The review compare reads Hana merges through the trunk walk. Results quote the merge row's source as printed: the recorded tip count, the oldest tip time and the 90-day reflog limit. The source is made per run and is not stored.
 
-**State:** none.
-
-**Constraints from prior phases:** as Phase 6b. `codex_mesh.py` is models-unit's file; this phase never edits it.
-
-**Acceptance gate:** the fixture tests pass; on natedev `~/.claude/scripts/lib/py <tree>/scripts/hierarchies/measure.py compare --before 2026-10-13T17:24..2026-10-20T17:24 --after 2026-10-23T17:37:00+00:00..2026-10-30T17:37:00+00:00` prints `after: 20.0/week` for Hana merges; unit tests, per-slot `basedpyright` (`0 errors, 0 warnings, 0 notes`) and merge gate green.
+**Gotchas:**
+- The Hana repo is read only: no fetch, gc or ref writes.
+- Reflog entries expire after 90 days. The local reflog starts 2026-10-30 08:30 EDT, so older windows follow the first parent.
+- `merge_receipts.jsonl` holds no Hana trunk receipts and starts 2026-10-29. It cannot replace the walk.
 
 ### Phase 6 — The four-week review: which waits slow Hana, which links helped, and which trial steps stay  · status: todo
-**Depends on:** Phase 6a's checkpoint (`compare`), and the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), Phase 15's checkpoint (`compare` prints through its `blocks`), and four weeks from the experiment start in design doc Step 2: the first day on which each holder producer (builds' `verify.sh`, models-unit's `codex_mesh.py`) has recorded a `NamedHolder`, read live from `progress_history.py waits`. At Phase 10's checkpoint (bece20e1) neither had, and Step 2 says `start not set`; the unit director sets the start and the review date when both have. Also models-unit's checkpoint that adds `codex_mesh.py end --cleanup-only` (routed from Phase 6a), merged into sdlc, and one `worker_owners.py end` run after that merge: until then every cleanup retry exits 2, so `end_cleanup_pending` counts the missing flag, not a held worker. The phase starts on the latest of these dates, never before.
+**Depends on:** Phase 6a's checkpoint (`compare`), Phase 6c's checkpoint (the Hana trunk walk), and the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), Phase 15's checkpoint (`compare` prints through its `blocks`), and four weeks from the experiment start in design doc Step 2: the first day on which each holder producer (builds' `verify.sh`, models-unit's `codex_mesh.py`) has recorded a `NamedHolder`, read live from `progress_history.py waits`. At Phase 10's checkpoint (bece20e1) neither had, and Step 2 says `start not set`; the unit director sets the start and the review date when both have. Also models-unit's checkpoint that adds `codex_mesh.py end --cleanup-only` (routed from Phase 6a), merged into sdlc, and one `worker_owners.py end` run after that merge: until then every cleanup retry exits 2, so `end_cleanup_pending` counts the missing flag, not a held worker. The phase starts on the latest of these dates, never before.
 
 #### Work Order
 
@@ -279,7 +269,7 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 
 **State:** none.
 
-**Constraints from prior phases:** as Phase 6a, plus the As-builts of Phases 6a and 6b. In `--full` text a table heading names its common window and source once, and a collapsed wait row's n counts phases or waits, with every id in its source. Results quotes `compare`'s markers as printed: an unknown saved snapshot stays `not recorded`; a `RowsSkipped` problem keeps the good counts and adds `; incomplete: N rows skipped`; a `SourceUnreadable` problem keeps its unavailable-source reason. `codex_mesh.py` is models-unit's file; this phase never edits it.
+**Constraints from prior phases:** as Phase 6a, plus the As-builts of Phases 6a, 6b and 6c. Results quotes the Hana merges row's source as printed: the recorded tip count, the oldest tip time and the 90-day reflog limit (before that tip the count follows the first parent). In `--full` text a table heading names its common window and source once, and a collapsed wait row's n counts phases or waits, with every id in its source. Results quotes `compare`'s markers as printed: an unknown saved snapshot stays `not recorded`; a `RowsSkipped` problem keeps the good counts and adds `; incomplete: N rows skipped`; a `SourceUnreadable` problem keeps its unavailable-source reason. `codex_mesh.py` is models-unit's file; this phase never edits it.
 
 **Acceptance gate:** Results holds real numbers for each step, judged on the measure and review point each of Phases 3–5 names; the F007 and unknown saved value tests pass on rendered `compare` output; unit tests, per-slot `basedpyright` (`0 errors, 0 warnings, 0 notes`) and merge gate green when code changed. **Measure and review point:** this phase is the review point for Steps 1, 2 and 4. Step 4's keep-or-drop reads `worker_owners.py report` `end_cleanup_pending` and the cleanup outcomes in `ends.jsonl` beside the ownerless-worker count: a worker ended with its cleanup still pending is not released capacity. At phase end the unit director sends the showrunner the Results and the keep-or-drop list as one question for the user.
 
