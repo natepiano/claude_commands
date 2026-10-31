@@ -217,6 +217,15 @@ As built (b20effdf, on origin/builds e2773be6, 2026-10-31; builds showrunner, ur
 **Goal:** merge `origin/builds` into builds-queue. Phase 4 (930fd7ea, the one decision pass) is not on builds yet, and resources Phase 26 landed first, so this branch carries Phase 26's changes into Phase 4 under option B (one copy each): no head_since, queue order from `priority_rank`, the bump runs `priority set`, the waiter row stays during a token wait. Conflicts: `memory_admit.py`, `queue_view.py`, `test_queue_view.py`, `test_queue_card.py`, `golden/card_4.txt`.
 **Acceptance:** test_memory_admit, the build_queue modules and their callers pass; basedpyright clean on changed files.
 
+### Phase 4e — unit_marks.py is session_staff.py, and rca reads the one showrunner mark  · status: todo
+**Depends on:** none. Builds showrunner ask, 2026-10-31.
+
+#### Work Order
+
+**Goal:** `scripts/production/unit_marks.py` matches a running session to its staff row; its name says something else. Rename it to `session_staff.py` and update every importer, test and doc, with no wrapper and no old name. `scripts/message/rca.py:74` keeps its own copy of `PRODUCTION_MARK`; it imports the one definition instead. The doc line "Staff identity joins and unit marks" says "Matching a running session to its staff row".
+**Files:** `scripts/production/` (the module, its importers and tests), `scripts/herdr/` (herdr.py and its tests), `scripts/message/` (unit_labels.py, rca.py and their tests), `docs/as-built/herdr-adoption.md`, `docs/as-built/session-roster.md`.
+**Acceptance:** `git grep unit_marks` finds nothing; every importer's tests pass; basedpyright clean on changed files.
+
 ### Phase 5 — The queue service, its socket protocol and its client exist and pass in-process tests; no build uses them yet  · status: todo
 **Depends on:** Phase 4
 **Blocked by:** none. This phase adds files only and changes no caller and no admission (builds showrunner, 2026-10-31).
