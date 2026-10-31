@@ -290,8 +290,11 @@ class LifecycleTestClock:
     monotonic_seconds: float = 0.0
 
     def freeze(self) -> None:
-        self.wall_seconds = self.time()
-        self.monotonic_seconds = self.monotonic()
+        # Whole-second seeds keep scripted deadlines exact. A fractional seed
+        # rounds (seed + 600) - seed to 599.9999999999999 for about one seed in
+        # ten while the monotonic clock is small, as it is after a reboot.
+        self.wall_seconds = float(int(self.time()))
+        self.monotonic_seconds = float(int(self.monotonic()))
         self.controlled = True
 
     def advance(self, seconds: float) -> None:
