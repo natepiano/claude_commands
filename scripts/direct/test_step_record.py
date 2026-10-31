@@ -5,15 +5,17 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
+import shlex
 import tempfile
 import socket
 import subprocess
 import sys
-from typing import cast
+from typing import cast, override
 import unittest
 from unittest.mock import patch
 
 from scripts.direct import step_record as steps
+from scripts.direct.verify_token_wait_test_support import VerifyTokenWaitFixture
 
 
 class StepRecordTests(unittest.TestCase):
@@ -136,6 +138,63 @@ runpy.run_path(sys.argv[0], run_name="__main__")
                 self.assertTrue(steps.consume_stopped_build("call", consumed))
                 self.assertFalse(steps.consume_stopped_build("call", consumed))
                 self.assertFalse(steps.consume_stopped_build("unrelated", root / "unused"))
+
+
+class VerifyDarwinStepRecordTests(VerifyTokenWaitFixture):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.environment["VERIFY_PROC_ROOT"] = str(self.root / "no-proc")
+        self.environment["TEST_RECORDED_STEP"] = str(self.root / "recorded-step.json")
+        launcher = self.root / "darwin-recorder.py"
+        _ = launcher.write_text('''import os
+from pathlib import Path
+import runpy
+import sys
+
+arguments = sys.argv[1:]
+recording = arguments[0].endswith("/step_record.py")
+owning = arguments[0] == "-c" and "def identity(pid):" in arguments[1]
+if not recording and not owning:
+    os.execv(sys.executable, [sys.executable, *arguments])
+sys.platform = "darwin"
+if owning:
+    sys.argv = ["-c", *arguments[2:]]
+    exec(arguments[1])
+    raise SystemExit(0)
+sys.argv = arguments
+try:
+    runpy.run_path(sys.argv[0], run_name="__main__")
+finally:
+    if sys.argv[1:2] == ["write"]:
+        for record in Path(os.environ["VERIFY_STEPS_DIR"]).glob("*.json"):
+            Path(os.environ["TEST_RECORDED_STEP"]).write_text(record.read_text())
+''')
+        interpreter = self.root / "darwin-python"
+        _ = interpreter.write_text(
+            "#!/bin/sh\nexec " + shlex.quote(sys.executable) + " "
+            + shlex.quote(str(launcher)) + ' "$@"\n')
+        interpreter.chmod(0o755)
+        _ = (self.root / "cache/claude/python3-3.11").write_text(str(interpreter) + "\n")
+
+    def test_refused_darwin_step_record_exits_nonzero_before_running_a_step(self) -> None:
+        ps = self.root / "stubs/ps"
+        ps.unlink()
+        _ = ps.write_text("#!/bin/sh\necho 'cannot read process start' >&2\nexit 2\n")
+        ps.chmod(0o755)
+        result = self.verify(self.environment)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("step refused", result.stderr)
+        self.assertFalse((self.root / "recorded-step.json").exists())
+        self.assertFalse((self.root / "cargo-calls").exists())
+
+    def test_darwin_step_records_without_proc_and_checks_stopped_builds(self) -> None:
+        result = self.verify(self.environment)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("step refused", result.stderr)
+        record = cast(dict[str, object], json.loads((self.root / "recorded-step.json").read_text()))
+        self.assertRegex(cast(str, record["proc_start"]), r"^[A-Z][a-z]{2} [A-Z][a-z]{2} +\d+ \d{2}:\d{2}:\d{2} \d{4}$")
+        self.assertIn("check", (self.root / "cargo-calls").read_text())
 
 
 if __name__ == "__main__":

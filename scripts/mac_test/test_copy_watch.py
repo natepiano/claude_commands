@@ -18,8 +18,8 @@ from collections.abc import Callable
 from typing import TypedDict, cast, final, override
 
 import copy_watch
-import mac_test
 import offload
+import process_start
 
 
 SCRIPT = Path(__file__).with_name("copy_watch.py")
@@ -254,9 +254,13 @@ class CandidateTests(unittest.TestCase):
 
     def write(self, call_id: str, pid: int, started: float, proc_start: str | None = None) -> Path:
         path = self.directory / f"{call_id}.json"
+        if proc_start is None:
+            start = process_start.read_process_start(pid)
+            assert isinstance(start, process_start.Started), start
+            proc_start = start.start
         record: copy_watch.CandidateRecord = {
             "pid": pid,
-            "proc_start": proc_start if proc_start is not None else mac_test.process_start_time(pid) or "",
+            "proc_start": proc_start,
             "call_started": started,
             "call_id": call_id,
         }
@@ -309,9 +313,11 @@ class CopyWatchProcessTests(unittest.TestCase):
         _ = self.runner.write_text(RUNNER_STUB)
         _ = (self.root / "step.py").write_text(STEP_STUB)
         _ = (self.root / "mac.conf").write_text("offload=on\nlinux_only.repo=\n")
+        start = process_start.read_process_start(os.getpid())
+        assert isinstance(start, process_start.Started), start
         busy: ClaimRecord = {
             "pid": os.getpid(),
-            "proc_start": mac_test.process_start_time(os.getpid()) or "",
+            "proc_start": start.start,
             "what": "nextest other",
             "worktree": str(self.repository),
             "since": datetime.now(timezone.utc).isoformat(),
@@ -512,8 +518,10 @@ class CopyWatchProcessTests(unittest.TestCase):
     def test_a_newer_live_candidate_takes_the_copy(self) -> None:
         newer = self.state / "copy_candidates" / "repo" / "v-newer.json"
         newer.parent.mkdir(parents=True)
+        start = process_start.read_process_start(os.getpid())
+        assert isinstance(start, process_start.Started), start
         record: copy_watch.CandidateRecord = {
-            "pid": os.getpid(), "proc_start": mac_test.process_start_time(os.getpid()) or "",
+            "pid": os.getpid(), "proc_start": start.start,
             "call_started": 2000.0, "call_id": "v-newer",
         }
         _ = newer.write_text(json.dumps(record))

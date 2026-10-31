@@ -32,3 +32,17 @@
 **Today:** each `verify.sh` step starts `mac_idle.py`, which costs about 122 ms of CPU (Phase 1 trace, real lint run).
 
 **Needed:** measure its imports and work with `VERIFY_PY_TRACE` and `python -X importtime`, then remove the start or its slow imports where the step does not need them, with every output unchanged. Done when the same trace shows the cost removed or named per cause.
+
+## Refuse a rename proof when a string escape can spell a format capture
+
+**Origin:** binding-rename guard closure review, 2026-10-31 (F002, minor). The rename proof (`prove_binding_rename` in `scripts/direct/assertion_guard.py`) checks each string literal's source text for an inline capture (`{name`). An escape that spells a brace passes: renaming `value` while `println!("\x7bvalue}")` stays gives a clean pass, though Rust reads `\x7b` as `{` and the string still captures the old name.
+
+**Fix as a class:** the proof refuses when any non-raw string or char literal in the enclosing test, on either side, holds a `\x` or `\u` escape. Add `\x7b` and `\u{7b}` cases to `test_binding_rename_refuses_inline_format_captures` in `scripts/direct/test_assertion_guard_revisions.py`.
+
+## Forward named variables to a Mac test run and fetch a named folder back
+
+**Source:** builds (showrunner), 2026-10-31, for hana P34: test fixtures save PNGs when `HANA_TOOLTIP_PLACEMENT_SHOTS` is set. `verify.sh`'s Mac offload forwards no such variable and copies no file back; builds allowed one direct `/build:mac` claimed run for P34 meanwhile.
+
+**Needed:** a Mac test run through `verify.sh test` that names the variables to forward and the folder to fetch back. Each is refused unless named, and the result is recorded like any other test run. One path, no second runner. Joins the `verify.sh test --mac` add-on if that is simpler. Tell hana when it is on main.
+
+**Order:** after the small items, with the `--mac` add-on.

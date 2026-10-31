@@ -242,24 +242,24 @@ lock_stale_reason() {
 }
 
 owned_group_matches() {
-  python3 - "$1" <<'PY'
+  python3 - "$1" "${BASH_SOURCE[0]%/*}/../lib" <<'PY'
 import json
 from pathlib import Path
-import subprocess
 import sys
+
+sys.path.insert(0, sys.argv[2])
+from process_start import Started, Unreadable, matches_stored_start, read_process_start
 
 try:
     record = json.loads(Path(sys.argv[1]).read_text())
     group = int(record['group'])
     if group <= 0:
         sys.exit(1)
-    try:
-        start = Path(f'/proc/{group}/stat').read_text().rsplit(') ', 1)[1].split()[19]
-    except (OSError, IndexError):
-        start = subprocess.check_output(['ps', '-p', str(group), '-o', 'lstart='],
-                                        text=True, stderr=subprocess.DEVNULL).strip()
-    sys.exit(0 if start == str(record['start']) else 1)
-except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
+    result = read_process_start(group)
+    # An unreadable identity is no proof that this live holder stopped.
+    sys.exit(0 if isinstance(result, Unreadable) or
+             isinstance(result, Started) and matches_stored_start(group, result, str(record['start'])) else 1)
+except (OSError, ValueError, KeyError, TypeError):
     sys.exit(1)
 PY
 }
@@ -276,7 +276,7 @@ write_lock_meta() {
 cleanup_owned_group() {
   local dir="$1"
   [[ -f "$dir/owned" ]] || return 0
-  python3 - "$dir/owned" <<'PY'
+  python3 - "$dir/owned" "${BASH_SOURCE[0]%/*}/../lib" <<'PY'
 from __future__ import annotations
 
 import json
@@ -287,20 +287,10 @@ import subprocess
 import sys
 import time
 
-record = Path(sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+from process_start import Started, Zombie, matches_stored_start, read_process_start
 
-def identity(pid: int) -> str | None:
-    try:
-        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
-        # A zombie leader still owns its PID, so its start time is safe to
-        # check while live children remain in the group.
-        return fields[19]
-    except (OSError, IndexError):
-        try:
-            return subprocess.check_output(['ps', '-p', str(pid), '-o', 'lstart='],
-                                           text=True, stderr=subprocess.DEVNULL).strip()
-        except subprocess.CalledProcessError:
-            return None
+record = Path(sys.argv[1])
 
 def live_group(group: int) -> bool:
     try:
@@ -320,7 +310,9 @@ except (OSError, ValueError, KeyError, TypeError):
     print('board.sh: invalid step ownership record', file=sys.stderr)
     sys.exit(1)
 
-if identity(group) != start:
+identity = read_process_start(group)
+# A zombie leader still owns its PID while live children remain in the group.
+if not isinstance(identity, (Started, Zombie)) or not matches_stored_start(group, identity, start):
     if live_group(group):
         print('board.sh: step group leader identity changed', file=sys.stderr)
         sys.exit(1)

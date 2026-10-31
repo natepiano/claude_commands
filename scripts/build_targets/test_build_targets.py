@@ -22,6 +22,7 @@ import build_targets
 import build_hold
 import offload
 import mac_test
+import process_start
 import targets
 if TYPE_CHECKING:
     from ..message import roster
@@ -108,7 +109,7 @@ class StatusTests(IsolatedBuildTargetTest):
             + "kind.natedev=local\nplatform.natedev=linux\n",
         )
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
-             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+             mock.patch.object(process_start, "read_process_start", return_value=process_start.Started("test-run-start")):
             return self.capture_status()
 
     def test_claim_holder_names_showrunner_and_unit_after_since(self) -> None:
@@ -144,7 +145,7 @@ class StatusTests(IsolatedBuildTargetTest):
             "stale-session": roster.UnitLabels("inspectors", "hana", "inspectors"),
         }
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
-             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"), \
+             mock.patch.object(process_start, "read_process_start", return_value=process_start.Started("test-run-start")), \
              mock.patch.object(mac_test, "read_claims", wraps=mac_test.read_claims) as claims_read, \
              mock.patch.object(roster, "unit_labels_for", return_value=labels) as lookup:
             result = self.capture_status()
@@ -202,7 +203,7 @@ class StatusTests(IsolatedBuildTargetTest):
             + "kind.natedev=local\nplatform.natedev=linux\n",
         )
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
-             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+             mock.patch.object(process_start, "read_process_start", return_value=process_start.Started("test-run-start")):
             code, output, errors = self.capture_status()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(output, "mac: running nextest hana since 13:05 PDT, idle since 13:20\nnatedev: free\n")
@@ -220,7 +221,7 @@ class StatusTests(IsolatedBuildTargetTest):
             + "kind.natedev=local\nplatform.natedev=linux\n",
         )
         with mock.patch.dict(os.environ, {"BUILD_TARGETS_CONFIG": str(config)}), \
-             mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+             mock.patch.object(process_start, "read_process_start", return_value=process_start.Started("test-run-start")):
             code, output, errors = self.capture_status()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(
@@ -231,7 +232,7 @@ class StatusTests(IsolatedBuildTargetTest):
 
     def test_mac_running_status_without_idle_time_keeps_existing_line(self) -> None:
         self.write_claim()
-        with mock.patch.object(mac_test, "process_start_time", return_value="test-run-start"):
+        with mock.patch.object(process_start, "read_process_start", return_value=process_start.Started("test-run-start")):
             state = targets.target_state(targets.SshTarget("mac", "macos", self.settings))
             self.assertEqual(build_targets.format_state("mac", state), "mac: running nextest hana since 13:05 PDT")
 

@@ -9,6 +9,7 @@ from typing import override
 
 from scripts.direct.test_assertion_guard import GitRepositoryFixture, TILE_NEW, TILE_OLD
 from scripts.direct import test_verify_lint_scope as verify_fixture
+from scripts.direct.shell_function_test_support import shell_functions
 
 VERIFY = Path(__file__).with_name("verify.sh")
 
@@ -31,14 +32,13 @@ class VerifyAssertionGuardTests(GitRepositoryFixture):
         # Use the real lint case; stub only the unrelated build tools and their setup.
         source = VERIFY.read_text(encoding="utf-8")
         case = source.split("\n    lint)\n", 1)[1].split("\n    doc)\n", 1)[0]
-        metadata_setup = "read_metadata() {" + source.split(
-            "read_metadata() {", 1)[1].split("require_taplo() {", 1)[0]
-        rulings_setup = "assertion_rulings_args() {" + source.split(
-            "assertion_rulings_args() {", 1)[1].split("# A Codex mesh worker", 1)[0]
+        metadata_setup = shell_functions(VERIFY, "read_metadata", "load_metadata", "require_member")
+        rulings_setup = shell_functions(VERIFY, "assertion_rulings_args") + "assertion_rulings_args\n"
         script = r'''
 set -euo pipefail
 CMD=lint
 ARGS=("$@")
+METADATA_READY=0
 FEATURE_FLAGS=()
 HOLD_LINT=0
 RUN_LOG=""

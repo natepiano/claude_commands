@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import override_guard
 import mac_test
 import offload
+import process_start
 
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -195,8 +196,8 @@ class StepProgress:
 
     def __init__(self, info: StepInfo | NoStepInfo) -> None:
         self.info: StepInfo | NoStepInfo = info
-        self.leader_start: str | None = (
-            mac_test.process_start_time(info.pgid) if isinstance(info, StepInfo) else None
+        self.leader_start: process_start.ProcessStart = (
+            process_start.read_process_start(info.pgid) if isinstance(info, StepInfo) else process_start.Gone()
         )
         self.offset: int = 0
         self.pending: bytes = b""
@@ -228,15 +229,10 @@ class StepProgress:
 
     def leader_alive(self) -> bool:
         """The step's group leader still runs: not reaped, not a zombie, not a reused pid."""
-        if isinstance(self.info, NoStepInfo) or self.leader_start is None:
+        if isinstance(self.info, NoStepInfo) or not isinstance(self.leader_start, process_start.Started):
             return False
         pgid = self.info.pgid
-        try:
-            stat = Path(f"/proc/{pgid}/stat").read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return False
-        fields = stat[stat.rfind(")") + 1 :].split()
-        if not fields or fields[0] == "Z" or mac_test.process_start_time(pgid) != self.leader_start:
+        if not mac_test.process_matches(pgid, self.leader_start.start):
             return False
         try:
             return os.getpgid(pgid) == pgid
@@ -284,7 +280,7 @@ def newest_candidate(directory: Path) -> str | None:
         record = read_candidate(path)
         if record is None:
             continue
-        if mac_test.process_start_time(record["pid"]) != record["proc_start"]:
+        if not mac_test.process_matches(record["pid"], record["proc_start"]):
             path.unlink(missing_ok=True)
             continue
         if newest is None or (record["call_started"], record["call_id"]) > (
@@ -503,9 +499,10 @@ class Watch:
         if not wanted:
             self.candidate.unlink(missing_ok=True)
         elif not self.candidate.exists():
+            start = process_start.read_process_start(os.getpid())
             record: CandidateRecord = {
                 "pid": os.getpid(),
-                "proc_start": mac_test.process_start_time(os.getpid()) or "",
+                "proc_start": start.start if isinstance(start, process_start.Started) else "",
                 "call_started": self.request.call_started,
                 "call_id": self.request.call_id,
             }

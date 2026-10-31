@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import re
 import signal
 import subprocess
 import sys
@@ -14,6 +13,7 @@ import unittest
 
 from scripts.direct.test_verify_mac_offload import stub_build_tool_path
 from scripts.direct.wait_for_test_state import wait_until
+from scripts.direct.shell_function_test_support import shell_functions
 
 
 VERIFY = Path(__file__).with_name("verify.sh")
@@ -32,13 +32,6 @@ class StepProcess(TypedDict):
     group: int
 
 
-def shell_function(source: str, name: str) -> str:
-    match = re.search(rf"(?ms)^{name}\(\) \{{\n.*?^\}}", source)
-    if match is None:
-        raise AssertionError(f"missing shell function: {name}")
-    return match.group(0)
-
-
 class TokenWaitNoteTests(unittest.TestCase):
     def test_holder_without_trailing_newline_is_named_in_wait_note(self) -> None:
         with tempfile.TemporaryDirectory(prefix="verify-wait-note-") as directory:
@@ -50,7 +43,7 @@ class TokenWaitNoteTests(unittest.TestCase):
                 "set -euo pipefail",
                 'BOARD_DIR="$1"',
                 "TOKEN_WAITERS_AHEAD=0",
-                shell_function(VERIFY.read_text(), "token_wait_note"),
+                shell_functions(VERIFY, "token_wait_note"),
                 "token_wait_note still 5",
             ))
             result = subprocess.run(["bash", "-c", script, "wait-note-test", str(board)],
@@ -83,6 +76,7 @@ class VerifyStepOwnerTests(unittest.TestCase):
             "BUILD_HOLD_RELEASE_DIR": str(self.root / "release"),
             "BOARD_DIR": str(self.root / "board"),
             "BOARD_HELPER": str(BOARD),
+            "STEP_RECORD_SCRIPT": str(VERIFY.with_name("step_record.py")),
             "BOARD_SLOT": "fixture",
             "TOKEN_HOLD_S": "3600",
             "TOKEN_RENEW_S": "60",
@@ -97,12 +91,11 @@ class VerifyStepOwnerTests(unittest.TestCase):
         verify = VERIFY.read_text()
         start = verify.index("STEP_OWNER_PY='\n")
         end = verify.index("\nrelease_token() {", start)
-        invoke = INVOKE.read_text()
         self.shell = "\n".join((
             "set -euo pipefail",
-            shell_function(invoke, "buildlog_exec"),
+            shell_functions(INVOKE, "buildlog_exec"),
             verify[start:end],
-            shell_function(invoke, "sweep_after_step"),
+            shell_functions(INVOKE, "sweep_after_step"),
             'mkdir -p "$BOARD_DIR/locks/cargo.d"',
             'printf "%s" "$$" > "$BOARD_DIR/locks/cargo.d/holder_pid"',
             'printf fixture > "$BOARD_DIR/locks/cargo.d/holder"',

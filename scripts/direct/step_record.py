@@ -11,6 +11,9 @@ import sys
 import tempfile
 from typing import Literal, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from process_start import Gone, Started, Zombie, read_process_start
+
 KINDS = ("check", "lint", "doc", "test", "build", "example", "final")
 
 
@@ -45,11 +48,12 @@ def record_path(call_id: str) -> Path:
 
 
 def process_start(pid: int) -> str:
-    root = Path(os.environ.get("VERIFY_PROC_ROOT", "/proc"))
-    fields = (root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
-    if fields[0] == "Z":
+    result = read_process_start(pid)
+    if isinstance(result, Started):
+        return result.start
+    if isinstance(result, (Gone, Zombie)):
         raise ProcessLookupError("process has ended")
-    return fields[19]
+    raise OSError(result.reason)
 
 
 def _text(value: object) -> str:
@@ -145,6 +149,9 @@ def remove(call_id: str) -> None:
 
 def consume_stopped_build(call_id: str, consumed: Path) -> bool:
     """Read this call's new enforcer stops, including stops before a release."""
+    # The hold enforcer and its boot-scoped stop journal run only on Linux.
+    if sys.platform == "darwin":
+        return False
     import socket
 
     root = Path(os.environ.get("BUILDLOG_DIR", str(Path.home() / ".local/state/buildlog")))

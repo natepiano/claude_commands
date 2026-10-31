@@ -2543,20 +2543,21 @@ import signal
 import subprocess
 import sys
 
-lock = Path(sys.argv[1])
-holder = sys.argv[2]
-command = sys.argv[3:]
+sys.path.insert(0, sys.argv[1])
+from process_start import Started, read_process_start
+
+lock = Path(sys.argv[2])
+holder = sys.argv[3]
+command = sys.argv[4:]
 
 def shell_status(status: int) -> int:
     return status if status >= 0 else 128 - status
 
 def identity(pid):
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
-        return fields[19]
-    except (OSError, IndexError):
-        return subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="],
-                                       text=True, stderr=subprocess.DEVNULL).strip()
+    result = read_process_start(pid)
+    if isinstance(result, Started):
+        return result.start
+    raise OSError(f"cannot read step owner start: {result}")
 
 child = os.fork()
 if child:
@@ -2664,13 +2665,14 @@ route_test() {
 buildlog_exec() {
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
         local TOKEN_RENEWER_PID="" step_status=0
+        local step_record_path="${STEP_RECORD_SCRIPT:-$HOME/.claude/scripts/direct/step_record.py}"
         if ! start_token_renewer; then
             printf lost > "${HOLD_WAIT_DIR:?}/token-lost"
             return 125
         fi
         VERIFY_PY_HELPER=STEP_OWNER_PY VERIFY_TOKEN_LOST_FILE="${HOLD_WAIT_DIR:+$HOLD_WAIT_DIR/token-lost}" \
             buildlog_exec_unowned "$PY" -c "$STEP_OWNER_PY" \
-                "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
+                "${step_record_path%/*}/../lib" "${BOARD_DIR}/locks/cargo.d" "$$" "$@" || step_status=$?
         stop_token_renewer
         return "$step_status"
     else
@@ -2778,12 +2780,20 @@ admit_with_token() {
 }
 
 buildlog_wait_for_memory() {
-    local stat fields=()
-    if [[ -n "${TREE_WATCH_DIR:-}" && -r "/proc/${BASHPID:-$$}/stat" ]]; then
-        stat="$(< "/proc/${BASHPID:-$$}/stat")"
-        read -r -a fields <<< "${stat##*) }"
-        printf '%s/admission/%s-%s.waiting\n' "${BUILDLOG_DIR:-$HOME/.local/state/buildlog}" \
-            "${BASHPID:-$$}" "${fields[19]}" >> "$TREE_WATCH_DIR/waiters"
+    local stat start="" waiter_pid="${BASHPID:-$$}" fields=()
+    if [[ -n "${TREE_WATCH_DIR:-}" ]]; then
+        if [[ "${OSTYPE:-}" == darwin* ]]; then
+            start="$(LC_ALL=C TZ=UTC ps -p "$waiter_pid" -o lstart= 2>/dev/null)" || start=""
+            read -r start <<< "$start"
+        elif [[ -r "${VERIFY_PROC_ROOT:-/proc}/$waiter_pid/stat" ]]; then
+            stat="$(< "${VERIFY_PROC_ROOT:-/proc}/$waiter_pid/stat")"
+            read -r -a fields <<< "${stat##*) }"
+            [[ "${fields[19]:-}" =~ ^[0-9]+$ ]] && start="${fields[19]}"
+        fi
+        if [[ -n "$start" ]]; then
+            printf '%s/admission/%s-%s.waiting\n' "${BUILDLOG_DIR:-$HOME/.local/state/buildlog}" \
+                "$waiter_pid" "$start" >> "$TREE_WATCH_DIR/waiters"
+        fi
     fi
     step_state waiting_hold
     TOKEN_WAITED=0

@@ -7,11 +7,41 @@ import sys
 from pathlib import Path
 
 from scripts.direct.verify_tree_cancel_test_support import CANCEL_LINE, VerifyTreeCancelFixture
-from scripts.direct.verify_token_wait_test_support import BOARD
+from scripts.direct.verify_token_wait_test_support import BOARD, VERIFY
+from scripts.direct.shell_function_test_support import shell_functions
 from scripts.direct.wait_for_test_state import wait_until
 
 
 class VerifyTreeCancelTests(VerifyTreeCancelFixture):
+    def test_memory_waiter_uses_shared_start_on_linux_and_darwin(self) -> None:
+        start = "Fri Oct 30 12:34:56 2026"
+        ps = self.root / "stubs/ps"
+        ps.unlink()
+        self.write_shell_tool(ps, 'test "$LC_ALL" = C && test "$TZ" = UTC || exit 2\n'
+                              + 'printf "  ' + start + '\\n"\n')
+        for host, expected in (("linux-gnu", "987654321"), ("darwin23", start)):
+            with self.subTest(host=host):
+                watch = self.root / host
+                watch.mkdir()
+                script = "\n".join((
+                    "set -euo pipefail",
+                    'TREE_WATCH_DIR="$1"; VERIFY_PROC_ROOT="$1/proc"; OSTYPE="$2"',
+                    'mkdir -p "$VERIFY_PROC_ROOT/$BASHPID"',
+                    'printf "%s (a name with ) parentheses) S " "$BASHPID" > "$VERIFY_PROC_ROOT/$BASHPID/stat"',
+                    'printf "0 %.0s" {1..18} >> "$VERIFY_PROC_ROOT/$BASHPID/stat"',
+                    'printf "987654321 0\\n" >> "$VERIFY_PROC_ROOT/$BASHPID/stat"',
+                    "step_state() { :; }; release_token() { return 1; }",
+                    "buildlog_wait_for_memory_only() { return 19; }",
+                    shell_functions(VERIFY, "buildlog_wait_for_memory"),
+                    'buildlog_wait_for_memory || test "$?" = 19',
+                    'printf "%s" "$BASHPID"',
+                ))
+                result = subprocess.run(["bash", "-c", script, "waiter-test", str(watch), host],
+                                        env=self.environment, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((watch / "waiters").read_text(),
+                                 f"{self.environment['BUILDLOG_DIR']}/admission/{result.stdout}-{expected}.waiting\n")
+
     def test_cancel_during_reacquisition_removes_own_queue_entry_and_keeps_peer(self) -> None:
         memory = Path(self.environment["BUILDLOG_MEMINFO"])
         _ = memory.write_text("MemAvailable: 0 kB\n")

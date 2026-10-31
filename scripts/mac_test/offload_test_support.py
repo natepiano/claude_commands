@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast, override
 import offload
 import mac_test
+import process_start
 import treekey
 from offload_test_commands import COMMAND_STUB, write_shell
 
@@ -114,6 +115,9 @@ from pathlib import Path
 import sys
 import time
 
+sys.path.insert(0, str(Path(os.environ["MAC_TEST_REAL_STATE"]).resolve().parents[1] / "lib"))
+from process_start import Started, read_process_start
+
 def main() -> int:
     root = Path(os.environ["MAC_TEST_STUB_DIR"])
     state = Path(os.environ["MAC_TEST_STATE_DIR"])
@@ -124,7 +128,9 @@ def main() -> int:
         state.mkdir(parents=True, exist_ok=True)
         arguments = sys.argv[2:]
         owner_pid = int(arguments[arguments.index("--pid") + 1])
-        proc_start = Path(f"/proc/{owner_pid}/stat").read_text().rpartition(")")[2].split()[19]
+        start = read_process_start(owner_pid)
+        assert isinstance(start, Started), start
+        proc_start = start.start
         record = {"pid": owner_pid, "proc_start": proc_start, "what": "nextest hana",
                   "worktree": arguments[arguments.index("--worktree") + 1], "since": "2026-10-12T00:00:00+00:00",
                   "remote_host": arguments[arguments.index("--remote") + 1]}
@@ -572,7 +578,7 @@ raise SystemExit(offload.main())
         self.assertTrue(path.exists())
         record = self.remote_claim()
         self.assertEqual(record["remote_host"], host)
-        self.assertIsNone(mac_test.process_start_time(record["pid"]))
+        self.assertIsInstance(process_start.read_process_start(record["pid"]), process_start.Gone)
         decoded = mac_test.read_run(path)
         self.assertNotIsInstance(decoded, mac_test.NoRun)
         if not isinstance(decoded, mac_test.NoRun):
