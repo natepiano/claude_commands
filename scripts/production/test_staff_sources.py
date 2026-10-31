@@ -169,6 +169,25 @@ class StaffSourcesTests(StaffTestCase):
         self.assertEqual(reviewer["identity"], {"codex": "thread-current"})
         self.assertIn(str(ledger), cast(list[str], value["inputs"]))
 
+    def test_adhoc_ledger_of_a_dot_named_worktree_takes_its_holder_run_without_a_name_error(self) -> None:
+        _ = self.production("sdlc", "models-unit")
+        _ = self.session_record("session-sdlc", "sdlc")
+        _ = self.session_record("session-models", "models-unit")
+        self.pane("w1:models", session_id="session-models", environment={
+            "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit"})
+        run = self.worker_run("sdlc", "models-unit", "session-models")
+        # A worktree named `.claude` gives the adhoc ledger stem `.claude-<digest>`.
+        _ = self.ledger_worker(run, "adhoc", ".claude-3314ec0bf589", "review", "review", "thread-adhoc")
+        _, errors = self.seed()
+        self.assertNotIn("name must contain", errors)
+        with redirect_stderr(io.StringIO()) as live_errors:
+            members = cast(list[dict[str, object]], staff_sources.live()["members"])
+        self.assertNotIn("name must contain", live_errors.getvalue())
+        unit = next(member for member in members if member["kind"] == "unit")
+        reviewer = next(member for member in members if member["kind"] == "worker")
+        self.assertEqual((reviewer["name"], reviewer["parent"]), ("review", unit["id"]))
+        self.assertEqual(reviewer["identity"], {"codex": "thread-adhoc"})
+
     def test_live_owner_ignores_a_newer_launch_whose_session_has_ended(self) -> None:
         _ = self.production("sdlc", "models-unit")
         _ = self.seed()
