@@ -242,8 +242,10 @@ def showrunner_ids(
 
 
 def production_rows(doc: Path, slug: str, record: staff.StaffSnapshot) -> list[dict[str, str]]:
+    from unit_lookup import live_unit_table
+
     lines = doc.read_text(encoding="utf-8").splitlines()
-    return production_units.live_unit_table(lines, slug, record=record)
+    return live_unit_table(lines, slug, record=record)
 
 
 def every_marked_unit(record: staff.StaffSnapshot | None = None) -> unit_lookup.MarkedProductions | OSError:

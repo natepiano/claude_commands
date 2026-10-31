@@ -413,7 +413,7 @@ def build(runner: showrunners.Showrunner, *, record: staff.StaffSnapshot) -> dic
     clock = BoardClock(ZoneInfo(runner["zone"]), plan_history.now_epoch())
     document = Path(runner["doc"]).expanduser().resolve()
     sources = {document}
-    rows = production_units.live_unit_table(
+    rows = unit_lookup.live_unit_table(
         document.read_text(encoding="utf-8").splitlines(), runner["slug"], record=record,
     )
     offset = datetime.fromtimestamp(clock.now, clock.zone).utcoffset()
