@@ -8,9 +8,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
-import showrunners
+from scripts.lib.process_failure import failure_detail
+from scripts.production import showrunners
 from upgrade_record import Record
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -31,13 +34,13 @@ def ensure_job(record: Record) -> None:
     result = _notifier("new", instance(record["slug"]), "--every", "240", "--timeout", "300",
                        "--run", " ".join(shlex.quote(word) for word in words))
     if result.returncode:
-        print(f"bevy_upgrade: could not schedule check: {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
+        print(f"bevy_upgrade: could not schedule check: {failure_detail(result)}", file=sys.stderr)
 
 
 def remove_job(slug: str) -> None:
     result = _notifier("remove", instance(slug))
     if result.returncode:
-        print(f"bevy_upgrade: could not remove check: {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
+        print(f"bevy_upgrade: could not remove check: {failure_detail(result)}", file=sys.stderr)
 
 
 def next_check(slug: str) -> datetime | None:
@@ -64,9 +67,9 @@ def tell_showrunner(slug: str, summary: str, text: str) -> bool:
         except OSError as error:
             outcome = f"FAILED: {error}"
         else:
-            outcome = result.stdout.strip() or result.stderr.strip() or f"FAILED: exit {result.returncode}"
-            if result.returncode == 0 and outcome.startswith("SENT:"):
+            if result.returncode == 0 and result.stdout.strip().startswith("SENT:"):
                 return True
+            outcome = failure_detail(result)
     print(f"bevy_upgrade: the showrunner was not told: {outcome}", file=sys.stderr)
     return False
 
@@ -85,5 +88,5 @@ def retire_message(slug: str) -> None:
     else:
         if result.returncode == 0:
             return
-        outcome = result.stdout.strip() or result.stderr.strip() or f"exit {result.returncode}"
+        outcome = failure_detail(result)
     print(f"bevy_upgrade: could not retire the queued message: {outcome}", file=sys.stderr)

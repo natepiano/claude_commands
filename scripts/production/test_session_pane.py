@@ -169,7 +169,7 @@ class SessionPaneTests(unittest.TestCase):
         result = self.run_cli("type", "unit", "show", "herdr-unit", "hello")
         self.assertEqual((result.returncode, result.stderr.strip()),
                          (4, "unit show herdr-unit: blocked at a prompt; nothing typed"))
-        actions = [row for row in self.log("herdr") if row[2:4] != ["session", "list"]]
+        actions = [row for row in self.log("herdr") if row[2:4] not in (["session", "list"], ["pane", "list"], ["pane", "process-info"])]
         self.assertEqual(actions, [["--session", "native", "agent", "prompt", "w1:p1", "hello"]])
         with self.assertRaises(AgentBlocked):
             session_pane.type_place(HerdrPlace("native", "w1:p1"), "hello")

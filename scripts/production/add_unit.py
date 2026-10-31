@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import staff, staff_sources
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -29,7 +30,7 @@ sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
 import autocompact
 import rename_state
-import showrunners
+from scripts.production import showrunners
 import sessions
 import unit_lookup
 import unit_names
@@ -38,6 +39,7 @@ from production_units import Production, Refusal, cell_value, plan_cell_is_retir
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from probe_session import PROBE_ENV  # noqa: E402
 from atomic_file import write_text_atomic
+from process_failure import failure_detail
 
 if TYPE_CHECKING:
     import herdr
@@ -697,11 +699,11 @@ def stop_for_attach(handoff: RunningSessionHandoff) -> SessionShutdown:
         down = run_attach_shutdown(["down", handoff.login, "--here", "--only", handoff.session_id,
                                     "--request-id", identity], restart.SESSION_WAIT_SECONDS)
         if down.returncode != 0:
-            raise Refusal(down.stderr.strip() or down.stdout.strip() or "shutdown down failed")
+            raise Refusal(f"shutdown down failed: {failure_detail(down)}")
         followed = run_attach_shutdown(["follow", handoff.login, "--request", identity],
                                       settle.NOT_ANSWERING_AFTER.total_seconds() + settle.SETTLE_INTERVAL_SECONDS)
         if followed.returncode != 0:
-            raise Refusal(followed.stderr.strip() or followed.stdout.strip() or "shutdown follow failed")
+            raise Refusal(f"shutdown follow failed: {failure_detail(followed)}")
         records = [saved for saved in session_records(handoff.login)
                    if saved["session"]["session_id"] == handoff.session_id and saved["request_id"] == identity]
         if (len(records) != 1 or records[0]["progress"]["kind"] not in {"stopped", "already gone"}

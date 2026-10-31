@@ -25,10 +25,10 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Literal, Self, cast, final, override
 from unittest.mock import call, patch
 
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.shutdown import stop_resume
-from scripts.production import showrunners
 from scripts.message import send as message_send
 from scripts.whoami import run_out
 from scripts.whoami import account
@@ -89,8 +89,8 @@ class RefusalWatchTests(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()))
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.home), "PATH": os.defpath, "AGENT_NOTES_DIR": str(self.home / "notes"),
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {
+            "PATH": os.defpath, "AGENT_NOTES_DIR": str(self.home / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions"), "USER_ZONE": "America/New_York",
         }, clear=True)))
@@ -101,11 +101,6 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.home / "pace.jsonl"))
         (self.home / ".claude").mkdir()
         (self.home / "notifier").mkdir()
-        # Production scripts import the registry under both spellings, each with paths fixed at import.
-        for registry in (showrunners, import_module("showrunners")):
-            for field, value in (("NOTIFIER_STATE_DIR", self.home / "notifier"), ("SESSIONS_DIR", self.home / "sessions"),
-                                 ("SHOWRUNNER_STATE_DIR", self.home / "showrunner")):
-                _ = self.enterContext(patch.object(registry, field, value))
         _ = (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
         for label, login in (("claude1", SOURCE_LOGIN), ("claude2", "main@example.invalid"), ("claude3", TARGET_LOGIN)):
             self.assertEqual(accounts.setup(label), [])

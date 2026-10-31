@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.process_failure import failure_detail
 from scripts.whoami import note_file
 
 from scripts.lib import agents_registry  # noqa: E402
@@ -89,14 +90,15 @@ def codex_alert_pass(home: Path | NoWorkersHome, reports: list[Report], observed
     )
 
 
-def resolve_codex_readings(value: CodexAlertPassReadings | ReadCurrentCodexReadings) -> CodexAlertPassReadings:
+def resolve_codex_readings(value: CodexAlertPassReadings | ReadCurrentCodexReadings, *,
+                           now: datetime) -> CodexAlertPassReadings:
     if isinstance(value, CodexAlertPassReadings):
         return value
     home = observe_workers_home()
     async def collect() -> list[Report]:
         return list(await asyncio.gather(*(codex_live(folder) for folder in codex_homes(home)
                                           if folder.is_dir() and codex_email_on_disk(folder))))
-    return codex_alert_pass(home, asyncio.run(collect()), datetime.now(timezone.utc))
+    return codex_alert_pass(home, asyncio.run(collect()), now)
 
 
 def selected_codex_report(readings: CodexAlertPassReadings, now: datetime) -> Report:
@@ -685,10 +687,10 @@ def state_file() -> Generator[State]:
 
 
 
-def ahead(resets: str | None) -> bool:
+def ahead(resets: str | None, *, now: datetime) -> bool:
     """Whether a note's reset is still to come."""
     reset = reset_time(resets)
-    return isinstance(reset, note_file.KnownReset) and reset.value > datetime.now(timezone.utc)
+    return isinstance(reset, note_file.KnownReset) and reset.value > now
 
 
 def remaining(note: AgentNote) -> float | None:
@@ -703,10 +705,10 @@ def percent(note: AgentNote) -> str:
     return "unknown" if value is None else f"{value:g}%"
 
 
-def low(notes: list[AgentNote], threshold: float) -> list[AgentNote]:
+def low(notes: list[AgentNote], threshold: float, *, now: datetime) -> list[AgentNote]:
     """Notes in use at or under the threshold in a window that has not reset."""
     return [note for note in notes
-            if note_file.in_use(note) and ahead(note.get("resets"))
+            if note_file.in_use(note) and ahead(note.get("resets"), now=now)
             and (value := remaining(note)) is not None and value <= threshold]
 
 
@@ -1509,7 +1511,7 @@ def relay(recipient: str, text: str, key: str | None) -> str | None:
         return str(error)
     if done.returncode == 0:
         return None
-    return " ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split())
+    return " ".join(failure_detail(done).split())
 
 
 @dataclass(frozen=True)
@@ -1540,7 +1542,7 @@ def tell_user(push: RenderedPush) -> PushDelivery:
         return PushFailed(str(error))
     if done.returncode == 0:
         return PushSent()
-    return PushFailed(" ".join((done.stdout.strip() or done.stderr.strip() or f"exit {done.returncode}").split()))
+    return PushFailed(" ".join(failure_detail(done).split()))
 
 
 def deliver(jobs: list[Job]) -> list[str | None]:
@@ -1582,8 +1584,8 @@ def alert(notes: list[AgentNote], now: datetime | None = None, *,
           codex_readings: CodexAlertPassReadings | ReadCurrentCodexReadings = READ_CURRENT_CODEX_READINGS) -> list[str]:
     """Send what is due, record it, and return one log line per attempt."""
     selection = _selection(selection)
-    codex_readings = resolve_codex_readings(codex_readings)
     now = now or datetime.now(timezone.utc)
+    codex_readings = resolve_codex_readings(codex_readings, now=now)
     _save_codex_readings(codex_readings, now)
     return _alert_for_saved_readings(notes, now, selection, codex_readings)
 
@@ -1932,7 +1934,7 @@ def _alert_for_saved_readings(notes: list[AgentNote], now: datetime, selection: 
         _ = close_recovered(state, notes, threshold, selection, now, codex_readings)
         back = switch_back(state, now, codex_readings)
         codex_readings = _readings_after_restoration(codex_readings, back)
-        for note in [*low([note for note in notes if note.tool != "codex"], threshold),
+        for note in [*low([note for note in notes if note.tool != "codex"], threshold, now=now),
                      *_low_codex_notes(notes, threshold, codex_readings, now)]:
             name = note.label
             if name not in episodes:
@@ -2067,8 +2069,8 @@ def _route_refusal(notes: list[AgentNote], refusing_account: agent_accounts.Refu
     """A provider refusal waits briefly, moves workers, or opens the Claude fallback."""
     from scripts.accounts import accounts
     del selection
-    readings = resolve_codex_readings(codex_readings)
     now = now or datetime.now(timezone.utc)
+    readings = resolve_codex_readings(codex_readings, now=now)
     refusal_time = refused_at.at if isinstance(refused_at, RefusedAt) else now
     _save_codex_readings(readings, now)
     _finish_workers_transitions(now)
@@ -2233,8 +2235,8 @@ def refresh(notes: list[AgentNote], here: str | None, now: datetime | None = Non
     """Refresh readings and restore routing without messaging sessions."""
     del here
     selection = _selection(selection)
-    codex_readings = resolve_codex_readings(codex_readings)
     now = now or datetime.now(timezone.utc)
+    codex_readings = resolve_codex_readings(codex_readings, now=now)
     _save_codex_readings(codex_readings, now)
     threshold = load_config()["threshold_percent"]
     with state_file() as state:
