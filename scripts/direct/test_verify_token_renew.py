@@ -349,6 +349,14 @@ release_token
 
 
 class LintInputIdentityTests(lint_support.VerifyLintScopeFixture):
+    def assert_lint_calls(self, *, fixes: int = 0) -> None:
+        judgment = ["--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings"]
+        expected = [judgment]
+        if fixes:
+            fix = ["--fix", "--allow-dirty", "--allow-staged", "--allow-no-vcs", *judgment]
+            expected = [judgment, *([fix] * fixes), judgment]
+        self.assertEqual(self.calls("clippy"), expected)
+
     def private_scripts(self) -> tuple[Path, Path]:
         scripts = Path(self.environment["HOME"]) / ".claude" / "scripts"
         scripts.unlink()
@@ -379,7 +387,7 @@ if arguments[:1] == ["clippy"]:''')
         self.environment.update(TEST_PRIVATE_VERIFY=str(verify), TEST_PRIVATE_INVOKE=str(invoke))
         with mock.patch.object(lint_support, "VERIFY", verify):
             result = self.verify("lint", "sample")
-        self.assert_fix_and_judgment_calls()
+        self.assert_lint_calls()
         self.assertNotIn("tree changed", result.stdout + result.stderr)
 
     def test_lost_token_status_is_not_cached_as_a_tree_lint_failure(self) -> None:
@@ -390,7 +398,7 @@ if arguments[:1] == ["clippy"]:''')
         self.assertEqual(list(cache.glob("*.fail")), [])
         self.environment["TEST_CLIPPY_STATUS"] = "0"
         _ = self.verify("lint", "sample")
-        self.assert_fix_and_judgment_calls()
+        self.assert_lint_calls()
 
     def test_script_edit_during_fix_cannot_cache_a_pass_for_the_new_script(self) -> None:
         verify, invoke = self.private_scripts()
@@ -403,14 +411,17 @@ if arguments[:1] == ["clippy"]:''')
             output.write("\\n# updated once during the fix pass\\n")
         marker.touch()
 if arguments[:1] == ["clippy"]:''')
-        self.write_executable(self.root / "bin" / "cargo", cargo)
+        from scripts.direct.test_verify_lint_judgment import FIRST_JUDGMENT, LINT_FINDING
+        self.write_executable(self.root / "bin" / "cargo", FIRST_JUDGMENT + cargo)
+        self.environment.update({"TEST_CLIPPY_FIRST_STATUS": "101",
+                                 "TEST_CLIPPY_FIRST_DIAGNOSTIC": LINT_FINDING})
         self.environment["TEST_PRIVATE_INVOKE"] = str(invoke)
         with mock.patch.object(lint_support, "VERIFY", verify):
             _ = self.verify("lint", "sample")
-            self.assert_fix_and_judgment_calls()
+            self.assert_lint_calls(fixes=1)
             self.assertEqual(list(cache.glob("*.pass")), [], "old loaded code certified the new script")
             _ = self.verify("lint", "sample")
-            self.assert_fix_and_judgment_calls()
+            self.assert_lint_calls(fixes=1)
             self.assertEqual(len(list(cache.glob("*.pass"))), 1)
             _ = self.verify("lint", "sample")
             self.assertEqual(self.calls("clippy"), [])
@@ -427,7 +438,7 @@ if arguments[:1] == ["clippy"]:''')
                     with script.open("a") as output:
                         _ = output.write("\n# cache input changed\n")
                     _ = self.verify("lint", "sample")
-                    self.assert_fix_and_judgment_calls()
+                    self.assert_lint_calls()
 
 
 class MemoryQueueIdentityTests(unittest.TestCase):

@@ -106,6 +106,10 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
     @override
     def build_fixture(self) -> None:
         super().build_fixture()
+        # This fixture's config reader enables tools but supplies no numeric
+        # policies. An absent fix limit exercises verify's default budget.
+        with (self.root / "lint-config.sh").open("a") as reader:
+            _ = reader.write('_lint_config_raw() { :; }\n')
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
         metadata = write_workspace(self.workspace)

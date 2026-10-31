@@ -22,7 +22,9 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         trace = self.root / "python-starts.tsv"
         self.environment["VERIFY_PY_TRACE"] = str(trace)
         result = self.verify("lint", "sample")
-        self.assert_fix_and_judgment_calls()
+        self.assertEqual(self.calls("clippy"), [[
+            "--workspace", "--all-targets", "--all-features", "--keep-going", "--", "-D", "warnings",
+        ]])
         rows = [line.split("\t") for line in trace.read_text().splitlines()]
         self.assertTrue(rows, result.stdout + result.stderr)
         for row in rows:
@@ -33,11 +35,12 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         print("lint helper starts:", dict(sorted(counts.items())), "total:", len(rows), flush=True)
         self.assertNotIn("INLINE_PY", counts, rows)
         self.assertNotIn("STDIN_PY", counts, rows)
-        # Baseline: 14 tree starts, including four lint pairs. The fifth paired site is Mac-only.
-        self.assertEqual(counts["tree_watch.py"], 10, rows)
-        # Baseline 47, minus four pairs and two code hashes. The no-site
-        # user clock runs outside the trace runner and contributes no row.
-        self.assertEqual(len(rows), 40, counts)
+        # Clean judgment skips the two repair-convergence tree keys.
+        self.assertEqual(counts["tree_watch.py"], 8, rows)
+        # Omitted fix: five step states, including memory admission's
+        # waiting_hold/on_natedev. Omitted fmt: two more. Together with the
+        # two convergence keys, these remove nine starts from HEAD's 40.
+        self.assertEqual(len(rows), 31, counts)
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"

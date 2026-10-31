@@ -8,6 +8,16 @@ from scripts.direct.verify_tree_cancel_test_support import VerifyTreeCancelFixtu
 
 class VerifyTreeCancelTests(VerifyTreeCancelFixture):
     def test_lint_rewrites_finish_without_cancelling(self) -> None:
+        # The initial judgment must report a finding before fixes are allowed.
+        cargo = self.root / "stubs" / "cargo"
+        source = cargo.read_text().replace(
+            'if stage == os.environ.get("TEST_BLOCK_STAGE", "test"):',
+            '''if stage == "clippy" and not (root / "fix.rewritten").exists():
+    print("error: unneeded return statement")
+    print("  = note: `-D clippy::needless-return` implied by `-D warnings`")
+    raise SystemExit(101)
+if stage == os.environ.get("TEST_BLOCK_STAGE", "test"):''')
+        _ = cargo.write_text(source)
         process = self.start_verify("lint", TEST_BLOCK_STAGE="clippy", TEST_FINISH="1",
                                     TEST_REWRITE_STAGES="mend,fix,fmt")
         self.release_lint_rewrites(process)

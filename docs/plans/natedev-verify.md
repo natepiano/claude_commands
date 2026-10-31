@@ -839,3 +839,17 @@ Start reasons, by class (evidence at e6f8540f):
 - basedpyright `0 errors, 0 warnings, 0 notes` on every changed Python file and its callers; `bash -n scripts/direct/verify.sh`; `shellcheck scripts/direct/verify.sh` with no new findings.
 - Live: one hana gate copy with task `phase:<unit>/19`, seeded, built and tested with `verify.sh` in it, and removed by `merge_checkpoint.py` when this phase's checkpoint merges (its line `removed 1 folder(s) of phase:<unit>/19`).
 - Merge gate `--tests-only` green on a tree merged with `origin/natedev`.
+
+### Phase 20 — Run clippy judgment first, fix only on a finding, and send Mac-allowed lint to a free Mac  · status: done
+
+**Origin:** builds showrunner, 2026-10-31 15:17 EDT, the user's order for more build capacity: in 24 h, 278 of 537 natedev clippy runs repeated a tree that had already passed the same command (169 h queue wait, 10 h run). Also the builds report of 15:10: the Mac was free while 17 natedev steps waited.
+
+#### Work Order
+
+**Source:** the worker prompts `phases/20/impl_prompt.md` and `phases/20/test_prompt.md` in the run directory.
+
+1. `verify.sh lint` runs clippy judgment first. A pass ends the stage with no fix pass. A clippy finding runs `--fix`, fmt, then judgment once more. Any other failure exits with its status and runs no fix. The fix-pass limit (default 3) is read from the lint config.
+2. A mac_allowed lint step leaves the natedev queue for the Mac whenever the Mac can take it now, by the one decision the test steps use, not only after the Mac-idle marker appears.
+3. A whole-workspace hana clippy can run on the Mac with its Linux-only members (`hana_video`, `hana_clerestory`) excluded, and those members stay linted on natedev; or the cause and size are reported if the change is large.
+
+**Acceptance gate:** the verify lint tests show one clippy call and no `--fix` on a passing tree, the fix loop only after a finding, no fix on a non-lint failure, and the limit from config; Mac routing and eligibility regression tests fail on the old code; basedpyright 0/0/0 on changed Python; `bash -n` and shellcheck on verify.sh; merge gate `--tests-only` green on a tree merged with origin/builds.
