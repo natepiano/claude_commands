@@ -311,13 +311,13 @@ def unit_conversation(found: unit_lookup.MarkedUnit | None, *, session_id: str =
         entry = pane_record.read(found.place.session).get(found.place.pane)
         if entry is not None and entry["session_id"] == session_id and entry["config_dir"]:
             return UnitConversation(session_id, Path(entry["config_dir"]).name.removeprefix("."))
-    accounts = {Path(entry["config_dir"]).name.removeprefix(".")
-                for path in pane_record.RECORD_DIR.glob("*.json")
-                for entry in pane_record.read(path.stem).values()
-                if entry["session_id"] == session_id and entry["config_dir"]}
-    if len(accounts) > 1:
-        raise RenameRefused(f"session {session_id}: pane launches name several accounts")
-    return UnitConversation(session_id, accounts.pop()) if accounts else NoUnitConversation()
+    try:
+        entry = pane_record.launch_for_session(session_id)
+    except ValueError as error:
+        raise RenameRefused(str(error)) from error
+    return (UnitConversation(session_id, Path(entry["config_dir"]).name.removeprefix("."))
+            if entry is not None and entry["config_dir"] else NoUnitConversation())
+
 
 
 class UnitPane(NamedTuple):

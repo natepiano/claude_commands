@@ -109,6 +109,24 @@ class StopResumeTests(unittest.TestCase):
         return (sessions.LiveSessionProcess(123) if call(123, signal.SIGKILL) not in self.kill.call_args_list
                 else sessions.SessionNotLive())
 
+    def test_recovery_opens_a_fresh_tab_for_a_missing_pane_then_uses_the_shared_resume(self) -> None:
+        self.client.rows.clear()
+        def open_tab(space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
+            self.assertEqual((space, title, cwd), ("alpha", "alpha", str(self.root)))
+            self.assertEqual(environment["CLAUDE_CONFIG_DIR"], str(self.root / ".claude3"))
+            self.client.rows.append({"pane_id": "w2:p3", "label": title, "workspace_id": "w2",
+                "agent_session": {"kind": "none"}})
+            return "w2:p3"
+        with patch.object(self.client, "open_tab", side_effect=open_tab) as opened:
+            result = stop_resume.resume("sid-alpha", why="watchdog recovery", restore_missing=True)
+        self.assertIsInstance(result, stop_resume.ClaudeUp)
+        assert isinstance(result, stop_resume.ClaudeUp)
+        self.assertEqual((result.session_id, result.pane_id, result.account), ("sid-alpha", "w2:p3", "claude3"))
+        opened.assert_called_once()
+        self.assertIn("sid-alpha", self.launched)
+        self.assertEqual(pane_record.read("agents")["w2:p3"]["session_id"], "sid-alpha")
+        self.assertEqual(self._typed(self.start.call_args.args)[2], "w2:p3")
+
     def test_stop_returns_as_soon_as_term_takes_effect(self) -> None:
         self.live.return_value = sessions.LiveSessionProcess(123)
         def exits_soon(_pid: int, _generation: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
@@ -202,7 +220,7 @@ class StopResumeTests(unittest.TestCase):
         self.seed.side_effect = herdr.HerdrFailure("no reply")
         self.assertEqual(stop_resume.stop("sid-alpha"), stop_resume.NotRunning("sid-alpha"))
 
-    def test_stop_sends_term_then_kill_to_the_same_claude_and_writes_nothing(self) -> None:
+    def test_stop_sends_term_then_kill_to_the_same_claude_and_only_marks_its_launch_ended(self) -> None:
         self.live.return_value = sessions.LiveSessionProcess(123)
         def signal_delivered(_pid: int, sig: int) -> None:
             if sig == signal.SIGKILL:
@@ -214,7 +232,14 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(self.kill.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
         self.assertTrue(all(0 < invocation.args[0] <= 0.1
                             for invocation in cast(Mock, cast(Mock, self.wait.return_value).wait).call_args_list))
-        self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+        launch_path = pane_record.record_path("agents")
+        expected = cast(dict[str, dict[str, object]], json.loads(before[launch_path]))
+        expected["w1:p2"]["ended"] = True
+        self.assertEqual(json.loads(launch_path.read_bytes()), expected)
+        after = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        self.assertEqual(set(after), set(before))
+        self.assertEqual({path: content for path, content in after.items() if path != launch_path},
+                         {path: content for path, content in before.items() if path != launch_path})
         self.start.assert_not_called()
 
     def test_stop_does_not_kill_an_exited_or_replaced_process(self) -> None:

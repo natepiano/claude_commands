@@ -248,15 +248,14 @@ class AddUnitResumeTests(AddUnitTestCase):
                 shutdown.assert_not_called()
                 self.assert_no_launch_change(document, head)
 
-    def test_attach_checks_launch_hold_before_requesting_shutdown(self) -> None:
+    def test_attach_uses_live_source_without_consulting_stale_holds(self) -> None:
         prior, trace = self.prepare_attach()
-        with patch.object(launch_permission, "launch_permission", return_value=launch_permission.BlockedByShutdown("units account is held")):
+        self.write_shutdown_record(self.shutdown_record("down"))
+        with patch.object(launch_permission, "launch_permission", side_effect=AssertionError("stale hold queried")):
             result = self.cli("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertIn("units account is held", result.stderr)
-        self.assertEqual(trace, [])
-
-
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(trace, ["stop", "launch"])
+        self.assertIn("--resume session-123", self.launch_command())
 
     def test_attach_refuses_process_still_registered_after_stop(self) -> None:
         prior, trace = self.prepare_attach(after_stop=(303,))

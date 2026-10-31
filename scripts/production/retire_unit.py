@@ -10,7 +10,7 @@ uncommitted work: no person wrote it. Then it stops what the unit owns. It finds
 
 - the marked director and each session recorded by the worktree's runs, wherever it works, stop
   through `stop_resume.stop`, which ends its Claude process, and its
-  restore is then forgotten, so no restart brings it back;
+  pane launch is then forgotten, so pane restore does not bring it back;
 - each run of the worktree that has an app-server stops it and ends its Codex workers
   (`codex_mesh.py stop`);
 - the unit's review-pool reviewers retire (`review_pool.py retire`); one still reviewing stays;
@@ -22,7 +22,7 @@ When nothing is left running, the Units row's Plan cell gets "(retired <date>, w
 session <id>)", adding ", folder <path>" when its transcript resumes outside the worktree,
 committed on the merge branch, and the worktree, the local branch and the origin branch go.
 Shutdown completion and forgetting its restore must succeed; a final liveness and record check
-refuses marking or removal while a known session still runs or its shutdown is unfinished.
+refuses marking or removal while a known session still runs or its liveness is unreadable.
 --dry-run prints each refusal and everything it would stop and remove, and changes nothing.
 
 Exit 0 when the unit is retired; 1 on a refusal or when something still runs (a rerun resumes);
@@ -63,21 +63,19 @@ import unit_lookup  # noqa: E402
 import unit_move  # noqa: E402
 import unit_names  # noqa: E402
 import unit_runs  # noqa: E402
+import pane_record  # noqa: E402
 from production_units import Production, read_production  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.message import sessions
     from scripts.message.sessions import SessionRecord
-    from scripts.shutdown import shutdown_record
     from scripts.shutdown import stop_resume
 else:
-    import shutdown_record
     from scripts.shutdown import stop_resume
     import sessions
     from sessions import SessionRecord
 
 SCRIPTS = Path(__file__).resolve().parent.parent
-SHUTDOWN = SCRIPTS / "shutdown" / "shutdown.py"
 MESH = SCRIPTS / "agents" / "codex_mesh.py"
 POOL = SCRIPTS / "direct" / "review_pool.py"
 BUILD_HOLD = SCRIPTS / "build_hold" / "build_hold.py"
@@ -484,18 +482,6 @@ def director_resume_folder(session_id: str) -> Path:
     return transcript_resume_folder(transcripts[0])
 
 
-def unit_shutdowns(unit: Unit, ids: frozenset[str]) -> list[shutdown_record.SessionShutdown]:
-    """Retained requests still owned by this unit, including a director that already exited."""
-    found: list[shutdown_record.SessionShutdown] = []
-    for saved in shutdown_record.all_session_records():
-        owner = saved["session"]
-        if owner["session_id"] in ids or (owner["kind"] == "unit"
-                and owner["host"]["unit"] == unit.name
-                and staff_sources.unit_parent(unit.name, owner["session_id"]).slug == unit.production.slug):
-            found.append(saved)
-    return found
-
-
 def last_session(unit: Unit) -> str:
     """The marked director, an existing retirement's session, or the newest interactive transcript
     under the worktree's project folder; empty when none can be found."""
@@ -508,9 +494,10 @@ def last_session(unit: Unit) -> str:
                 saved = re.match(r"^\s*\(retired [^)]*, session ([0-9A-Za-z-]+)(?:, folder [^)]*)?\)", row.get("Plan", ""))
                 if saved:
                     return saved[1]
-    retained = unit_shutdowns(unit, frozenset())
-    if retained:
-        return max(retained, key=lambda saved: saved["requested_at"])["session"]["session_id"]
+    launches = [entry for entry in pane_record.launches()
+                if entry["environment"].get("SHOWRUNNER_UNIT_ID") == unit.name and entry["session_id"]]
+    if launches:
+        return max(launches, key=lambda entry: entry["written_at"])["session_id"]
     folder = unit_move.project_folder(str(unit.worktree))
     transcripts = [path for directory in unit_move.config_dirs()
                    for path in (directory / "projects" / folder).glob("*.jsonl") if _interactive(path)]
@@ -572,14 +559,9 @@ def dry_run(unit: Unit) -> int:
 
 
 def stop_sessions(unit: Unit, found: Found, wait_minutes: float, known_ids: frozenset[str], *, forget: bool = True) -> list[str]:
-    """End each unit Claude through the single stop API, then forget its old restore."""
+    """End each unit Claude through the single stop API, then forget its pane launch."""
     del wait_minutes
-    try:
-        saved = unit_shutdowns(unit, known_ids | {item["sessionId"] for item in found.claude})
-    except (shutdown_record.InvalidRecord, OSError) as error:
-        return [f"shutdown records unreadable: {error}"]
-    identities = list(dict.fromkeys([item["sessionId"] for item in found.claude]
-                                   + [item["session"]["session_id"] for item in saved] + sorted(known_ids)))
+    identities = list(dict.fromkeys([item["sessionId"] for item in found.claude] + sorted(known_ids)))
     failures: list[str] = []
     for identity in identities:
         outcome = stop_resume.stop(identity)
@@ -590,12 +572,12 @@ def stop_sessions(unit: Unit, found: Found, wait_minutes: float, known_ids: froz
             if not isinstance(sessions.session_liveness(identity), sessions.SessionNotLive):
                 failures.append(f"{identity}: no local tab; stop refused")
                 continue
-        if forget:
-            forgot = run([sys.executable, str(SHUTDOWN), "forget", identity])
-            if forgot.returncode:
-                failures.append(f"{identity}: its restore stays: {failure(forgot)}")
-                continue
         print(f"stopped: {identity}")
+    if forget and not failures:
+        try:
+            _ = pane_record.forget_unit(unit.name)
+        except (OSError, ValueError) as error:
+            failures.append(f"{unit.name}: pane launch stays: {error}")
     return failures
 
 
@@ -719,9 +701,6 @@ def final_stop_check(unit: Unit, ids: frozenset[str]) -> list[str]:
             left.append(f"session {session_id}: {observed.reason}")
         else:
             left.extend(f"session {session_id}, pid {pid}" for pid in observed.pids)
-    for saved in unit_shutdowns(unit, ids):
-        if not shutdown_record.shutdown_finished(saved) or shutdown_record.stop_incomplete(saved):
-            left.append(f"session {saved['session']['session_id']}, pid {saved['session']['pid']}: shutdown {saved['progress']['kind']}")
     if unit_move.exists(unit.worktree):
         left.extend(f"unowned process {pid} works inside {unit.worktree}; stop it first"
                     for pid in unit_move.processes_inside(unit.worktree) if pid != os.getpid())
@@ -742,7 +721,6 @@ def retire(unit: Unit, wait_minutes: float) -> int:
     ids = {item["sessionId"] for item in found.claude}
     if session_id:
         ids.add(session_id)
-    ids.update(saved["session"]["session_id"] for saved in unit_shutdowns(unit, frozenset(ids)))
     left = stop_sessions(unit, found, wait_minutes, frozenset(ids), forget=pane is None)
     if not left:
         remaining = gather(unit)
@@ -770,7 +748,7 @@ def retire(unit: Unit, wait_minutes: float) -> int:
         return 1
     try:
         left = final_stop_check(unit, frozenset(ids))
-    except (Refused, shutdown_record.InvalidRecord, OSError) as error:
+    except (Refused, OSError) as error:
         left = [str(error)]
     if left:
         print("\n".join(f"left running: {reason}" for reason in left))
@@ -806,7 +784,7 @@ def _main(argv: list[str]) -> int:
         return retire(unit, cast(float, options.wait_minutes))
     except (staff.StaffRefused, staff.StaffUnreadable):
         raise
-    except (Refused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, shutdown_record.InvalidRecord, OSError) as error:
+    except (Refused, production_units.Refusal, unit_names.BadName, WorkerUnavailable, OSError) as error:
         print(f"refused: {error}")
         return 1
 

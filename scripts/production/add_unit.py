@@ -42,7 +42,6 @@ from atomic_file import write_text_atomic
 
 if TYPE_CHECKING:
     import herdr
-    import launch_permission
     from scripts.accounts.accounts import ClaudeLaunchAccount
 
 
@@ -660,7 +659,6 @@ def preflight(request: RequestedUnitLaunch, selected: ClaudeLaunchAccount) -> Re
 def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
     """Require one live, attributed inventory identity before requesting its safe stop."""
     import inventory
-    from shutdown_record import session_records
 
     processes = sessions.session_processes(session_id)
     if isinstance(processes, sessions.SessionLivenessUnknown):
@@ -674,8 +672,6 @@ def attach_source(session_id: str, pid: int) -> RunningSessionHandoff:
     login, proc_start = identities.pop()
     if not login or not proc_start:
         raise Refusal(f"cannot attach {session_id}: source account or process identity is unreadable")
-    if any(saved["session"]["session_id"] == session_id for saved in session_records(login)):
-        raise Refusal(f"cannot attach {session_id}: a shutdown record already owns this session")
     return RunningSessionHandoff(session_id, pid, proc_start, login)
 
 
@@ -1032,27 +1028,6 @@ def close_untyped_session(request: UnitLaunch, outcome: herdr.PromptNotSubmitted
     return "; its session is closed: run the same command again"
 
 
-def launch_environment() -> dict[str, str]:
-    """The sanitized caller environment used by the launch-permission check."""
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith(("CLAUDE_", "STAFF_OPERATION_"))
-    }
-
-
-def require_shutdown_launch_permission(selected: ClaudeLaunchAccount, purpose: launch_permission.LaunchPurpose) -> None:
-    import launch_permission
-
-    environment = launch_environment()
-    environment["CLAUDE_CONFIG_DIR"] = str(selected.dir)
-    permission = launch_permission.launch_permission(environment, purpose)
-    if isinstance(permission, launch_permission.BlockedByShutdown):
-        raise Refusal(f"{permission.reason}; /shutdown restart first")
-    if isinstance(permission, launch_permission.ShutdownStateUnreadable):
-        raise Refusal(f"shutdown state unreadable: {permission.detail}")
-
-
 def record_scheduled_restore_prompt(session_id: str, prompt: str) -> None:
     # Imported here, not at the top: live_units.py and update_registration.py
     # import this module for its table readers from trees without scripts/hooks.
@@ -1138,27 +1113,20 @@ def account_for_launch(request: RequestedUnitLaunch, target: str = "", config_di
     """Resume a saved conversation on its launch account; otherwise use the units account."""
     from scripts.accounts import accounts
     try:
-        if target and not config_dir and not source_fallback and isinstance(request.session, ResumedSession):
+        if isinstance(request.session, ResumedSession) and not config_dir:
             import unit_move
 
             conversation = unit_move.unit_conversation(None, session_id=request.session.session_id)
-            if isinstance(conversation, unit_move.UnitConversation) and conversation.account == target:
-                prepared = accounts.prepared_account(target, resume=True)
+            if source_fallback and (not isinstance(conversation, unit_move.UnitConversation)
+                                    or conversation.account != target):
+                raise Refusal("--source-fallback must name the pane launch's source account")
+            if isinstance(conversation, unit_move.UnitConversation) and (not target or target == conversation.account):
+                prepared = accounts.prepared_account(conversation.account, resume=True)
                 if isinstance(prepared, accounts.AccountRefused):
                     raise Refusal(prepared.reason)
-                return accounts.NamedAccount(target, accounts.claude_account_dir(target))
-        if source_fallback:
-            from shutdown_record import all_session_records
-
-            if not isinstance(request.launch_kind, UnitRestoreLaunch):
-                raise Refusal("--source-fallback requires a recorded unit restore")
-            identity = request.launch_kind.session_id
-            matches = [saved for saved in all_session_records()
-                       if saved["session"]["session_id"] == identity
-                       and saved["session"]["kind"] == "unit" and saved.get("target") == target
-                       and saved.get("source_label", saved["label"]) == target]
-            if len(matches) != 1:
-                raise Refusal("--source-fallback must name the shutdown record's source account")
+                return accounts.NamedAccount(conversation.account, accounts.claude_account_dir(conversation.account))
+        elif source_fallback:
+            raise Refusal("--source-fallback requires a resumed session and its pane launch account")
         return accounts.account_for_group_launch("unit", resume=isinstance(request.session, ResumedSession),
                                                  target=target, config_dir=config_dir, source_fallback=source_fallback)
     except accounts.AccountsError as error:
@@ -1218,21 +1186,20 @@ def transcript_model(session_id: str) -> str:
 
 
 def model_for_resume(request: RequestedUnitLaunch, explicit: str = "") -> str:
-    """Use the recorded model when available, with --model as the restore boundary."""
+    """Use the pane launch model when available, with --model as the restore boundary."""
     if isinstance(request.session, NewSession):
         if explicit:
             raise Refusal("--model requires --resume")
         return ""
     if explicit:
         return explicit
-    import shutdown_record
+    import pane_record
     try:
-        saved = [item for item in shutdown_record.all_session_records()
-                 if item["session"]["session_id"] == request.session.session_id]
-    except (shutdown_record.InvalidRecord, OSError) as error:
-        raise Refusal(f"shutdown state unreadable: {error}") from error
-    if len(saved) == 1 and saved[0]["session"]["model"]["kind"] == "model":
-        return saved[0]["session"]["model"]["name"]
+        entry = pane_record.launch_for_session(request.session.session_id)
+    except (OSError, ValueError) as error:
+        raise Refusal(f"pane launch unreadable: {error}") from error
+    if entry is not None and entry["model"]:
+        return entry["model"]
     return transcript_model(request.session.session_id) if isinstance(launched_unit(request), MarkedUnitFound) else ""
 
 
@@ -1335,9 +1302,8 @@ def _main(argv: list[str]) -> int:
 
         handoff: NoSessionHandoff | StoppedSessionHandoff = NoSessionHandoff()
         if isinstance(request.session, ResumedSession) and isinstance(request.session.handoff, AttachRunningSession):
-            # Release the launch barrier before down creates its own shutdown record.
+            # Release the launch barrier before stopping the source process.
             with launch_permission.launch_barrier():
-                require_shutdown_launch_permission(unit_account, launch_permission.NewWorkLaunchPurpose())
                 attach_ready = preflight(request, unit_account)
             source = attach_ready.handoff
             if cast(bool, args.check):
@@ -1350,19 +1316,10 @@ def _main(argv: list[str]) -> int:
             request = replace(request, session=request.session._replace(handoff=ResumeStoppedSession()))
 
         outcome = herdr.PromptNotSubmitted("restore reused a session without submit proof")
-        purpose: launch_permission.LaunchPurpose = (
-            launch_permission.RecordedSessionRestoreLaunchPurpose(
-                request.launch_kind.session_id
-            )
-            if isinstance(request.launch_kind, UnitRestoreLaunch)
-            else launch_permission.RecordedSessionRestoreLaunchPurpose(handoff.session_id)
-            if isinstance(handoff, StoppedSessionHandoff)
-            else launch_permission.NewWorkLaunchPurpose()
-        )
         from scripts.whoami.account import named_claude_account
         with launch_permission.admitted_launch(named_claude_account(unit_account.label).login,
                 request.session.session_id if isinstance(request.session, ResumedSession) else "",
-                request.unit_id, lambda: require_shutdown_launch_permission(unit_account, purpose)):
+                request.unit_id, lambda: None):
             ready = preflight(request, unit_account)
             request = ready.launch
             if cast(bool, args.check):

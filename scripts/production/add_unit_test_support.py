@@ -318,6 +318,11 @@ class AddUnitTestCase(ShutdownTestCase):
         self.persist_herdr_unit(session, self.root)
         environment = self.root / "proc/202/environ"
         _ = environment.write_text(environment.read_text() + f"\0CLAUDE_CONFIG_DIR={directory}")
+        import pane_record
+        with patch.object(pane_record, "RECORD_DIR", Path(self.env["HERDR_PANE_RECORD_DIR"])):
+            pane_record.write(session, pane_record.launch("w1:p1", "session-123", str(self.root),
+                {"CLAUDE_CONFIG_DIR": str(directory), "SHOWRUNNER_UNIT_ID": "alpha-unit"},
+                ["claude", "-n", "alpha", "--model", model]))
         transcript = Path(self.env["HOME"]) / ".claude/projects/project/session-123.jsonl"
         transcript.parent.mkdir(parents=True, exist_ok=True)
         _ = transcript.write_text(json.dumps({"type": "assistant", "message": {"model": model}}) + "\n")

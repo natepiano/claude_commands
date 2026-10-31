@@ -11,14 +11,14 @@ import sys
 import subprocess
 import time
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from io import StringIO
 from threading import Event
 from time import monotonic
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -29,8 +29,14 @@ for dependency in ("shutdown", "herdr", "message", "whoami", "lib"):
 import herdr
 import pane_record
 from scripts.shutdown import folder_trust
+from scripts.shutdown.stop_results import (
+    Stopped as Stopped, NotRunning as NotRunning, StopFailed as StopFailed,
+    ClaudeUp as ClaudeUp, MoveHandedOff as MoveHandedOff, ResumeFailed as ResumeFailed,
+    SessionNotFound as SessionNotFound, MoveResult as MoveResult, claude_up_line as claude_up_line,
+)
 import sessions
-from shutdown_record import PausedSeat
+if TYPE_CHECKING:
+    from scripts.shutdown.inventory import PausedSeat
 from launch_permission import shutdown_state_root
 
 STOP_GRACE_SECONDS = 2.0
@@ -38,48 +44,6 @@ KILL_GRACE_SECONDS = 5.0
 START_SECONDS = 20.0
 STAY_SECONDS = 10.0
 RESUME_ATTEMPTS = 3
-
-
-@dataclass(frozen=True)
-class Stopped:
-    session_id: str
-    pid: int
-
-
-@dataclass(frozen=True)
-class NotRunning:
-    session_id: str
-
-
-@dataclass(frozen=True)
-class StopFailed:
-    session_id: str
-    reason: str
-
-
-@dataclass(frozen=True)
-class ClaudeUp:
-    session_id: str
-    pane_id: str
-    account: str
-    elapsed_seconds: float = field(default=0.0, compare=False)
-    trust_copied_from: str = field(default="", compare=False)
-
-
-@dataclass(frozen=True)
-class MoveHandedOff:
-    session_id: str
-
-
-@dataclass(frozen=True)
-class ResumeFailed:
-    session_id: str
-    reason: str
-
-
-@dataclass(frozen=True)
-class SessionNotFound:
-    name: str
 
 
 def _tab_of(session: str) -> herdr.TabSession | SessionNotFound:
@@ -131,8 +95,18 @@ def _record_launches(selected: list[str]) -> None:
 
 
 def stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
+    """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
     _record_launches([session])
-    return _stop(session)
+    result = _stop(session)
+    if isinstance(result, Stopped):
+        try:
+            owner = herdr.shared_session()
+            for pane, entry in pane_record.read(owner).items():
+                if entry["session_id"] == result.session_id:
+                    pane_record.end(owner, pane, result.session_id)
+        except (OSError, ValueError) as error:
+            return StopFailed(result.session_id, f"Claude stopped, but its intentional stop could not be saved: {error}")
+    return result
 
 
 def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
@@ -239,25 +213,33 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     client.run_in_pane(tab.pane_id, command)
 
 
-def resume(session: str, *, why: str, to: str | None = None, requester: str = "") -> ClaudeUp | ResumeFailed | SessionNotFound:
+def resume(session: str, *, why: str, to: str | None = None, requester: str = "",
+           restore_missing: bool = False) -> ClaudeUp | ResumeFailed | SessionNotFound:
     began = monotonic()
     identity = session
     try:
         tab = _tab_of(session)
+        client = herdr.Herdr(herdr.shared_session())
         if isinstance(tab, SessionNotFound):
-            return tab
-        if tab.session_id is None:
-            return SessionNotFound(session)
-        identity = tab.session_id
+            if not restore_missing:
+                return tab
+            entry = pane_record.launch_for_session(session)
+            if entry is None:
+                return tab
+        else:
+            if tab.session_id is None:
+                return SessionNotFound(session)
+            identity = tab.session_id
+            entry = pane_record.read(client.session).get(tab.pane_id)
         live = sessions.session_liveness(identity)
         if isinstance(live, sessions.LiveSessionProcess):
             return ResumeFailed(identity, "Claude is still running")
         if isinstance(live, sessions.SessionLivenessUnknown):
             return ResumeFailed(identity, live.reason)
-        client = herdr.Herdr(herdr.shared_session())
-        entry = pane_record.read(client.session).get(tab.pane_id)
         if entry is None or entry["session_id"] != identity:
             return ResumeFailed(identity, "pane launch entry does not match the session")
+        if restore_missing and entry.get("ended", False):
+            return ResumeFailed(identity, "Claude was closed by hand")
         if not entry.get("flags_read", False):
             return ResumeFailed(identity, "pane launch flags are unknown")
         from inventory import codex_seats
@@ -271,6 +253,19 @@ def resume(session: str, *, why: str, to: str | None = None, requester: str = ""
         trust = folder_trust.heal(Path(entry["cwd"]), target_dir, source)
         if isinstance(trust, (folder_trust.FolderNotTrusted, folder_trust.FolderTrustUnreadable)):
             return ResumeFailed(identity, f"{trust.reason}. Run: {trust.command}")
+        if isinstance(tab, SessionNotFound):
+            from scripts.whoami.account import named_account_environment
+
+            pane = client.open_tab(entry["environment"].get("SHOWRUNNER_UNIT", "agents"),
+                entry["name"] or identity, entry["cwd"],
+                {**entry["environment"], **named_account_environment(target_dir)})
+            entry = entry.copy()
+            entry["pane_id"] = pane
+            pane_record.write(client.session, entry)
+            tab = next((item for item in client.tab_sessions() if item.pane_id == pane), None)
+            if tab is None:
+                return ResumeFailed(identity, "new recovery pane is unavailable")
+            tab = replace(tab, session_id=identity)
         copied_from = trust.source if isinstance(trust, herdr.TrustCopied) else ""
         workers = ResumeWorkers(codex_seats([Path(run) for run in unit_runs.held(identity)]), entry["cwd"])
         message = resume_message(why, moved_from=source.name.removeprefix(".") if to else None,
@@ -304,9 +299,6 @@ def resume(session: str, *, why: str, to: str | None = None, requester: str = ""
         return ResumeFailed(identity, reason)
     except (OSError, ValueError, herdr.HerdrFailure, subprocess.SubprocessError) as error:
         return ResumeFailed(identity, str(error))
-
-
-MoveResult = ClaudeUp | MoveHandedOff | StopFailed | ResumeFailed | SessionNotFound
 
 
 def _detach(arguments: list[str], task: str) -> None:
@@ -397,12 +389,6 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
         _ = quota_alert.tell_user(render("shutdown.restart_failed", account=account, machine=local_machine(),
                                         stopped=name, cause=cause))
     return cause
-
-
-def claude_up_line(result: ClaudeUp) -> str:
-    return (f"{result.session_id}: Claude is up on {result.account} in {result.pane_id} "
-            + f"({result.elapsed_seconds:.1f} s)"
-            + (f"; copied folder trust from {result.trust_copied_from}" if result.trust_copied_from else ""))
 
 
 def _warn_session(session: str, target: str, why: str, seconds: int) -> None:

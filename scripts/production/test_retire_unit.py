@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast, final, override
+from typing import TYPE_CHECKING, final, override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -28,23 +28,20 @@ import unit_lookup
 import unit_move
 from herdr import HerdrPlace
 from production_units import Production, read_production
-from scripts.production.fake_unit_host import PaneShellFixture, stopped_record
+from scripts.production.fake_unit_host import PaneShellFixture
 
 if TYPE_CHECKING:
     from scripts.message import sessions
     from scripts.message.sessions import SessionRecord
-    from scripts.shutdown import shutdown_record
-    from scripts.shutdown.shutdown_record import SessionShutdown
 else:
     # retire_unit puts the message and shutdown folders on the path.
-    import shutdown_record
     import sessions
     from sessions import SessionRecord
 
 from scripts.production.staff_test_support import StaffTestCase
-from scripts.shutdown import shutdown, stop_resume
+from scripts.shutdown import stop_resume
+import pane_record
 from scripts.production import staff
-from scripts.production.cli_fixture import parse_arguments
 
 DIRECTOR = "11111111-1111-1111-1111-111111111111"
 # The fixture replaces the lookup; a test of the lookup itself puts it back.
@@ -79,7 +76,6 @@ class RetireUnitTests(unittest.TestCase):
     pool_lines: str = ""
     marked: unit_lookup.MarkedUnit | None = None
     config: Path = Path()
-    records: list[SessionShutdown] = []
 
     @override
     def setUp(self) -> None:
@@ -127,7 +123,6 @@ class RetireUnitTests(unittest.TestCase):
         _ = (holds / DIRECTOR).write_text("{}", encoding="utf-8")
 
         self.calls = []
-        self.records = []
         self.claude = [session(DIRECTOR, "alpha", 4101), session(SEAT, "alpha-seat", 4102)]
         self.pool_lines = "code-1\tcode\talpha-unit:1\tidle\t3\ncode-2\tcode\tbeta-unit:1\tidle\t1\n"
         self.staff.register_production("alpha", self.doc)
@@ -147,9 +142,6 @@ class RetireUnitTests(unittest.TestCase):
         def no_reservations(_worktree: Path) -> tuple[str, ...]:
             return ()
 
-        def no_records() -> list[SessionShutdown]:
-            return self.records
-
         def session_processes(session_id: str) -> sessions.SessionProcesses:
             return sessions.SessionProcesses(tuple(item["pid"] for item in self.claude if item["sessionId"] == session_id))
 
@@ -165,7 +157,6 @@ class RetireUnitTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(retire_unit, "claude_sessions", claude_sessions))
         _ = self.enterContext(mock.patch.object(unit_move, "processes_inside", nothing_inside))
         _ = self.enterContext(mock.patch.object(retire_unit, "reservations", no_reservations))
-        _ = self.enterContext(mock.patch.object(shutdown_record, "all_session_records", no_records))
         _ = self.enterContext(mock.patch.object(sessions, "session_processes", session_processes))
         self.marked = unit_lookup.MarkedUnit(
             "alpha-unit", unit_lookup.LiveClaude("alpha", DIRECTOR, "/nonexistent.sock", 4101), HerdrPlace("alpha", "w1:p1"))
@@ -173,6 +164,9 @@ class RetireUnitTests(unittest.TestCase):
         def marked_unit(_slug: str, _name: str) -> unit_lookup.MarkedUnit | None:
             return self.marked
 
+        _ = self.enterContext(mock.patch.object(pane_record, "RECORD_DIR", self.root / "panes"))
+        pane_record.write("alpha", pane_record.launch("w1:p1", DIRECTOR, str(self.worktree),
+            {"CLAUDE_CONFIG_DIR": str(self.config), "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude", "-n", "alpha"]))
         def process_info(*_arguments: str) -> dict[str, object]:
             # Existing cases launch Claude with exec: it replaces the pane's shell.
             pid = self.marked.claude.pid if self.marked and isinstance(self.marked.claude, unit_lookup.LiveClaude) else 4101
@@ -188,13 +182,6 @@ class RetireUnitTests(unittest.TestCase):
         folder = self.config / "projects" / unit_move.project_folder(str(cwd))
         folder.mkdir(parents=True, exist_ok=True)
         _ = (folder / f"{DIRECTOR}.jsonl").write_text(json.dumps({"entrypoint": "cli", "cwd": str(cwd)}) + "\n")
-
-    def shutdown_state(self, kind: Literal["stopping", "stopped"]) -> SessionShutdown:
-        # Only the record fields read by the stop/finished checks at this patched boundary.
-        return cast("SessionShutdown", cast(object, {"session": {"session_id": DIRECTOR, "pid": 4101,
-                    "name": "alpha", "kind": "unit", "host": {"production": "alpha", "unit": "alpha-unit"}},
-                    "requested_at": "2026-10-28T23:00:00+00:00",
-                    "progress": {"kind": kind}, "force": "wait for ready", "then": "stop", "stop_issues": []}))
 
     def fake_run(self, argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         """Git runs for real; every other command is recorded and answered."""
@@ -231,18 +218,10 @@ class RetireUnitTests(unittest.TestCase):
         pane = PaneShellFixture(self, self.worktree, self.root / "proc", live=live, slug="alpha")
         pane.found = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude(
             "alpha", DIRECTOR, "socket", pane.director) if live else unit_lookup.ClaudeNotRunning(), pane.place)
-        saved = stopped_record(self.root, self.worktree)
-        saved["session"]["session_id"] = DIRECTOR
-        host = saved["session"]["host"]
-        assert host["kind"] == "unit"
-        self.records = []
-        self.claude = [session(DIRECTOR,"alpha",pane.director)] if live else []
-        self.enterContext(mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown")}))
+        self.claude = [session(DIRECTOR, "alpha", pane.director)] if live else []
         def clean_stop() -> None:
             pane.stopped()
             self.claude = []
-            self.assertTrue(shutdown_record.create_session(saved))
-            self.records = [saved]
         original = self.stop_session
         def stop(identity: str) -> stop_resume.Stopped | stop_resume.NotRunning:
             result = original(identity)
@@ -310,7 +289,6 @@ class RetireUnitTests(unittest.TestCase):
                     self.claude = []
                     self.marked = None
                     unit = retire_unit.find_unit("alpha", "alpha")
-                    self.records = []
                     pane = PaneShellFixture(self, self.worktree, self.root / "visitor-proc", live=False, slug="alpha")
                     pane.add_occupant(991551, unit=visitor_unit, marked=bool(visitor_unit))
                     if not marked_pane:
@@ -431,14 +409,12 @@ class RetireUnitTests(unittest.TestCase):
         self.assertIn("invalid backend", output)
         self.assertIn(str(store.path), output)
 
-    def test_every_shutdown_call_retire_makes_parses(self) -> None:
+    def test_retirement_forgets_its_pane_launch_without_calling_shutdown_cli(self) -> None:
+        self.assertEqual(pane_record.read("alpha")["w1:p1"]["session_id"], DIRECTOR)
         code, output = self.retire()
         self.assertEqual(code, 0, output)
-        calls = [call[1:] for call in self.calls if call[0] == "shutdown.py"]
-        self.assertIn("forget", [call[0] for call in calls])
-        for arguments in calls:
-            with self.subTest(arguments=arguments):
-                self.assertIsNotNone(parse_arguments(shutdown.main, arguments), f"shutdown.py refuses {arguments}")
+        self.assertEqual(pane_record.read("alpha"), {})
+        self.assertFalse(any(call[0] == "shutdown.py" for call in self.calls))
 
     def test_retires_a_unit_with_a_seat_a_worker_and_a_reviewer(self) -> None:
         code, output = self.retire()
@@ -446,9 +422,7 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(code, 0, output)
         self.assertEqual(self.stops(), [
             ["stop_resume.stop", DIRECTOR],
-            ["shutdown.py", "forget", DIRECTOR],
             ["stop_resume.stop", SEAT],
-            ["shutdown.py", "forget", SEAT],
             ["codex_mesh.py", "stop", "--session-dir", str(self.run_folder)],
             ["review_pool.py", "retire", "--production", "alpha", "--unit", "alpha-unit"],
             ["build_hold.py", "release", "--holder", DIRECTOR],
@@ -562,7 +536,7 @@ class RetireUnitTests(unittest.TestCase):
         code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertIn(["stop_resume.stop", DIRECTOR], self.calls)
-        self.assertIn(["shutdown.py", "forget", DIRECTOR], self.calls)
+        self.assertEqual(pane_record.read("alpha"), {})
         self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
         self.assertFalse(self.worktree.exists())
 
@@ -622,26 +596,20 @@ class RetireUnitTests(unittest.TestCase):
 
     def test_failed_forget_keeps_the_unit_and_reports_failure(self) -> None:
         before = self.doc.read_bytes()
-        def command(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-            if argv[1:3] == [str(retire_unit.SHUTDOWN), "forget"]:
-                return subprocess.CompletedProcess(argv, 1, "", "cannot forget shutdown in progress (stopping)")
-            return self.fake_run(argv, cwd)
-        with mock.patch.object(retire_unit, "run", command):
+        with mock.patch.object(pane_record, "forget_unit", side_effect=OSError("pane entry storage failed")):
             code, output = self.retire()
         self.assertEqual(code, 1, output)
-        self.assertIn("left running:", output)
-        self.assertIn("cannot forget shutdown in progress (stopping)", output)
+        self.assertIn("pane entry storage failed", output)
         self.assertEqual(self.doc.read_bytes(), before)
         self.assertTrue(self.worktree.exists())
 
-    def test_final_check_refuses_a_shutdown_record_that_is_still_in_progress(self) -> None:
+    def test_failed_stop_retains_the_pane_launch_and_unit(self) -> None:
         before = self.doc.read_bytes()
-        def pending_stop(_slug: str, _unit: str) -> None:
-            self.records = [self.shutdown_state("stopping")]
-        with mock.patch.object(design_roles, "end_holder", side_effect=pending_stop):
+        with mock.patch.object(stop_resume, "stop", return_value=stop_resume.StopFailed(DIRECTOR, "still alive")):
             code, output = self.retire()
         self.assertEqual(code, 1, output)
-        self.assertIn(f"session {DIRECTOR}, pid 4101: shutdown stopping", output)
+        self.assertIn("still alive", output)
+        self.assertEqual(pane_record.read("alpha")["w1:p1"]["session_id"], DIRECTOR)
         self.assertEqual(self.doc.read_bytes(), before)
         self.assertTrue(self.worktree.exists())
 
@@ -667,38 +635,20 @@ class RetireUnitTests(unittest.TestCase):
         self.assertTrue(self.worktree.exists())
 
 
-    def test_rerun_forgets_the_exited_directors_retained_restore_before_marking(self) -> None:
+    def test_rerun_forgets_the_exited_directors_pane_launch_before_marking(self) -> None:
         folder = self.outside_director()
-        reject_forget = True
-        def command(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-            if argv[1:3] == [str(retire_unit.SHUTDOWN), "forget"] and reject_forget:
-                return subprocess.CompletedProcess(argv, 1, "", "forget storage failed")
-            result = self.fake_run(argv, cwd)
-            if argv[1:3] == [str(retire_unit.SHUTDOWN), "forget"]:
-                self.records = []
-            return result
-        original = self.stop_session
-        def stop(identity: str) -> stop_resume.Stopped | stop_resume.NotRunning:
-            result = original(identity)
-            if not self.records:
-                self.records = [self.shutdown_state("stopped")]
-            return result
-        with (mock.patch.object(retire_unit, "run", command),
-              mock.patch.object(stop_resume, "stop", side_effect=stop)):
+        with mock.patch.object(pane_record, "forget_unit", side_effect=OSError("pane entry storage failed")):
             code, output = self.retire()
-            self.assertEqual(code, 1, output)
-            self.assertIn("forget storage failed", output)
-            self.assertNotIn("(retired", self.doc.read_text())
-            self.assertTrue(self.worktree.exists())
-            self.assertIsNone(self.marked)
-            reject_forget = False
-            code, output = self.retire()
+        self.assertEqual(code, 1, output)
+        self.assertIn("pane entry storage failed", output)
+        self.assertTrue(self.worktree.exists())
+        self.assertIsNone(self.marked)
+        code, output = self.retire()
         self.assertEqual(code, 0, output)
         self.assertIn(f"session {DIRECTOR}, folder {folder})", self.doc.read_text())
         self.assertFalse(self.worktree.exists())
         self.assertEqual(len([call for call in self.calls if call == ["stop_resume.stop", DIRECTOR]]), 2)
-        self.assertEqual(self.records, [])
-
+        self.assertEqual(pane_record.read("alpha"), {})
 
 if __name__ == "__main__":
     _ = unittest.main()

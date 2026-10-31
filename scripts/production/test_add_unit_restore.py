@@ -356,7 +356,8 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(result.stderr, "")
         self.assertEqual(self.repository_state(), before)
 
-    def test_restart_restore_is_refused_when_record_is_down(self) -> None:
+    def test_restart_restore_ignores_a_stale_down_record(self) -> None:
+        self.commit_prepared_row(self.unit_row())
         self.write_shutdown_record(self.shutdown_record("down"))
         prior = self.root / "prior-session"
         prior.mkdir()
@@ -379,12 +380,12 @@ class AddUnitRestoreTests(AddUnitTestCase):
             "recorded-herdr",
          "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertIn("/shutdown restart first", result.stderr)
-        self.assertEqual(self.servers_started(), [])
-        self.assertEqual(self.recorded_prompts("session-123"), ())
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+        self.assertEqual(len(self.servers_started()), 1)
 
-    def test_restart_restore_is_refused_when_record_does_not_hold_it(self) -> None:
+    def test_restart_restore_ignores_a_stale_record_for_another_session(self) -> None:
+        self.commit_prepared_row(self.unit_row())
         self.write_shutdown_record(
             self.shutdown_record("restarting", session_id="other-session")
         )
@@ -409,12 +410,12 @@ class AddUnitRestoreTests(AddUnitTestCase):
             "recorded-herdr",
          "--config-dir", str(Path(self.env["HOME"]) / ".claude2"))
 
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertIn("/shutdown restart first", result.stderr)
-        self.assertEqual(self.servers_started(), [])
-        self.assertEqual(self.recorded_prompts("session-123"), ())
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+        self.assertEqual(len(self.servers_started()), 1)
 
-    def test_unreadable_shutdown_state_refuses_a_restore_with_one_prefix(self) -> None:
+    def test_restore_ignores_unreadable_stale_shutdown_state(self) -> None:
+        self.commit_prepared_row(self.unit_row())
         account = Path(self.env["SHUTDOWN_STATE_DIR"]) / "owner@example.com"
         account.mkdir(parents=True)
         _ = (account / "record.json").write_text("{", encoding="utf-8")
@@ -439,34 +440,18 @@ class AddUnitRestoreTests(AddUnitTestCase):
             "recorded-herdr",
         )
 
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertTrue(
-            result.stderr.startswith("add_unit: shutdown state unreadable: "),
-            result.stderr,
-        )
-        self.assertEqual(result.stderr.count("shutdown state unreadable: "), 1)
-        self.assertEqual(self.servers_started(), [])
-        self.assertEqual(self.recorded_prompts("session-123"), ())
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
+        self.assertEqual(len(self.servers_started()), 1)
 
-    def test_refused_marked_restore_does_not_stop_herdr_or_record_prompt(self) -> None:
+    def test_stale_down_record_does_not_block_a_stopped_marked_restore(self) -> None:
         self.write_shutdown_record(self.shutdown_record("down"))
-        launch_kind = add_unit.UnitRestoreLaunch(
-            "session-123",
-            self.root / "restart-note",
-            "recorded-name",
-            "recorded-herdr",
-        )
-
-        result, error, commands, launches, writes = self.run_with_marked_unit(
-            launch_kind, unit_lookup.ClaudeNotRunning()
-        )
-
-        self.assertEqual(result, 2)
-        self.assertIn("/shutdown restart first", error)
+        launch_kind = add_unit.UnitRestoreLaunch("session-123", self.root / "restart-note", "recorded-name", "recorded-herdr")
+        result, error, commands, launches, writes = self.run_with_marked_unit(launch_kind, unit_lookup.ClaudeNotRunning())
+        self.assertEqual(result, 0, error)
         self.assertEqual(commands, [])
-        self.assertEqual(launches, 0)
-        self.assertEqual(writes, 0)
-        self.assertEqual(self.recorded_prompts("session-123"), ())
+        self.assertEqual((launches, writes), (1, 1))
+        self.assertEqual(len(self.recorded_prompts("session-123")), 1)
 
     def test_launch_claim_releases_global_barrier_before_spawn(self) -> None:
         note = self.root / "restart-note"
@@ -698,10 +683,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         arguments = self.agent_arguments()
         self.assertEqual(arguments[arguments.index("--autocompact") + 1], "200k")
 
-    def test_recorded_source_fallback_uses_add_unit_in_the_shared_host(self) -> None:
-        from test_restart import entry, unit
-        import shutdown_record
-
+    def test_pane_source_fallback_uses_add_unit_in_the_shared_host(self) -> None:
         self.commit_prepared_row(self.unit_row())
         directory = self.prepare_unit_account("claude1")
         _ = self.prepare_unit_account("claude2")
@@ -709,20 +691,14 @@ class AddUnitRestoreTests(AddUnitTestCase):
         prior.mkdir()
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume on the source after the target refused.", encoding="utf-8")
-        saved = entry(unit("session-123"))
-        saved.update(target="claude1", source_label="claude1")
+        self.persist_unit_account(directory, session="alpha")
         flags = ("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior),
                  "--restart-note", str(note), "--session-name", "recorded-name", "--host-session", "shared-herdr",
                  "--account", "claude1")
-        with (patch.object(shutdown_record, "all_session_records", return_value=[saved]),
-              patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
-              patch.object(herdr, "shared_session", return_value="shared-herdr"),
+        with (patch.object(herdr, "shared_session", return_value="shared-herdr"),
               patch.object(herdr, "start_server") as start,
               patch.object(herdr, "open_tab", return_value="w1:p1") as tab,
               patch.object(herdr, "start_agent", return_value=SUBMITTED_PROMPT) as agent):
-            refused = self.cli(*flags)
-            self.assertEqual(refused.returncode, 2)
-            self.assertIn("units account is claude2", refused.stderr)
             _ = self.successful(*flags, "--source-fallback")
         start.assert_called_once_with("shared-herdr", 90_000)
         environment = cast(dict[str, str], tab.call_args.args[4])
@@ -732,23 +708,20 @@ class AddUnitRestoreTests(AddUnitTestCase):
         agent.assert_called_once()
         self.assertEqual(agent.call_args.args[:2], ("shared-herdr", "w1:p1"))
 
-    def test_source_fallback_requires_a_restore_of_its_recorded_source(self) -> None:
-        import shutdown_record
-
+    def test_source_fallback_requires_its_pane_launch_source(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
         note = self.root / "restart-note.txt"
         _ = note.write_text("Resume.", encoding="utf-8")
-        with (patch.object(shutdown_record, "all_session_records", return_value=[]),
-              patch.object(herdr, "start_agent", side_effect=AssertionError("invalid fallback launched"))):
+        with patch.object(herdr, "start_agent", side_effect=AssertionError("invalid fallback launched")):
             new = self.cli("alpha", "--plan", "docs/plans/given.md", "--source-fallback", "--account", "claude2")
             self.assertEqual(new.returncode, 2)
-            self.assertIn("requires a recorded unit restore", new.stderr)
+            self.assertIn("requires a resumed session", new.stderr)
             restore = self.cli("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123", "--cwd", str(prior),
                 "--restart-note", str(note), "--session-name", "recorded-name", "--host-session", "shared-herdr",
                 "--account", "claude2", "--source-fallback")
             self.assertEqual(restore.returncode, 2)
-            self.assertIn("must name the shutdown record's source account", restore.stderr)
+            self.assertIn("must name the pane launch's source account", restore.stderr)
 
     def test_all_restore_flags_parse_as_a_unit_restore_and_other_launches_do_not(self) -> None:
         note = self.root / "restart note.txt"

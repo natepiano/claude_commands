@@ -47,7 +47,6 @@ import unit_lookup
 import unit_move
 import unit_names
 from production_units import Production
-from shutdown_record import InvalidRecord
 from atomic_file import write_text_atomic
 
 ADD_UNIT = Path(__file__).resolve().parent / "add_unit.py"
@@ -279,7 +278,7 @@ def _main(argv: list[str]) -> int:
         return dry_run(unit) if cast(bool, options.dry_run) else resume(unit)
     except (staff.StaffRefused, staff.StaffUnreadable):
         raise
-    except (Refused, retire_unit.Refused, production_units.Refusal, unit_names.BadName, InvalidRecord, OSError) as error:
+    except (Refused, retire_unit.Refused, production_units.Refusal, unit_names.BadName, OSError) as error:
         print(f"refused: {error}")
         return 1
 

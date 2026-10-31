@@ -126,6 +126,15 @@ class RemoteControlTests(ShutdownTestCase):
         self.assertTrue(lines[0].startswith("trunk unit:"))
         return outcome, output.getvalue(), [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
 
+    def test_live_pane_marks_name_remote_control_messages(self) -> None:
+        launch: dict[str, object] = {"session_id": "conversation", "name": "Working tab",
+                                     "environment": {"SHOWRUNNER_UNIT_ID": "builders-unit", "SHOWRUNNER_UNIT": "demo"}}
+        self.assertEqual(remote_control.remote_control_who(launch), "builders unit")
+        launch["environment"] = {"SHOWRUNNER_UNIT": "demo"}
+        self.assertEqual(remote_control.remote_control_who(launch), "demo showrunner")
+        launch["environment"] = {}
+        self.assertEqual(remote_control.remote_control_who(launch), "Working tab")
+
     def test_launch_flag_activates_during_grace_without_pane_input_or_push(self) -> None:
         def activate(at: float) -> None:
             if at >= 14.5:

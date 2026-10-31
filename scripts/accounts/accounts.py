@@ -54,6 +54,7 @@ from scripts.accounts.refusals import (  # noqa: E402
 )
 
 from scripts.accounts import next_moves
+from scripts.shutdown import stop_results
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 from scripts.accounts.role_map import (  # noqa: E402
     RoleMap as RoleMap, RoleMapChange as RoleMapChange,
@@ -63,7 +64,6 @@ from scripts.accounts.role_map import (  # noqa: E402
 )
 
 if TYPE_CHECKING:
-    from scripts.shutdown import stop_resume
     from scripts.agents.codex_mesh import WorkersRunSwitch
     from scripts.shutdown.inventory import ListedSession, Session, ShowrunnerRegistrations
 
@@ -3015,9 +3015,12 @@ class SessionMoveRefused:
     reason: str
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.ClaudeUp | stop_resume.MoveHandedOff | SessionMoveRefused, ...]:
+class SessionBatchMove(Protocol):
+    def __call__(self, sessions: list[str], target: str, *, why: str) -> list[stop_results.MoveResult]: ...
+
+
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_results.ClaudeUp | stop_results.MoveHandedOff | SessionMoveRefused, ...]:
     """Stop and resume each selected local owner through the shared move API."""
-    from scripts.shutdown import stop_resume
 
     if TYPE_CHECKING:
         from scripts.shutdown import inventory
@@ -3042,26 +3045,26 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_
             refused[identity] = SessionMoveRefused(identity, "already on " + checked.destination.label)
         else:
             eligible.append(identity)
-    outcomes: dict[str, stop_resume.ClaudeUp | stop_resume.MoveHandedOff | SessionMoveRefused] = dict(refused)
-    results = stop_resume.move_sessions(eligible, checked.destination.label, why=why)
+    outcomes: dict[str, stop_results.ClaudeUp | stop_results.MoveHandedOff | SessionMoveRefused] = dict(refused)
+    batch = cast(SessionBatchMove, import_module("scripts.shutdown.stop_resume").move_sessions)
+    results = batch(eligible, checked.destination.label, why=why)
     for identity, result in zip(eligible, results):
-        if isinstance(result, (stop_resume.ClaudeUp, stop_resume.MoveHandedOff)):
+        if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff)):
             outcomes[identity] = result
         else:
-            reason = ("session has no tab on this machine" if isinstance(result, stop_resume.SessionNotFound)
+            reason = ("session has no tab on this machine" if isinstance(result, stop_results.SessionNotFound)
                       else result.reason)
             outcomes[identity] = SessionMoveRefused(identity, reason)
     return tuple(outcomes[identity] for identity in selected)
 
 
-def move_result_line(result: stop_resume.ClaudeUp | stop_resume.MoveHandedOff | SessionMoveRefused) -> str:
+def move_result_line(result: stop_results.ClaudeUp | stop_results.MoveHandedOff | SessionMoveRefused) -> str:
     if isinstance(result, SessionMoveRefused):
         return f"{result.session_id}: not moved: {result.reason}"
-    from scripts.shutdown import stop_resume
 
-    if isinstance(result, stop_resume.MoveHandedOff):
+    if isinstance(result, stop_results.MoveHandedOff):
         return f"{result.session_id}: moving now"
-    return stop_resume.claude_up_line(result)
+    return stop_results.claude_up_line(result)
 
 
 @dataclass(frozen=True)
@@ -3134,41 +3137,8 @@ class MoveDryRun:
     lines: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class MoveTargetHoldClear:
-    notices: tuple[str, ...] = ()
-
-
-def check_move_target_hold(target: str, *, dry_run: bool = False) -> MoveTargetHoldClear | MoveRefused:
-    """Check the target before changing a group or stopping a session."""
-    if dry_run:
-        return MoveTargetHoldClear((f"{target}: would check the shutdown hold",))
-    sys.path.insert(0, str(SCRIPTS / "shutdown"))
-    if TYPE_CHECKING:
-        from scripts.shutdown import launch_permission
-    else:
-        launch_permission = import_module("launch_permission")
-    environment = {**os.environ, "CLAUDE_CONFIG_DIR": str(claude_account_dir(target))}
-    permission = launch_permission.launch_permission(environment, launch_permission.NewWorkLaunchPurpose())
-    if isinstance(permission, launch_permission.BlockedByShutdown):
-        return MoveRefused(f"accounts: {permission.reason}; no session was stopped")
-    if isinstance(permission, launch_permission.ShutdownStateUnreadable):
-        return MoveRefused(f"accounts: shutdown state unreadable: {permission.detail}; no session was stopped")
-    released = permission.released
-    if released is None:
-        return MoveTargetHoldClear()
-    requester = (f"session {released.session_id[:8]}" if released.session_id is not None
-                 else "requested in a terminal or by a recovery snapshot")
-    at = datetime.fromisoformat(released.requested_at).astimezone(agent_accounts.user_zone())
-    return MoveTargetHoldClear((f"cleared a finished {released.then} hold on {released.label} "
-                               + f"from {at:%Y-%m-%d %H:%M %Z} ({requester})",))
-
-
 def check_move_target(target: str, now: datetime, *, repair: bool = True) -> MoveTargetReady | MoveRefused:
     """Check the destination without changing a group or starting a shutdown."""
-    hold = check_move_target_hold(target, dry_run=not repair)
-    if isinstance(hold, MoveRefused):
-        return hold
     destination = _move_target(target, repair=repair)
     if isinstance(destination, MoveRefused):
         return destination
@@ -3186,18 +3156,18 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True) -> Mov
                     chosen = pick("claude", now, exclude=frozenset({destination.label}), keep=NoKeep())
                     room = f"{chosen.label} has room" if isinstance(chosen, PickedAccount) else no_room_line("claude", chosen)
                     return MoveRefused(f"accounts: {destination.label} is out of usage ({name} {window.left:g}% left, resets {reset}); {room}")
-        return MoveTargetReady(destination, hold.notices)
+        return MoveTargetReady(destination, ())
     windows = ((reading.weekly, reading.five_hour) if isinstance(reading, StaleReading) else ())
     times = [window.at for window in windows if isinstance(window, ReadingWindow)]
     age = f"last {max(0, int((now - max(times)).total_seconds() // 60))} minutes ago" if times else "last reading unknown"
-    return MoveTargetReady(destination, (*hold.notices, f"no fresh usage reading for {destination.label} ({age})"))
+    return MoveTargetReady(destination, (f"no fresh usage reading for {destination.label} ({age})",))
 
 
 def move_preview_line(member: ListedSession, target: str) -> str:
     return f"{member.name}: {member.session_id} · stop, then resume on {target} (from {session_account_label(member)})"
 
 
-def _move_output(results: tuple[stop_resume.ClaudeUp | stop_resume.MoveHandedOff | SessionMoveRefused, ...],
+def _move_output(results: tuple[stop_results.ClaudeUp | stop_results.MoveHandedOff | SessionMoveRefused, ...],
                  notices: tuple[str, ...]) -> tuple[str, str, int]:
     stdout = "".join(line + "\n" for line in notices)
     stderr = ""

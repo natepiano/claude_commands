@@ -82,49 +82,27 @@ class AccountMoveTests(ShutdownTestCase):
             refusals.ReadingWindow(80, refusals.NoResetKnown(), at), refusals.NoWindow(), "")))
 
 
-    def test_target_shutdown_hold_refuses_group_and_single_move_before_any_write(self) -> None:
-        reason = "claude3 is held by a shutdown (since 10-18), requested by session b1f5ca98"
-        for permission in (launch_permission.BlockedByShutdown(reason),
-                           launch_permission.ShutdownStateUnreadable("bad shutdown state")):
-            for subject in ("units", "move-id"):
-                with self.subTest(permission=permission, subject=subject):
-                    before = self.disk_state()
-                    with (patch.object(launch_permission, "launch_permission", return_value=permission),
-                          patch.object(accounts, "move_sessions") as move,
-                          patch.object(accounts, "set_group_account") as select):
-                        result, output, error = self.cli(subject)
-                    self.assertEqual(result, 1)
-                    self.assertEqual(output, "")
-                    self.assertIn("no session was stopped", error)
-                    move.assert_not_called()
-                    select.assert_not_called()
-                    self.assertEqual(before, self.disk_state())
-
-
-    def test_released_target_hold_is_named_and_dry_run_does_not_call_the_check(self) -> None:
-        for session_id, requester in (
-            ("b1f5ca98-rest", "session b1f5ca98"),
-            (None, "requested in a terminal or by a recovery snapshot"),
-        ):
-            with self.subTest(session_id=session_id):
-                hold = launch_permission.ReleasedHold(
-                    label="claude3", then="stop", requested_at="2026-10-18T12:00:00+00:00",
-                    session_id=session_id)
+    def test_group_and_single_move_ignore_stale_shutdown_holds(self) -> None:
+        for subject in ("units", "move-id"):
+            with self.subTest(subject=subject):
+                self.moves.calls.clear()
+                member = replace(self.current_listing()[0], kind="unit")
                 with (patch.object(launch_permission, "launch_permission",
-                                   return_value=launch_permission.AllowedByShutdownState(hold)),
-                      patch.object(accounts, "move_sessions", return_value=()),
-                      patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []})):
-                    outcome = accounts.move_group("units", "claude3")
-                self.assertIsInstance(outcome, accounts.GroupMoveStarted)
-                assert isinstance(outcome, accounts.GroupMoveStarted)
-                self.assertIn(
-                    f"cleared a finished stop hold on claude3 from 2026-10-18 12:00 UTC ({requester})",
-                    outcome.stdout)
-        with patch.object(launch_permission, "launch_permission") as check:
+                                   side_effect=AssertionError("moves must not read shutdown holds")),
+                      patch.object(accounts, "live_group_members", return_value={"units": [member], "showrunners": []})):
+                    result, output, error = self.cli(subject)
+                self.assertEqual(result, 0, error)
+                self.assertEqual(error, "")
+                self.assertIn("move-id: Claude is up on claude3", output)
+                self.assertEqual([call.session_id for call in self.moves.calls], ["move-id"])
+
+    def test_target_preview_uses_readiness_and_usage_without_querying_holds(self) -> None:
+        before = self.disk_state()
+        with patch.object(launch_permission, "launch_permission",
+                          side_effect=AssertionError("preview must not read shutdown holds")):
             result = accounts.check_move_target("claude3", datetime.now(timezone.utc), repair=False)
-        check.assert_not_called()
-        assert isinstance(result, accounts.MoveTargetReady)
-        self.assertIn("would check the shutdown hold", result.notices[0])
+        self.assertIsInstance(result, accounts.MoveTargetReady)
+        self.assertEqual(self.disk_state(), before)
 
 
     def listed(self, report: inventory.Inventory) -> list[inventory.ListedSession]:

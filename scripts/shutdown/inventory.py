@@ -34,7 +34,6 @@ import conversation_pause
 from probe_session import PROBE_ENV
 import unit_runs
 if TYPE_CHECKING:
-    from shutdown_record import PausedSeat
     from ..direct.worker_state import worker_ledger
 else:
     from worker_state import worker_ledger
@@ -905,9 +904,17 @@ def _left_since_offered(directory: Path, roster: dict[str, dict[str, object]]) -
     return board < offered
 
 
-def codex_seats(run_directories: list[Path]) -> list[PausedSeat]:
-    from shutdown_record import PausedSeat
+class PausedSeat(TypedDict):
+    """A director's existing worker thread and the launcher that continues it."""
+    run_dir: str
+    seat: str
+    role: str
+    thread_id: str
+    turn_live: bool
+    launcher_command: list[str]
 
+
+def codex_seats(run_directories: list[Path]) -> list[PausedSeat]:
     seats: list[PausedSeat] = []
     for directory in run_directories:
         run_dir = str(directory)
