@@ -10,6 +10,7 @@ from typing import Literal, NamedTuple, TypedDict
 
 import store
 import cgroup_capture
+import filesystem
 from cgroup_capture import (Unmeasured as Unmeasured, StallTotals as StallTotals,
                             PartialStallTotals as PartialStallTotals, read_pressure as read_pressure,
                             parse_pressure as parse_pressure)
@@ -149,11 +150,9 @@ class FilesystemMeasured(TypedDict):
 
 
 def filesystem_reading() -> FilesystemMeasured | cgroup_capture.ReadingUnavailable:
-    import disk
-
     path = os.environ.get("BUILDLOG_TARGET_FILESYSTEM", os.environ.get("CARGO_TARGET_DIR", str(Path.home() / "rust")))
     try:
-        reading = disk.filesystem_usage(path)
+        reading = filesystem.filesystem_usage(path)
         return {"state": "measured", "path": path, "total": reading.total, "used": reading.used,
                 "free": reading.free, "device": reading.device, "device_name": reading.device_name}
     except OSError:

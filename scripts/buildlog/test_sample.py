@@ -48,6 +48,25 @@ class SampleTests(unittest.TestCase):
             _ = self.enterContext(patch.object(sample, name, proc / filename))
         _ = self.enterContext(patch.object(sample, "POWER_PROFILE_STATE", self.root / "absent-profile"))
 
+    def test_filesystem_reading_does_not_import_disk_or_sweep(self) -> None:
+        command = (
+            "import sys; sys.path.insert(0, sys.argv[1]); import sample; "
+            "reading = sample.filesystem_reading(); "
+            "assert reading['state'] == 'measured', reading; "
+            "assert 'disk' not in sys.modules, 'filesystem reading imported disk'; "
+            "assert 'sweep' not in sys.modules, 'filesystem reading imported sweep'"
+        )
+        result = subprocess.run(
+            ["python3", "-c", command, str(CLI.parent)],
+            cwd=CLI.parents[2],
+            env={**os.environ, "BUILDLOG_DIR": str(self.root), "BUILDLOG_TARGET_FILESYSTEM": str(self.root)},
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_pool_token_readings_use_read_only_commands_and_short_timeouts(self) -> None:
         with patch.object(subprocess, "run", side_effect=[
             subprocess.CompletedProcess(["stevie"], 0, "31\n", ""),

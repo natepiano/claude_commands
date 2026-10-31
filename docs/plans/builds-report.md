@@ -395,3 +395,29 @@ including the details to make it clear
 - Old `errors.log` entries can come from older copies of a test module in other worktrees. This tree isolates its launch-recording tests through the shared `BuildLogIsolatedTest`.
 
 **Ruled out:** a head-time write at bump time (bump is off; order changes only through stored order fields); a change to `verify.sh` (the gate script carries both token times).
+
+### Phase 9 — The build-log modules import without a cycle  · status: done
+
+**Depends on:** Phase 8
+
+#### Work Order
+
+**Goal:** basedpyright reports no import cycle on the builds merge of this branch. The cycle is `disk.py > lint/sweep.py > record.py > sample.py > disk.py`: `sample.py` imports `disk` only to call `disk.filesystem_usage()`, and `disk.py` imports `sweep`.
+
+**Spec:**
+- Move `FilesystemUsage` and `filesystem_usage(path)` from `scripts/buildlog/disk.py` into one small module that imports neither `sweep` nor `record`, for example `scripts/buildlog/filesystem.py`. `sample.py` and `disk.py` both import it there. Keep one copy only; leave no re-export shim in `disk.py` unless a caller outside these files needs it.
+- No type ignore and no local import used to hide the cycle.
+- Behavior does not change: the sample row's disk fields and `buildlog disk` output stay byte-identical.
+
+**Files:**
+- `scripts/buildlog/disk.py`
+- `scripts/buildlog/sample.py`
+- `scripts/buildlog/filesystem.py`
+- `scripts/buildlog/test_disk.py`
+- `scripts/buildlog/test_sample.py`
+
+**Workers:** impl3 writes production files; test3 writes tests.
+
+**Acceptance gate:** on a trial merge with `origin/builds-resources` 5c9b01fd (or origin/builds once it holds that set), `basedpyright scripts/buildlog/disk.py scripts/buildlog/sample.py scripts/buildlog/filesystem.py scripts/buildlog/record.py scripts/lint/sweep.py` reads 0 errors, 0 warnings, 0 notes; `python3 -m unittest scripts.buildlog.test_disk scripts.buildlog.test_sample scripts.buildlog.test_record` passes.
+
+**Constraints:** no worktree commit from workers; tests run with `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD`; never write the live build log.

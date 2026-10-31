@@ -10,13 +10,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lint"))
 import sweep
 
 import store
-import cgroup_capture
+import filesystem
 
 
 class DiskRow(TypedDict):
@@ -75,15 +75,6 @@ FOLDERS: list[tuple[str, str]] = [
 
 
 @dataclass(frozen=True)
-class FilesystemUsage:
-    used: int
-    free: int
-    total: int | Literal["unavailable"] = "unavailable"
-    device: str = "unavailable"
-    device_name: str = "unavailable"
-
-
-@dataclass(frozen=True)
 class EarlierOutsideMeasurement:
     measured_at: str
     directory_bytes: dict[str, int]
@@ -102,19 +93,6 @@ NO_EARLIER_OUTSIDE_MEASUREMENT = NoEarlierOutsideMeasurement()
 
 class InvalidFloor(ValueError):
     """A configured disk floor that cannot be measured in GiB."""
-
-
-def filesystem_usage(path: str) -> FilesystemUsage:
-    stat = os.statvfs(path)
-    identity = os.stat(path).st_dev
-    device = f"{os.major(identity)}:{os.minor(identity)}"
-    return FilesystemUsage(
-        used=(stat.f_blocks - stat.f_bfree) * stat.f_frsize,
-        free=stat.f_bavail * stat.f_frsize,
-        total=stat.f_blocks * stat.f_frsize,
-        device=device,
-        device_name=cgroup_capture.device_name(device),
-    )
 
 
 def read_floor() -> int | None:
@@ -217,7 +195,7 @@ def outside_directories(
 
 
 def measure(
-    folders: list[tuple[str, str]], usage: Callable[[], FilesystemUsage], floor: int | None,
+    folders: list[tuple[str, str]], usage: Callable[[], filesystem.FilesystemUsage], floor: int | None,
     previous: PreviousOutsideMeasurement = NO_EARLIER_OUTSIDE_MEASUREMENT,
 ) -> MeasuredDiskSnapshot:
     seen: set[sweep.InodeKey] = set()
@@ -244,7 +222,7 @@ def measure(
 def snapshot() -> MeasuredDiskSnapshot:
     floor = read_floor()
     previous = previous_outside_measurement(read_snapshot())
-    return measure(FOLDERS, lambda: filesystem_usage("/"), floor, previous)
+    return measure(FOLDERS, lambda: filesystem.filesystem_usage("/"), floor, previous)
 
 
 def write_snapshot(snapshot: DiskSnapshot | MeasuredDiskSnapshot) -> None:
