@@ -1062,36 +1062,19 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 **Ruled out:** a shared per-repository build folder for verify copies — its build lock serializes the copies.
 
 ### Phase 35 — The hold wait line names the hold the session waits on  · status: done
-**Depends on:** none.
 
-**Approved:** builds showrunner 2026-10-30, current add-on (wrong result, small), from natedev's check of change C44. Natedev closes C44 when this lands.
+#### As-built
 
-#### Work Order
-
-**Goal:** with two holds on natedev, the wait line names a hold the waiting session does not own. Today it can read `natedev is held by me for my why; waiting` while the session waits on another session's hold. The wait itself is correct and stays as it is.
-
-**Measured (2026-10-30, `builds-resources` `14248a6a`):**
-- `scripts/build_targets/build_targets.py` local wait loop (~:389-405): it returns at once when `caller_holds_only_own()` is true, else prints `{name}: natedev is held by {state.holder} for {state.reason}{waiting}` once. `state` is `target_state(target)`, a `Held` built from one holder, the oldest in force. When the caller's own hold is the oldest, the line names the caller.
-- The same `Held` text is also printed at ~:478 (`{label}: natedev is held by …`) and ~:486 (`… launch after the release.`). Check each for the same fault; a line shown to a session that holds a hold of its own must name another holder.
-- `build_hold.natedev_holds(directory).in_force` lists every hold in force, and `holds_only_own` already compares each `holder.key` with the caller's `holder_path(directory, owner.session_id).name`.
-
-**Spec:**
-1. **One choice of the named hold.** One function picks the hold a session waits on: the oldest hold in force whose key is not the caller's own. With no owning session, it is the oldest hold, as today. Every wait and launch line that names a holder for a caller uses it. `caller_holds_only_own` and this choice read one `natedev_holds` result, never two reads that can disagree.
-2. **Text.** The line keeps its words; only the holder and reason change to the chosen hold's.
-3. **Tests** (`scripts/build_targets/test_build_targets.py`), on scratch hold files as natedev reproduced it: the caller holds the older hold and another session holds a newer one; the wait line names the other session and its reason, never the caller's. One hold of another session alone: the line names it (unchanged). The caller's own hold alone: no wait, as today. Each test fails without the fix.
-4. **Docs.** `docs/as-built/build-targets.md` (or the hold doc that states the wait line): the line names the hold the session waits on.
+- `build_targets.hold_waited_on` picks the hold a session waits on: the oldest hold in force whose key is not the caller's own. It returns `NoBlockingHold` when no hold blocks the caller. A caller with no owning session gets the oldest hold in force.
+- The wait line, the check and launch lines and the 2 h line name the holder and reason of that hold. The words of each line stay the same.
+- `holds_only_own` and `caller_holds_only_own` use the same choice over one `natedev_holds` read, so the wait decision and the named hold cannot disagree.
+- When the caller owns the older of two holds, the line names the other session and its reason. The caller's own hold alone gives no wait.
 
 **Files:**
-- `scripts/build_targets/build_targets.py` — Spec 1-2.
-- `scripts/build_targets/test_build_targets.py` — Spec 3.
-- `docs/as-built/build-targets.md` — Spec 4.
+- `scripts/build_targets/build_targets.py` — `hold_waited_on`, `NoBlockingHold`, and the wait, check and launch lines.
+- `scripts/build_targets/test_build_targets.py` — scratch-hold cases for owner, peer and later sessions and for callers, among them `test_wait_and_launch_lines_name_the_oldest_hold_the_caller_does_not_own`.
+- `docs/as-built/build-targets.md` — the named-hold bullet.
 
-`scripts/direct/verify.sh` prints no `is held by` line of its own (checked 2026-10-30), so the fix stays in `build_targets.py` and the notice needs no also-touches line.
+**Gotchas:** `scripts/direct/verify.sh` prints no `is held by` line of its own; the line comes only from `build_targets.py`.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — `build_targets.py` and the doc.
-- `test` — `test_build_targets.py`.
-
-**Acceptance gate:**
-- `test_build_targets.py` passes with the new tests; `basedpyright scripts/build_targets/build_targets.py scripts/build_targets/test_build_targets.py` reports `0 errors, 0 warnings, 0 notes`; the importers of `build_targets` pass.
-- Change-Review line: the hold wait line names the hold you wait on | on natedev, while two sessions hold natedev, start a build from the session that holds the older hold | the wait line names the other session and its reason, not yours
+**Ruled out:** a change in `verify.sh` — it has no held-by line to fix.
