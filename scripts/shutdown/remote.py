@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import shlex
+import socket
 import subprocess
 import sys
 from typing import Literal, TypedDict
@@ -20,6 +21,12 @@ class WhileLinkAlive(TypedDict):
 
 RemoteCallLimit = TimeLimit | WhileLinkAlive
 STANDARD_TIME_LIMIT: TimeLimit = {"kind": "time limit", "seconds": 120.0}
+
+
+def local_machine() -> str:
+    """Return this machine's shutdown-record name."""
+    name = socket.gethostname().split(".", 1)[0]
+    return name or ("mac" if sys.platform == "darwin" else "natedev")
 
 
 def other_machine() -> str:

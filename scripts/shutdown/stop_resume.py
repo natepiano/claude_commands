@@ -355,7 +355,7 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     from datetime import datetime, timezone
     import quota_alert
     from probe_session import PROBE_ENV
-    from restart_support import local_machine
+    from remote import local_machine
 
     entry = pane_record.read(herdr.shared_session()).get(pane)
     entry = entry if entry and entry["session_id"] == identity else None
