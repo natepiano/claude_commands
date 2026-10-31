@@ -390,6 +390,10 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
                     dispatch.board(slot, "status", f"launcher: {dispatch.worker} still has a live turn after compaction: {detail}; follow-up not sent")
                     refuse(f"{dispatch.worker} still has a live turn after compaction; end the worker "
                            + f"(codex_mesh.py end --to {dispatch.worker}) and start a fresh one")
+                if compact.returncode == codex_mesh.COMPACT_ROSTER_CHANGED:
+                    dispatch.board(slot, "status", f"launcher: {detail}; follow-up not sent")
+                    refuse(f"{dispatch.worker}: roster changed during compaction; follow-up not sent; "
+                           + f"inspect the worker and use codex_mesh.py reopen --to {dispatch.worker} if idle")
                 dispatch.board(slot, "status", f"launcher: compaction failed for {dispatch.worker}: {detail}; continuing follow-up")
             else:
                 dispatch.board(slot, "status", f"launcher: {compact.stdout.strip() or f'compacted {dispatch.worker}'}")

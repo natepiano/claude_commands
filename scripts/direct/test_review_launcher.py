@@ -334,6 +334,27 @@ class ReviewLauncherPassTests(support.ReviewLauncherFixture):
         board = (session_dir / "board.log").read_text(encoding="utf-8")
         self.assertIn(f"compacted {worker}: 100001 -> 12000 tokens", board)
 
+    def test_a_compaction_roster_conflict_stops_review_before_claim_or_follow(self) -> None:
+        session_dir = self.start_implementation("compact-roster-changed")
+        self.finish_implementation(session_dir)
+        worker = self.open_worker(session_dir, context_tokens=100001)
+        original = (session_dir / "mesh_roster.json").read_bytes()
+        (session_dir / "compact_roster_changed").touch()
+
+        result = self.run_assigned_review(session_dir, worker)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("roster changed during compaction", result.stderr)
+        self.assertIn("reopen", result.stderr)
+        self.assertEqual((session_dir / "mesh_events.txt").read_text().splitlines(), ["compact"])
+        self.assertEqual((session_dir / "mesh_roster.json").read_bytes(), original)
+        self.assertFalse((session_dir / "follow_message.txt").exists())
+        self.assertFalse((session_dir / "review_status").exists())
+        self.assertFalse((session_dir / "review_findings_1.txt").exists())
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertIn("follow-up not sent", board)
+        self.assertNotIn("continuing follow-up", board)
+
     def test_review_of_an_unmeasured_worker_does_not_compact_again(self) -> None:
         session_dir = self.start_implementation("unmeasured-review")
         self.finish_implementation(session_dir)

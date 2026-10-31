@@ -27,6 +27,7 @@ from uuid import UUID, uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_work
+from scripts.agents import worker_lifecycle
 
 ROOT = Path(__file__).resolve().parents[2]
 Role = Literal['designer', 'reviewer']
@@ -772,54 +773,55 @@ def recover(instance_id: str) -> HeldDesign:
     if role_text not in ('designer', 'reviewer'):
         raise RoleRefused('unknown role')
     role = role_text
-    design = read_design(design_id)
-    _ = _authorize(design)
-    instance = _instance(design, role)
-    if isinstance(instance.lifecycle, RoleEnded):
-        raise RoleRefused('role ended; this design identity cannot be reopened.')
-    entry = _object(_roster(design).get(instance.name))
-    if entry.get('transferring_role') or entry.get('role_redirect'):
-        raise RoleRefused('role transfer is fenced; use the destination holder')
-    thread = _text(entry, 'thread_id')
-    if not isinstance(instance.lifecycle, RoleNotOpened) and instance.lifecycle.thread_id != thread:
-        raise RoleRefused('RoleNeedsRecovery: recorded thread differs; replacement refused')
-    launcher = entry.get('launcher_pid')
-    if isinstance(launcher, int) and launcher > 0:
-        try:
-            os.kill(launcher, 0)
-        except ProcessLookupError:
-            pass
-        else:
-            raise RoleRefused('role launcher is still active')
-    mesh = mesh_directory(design_id)
-    port, _ = codex_mesh.ensure_server(str(mesh))
-    client = codex_mesh.Client(port, 'held-role-recovery')
-    try:
-        reply = client.call('thread/resume', {'threadId': thread})
-        if reply.get('error'):
-            raise RoleRefused('RoleNeedsRecovery: recorded thread cannot be resumed; replacement refused')
-        if _object(_object(reply.get('result')).get('thread')).get('id') != thread:
-            raise RoleRefused('RoleNeedsRecovery: resumed thread identity differs; replacement refused')
-        state = codex_mesh._read_live_turn(client, thread)  # pyright: ignore[reportPrivateUsage]
-        if not isinstance(state, codex_mesh.ThreadIdle):
-            raise RoleRefused('RoleNeedsRecovery: recorded thread is not proven idle')
-    finally:
-        client.close()
     with _lock(design_directory(design_id)):
-        current = read_design(design_id)
-        if current != design:
-            raise RoleRefused('role changed during recovery')
-        with _edit_roster(design_id) as roster:
-            current_entry = _object(roster.get(instance.name))
-            if current_entry != entry:
-                raise RoleRefused('roster changed during recovery')
-            current_entry.update({'status': 'done', 'launcher_pid': 0})
-            roster[instance.name] = current_entry
-            updated = _set_lifecycle(replace(current, roles=tuple(replace(value, assignment_claim='') if value.role == role else value
-                                                                for value in current.roles)), role, RoleOpen(thread))
-            _save(updated)
-    refresh_census(design_id)
-    return updated
+        design = read_design(design_id)
+        _ = _authorize(design)
+        instance = _instance(design, role)
+        if isinstance(instance.lifecycle, RoleEnded):
+            raise RoleRefused('role ended; this design identity cannot be reopened.')
+        with worker_lifecycle.lock_worker(mesh_directory(design_id), instance.name):
+            entry = _object(_roster(design).get(instance.name))
+            if entry.get('transferring_role') or entry.get('role_redirect'):
+                raise RoleRefused('role transfer is fenced; use the destination holder')
+            thread = _text(entry, 'thread_id')
+            if not isinstance(instance.lifecycle, RoleNotOpened) and instance.lifecycle.thread_id != thread:
+                raise RoleRefused('RoleNeedsRecovery: recorded thread differs; replacement refused')
+            launcher = entry.get('launcher_pid')
+            if isinstance(launcher, int) and launcher > 0:
+                try:
+                    os.kill(launcher, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise RoleRefused('role launcher is still active')
+            mesh = mesh_directory(design_id)
+            port, _ = codex_mesh.ensure_server(str(mesh))
+            client = codex_mesh.Client(port, 'held-role-recovery')
+            try:
+                reply = client.call('thread/resume', {'threadId': thread})
+                if reply.get('error'):
+                    raise RoleRefused('RoleNeedsRecovery: recorded thread cannot be resumed; replacement refused')
+                if _object(_object(reply.get('result')).get('thread')).get('id') != thread:
+                    raise RoleRefused('RoleNeedsRecovery: resumed thread identity differs; replacement refused')
+                state = codex_mesh._read_live_turn(client, thread)  # pyright: ignore[reportPrivateUsage]
+                if not isinstance(state, codex_mesh.ThreadIdle):
+                    raise RoleRefused('RoleNeedsRecovery: recorded thread is not proven idle')
+            finally:
+                client.close()
+            current = read_design(design_id)
+            if current != design:
+                raise RoleRefused('role changed during recovery')
+            with _edit_roster(design_id) as roster:
+                current_entry = _object(roster.get(instance.name))
+                if current_entry != entry:
+                    raise RoleRefused('roster changed during recovery')
+                current_entry.update({'status': 'done', 'launcher_pid': 0})
+                roster[instance.name] = current_entry
+                updated = _set_lifecycle(replace(current, roles=tuple(replace(value, assignment_claim='') if value.role == role else value
+                                                                    for value in current.roles)), role, RoleOpen(thread))
+                _save(updated)
+        refresh_census(design_id)
+        return updated
 
 
 def resume(instance_id: str, prompt_file: str | Path) -> Path:
@@ -853,7 +855,7 @@ def resume(instance_id: str, prompt_file: str | Path) -> Path:
             raise RoleRefused('role changed before dispatch')
         if (directory / 'transition.json').exists():
             raise RoleRefused('binding transition is incomplete')
-        with _edit_roster(design_id) as roster:
+        with worker_lifecycle.lock_worker(mesh_directory(design_id), instance.name), _edit_roster(design_id) as roster:
             entry = _object(roster.get(instance.name))
             if entry.get('thread_id') != instance.lifecycle.thread_id or entry.get('status') in BUSY:
                 raise RoleRefused('RoleNeedsRecovery: roster thread or idle state changed')
@@ -1148,61 +1150,63 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
     model, effort = resolve_model(role)
     source = Path(source_mesh)
     source_path = source / 'mesh_roster.json'
-    entry = _object(_read(source_path).get(name))
-    _check_adoption_source(entry, thread_id)
-    source_model, source_effort = _adoption_model(source, name, thread_id, entry)
-    if source_model != model or source_effort != effort:
-        raise RoleRefused('AdoptionRequired: source model or effort differs from the configured design-role model and effort')
-    transfer = {'adoption_id': adoption_id, 'destination': str(mesh_directory(design_id))}
-    if entry.get('transferring_role') is not None and entry.get('transferring_role') != transfer:
-        raise RoleRefused('source is fenced by another adoption')
-    prompt, _ = _prompt(candidate, role, 'Continue the adopted design in the same thread when the holder assigns work.')
-    _ = authority_request('adopt-reserve', {'repository_id': repository, 'document': document, 'host': host,
-                                            'adoption_id': adoption_id})
-    with _lock(design_directory(design_id)), source_path.open('r+', encoding='utf-8') as source_lock:
-        fcntl.flock(source_lock, fcntl.LOCK_EX)
-        roster = _object(cast(object, json.load(source_lock)))
-        entry = _object(roster.get(name))
+    with _lock(design_directory(design_id)), worker_lifecycle.lock_workers(
+            worker_lifecycle.WorkerIdentity(source, name),
+            worker_lifecycle.WorkerIdentity(mesh_directory(design_id), name)):
+        entry = _object(_read(source_path).get(name))
         _check_adoption_source(entry, thread_id)
-        recorded = codex_mesh.recorded_turn_settings(entry)
-        if (recorded.model and recorded.model != model) or (recorded.effort and recorded.effort != effort):
-            raise RoleRefused('adoption requires the configured model and effort, recorded at the source')
-        fence = entry.get('transferring_role')
-        destination = str(mesh_directory(design_id))
-        transfer = {'adoption_id': adoption_id, 'destination': destination}
-        if fence is not None and fence != transfer:
+        source_model, source_effort = _adoption_model(source, name, thread_id, entry)
+        if source_model != model or source_effort != effort:
+            raise RoleRefused('AdoptionRequired: source model or effort differs from the configured design-role model and effort')
+        transfer = {'adoption_id': adoption_id, 'destination': str(mesh_directory(design_id))}
+        if entry.get('transferring_role') is not None and entry.get('transferring_role') != transfer:
             raise RoleRefused('source is fenced by another adoption')
-        _atomic(design_directory(design_id) / 'transition.json',
-                {'generation': _integer(placement, 'generation'), 'reason': 'adoption'})
-        _atomic(design_directory(design_id) / 'transfer.json',
-                {**transfer, 'design_id': design_id, 'thread_id': thread_id, 'name': name, 'source_mesh': str(source)})
-        entry['transferring_role'] = transfer
-        roster[name] = entry
-        _ = source_lock.seek(0)
-        _ = source_lock.truncate()
-        json.dump(roster, source_lock)
-        source_lock.flush()
-    server = _read(source / 'mesh_server.json')
-    port = _integer(server, 'port')
-    client = codex_mesh.Client(port, 'design-role-adopt')
-    try:
-        with codex_mesh._pending_file(str(source), name) as pending:  # pyright: ignore[reportPrivateUsage]
-            state = codex_mesh._read_live_turn(client, thread_id)  # pyright: ignore[reportPrivateUsage]
-            if not isinstance(state, codex_mesh.ThreadIdle):
-                raise RoleRefused('AdoptionNeedsRecovery: source is not proven idle')
-            def park(message: str) -> None:
-                messages = codex_mesh._pending_for_thread(pending, thread_id)  # pyright: ignore[reportPrivateUsage]
-                codex_mesh._write_pending(pending, thread_id, [*messages, message])  # pyright: ignore[reportPrivateUsage]
-            codex_mesh._move_queue_to_pending(client, thread_id, park)  # pyright: ignore[reportPrivateUsage]
-            released = codex_mesh._release_worker_thread(client, thread_id, str(source))  # pyright: ignore[reportPrivateUsage]
-            if isinstance(released, codex_mesh.WorkerThreadStateUnknown):
-                raise RoleRefused('AdoptionNeedsRecovery: ' + released.reason)
-            _ = pending.seek(0)
-            pending_text = pending.read()
-    finally:
-        client.close()
-    directory = design_directory(design_id)
-    with _lock(directory):
+        prompt, _ = _prompt(candidate, role, 'Continue the adopted design in the same thread when the holder assigns work.')
+        _ = authority_request('adopt-reserve', {'repository_id': repository, 'document': document, 'host': host,
+                                                'adoption_id': adoption_id})
+        with source_path.open('r+', encoding='utf-8') as source_lock:
+            fcntl.flock(source_lock, fcntl.LOCK_EX)
+            roster = _object(cast(object, json.load(source_lock)))
+            entry = _object(roster.get(name))
+            _check_adoption_source(entry, thread_id)
+            recorded = codex_mesh.recorded_turn_settings(entry)
+            if (recorded.model and recorded.model != model) or (recorded.effort and recorded.effort != effort):
+                raise RoleRefused('adoption requires the configured model and effort, recorded at the source')
+            fence = entry.get('transferring_role')
+            destination = str(mesh_directory(design_id))
+            transfer = {'adoption_id': adoption_id, 'destination': destination}
+            if fence is not None and fence != transfer:
+                raise RoleRefused('source is fenced by another adoption')
+            _atomic(design_directory(design_id) / 'transition.json',
+                    {'generation': _integer(placement, 'generation'), 'reason': 'adoption'})
+            _atomic(design_directory(design_id) / 'transfer.json',
+                    {**transfer, 'design_id': design_id, 'thread_id': thread_id, 'name': name, 'source_mesh': str(source)})
+            entry['transferring_role'] = transfer
+            roster[name] = entry
+            _ = source_lock.seek(0)
+            _ = source_lock.truncate()
+            json.dump(roster, source_lock)
+            source_lock.flush()
+        server = _read(source / 'mesh_server.json')
+        port = _integer(server, 'port')
+        client = codex_mesh.Client(port, 'design-role-adopt')
+        try:
+            with codex_mesh._pending_file(str(source), name) as pending:  # pyright: ignore[reportPrivateUsage]
+                state = codex_mesh._read_live_turn(client, thread_id)  # pyright: ignore[reportPrivateUsage]
+                if not isinstance(state, codex_mesh.ThreadIdle):
+                    raise RoleRefused('AdoptionNeedsRecovery: source is not proven idle')
+                def park(message: str) -> None:
+                    messages = codex_mesh._pending_for_thread(pending, thread_id)  # pyright: ignore[reportPrivateUsage]
+                    codex_mesh._write_pending(pending, thread_id, [*messages, message])  # pyright: ignore[reportPrivateUsage]
+                codex_mesh._move_queue_to_pending(client, thread_id, park)  # pyright: ignore[reportPrivateUsage]
+                released = codex_mesh._release_worker_thread(client, thread_id, str(source))  # pyright: ignore[reportPrivateUsage]
+                if isinstance(released, codex_mesh.WorkerThreadStateUnknown):
+                    raise RoleRefused('AdoptionNeedsRecovery: ' + released.reason)
+                _ = pending.seek(0)
+                pending_text = pending.read()
+        finally:
+            client.close()
+        directory = design_directory(design_id)
         if (directory / 'design.json').exists():
             design = read_design(design_id)
         else:
@@ -1217,7 +1221,6 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
         _validate_binding(binding, design.repository, role)
         mesh = mesh_directory(design_id)
         mesh.mkdir(parents=True, exist_ok=True)
-        destination_roster = _read(mesh / 'mesh_roster.json') if (mesh / 'mesh_roster.json').exists() else {}
         adopted = dict(entry)
         _ = adopted.pop('transferring_role', None)
         _ = adopted.pop('paused_from', None)
@@ -1225,34 +1228,34 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
         adopted.update({'held_design_id': design_id, 'held_role': role, 'access_policy': _tag(access_policy(design, role)),
                         'instructions_file': str(prompt), 'status': 'done', 'cwd': design.repository,
                         'model': source_model, 'effort': source_effort})
-        destination_roster[name] = adopted
-        _atomic(mesh / 'mesh_roster.json', destination_roster)
+        with _edit_roster(design_id) as destination_roster:
+            destination_roster[name] = adopted
         _atomic(mesh / 'serving_home.json', {'codex_home': _text(server, 'codex_home')})
         if pending_text:
             _ = (mesh / f'{name}.pending.json').write_text(pending_text, encoding='utf-8')
         _save(design)
         _mesh_context(design, reach)
-    confirm_adoption(design, role, thread_id)
-    with source_path.open('r+', encoding='utf-8') as source_lock:
-        fcntl.flock(source_lock, fcntl.LOCK_EX)
-        roster = _object(cast(object, json.load(source_lock)))
-        current = _object(roster.get(name))
-        current['role_redirect'] = {'design_id': design_id, 'destination': str(mesh), 'adoption_id': adoption_id}
-        roster[name] = current
-        _ = source_lock.seek(0)
-        _ = source_lock.truncate()
-        json.dump(roster, source_lock)
-        source_lock.flush()
-    _atomic(directory / 'adoption.json', {'adoption_id': adoption_id, 'source_mesh': str(source), 'name': name,
-                                         'thread_id': thread_id, 'completed': True})
-    _ = authority_request('adopt-commit', {'repository_id': repository, 'document': document, 'host': host,
-                                          'adoption_id': adoption_id})
-    (directory / 'transition.json').unlink(missing_ok=True)
-    # The serving home is known even before a destination server is needed.
-    astra_roles = _census_projection()
-    _ = astra_roles.hold(role, thread_id, _text(server, 'codex_home'), manager=reach.session_id,
-                         design_id=design_id, role_id=role)
-    return design
+        confirm_adoption(design, role, thread_id)
+        with source_path.open('r+', encoding='utf-8') as source_lock:
+            fcntl.flock(source_lock, fcntl.LOCK_EX)
+            roster = _object(cast(object, json.load(source_lock)))
+            current = _object(roster.get(name))
+            current['role_redirect'] = {'design_id': design_id, 'destination': str(mesh), 'adoption_id': adoption_id}
+            roster[name] = current
+            _ = source_lock.seek(0)
+            _ = source_lock.truncate()
+            json.dump(roster, source_lock)
+            source_lock.flush()
+        _atomic(directory / 'adoption.json', {'adoption_id': adoption_id, 'source_mesh': str(source), 'name': name,
+                                             'thread_id': thread_id, 'completed': True})
+        _ = authority_request('adopt-commit', {'repository_id': repository, 'document': document, 'host': host,
+                                              'adoption_id': adoption_id})
+        (directory / 'transition.json').unlink(missing_ok=True)
+        # The serving home is known even before a destination server is needed.
+        astra_roles = _census_projection()
+        _ = astra_roles.hold(role, thread_id, _text(server, 'codex_home'), manager=reach.session_id,
+                             design_id=design_id, role_id=role)
+        return design
 
 
 def transfer_route(thread_id: str, destination_design: str = '') -> str:

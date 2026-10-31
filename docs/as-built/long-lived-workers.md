@@ -105,12 +105,13 @@ The verbs:
 | `start` | `--session-dir --name [--role impl\|test\|fix\|review] [--lens] --cwd --prompt-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--sandbox danger-full-access] [--resident]` | Opens a thread and blocks until its turn ends. `--role` is optional, and roleless threads such as ask-a-friend friends leave it out. A given role, with `--lens` when passed, is appended to `agents.jsonl` for the new thread. |
 | `follow` | `--session-dir --to --role (required) [--lens] [--claim-pid] --message-file --summary-file [--reply-file] --log-file [--model --effort --service-tier] [--cwd] [--read-only] [--image …]` | Runs one more turn on a finished thread. If the old server is gone, it resumes the thread on a new one. `--cwd`, `--read-only` and `--image` apply to that turn only and also apply to unit-owned reviewers; without them the request is the worker's usual one. |
 | `prime`, `fork`, `reset` | see `docs/as-built/review-pool.md` | Create a read-only reviewer template with standing instructions, fork a named reviewer from it, and remove every turn from an idle reviewer. Only the retained legacy allocator calls them. |
-| `compact` | `--session-dir --to` | Exits 2 for a worker that is running or busy, a worker with no recorded context size, and a worker whose size is `not_measured_since_compaction` (`size not measured since its last compaction; compact refused`). Otherwise it reads the entry's `revision`, resumes the thread, waits up to 60 s (`COMPACT_IDLE_WAIT_SECS`) for a turn still live on it to end, exits 3 (`COMPACT_TURN_STILL_LIVE`) if one stays live, and calls `thread/compact/start`. It waits until the compaction turn has a `thread/compacted` notice or a `contextCompaction` item, a token-usage update and a `turn/completed`. It then writes the new size under `RosterUnchanged(thread_id, revision)`, so a turn that wrote the entry in between keeps its record. A size above 0 prints `compacted <worker>: <before> -> <after> tokens`; a compaction turn that reports 0 stores `not_measured_since_compaction` and prints `compacted <worker>: <before> tokens, size not measured until its next turn`. A compaction that has not finished in 300 s (`CompactionTimedOut`) is interrupted with `turn/interrupt` and the thread is read until idle, up to the same 60 s: idle is exit 1 with `…; interrupted the compaction turn, the worker is idle and not compacted`, so a follow-up can still be sent; a turn still live is exit 3. |
+| `compact` | `--session-dir --to` | Exits 2 for a worker that is running or busy, a worker with no recorded context size, and a worker whose size is `not_measured_since_compaction` (`size not measured since its last compaction; compact refused`). Otherwise it reads the entry's `revision`, resumes the thread, waits up to 60 s (`COMPACT_IDLE_WAIT_SECS`) for a turn still live on it to end, exits 3 (`COMPACT_TURN_STILL_LIVE`) if one stays live, and calls `thread/compact/start`. It waits until the compaction turn has a `thread/compacted` notice or a `contextCompaction` item, a token-usage update and a `turn/completed`. It then writes the new size under `RosterUnchanged(thread_id, revision)`, so a turn that wrote the entry in between keeps its record. A refused write exits 4 (`COMPACT_ROSTER_CHANGED`), reports the current status, thread, turn and revision, and refuses the follow-up. Old followers detach once their launcher no longer owns the entry; broadcast compaction notices cannot change, settle or clean up a paused, finished or newly claimed worker. A size above 0 prints `compacted <worker>: <before> -> <after> tokens`; a compaction turn that reports 0 stores `not_measured_since_compaction` and prints `compacted <worker>: <before> tokens, size not measured until its next turn`. A compaction that has not finished in 300 s (`CompactionTimedOut`) is interrupted with `turn/interrupt` and the thread is read until idle, up to the same 60 s: idle is exit 1 with `…; interrupted the compaction turn, the worker is idle and not compacted`, so a follow-up can still be sent; a turn still live is exit 3. |
+
 | `can-follow` | `--session-dir --to --role [--lens] [--claim-pid]` | Refuses a worker that cannot take a follow-up. With `--claim-pid`, it claims the worker under the roster `flock`: it sets `status: starting`, `launcher_pid`, `previous_status`, the new `role`, and `previous_role` (the role the worker held before), and appends the role and lens to the role log `agents.jsonl` (`docs/as-built/usage-ledger.md`). |
 | `release-follow` | `--session-dir --to --claim-pid` | Releases a claim that never started a turn. It restores `previous_role`, or removes `role` if the worker had none, returns the worker to its previous status, and appends the restored role to `agents.jsonl`. A follow that did run keeps the role it was claimed with, so after a completed review the worker's role stays `review`. |
 | `end` | `--session-dir --to` | Clears the worker's pending queue, writes its end marker and sets the worker's roster `status` to `"ended"`. |
 | `stop` | `--session-dir [--pause]` | Sets every roster worker to `"ended"` and stops the current server and every retired one. With `--pause` (a shutdown stop, `docs/as-built/shutdown-and-restart.md`) it instead sets every non-ended worker to the followable `"paused"`, with `paused_from` and `paused_turn`, after dropping its queued messages and interrupting a live turn. |
-| `reopen` | `--session-dir --to` | Returns an `ended` worker, or a `running`/`starting` one whose launcher is dead and whose server is gone, to `"paused"` on its recorded thread. Exits 2 with one stderr line when the thread id is missing or a launcher or server is alive. |
+| `reopen` | `--session-dir --to` | Returns an `ended` worker, or an abandoned `running`/`starting` worker, to `"paused"` on its recorded thread. With a live recorded server it requires a positive idle read and no live launcher, clears the stale turn id, and stores `not_measured_since_compaction`. Its one-line result names that same thread; no replacement thread is opened. A live turn, unreadable thread, missing thread id or live launcher refuses recovery with exit 2. |
 | `sweep` | `[--root] [--stop]` | Gives a verdict on every app-server listening on `ws://` (see Cleanup). |
 | `idle-stop` | `--session-dir --pid --port` | The server's own watcher calls this. It stops the server, or touches its record if something still uses it. |
 | `list` | `--session-dir` | Prints the roster. |
@@ -126,6 +127,7 @@ A held design role (a roster entry with `held_design_id`, `docs/as-built/long-li
 - `role`: `impl`, `test`, `fix` or `review`, or absent for a roleless thread.
 - `context_tokens`: `tokenUsage.last.inputTokens` from the turn's latest `thread/tokenUsage/updated`, or `"not_measured_since_compaction"` after a compaction turn that reported 0, until the worker's next turn reports a size.
 - `revision`: raised by one on every write inside the roster lock; an entry without one reads as 0. `_update_roster_if_expected` writes only when the entry still matches what the writer expects (still on its thread, absent, ended on its thread, or at an unchanged revision), so a command still at work for an earlier thread, or a compaction that ends late, cannot replace a newer record (`docs/as-built/usage-ledger.md`, Worker roster guards).
+- A stream owns worker work only while its entry is `starting`, `running` or `waiting_capacity` with that launcher's PID. Ownership loss is sticky: an old subscriber cannot settle, clean up or close the inbox of a paused, finished, adopted or newly claimed worker. Terminal settlement checks launcher ownership under the roster lock. Readbacks, cleanup and summary delivery run outside that lock, with ownership rechecked before further work and inside the terminal write. `assign.py`, `implement.sh` and `review.sh` all refuse a follow-up after compaction exit 4 and advise same-thread `reopen` if idle.
 - During a claim only: `previous_role` and `previous_status`.
 - For a pooled reviewer, its template or a held design role: `instructions_file`, whose text is sent again as `developerInstructions` on every resume and fork.
 - `access_policy`, which decides the sandbox (`_worker_sandbox`, `_resume_params`): `{"kind": "ReadOnlyReviewer"}` (written by `prime` and `fork`, and for a held reviewer) gives `read-only`; `PhaseBoundDesigner` (a held designer) gives its `launch_sandbox`. An entry with no policy takes `--sandbox` or the default `danger-full-access`; an entry with `instructions_file` and no policy refuses with `recovery required`. Access never comes from the instructions text.
@@ -148,7 +150,7 @@ The flag is cleared by any `item/completed` from the worker's own work, but not 
 - With `--to`, it follows the open worker after these steps, all under `<session>/impl_worker_claim.lock`:
   1. Checks that the identity file `impl_worker_<team_role>.json` (`impl_worker_fix.json` for the `-fix` repair worker, which runs in slot `impl`; `worker_state.worker_record_path` owns the rule) equals `{name, slot, family, worker_id}` for this launch, with `worker_id` the thread id. The saved `model` is retained for compatibility with old identity files; it does not select a turn's model or effort. Each turn uses an explicit override or the current role default. A mismatch fails with `has no matching durable worker identity`. A missing file with a roster thread for the name is not a mismatch: the claim writes the identity from the roster and continues. That resumes a reopened worker, and a fix worker of a run from before 2026-10-17, whose record the impl worker's replaced. A worker recorded under another slot is still refused.
   2. Refuses a worker that another live launcher has claimed (`impl_claim_<slot>.json`), or whose status is `implementing` while its roster `launcher_pid` is alive. A claim whose launcher is dead is dropped, and an `implementing` status with no claim file and no live roster launcher is treated the same way: it writes `error` and continues.
-  3. If the roster's `context_tokens` is an integer greater than `UNIT_COMPACT_ABOVE_TOKENS`, runs `codex_mesh.py compact`; a `not_measured_since_compaction` size skips this step, so the worker gets its follow-up with no second compaction. On success it posts `launcher: compacted …`. On exit 3 (a turn is still live on the thread) it posts `launcher: <worker> still has a live turn after compaction: <detail>; follow-up not sent` and exits 2, naming `codex_mesh.py end --to <worker>` and a fresh worker as the remedy; `review.sh` does the same. On any other failure it posts `launcher: compaction failed for <worker>: <detail>; continuing follow-up` and continues.
+  3. If the roster's `context_tokens` is an integer greater than `UNIT_COMPACT_ABOVE_TOKENS`, runs `codex_mesh.py compact`; a `not_measured_since_compaction` size skips this step, so the worker gets its follow-up with no second compaction. On success it posts `launcher: compacted …`. On exit 3 (a turn is still live on the thread) it posts `launcher: <worker> still has a live turn after compaction: <detail>; follow-up not sent` and exits 2, naming `codex_mesh.py end --to <worker>` and a fresh worker as the remedy; `review.sh` does the same. On exit 4 (the roster changed during compaction) it refuses the follow-up and advises inspection and same-thread `reopen` when idle. On other failures it posts `launcher: compaction failed for <worker>: <detail>; continuing follow-up` and continues.
   4. Claims the worker with `can-follow --role <pass_kind>`.
 - On exit, it releases the claim.
 - After launch it waits for the worker's record (with `--to` on Codex, the turn record) for up to `UNIT_WORKER_WAIT_ATTEMPTS` (30) checks `UNIT_WORKER_POLL_SECS` (1 s) apart, stopping early when the launcher exits. Tests shorten the interval and raise the count.
@@ -171,6 +173,15 @@ Every review attempt records `arm: own`. Records under
 `review_turns/<run>/<started>-<pid>-<sequence>.json` keep separate attempts from
 one launcher. History reads both earlier `arm: pool` and current `arm: own`
 records. No recorded review differs from a recorded review with zero findings.
+
+An explicit `--to <worker>` compacts under `impl_worker_claim.lock`, then
+claims with `can-follow --role review` before writing artifacts. Compaction
+exit 3 (live turn) or 4 (roster changed) refuses the follow-up; exit 4 advises
+inspection and same-thread `reopen` when idle. Other compaction failures are
+best-effort, with one board line. The launcher releases the claim on exit.
+Each attempt records cancellation on TERM, INT or HUP. Explicit extra slots
+retain their unit worker identity for later implementation or repair work.
+
 
 **Compatibility launcher tree guard.** Before the turn, `review.sh` runs `review_tree.py baseline`, which records HEAD and, for each path `git status` names (untracked, non-ignored files included), its HEAD, index and worktree entries: mode and blob id, a symlink's target standing for its content.
 
@@ -281,7 +292,7 @@ skips ambiguous unit matches; see `production-rename.md`.
 - Codex workers open once per run and end only at `end_session.sh`. A held design role is not a run worker: run end unbinds it and never ends its thread. Phase cleanup never ends a Codex thread. A new worker opens only when no open worker can take the work.
 - Claude workers keep their per-phase lifecycle; this design covers Codex workers only.
 - Only the unit director starts a finished worker's next turn through `implement.sh --to <worker>` or `review.sh --to <worker>`. A peer message sent with `send` is held for that turn, which receives it after its dispatch prompt.
-- Compaction, the worker claim and the identity check run under one lock (`impl_worker_claim.lock`). Compaction is best-effort: a failure posts one board line and never blocks the follow-up.
+- Compaction, the worker claim and the identity check run under one launcher lock (`impl_worker_claim.lock`); each mesh operation also holds its worker lifecycle lock. A live compaction turn (exit 3) or changed roster (exit 4) blocks the follow-up. Other compaction failures post one board line and allow the follow-up.
 - A worker's identity file is anchored to the implementation model, whichever launcher opened the worker.
 - A assigned review claims its worker before writing any artifact, and fails if the working tree changed in any of HEAD, status, tracked diff or untracked content.
 - Review artifacts are keyed by pass and lens; the recorder pass is keyed by the slot that ran it and a fresh Claude design check records no code-review pass.
@@ -388,7 +399,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 
 **Mesh refusals for held entries** (`codex_mesh.py`): `start`, `prime` on an existing held entry, `fork` from one, `reopen`, raw `stop --pause` (`_pause_roster`), raw `stop`, and `set-instructions` refuse with a pointer to `design_roles.py`. `follow` refuses a message file other than the `authorized_prompt`, except an account-move continuation. `implement.sh --to` refuses a held or fenced entry.
 
-**Turn claim and lock order.** `_claim_follow` runs inside `_design_claim_lock` (design `lock`, then the pending file), then the roster flock: design, pending, roster, server. `_validate_held_claim` checks the role is open on the same thread, the caller is the live holder, the authorized generation and holder match, `assignment_claim` equals `authorized_prompt`, and no `transition.json` exists. It then sets `instructions_file` and `access_policy`. The claim pops `authorized_prompt`, so one authorization starts one turn. A stale launcher claim on a held entry is not taken over.
+**Turn claim and lock order.** `_claim_follow` runs inside `_design_claim_lock`: design lock, worker lifecycle lock, pending file, then roster flock. Server probes run outside the roster flock. `_validate_held_claim` checks the role is open on the same thread, the caller is the live holder, the authorized generation and holder match, `assignment_claim` equals `authorized_prompt`, and no `transition.json` exists. It then sets `instructions_file` and `access_policy`. The claim pops `authorized_prompt`, so one authorization starts one turn. A stale launcher claim on a held entry is not taken over.
 
 **Server environment.** `_design_context(session_dir)` rebuilds `design_context.json` from `design.json` and the live holder. `ensure_server` compares it with the server record's `design_context` (and home, compact limit, sign-in); any difference runs `_release_held_server` first. That function saves the serving home, parks each queue (`_move_queue_to_pending`), requires `ThreadIdle`, releases the thread (`_release_worker_thread`) and reaps the server; uncertainty raises `RoleNeedsRecovery`. `_server_environment` for a durable mesh drops `UNIT_*`, `PLAN_DELEGATE_*`, `CLAUDE_CODE_SESSION_ID`, `HELD_DESIGN_ID` and `DESIGN_BINDING_GENERATION` from the caller and sets them from the context: holder session, design ID, generation, and `PLAN_DELEGATE_BOARD_DIR` only when bound.
 
@@ -425,7 +436,7 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 - One designer and at most one reviewer per design, one holder per design, and the pair lives on the holder's host. No host transfer and no authority failover.
 - A lost or uncertain thread becomes `RoleNeedsRecovery`; nothing starts a replacement thread, forks a held thread or reopens an ended identity.
 - Held roles change only through `design_roles.py`. Every mesh route that can start, follow, pause, stop, reopen, fork or re-instruct a thread checks `held_design_id` and `_role_fence`. A new route must do the same.
-- Lock order is design, pending, roster, server. No SSH, authority call or LLM turn runs under these locks; `authority_request` runs after design and mesh locks are released.
+- Lock order is unit ledger, then design and pool locks, then worker lifecycle locks in sorted `(session, name)` order, then inbox, then roster. No operation acquires lifecycle while holding an inbox or roster flock. Adoption retains its nonblocking inbox attempts; it never waits on a busy inbox while holding a roster flock. Authority transitions and adoption publication retain the design and lifecycle fence; ordinary turn watching holds neither lifecycle nor roster.
 - Park queued text before any server stop or release. Clear a pending message only after its turn is accepted; keep it and its ID on uncertainty.
 - Access comes from the roster `access_policy`, never from the instructions text. Reviews stay `ReadOnlyReviewer`.
 - The berth check covers `apply_patch` only. Designers edit by patch; shell or Python writes are outside the check. Do not copy reservation state into the role store.
@@ -460,3 +471,45 @@ Other public functions: `queue_message`, `pending_messages`, `held_document`, `e
 - **Patch-only write check.** The berth hook sees `apply_patch` paths before the edit; other tools give no path list, and writers run with full sandbox access. So the guarantee covers patches, and the designer prompt tells designers to edit only by patch.
 - **Explicit access policy.** Access must not follow from prompt text. The mesh once inferred read-only access from `instructions_file`; a typed `ThreadAccessPolicy` on the roster entry now keeps access through start, follow, account recovery and adoption. `roster_access_policy` in `codex_mesh.py` is the one reader. An entry from before the policy existed gets its policy by what it is: with `instructions_file` and no `held_design_id` it is a reviewer template or fork (pool or `review.sh --slot`) and gets `ReadOnlyReviewer`; with `held_design_id` it is a damaged held role and refuses, naming `design_roles.py recover`; with neither it is a worker and keeps its launch sandbox. Each locked roster load stores the reviewer policy on every such entry in the file, so the first write after install migrates a whole pool; a read without the lock writes nothing.
 - **Short cited rulings.** Revisions that answered every finding with more mechanism grew a design without a correctness gain. Holders resume the same writer with short rulings that cite files, and change the Work Order only when scope changes.
+
+
+## Worker operation fencing
+
+`scripts/agents/worker_lifecycle.py` owns the per-worker flock at
+`<session>/<name>.lifecycle.lock`. `lock_worker` takes one identity;
+`lock_workers` canonicalizes and sorts identities for a transfer. Recursive
+acquisition by the same thread fails immediately and names both call sites.
+Competing threads and processes serialize on the flock.
+
+The operation boundary runs from the authoritative identity check through
+server effects to final roster publication. Settlement, pause, compact, claim,
+claim restoration, release-follow, start, submission, replacement-thread
+publication, account-move resume, reopen, end, reset, and bulk stop use it.
+Unit-worker adoption and rollback, reviewer transfer, and held-role recovery
+use the same lock module. Normal turn watching and capacity backoff release
+the lifecycle lock. Ledger telemetry refresh runs after releasing lifecycle
+and inbox locks, then reacquires ledger before lifecycle and roster.
+
+Known limit: bulk pause, bulk stop and held-server release lock the lifecycle of
+the workers present when they start, then act on every current roster entry. A
+worker added after that snapshot is changed without its lifecycle lock. A run-level
+membership lock is the planned fix (models-unit follow-up, F024 residual).
+
+Settlement closes only its own inbox and checks ownership before cleanup and
+terminal publication. A replacement-thread failure normalizes both port and
+thread before its first ownership check. Ownership loss is permanent for that
+subscriber; paused and adopted entries retain their pending messages.
+Unwatched cleanup shares one `THREAD_RELEASE_TIMEOUT_SECS` deadline across
+connection, initialization, queue draining, readback and interruption. A
+released lifecycle lock is not proof that the turn stopped: follow still
+requires positive idle evidence.
+
+An abandoned running worker recovers through `follow` or `reopen`. The current
+server may not know a thread on a retired server: recovery checks the old
+writer, resumes the exact thread on the current server and proves idle before
+publishing recovery or submitting work. Live or unknown state preserves pending
+work and names the cause. Reopen probes without a roster flock, then rechecks
+revision and launcher under the roster flock. Compact does not recover a dead
+launcher; its refusal directs the caller to follow or reopen.
+When no server is live, follow refuses before claiming an abandoned worker;
+reopen can restart the server and recover only after proving that same thread idle.
