@@ -46,6 +46,39 @@ class QueueViewTests(QueueFixtureTests):
         assert isinstance(frozen, gate.HeadStillHeld)
         self.assertEqual(frozen.decision, head.decision)
 
+    def test_snapshot_view_and_explanation_resolve_the_readers_live_budget(self) -> None:
+        fixture = self.fixture
+        model = fixture.model()
+        config = fixture.root / "lint.conf"
+        for source in ("environment", "config"):
+            for stale in (False, True):
+                with self.subTest(source=source, stale=stale), mock.patch.dict("os.environ", {
+                    "BUILDLOG_BUILD_BUDGET_GIB": "21" if source == "environment" else "",
+                    "LINT_CONFIG_FILE": str(config),
+                }):
+                    _ = config.write_text("[memory]\nbuild_budget_gib=21\n")
+                    inputs = fixture.inputs()
+                    with mock.patch.object(time, "time", return_value=NOW):
+                        gate.write_queue_snapshot(fixture.directory, inputs)
+                    _ = config.write_text("[memory]\nbuild_budget_gib=24\n")
+                    with mock.patch.dict("os.environ", {
+                        "BUILDLOG_BUILD_BUDGET_GIB": "24" if source == "environment" else "",
+                    }), mock.patch.object(time, "time", return_value=NOW + (11 if stale else 0)), \
+                         mock.patch.object(gate, "locked_queue_read", side_effect=TimeoutError("held")) as locked, \
+                         mock.patch.object(gate, "resolve_admission_limits", wraps=gate.resolve_admission_limits) as resolve:
+                        reading = gate.queue_read()
+                    resolve.assert_called_once_with(60 * gate.GIB)
+                    self.assertEqual(locked.call_count, int(stale))
+                    assert isinstance(reading, gate.QueueRead)
+                    assert isinstance(reading.explanation.host, gate.HostAvailable)
+                    assert isinstance(reading.explanation.head, gate.HeadExplanation)
+                    self.assertEqual(reading.explanation.host.budget, 24 * gate.GIB)
+                    self.assertEqual(reading.explanation.head.decision.budget, 24 * gate.GIB)
+                    self.assertEqual(reading.view.reserve, reading.explanation.host.reserve)
+                    self.assertEqual(reading.freshness,
+                                     gate.StaleReading(NOW) if stale else gate.CurrentReading())
+                    self.assertIn("budget 24.0", plain(queue_view.render_view(replace(model, reading=reading), 100)))
+
     def test_stale_snapshot_marks_only_the_original_header_time_as_warning(self) -> None:
         model = self.fixture.budget_model()
         current = queue_view.render_view(model, 100)
