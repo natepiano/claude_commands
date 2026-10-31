@@ -545,10 +545,13 @@ def command_json(*args: str, environment: dict[str, str] | None = None) -> objec
     if result.returncode and (result.returncode != 1 or args != ("claude", "auth", "status")):
         raise RuntimeError("account command failed")
     decoded = cast(object, json.loads(result.stdout))
-    if result.returncode and not (isinstance(decoded, dict)
-            and cast(dict[str, object], decoded).get("loggedIn") is False):
+    if result.returncode and not signed_out_answer(decoded):
         raise RuntimeError("account command failed")
     return decoded
+
+
+def signed_out_answer(decoded: object) -> bool:
+    return isinstance(decoded, dict) and cast(dict[str, object], decoded).get("loggedIn") is False
 
 
 def claude_config_dir() -> Path:

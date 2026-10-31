@@ -15,7 +15,7 @@ class QueueCardTests(QueueFixtureTests):
         inputs = self.fixture.inputs()
         path, row = inputs.ordered[1]
         reading = gate.queue_read_from(replace(inputs, ordered=[inputs.ordered[0],
-            (path, {**row, "estimated_at": NOW - 600})]))
+            (path, {**row, "estimated_at": NOW - 600})]), gate.resolve_admission_limits(60 * gate.GIB))
         model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
         text = plain(queue_card.render_card(model, [2], 400))
         self.assertIn("✗ estimate       expired at 10:36; refreshes on its next poll", text)
@@ -31,7 +31,7 @@ class QueueCardTests(QueueFixtureTests):
             running=(replace(inputs.running[0], promise=gate.GIB, measured=gate.MeasuredMemory(gate.GIB)),),
             reservations=({**inputs.reservations[0], "need": gate.GIB},), ordered=[
                 (path, {**head, "need": 15 * gate.GIB, "priority_since": NOW - 60}),
-                (follower_path, {**follower, "need": gate.GIB})]))
+                (follower_path, {**follower, "need": gate.GIB})]), gate.resolve_admission_limits(60 * gate.GIB))
         self.assertIsInstance(reading.view.waiting[1].reason, gate.ReadyForAdmission)
         from scripts.build_queue import queue_view
         self.assertEqual(queue_view.reason_phrase(reading.view.waiting[1].reason, reading.view.waiting),

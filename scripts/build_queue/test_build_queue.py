@@ -105,7 +105,8 @@ class QueueTests(unittest.TestCase):
         inputs = self.fixture.inputs()
         path, row = inputs.ordered[0]
         reading = memory_admit.queue_read_from(replace(inputs, pressure=memory_admit.NoPressureHold(),
-            ordered=[(path, {**row, "estimated_at": NOW - 600})]))
+            ordered=[(path, {**row, "estimated_at": NOW - 600})]),
+            memory_admit.resolve_admission_limits(60 * GIB))
         status, output, errors = self.invoke(reading, "--json", "--columns", "60")
         self.assertEqual((status, errors), (0, ""))
         data = cast(QueueLines, json.loads(output))

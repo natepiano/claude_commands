@@ -154,14 +154,14 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
          "step": step.step, "folder": step.folder}) for step in view.waiting]
     inputs = gate.QueueInputs(ordered, view.running, (),
         gate.HostMemory(view.available, gate.UnknownHostTotal()), gate.NoPressureHold(),
-        gate.NoRecoverySpacing(), gate.AdmissionLimits(21 * gate.GIB, view.reserve),
+        gate.NoRecoverySpacing(),
         gate.NoHeadAdmissionOverride(), view.now)
     explanation = gate.QueueExplanation(view.now, host, running,
         gate.QueueMemoryTotals(sum(step.charged for step in running), sum(step.measured for step in running), view.promised),
         first, gate.WaitingLine(tuple(followers), len(followers), sum(row.fits_now for row in followers),
             min((row.waiter.need for row in followers), default=0),
             max((row.waiter.need for row in followers), default=0),
-            min((row.waiter.since for row in followers), default=view.now)), inputs)
+            min((row.waiter.since for row in followers), default=view.now)), inputs, gate.AdmissionLimits(budget, view.reserve))
     return gate.QueueRead(view, explanation, ordered)
 
 
@@ -273,11 +273,11 @@ class QueueFixture(ExitStack):
         write_lines(self.directory / "anon_peaks.jsonl", lines, tail=tail)
 
     def inputs(self) -> gate.QueueInputs:
-        """Resolve the fixed 10:46 queue once, including raw pressure and limits."""
+        """Resolve the fixed 10:46 queue once, including raw pressure."""
         return gate.gather_queue_inputs(self.directory, gate.process_table(self.proc), NOW)
 
     def read(self) -> gate.QueueRead:
-        return gate.queue_read_from(self.inputs())
+        return gate.read_queue_pass(self.directory, gate.process_table(self.proc), NOW)
 
     def model(self) -> queue_view.QueueModel:
         reading = self.read()

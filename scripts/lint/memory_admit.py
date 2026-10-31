@@ -1194,6 +1194,7 @@ class QueueExplanation:
     head: HeadExplanation | NoWaiter
     line: WaitingLine
     decided_from: QueueInputs
+    limits: AdmissionLimits
     ordered: tuple[Waiter, ...] = ()
     reservations: tuple[Reservation, ...] = ()
     override: HeadAdmissionOverride | NoHeadAdmissionOverride = NoHeadAdmissionOverride()
@@ -1218,14 +1219,13 @@ class QueueBusy:
 
 @dataclass(frozen=True)
 class QueueInputs:
-    """All resolved evidence for a queue decision; independent of the reader's host."""
+    """Queue evidence without configuration; limits are resolved by each reader."""
     ordered: list[tuple[Path, Waiter]]
     running: tuple[RunningStep, ...]
     reservations: tuple[Reservation, ...]
     host: HostMemory | ReadingUnavailable
     pressure: Pressure
     recovery: RecoverySpacing
-    limits: AdmissionLimits
     override: HeadAdmissionOverride | NoHeadAdmissionOverride
     now: float
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
@@ -3157,7 +3157,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         inputs = gather_queue_inputs(directory, processes, now.timestamp(), snapshot.memory, readings=snapshot)
         inputs = replace(inputs, ordered=ordered, priority=priority,
                          blockers_for=frozenset((waiter_owner(waiter),)))
-        result = admission_pass(inputs, now.timestamp())
+        result = admission_pass(inputs, now.timestamp(), _queue_limits(inputs))
         own = next(row for row in result.rows if row.owner == waiter_owner(waiter))
         decision = own.decision
         # Persist actual selected bases after the pure pass. Failure to record
@@ -3363,7 +3363,7 @@ def waiter_owner(row: Waiter) -> str:
     return f"{row['pid']}-{row['start_time']}"
 
 
-def admission_pass(inputs: QueueInputs, now: float) -> PassResult:
+def admission_pass(inputs: QueueInputs, now: float, limits: AdmissionLimits) -> PassResult:
     """Decide one frozen scenario, proposing ledger changes without committing any."""
     ordered = sorted(((path, row.copy()) for path, row in inputs.ordered), key=lambda item: waiter_order(item[1]))
     memory = [step.measured for step in inputs.running]
@@ -3371,7 +3371,7 @@ def admission_pass(inputs: QueueInputs, now: float) -> PassResult:
     available, total = host.available, host.total
     recovery = next_recovery(inputs.recovery, inputs.pressure, now)
     pressure = pressure_with_recovery(recovery, inputs.pressure, now)
-    head = head_priority([row for _, row in ordered], available, total, memory, now, limits=inputs.limits)
+    head = head_priority([row for _, row in ordered], available, total, memory, now, limits=limits)
     marks: tuple[HeadMark, ...] = ()
     if isinstance(head, HeadPriority) and "priority_since" not in head.waiter:
         marked = head.waiter.copy()
@@ -3385,10 +3385,10 @@ def admission_pass(inputs: QueueInputs, now: float) -> PassResult:
     if not isinstance(raw_override, NoHeadAdmissionOverride) and not any(
             head_override_matches(raw_override, path, row) for path, row in ordered):
         outcome = OverrideEnded(raw_override, "lapsed")
-    totals = decide(available, total, 0, memory, pressure=pressure, limits=inputs.limits)
+    totals = decide(available, total, 0, memory, pressure=pressure, limits=limits)
     admissions = admission_walk(available, total, [row for _, row in ordered], memory, head, pressure,
         recovery=recovery, now=now, room_used=head_room_used(list(inputs.reservations), memory, head),
-        override=override, limits=inputs.limits)
+        override=override, limits=limits)
     rows: list[PassRow] = []
     endings: tuple[PassResult, ...] = ()
     rank = 0
@@ -3416,7 +3416,7 @@ def admission_pass(inputs: QueueInputs, now: float) -> PassResult:
         if owner in inputs.blockers_for:
             if decision.state == "hold" and not isinstance(inputs.host, ReadingUnavailable):
                 if not endings:
-                    endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,))), now)
+                    endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,))), now, limits)
                                     for ended in range(len(inputs.running)))
                 blocker = blocking_index(owner, endings)
             else:
@@ -3491,7 +3491,7 @@ def blocker_snapshot(waiter_path: Path) -> Blocker:
             raise WaiterGone(f"waiter file is gone: {waiter_path}")
         return NoSingleBlocker()
     owner = waiter_owner(matching[0])
-    result = admission_pass(replace(inputs, blockers_for=frozenset((owner,))), inputs.now)
+    result = admission_pass(replace(inputs, blockers_for=frozenset((owner,))), inputs.now, _queue_limits(inputs))
     row = next((row for row in result.rows if row.owner == owner), None)
     return (blocker_identity(row.blocker, list(inputs.reservations), processes, proc)
             if row is not None else NoSingleBlocker())
@@ -3568,9 +3568,8 @@ def gather_queue_inputs(directory: Path, processes: dict[int, ProcessIdentity], 
         row["session_id"], row["session_name"] = identity["session_id"], identity["session_name"]
         row["step"], row["folder"] = identity["step"], identity["folder"]
     ordered, priority = resolve_queue_order(directory, rows, readings=readings)
-    limits = resolve_admission_limits(host.total if isinstance(host, HostMemory) else UnknownHostTotal())
-    return QueueInputs(ordered, tuple(running), tuple(reservations), host, pressure, recovery, limits,
-                       read_head_override(directory), now, priority=priority)
+    return QueueInputs(ordered, tuple(running), tuple(reservations), host, pressure, recovery,
+                       read_head_override(directory), now, priority)
 
 
 class RecordedQueueIdentities:
@@ -3590,7 +3589,7 @@ def decision_checks(decision: AdmissionDecision, need: int, available: int) -> t
             FreeCheck(available, need, decision.reserve, decision.promised, decision.threshold, decision.free_passes))
 
 
-def queue_read_from(inputs: QueueInputs) -> QueueRead:
+def queue_read_from(inputs: QueueInputs, limits: AdmissionLimits) -> QueueRead:
     """Apply admission to resolved evidence, with no file, process or environment reads."""
     ordered = sorted(inputs.ordered, key=lambda item: waiter_order(item[1]))
     running, reservations, now = inputs.running, inputs.reservations, inputs.now
@@ -3599,8 +3598,8 @@ def queue_read_from(inputs: QueueInputs) -> QueueRead:
     unavailable = isinstance(inputs.host, ReadingUnavailable)
     host = inputs.host if isinstance(inputs.host, HostMemory) else HostMemory(0, UnknownHostTotal())
     available, total = host.available, host.total
-    result = admission_pass(inputs, now)
-    recovery, limits = result.recovery, inputs.limits
+    result = admission_pass(inputs, now, limits)
+    recovery = result.recovery
     override = result.override.record if isinstance(result.override, OverrideKept) else NoHeadAdmissionOverride()
     pressure = result.totals.pressure
     explained: list[ExplainedRunningStep] = []
@@ -3660,13 +3659,21 @@ def queue_read_from(inputs: QueueInputs) -> QueueRead:
                     min((item.waiter.need for item in line), default=0),
                     max((item.waiter.need for item in line), default=0),
                     min((item.waiter.since for item in line), default=now)),
-        inputs, tuple(row for _, row in ordered), tuple(reservations), override, recovery, inputs.priority)
+        inputs, limits, tuple(row for _, row in ordered), tuple(reservations), override, recovery, inputs.priority)
     return QueueRead(view, explanation, ordered)
 
 
 
+def _queue_limits(inputs: QueueInputs) -> AdmissionLimits:
+    return resolve_admission_limits(inputs.host.total if isinstance(inputs.host, HostMemory) else UnknownHostTotal())
+
+
+def _queue_read_live(inputs: QueueInputs) -> QueueRead:
+    return queue_read_from(inputs, _queue_limits(inputs))
+
+
 def read_queue_pass(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> QueueRead:
-    return queue_read_from(gather_queue_inputs(directory, processes, now))
+    return _queue_read_live(gather_queue_inputs(directory, processes, now))
 
 
 def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
@@ -3771,9 +3778,7 @@ def parse_snapshot_value(value: object, schema: object) -> object:
 
 def write_queue_snapshot(directory: Path, inputs: QueueInputs) -> None:
     """Publish a cache atomically under LOCK_EX; durability is deliberately unnecessary."""
-    evidence = cast(dict[str, object], snapshot_value(inputs))
-    del evidence["limits"]  # Each reader resolves configuration at its own boundary.
-    encoded = json.dumps({"v": 2, "written_at": time.time(), "inputs": evidence},
+    encoded = json.dumps({"v": 3, "written_at": time.time(), "inputs": snapshot_value(inputs)},
                          separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     temporary = directory / "queue.json.tmp"
     try:
@@ -3789,18 +3794,16 @@ def read_queue_snapshot(directory: Path) -> QueueSnapshot | NoQueueSnapshot:
         if not isinstance(raw, dict):
             return NoQueueSnapshot()
         envelope = cast(dict[str, object], raw)
-        if type(envelope.get("v")) is not int or envelope["v"] != 2:
+        if type(envelope.get("v")) is not int or envelope["v"] != 3:
             return NoQueueSnapshot()
         written_at = cast(float, parse_snapshot_value(envelope["written_at"], float))
         evidence = envelope["inputs"]
-        if not isinstance(evidence, dict) or "limits" in evidence:
+        if not isinstance(evidence, dict):
             return NoQueueSnapshot()
-        evidence = cast(dict[str, object], evidence)
-        host = cast(HostMemory | ReadingUnavailable,
-                    parse_snapshot_value(evidence["host"], HostMemory | ReadingUnavailable))
-        limits = resolve_admission_limits(host.total if isinstance(host, HostMemory) else UnknownHostTotal())
-        inputs = cast(QueueInputs, parse_snapshot_value(
-            {**evidence, "limits": snapshot_value(limits)}, QueueInputs))
+        fields = cast(dict[str, object], evidence)
+        if "limits" in fields:
+            return NoQueueSnapshot()
+        inputs = cast(QueueInputs, parse_snapshot_value(fields, QueueInputs))
         if sum(not isinstance(step.measured, CompilerServiceMemory) for step in inputs.running) != len(inputs.reservations):
             return NoQueueSnapshot()
         return QueueSnapshot(written_at, inputs)
@@ -3811,12 +3814,12 @@ def read_queue_snapshot(directory: Path) -> QueueSnapshot | NoQueueSnapshot:
 def queue_read() -> QueueRead | QueueBusy:
     snapshot = read_queue_snapshot(store.root() / "admission")
     if isinstance(snapshot, QueueSnapshot) and 0 <= time.time() - snapshot.written_at <= SNAPSHOT_MAX_AGE_SECONDS:
-        return queue_read_from(snapshot.inputs)
+        return _queue_read_live(snapshot.inputs)
     try:
         return locked_queue_read(timeout=QUEUE_READ_LOCK_SECONDS)
     except TimeoutError:
         if isinstance(snapshot, QueueSnapshot):
-            return replace(queue_read_from(snapshot.inputs), freshness=StaleReading(snapshot.written_at))
+            return replace(_queue_read_live(snapshot.inputs), freshness=StaleReading(snapshot.written_at))
         return QueueBusy()
 
 
@@ -3908,7 +3911,7 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
     indices = frozenset(ended)
     released = [row for index, row in enumerate(explanation.running) if index in indices]
     inputs = inputs_after_steps_end(explanation.decided_from, indices)
-    row = admission_pass(inputs, explanation.now).rows[0]
+    row = admission_pass(inputs, explanation.now, explanation.limits).rows[0]
     if isinstance(row.reason, EstimateExpired):
         return row.reason
     decision = row.decision
