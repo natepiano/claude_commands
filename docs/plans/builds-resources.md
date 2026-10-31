@@ -1245,40 +1245,29 @@ The Phase 26 checkpoint did not name two narrowed assertions; this phase's check
 - `test` — the test files and goldens.
 
 ### Phase 43 — Every agent Hana carries its owner and purpose, and `hanas` lists, stops and sweeps test Hanas on both machines  · status: done
-**Depends on:** none (runs beside Phase 41; no shared files).
 
-**Approved:** builds showrunner 2026-10-31, relaying a user request through hana: design `/home/natepiano/.local/state/showrunner/tool-based-ui/session/hana-test-window-design.md`, its phase 1. Outside paths approved under `--also`: `scripts/production/mac_run.sh`, `scripts/production/smoke_launch.sh`, `scripts/hana_shot/hana_shot.py`, `config/mac_test.conf`. `/etc/nixos` changes go to natedev as branch + hash. bevy_brp needs no change: its launch tool already takes `env` (`~/rust/bevy_brp/mcp/src/app_tools/launch_params.rs:49-52`). Trunk Phase 174 (the Hana side: refusal, title, idle exit) lands only after this phase is installed.
+#### As-built
 
-#### Work Order
-
-**Goal:** The user wants each test Hana window to name the unit director and the feature under test, on the Mac and on natedev, and wants every test Hana to stop reliably, with no dependence on memories or announcements. This phase gives every agent launch path the two labels, refuses an agent Hana launch with no purpose, and adds one tool, `hanas`, that finds test Hanas from the process table on both machines, also when their owner session is gone, and stops the ones over their limits.
-
-**Spec:**
-
-1. **Config.** A new `config/hanas.conf` (documented in `config/README.md`) holds every limit, read at run time through `config_values`: `exempt_ports=15702,15761` (the user's own Hana and the demo), `test_max_hours=4`, `unlabelled_max_minutes=30`, `stop_grace_seconds`. Nothing hard-codes a limit or a port.
-2. **The labels.** Every agent launch path passes `HANA_TEST_PURPOSE` (the feature under test, required) and `HANA_TEST_OWNER` (the unit director's name; default `SHOWRUNNER_UNIT_ID` from the caller's env) in Hana's env:
-   - `scripts/hana_shot/hana_shot.py`: `launch()` (:2090, env built at :2113-2116) and every caller of it (`command_launch` :2747, `instance()` :2293) take a purpose; a launch without one refuses with one line naming the flag.
-   - `scripts/production/mac_run.sh`: the generated `.command` (:117-122) sets both; a run without a purpose refuses before any ssh.
-   - `scripts/production/smoke_launch.sh` (:73-74): the same.
-3. **The launch gate.** `scripts/hooks/pre-tool-use-brp-launch-gate.sh` reads `tool_input` and denies an `mcp__brp__brp_launch` of the Hana app whose `env` has no non-empty `HANA_TEST_PURPOSE`, with a reason that names the `env` key to add. Other apps pass as today. The deny uses the hook's existing deny form (:20-26) and runs before the memory wait.
-4. **`hanas`.** New `scripts/hanas/hanas.py` with `list`, `stop <machine>:<pid|port>` and `sweep [--dry-run]`. It reads the process table on natedev (`/proc`, the env through `shutdown/inventory.py` `_process_environment`) and on the Mac over ssh (`ps eww -axww`, ssh options from `mac_test/offload.py` `ssh_prefix`, host from `mac_test.conf`). A Hana is a process whose executable is a `target/<profile>/hana`. Each row: machine, pid, port (`BRP_EXTRAS_PORT`), owner, purpose, age, checkout. An unreachable Mac is one line, and natedev rows still print. A test Hana is a labelled Hana, or any Hana on a port outside `exempt_ports`, or a Hana on an exempt port whose env carries `CLAUDECODE`, `SSH_CONNECTION` or `SHOWRUNNER_UNIT_ID`. `sweep` stops a test Hana older than `test_max_hours` and an unlabelled test Hana older than `unlabelled_max_minutes`: TERM, then KILL after `stop_grace_seconds`. It never stops a user Hana (exempt port, no agent env). Every stop prints one line, and a rerun with nothing left to stop exits 0.
-5. **Install and timer (director, after the checkpoint).** A `/etc/nixos` branch adds a `hanas` wrapper beside `agents.nix:19-30` and a both-machine `nate.jobs` entry that runs `hanas sweep` (template `modules/common/folder-audit.nix`). Its interval is the only value set in nix. Sent to natedev as branch + hash.
-
-Tests: `scripts/hooks/test_brp_launch_gate.py`: a Hana launch with no purpose is denied with the named key; with a purpose it reaches the memory wait; another app is not checked. `scripts/hanas/test_hanas.py`: rows from a fake `/proc` and from fake `ps eww` output; the test-Hana rule for each exempt-port case; sweep picks only rows over their limit, from config values; a stop of a pid that is gone exits 0; an unreachable Mac still lists natedev. `scripts/hana_shot/test_hana_shot.py`: a launch without a purpose refuses; the started env carries both labels.
-
-**Acceptance:** the tests; `test_brp_launch_gate.py`, `test_hanas.py`, `test_hana_shot.py` and `basedpyright` on the changed Python files pass from the worktree. Live on natedev: `hanas list` shows each running Hana on both machines with owner and purpose, or `unlabelled`; `hanas sweep --dry-run` names exactly the ones over their limits.
+- Hana-shot launch and capture, Mac-run and smoke launch carry `HANA_TEST_PURPOSE` and `HANA_TEST_OWNER`; owner defaults to `SHOWRUNNER_UNIT_ID`. Missing or blank purpose refuses before launch and before Mac SSH; the BRP Hana hook checks purpose before hold and memory checks.
+- `config_values` reads `config/hanas.conf` each invocation: exempt ports 15702/15761, labelled lifetime 4 hours, unlabelled lifetime 30 minutes and stop grace 5 seconds. `HANAS_CONFIG` selects another file; Mac host and SSH settings come from `mac_test.conf`.
+- `hanas list`, `stop <machine>:<pid|port>` and `sweep [--dry-run]` share one inventory, classification and stop path. Matching `target/<profile>/hana` yields machine, pid, port, owner, purpose, age and checkout without session lookup; natedev collects local `/proc` plus Mac SSH, while Darwin collects local `ps`.
+- `HanaCheckout | NotHana`, `HanaProcess | NotHana`, `ProcessIdentity | ProcessGone` and `EnvironmentKnown | EnvironmentUnknown` distinguish match, lifetime and environment states. A label, known non-exempt port, or agent marker (`CLAUDECODE`, `SSH_CONNECTION`, `SHOWRUNNER_UNIT_ID`) marks a test Hana; unknown port alone does not. Stop protects user Hanas on exempt ports without labels or markers and refuses unknown environments.
+- Each stop checks saved start identity before TERM and KILL, waits the configured grace and confirms the original process exited before printing `stopped`; reused pids receive no signal. Linux uses start ticks and Darwin UTC `lstart`; absent targets report `already gone` and succeed, while failed signals or missing exit confirmation fail. Reruns collect fresh identities.
+- Sweep stops only overdue test Hanas; dry-run sends no signals. Unknown environments remain visible with their cause; an unreachable Mac leaves natedev rows visible. Sweep handles other known rows after a Mac inventory problem or a failed stop and returns nonzero; a repeated completed sweep succeeds with no further stops.
 
 **Files:**
-- `config/hanas.conf`, `config/README.md` — item 1.
-- `scripts/hana_shot/hana_shot.py`, `scripts/production/mac_run.sh`, `scripts/production/smoke_launch.sh` — item 2 (approved outside paths).
-- `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — item 3.
-- `scripts/hanas/hanas.py` — item 4.
-- `docs/as-built/hana-test-windows.md` — new: the labels, the gate, `hanas` and its config.
-- `scripts/hooks/test_brp_launch_gate.py`, `scripts/hanas/test_hanas.py`, `scripts/hana_shot/test_hana_shot.py` — tests.
+- `scripts/hanas/hanas.py`, `scripts/hanas/test_hanas.py` — inventory, classification, stop/sweep and private-process tests.
+- `config/hanas.conf`, `config/README.md` — runtime settings and guide.
+- `scripts/hana_shot/hana_shot.py`, `scripts/hana_shot/test_hana_shot.py` — purpose/owner flags, labels and refusal.
+- `scripts/hooks/pre-tool-use-brp-launch-gate.sh`, `scripts/hooks/test_brp_launch_gate.py` — Hana purpose gate.
+- `scripts/production/mac_run.sh`, `scripts/production/smoke_launch.sh`, `scripts/production/test_mac_run.py`, `scripts/buildlog/test_launch_recording.py` — labelled shell launches and caller/recovery tests.
+- `commands/hana_shot.md`, `commands/showrunner/produce.md`, `docs/as-built/hana-test-windows.md` — launch guidance and tool behavior.
 
-**Workers:** `1 writer + 1 tester`
-- `impl` — the source, config and doc files.
-- `test` — the test files.
+**Binds later work:** “Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor” preserves required purpose, owner fallback, literal label quoting, refusal before SSH and launch recovery; uses runtime settings without changing Hana lifetimes or exemptions; keeps live or unreadable-environment checkouts busy; and reuses the inventory/process-use guard and stop path.
+
+**Gotchas:** Darwin uses herdr's existing argv/environment boundary; assignment-like arguments are not labels. The remote stop program supports Bash and Zsh, uses `identity_status` because Zsh reserves `status`, and checks the full process table before declaring exit; remote success status alone proves nothing. The CLI exists in the repository; wrapper and both-machine sweep timer installation remain a director-only `/etc/nixos` branch-and-hash handoff. Hana's own refusal, title and idle-exit change waits for this installation.
+
+**Ruled out:** A second Darwin environment lexer; roster-dependent discovery; unknown ports alone proving test ownership; failed environment reads proving absence or safety; failed signals proving exit; signalling reused pids; stopping sweep at its first failure.
 
 ### Phase 44 — Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor  · status: todo
 **Depends on:** Phase 43
@@ -1296,15 +1285,21 @@ Tests: `scripts/hooks/test_brp_launch_gate.py`: a Hana launch with no purpose is
 3. **Below the Mac floor.** When the Mac's free space is under `free_floor_gib` (`config/mac_test.conf:17`), the sweep removes idle clones, oldest first; a clone with unsaved work (a dirty git tree) loses only its `target`.
 
 Tests: `scripts/lint/test_folder_audit.py` and the Mac sweep's tests: a clone over the age is removed and a younger one stays; below the floor an idle clone goes, a dirty one keeps its source and loses `target`; a busy clone stays.
+In `scripts/production/test_mac_run.py`, add `test_scratch_clone_launch_keeps_purpose_and_owner` for the generated Mac launch command and `test_missing_purpose_refuses_before_ssh`. Keep `test_early_failure_releases_claim` reaching its intended Git failure, with a purpose in the shared fixture.
 
 **Acceptance:** the tests and `basedpyright` on the changed Python files pass from the worktree.
 
 **Files:**
 - `scripts/lib/scratch.py`, `scripts/lint/folder_audit.py`, `scripts/production/mac_run.sh`, `config/mac_test.conf`, `config/hanas.conf` — items 1-3.
 - `scripts/lib/test_scratch.py`, `scripts/lint/test_folder_audit.py` — tests.
+- `scripts/production/test_mac_run.py` — the clone launch and refusal tests.
+- `commands/showrunner/produce.md`, `docs/as-built/hana-test-windows.md` — item 1, the existing Mac clone and launch guidance.
+- `scripts/hanas/hanas.py` — read the existing Hana inventory and stop contract for busy-clone checks; reuse it when Hana-specific evidence is needed.
 
 **Constraints from prior phases:** Phase 40 validates a new `phase:<unit>/<id>` assignment in `scratch.target` and `scratch.hand_over` through `scratch.registered_plan(unit) -> Path` and `plan_history.plan_phases`. The registered plan comes from the staff parent and production Units record, never the caller's checkout. Clone flows outside a real phase use `gate:<id>` or `--until <when>`. Keep `checked_task` as a shape check so old tasks can still update and end. Tests patch only `registered_plan` with a private plan and use private scratch and copy roots; keep `test_unknown_phase_is_refused_before_creation_or_hand_over` and `test_an_existing_unknown_phase_task_can_update_and_end` in `test_scratch.py`. A `mesh_runs` cwd keeps a folder only while its record says `running`; finished records do not remove the other keeps or the 7-day fallback.
 
+Phase 43 makes `mac_run.sh` refuse a missing or blank `HANA_TEST_PURPOSE` before SSH. Keep that check when changing clone creation. Carry the purpose and `HANA_TEST_OWNER` into the generated Terminal command; the owner defaults to `SHOWRUNNER_UNIT_ID`, and Zsh's `(q)` quoting keeps labels literal. The promotion example in `commands/showrunner/produce.md` supplies the purpose. `config/hanas.conf` already holds the Hana lifetimes, exempt ports and stop grace through runtime `config_values`; add clone settings there without copying those values. `hanas.collect_processes` gives each Hana its checkout, start identity and `EnvironmentKnown | EnvironmentUnknown` state. An unreadable environment still names a live checkout and cannot prove it idle. Keep the existing process-use guards; do not copy the Darwin environment parser. If cleanup stops a Hana, reuse `hanas.stop_process`: it protects user Hanas, refuses unknown environments, checks start identity before each signal, and requires confirmed exit. Keep `test_unavailable_process_uses_keeps_due_folders` in `test_folder_audit.py` and the identity, unknown-environment and per-stop-failure tests in `test_hanas.py`.
+
 **Workers:** `1 writer + 1 tester`
-- `impl` — the source and config files.
-- `test` — the test files.
+- `impl` — the source, config and guidance files; hub: `scripts/production/mac_run.sh` (clone setup and the generated launch command).
+- `test` — `test_scratch.py`, `test_folder_audit.py` and `test_mac_run.py`; private clone, process and SSH fixtures.
