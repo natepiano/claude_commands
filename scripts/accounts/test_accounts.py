@@ -32,6 +32,7 @@ from typing import Literal, Self, TextIO, TypedDict, cast, final, override
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from zoneinfo import ZoneInfo
 
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader, installed_program
 from scripts.production import showrunners
@@ -67,7 +68,6 @@ def named_environment(config_dir: Path) -> dict[str, str]:
 def setUpModule() -> None:
     _ = cast(object, unittest.enterModuleContext(patch.object(accounts, "import_module", side_effect=imports_with_nix_loader(fake_nix_loader()))))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory())).resolve()
-    _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
     _ = unittest.enterModuleContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (root / "worker-runs",)))
     _ = unittest.enterModuleContext(patch.object(role_map, "is_role_map_host", return_value=True))
 
@@ -184,14 +184,13 @@ class AccountsTests(unittest.TestCase):
         _ = notes.mkdir()
         environment = {
             "AGENT_NOTES_DIR": str(notes),
-            "HOME": str(self.home),
             "PATH": os.defpath,
             # The wall times these tests pass are Pacific; the user's zone setting must not change them.
             "USER_ZONE": "America/Los_Angeles",
         }
         environment_context: object = cast(
             object,
-            self.enterContext(patch.dict(os.environ, environment, clear=True)),
+            self.enterContext(scratch_account_home(self.home, environment)),
         )
         del environment_context
         _ = self.enterContext(patch.object(quota_alert, "STATE", self.root / "quota_alert.json"))
@@ -202,7 +201,6 @@ class AccountsTests(unittest.TestCase):
             agent_accounts, "codex_live", return_value=agent_accounts.Report("Codex", problem="Not logged in"),
         )))
         _ = self.enterContext(patch.object(accounts, "WORKERS_RUN_ROOTS", (self.root / "worker-runs",)))
-        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(patch.object(agent_accounts, "prepare_codex_home",
             return_value=agent_accounts.CodexHomePrepared()))
         _ = self.enterContext(patch.object(codex_mesh, "retire_workers_servers", return_value=[]))
@@ -1172,7 +1170,7 @@ class AccountsTests(unittest.TestCase):
                     environment["RELAUNCH_SUPERVISED"] = "1"
                 else:
                     _ = environment.pop("RELAUNCH_SUPERVISED", None)
-                with (patch.dict(os.environ, environment, clear=True),
+                with (scratch_account_home(self.home, environment),
                       patch.object(sys.stdin, "isatty", return_value=tty),
                       patch.object(os, "execvpe") as launch):
                     accounts.exec_account("claude3", ["--resume", "conversation-id"])
@@ -5226,7 +5224,7 @@ class AccountsTests(unittest.TestCase):
         later_home = self.root / "later home"
         _ = later_home.mkdir()
 
-        with patch.dict(os.environ, {"HOME": str(later_home)}):
+        with scratch_account_home(later_home, {}, clear=False):
             self.assertEqual(accounts.accounts_home(), later_home)
             self.assertEqual(accounts.main_config_dir(), later_home / ".claude")
 
@@ -6042,8 +6040,8 @@ class PickerTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes"), "USER_ZONE": "UTC",
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {
+            "AGENT_NOTES_DIR": str(self.home / "notes"), "USER_ZONE": "UTC",
         }, clear=True)))
         (self.home / "notes").mkdir()
         _ = installed_program(self.home, "claude")
@@ -7078,8 +7076,8 @@ class StatusProblemCauseTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes"),
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {
+            "AGENT_NOTES_DIR": str(self.home / "notes"),
             "CODEX_HOME": str(self.home / ".codex"), "USER_ZONE": "UTC",
         }, clear=True)))
         _ = self.enterContext(patch.object(subprocess, "run", side_effect=AssertionError("no real child")))
