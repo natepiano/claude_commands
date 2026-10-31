@@ -31,10 +31,61 @@ import fake_showrunner
 import fake_unit_host
 
 from scripts.production.rename_unit_test_support import UnitRenameFixture
+from scripts.production import staff
 
 
 @final
 class UnitRenameSessionsTests(UnitRenameFixture):
+
+    def test_recordless_relaunch_real_add_unit_joins_parent_operation(self) -> None:
+        rename = rename_unit.plan("demo", "alpha", "gamma", self.root / "scratch")
+        rename.session_id = "sid-alpha"
+        self.write(self.doc, self.doc.read_text().replace(
+            "alpha-unit | docs/plans/alpha.md", "gamma-unit | standby"))
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+        children: list[subprocess.CompletedProcess[str]] = []
+
+        def launch(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command[:2], [sys.executable, str(Path(add_unit.__file__))])
+            # The real entry acquires staff.operation before parsing --help. Stop
+            # there so this regression cannot launch or stop a live director.
+            child = run([*command, "--help"], timeout=3, **options)
+            children.append(child)
+            return child
+
+        with (patch.dict(os.environ, self.env), staff.operation(),
+              patch.object(rename_unit, "_unit_records", return_value=[]),
+              patch.object(rename_unit, "_await_live") as observed,
+              patch.object(subprocess, "run", side_effect=launch)):
+            rename_unit._relaunch(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
+            self.assertTrue(staff.operation_fds())
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0].returncode, 0, children[0].stderr)
+        self.assertIn("--production", children[0].stdout)
+        observed.assert_called_once_with(rename)
+
+    def test_restart_child_joins_parent_operation_and_clears_session_identity(self) -> None:
+        child_entry = self.root / "restart_lock_probe.py"
+        checkout = Path(__file__).resolve().parents[2]
+        self.write(child_entry, f"""import os, sys
+sys.path.insert(0, {str(checkout)!r})
+from scripts.production import staff
+assert 'CLAUDE_CODE_SESSION_ID' not in os.environ
+with staff.operation():
+    staff.ensure('showrunner', name='restart-child')
+""")
+        run = cast(Callable[..., subprocess.CompletedProcess[str]], subprocess.run)
+
+        def launch(command: list[str], **options: object) -> subprocess.CompletedProcess[str]:
+            options["timeout"] = 3
+            return run(command, **options)
+
+        with (patch.dict(os.environ, {**self.env, "CLAUDE_CODE_SESSION_ID": "parent-session"}),
+              staff.operation(), patch.object(rename_unit, "SHUTDOWN", child_entry),
+              patch.object(subprocess, "run", side_effect=launch)):
+            rename_unit.run_shutdown("restart", "--only", "fixture-session")
+            self.assertIsNotNone(staff.by_path("restart-child"))
+            self.assertTrue(staff.operation_fds())
 
     def test_recordless_rename_relaunch_is_a_valid_add_unit_request(self) -> None:
         rename = rename_unit.plan("demo", "alpha", "gamma", self.root / "scratch")

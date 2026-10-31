@@ -648,6 +648,7 @@ def run_shutdown(*arguments: str) -> None:
     account that holds the session, not the showrunner's own."""
     environment = {key: value for key, value in os.environ.items() if key != "CLAUDE_CODE_SESSION_ID"}
     result = subprocess.run([sys.executable, str(SHUTDOWN), *arguments, "--here"], env=environment,
+                            pass_fds=staff.operation_fds(),
                             capture_output=True, text=True, check=False, timeout=900)
     if result.returncode:
         raise RenameRefused(f"shutdown {arguments[0]}: {(result.stderr or result.stdout).strip()}")
@@ -905,6 +906,7 @@ def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
                 "--production", rename.doc, rename.new, *production_units.plan_arguments(plan),
                 "--resume", rename.session_id, "--cwd", rename.new_worktree,
                 *(["--account", rename.account] if rename.account else [])],
+                pass_fds=staff.operation_fds(),
                 capture_output=True, text=True, check=False)
             if result.returncode:
                 raise RenameRefused((result.stderr or result.stdout).strip())
