@@ -128,8 +128,8 @@ reach: a worker launched that way takes one prompt and is unreachable until it
 exits. `codex_mesh.py` is the alternative launch path that gives a codex worker
 an address, so peers and the unit director can message and interrupt it mid-run
 the way they already can a claude worker. It launches `/unit:direct`'s codex
-workers, `/ask_a_friend`'s codex friend (`start --resident`) and each
-production's pooled reviewers (`review-pool.md`). For workers it
+workers, including the unit-owned `review` and concurrent `review2`, and
+`/ask_a_friend`'s codex friend (`start --resident`). For workers it
 is selected per `[direct.options] codex_mesh` in the registry (`1` as shipped,
 so the mesh is the normal codex launch path), overridable for one run with
 `UNIT_CODEX_MESH`; `implement.sh` reads it and branches, and `0`, or a
@@ -161,8 +161,7 @@ codex_mesh.py sweep  [--root <dir>] [--stop]
 `revision` and `context_tokens`, and overflow press-on are described in
 `long-lived-workers.md`; the role log and guarded roster writes in `usage-ledger.md`.
 `follow` takes `--cwd`, `--read-only` and `--image` for unit reviewers.
-`prime`, `fork` and `reset` remain for held designs and retained legacy state;
-`review-pool.md` records the earlier allocator. `prime --held-design --held-role` starts a held design role's
+`prime --held-design --held-role` starts a held design role's
 thread for `scripts/astra/design_roles.py`; held roles, their access policy and the
 verbs that refuse them (`start`, `fork`, `reopen`, `set-instructions`, raw `stop`
 and `stop --pause`) are described in `long-lived-workers.md#lasting-roles`.
@@ -312,7 +311,7 @@ A thin dispatcher over the resolver:
 | `config/README.md` | The `## agents.conf` section: three-layer schema, `/agent` as the editor, sync behavior. |
 | `scripts/agents/agents_config.sh` | Resolver + editors + freshness-gated sync trigger; `agents_workers_home` reads the signed-in workers home for the shell launchers. |
 | `scripts/agents/agent_exec.sh` | Family dispatch launcher, dry-run hook. |
-| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:direct` workers the path for `/ask_a_friend`'s codex friend (`start --resident`), and the launcher of each production's pooled reviewers (`prime`/`fork`/`reset`, `docs/as-built/review-pool.md`). One app-server per session, one thread per worker, `send`/`steer`/`end`/`list`/`stop`, `follow`/`can-follow`/`release-follow` (a new turn on a finished worker's thread, for `implement.sh --to` and `review.sh --to`), `compact`, `sweep`, and a capacity backoff that resumes the same thread. |
+| `scripts/agents/codex_mesh.py` | Addressable codex launcher: the default for codex `/unit:direct` workers, including the unit-owned `review` and concurrent `review2`, and the path for `/ask_a_friend`'s codex friend (`start --resident`). One app-server per session, one thread per worker, `send`/`steer`/`end`/`list`/`stop`, `follow`/`can-follow`/`release-follow` (a new turn on a finished worker's thread, for `implement.sh --to` and `review.sh --to`), `compact`, `sweep`, and a capacity backoff that resumes the same thread. |
 | `scripts/agents/agent_admin.sh` | `/agent` backend. |
 | `scripts/agents/sync_codex_catalog.sh` + `.plist` | `[codex.agents]` materialization, staleness warnings. |
 | `scripts/agents/heartbeat.sh`, `heartbeat_watch.sh` | Liveness log helpers used by the worker wrappers (role header block, 60 s beats with an activity digest decoded from the agent log). |

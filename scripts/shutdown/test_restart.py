@@ -28,7 +28,7 @@ import unittest
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from typing import BinaryIO, Literal, TextIO, TypedDict, cast, final, override
+from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
@@ -954,15 +954,13 @@ class RestartTests(ShutdownTestCase):
                 persisted = next(item for item in shutdown_record.session_records(LOGIN) if item["session"]["session_id"] == owner["session_id"])
                 self.assertEqual(persisted["progress"]["kind"], "restarted")
 
-    def test_restarted_unit_keeps_its_adopted_reviewer_and_queue_with_the_pool_archive_unreadable(self) -> None:
+    def test_restarted_unit_keeps_its_reviewer_identity_and_queue(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
         owner = unit("adopted-review-owner")
         run = self.root / "adopted-review-run"
         run.mkdir()
         name = "project-review"
         thread = "adopted-private-thread"
-        archive = self.root / "review-pool"
-        archive.mkdir()
         roster = run / "mesh_roster.json"
         _ = roster.write_text(json.dumps({name: {"thread_id": thread, "role": "review",
                                                "status": "paused", "slot": "review"}}))
@@ -974,17 +972,7 @@ class RestartTests(ShutdownTestCase):
                                                   turn_live=False, launcher_command=[])]
         self.create([saved])
         commands = CommandRecorder()
-        original_open = Path.open
-
-        def refuse_archive(path: Path, mode: str = "r", buffering: int = -1,
-                           encoding: str | None = None, errors: str | None = None,
-                           newline: str | None = None) -> TextIO | BinaryIO:
-            if path.is_relative_to(archive):
-                raise AssertionError(f"restart read the archive: {path}")
-            return cast(TextIO | BinaryIO, original_open(path, mode, buffering, encoding, errors, newline))
-
-        with patch.dict(os.environ, {"REVIEW_POOL_STATE": str(archive)}), \
-                patch.object(Path, "open", refuse_archive), patch.object(restart, "_run", commands):
+        with patch.object(restart, "_run", commands):
             restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         sends = [argv for argv in commands.calls if "resume-workers-" + owner["session_id"] in argv]
         self.assertEqual(len(sends), 1)

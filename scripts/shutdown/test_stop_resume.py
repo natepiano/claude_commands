@@ -20,6 +20,7 @@ from unittest.mock import Mock, call, patch
 from scripts.accounts import accounts
 from scripts.whoami import account
 from scripts.shutdown import stop_resume
+from scripts.shutdown.inventory import PausedSeat
 import herdr
 import pane_record
 import sessions
@@ -113,6 +114,23 @@ class StopResumeTests(unittest.TestCase):
     def alive_until_kill(self, _pid: int, _generation: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
         return (sessions.LiveSessionProcess(123) if call(123, signal.SIGKILL) not in self.kill.call_args_list
                 else sessions.SessionNotLive())
+
+    def test_saved_review_resumes_without_retired_allocation_options(self) -> None:
+        run, cwd = str(self.root / "worker run"), str(self.root / "working tree")
+        task = [run, cwd, "old prompt.md", "review", "check this change", "reviewing", "2"]
+        command = ["bash", str(stop_resume.SCRIPTS / "direct/review.sh"),
+                   "--pool", "code", "--lease", "x/y/7", "--phase", "3p", "--lens", "contract",
+                   "--slot", "review", *task]
+        seat = PausedSeat(run_dir=run, seat="review2", role="review", thread_id="same-thread",
+                          turn_live=True, launcher_command=command)
+        expected = [*command[:2], "--phase", "3p", "--lens", "contract", "--to", "review2",
+                    run, cwd, str(Path(run) / "review2.resume-prompt.md"), *task[3:]]
+        rebuilt = stop_resume.resume_worker_command(seat, cwd)
+        self.assertEqual(shlex.split(rebuilt), expected)
+        self.assertNotIn("--pool", shlex.split(rebuilt))
+        self.assertNotIn("--lease", shlex.split(rebuilt))
+        seat["launcher_command"] = shlex.split(rebuilt)
+        self.assertEqual(stop_resume.resume_worker_command(seat, cwd), rebuilt)
 
     def test_recovery_opens_a_fresh_tab_for_a_missing_pane_then_uses_the_shared_resume(self) -> None:
         self.client.rows.clear()
