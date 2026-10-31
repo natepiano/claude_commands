@@ -2705,16 +2705,30 @@ def server_environment(name: str) -> dict[str, str]:
         raise HerdrFailure(f"{context}: cannot read process environment") from error
 
 
+class _PaneListStatus(Enum):
+    READABLE = "readable"
+    UNREADABLE = "unreadable"
+
+
 class _LivePanePlaces:
     """One server read, with retained shell identities for panes whose ids changed."""
 
     def __init__(self, session: str) -> None:
         self.session: str = session
-        self.panes: dict[str, PaneIdentity] = {pane["pane_id"]: pane for pane in Herdr(session).panes()}
+        self.panes: dict[str, PaneIdentity] = {}
+        self.pane_list_status: _PaneListStatus = _PaneListStatus.UNREADABLE
+        try:
+            self.panes = {pane["pane_id"]: pane for pane in Herdr(session).panes()}
+        except (HerdrFailure, OSError, ValueError):
+            pass
+        else:
+            self.pane_list_status = _PaneListStatus.READABLE
         self.shell_places: dict[int, HerdrPlace] = {}
         self.shells_read: bool = False
 
     def shells(self) -> dict[int, HerdrPlace]:
+        if self.pane_list_status is _PaneListStatus.UNREADABLE:
+            return {}
         if not self.shells_read:
             self.shells_read = True
             for pane in self.panes:
@@ -2732,6 +2746,8 @@ class _LivePanePlaces:
         launch_pane = environment.get("HERDR_PANE_ID", "")
         if not launch_pane or environment.get("TMUX_PANE"):
             return NotInHerdr()
+        if self.pane_list_status is _PaneListStatus.UNREADABLE:
+            return HerdrPlace(self.session, launch_pane)
         if launch_pane in self.panes:
             return HerdrPlace(self.session, self.panes[launch_pane]["pane_id"])
         shells = self.shells()

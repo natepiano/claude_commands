@@ -2899,27 +2899,94 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 
 **Ruled out:** Taking the expected text from the alert's formatter: the literal `resets at 14:20 PDT` stays so the test still catches a formatter defect.
 
-### Phase 101 — The account readout names a turned-off MCP server only where it differs from ~/.claude  · status: todo
+### Phase 101 — The account readout names a turned-off MCP server only where it differs from ~/.claude  · status: done
 
 **Depends on:** Phase 100 (order only; both edit `scripts/accounts/accounts.py`).
 
-#### Work Order
+#### As-built
 
-**Goal:** The accounts readout reports an MCP server difference as one short, exact line per account and server, and only where the account differs from the same project in `~/.claude`. Today `mcpServers differ from ~/.claude` lists `- brp` for claude2 and claude3 with no project count and a step that sends the user to read two whole config files. Showrunner design, approved 2026-10-30.
-
-**Spec:**
-- `_mcp_differences` keeps its per-project comparison: the home scope, then each project path from either file, with a project absent from one file compared against that file's global servers. It returns, per server and direction, the project paths where the account differs (`turned off` = on in `~/.claude`, off in the account; `turned on` = the reverse). A project where both files agree adds nothing.
-- The problem line reads, per account and server: `claude2 turns brp off in 3 projects where ~/.claude does not: <command>` (and `… turns <server> on in N project(s) where ~/.claude does not: <command>`). One project reads `1 project`. The home scope counts as a project named `~` in the count.
-- `<command>` is one read-only command the user can paste that prints those project paths. It runs `accounts.py` and prints the paths the shared comparison already found (`_mcp_differences`), so baseline-only projects and the home scope `~` are included. No `jq` or other second parser of the two files: that would copy the comparison. It changes no file. (Plan review 100b: one file alone cannot give baseline-only paths or `~`.)
-- Each problem line has its own cause identity that includes server and direction. Today `_status_cause_key` (`accounts.py:4417`) gives all MCP differences of one account one identity, and `merge_status_problems` keeps one line per identity, so separate server lines would be lost.
-- When no project differs, there is no MCP line. An unreadable `~/.claude` config keeps its current `mcp_baseline_problems` line.
-- The `--detail` match at `accounts.py:4794` follows the new text.
-- No change to which accounts are read, to the config files, or to the brp setting itself (the user's open question).
+- `_mcp_differences` compares the home scope (`~`) and every project path from either file, sorted; a project absent from one file compares against that file's global servers. It returns `McpServerDifferences(entries: tuple[McpServerDifference, ...])`, each `McpServerDifference(server, direction: McpDirection, projects)`, with `McpDirection = Literal["off", "on"]`. A project where both files agree adds nothing.
+- `_inspect_mcp_configuration(directory) -> McpConfigurationInspection` is the one read of `~/.claude`'s config and the account's `.claude.json` under the linked-folder rule; `_status_for` and `mcp_projects` both call it. `AccountStatus.mcp_differences` replaces `missing_mcp_servers`/`extra_mcp_servers`.
+- The readout prints one line per account, server and direction: `claude2 turns brp off in 3 projects where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off` (`1 project` when one). The line's cause location is `McpServerCause(server, direction)`, so `merge_status_problems` keeps each line. Terminal and JSON `problems` carry the same lines; the `--detail` read-warning match follows the new text.
+- `accounts.py mcp-projects <account> <server> <off|on>` is read-only and prints one project path per line, `~` for the home scope. The printed command puts `--` before its arguments only when one starts with `-`.
+- `docs/accounts.md` describes the MCP line as the one exception to the problem-line form, and the command.
 
 **Files:**
-- `scripts/accounts/accounts.py` — `_mcp_differences`, `McpServerDifferences`, `AccountStatus` MCP fields, the problem text and the `--detail` match.
-- `scripts/accounts/test_accounts.py` — tests.
+- `scripts/accounts/accounts.py` — comparison result, shared inspection, problem lines, cause identity, `--detail` match, `mcp-projects`.
+- `scripts/accounts/test_accounts.py` — acceptance cases and the leading-dash server regression.
+- `docs/accounts.md` — the MCP line and `mcp-projects`.
 
-**Workers:** 1 writer + 1 tester. `impl` owns `scripts/accounts/accounts.py`; `test` owns `scripts/accounts/test_accounts.py`.
+**Gotchas:** Before Phase 101b, the accounts suite failed two `test_cutover_home` tests when run from a real home; Phase 101b fixed that.
 
-**Acceptance gate:** in a scratch `HOME`, a test home whose `.claude.json` turns `brp` off in 3 projects that `~/.claude` leaves on prints exactly `claude2 turns brp off in 3 projects where ~/.claude does not: <command>`, and running `<command>` against that file prints those 3 paths; a home that matches `~/.claude` in every project prints no MCP line; a project present in only one file compares against the other file's global servers. `<command>` also prints a baseline-only project path and `~` when they differ, and prints nothing for a project both files turn off. One account with two servers that differ, and one server that differs in opposite directions, prints one line each, in the terminal readout and in the JSON. `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` passes; `basedpyright` on both files reads `0 errors, 0 warnings, 0 notes`.
+### Phase 101b — The accounts tests pass when run from a real home  · status: done
+
+**Depends on:** Phase 101 (order only; both edit `scripts/accounts/test_accounts.py`).
+
+#### As-built
+
+- `scripts/accounts/home_test_support.scratch_account_home(home, environment, *, clear=True)` is the one fixture that sets a test's `HOME`. It also enters `scripts/production/showrunner_registry_test_support.scratch_showrunner_registry(home)`, because `showrunners.py` computes its registry, sessions and notifier folders from `Path.home()` at import.
+- Nine accounts test files use it in place of their own `HOME` patches: `test_accounts`, `test_cutover_home`, `test_launch_accounts`, `test_moves`, `test_new_account`, `test_next_moves`, `test_refusal_watch`, `test_refusals`, `test_role_map`. No product change, no assertion change.
+- The suite passes from the real home and from a scratch `HOME` (835 tests).
+
+**Files:**
+- `scripts/accounts/home_test_support.py` — the fixture.
+- `scripts/accounts/test_*.py` (nine files above) — callers.
+
+### Phase 101c — A failed CI point names its cause  · status: done
+
+**Depends on:** none (order only).
+
+#### As-built
+
+- `scripts/lib/process_failure.failure_detail(result, *, lines=20)` returns the last `lines` lines of stderr and of stdout, each labelled (`stderr: …`, `stdout: …`), stderr first, an empty stream left out, and `exit <code>` when both are empty.
+- `ci_points.py` uses it in `required`, the validation step and the review watch; `merge_checkpoint.push_validate` uses it for its validate_and_push failure. `report()` joins the lines with `; `, so each step is still one line. A validation failure with no output now reads `exit <code>`, not `validation failed`.
+- 37 other copies of the old pattern remain; Phase 101e moves them.
+
+**Files:**
+- `scripts/lib/process_failure.py`, `scripts/lib/test_process_failure.py` — helper and its tests.
+- `scripts/production/ci_points.py`, `scripts/production/merge_checkpoint.py` — callers.
+- `scripts/production/test_ci_points.py` — memory-wait stderr with the failing check on stdout.
+
+### Phase 101d — A CI point validates one fixed commit  · status: done
+
+#### As-built
+
+- `ci_points.py ci start` records the merge branch tip and validates it in a private `git clone --shared --no-checkout` copy under the state dir, with `CARGO_TARGET_DIR=<copy>/target`. The production checkout is never the validation tree. The copy is removed when the run ends, pass or fail.
+- `validate_and_push.sh --validate-only` runs validation in the copy and makes at most one fix commit there. It does not push.
+- Publish runs under `merge_checkpoint.merge_lock`: it fetches the copy's `HEAD` into the production checkout, does a guarded `git merge --ff-only`, then runs `push_direct.sh --publish-only <sha>`, which prints `<sha> pushed` or `<sha> contained`.
+- The publish rule: if `origin/<merge branch>` contains the sha, the run passes and nothing is pushed. A fix commit is pushed only when it fast-forwards `origin/<merge branch>`. Otherwise the run fails with `merge branch moved during validation`. Nothing is ever force-pushed.
+- After the lock is released, `push_direct.sh --follow-published <sha> <state>` runs the hook, the CI-run lookup and the cancellation of older runs (`CANCEL_PRIOR` env). The validation report line follows the publish receipt. Failures keep `failure_detail`.
+
+**Files:**
+- `scripts/production/ci_points.py` — the fixed sha, the copy, publish under `merge_lock`, the report line.
+- `scripts/validate_and_push/push_direct.sh` — the one publish rule (`--publish-only`), the follow step (`--follow-published`), `cancel_prior_runs`.
+- `scripts/validate_and_push/validate_and_push.sh` — `--validate-only`.
+- `scripts/production/test_ci_points.py` — copy, contained, fast-forward, moved-branch, retry and lock-wait cases.
+
+**Binds later work:** The publish rule and the cancellation of older runs live only in `push_direct.sh`; other callers use them there. A fix commit reaches the local merge branch through the fetch and `--ff-only` merge under `merge_lock`, so the local branch and `origin` stay equal. The outcomes `pushed`, `contained` and `merge branch moved during validation` show in the CI point's validation line.
+
+**Gotchas:**
+- A push of a fix commit from the copy alone leaves the local merge branch stale: collect rejects it, a rerun makes a second fix, and a later merge-gate push is refused. The fix must go through the checkout under the lock.
+- A retry after a failed publish starts with the local branch at fix F; the publish rule fast-forwards `origin` to F.
+- Copy disk use, peak memory and the fresh-target build time are not yet measured. They are measured at the first real CI point and reported to the showrunner.
+
+**Ruled out:** `--ci-base` (removed); validation in the production checkout; a shared cargo target folder with the checkout (a merge gate builds there at the same time); a second copy of the CI-run lookup or `cancel_prior_runs`.
+
+### Phase 101e — One helper reports a failed command's output  · status: todo
+
+**Depends on:** Phase 101c (the helper).
+
+#### Work Order
+
+**Goal:** No caller loses a failure's cause behind stderr noise. `result.stderr.strip() or result.stdout.strip()` appears 41 times in 22 non-test modules. Each copy drops stdout whenever stderr holds any text. Natedev showrunner ruling, 2026-10-30: current, after 101d.
+
+**Spec:**
+- Every non-test copy calls `scripts/lib/process_failure.py`'s helper. Local wrappers such as `waiting.detail` go away or become one call to it.
+- A check keeps new copies out: a test or lint scan of `scripts/` fails on the pattern outside the helper.
+- No caller's other behavior changes.
+
+**Files:** the 22 modules (list them from `grep -rln 'stderr.strip() or' scripts --include=*.py`), the scan test, and any test that asserts the old text.
+
+**Workers:** 2 writers split by folder + 1 tester.
+
+**Acceptance gate:** each touched module's suite passes; basedpyright 0/0/0 on each changed file and its callers; the scan test fails on a planted copy.
