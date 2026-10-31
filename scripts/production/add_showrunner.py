@@ -31,9 +31,10 @@ from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import completion_receipt, staff, staff_sources
 
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 from production_units import Production, read_production
 from production_units import Refusal

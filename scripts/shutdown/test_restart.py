@@ -52,8 +52,6 @@ from fake_herdr import CommandResponse
 import conversation_pause
 import settle
 from scripts.message import send as message_send
-# The module settle imports by its own path entry: a separate object from the package import below.
-import showrunners as settle_showrunners
 import shutdown
 from scripts.whoami import account as account_reader
 from scripts.accounts import accounts, outage_alerts
@@ -301,7 +299,6 @@ def setUpModule() -> None:
     unittest.enterModuleContext(patch.dict(os.environ, {"USER_ZONE": "America/Los_Angeles"}))
     root = Path(unittest.enterModuleContext(tempfile.TemporaryDirectory()))
     _ = unittest.enterModuleContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", root))
-    _ = unittest.enterModuleContext(patch.object(settle_showrunners, "NOTIFIER_STATE_DIR", root))
 
 
 @final
