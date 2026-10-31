@@ -4941,15 +4941,32 @@ class RestartTests(ShutdownTestCase):
         self.assertEqual(restored.get("target"), "claude3")
         self.assertEqual(restored["session"]["session_id"], "only-old-copy")
 
+    def test_live_snapshot_rerun_prints_one_line_without_a_source_or_launch(self) -> None:
+        owner = top_level("snapshot-live", name="Live", host=inventory.HerdrHost(
+            kind="herdr", herdr_session="snapshot-live", pane_id="w1:p1", presentation="detached"))
+        _ = self.recovery([owner])
+        before = shutdown_record.read_snapshot(LOGIN)
+        for live_ids in (frozenset({owner["session_id"]}), EMPTY_SESSION_IDS):
+            for dry_run in (False, True):
+                with (self.subTest(registry=bool(live_ids), dry_run=dry_run),
+                      patch.object(restart, "_live_session_ids", return_value=live_ids),
+                      patch.object(restart, "_owner_liveness", return_value=restart.SessionLive()),
+                      patch.object(restart, "_launch_session") as launch,
+                      redirect_stdout(io.StringIO()) as output):
+                    self.assertEqual(restart.up(LOGIN, dry_run=dry_run, only=(owner["session_id"],)), 0)
+                self.assertEqual(output.getvalue().splitlines(), ["Live: already running; skipped"])
+                launch.assert_not_called()
+                self.assertEqual(shutdown_record.read_snapshot(LOGIN), before)
+
     def test_snapshot_source_uses_the_entry_last_seen_instead_of_the_latest_pass_time(self) -> None:
         snapshot = self.recovery([top_level("old-observation", host=inventory.HerdrHost(kind="herdr", herdr_session="old-observation", pane_id="w1:p1", presentation="detached"))])
         snapshot["taken_at"] = RESTARTED
         shutdown_record.write_snapshot(snapshot)
-        with (patch.object(restart, "_owner_liveness", return_value=restart.SessionLive()),
+        with (patch.object(restart, "_owner_liveness", return_value=restart.SessionNotLive()),
               patch.object(restart, "datetime", RestartAttemptTime),
               patch.object(restart, "user_zone", return_value=timezone.utc),
               redirect_stdout(io.StringIO()) as output):
-            self.assertEqual(restart.up(LOGIN), 0)
+            self.assertEqual(restart.up(LOGIN, dry_run=True), 0)
         self.assertIn("from snapshot taken 2026-10-09 21:49:10 UTC (3h ago)", output.getvalue())
         self.assertNotIn("from snapshot taken 2026-10-10", output.getvalue())
 

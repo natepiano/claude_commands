@@ -40,9 +40,11 @@ SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "herdr"))
 sys.path.insert(0, str(SCRIPTS / "lib"))
 sys.path.insert(0, str(SCRIPTS / "whoami"))
+sys.path.insert(0, str(SCRIPTS / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import herdr  # noqa: E402
+import sessions  # noqa: E402
 from probe_session import PROBE_ENV  # noqa: E402
 
 RECORD_DIR = Path(os.environ.get("HERDR_PANE_RECORD_DIR") or Path.home() / ".local/state/herdr-panes")
@@ -166,23 +168,29 @@ def prepare_down(session: str, pane_id: str, session_id: str) -> None:
             _save(session, entries)
 
 
-def end(session: str, pane_id: str, session_id: str) -> None:
-    """Mark the pane's entry ended when it is still this conversation's."""
+def end(session: str, pane_id: str, session_id: str, *, restart_after_down: bool = False) -> None:
+    """End this conversation, atomically retaining down intent when requested."""
     with _locked(session):
         entries = read_strict(session)
         entry = entries.get(pane_id)
         if entry is None or entry["session_id"] != session_id:
             return
+        if entry.get("ended", False) and (not restart_after_down or entry.get("restart_after_down", False)):
+            return
         entry["ended"] = True
+        if restart_after_down:
+            entry["restart_after_down"] = True
         _save(session, entries)
 
 
 def resumed(session: str, pane_id: str, session_id: str) -> None:
-    """Clear intentional-stop marks only for the conversation confirmed running here."""
+    """Confirm liveness under the record lock before clearing intentional-stop marks."""
     with _locked(session):
         entries = read_strict(session)
         entry = entries.get(pane_id)
         if entry is not None and entry["session_id"] == session_id:
+            if not isinstance(sessions.session_liveness(session_id), sessions.LiveSessionProcess):
+                return
             entry["ended"] = False
             _ = entry.pop("restart_after_down", None)
             entry["written_at"] = datetime.now(timezone.utc).isoformat()

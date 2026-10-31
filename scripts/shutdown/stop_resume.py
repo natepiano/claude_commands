@@ -170,12 +170,11 @@ def down(only: Sequence[str] = ()) -> list[DownResult]:
             if isinstance(live, sessions.SessionLivenessUnknown):
                 return StopFailed(identity, live.reason)
             if isinstance(live, sessions.SessionNotLive):
-                if not entry.get("ended", False):
-                    pane_record.end(client.session, entry["pane_id"], identity)
+                pane_record.end(client.session, entry["pane_id"], identity, restart_after_down=True)
                 return NotRunning(identity)
             result = _stop(identity)
             if isinstance(result, (Stopped, NotRunning)):
-                pane_record.end(client.session, entry["pane_id"], identity)
+                pane_record.end(client.session, entry["pane_id"], identity, restart_after_down=True)
             return result
         except (OSError, ValueError, herdr.HerdrFailure) as error:
             return StopFailed(identity, str(error))

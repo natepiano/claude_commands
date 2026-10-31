@@ -734,7 +734,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                                            sessions=[saved["session"]], unattributed=[])
 
                 def read_peer(arguments: list[str]) -> tuple[int, str]:
-                    if arguments == ["status", LOGIN, "--json", "--here"]:
+                    if arguments == ["status", "--json", "--here"]:
                         return 0, json.dumps(peer)
                     self.assertEqual(arguments, ["records", "--json", "--here"])
                     return 0, json.dumps([saved])
@@ -751,7 +751,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                       redirect_stdout(io.StringIO()) as output):
                     self.assertEqual(shutdown.main(["status", LOGIN]), 0)
                 self.assertEqual([call.args[0] for call in remote_read.call_args_list],
-                                 [["status", LOGIN, "--json", "--here"], ["records", "--json", "--here"]])
+                                 [["status", "--json", "--here"], ["records", "--json", "--here"]])
                 command = restart_support.shutdown_command("forget", "peer-session", "--account", LOGIN)
                 text = output.getvalue()
                 self.assertIn("  alpha: restart prompt not confirmed; session is running — check it, " +
@@ -1463,14 +1463,60 @@ class OnlySessionCliTests(ShutdownTestCase):
                 self.assertEqual(shutdown_store.find_session(LOGIN, "gamma-id"), before[2])
                 self.assertIsNone(shutdown_store.find_session(LOGIN, "beta-id"))
 
+    def test_three_item_selection_reads_each_account_listing_and_process_scan_once(self) -> None:
+        from scripts.production import fake_unit_host
+
+        other_login = "other@example.com"
+        selected = (Account("claude", LOGIN, LABEL), Account("claude", other_login, "claude3"))
+        for owner in self.owners:
+            saved = session_shutdown(shutdown_store.SessionStopped(kind="stopped", at=OCTOBER), owner["session_id"])
+            saved["session"] = owner
+            if owner["session_id"] == "gamma-id":
+                saved["login"], saved["label"] = other_login, "claude3"
+            self.assertTrue(shutdown_store.create_session(saved))
+        host = fake_unit_host.environment(self.root)
+        fake_unit_host.write(host, [])
+        peer_reports = {tuple([verb, "--json", "--here"]): (0, "[]") for verb in ("records", "holds")}
+        peer_reports[("status", "--json", "--here")] = (0, json.dumps([
+            inventory.Inventory(machine="Mac", login=account.login, label=account.label, sessions=[], unattributed=[])
+            for account in selected]))
+        def read_peer(arguments: list[str]) -> tuple[int, str]:
+            return peer_reports[tuple(arguments)]
+
+        for here in (True, False):
+            with (self.subTest(here=here),
+                  patch.dict(os.environ, {**host, "CLAUDE_CODE_SESSION_ID": ""}),
+                  patch.object(shutdown, "listing", wraps=inventory.listing) as membership,
+                  patch.object(shutdown, "all_session_records", wraps=shutdown_store.all_session_records) as records,
+                  patch.object(restart_work, "restart_launches", wraps=restart_work.restart_launches) as launches,
+                  patch.object(shutdown_store, "all_snapshots", wraps=shutdown_store.all_snapshots) as snapshots,
+                  patch.object(inventory, "showrunner_registrations", return_value=inventory.ShowrunnerRegistrations(())),
+                  patch.object(herdr, "_scan_herdr_processes", return_value=[]) as scan,
+                  patch.object(shutdown, "inventory", side_effect=AssertionError("selection inspected full inventory")),
+                  patch.object(shutdown, "run_remote", side_effect=read_peer) as peer,
+                  patch.object(restart_work, "restart", return_value=0) as restore,
+                  redirect_stdout(io.StringIO())):
+                self.assertEqual(shutdown.main(["restart", "--only", "Alpha,Beta,Gamma", "--dry-run",
+                                                *(["--here"] if here else [])]), 0)
+            self.assertCountEqual([call.args[0] for call in membership.call_args_list], [LOGIN, other_login])
+            scan.assert_called_once()
+            records.assert_called_once()
+            launches.assert_called_once()
+            snapshots.assert_called_once()
+            self.assertCountEqual([call.args[0] for call in peer.call_args_list],
+                [] if here else [[verb, "--json", "--here"] for verb in ("records", "holds", "status")])
+            self.assertEqual(restore.call_count, len(selected))
+            self.assertEqual(restore.call_args_list[0].kwargs["only"], ["alpha-id", "beta-id"])
+            self.assertEqual(restore.call_args_list[1].kwargs["only"], ["gamma-id"])
+
     def test_terminal_only_routes_selection_to_its_account_for_down_restart_and_status(self) -> None:
         selected = [Account('claude', LOGIN, LABEL), Account('claude', 'other@example.com', 'claude3')]
         real_resolve = shutdown.resolve_sessions
 
-        def resolve(login: str, items: Iterable[str], *, here: bool=False, recovery: bool=False) -> shutdown.ResolvedSessions:
+        def resolve(index: shutdown.SelectionIndex, login: str, items: Iterable[str], *, here: bool=False, recovery: bool=False) -> shutdown.ResolvedSessions:
             if login != LOGIN:
                 raise shutdown.SessionNotFound('Beta: matches no session')
-            return real_resolve(login, items, here=here, recovery=recovery)
+            return real_resolve(index, login, items, here=here, recovery=recovery)
         for verb in ('restart', 'status'):
             with self.subTest(verb=verb), patch.dict(os.environ, {'CLAUDE_CODE_SESSION_ID': ''}), patch.object(shutdown, '_terminal_accounts', return_value=shutdown.TerminalAccountSelection(tuple(selected))), patch.object(shutdown, 'resolve_sessions', side_effect=resolve), patch.object(restart_work, 'restart', return_value=0) as resume, patch.object(shutdown, 'run_remote', side_effect=AssertionError('--here read peer')), redirect_stdout(io.StringIO()) as output:
                 args = [verb, '--only', 'Beta', '--here']
@@ -1494,8 +1540,9 @@ class OnlySessionCliTests(ShutdownTestCase):
     def test_selected_status_filters_peer_sessions_without_requiring_a_peer_match(self) -> None:
         peer = inventory.Inventory(machine="Mac", login=LOGIN, label=LABEL, sessions=self.owners, unattributed=[])
         with patch.object(shutdown, "run_remote", return_value=(0, json.dumps(peer))) as remote:
-            reports = shutdown._status(Account("claude", LOGIN, LABEL), False, ("beta-id",))  # pyright: ignore[reportPrivateUsage]
-        self.assertEqual(remote.call_args.args[0], ["status", LOGIN, "--json", "--here"])
+            index = shutdown.build_selection_index(shutdown.CommandLine(command="status", here=True), (Account("claude", LOGIN, LABEL),))
+            reports = shutdown._status(Account("claude", LOGIN, LABEL), False, index, ("beta-id",))  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(remote.call_args.args[0], ["status", "--json", "--here"])
         self.assertEqual(len(reports), 2)
         self.assertIn("sessions", reports[1])
         peer_report = cast(inventory.Inventory, reports[1])
@@ -1507,6 +1554,9 @@ class OnlySessionCliTests(ShutdownTestCase):
 
     def test_restart_list_skips_live_and_keeps_going_after_unknown_name(self) -> None:
         from test_restart import SUBMITTED_PROMPT
+
+        def liveness(pid: int, _start: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+            return sessions.LiveSessionProcess(99) if pid == 99 else sessions.SessionNotLive()
 
         for all_accounts in (False, True):
             with self.subTest(all_accounts=all_accounts):
@@ -1520,6 +1570,7 @@ class OnlySessionCliTests(ShutdownTestCase):
                 args = ["restart", *([] if all_accounts else [LABEL]), "--only", "Running,Unknown,Alpha,Beta", "--here", "--no-alert"]
                 with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
                       patch.object(sessions, "live_sessions", return_value=[live]),
+                      patch.object(sessions, "process_liveness", side_effect=liveness),
                       patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection((Account("claude", LOGIN, LABEL),))),
                       patch.object(restart_work, "_launch_session", return_value=restart_work.SessionLaunched(SUBMITTED_PROMPT)) as launch,
                       patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
@@ -1536,10 +1587,11 @@ class OnlySessionCliTests(ShutdownTestCase):
             with self.subTest(all_accounts=all_accounts):
                 owner = self.owners[0]
                 live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
-                    messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+                    procStart=owner["proc_start"], messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
                 args = ["restart", *([] if all_accounts else [LABEL]), "--only", owner["name"], "--here"]
                 with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
                       patch.object(sessions, "live_sessions", return_value=[live]),
+                      patch.object(sessions, "process_liveness", return_value=sessions.LiveSessionProcess(owner["pid"])),
                       patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection((Account("claude", LOGIN, LABEL),))),
                       patch.object(restart_work, "_launch_session", side_effect=AssertionError("live session relaunched")),
                       patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()),
@@ -1547,6 +1599,55 @@ class OnlySessionCliTests(ShutdownTestCase):
                     code = shutdown.main(args)
                 self.assertEqual((code, error.getvalue()), (0, ""))
                 self.assertEqual(output.getvalue(), f"{owner['name']}: already running; skipped\n")
+
+    def test_restart_item_reads_registry_once_and_rechecks_the_matched_process(self) -> None:
+        owner = self.owners[0]
+        live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+            procStart=owner["proc_start"], messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        index = shutdown.SelectionIndex("natedev", [], [], [], shutdown.TerminalAccountSelection(()))
+        for item in (owner["session_id"], owner["name"]):
+            with (self.subTest(item=item),
+                  patch.object(sessions, "read_registry", return_value=sessions.RegistryRead(
+                      (sessions.RegistryObservation(live, {}),), ())) as registry,
+                  patch.object(os, "kill"),
+                  patch.object(sessions, "process_start", return_value=owner["proc_start"]),
+                  patch.object(sessions, "messaging_socket_exists", return_value=True),
+                  patch.object(sessions, "process_liveness", wraps=sessions.process_liveness) as process,
+                  redirect_stdout(io.StringIO()) as output):
+                self.assertTrue(shutdown._restart_item_running(index, item))  # pyright: ignore[reportPrivateUsage]
+            registry.assert_called_once()
+            process.assert_called_once_with(owner["pid"], owner["proc_start"])
+            self.assertEqual(output.getvalue(), f"{owner['name']}: already running; skipped\n")
+
+    def test_restart_dispatches_a_session_that_dies_after_selection_index_build(self) -> None:
+        owner = self.owners[0]
+        shutdown_store.write_snapshot(shutdown_store.RecoverySnapshot(machine="natedev", login=LOGIN, label=LABEL,
+            taken_at=OCTOBER, sessions=[shutdown_store.SnapshotClaudeSession(agent="claude", session=owner,
+                workers=[], timers=[], last_seen=OCTOBER, state="unresolved", crash="host gone")]))
+        live = sessions.SessionRecord(pid=owner["pid"], sessionId=owner["session_id"], name=owner["name"],
+            procStart=owner["proc_start"], messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
+        original_build = shutdown.build_selection_index
+        for all_accounts in (False, True):
+            with self.subTest(all_accounts=all_accounts):
+                def build_then_crash(options: shutdown.CommandLine,
+                                     accounts: tuple[Account, ...] = ()) -> shutdown.SelectionIndex:
+                    self.assertIsInstance(sessions.process_liveness(owner["pid"], owner["proc_start"]), sessions.LiveSessionProcess)
+                    index = original_build(options, accounts)
+                    liveness.return_value = sessions.SessionNotLive()
+                    return index
+
+                with (patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+                      patch.object(sessions, "live_sessions", return_value=[live]),
+                      patch.object(sessions, "process_liveness", return_value=sessions.LiveSessionProcess(owner["pid"])) as liveness,
+                      patch.object(shutdown, "build_selection_index", side_effect=build_then_crash),
+                      patch.object(shutdown, "_terminal_accounts", return_value=shutdown.TerminalAccountSelection((Account("claude", LOGIN, LABEL),))),
+                      patch.object(restart_work, "restart", return_value=0) as restore,
+                      redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
+                    self.assertEqual(shutdown.main(["restart", *([] if all_accounts else [LABEL]),
+                                                    "--only", owner["name"], "--here"]), 0)
+                restore.assert_called_once()
+                self.assertEqual(restore.call_args.kwargs["only"], [owner["session_id"]])
+                self.assertEqual((output.getvalue(), error.getvalue()), ("", ""))
 
     def test_restart_stopped_record_wins_over_a_different_live_session_with_the_same_name(self) -> None:
         from test_restart import SUBMITTED_PROMPT
@@ -1635,13 +1736,15 @@ class OnlySessionCliTests(ShutdownTestCase):
     def test_resolve_sessions_here_deduplicates_record_and_inventory_without_peer(self) -> None:
         _ = self.save_three({"kind": "waiting"})
         with patch.object(shutdown, "run_remote") as peer:
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Beta", "beta-id", "Beta"], here=True).session_ids, ("beta-id",))
+            self.assertEqual(shutdown.resolve_sessions(shutdown.build_selection_index(
+                shutdown.CommandLine(command="status", only="selected", here=True), (Account("claude", LOGIN, LABEL),)), LOGIN, ["Beta", "beta-id", "Beta"], here=True).session_ids, ("beta-id",))
         peer.assert_not_called()
 
     def test_resolve_local_id_does_not_wait_for_the_peer(self) -> None:
         _ = self.save_three({"kind": "waiting"})
         with patch.object(shutdown, "run_remote") as peer:
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["beta-id"]).session_ids, ("beta-id",))
+            self.assertEqual(shutdown.resolve_sessions(shutdown.build_selection_index(
+                shutdown.CommandLine(command="status", only="selected", here=True), (Account("claude", LOGIN, LABEL),)), LOGIN, ["beta-id"]).session_ids, ("beta-id",))
         peer.assert_not_called()
 
     def test_resolve_peer_name_counts_its_record_and_inventory_once(self) -> None:
@@ -1653,16 +1756,18 @@ class OnlySessionCliTests(ShutdownTestCase):
         def peer(arguments: list[str]) -> tuple[int, str]:
             if arguments == ["records", "--json", "--here"]:
                 return 0, json.dumps([remote_record])
-            self.assertEqual(arguments, ["status", LOGIN, "--json", "--here"])
-            return 0, json.dumps(remote_inventory)
+            self.assertEqual(arguments, ["status", "--json", "--here"])
+            return 0, json.dumps([remote_inventory])
         with patch.object(shutdown, "run_remote", side_effect=peer), patch.object(shutdown, "other_machine", return_value="Mac"):
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Remote"]).session_ids, ("remote-id",))
+            self.assertEqual(shutdown.resolve_sessions(shutdown.build_selection_index(
+                shutdown.CommandLine(command="status", only="selected", here=True), (Account("claude", LOGIN, LABEL),)), LOGIN, ["Remote"]).session_ids, ("remote-id",))
 
     def test_resolve_name_with_unreachable_peer_uses_local_and_warns(self) -> None:
         _ = self.save_three({"kind": "waiting"})
         error = io.StringIO()
         with patch.object(shutdown, "run_remote", return_value=(255, "")), patch.object(shutdown, "other_machine", return_value="Mac"), redirect_stderr(error):
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["Beta"]).session_ids, ("beta-id",))
+            self.assertEqual(shutdown.resolve_sessions(shutdown.build_selection_index(
+                shutdown.CommandLine(command="status", only="selected", here=True), (Account("claude", LOGIN, LABEL),)), LOGIN, ["Beta"]).session_ids, ("beta-id",))
         self.assertIn("Mac: not reached; names checked on natedev only\n", error.getvalue())
 
     def test_only_missing_name_with_unreachable_peer_exits_two_and_names_peer(self) -> None:
@@ -1811,7 +1916,8 @@ class OnlySessionCliTests(ShutdownTestCase):
             return (0, json.dumps([saved])) if arguments[0] == "records" else (255, "")
         error = io.StringIO()
         with patch.object(shutdown, "run_remote", side_effect=peer), patch.object(shutdown, "other_machine", return_value="Mac"), redirect_stderr(error):
-            self.assertEqual(shutdown.resolve_sessions(LOGIN, ["remote-id"]).session_ids, ("remote-id",))
+            self.assertEqual(shutdown.resolve_sessions(shutdown.build_selection_index(
+                shutdown.CommandLine(command="status", only="selected", here=True), (Account("claude", LOGIN, LABEL),)), LOGIN, ["remote-id"]).session_ids, ("remote-id",))
         self.assertEqual(error.getvalue(), "Mac: not reached; names checked on natedev only\n")
 
 

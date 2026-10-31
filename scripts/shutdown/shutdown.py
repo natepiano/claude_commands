@@ -9,7 +9,7 @@ import os
 import json
 import sys
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -43,11 +43,13 @@ import shutdown_record as recovery_store
 from launch_permission import RELEASED_HOLD_PREFIX, LaunchPurpose, NewWorkLaunchPurpose, RecordedSessionRestoreLaunchPurpose
 from shutdown_record import InvalidRecord, SessionShutdown, ShutdownContinuation, AccountOpen, HoldReleased, RequestOrigin, ShutdownFound, lookup_session, release_finished_account_hold, all_account_holds, all_session_records, parse_account_holds, parse_session_records, session_records
 import remote
-from remote import other_machine, run_remote
+from remote import other_machine, run_remote as run_remote
 import restart_support
 import inventory as stop_work
 import restart as restart_work
 import herdr
+import pane_record
+import sessions
 from scripts.shutdown import stop_resume
 import remote_control
 from scripts.whoami import note_file
@@ -241,15 +243,14 @@ def _unavailable(machine: str, rc: int, reason: str) -> UnavailableMachine:
     }
 
 
-def _status(selected: Account, here: bool, only: tuple[str, ...] = ()) -> list[MachineStatusReport]:
+def _status(selected: Account, here: bool, index: SelectionIndex, only: tuple[str, ...] = ()) -> list[MachineStatusReport]:
     local = inventory(selected.login, only=frozenset(only)) if only else inventory(selected.login)
     unresolved = _unresolved_snapshot_status(selected.login, only)
     local = RecoveryStatusInventory(**local, recovery=unresolved, snapshot=_snapshot_status())
     reports: list[MachineStatusReport] = [local]
     if here:
         return reports
-    arguments = ["status", selected.login, "--json", "--here"]
-    status, output = run_remote(arguments)
+    status, output = index.read_peer(["status", "--json", "--here"])
     machine = other_machine()
     if status == 255:
         reports.append({"machine": machine, "unreachable": True})
@@ -258,7 +259,7 @@ def _status(selected: Account, here: bool, only: tuple[str, ...] = ()) -> list[M
         reports.append(_unavailable(machine, status, output))
         return reports
     try:
-        remote = parse_inventory(output)
+        remote = _peer_inventory(output, selected.login)
     except InvalidInventory as error:
         reports.append(_unavailable(machine, status, str(error)))
         return reports
@@ -358,9 +359,9 @@ def _local_shutdown_records(
         return {"kind": "unreadable", "machine": machine, "reason": str(error)}
 
 
-def _remote_shutdown_records(login: str) -> RemoteShutdownRecordOutcome:
+def _remote_shutdown_records(login: str, index: SelectionIndex) -> RemoteShutdownRecordOutcome:
     machine = other_machine()
-    status, output = run_remote(["records", "--json", "--here"])
+    status, output = index.read_peer(["records", "--json", "--here"])
     if status == 255:
         return {"kind": "unreachable", "machine": machine}
     if status != 0:
@@ -415,7 +416,6 @@ def _observed_owner(record: SessionShutdown, observations: tuple[Inventory, ...]
     return stop_work.SessionAbsent(kind="session absent")
 
 
-
 @dataclass(frozen=True)
 class _SelectableSession:
     session_id: str
@@ -427,7 +427,6 @@ class _SelectableSession:
 @dataclass(frozen=True)
 class ResolvedSessions:
     session_ids: tuple[str, ...]
-    report: Inventory
 
 
 class SessionSelectionError(ValueError):
@@ -438,60 +437,158 @@ class SessionNotFound(SessionSelectionError):
     """No session of this account matches the requested id or name."""
 
 
-def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False, recovery: bool = False) -> ResolvedSessions:
-    """Resolve names from membership, then build one filtered inventory."""
+def _peer_inventory(output: str, login: str) -> Inventory:
+    try:
+        decoded = cast(object, json.loads(output))
+    except ValueError as error:
+        raise InvalidInventory(str(error)) from error
+    reports = ([parse_inventory(json.dumps(item)) for item in cast(list[object], decoded)]
+               if isinstance(decoded, list) else [parse_inventory(output)])
+    matching = [report for report in reports if report["login"].casefold() == login.casefold()]
+    if len(matching) != 1:
+        raise InvalidInventory("peer inventory is for another account")
+    return matching[0]
+
+
+SessionCandidates = dict[str, _SelectableSession]
+
+
+@dataclass(frozen=True)
+class AccountSessionIndex:
+    local: SessionCandidates
+    recorded: SessionCandidates
+
+
+@dataclass(frozen=True)
+class PeerSessionIndex:
+    candidates: SessionCandidates
+    recorded: SessionCandidates
+    unavailable: bool
+
+
+@dataclass
+class SelectionIndex:
+    """One command's membership evidence; never used for launch authorization."""
+
+    machine: str
+    records: list[SessionShutdown]
+    launches: list[pane_record.PaneLaunch]
+    snapshots: list[recovery_store.RecoverySnapshot]
+    scope: TerminalAccountSelection
+    accounts: dict[str, AccountSessionIndex] = field(default_factory=dict)
+    peer_reads: dict[tuple[str, ...], tuple[int, str]] = field(default_factory=dict)
+    peer_candidates: dict[str, PeerSessionIndex] = field(default_factory=dict)
+
+    def account_records(self, login: str) -> list[SessionShutdown]:
+        return [saved for saved in self.records if saved["login"].casefold() == login.casefold()]
+
+    def read_peer(self, arguments: list[str]) -> tuple[int, str]:
+        key = tuple(arguments)
+        if key not in self.peer_reads:
+            self.peer_reads[key] = run_remote(arguments)
+        return self.peer_reads[key]
+
+    def account(self, login: str, recovery: bool) -> AccountSessionIndex:
+        key = login.casefold()
+        if key not in self.accounts:
+            local: dict[str, _SelectableSession] = {}
+            for saved in self.account_records(login):
+                owner = saved["session"]
+                local[owner["session_id"]] = _SelectableSession(owner["session_id"], owner["name"], saved["machine"])
+            if recovery:
+                for entry in self.launches:
+                    account = restart_work.launch_account(entry)
+                    if isinstance(account, restart_work.FailedSessionRestart) or account.login.casefold() != login.casefold():
+                        continue
+                    local[entry["session_id"]] = _SelectableSession(entry["session_id"], entry["name"], self.machine)
+                for snapshot in self.snapshots:
+                    if snapshot["login"].casefold() != login.casefold():
+                        continue
+                    for item in snapshot["sessions"]:
+                        owner = item["session"]
+                        host = owner["host"]
+                        aliases = (host["herdr_session"],) if host["kind"] == "herdr" else ()
+                        _ = local.setdefault(owner["session_id"], _SelectableSession(
+                            owner["session_id"], owner["name"], snapshot["machine"], aliases))
+            recorded = dict(local)
+            for owner in listing(login):
+                if owner.kind != "worker":
+                    local[owner.session_id] = _SelectableSession(owner.session_id, owner.name, self.machine)
+            self.accounts[key] = AccountSessionIndex(local, recorded)
+        return self.accounts[key]
+
+    def peer(self, login: str) -> PeerSessionIndex:
+        key = login.casefold()
+        if key not in self.peer_candidates:
+            recorded: dict[str, _SelectableSession] = {}
+            candidates: dict[str, _SelectableSession] = {}
+            peer = _remote_shutdown_records(login, self)
+            unavailable = peer["kind"] != "records"
+            if peer["kind"] == "records":
+                for saved in peer["records"]:
+                    owner = saved["session"]
+                    candidate = _SelectableSession(owner["session_id"], owner["name"], saved["machine"])
+                    recorded[owner["session_id"]] = candidate
+                    candidates[owner["session_id"]] = candidate
+                status, output = self.read_peer(["status", "--json", "--here"])
+                if status != 0:
+                    unavailable = True
+                else:
+                    try:
+                        report = _peer_inventory(output, login)
+                    except (InvalidInventory, ValueError):
+                        unavailable = True
+                    else:
+                        for owner in report["sessions"]:
+                            if owner["kind"] != "worker":
+                                _ = candidates.setdefault(owner["session_id"], _SelectableSession(
+                                    owner["session_id"], owner["name"], report["machine"]))
+            if unavailable:
+                print(f"{other_machine()}: not reached; names checked on {self.machine} only", file=sys.stderr)
+            self.peer_candidates[key] = PeerSessionIndex(candidates, recorded, unavailable)
+        return self.peer_candidates[key]
+
+
+def build_selection_index(options: CommandLine, accounts: tuple[Account, ...] = ()) -> SelectionIndex:
+    """Read only this command's sources, sharing one herdr process observation."""
+    with herdr.process_snapshot():
+        recovery = options.command == "restart"
+        records: list[SessionShutdown] = []
+        if recovery or options.only is not None:
+            if recovery or not accounts:
+                records = all_session_records()
+            else:
+                records = [saved for account in accounts for saved in session_records(account.login)]
+        launches = restart_work.restart_launches() if recovery else []
+        snapshots = recovery_store.all_snapshots() if recovery or not accounts else []
+        peer_reads: dict[tuple[str, ...], tuple[int, str]] = {}
+        scope = (TerminalAccountSelection(accounts) if accounts else
+                 _terminal_accounts(options, records, launches, snapshots, peer_reads))
+        index = SelectionIndex(remote.local_machine(), records, launches, snapshots, scope,
+                               peer_reads=peer_reads)
+        if options.only is not None:
+            for account in scope.accounts:
+                _ = index.account(account.login, recovery)
+        return index
+
+
+def resolve_sessions(index: SelectionIndex, login: str, items: Iterable[str], *,
+                     here: bool = False, recovery: bool = False) -> ResolvedSessions:
+    """Match requested names against the explicitly shared command index."""
     requested = list(dict.fromkeys(items))
     if not requested or any(not item for item in requested):
         raise SessionSelectionError("--only needs a session id or exact name")
-    local_machine = remote.local_machine()
-    local: dict[str, _SelectableSession] = {}
-    for saved in session_records(login):
-        owner = saved["session"]
-        local[owner["session_id"]] = _SelectableSession(owner["session_id"], owner["name"], saved["machine"])
-    if recovery:
-        for entry in restart_work.restart_launches(login, all_accounts=False):
-            local[entry["session_id"]] = _SelectableSession(entry["session_id"], entry["name"], local_machine)
-        snapshot = recovery_store.read_snapshot(login)
-        if not isinstance(snapshot, recovery_store.NoRecoverySnapshot):
-            for item in snapshot["sessions"]:
-                owner = item["session"]
-                host = owner["host"]
-                aliases = (host["herdr_session"],) if host["kind"] == "herdr" else ()
-                _ = local.setdefault(owner["session_id"], _SelectableSession(
-                    owner["session_id"], owner["name"], snapshot["machine"], aliases))
-    recorded = dict(local)
-    for owner in listing(login):
-        if owner.kind != "worker":
-            local[owner.session_id] = _SelectableSession(owner.session_id, owner.name, local_machine)
-    candidates = dict(local)
+    account = index.account(login, recovery)
+    local = account.local
+    recorded, candidates = dict(account.recorded), dict(local)
     peer_unavailable = False
-    needs_peer = not here and any(item not in local for item in requested)
-    if needs_peer:
-        peer = _remote_shutdown_records(login)
-        if peer["kind"] != "records":
-            peer_unavailable = True
-        else:
-            for saved in peer["records"]:
-                owner = saved["session"]
-                candidate = _SelectableSession(owner["session_id"], owner["name"], saved["machine"])
-                _ = recorded.setdefault(owner["session_id"], candidate)
-                _ = candidates.setdefault(owner["session_id"], candidate)
-            status, output = run_remote(["status", login, "--json", "--here"])
-            if status != 0:
-                peer_unavailable = True
-            else:
-                try:
-                    report = parse_inventory(output)
-                    if report["login"].casefold() != login.casefold():
-                        raise InvalidInventory("peer inventory is for another account")
-                except InvalidInventory:
-                    peer_unavailable = True
-                else:
-                    for owner in report["sessions"]:
-                        if owner["kind"] != "worker":
-                            _ = candidates.setdefault(owner["session_id"], _SelectableSession(owner["session_id"], owner["name"], report["machine"]))
-        if peer_unavailable:
-            print(f"{other_machine()}: not reached; names checked on {local_machine} only", file=sys.stderr)
+    if not here and any(item not in local for item in requested):
+        peer = index.peer(login)
+        peer_unavailable = peer.unavailable
+        for identity, session in peer.recorded.items():
+            _ = recorded.setdefault(identity, session)
+        for identity, session in peer.candidates.items():
+            _ = candidates.setdefault(identity, session)
     result: list[str] = []
     for item in requested:
         saved_matches = ([recorded[item]] if item in recorded else
@@ -514,9 +611,7 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False, re
             raise error_type("\n".join(lines))
         if matches[0].session_id not in result:
             result.append(matches[0].session_id)
-    report = (Inventory(machine=local_machine, login=login, label=login, sessions=[], unattributed=[])
-              if login.startswith("codex-") else inventory(login, only=frozenset(result)))
-    return ResolvedSessions(tuple(result), report)
+    return ResolvedSessions(tuple(result))
 
 
 def _snapshot() -> int:
@@ -652,8 +747,6 @@ def _unresolved_snapshot_status(login: str, only: tuple[str, ...] = ()) -> list[
             and (not only or item["session"]["session_id"] in only)]
 
 
-
-
 def _restart_failed_liveness(saved: SessionShutdown, observations: tuple[Inventory, ...] = ()) -> restart_work.SessionLive | restart_work.SessionNotLive | restart_work.SessionLivenessUnknown:
     if saved["machine"].casefold() == remote.local_machine().casefold():
         return restart_work.restart_failed_liveness(saved)
@@ -685,7 +778,6 @@ def _status_actions(records: list[SessionShutdown],
         names = ", ".join(saved["session"]["name"] for saved in selected)
         lines.append(f"  bring back: in a terminal on {selected[0]['machine']}: {command} · {names}")
     return lines
-
 
 
 def _only_ids(value: str | None) -> tuple[str, ...]:
@@ -822,28 +914,36 @@ class TerminalAccountSelection:
     unavailable: tuple[str, ...] = ()
 
 
-def _terminal_accounts(options: CommandLine) -> TerminalAccountSelection:
+def _terminal_accounts(
+    options: CommandLine,
+    records: list[SessionShutdown],
+    launches: list[pane_record.PaneLaunch],
+    snapshots: list[recovery_store.RecoverySnapshot],
+    peer_reads: dict[tuple[str, ...], tuple[int, str]],
+) -> TerminalAccountSelection:
     """Terminal restarts cover records and holds; other verbs cover configured logins."""
     selected: dict[str, Account] = {}
     unavailable: list[str] = []
     if options.command == "restart":
         candidates = {saved["login"].casefold(): Account("claude", saved["login"], saved["label"])
-                      for saved in all_session_records()}
+                      for saved in records}
         candidates.update({held["login"].casefold(): Account("claude", held["login"], held["label"])
                            for held in all_account_holds()})
-        for entry in restart_work.restart_launches():
+        for entry in launches:
             selected_account = restart_work.launch_account(entry)
             if isinstance(selected_account, restart_work.FailedSessionRestart):
                 unavailable.append(f"{selected_account.name}: restart failed: {selected_account.reason}")
                 continue
             candidates[selected_account.login.casefold()] = selected_account
-        for snapshot in recovery_store.all_snapshots():
+        for snapshot in snapshots:
             if snapshot["sessions"]:
                 tool = "codex" if all(item["agent"] == "codex" for item in snapshot["sessions"]) else "claude"
                 _ = candidates.setdefault(snapshot["login"].casefold(), Account(tool, snapshot["login"], snapshot["label"]))
         if not options.here:
             for command in ("records", "holds"):
-                status, output = run_remote([command, "--json", "--here"])
+                arguments = (command, "--json", "--here")
+                status, output = run_remote(list(arguments))
+                peer_reads[arguments] = (status, output)
                 if status != 0:
                     unavailable.append(f"{other_machine()}: shutdown {command} not reached (rc {status})")
                     continue
@@ -863,7 +963,7 @@ def _terminal_accounts(options: CommandLine) -> TerminalAccountSelection:
             if note.tool == "claude" and login:
                 selected[login.casefold()] = Account("claude", login, note.label)
         if options.command == "status":
-            for snapshot in recovery_store.all_snapshots():
+            for snapshot in snapshots:
                 if snapshot["sessions"]:
                     tool = "codex" if all(item["agent"] == "codex" for item in snapshot["sessions"]) else "claude"
                     _ = selected.setdefault(snapshot["login"].casefold(), Account(tool, snapshot["login"], snapshot["label"]))
@@ -871,42 +971,42 @@ def _terminal_accounts(options: CommandLine) -> TerminalAccountSelection:
                                     tuple(unavailable))
 
 
-def _restart_item_running(item: str) -> bool:
+def _restart_item_running(index: SelectionIndex, item: str) -> bool:
     """Skip a live session only when no retained restart source needs dispatch."""
-    import sessions
-
     matches = [owner for owner in sessions.live_sessions()
                if item == owner["sessionId"] or item == owner["name"] or item in owner.get("formerNames", [])]
     if len(matches) != 1:
         return False
     identity = matches[0]["sessionId"]
-    if restart_work.restart_launches(ids=(identity,)):
+    if any(entry["session_id"] == identity for entry in index.launches):
         return False
-    if any(saved["session"]["session_id"] == identity for saved in all_session_records()):
+    if any(saved["session"]["session_id"] == identity for saved in index.records):
+        return False
+    if not isinstance(sessions.process_liveness(matches[0]["pid"], matches[0].get("procStart", "")), sessions.LiveSessionProcess):
         return False
     print(f"{matches[0]['name']}: already running; skipped")
     return True
 
 
-def _all_accounts(options: CommandLine) -> int:
+def _all_accounts(options: CommandLine, index: SelectionIndex) -> int:
     selection_failed = False
     try:
-        scope = _terminal_accounts(options)
+        scope = index.scope
         selected = scope.accounts
         for problem in scope.unavailable:
             print(f"shutdown: {problem}; to retry there, in a terminal on {other_machine()}: agents restart --here", file=sys.stderr)
         ids_by_login: dict[str, list[str]] = {account.login: [] for account in selected}
-        choices = restart_work.restore_account_choices() if options.command == "restart" else {}
+        choices = restart_work.choose_restore_accounts(index.records, index.snapshots) if options.command == "restart" else {}
         if options.only is not None:
             for item in _only_ids(options.only):
                 try:
                     matches: list[tuple[Account, tuple[str, ...]]] = []
                     recorded_accounts = [account for account in selected if any(
                         item in {saved["session"]["session_id"], saved["session"]["name"]}
-                        for saved in session_records(account.login))] if options.command == "restart" else []
+                        for saved in index.account_records(account.login))] if options.command == "restart" else []
                     for account in recorded_accounts or selected:
                         try:
-                            resolved = resolve_sessions(account.login, (item,), here=options.here or account.tool == "codex",
+                            resolved = resolve_sessions(index, account.login, (item,), here=options.here or account.tool == "codex",
                                                         recovery=options.command == "restart")
                         except SessionNotFound:
                             continue
@@ -920,13 +1020,13 @@ def _all_accounts(options: CommandLine) -> int:
                         if isinstance(decision, restart_work.RestoreAccountChosen):
                             matches = [(account, found) for account, found in matches
                                        if account.login.casefold() == decision.source_login]
-                    if not matches and options.command == "restart" and _restart_item_running(item):
+                    if not matches and options.command == "restart" and _restart_item_running(index, item):
                         continue
                     if len(matches) != 1:
                         candidates = ", ".join(account.label for account, _ids in matches)
                         raise SessionSelectionError(f"{item}: matches {'more than one account: ' + candidates if matches else 'no session'}")
                     account, ids = matches[0]
-                    if options.command == "restart" and len(ids) == 1 and _restart_item_running(ids[0]):
+                    if options.command == "restart" and len(ids) == 1 and _restart_item_running(index, ids[0]):
                         continue
                     ids_by_login[account.login].extend(ids)
                 except SessionSelectionError as error:
@@ -960,7 +1060,7 @@ def _all_accounts(options: CommandLine) -> int:
             continue
         if options.command == "status" and options.as_json:
             try:
-                reports.extend(_status(account, options.here, ids))
+                reports.extend(_status(account, options.here, index, ids))
             except (InvalidRecord, InvalidInventory, OSError) as error:
                 print(f"shutdown: {account.label}: {error}", file=sys.stderr)
                 status = max(status, 3)
@@ -969,7 +1069,8 @@ def _all_accounts(options: CommandLine) -> int:
         per_account.account = account.login
         if options.only is not None:
             per_account.only = ",".join(ids)
-        result = _dispatch(per_account)
+        result = (_restart_selected(per_account, account, index, ids) if options.command == "restart"
+                  else _account_status(per_account, account, index, ids))
         status = max(status, result)
     if options.command == "status" and options.as_json:
         print(json.dumps(reports, sort_keys=True))
@@ -978,6 +1079,35 @@ def _all_accounts(options: CommandLine) -> int:
     return status
 
 
+def _restart_selected(options: CommandLine, selected: Account, index: SelectionIndex,
+                      resolved_ids: tuple[str, ...] = ()) -> int:
+    restart_ids: list[str] = []
+    selection_failed = False
+    if resolved_ids:
+        restart_ids.extend(resolved_ids)
+    elif options.only is not None:
+        for item in _only_ids(options.only):
+            try:
+                ids = resolve_sessions(index, selected.login, (item,), here=options.here, recovery=True).session_ids
+                if len(ids) == 1 and _restart_item_running(index, ids[0]):
+                    continue
+                restart_ids.extend(ids)
+            except SessionNotFound as error:
+                if not _restart_item_running(index, item):
+                    print(f"shutdown: {error}", file=sys.stderr)
+                    selection_failed = True
+            except SessionSelectionError as error:
+                print(f"shutdown: {error}", file=sys.stderr)
+                selection_failed = True
+            except (InvalidRecord, InvalidInventory, OSError) as error:
+                print(f"shutdown: {error}", file=sys.stderr)
+                return 3
+        if not restart_ids:
+            return 1 if selection_failed else 0
+    result = restart_work.restart(restart_work.AccountNamed(selected.login), dry_run=options.dry_run,
+        alerts=restart_work.NeverAlert() if options.no_alert else restart_work.AlertWhenNotBack(),
+        only=restart_ids, here=options.here)
+    return max(result, int(selection_failed))
 
 
 def _dispatch(options: CommandLine) -> int:
@@ -1017,7 +1147,11 @@ def _dispatch(options: CommandLine) -> int:
             return 1
     if (options.command in {"restart", "status"} and options.account is None
             and (options.command == "restart" or not os.environ.get("CLAUDE_CODE_SESSION_ID"))):
-        return _all_accounts(options)
+        try:
+            return _all_accounts(options, build_selection_index(options))
+        except (InvalidRecord, InvalidInventory, OSError, ValueError) as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 3
 
     if options.command == "remote-control":
         outcome = remote_control.fix(options.session_id, options.pid, options.proc_start, options.who, options.session)
@@ -1071,39 +1205,18 @@ def _dispatch(options: CommandLine) -> int:
             if options.no_alert
             else restart_work.AlertWhenNotBack()
         )
-        restart_ids: list[str] = []
-        selection_failed = False
-        if options.only is not None:
-            try:
-                selected = restart_work.select_account(requested)
-            except UnknownAccountName as error:
-                print(f"shutdown: {error}", file=sys.stderr)
-                return 2
-            except (restart_work.RestartAccountNotDetermined, UnreadableAccount, InvalidRecord, OSError, ValueError) as error:
-                print(f"shutdown: {error}", file=sys.stderr)
-                return 1
-            selection_failed = False
-            for item in _only_ids(options.only):
-                try:
-                    ids = resolve_sessions(selected.login, (item,), here=options.here, recovery=True).session_ids
-                    if len(ids) == 1 and _restart_item_running(ids[0]):
-                        continue
-                    restart_ids.extend(ids)
-                except SessionNotFound as error:
-                    if not _restart_item_running(item):
-                        print(f"shutdown: {error}", file=sys.stderr)
-                        selection_failed = True
-                except SessionSelectionError as error:
-                    print(f"shutdown: {error}", file=sys.stderr)
-                    selection_failed = True
-                except (InvalidRecord, InvalidInventory, OSError) as error:
-                    print(f"shutdown: {error}", file=sys.stderr)
-                    return 3
-            if not restart_ids:
-                return 1 if selection_failed else 0
-            requested = restart_work.AccountNamed(selected.login)
-        result = restart_work.restart(requested, dry_run=options.dry_run, alerts=alerts, only=restart_ids, here=options.here)
-        return max(result, int(selection_failed))
+        if options.only is None:
+            return restart_work.restart(requested, dry_run=options.dry_run, alerts=alerts, only=[], here=options.here)
+        try:
+            selected = restart_work.select_account(requested)
+            index = build_selection_index(options, (selected,))
+        except UnknownAccountName as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 2
+        except (restart_work.RestartAccountNotDetermined, UnreadableAccount, InvalidRecord, InvalidInventory, OSError, ValueError) as error:
+            print(f"shutdown: {error}", file=sys.stderr)
+            return 1
+        return _restart_selected(options, selected, index)
 
     if options.command == "holds":
         try:
@@ -1126,36 +1239,45 @@ def _dispatch(options: CommandLine) -> int:
         return 0
 
     try:
-        try:
-            selected = _selected_account(options.account)
-        except (UnreadableAccount, UnknownAccountName) as error:
-            print(f"shutdown: {error}", file=sys.stderr)
-            return 2
-        status_ids = resolve_sessions(selected.login, _only_ids(options.only), here=options.here).session_ids if options.only is not None else ()
-        reports = _status(selected, options.here, status_ids)
+        selected = _selected_account(options.account)
+        index = build_selection_index(options, (selected,))
+    except (UnreadableAccount, UnknownAccountName) as error:
+        print(f"shutdown: {error}", file=sys.stderr)
+        return 2
+    except (InvalidRecord, InvalidInventory, OSError) as error:
+        print(f"shutdown: {error}", file=sys.stderr)
+        return 3
+    return _account_status(options, selected, index)
+
+
+def _account_status(options: CommandLine, selected: Account, index: SelectionIndex, resolved_ids: tuple[str, ...] = ()) -> int:
+    try:
+        status_ids = (resolved_ids or resolve_sessions(index, selected.login, _only_ids(options.only),
+                      here=options.here).session_ids if options.only is not None else ())
+        reports = _status(selected, options.here, index, status_ids)
         if options.as_json:
             print(json.dumps(reports[0] if options.here else reports, sort_keys=True))
         else:
             print(f"{selected.label} · {selected.login}")
             observations = tuple(report for report in reports if "sessions" in report)
-            for index, report in enumerate(reports):
+            for position, report in enumerate(reports):
                 if "sessions" in report:
                     print("\n".join(_inventory_lines(report)))
                 elif "unreachable" in report:
                     print(f"{report['machine']}: unreachable")
                 else:
                     print(f"{report['machine']}: unavailable (rc {report['rc']})")
-                outcome = (_local_shutdown_records(selected.login, report["machine"]) if index == 0
-                           else _remote_shutdown_records(selected.login))
+                outcome = (_local_shutdown_records(selected.login, report["machine"]) if position == 0
+                           else _remote_shutdown_records(selected.login, index))
                 if status_ids and outcome["kind"] == "records":
                     outcome["records"] = [saved for saved in outcome["records"]
                                           if saved["session"]["session_id"] in status_ids]
-                record_lines = _shutdown_record_lines(outcome, observations, local_observation=index == 0)
+                record_lines = _shutdown_record_lines(outcome, observations, local_observation=position == 0)
                 if outcome["kind"] == "records":
                     record_lines.extend(_status_actions(outcome["records"], observations))
                 if record_lines:
                     print("\n".join(record_lines))
-                if index == 0:
+                if position == 0:
                     for line in _snapshot_outcome_lines(_snapshot_status()):
                         print(line)
                     for line in _unresolved_snapshot_lines(selected.login, status_ids):

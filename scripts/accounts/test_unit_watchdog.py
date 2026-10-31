@@ -855,7 +855,8 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(self.pass_at(4), [])
         self.assertEqual(self.pending, [])
         self.assertEqual(self.commands, [])
-        pane_record.resumed("shared", "alpha", "alpha")
+        with patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(123)):
+            pane_record.resumed("shared", "alpha", "alpha")
         _ = self.pass_at(6)
         _ = self.pass_at(8)
         _ = self.pass_at(10)

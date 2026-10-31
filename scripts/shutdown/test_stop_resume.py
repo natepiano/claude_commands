@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import fcntl
 import json
 import os
 import shlex
@@ -251,6 +252,64 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(result, 0, output)
         self.start.assert_not_called()
         self.assertIs(pane_record.read("agents")["w1:p2"].get("ended"), True)
+
+    def test_down_final_write_restores_intent_after_a_concurrent_resume(self) -> None:
+        prepare = pane_record.prepare_down
+
+        def resume_after_prepare(session: str, pane: str, identity: str) -> None:
+            prepare(session, pane, identity)
+            self.assertTrue(pane_record.read(session)[pane].get("restart_after_down", False))
+            with patch.object(sessions, "session_liveness", return_value=sessions.LiveSessionProcess(123)):
+                pane_record.resumed(session, pane, identity)
+            self.assertNotIn("restart_after_down", pane_record.read(session)[pane])
+
+        for live in (True, False):
+            with self.subTest(live=live):
+                pane_record.write("agents", self.entry.copy())
+                self.live.return_value = sessions.LiveSessionProcess(123) if live else sessions.SessionNotLive()
+                with (patch.object(pane_record, "prepare_down", side_effect=resume_after_prepare),
+                      patch.object(sessions, "running_sessions", return_value=[]),
+                      patch.object(stop_resume, "_stop", return_value=stop_resume.Stopped("sid-alpha", 123)) as stopped):
+                    expected = stop_resume.Stopped("sid-alpha", 123) if live else stop_resume.NotRunning("sid-alpha")
+                    self.assertEqual(stop_resume.down(("sid-alpha",)), [expected])
+                self.assertEqual(stopped.call_count, int(live))
+                final_entry = pane_record.read("agents")["w1:p2"]
+                self.assertIs(final_entry.get("ended"), True)
+                self.assertIs(final_entry.get("restart_after_down"), True)
+                self.live.return_value = sessions.SessionNotLive()
+                self.assertEqual([entry["session_id"] for entry in restart.restart_launches(ids=("sid-alpha",))], ["sid-alpha"])
+
+    def test_delayed_resume_preserves_down_intent_when_claude_is_gone_or_unknown(self) -> None:
+        for observation in (sessions.SessionNotLive(), sessions.SessionLivenessUnknown("registry unavailable"),
+                            sessions.LiveSessionProcess(123)):
+            with self.subTest(observation=observation):
+                pane_record.write("agents", self.entry.copy())
+                self.live.return_value = sessions.LiveSessionProcess(123)
+                self.assertIsInstance(sessions.session_liveness("sid-alpha"), sessions.LiveSessionProcess)
+                pane_record.prepare_down("agents", "w1:p2", "sid-alpha")
+                pane_record.end("agents", "w1:p2", "sid-alpha", restart_after_down=True)
+                before = pane_record.record_path("agents").read_bytes()
+
+                def observe_while_locked(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive | sessions.SessionLivenessUnknown:
+                    self.assertEqual(identity, "sid-alpha")
+                    with (pane_record.RECORD_DIR / ".agents.lock").open() as lock:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return observation
+
+                with patch.object(sessions, "session_liveness", side_effect=observe_while_locked) as checked:
+                    pane_record.resumed("agents", "w1:p2", "sid-alpha")
+                checked.assert_called_once_with("sid-alpha")
+                saved = pane_record.read("agents")["w1:p2"]
+                if isinstance(observation, sessions.LiveSessionProcess):
+                    self.assertIs(saved.get("ended"), False)
+                    self.assertNotIn("restart_after_down", saved)
+                else:
+                    self.assertEqual(pane_record.record_path("agents").read_bytes(), before)
+                    self.assertIs(saved.get("ended"), True)
+                    self.assertIs(saved.get("restart_after_down"), True)
+                    self.live.return_value = sessions.SessionNotLive()
+                    self.assertEqual([entry["session_id"] for entry in restart.restart_launches(ids=("sid-alpha",))], ["sid-alpha"])
 
     def test_down_saves_intent_before_stop_and_survives_a_missing_pane(self) -> None:
         self.live.return_value = sessions.LiveSessionProcess(123)

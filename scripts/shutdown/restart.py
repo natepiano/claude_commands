@@ -2676,9 +2676,10 @@ def _account_observations(
     return observations
 
 
-def _restore_choices(
+def choose_restore_accounts(
     records: list[SessionShutdown], snapshots: list[RecoverySnapshot],
 ) -> dict[str, RestoreAccountChosen | RestoreAccountConflict]:
+    """Choose accounts from a caller's already-read recovery evidence."""
     observations = _account_observations(records, snapshots)
     copies: dict[str, list[AccountObservation]] = {}
     for saved in records:
@@ -2703,7 +2704,7 @@ def _restore_choices(
 
 def restore_account_choices() -> dict[str, RestoreAccountChosen | RestoreAccountConflict]:
     """Choose the source copy and destination across all local recovery sources."""
-    return _restore_choices(all_session_records(), all_snapshots())
+    return choose_restore_accounts(all_session_records(), all_snapshots())
 
 
 def _restore_target(saved: SessionShutdown, decision: RestoreAccountChosen, *, dry_run: bool) -> SessionShutdown:
@@ -3172,7 +3173,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
     for snapshot in snapshots:
         snapshot["sessions"] = [entry for entry in snapshot["sessions"]
                                 if entry["session"]["session_id"] not in down_ids]
-    choices = _restore_choices(all_records if all_accounts else [saved for saved in all_session_records()
+    choices = choose_restore_accounts(all_records if all_accounts else [saved for saved in all_session_records()
                                if saved["session"]["session_id"] not in down_ids], snapshots)
     sources: dict[str, RecoverySnapshot] = {}
     recorded = {saved["session"]["session_id"]: saved for saved in all_records}
@@ -3190,9 +3191,10 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
             if (ids and identity not in ids) or (identity in recorded
                     and not recovery_store.snapshot_supersedes_record(snapshot, recorded[identity])):
                 continue
-            print(f"{name}: {snapshot_source(entry['last_seen'])}")
+            source_line = f"{name}: {snapshot_source(entry['last_seen'])}"
             decision = choices[identity]
             if isinstance(decision, RestoreAccountConflict):
+                print(source_line)
                 reason = "conflicting account evidence: " + ", ".join(decision.accounts)
                 print(f"{name}: {reason}")
                 recovery_failures.append(FailedSessionRestart(name, reason))
@@ -3205,13 +3207,16 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
                 if isinstance(liveness, inventory_work.CodexLive):
                     print(f"{name}: already running (pid {liveness.pid}); skipped")
                 elif isinstance(liveness, inventory_work.CodexLivenessUnknown):
+                    print(source_line)
                     print(f"{name}: recovery refused: {liveness.reason}")
                     recovery_failures.append(FailedSessionRestart(name, liveness.reason))
                 else:
                     evidence = crash_check.check(snapshot, entry)
                     if isinstance(evidence, CrashConfirmed):
+                        print(source_line)
                         codex_entries.append((snapshot, entry))
                     elif isinstance(evidence, CrashEvidenceUnreadable):
+                        print(source_line)
                         print(f"{name}: recovery refused: {evidence.reason}")
                         recovery_failures.append(FailedSessionRestart(name, evidence.reason))
                     else:
@@ -3230,6 +3235,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
                 print(f"{name}: already running; skipped")
                 continue
             if isinstance(liveness, SessionLivenessUnknown):
+                print(source_line)
                 print(f"{name}: recovery refused: {liveness.reason}")
                 recovery_failures.append(FailedSessionRestart(name, liveness.reason))
                 continue
@@ -3242,12 +3248,14 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
             if isinstance(evidence, NoCrashSignal):
                 evidence = crash_check.check(snapshot, entry)
             if isinstance(evidence, CrashEvidenceUnreadable):
+                print(source_line)
                 print(f"{name}: recovery refused: {evidence.reason}")
                 recovery_failures.append(FailedSessionRestart(name, evidence.reason))
                 continue
             if isinstance(evidence, NoCrashSignal):
                 print(f"{name}: no crash signal; skipped")
                 continue
+            print(source_line)
             verified_entry = copy.copy(entry)
             if isinstance(evidence, CrashConfirmed):
                 verified_entry["crash"] = evidence.signal
