@@ -8,9 +8,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from zoneinfo import ZoneInfo
 
+for directory in (Path(__file__).resolve().parent, Path(__file__).resolve().parents[2]):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
 if TYPE_CHECKING:
     import unit_lookup
-from scripts.production import showrunners
+from scripts.production import showrunners  # noqa: E402
 from collections.abc import Iterable
 from scripts.production import staff
 import unit_names
@@ -69,6 +72,11 @@ def unit_table(lines: list[str]) -> list[dict[str, str]]:
     headings = unit_headings(lines)
     _, rows = unit_rows(lines)
     return [dict(zip(headings, row_cells(row), strict=False)) for row in rows]
+
+
+def plan_arguments(plan: str) -> list[str]:
+    """Translate a Units Plan cell into add_unit's launch mode."""
+    return ["--" + plan] if plan in ("standby", "permanent") else ["--plan", plan]
 
 
 def plan_cell_is_retired(plan_cell: str) -> bool:

@@ -40,7 +40,6 @@ sys.path.insert(0, str(SCRIPTS / "direct"))
 import codex_daemon
 from codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 import process_table
-import remove_workers
 import roster
 import send
 import broadcast
@@ -163,10 +162,6 @@ class RosterTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions))
         _ = self.enterContext(mock.patch.object(
             showrunners, "SESSIONS", Path(__file__).with_name("sessions.py"),
-        ))
-        _ = self.enterContext(mock.patch.object(
-            remove_workers, "shutdown_held_sessions",
-            return_value={"kind": "held sessions", "session_ids": set()},
         ))
         _ = self.enterContext(mock.patch.object(
             process_table, "PS", ["ps", "-eo", "pid=,ppid=,comm=,args="],

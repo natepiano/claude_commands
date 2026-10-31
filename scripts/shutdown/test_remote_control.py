@@ -19,7 +19,7 @@ import remote_control
 import herdr
 import sessions
 import session_pane
-import settle
+import restart_support
 import detached
 from push_texts import RenderedPush
 from herdr import HerdrPlace
@@ -91,7 +91,7 @@ class RemoteControlTests(ShutdownTestCase):
         })))
         _ = self.enterContext(patch.object(Path, "home", return_value=self.root))
         _ = self.enterContext(patch.object(sessions, "process_start", return_value="original"))
-        _ = self.enterContext(patch.object(settle, "local_machine", return_value="natedev"))
+        _ = self.enterContext(patch.object(restart_support, "local_machine", return_value="natedev"))
         self.clock = FakeClock()
         self.write()
         _ = self.enterContext(patch.object(session_pane, "record_place", side_effect=self.find_place))
@@ -119,12 +119,21 @@ class RemoteControlTests(ShutdownTestCase):
 
     def run_fix(self) -> tuple[remote_control.RemoteControlOutcome, str, list[RenderedPush]]:
         output = io.StringIO()
-        with patch.object(settle, "alert_user") as alert, redirect_stdout(output):
+        with patch.object(restart_support, "alert_user") as alert, redirect_stdout(output):
             outcome = remote_control.fix("owner", 321, "original", "trunk unit", "Owner", clock=self.clock)
         lines = output.getvalue().splitlines()
         self.assertEqual(len(lines), 1, output.getvalue())
         self.assertTrue(lines[0].startswith("trunk unit:"))
         return outcome, output.getvalue(), [cast(RenderedPush, call.args[0]) for call in alert.call_args_list]
+
+    def test_live_pane_marks_name_remote_control_messages(self) -> None:
+        launch: dict[str, object] = {"session_id": "conversation", "name": "Working tab",
+                                     "environment": {"SHOWRUNNER_UNIT_ID": "builders-unit", "SHOWRUNNER_UNIT": "demo"}}
+        self.assertEqual(remote_control.remote_control_who(launch), "builders unit")
+        launch["environment"] = {"SHOWRUNNER_UNIT": "demo"}
+        self.assertEqual(remote_control.remote_control_who(launch), "demo showrunner")
+        launch["environment"] = {}
+        self.assertEqual(remote_control.remote_control_who(launch), "Working tab")
 
     def test_launch_flag_activates_during_grace_without_pane_input_or_push(self) -> None:
         def activate(at: float) -> None:

@@ -311,7 +311,7 @@ def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path,
 
     def shutdown(*arguments: str) -> None:
         pane.stop_calls.append(' '.join(arguments))
-        if arguments[0] in {'now', 'down'}:
+        if arguments[0] == 'stop':
             pane.stopped()
             fields = cast(dict[str, str], json.loads(path.read_text()))
             def stopped(saved: shutdown_record.SessionShutdown) -> None:
@@ -330,6 +330,11 @@ def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path,
         else:
             raise AssertionError(f'unexpected shutdown: {arguments}')
 
+    from scripts.shutdown import stop_resume
+    def stop(identity: str) -> stop_resume.Stopped:
+        shutdown("stop", identity)
+        return stop_resume.Stopped(identity, pane.director)
+    _ = case.enterContext(mock.patch.object(stop_resume, 'stop', side_effect=stop))
     _ = case.enterContext(mock.patch.object(rename_unit, 'run_shutdown', side_effect=shutdown))
     def wait_for_stop(_seconds: float) -> None:
         case.assertTrue(stopped_event.wait(TEST_HANG_GUARD_SECS), 'fake shutdown did not publish its stop')
