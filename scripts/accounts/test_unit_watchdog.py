@@ -176,7 +176,7 @@ class UnitWatchdogTests(unittest.TestCase):
         owner["config_dir"] = str(accounts.account_dir(label))
         self.die(identity)
         self.fixture.live.append(sessions.SessionRecord(pid=owner["pid"], sessionId=identity, name=owner["name"],
-            messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]))
+            procStart=owner["proc_start"], messagingSocketPath="/fixture.sock", updatedAt=1, tmux="", formerNames=[]))
 
     def tell(self, _slug: str, _key: str, text: str) -> str:
         self.notices.append(text)
