@@ -240,11 +240,26 @@ class StopResumeTests(unittest.TestCase):
 
     def test_stop_and_move_never_take_a_held_watcher_lock(self) -> None:
         log = self.prompt_retirement_fixture(alerted=True)
+        real_flock = fcntl.flock
+        forbidden_attempts: list[tuple[int, int]] = []
         with (stall_watch.STATE_DIR / "lock").open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            with patch.object(fcntl, "flock", side_effect=AssertionError("watcher lock must not be acquired")):
+            real_flock(lock, fcntl.LOCK_EX)
+            held = os.fstat(lock.fileno())
+            watcher_identity = (held.st_dev, held.st_ino)
+
+            def forbid_watcher_lock(file: int | io.IOBase, operation: int) -> None:
+                descriptor = file if isinstance(file, int) else file.fileno()
+                stat = os.fstat(descriptor)
+                identity = (stat.st_dev, stat.st_ino)
+                if identity == watcher_identity:
+                    forbidden_attempts.append(identity)
+                    raise AssertionError("watcher lock must not be acquired")
+                real_flock(file, operation)
+
+            with patch.object(fcntl, "flock", side_effect=forbid_watcher_lock):
                 self.assertEqual(stop_resume.stop("alpha"), stop_resume.NotRunning("sid-alpha"))
                 self.assertIsInstance(stop_resume.move("alpha", "claude4", why="limit"), stop_resume.ClaudeUp)
+        self.assertEqual(forbidden_attempts, [], "stop and move must never attempt the watcher lock")
         self.assert_prompt_cancellation_requested(log)
 
     def test_a_delayed_cancellation_never_retires_a_resumed_sessions_new_prompt(self) -> None:
