@@ -2931,3 +2931,69 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 **Files:**
 - `scripts/accounts/home_test_support.py` — the fixture.
 - `scripts/accounts/test_*.py` (nine files above) — callers.
+
+### Phase 101c — A failed CI point names its cause  · status: done
+
+**Depends on:** none (order only).
+
+#### Work Order
+
+**Goal:** When a CI point fails, its report names the real cause. Today `scripts/production/ci_points.py:81`, `:158` and `:226` report `result.stderr.strip() or result.stdout.strip()`. `validate_and_push.sh` now writes memory-wait lines to stderr, so that text wins and the failure on stdout is lost: hana's CI point on `cac4a24bc4` failed at 20:19 after 7 h with no cause. `merge_checkpoint.push_validate` (`scripts/production/merge_checkpoint.py:879`) calls the same script with the same pattern. Natedev showrunner order, 2026-10-30.
+
+**Spec:**
+- One helper, `scripts/lib/process_failure.py`, builds the failure text from a `subprocess.CompletedProcess[str]`: the last lines of stderr and of stdout, each labelled, empty streams left out, and `exit <code>` when both are empty. It takes the line count as a keyword with one default (20).
+- `ci_points.py` uses it at all three sites (`required`, the validation step, the review watch). `merge_checkpoint.push_validate` uses it for its validate_and_push failure. No other copy of the pattern changes in this phase.
+- `report()` already joins lines with `; `; the output stays one line per step.
+
+**Files:**
+- `scripts/lib/process_failure.py` — new helper.
+- `scripts/production/ci_points.py`, `scripts/production/merge_checkpoint.py` — callers.
+- `scripts/lib/test_process_failure.py` — helper tests.
+- `scripts/production/test_ci_points.py` — a validation failure whose stderr holds only memory-wait lines and whose stdout holds the failing check; the report names the failing check.
+
+**Workers:** 1 writer (`impl`: helper and callers) + 1 tester (`test`: the two test files).
+
+**Acceptance gate:** `scripts/lib` and `scripts/production` suites pass for `test_process_failure`, `test_ci_points` and `test_merge_checkpoint*`; basedpyright on each changed file and each caller module reads `0 errors, 0 warnings, 0 notes`.
+
+### Phase 101d — A CI point validates one fixed commit  · status: todo
+
+**Depends on:** Phase 101c (order only; both edit `scripts/production/ci_points.py`).
+
+#### Work Order
+
+**Goal:** A CI point never pushes a tree it did not validate. Today `ci_points.py ci start` runs `validate_and_push.sh --to <merge branch>` in `production.checkout` with no lock, while `merge_checkpoint.py` merges and pushes in the same checkout (`merge_checkpoint.py:847-849`). `push_direct.sh` pushes `HEAD` as it is at push time, and `ci_start`'s guard (`ci_points.py:163`) compares two readings of that same new `HEAD`. Natedev showrunner ruling, 2026-10-30.
+
+**Spec:**
+- `ci start` records the merge branch's sha, makes a `git clone --shared` copy of `production.checkout` at that sha in a scratch folder, and runs validation there. The production checkout is never touched.
+- After validation passes, with no fix commit: if `origin/<merge branch>` contains the sha, that is a pass. Report the sha, push nothing, and follow the CI run of the branch tip that contains it.
+- With a fix commit: push it only when it fast-forwards `origin/<merge branch>`. Otherwise fail with `merge branch moved during validation`. Never force.
+- The copy is removed when the run ends, pass or fail.
+- Report the copy's added disk use and peak memory, and whether a fresh cargo target folder makes the run longer, measured on one real CI point.
+
+**Files:**
+- `scripts/production/ci_points.py` — fixed sha, copy, push rule.
+- `scripts/validate_and_push/*` — only if the push rule cannot be done in `ci_points.py`.
+- `scripts/production/test_ci_points.py` — moved-branch, contained-sha and fix-commit cases.
+
+**Workers:** 1 writer + 1 tester.
+
+**Acceptance gate:** `test_ci_points` passes; basedpyright 0/0/0 on each changed file; one real CI point, with the measures above.
+
+### Phase 101e — One helper reports a failed command's output  · status: todo
+
+**Depends on:** Phase 101c (the helper).
+
+#### Work Order
+
+**Goal:** No caller loses a failure's cause behind stderr noise. `result.stderr.strip() or result.stdout.strip()` appears 41 times in 22 non-test modules. Each copy drops stdout whenever stderr holds any text. Natedev showrunner ruling, 2026-10-30: current, after 101d.
+
+**Spec:**
+- Every non-test copy calls `scripts/lib/process_failure.py`'s helper. Local wrappers such as `waiting.detail` go away or become one call to it.
+- A check keeps new copies out: a test or lint scan of `scripts/` fails on the pattern outside the helper.
+- No caller's other behavior changes.
+
+**Files:** the 22 modules (list them from `grep -rln 'stderr.strip() or' scripts --include=*.py`), the scan test, and any test that asserts the old text.
+
+**Workers:** 2 writers split by folder + 1 tester.
+
+**Acceptance gate:** each touched module's suite passes; basedpyright 0/0/0 on each changed file and its callers; the scan test fails on a planted copy.
