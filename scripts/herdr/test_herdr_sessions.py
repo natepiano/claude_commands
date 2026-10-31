@@ -222,7 +222,7 @@ class HerdrSessionsTests(unittest.TestCase):
         self.register_showrunner(101)
         self.assertEqual(self.call("list"), (0, "unit\tunit build/one\tdirector\n", ""))
 
-    def test_unit_marks_are_visible_without_a_claude_record(self) -> None:
+    def test_staff_marks_are_visible_without_a_claude_record(self) -> None:
         self.respond(["agents"], tabs=("unit",))
         self.server(100, "agents")
         unit = unit_membership("build", "one")
@@ -258,7 +258,7 @@ class HerdrSessionsTests(unittest.TestCase):
                 + "terminal\tstandalone\t\nstyle\tstandalone\t\n", ""))
         read.assert_called_once_with()
 
-    def test_partial_unit_marks_do_not_make_a_unit_role(self) -> None:
+    def test_partial_staff_marks_do_not_make_a_unit_role(self) -> None:
         self.respond(["agents"], tabs=("solo",))
         self.server(100, "agents")
         self.claude(101, 100, "solo-name", pane="w1:p1", marks={"SHOWRUNNER_UNIT": "build"})

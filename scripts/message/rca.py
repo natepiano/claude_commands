@@ -64,14 +64,12 @@ import sessions  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import silence  # noqa: E402
 from user_zone import user_zone  # noqa: E402
+from session_staff import PRODUCTION_MARK  # noqa: E402
 
 STATE = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "message" / "rca"
 SEND = Path(os.environ.get("RCA_SEND") or Path(__file__).resolve().parent / "send.py")
 CALL = "~/.claude/scripts/lib/py ~/.claude/scripts/message/rca.py"
 PROJECTS = Path.home() / ".claude" / "projects"
-# unit_lookup.PRODUCTION_MARK: the production slug every process of a unit's session inherits.
-# unit_lookup itself is not imported here, as its herdr import costs 160 ms.
-PRODUCTION_MARK = "SHOWRUNNER_UNIT"
 # The owner when the session has no production, or its showrunner does not run.
 NATEDEV = "natedev"
 SENDER = "rca"

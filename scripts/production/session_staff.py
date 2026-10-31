@@ -1,4 +1,4 @@
-"""Staff identity joins and unit marks shared by file readers and process discovery."""
+"""Matching a running session to its staff row."""
 from __future__ import annotations
 
 import sys
@@ -267,10 +267,10 @@ def group_marked_units(marked: Iterable[tuple[str, MarkedUnit]], *,
                                            for slug, rows in membership.items()})
 
 
-def session_unit_marks(
+def session_staff_and_directors(
     records: list[SessionRecord], environment: Mapping[str, str], *, record: staff.StaffSnapshot | None = None,
 ) -> tuple[MarkedProductions, dict[str, str]]:
-    """Read unit marks only for known session PIDs, without enumerating processes."""
+    """Match known session PIDs to staff and directors, without enumerating processes."""
     marked: list[tuple[str, MarkedUnit]] = []
     directors: dict[str, str] = {}
     known = {session["sessionId"] for session in records}

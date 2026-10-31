@@ -211,7 +211,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
         self.assertEqual(len(starts), 1)
 
-    def test_attach_stops_then_launches_once_with_unit_marks_and_finishes(self) -> None:
+    def test_attach_stops_then_launches_once_with_staff_marks_and_finishes(self) -> None:
         prior, trace = self.prepare_attach()
         result = self.successful("alpha", "--permanent", "--attach", "session-123", "--cwd", str(prior))
         self.assertEqual(trace, ["stop", "launch"])

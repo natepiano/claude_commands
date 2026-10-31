@@ -200,7 +200,7 @@ class RenamePaneShellTests(UnitRenameFixture):
         self.interrupt_before_close(renamed)
         competitor = self.publish_stopped_panes(pane, renamed, ("sid-alpha", "sid-unrelated"))
         with (mock.patch.object(unit_lookup, "marked_unit", return_value=competitor),
-              mock.patch.object(unit_lookup, "observed_unit_marks", return_value=(("demo", competitor),))):
+              mock.patch.object(unit_lookup, "observed_staff_marks", return_value=(("demo", competitor),))):
             rename_unit.stop_unit(renamed, lambda: None)
         self.assertEqual(pane.close_calls(), [["--session", "agents", "pane", "close", "w1:p1"]])
         self.assertTrue((Path(self.env["HERDR_PROC"]) / "991003").exists())

@@ -3173,7 +3173,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
     return processes
 
 
-def has_unit_marks(environment: dict[str, str]) -> bool:
+def has_staff_marks(environment: dict[str, str]) -> bool:
     return all(environment.get(mark) for mark in UNIT_MARKS)
 
 

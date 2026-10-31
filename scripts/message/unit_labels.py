@@ -17,7 +17,7 @@ for directory in (SCRIPTS / "message", SCRIPTS / "production", SCRIPTS / "herdr"
         sys.path.insert(0, str(directory))
 from scripts.production import staff, showrunners
 import production_units
-import unit_marks as unit_lookup
+import session_staff
 import unit_runs
 from sessions import SessionRecord, running_sessions
 if TYPE_CHECKING:
@@ -246,7 +246,7 @@ def production_rows(doc: Path, slug: str, record: staff.StaffSnapshot) -> list[d
     return production_units.live_unit_table(lines, slug, record=record)
 
 
-def every_marked_unit(record: staff.StaffSnapshot | None = None) -> unit_lookup.MarkedProductions | OSError:
+def every_marked_unit(record: staff.StaffSnapshot | None = None) -> session_staff.MarkedProductions | OSError:
     """Every production's observed units, joined to one staff snapshot."""
     import unit_lookup as process_units
 
@@ -270,13 +270,13 @@ def production_places(
     runner_ids: Mapping[str, showrunners.Showrunner], ledger_workers: set[str],
     problems: list[str],
     *, record: staff.StaffSnapshot,
-    marks: unit_lookup.MarkedProductions | DiscoverProductionMarks = DISCOVER_PRODUCTION_MARKS,
+    marks: session_staff.MarkedProductions | DiscoverProductionMarks = DISCOVER_PRODUCTION_MARKS,
 ) -> dict[str, ProductionPlace]:
     addresses = {runner["slug"]: f"session:{session_id}" for session_id, runner in runner_ids.items()}
     places: dict[str, ProductionPlace] = {}
     # One read of every production's marks serves every showrunner below.
-    every = (marks if isinstance(marks, unit_lookup.MarkedProductions)
-             else every_marked_unit(record) if registered else unit_lookup.MarkedProductions({}, {}))
+    every = (marks if isinstance(marks, session_staff.MarkedProductions)
+             else every_marked_unit(record) if registered else session_staff.MarkedProductions({}, {}))
     # One process scan places every record; a scan per record took most of the roster's time.
     record_places: dict[int, herdr.HerdrPlace] | None = None
     for runner in registered:
@@ -298,7 +298,7 @@ def production_places(
         else:
             for unit_name, marked in units.items():
                 place = ProductionPlace(showrunner, DirectsUnit(unit_name))
-                if isinstance(marked.claude, unit_lookup.LiveClaude):
+                if isinstance(marked.claude, session_staff.LiveClaude):
                     _ = places.setdefault(marked.claude.session_id, place)
                     continue
                 # A socketless director is still identified by its marked pane.
@@ -340,7 +340,7 @@ def unit_labels_for(session_ids: Iterable[str], environment: Mapping[str, str]) 
         registered = registered_showrunners(environment, problems,
                                             known_sessions={record["sessionId"]: record for record in records})
         runners = showrunner_ids(records, registered)
-        marks, directors = unit_lookup.session_unit_marks(records, environment, record=record)
+        marks, directors = session_staff.session_staff_and_directors(records, environment, record=record)
         places = production_places(records, {}, registered, runners, set(directors), problems, record=record, marks=marks)
         names = {record["sessionId"]: record["name"] for record in records}
         labels: dict[str, UnitLabels] = {}
