@@ -27,6 +27,7 @@ import proposals_folder
 from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 from change_review import Visible
 from next_item import NextError, Queue
 
@@ -153,6 +154,8 @@ class NextItemTests(unittest.TestCase):
             self.assertEqual(run("show", "--kind", "question", "--order", "oldest")[1], "question\ndemo: Newest question\n")
 
     def test_the_efficiency_and_change_lists_read_their_real_files(self) -> None:
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        _ = unit_membership("demo", "fixture-unit")
         _ = (self.root / "ledger.md").write_text(LEDGER, encoding="utf-8")
         doc = self.root / "docs" / "plans" / "demo-production.md"
         doc.parent.mkdir(parents=True)
