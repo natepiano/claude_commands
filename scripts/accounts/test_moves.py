@@ -257,7 +257,7 @@ class MoveJournalTests(unittest.TestCase):
         self.assertNotIn("default", rendered)
         self.assertEqual(path.read_bytes(), original)
 
-    def test_historical_source_uses_matching_shutdown_login_not_later_cutover(self) -> None:
+    def test_historical_source_uses_the_move_login_and_ignores_stale_shutdown_state(self) -> None:
         path = moves.store_file()
         path.parent.mkdir(parents=True)
         notes = self.home / "rust/hanadocs/agents"
@@ -270,10 +270,10 @@ class MoveJournalTests(unittest.TestCase):
             "label": "claude3", "login": "later@example.invalid"}]}))
         record = self.home / ".local/state/shutdown/session.json"
         record.parent.mkdir(parents=True)
-        _ = record.write_text(json.dumps({"request_id": "attempt", "login": "source@example.invalid",
+        _ = record.write_text(json.dumps({"request_id": "attempt", "login": "later@example.invalid",
             "source_label": "default", "session": {"config_dir": str(self.home / ".claude")}, "target": "default"}))
         original = json.dumps({**self.common(tool="claude"), "request_id": "attempt", "kind": "requested",
-            "from": "default", "to": "default", "window": "unknown", "why": "fixture"}) + "\n"
+            "from": "default", "to": "default", "login": "source@example.invalid", "window": "unknown", "why": "fixture"}) + "\n"
         _ = path.write_text(original)
         loaded = moves.read_moves()
         self.assertEqual(loaded[0].get("from"), "claude2")

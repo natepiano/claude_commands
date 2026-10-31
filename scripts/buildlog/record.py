@@ -979,6 +979,23 @@ def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step
     })
 
 
+
+class IdleFloorTarget(TypedDict):
+    folder: str
+    last_use: float
+    bytes: int
+
+
+def floor_scan(free_after_scan: int, floor: int, idle_targets: list[IdleFloorTarget], at: float) -> None:
+    host = store.host_name()
+    store.append_line(store.host_file(host, at), {
+        "kind": "floor_scan", "v": RECORD_VERSION,
+        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
+        "free_after_scan": free_after_scan, "floor": floor, "shortfall": floor - free_after_scan,
+        "idle_targets": idle_targets,
+    })
+
+
 def sweep_trim(folder: str, bytes_freed: int, extent: Literal["whole", "partial"],
                cause: Literal["budget take", "floor take"], at: float) -> None:
     host = store.host_name()

@@ -162,6 +162,12 @@ buildlog_memory_line_inner() {
         measured) description="the 90th percentile of $count measured runs" ;;
         buildlog) description="0.65 of the 90th percentile peak of $count runs" ;;
         pooled) description="the 90th percentile of $count measured runs of this step in every repo" ;;
+        shape)
+            if [[ "$count" == 0 ]]; then
+                description="the same-shape fallback: no earlier builds"
+            else
+                description="a same-shape promise from $count earlier builds"
+            fi ;;
         *) description="no history, so the fallback" ;;
     esac
     if [[ "$kind" == first || "$kind" == periodic ]]; then
@@ -244,7 +250,7 @@ buildlog_wait_for_memory() {
             *) buildlog_memory_refuse "invalid admission answer $state:$reason"; return 2 ;;
         esac
         case "$source" in
-            measured|buildlog|pooled|fallback) ;;
+            measured|buildlog|pooled|fallback|shape) ;;
             *) buildlog_memory_refuse 'invalid memory source'; return 2 ;;
         esac
         for numeric in "$threshold" "$need" "$count" "$promised" "$running" "$reserve" "$fresh" "$measured" "$head_need"; do
