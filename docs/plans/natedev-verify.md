@@ -382,38 +382,61 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 
 ### Phase 10 — A stopped verify run ends all of its processes  · status: done
 
-**Depends on:** Phase 9 (same file: `verify.sh`); it is this phase's baseline.
+#### As-built
 
-**Origin:** builds showrunner defect report, ruled a wrong result and current (2026-10-30): `kill -TERM` on the process group of a lint run marked its record finished with exit 141, but two `verify.sh` processes lived on and held a memory-queue place for 58 minutes.
+Checkpoints c0377368 and 4751eb55 on `natedev-verify-cancel`.
+
+- A TERM, INT or HUP sent to a verify run's process group ends every process the run started, frees its memory-queue place and exits 128 + signal (143, 130, 129), never 141. `verify_interrupted` is the one stop path: it stops the step group (its own group, from `set -m`) and releases what the step holds. `memory_admit` is unchanged.
+- `run_log_tee` in `verify.sh` runs both run-log tees (`exec > >(run_log_tee) 2> >(run_log_tee >&2)`). Each tee ignores INT, TERM and HUP, runs `tee -i -a "$RUN_LOG"` and reads to EOF, so the run's last writes during the stop reach the log.
+- `user_clock` runs `TZ="$(python3 -S …/lib/user_zone.py)"`, outside the `VERIFY_PY_TRACE` runner; `test_verify_python_starts` expects 40 traced rows.
+- Test support: `VerifyHoldWaitFixture.start_memory_queued_lint()` parks a real `verify.sh lint` in the memory queue (real checker and ledger, `MemAvailable: 0`, `BUILDLOG_MEM_POLL_S=3600`), with `memory_queue_pids()`, `owned_process_snapshot()` and `wait_for_owned_exit(timeout)`. `wait_for_marker_exit(marker, timeout) -> set[int]` in `verify_mac_offload_test_support.py` is the one process-exit waiter, also for `VerifyMacOffloadFixture.assert_nothing_outlives`; reaping stays separate. The `sleep` stub in `VerifyTokenWaitFixture` ends only the zero-memory poll at once and passes every other delay to the real `sleep`.
+
+**Files:**
+- `scripts/direct/verify.sh` — `run_log_tee`, `user_clock`
+- `scripts/direct/test_verify_hold_signals.py` — TERM, INT and HUP group-stop tests: no survivor within 5 s, queue no longer lists the run, exit 128 + signal, `outcome: interrupted`, no saved result
+- `scripts/direct/verify_hold_wait_test_support.py` — memory-queued lint starter, queue and process readers
+- `scripts/direct/verify_mac_offload_test_support.py` — `wait_for_marker_exit`
+- `scripts/direct/verify_token_wait_test_support.py` — `sleep` stub with real delays
+- `scripts/direct/test_verify_python_starts.py` — 40 traced rows
+
+**Binds later work:** a group stop goes through `verify_interrupted` only; the three group-stop tests in `test_verify_hold_signals.py` stay green. A parked memory wait in a test uses `start_memory_queued_lint`, and a process-exit wait uses `wait_for_marker_exit`.
+
+**Gotchas:**
+- A run-log tee that dies on a group signal turns the next write into SIGPIPE (141) and skips `verify_interrupted`.
+- The renewer's delay is Bash `sleep`; a `sleep` stub that returns at once makes the renewer spin and rewrite a lease that a test set to expire.
+
+**Ruled out:** a sweep that cleans up after a stop, or a second cancel path beside `verify_interrupted`.
+
+### Phase 13 — Stop the Mac copy watcher when verify ends before the watcher starts  · status: todo
+
+**Origin:** builds showrunner, 2026-10-31 00:3x EDT, add-on. Branch `natedev-verify-cancel` (carries Phases 9 and 10), worktree `/home/natepiano/worktrees/claude-build-followups-verify-cancel`, merged with origin/builds 1de3f51c at f133fa6e.
+
+**Depends on:** Phase 10 (same `verify.sh` stop path).
 
 #### Work Order
 
-**Goal:** A TERM, INT or HUP sent to a verify run's process group ends every process the run started, frees its memory-queue place at once, and records the signal's exit status (143 for TERM), never 141.
+**Source:** builds, 2026-10-31. `copy_watch.py`'s `Wakeup` stops on parent loss: it saves `os.getppid()` when it starts and stops when that value changes. When `verify.sh` dies before the watcher saves it, the saved value is already the new parent (init or a subreaper), so the watcher never sees the loss and runs on.
+
+**Goal:** the watcher always stops when the `verify.sh` process that started it is gone, also when that process ended before the watcher started.
 
 **Spec:**
 
-1. Reproduce first, before any edit. Start a real `verify.sh lint` run (fake cargo and rustc from the shared fixtures) in its own process group, the way `mesh_runs.py` starts it, with a memory checker that always waits, so the step sits in the memory queue. Send `kill -TERM -<pgid>`. Record which processes outlive the signal, their process groups, and the run's exit status. Put the measured cause in the worker summary.
-2. Lead to confirm or refute, not a given: the output tees from `exec > >(tee -a "${RUN_LOG}") 2> >(tee …)` (verify.sh, run-log setup) share the run's group, so the group signal ends them; `verify.sh`'s next write to its stdout then takes SIGPIPE and the shell dies with 141 before `verify_interrupted` sends the signal to the step group. The step subshell runs in its own group (`set -m` before it starts), which the run's group signal does not reach, and it waits silently in the memory queue.
-3. Fix it at the cause in `verify.sh`, so the run's own interrupt path always ends the step group and releases what it holds. No sweep that cleans up afterward, and no second cancel path beside `verify_interrupted`.
-4. If the memory-queue place can only be freed by `memory_admit`, that change is resources-unit's file: make it, and the director names it in the notice's also-touches line.
+1. Reproduce first: a test starts the watcher with a parent that has already exited (or exits before the watcher reads its parent), and shows the watcher keeps running.
+2. `verify.sh` `start_copy_watch` passes the pid of the shell that starts the watcher (`--parent-pid`). Use the pid that is the watcher's real parent at start (in a subshell that is not `$$`); say in the summary which value you pass and why.
+3. `Wakeup` takes that pid from the arguments in place of its own `os.getppid()` read, and stops when `os.getppid()` differs from it, at its first check. No second parent check, no sweep.
+4. A missing `--parent-pid` is an argument error, not a fallback.
 
 **Files:**
-- `scripts/direct/verify.sh`
-- `scripts/direct/test_verify_hold_signals.py`
-- `scripts/direct/verify_hold_wait_test_support.py`
+- `scripts/direct/verify.sh` — `start_copy_watch`
+- `scripts/mac_test/copy_watch.py` — `Wakeup` and the argument
+- `scripts/mac_test/test_copy_watch.py` — the gap test
 
-**Workers:** 1 writer (one owner for all three files).
+**Workers:** 1 writer.
 
-**State:** none — the fix changes how a run ends, not what it stores.
+**State:** none.
 
-**Constraints from prior phases:**
-- Phase 7: a stop kills the token renewer's delay process, then the renewer; `renew_token` reads 0 and 2 as renewed.
-- Phase 8 (other branch, natedev-verify-holder): the wait-holder hook and `phase_wait_finish` change in `verify.sh`; it also edits `verify_hold_wait_test_support.py`; add new fixture parts beside the old ones and keep this change apart from those functions, so the two merge cleanly.
-- Phase 9: no new Python start in `verify.sh`; any inline Python names itself with `VERIFY_PY_HELPER=<NAME>`.
-- `test_verify_hold_signals.py` already sends signals to a real verify run through `VerifyHoldWaitFixture` (`verify_hold_wait_test_support.py`, which starts it with `start_new_session=True`); add the new tests there and extend that fixture for a memory checker that always waits, never a second harness.
+**Constraints from prior phases:** Phase 10's stop path (`verify_interrupted`) and its tests stay as they are. Phase 1b (main worktree, not yet committed) changes other parts of `copy_watch.py` (the shared process-start reader); keep this change inside `Wakeup`, its argument and `start_copy_watch`, so the two merge cleanly.
 
 **Acceptance gate:**
-- A new test in `test_verify_hold_signals.py` runs the real verify CLI in its own group, waits until the step is in the memory queue, sends TERM to the group, and requires: no process of the run or its step group alive within 5 s, the queue no longer lists the run, and exit status 143. It fails on the Phase 9 tree.
-- The same test for INT (130).
-- These pass unchanged: `test_verify_wait_holder`, `test_verify_token_renew`, `test_verify_final_pass_script`, `test_verify_python_starts`.
-- basedpyright 0/0/0 on the new test; `bash -n` and shellcheck with no new findings; merge gate `--tests-only` green on a tree merged with origin/builds.
+- The gap test fails on f133fa6e and passes after the change; a normal parent loss after start still stops the watcher (existing test passes unchanged).
+- Every `scripts/mac_test/test_*` module and `scripts.direct.test_verify_hold_signals` pass; basedpyright `0 errors, 0 warnings, 0 notes` on the changed Python files; `bash -n` and shellcheck on `verify.sh` with no new findings; the merge gate passes.
