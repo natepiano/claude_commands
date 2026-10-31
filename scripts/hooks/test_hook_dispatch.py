@@ -573,6 +573,7 @@ class SettingsRegistrationTests(IsolatedHookTests):
             event: [list(row) for row in rows] for event, rows in LEGACY.items()
         }
         expected["post_tool_use"].append(["post-tool-use-push-delivered.py", "PushNotification", 600])
+        expected["post_tool_use"].append(["post-tool-use-sendmessage-miss.py", "SendMessage", 600])
         self.assertEqual(parsed_output(result.stdout), expected)
 
     def test_each_event_registers_dispatch_once_and_removes_old_python_commands(self) -> None:

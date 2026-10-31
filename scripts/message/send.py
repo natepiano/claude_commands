@@ -544,6 +544,24 @@ RecipientResolutionScope = LocalOnly | LocalThenPeer | NamedMachine
 
 
 @dataclass(frozen=True)
+class RecipientMatches:
+    entries: list[roster.RosterEntry]
+    destination: LocalOnly | NamedMachine
+    problems: list[str]
+
+
+@dataclass(frozen=True)
+class LocalRosterIncomplete:
+    problems: list[str]
+
+
+@dataclass(frozen=True)
+class RecipientSearchFailed:
+    reason: str
+    problems: list[str]
+
+
+@dataclass(frozen=True)
 class RosterLookup:
     to: str
 
@@ -1331,6 +1349,26 @@ def _matched_recipient(
     return _messageable_recipient(entry)
 
 
+def matching_recipients(
+    to: str, scope: LocalOnly | LocalThenPeer, observed: roster.Roster,
+) -> RecipientMatches | LocalRosterIncomplete | RecipientSearchFailed:
+    """Find rows without delivering or exiting; ask the peer only after a local miss."""
+    import roster
+
+    matches = _recipient_matches(to, observed.entries)
+    if matches or isinstance(scope, LocalOnly):
+        return RecipientMatches(matches, LocalOnly(), observed.problems)
+    addressed = to.startswith(("session:", "worker:", "codex:"))
+    if observed.problems and not addressed:
+        return LocalRosterIncomplete(observed.problems)
+    peer = roster.peer_roster(os.environ)
+    problems = [*observed.problems, *peer.problems]
+    matches = _recipient_matches(to, peer.entries)
+    if not matches and peer.problems:
+        return RecipientSearchFailed("; ".join(peer.problems), problems)
+    return RecipientMatches(matches, NamedMachine(roster.remote.other_machine()), problems)
+
+
 def resolve_recipient(
     to: str, scope: RecipientResolutionScope, observed: roster.Roster,
 ) -> DeliveryRoute:
@@ -1343,24 +1381,14 @@ def resolve_recipient(
         thread_id = to.removeprefix("codex:")
         if not thread_id:
             usage_error("codex: needs a thread id")
-    import roster
-
-    result = observed
+    result = matching_recipients(to, scope, observed)
     _print_roster_problems(result.problems)
-    matches = _recipient_matches(to, result.entries)
-    if matches:
-        return _matched_recipient(to, matches, LocalOnly())
-    addressed = to.startswith(("session:", "worker:", "codex:"))
-    if isinstance(scope, LocalThenPeer):
-        if result.problems and not addressed:
-            usage_error(f"absence of {to} here is not proven; use an address or --machine")
-        peer = roster.peer_roster(os.environ)
-        _print_roster_problems(peer.problems)
-        matches = _recipient_matches(to, peer.entries)
-        if matches:
-            return _matched_recipient(to, matches, NamedMachine(roster.remote.other_machine()))
-        if peer.problems:
-            return RecipientLookupFailed("; ".join(peer.problems))
+    if isinstance(result, LocalRosterIncomplete):
+        usage_error(f"absence of {to} here is not proven; use an address or --machine")
+    if isinstance(result, RecipientSearchFailed):
+        return RecipientLookupFailed(result.reason)
+    if result.entries:
+        return _matched_recipient(to, result.entries, result.destination)
     if to.startswith("worker:"):
         usage_error(f"no roster session has address {to}")
     if to.startswith("codex:"):

@@ -92,6 +92,7 @@ POST_TOOL_USE = (
     HookSpec("post-tool-use-context-usage.py", None),
     HookSpec("post-tool-use-banned-words.py", None),
     HookSpec("post-tool-use-push-delivered.py", "PushNotification"),
+    HookSpec("post-tool-use-sendmessage-miss.py", "SendMessage"),
 )
 STOP = (
     HookSpec("stop-direct-continue.py", None),

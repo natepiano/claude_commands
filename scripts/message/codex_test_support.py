@@ -159,6 +159,28 @@ def write_codex_account(home: Path, notes: Path, label: str) -> None:
     _ = (home / "auth.json").write_text(json.dumps({"tokens": {"id_token": f"header.{claims}.signature"}}))
 
 
+def loaded_session_daemon(home: Path, names: dict[str, str], *, expect_contact: bool = True) -> FakeDaemon:
+    """Serve roster discovery only; any attempt to queue a message fails the test."""
+    def conversation(connection: socket.socket) -> None:
+        initialize = receive_frame(connection)
+        assert initialize["method"] == "initialize", initialize
+        reply(connection, initialize, {})
+        assert receive_frame(connection)["method"] == "initialized"
+        listing = receive_frame(connection)
+        assert listing["method"] == "thread/loaded/list", listing
+        reply(connection, listing, {"data": list(names)})
+        for thread in names:
+            request = receive_frame(connection)
+            assert request["method"] == "thread/read", request
+            assert request["params"] == {"threadId": thread, "includeTurns": False}, request
+            reply(connection, request, {"thread": {
+                "id": thread, "name": names[thread], "cwd": str(home), "status": {"type": "idle"},
+            }})
+
+    return FakeDaemon(home / "app-server-control/app-server-control.sock", conversation,
+                      repeat=True, expect_contact=expect_contact)
+
+
 def daemon_session_row(owner: codex_daemon.CodexDaemon, thread: str, name: str) -> roster.RosterEntry:
     """A loaded session row for tests that isolate send's formatting or transport errors."""
     import roster

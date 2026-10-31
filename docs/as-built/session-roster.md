@@ -131,6 +131,8 @@ Routes (`resolve_recipient(to: str, scope: RecipientResolutionScope, observed: r
 
 Resolution for `session:`, `worker:`, `codex:` and bare names reads this machine's roster once (problems print as `send.py: roster: <problem>`). Address forms match `Messageable` addresses exactly; names match any row without regard to letter case, with no preference for an exact-case match. `send.py` imports `roster` only on that path, so acknowledgements (`ack`, `reopen`, `pending`, `retire`), `uds:` sockets and `--machine` sends start without it.
 
+`post-tool-use-sendmessage-miss.py` runs after SendMessage. Only a failed "No agent named … is reachable" result for a name reads the roster. The hook and send.py share `matching_recipients(to, scope, observed)`: casefold matches here first, then on the peer after a proven local miss. The hook adds context with each matching session's kind, account, machine and address, plus the send.py command to run with the sandbox off. Multiple matches require one listed address; a clean miss or roster error is stated. The hook never sends or blocks; successes, socket addresses and other failures do not read the roster.
+
 - A match here sends here; the other machine is not asked.
 - Several matching rows: exit 2, `<name> matches <N> sessions:` with each address (or its `cannot take messages` reason) and role; Codex daemon rows also name their account and home.
 - One `CannotReceiveMessages` row: exit 2 with `cannot_receive_message_text`.
