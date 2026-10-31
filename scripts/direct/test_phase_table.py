@@ -21,8 +21,11 @@ from zoneinfo import ZoneInfo
 from scripts.direct import phase_table
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib.socket_test_support import short_socket_directory
-from scripts.production import fake_showrunner, fake_unit_host, showrunners
+from scripts.production import fake_showrunner, fake_unit_host, showrunners, staff
 from scripts.production.production_units import read_production
+from scripts.production.staff_test_support import (
+    isolated_staff_file, production_membership, showrunner_relationship, unit_membership,
+)
 
 
 SCRIPT = Path(__file__).with_name("phase_table.py")
@@ -56,6 +59,8 @@ class PhaseTableTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", {}))
+        production_membership("show")
         self.history_dir = self.root / "history"
         self.working_dir = self.root / "worktree"
         self.session_dir = self.root / "session"
@@ -197,6 +202,7 @@ class PhaseTableTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        production_membership("show", *(row[0] for row in rows if not row[1].startswith("retired")))
         return path
 
     def make_live_worktree(self, name: str) -> Path:
@@ -383,6 +389,7 @@ class PhaseTableTests(unittest.TestCase):
             self.write_showrunner()
 
     def mark_unit(self, live_name: str = "") -> None:
+        production_membership("show", "table-unit")
         fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
             "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "table-unit"})])
         if not live_name:
@@ -3663,6 +3670,7 @@ class PhaseTableTests(unittest.TestCase):
                 "### Phase 1 — Current delivery  · status: todo",
             )
         )
+        _ = staff.move(unit_membership("show", "table-unit").id, showrunner_relationship("other").id)
         fake_unit_host.write(self.environment(), [fake_unit_host.HostedUnit(
             "table-host", "w1:p1", {"SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "table-unit"})])
         live_record = cast(dict[str, object], json.loads(

@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 import unittest
+import contextlib
 from scripts.direct import implement_launcher_test_support as support
 from scripts.direct.implement_launcher_test_support import STUB_MESH as STUB_MESH
 from typing import cast
@@ -266,12 +267,17 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
         self.assertEqual(roster[name]["task"], "direct.impl")
 
     def test_worker_and_turn_identity_are_recorded_before_the_heartbeat_watcher_starts(self) -> None:
+        watcher = self.root / "scripts" / "agents" / "heartbeat_watch.sh"
+        original_watcher = watcher.read_text()
+        launch_directory = self.root / "launcher-cwd"
+        launch_directory.mkdir()
         for follow in (False, True):
             with self.subTest(follow=follow):
                 session = self.start_phase(f"identity-before-heartbeat-{follow}")
                 arguments = ["bash", str(self.implement_script)]
                 if follow:
-                    initial = self.mesh_launch(session)
+                    with contextlib.chdir(launch_directory):
+                        initial = self.mesh_launch(session)
                     self.assertEqual(initial.returncode, 0, initial.stderr)
                     roster = cast("dict[str, object]", json.loads((session / "mesh_roster.json").read_text()))
                     arguments.extend(["--to", next(iter(roster))])
@@ -293,7 +299,7 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
                 if follow:
                     environment.update({"STUB_FOLLOW_HOLD": "after", "STUB_LAUNCH_RELEASE": str(release)})
                 process = subprocess.Popen(arguments, env=environment, stdout=subprocess.PIPE,
-                                           stderr=subprocess.PIPE, text=True, start_new_session=True)
+                                           stderr=subprocess.PIPE, text=True, start_new_session=True, cwd=launch_directory)
                 try:
                     wait_for_file(witness)
                     identity = cast("dict[str, object]", json.loads(witness.read_text()))
@@ -306,7 +312,32 @@ class ImplementLauncherWorkerTests(support.ImplementLauncherFixture):
                 finally:
                     release.touch()
                     output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
+                    _ = watcher.write_text(original_watcher)
                 self.assertEqual(process.returncode, 0, output + errors)
+                self.assertEqual(list(launch_directory.iterdir()), [], "heartbeat watcher leaked a relative temporary file")
+
+    def test_a_refused_compaction_roster_write_stops_before_claiming_or_sending_follow_up(self) -> None:
+        session_dir = self.start_phase("compact-roster-changed")
+        first = self.mesh_launch(session_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        roster = cast("dict[str, object]", json.loads(
+            (session_dir / "mesh_roster.json").read_text(encoding="utf-8")
+        ))
+        name = next(iter(roster))
+        self.set_mesh_context(session_dir, name, 126299)
+        original = (session_dir / "mesh_roster.json").read_bytes()
+        (session_dir / "compact_roster_changed").touch()
+
+        result = self.mesh_launch(session_dir, to=name)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("roster changed during compaction", result.stderr)
+        self.assertEqual((session_dir / "mesh_events.txt").read_text().splitlines(), ["compact"])
+        self.assertEqual((session_dir / "mesh_roster.json").read_bytes(), original)
+        self.assertFalse((session_dir / "follow_message.txt").exists())
+        board = (session_dir / "board.log").read_text(encoding="utf-8")
+        self.assertIn("follow-up not sent", board)
+        self.assertNotIn("continuing follow-up", board)
 
 
 if __name__ == "__main__":

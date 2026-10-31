@@ -18,12 +18,15 @@ from typing import cast, override
 from unittest import mock
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 TEST_HANG_GUARD_SECS = 300
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fake_unit_host
-import showrunners
+from scripts.production import showrunners
 from sessions import SessionRecord
 from fake_unit_host import HostedUnit
 from scripts.lib.socket_test_support import short_socket_directory
@@ -483,8 +486,8 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
             delivery = showrunners.tell_others({"self": "skip", "top": "hello", "mid": "hello"}, "notice")
         self.assertEqual(list(delivery.lines), ["told top", "could not tell mid: offline"])
         self.assertEqual(delivery.failed, ("mid",))
-        self.assertEqual(sender.call_args_list, [mock.call("session:top", "notice", "hello", recipient="top"),
-                                                 mock.call("session:mid", "notice", "hello", recipient="mid")])
+        self.assertEqual(sender.call_args_list, [mock.call("session:top", "notice", "hello", recipient="top", sender="showrunners"),
+                                                 mock.call("session:mid", "notice", "hello", recipient="mid", sender="showrunners")])
         with self.assertRaises(FrozenInstanceError):
             setattr(delivery, "lines", ())
         with self.assertRaises(FrozenInstanceError):

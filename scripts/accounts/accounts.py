@@ -54,6 +54,7 @@ from scripts.accounts.refusals import (  # noqa: E402
 )
 
 from scripts.accounts import next_moves
+from scripts.shutdown import stop_results
 sys.path.insert(0, str(SCRIPTS / "shutdown"))
 from scripts.accounts.role_map import (  # noqa: E402
     RoleMap as RoleMap, RoleMapChange as RoleMapChange,
@@ -63,7 +64,6 @@ from scripts.accounts.role_map import (  # noqa: E402
 )
 
 if TYPE_CHECKING:
-    from scripts.shutdown import stop_resume
     from scripts.agents.codex_mesh import WorkersRunSwitch
     from scripts.shutdown.inventory import ListedSession, Session, ShowrunnerRegistrations
 
@@ -427,8 +427,7 @@ class AccountStatus:
     role: str
     problems: tuple[str, ...]
     unclassified: tuple[str, ...]
-    missing_mcp_servers: tuple[str, ...]
-    extra_mcp_servers: tuple[str, ...]
+    mcp_differences: McpServerDifferences
     state_source: ObservedStateCause | NoObservedStateCause = field(default_factory=NoObservedStateCause)
     note_source: ObservedStateCause | NoObservedStateCause = field(default_factory=NoObservedStateCause)
     mcp_baseline_problems: tuple[UnreadableMcpConfiguration, ...] = ()
@@ -481,6 +480,8 @@ class CommandLine(argparse.Namespace):
     as_json: bool = False
     stored: bool = False
     change: str = ""
+    server: str = ""
+    direction: McpDirection = "off"
 
 
 
@@ -616,6 +617,14 @@ def account_dir(label: str) -> Path:
     if not isinstance(parsed, note_file.NumberedAccountLabel) or parsed.tool != "claude":
         raise AccountsError(f"accounts: {label} is not a claudeN label")
     return accounts_home() / f".claude{parsed.number}"
+
+
+def claude_config_label(config_dir: Path) -> str:
+    """The launch folder's account label, retaining legacy and custom folder names.
+
+    This names a folder without reading its login or validating it as a numbered account.
+    """
+    return config_dir.name.removeprefix(".")
 
 
 def codex_setup_home(label: str) -> Path:
@@ -1630,7 +1639,7 @@ def trust_sources(target_dir: Path, source_dir: Path | None) -> list[tuple[str, 
     `herdr.heal_claude_trust` copies a folder's trust from the first of them that has it.
     """
     home = (accounts_home() / ".claude").resolve()
-    candidates = [NamedAccount(source_dir.name.removeprefix("."), source_dir)] if source_dir is not None else []
+    candidates = [NamedAccount(claude_config_label(source_dir), source_dir)] if source_dir is not None else []
     candidates.extend(_existing_named_accounts())
     sources: dict[Path, tuple[str, Path]] = {}
     for named in candidates:
@@ -3014,9 +3023,12 @@ class SessionMoveRefused:
     reason: str
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.Resumed | stop_resume.MoveHandedOff | SessionMoveRefused, ...]:
+class SessionBatchMove(Protocol):
+    def __call__(self, sessions: list[str], target: str, *, why: str) -> list[stop_results.MoveResult]: ...
+
+
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_results.ClaudeUp | stop_results.MoveHandedOff | SessionMoveRefused, ...]:
     """Stop and resume each selected local owner through the shared move API."""
-    from scripts.shutdown import stop_resume
 
     if TYPE_CHECKING:
         from scripts.shutdown import inventory
@@ -3041,26 +3053,26 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_
             refused[identity] = SessionMoveRefused(identity, "already on " + checked.destination.label)
         else:
             eligible.append(identity)
-    outcomes: dict[str, stop_resume.Resumed | stop_resume.MoveHandedOff | SessionMoveRefused] = dict(refused)
-    results = stop_resume.move_sessions(eligible, checked.destination.label, why=why)
+    outcomes: dict[str, stop_results.ClaudeUp | stop_results.MoveHandedOff | SessionMoveRefused] = dict(refused)
+    batch = cast(SessionBatchMove, import_module("scripts.shutdown.stop_resume").move_sessions)
+    results = batch(eligible, checked.destination.label, why=why)
     for identity, result in zip(eligible, results):
-        if isinstance(result, (stop_resume.Resumed, stop_resume.MoveHandedOff)):
+        if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff)):
             outcomes[identity] = result
         else:
-            reason = ("session has no tab on this machine" if isinstance(result, stop_resume.SessionNotFound)
+            reason = ("session has no tab on this machine" if isinstance(result, stop_results.SessionNotFound)
                       else result.reason)
             outcomes[identity] = SessionMoveRefused(identity, reason)
     return tuple(outcomes[identity] for identity in selected)
 
 
-def move_result_line(result: stop_resume.Resumed | stop_resume.MoveHandedOff | SessionMoveRefused) -> str:
+def move_result_line(result: stop_results.ClaudeUp | stop_results.MoveHandedOff | SessionMoveRefused) -> str:
     if isinstance(result, SessionMoveRefused):
         return f"{result.session_id}: not moved: {result.reason}"
-    from scripts.shutdown import stop_resume
 
-    if isinstance(result, stop_resume.MoveHandedOff):
+    if isinstance(result, stop_results.MoveHandedOff):
         return f"{result.session_id}: moving now"
-    return f"{result.session_id}: resumed on {result.account} in {result.pane_id}"
+    return stop_results.claude_up_line(result)
 
 
 @dataclass(frozen=True)
@@ -3133,41 +3145,8 @@ class MoveDryRun:
     lines: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class MoveTargetHoldClear:
-    notices: tuple[str, ...] = ()
-
-
-def check_move_target_hold(target: str, *, dry_run: bool = False) -> MoveTargetHoldClear | MoveRefused:
-    """Check the target before changing a group or stopping a session."""
-    if dry_run:
-        return MoveTargetHoldClear((f"{target}: would check the shutdown hold",))
-    sys.path.insert(0, str(SCRIPTS / "shutdown"))
-    if TYPE_CHECKING:
-        from scripts.shutdown import launch_permission
-    else:
-        launch_permission = import_module("launch_permission")
-    environment = {**os.environ, "CLAUDE_CONFIG_DIR": str(claude_account_dir(target))}
-    permission = launch_permission.launch_permission(environment, launch_permission.NewWorkLaunchPurpose())
-    if isinstance(permission, launch_permission.BlockedByShutdown):
-        return MoveRefused(f"accounts: {permission.reason}; no session was stopped")
-    if isinstance(permission, launch_permission.ShutdownStateUnreadable):
-        return MoveRefused(f"accounts: shutdown state unreadable: {permission.detail}; no session was stopped")
-    released = permission.released
-    if released is None:
-        return MoveTargetHoldClear()
-    requester = (f"session {released.session_id[:8]}" if released.session_id is not None
-                 else "requested in a terminal or by a recovery snapshot")
-    at = datetime.fromisoformat(released.requested_at).astimezone(agent_accounts.user_zone())
-    return MoveTargetHoldClear((f"cleared a finished {released.then} hold on {released.label} "
-                               + f"from {at:%Y-%m-%d %H:%M %Z} ({requester})",))
-
-
 def check_move_target(target: str, now: datetime, *, repair: bool = True) -> MoveTargetReady | MoveRefused:
     """Check the destination without changing a group or starting a shutdown."""
-    hold = check_move_target_hold(target, dry_run=not repair)
-    if isinstance(hold, MoveRefused):
-        return hold
     destination = _move_target(target, repair=repair)
     if isinstance(destination, MoveRefused):
         return destination
@@ -3185,18 +3164,18 @@ def check_move_target(target: str, now: datetime, *, repair: bool = True) -> Mov
                     chosen = pick("claude", now, exclude=frozenset({destination.label}), keep=NoKeep())
                     room = f"{chosen.label} has room" if isinstance(chosen, PickedAccount) else no_room_line("claude", chosen)
                     return MoveRefused(f"accounts: {destination.label} is out of usage ({name} {window.left:g}% left, resets {reset}); {room}")
-        return MoveTargetReady(destination, hold.notices)
+        return MoveTargetReady(destination, ())
     windows = ((reading.weekly, reading.five_hour) if isinstance(reading, StaleReading) else ())
     times = [window.at for window in windows if isinstance(window, ReadingWindow)]
     age = f"last {max(0, int((now - max(times)).total_seconds() // 60))} minutes ago" if times else "last reading unknown"
-    return MoveTargetReady(destination, (*hold.notices, f"no fresh usage reading for {destination.label} ({age})"))
+    return MoveTargetReady(destination, (f"no fresh usage reading for {destination.label} ({age})",))
 
 
 def move_preview_line(member: ListedSession, target: str) -> str:
     return f"{member.name}: {member.session_id} · stop, then resume on {target} (from {session_account_label(member)})"
 
 
-def _move_output(results: tuple[stop_resume.Resumed | stop_resume.MoveHandedOff | SessionMoveRefused, ...],
+def _move_output(results: tuple[stop_results.ClaudeUp | stop_results.MoveHandedOff | SessionMoveRefused, ...],
                  notices: tuple[str, ...]) -> tuple[str, str, int]:
     stdout = "".join(line + "\n" for line in notices)
     stderr = ""
@@ -3564,10 +3543,31 @@ class ProjectMcpServers:
     names: frozenset[str]
 
 
+McpDirection = Literal["off", "on"]
+
+
+@dataclass(frozen=True)
+class McpServerDifference:
+    """The scopes where one server changes in one direction."""
+
+    server: str
+    direction: McpDirection
+    projects: tuple[str, ...]
+
+
 @dataclass(frozen=True)
 class McpServerDifferences:
-    missing: tuple[str, ...] = ()
-    extra: tuple[str, ...] = ()
+    entries: tuple[McpServerDifference, ...] = ()
+
+
+@dataclass(frozen=True)
+class McpConfigurationInspection:
+    """The comparison and faults from inspecting both configurations safely."""
+
+    differences: McpServerDifferences
+    account_is_safe_to_inspect: bool
+    baseline_problems: tuple[UnreadableMcpConfiguration, ...]
+    account_problems: tuple[UnreadableMcpConfiguration, ...]
 
 
 def _mcp_server_names(config_file: Path, project: Path) -> ReadMcpConfiguration | UnreadableMcpConfiguration:
@@ -3604,15 +3604,43 @@ def _mcp_differences(baseline: ReadMcpConfiguration | UnreadableMcpConfiguration
     baseline_projects = {scope.path: scope.names for scope in baseline.projects}
     current_projects = {scope.path: scope.names for scope in current.projects}
     homes = {str(main_config_dir().resolve()), str(directory.resolve())}
-    comparisons = [(baseline.names, current.names), *((baseline_projects.get(path, baseline.global_names),
-        current_projects.get(path, current.global_names)) for path in baseline_projects.keys() | current_projects.keys()
+    comparisons = [("~", baseline.names, current.names), *((path, baseline_projects.get(path, baseline.global_names),
+        current_projects.get(path, current.global_names)) for path in sorted(baseline_projects.keys() | current_projects.keys())
         if path not in homes)]
-    missing: set[str] = set()
-    extra: set[str] = set()
-    for before, after in comparisons:
-        missing.update(before - after)
-        extra.update(after - before)
-    return McpServerDifferences(tuple(sorted(missing)), tuple(sorted(extra)))
+    projects: dict[tuple[str, McpDirection], list[str]] = {}
+    for path, before, after in comparisons:
+        for server in before - after:
+            projects.setdefault((server, "off"), []).append(path)
+        for server in after - before:
+            projects.setdefault((server, "on"), []).append(path)
+    return McpServerDifferences(tuple(McpServerDifference(server, direction, tuple(paths))
+        for (server, direction), paths in sorted(projects.items())))
+
+
+def _inspect_mcp_configuration(directory: Path) -> McpConfigurationInspection:
+    baseline = _mcp_server_names(agent_accounts.claude_config_file(main_config_dir()), main_config_dir())
+    config_file = directory / ".claude.json"
+    account_is_safe_to_inspect = not directory.is_symlink() and not config_file.is_symlink()
+    current = _mcp_server_names(config_file, directory) if account_is_safe_to_inspect else baseline
+    return McpConfigurationInspection(
+        _mcp_differences(baseline, current, directory), account_is_safe_to_inspect,
+        (baseline,) if isinstance(baseline, UnreadableMcpConfiguration) else (),
+        (current,) if account_is_safe_to_inspect and isinstance(current, UnreadableMcpConfiguration) else (),
+    )
+
+
+def mcp_projects(label: str, server: str, direction: McpDirection) -> tuple[str, ...]:
+    """Read the differing scopes without changing either configuration."""
+    directory = account_dir(label)
+    inspection = _inspect_mcp_configuration(directory)
+    if not inspection.account_is_safe_to_inspect:
+        raise AccountsError(f"accounts: cannot inspect linked MCP configuration for {label}")
+    if not directory.is_dir():
+        raise AccountsError(f"accounts: {label} is not set up; run accounts.py setup {label}")
+    for configuration in (*inspection.baseline_problems, *inspection.account_problems):
+        raise AccountsError(f"accounts: cannot read MCP configuration {configuration.path}: {configuration.reason}")
+    return next((entry.projects for entry in inspection.differences.entries
+                 if entry.server == server and entry.direction == direction), ())
 
 
 def _existing_named_accounts() -> list[NamedAccount]:
@@ -3622,51 +3650,43 @@ def _existing_named_accounts() -> list[NamedAccount]:
         return []
     accounts: list[NamedAccount] = []
     for child in children:
-        match = re.fullmatch(r"\.claude([1-9][0-9]*)", child.name)
-        if match is not None:
-            accounts.append(NamedAccount(note_file.NumberedAccountLabel("claude", int(match.group(1))).label, child))
+        label = claude_config_label(child)
+        if child.name.startswith(".") and re.fullmatch(r"claude[1-9][0-9]*", label):
+            accounts.append(NamedAccount(label, child))
     return sorted(accounts, key=lambda account: _label_number(account.label))
 
 
 def _status_for(config_dir: Path, folder: str, named: NamedAccount, problems: list[str],
                 state_source: ObservedStateCause | NoObservedStateCause = NO_OBSERVED_STATE_CAUSE,
                 note_source: ObservedStateCause | NoObservedStateCause = NO_OBSERVED_STATE_CAUSE) -> AccountStatus:
-    baseline = _mcp_server_names(agent_accounts.claude_config_file(main_config_dir()), main_config_dir())
-    account_is_safe_to_inspect = not config_dir.is_symlink() and not (
-        (config_dir / ".claude.json").is_symlink()
-    )
+    mcp = _inspect_mcp_configuration(config_dir)
     # A named folder keeps its own label whatever login it holds; `problems` names a mismatch.
     label = named.label
     login = ""
-    if account_is_safe_to_inspect:
+    if mcp.account_is_safe_to_inspect:
         identity = account_identity(config_dir)
         if isinstance(identity, (agent_accounts.NumberedAccount, agent_accounts.UnnotedLogin)):
             login = identity.login
             if isinstance(identity, agent_accounts.UnnotedLogin):
                 problems.append(unnoted_home_line(config_dir, identity.login))
-        config_file = config_dir / ".claude.json"
-        current = _mcp_server_names(config_file, config_dir)
         unclassified = _unclassified(config_dir)
     else:
-        current = baseline
         unclassified = ()
-    differences = _mcp_differences(baseline, current, config_dir)
     return AccountStatus(
         folder=folder,
         config_dir=config_dir,
         is_named_account=True,
         is_set_up=True,
-        account_is_safe_to_inspect=account_is_safe_to_inspect,
+        account_is_safe_to_inspect=mcp.account_is_safe_to_inspect,
         label=label,
         login=login,
         role="",
         problems=tuple(problems),
         unclassified=unclassified,
-        missing_mcp_servers=differences.missing,
-        extra_mcp_servers=differences.extra,
+        mcp_differences=mcp.differences,
         state_source=state_source,
         note_source=note_source,
-        mcp_baseline_problems=(baseline,) if isinstance(baseline, UnreadableMcpConfiguration) else (),
+        mcp_baseline_problems=mcp.baseline_problems,
     )
 
 
@@ -3706,8 +3726,7 @@ def account_statuses() -> list[AccountStatus]:
             role=NO_VALUE,
             problems=(),
             unclassified=(),
-            missing_mcp_servers=(),
-            extra_mcp_servers=(),
+            mcp_differences=McpServerDifferences(),
         ))
     return statuses
 
@@ -4133,19 +4152,27 @@ class OwnProblemCause:
 
 
 @dataclass(frozen=True)
+class McpServerCause:
+    """One server and direction remain independent of other MCP faults."""
+
+    server: str
+    direction: McpDirection
+
+
+@dataclass(frozen=True)
 class ProblemCauseKey:
     """One cause on one account or home, shared by its symptoms."""
 
     kind: ProblemKind
     account: CauseAccount | NoCauseAccount
-    location: CauseFile | DuplicateLoginHomes | UsageServiceFailure | NoCauseFile
+    location: CauseFile | DuplicateLoginHomes | UsageServiceFailure | McpServerCause | NoCauseFile
 
 
 @dataclass(frozen=True)
 class ProblemCause:
     kind: ProblemKind
     explanation: str
-    location: CauseFile | DuplicateLoginHomes | UsageServiceFailure | NoCauseFile = NoCauseFile()
+    location: CauseFile | DuplicateLoginHomes | UsageServiceFailure | McpServerCause | NoCauseFile = NoCauseFile()
     account: CauseAccount | NoCauseAccount = NoCauseAccount()
     key: ProblemCauseKey | OwnProblemCause = OwnProblemCause()
 
@@ -4175,6 +4202,9 @@ class StatusProblem:
 
 
 def render_status_problem(problem: StatusProblem) -> str:
+    if isinstance(problem.cause, ProblemCause) and isinstance(problem.cause.location, McpServerCause):
+        line = f"{problem.subject} {problem.wrong}"
+        return line + ": " + problem.step.instruction if isinstance(problem.step, ProblemStep) else line
     parts = [f"{problem.subject}: {problem.wrong}"]
     if isinstance(problem.cause, ProblemCause):
         parts.append(problem.cause.explanation)
@@ -4388,11 +4418,16 @@ def _status_problems(status: AccountStatus | CodexStatus, *, detail: bool, zone:
         problems.append(StatusProblem(subject, "unclassified entries", ProblemCause("unclassified", ", ".join(status.unclassified)),
             ProblemStep(f"check these entries in {status.folder}; keep private files in this home")))
     if isinstance(status, AccountStatus):
-        differences = [*(f"- {name}" for name in status.missing_mcp_servers), *(f"+ {name}" for name in status.extra_mcp_servers)]
-        if differences:
-            problems.append(StatusProblem(subject, "mcpServers differ from ~/.claude",
-                ProblemCause("mcp servers", ", ".join(differences)),
-                ProblemStep(f"check mcpServers in {status.folder}/.claude.json against {_codex_folder(agent_accounts.claude_config_file(main_config_dir()))}")))
+        for difference in status.mcp_differences.entries:
+            count = len(difference.projects)
+            scopes = "project" if count == 1 else "projects"
+            arguments = (status.label, difference.server, difference.direction)
+            command = ("~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects "
+                       + shlex.join(("--", *arguments) if any(value.startswith("-") for value in arguments) else arguments))
+            problems.append(StatusProblem(subject,
+                f"turns {difference.server} {difference.direction} in {count} {scopes} where ~/.claude does not",
+                ProblemCause("mcp servers", ", ".join(difference.projects),
+                    McpServerCause(difference.server, difference.direction)), ProblemStep(command)))
     bound: list[StatusProblem] = []
     for problem in problems:
         if isinstance(problem.cause, ProblemCause):
@@ -4415,7 +4450,7 @@ def _status_cause_account(status: AccountStatus | CodexStatus) -> CauseAccount |
 
 
 def _status_cause_key(status: AccountStatus | CodexStatus, kind: ProblemKind,
-                      specific: CauseFile | DuplicateLoginHomes | UsageServiceFailure | NoCauseFile = NO_CAUSE_FILE) -> ProblemCauseKey:
+                      specific: CauseFile | DuplicateLoginHomes | UsageServiceFailure | McpServerCause | NoCauseFile = NO_CAUSE_FILE) -> ProblemCauseKey:
     if not isinstance(specific, NoCauseFile):
         return ProblemCauseKey(kind, NoCauseAccount() if isinstance(specific, DuplicateLoginHomes)
                                else _status_cause_account(status), specific)
@@ -4792,7 +4827,7 @@ def read_status(*, source: UsageSource = REFRESH_STALE_USAGE, detail: bool = Fal
         if not line.strip() or line in represented or line in diagnostics.delivered:
             continue
         mcp = re.fullmatch(r"~/(\.claude[0-9]+): mcpServers: .*", line)
-        if mcp and any(note.startswith(mcp[1][1:] + ": mcpServers differ") for note in notes):
+        if mcp and any(note.startswith(mcp[1][1:] + " turns ") and " where ~/.claude does not: " in note for note in notes):
             continue
         notes.append(render_status_problem(StatusProblem("accounts", "read warning",
             ProblemCause("warning", line), NoUserStep())))
@@ -4990,6 +5025,10 @@ def _parser() -> argparse.ArgumentParser:
     for action in ("setup", "check"):
         command = commands.add_parser(action)
         _ = command.add_argument("label")
+    mcp_command = commands.add_parser("mcp-projects", help="list projects where an account's MCP server differs")
+    _ = mcp_command.add_argument("label")
+    _ = mcp_command.add_argument("server")
+    _ = mcp_command.add_argument("direction", choices=("off", "on"))
     cutover = commands.add_parser("cutover-home")
     _ = cutover.add_argument("label", nargs="?", default="")
     _ = cutover.add_argument("--undo", action="store_true")
@@ -5114,6 +5153,10 @@ def main(argv: list[str]) -> int:
             return 0
         if options.detail and options.action != "status":
             raise AccountsError("--detail goes only with no action")
+        if options.action == "mcp-projects":
+            for path in mcp_projects(options.label, options.server, options.direction):
+                print(path)
+            return 0
         if options.action == "placement":
             print(placement_report())
             return 0

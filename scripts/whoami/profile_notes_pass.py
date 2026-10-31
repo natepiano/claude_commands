@@ -129,8 +129,6 @@ class NotesPass:
     showrunners: ModuleType
     run_out: ModuleType
     outage: ModuleType
-    record: ModuleType
-    permission: ModuleType
 
 
 def load_pass() -> NotesPass:
@@ -144,8 +142,7 @@ def load_pass() -> NotesPass:
         import_module("five_hour"), import_module("scripts.accounts.role_map"),
         import_module("scripts.accounts.moves"), import_module("scripts.accounts.next_moves"),
         import_module("scripts.accounts.refusals"), import_module("scripts.production.showrunners"),
-        import_module("scripts.whoami.run_out"), import_module("scripts.accounts.outage_alerts"),
-        import_module("shutdown_record"), import_module("launch_permission"))
+        import_module("scripts.whoami.run_out"), import_module("scripts.accounts.outage_alerts"))
 
 
 def result(owner: ModuleType, name: str, *args: object) -> object:
@@ -197,8 +194,6 @@ def patch_list(pass_: NotesPass) -> tuple[PassCallPatch, ...]:
                        result(a, "LoginRenewalFailed", "profile: renewal suppressed")),
         PassCallPatch(a, "prepared_account", "repairs account links before a move",
                        result(a, "AccountRefused", "profile: account preparation suppressed")),
-        PassCallPatch(a, "check_move_target_hold", "can clear a finished shutdown hold",
-                       result(a, "MoveRefused", "profile: hold change suppressed")),
         PassCallPatch(a, "set_group_account", "changes a group selection",
                        result(a, "GroupTransition", "profile", result(a, "HandOrigin"))),
         PassCallPatch(a, "move_sessions", "starts session shutdowns and restarts", ()),
@@ -206,14 +201,9 @@ def patch_list(pass_: NotesPass) -> tuple[PassCallPatch, ...]:
         PassCallPatch(d, "_write_state", "writes watchdog outage ownership"),
         PassCallPatch(d, "_start_recovery", "starts a detached unit restart"),
         PassCallPatch(d, "_alert_failure", "claims an outage and sends its failure push"),
-        PassCallPatch(d, "_alert_without_record", "claims a dropped-record outage and pushes it"),
+        PassCallPatch(d, "_alert_without_record", "claims an outage without a launch and pushes it"),
         PassCallPatch(pass_.showrunners, "tell", "sends a watchdog outcome to a showrunner", "profile: message suppressed"),
         PassCallPatch(pass_.outage, "clear", "clears the outage alert ledger", False),
-        PassCallPatch(pass_.record, "clear_restore_alert", "clears a restart alert marker"),
-        PassCallPatch(pass_.record, "mark_snapshot_agent_exited", "updates saved crash evidence", False),
-        PassCallPatch(pass_.record, "restore_snapshot_agent_exited", "restores saved crash evidence", False),
-        PassCallPatch(pass_.permission, "launch_permission", "runs launch-blocked which can release shutdown holds",
-                       result(pass_.permission, "BlockedByShutdown", "profile: launch action suppressed")),
         PassCallPatch(import_module("scripts.whoami.agent_accounts"), "codex_live",
                        "starts a Codex server that can write its session index; uses copied timer reports", mode="codex"),
         PassCallPatch(q, "codex_live",
@@ -238,7 +228,7 @@ def patch_list(pass_: NotesPass) -> tuple[PassCallPatch, ...]:
 
 def state_copies(pass_: NotesPass) -> tuple[StateCopy, ...]:
     """Only side-effect state is copied. Notes, transcripts, registry and rosters stay live."""
-    account_patterns = ("refusal_watch.json", "pending_cleared_holds.json", "login_renewals.json",
+    account_patterns = ("refusal_watch.json", "login_renewals.json",
                         "assumed_refusals/*.json", "unit-watchdog-results/*.json")
     return (
         StateCopy(pass_.usage, "store_file", state_path(pass_.usage, "store_file", True), True),
@@ -262,8 +252,6 @@ def state_copies(pass_: NotesPass) -> tuple[StateCopy, ...]:
         StateCopy(pass_.next_moves, "next_moves_file", state_path(pass_.next_moves, "next_moves_file", True), True),
         StateCopy(pass_.refusals, "store_file", state_path(pass_.refusals, "store_file", True), True),
         StateCopy(pass_.watchdog, "_state_file", state_path(pass_.watchdog, "_state_file", True), True),
-        StateCopy(pass_.record, "_state_root", state_path(pass_.record, "_state_root", True), True,
-                  ("snapshots/*.json", "*/*.json")),
         StateCopy(pass_.outage, "_path", state_path(pass_.outage, "_path", True), True),
         StateCopy(pass_.accounts, "login_renewals_file", state_path(pass_.accounts, "login_renewals_file", True), True),
     )

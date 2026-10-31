@@ -14,6 +14,17 @@ else:
 require_checkout(Path(__file__))
 
 
+def gate_isolation_environment(root: Path) -> dict[str, str]:
+    """Keep a gate subprocess outside the caller's holds and session records."""
+    return {
+        "BUILD_HOLD_DIR": str(root / "holders"),
+        "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+        "UNIT_ACTIVE_DIR": str(root / "active"),
+        "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+        "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+    }
+
+
 def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
                          total_kib: int = 67108864, full_avg10: float = 0.0,
                          swap_total_kib: int = 0, swap_free_kib: int = 0, some_avg10: float = 0.0) -> dict[str, str]:

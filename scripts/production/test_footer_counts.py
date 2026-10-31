@@ -11,13 +11,15 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import change_review
 import footer_counts
 import next_item
 import proposal_issue
 import proposals_folder
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
 from footer_counts import FooterCounts

@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Self, cast, override
 from unittest.mock import Mock, patch
 
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
 from scripts.agents import codex_mesh
-from scripts.production.showrunner_registry_test_support import scratch_showrunner_registry
 from scripts.whoami import agent_accounts
 
 send_role_map_command = role_map.ssh_role_map
@@ -48,11 +48,10 @@ class RoleMapTests(unittest.TestCase):
             for label in ("claude1", "claude2", "claude3", "codex1", "codex3"):
                 _ = (home / "notes" / f"{label}.md").write_text(
                     f"---\nlogin: {label}@example.invalid\n---\n")
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.home), "AGENT_NOTES_DIR": str(self.home / "notes"),
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {
+            "AGENT_NOTES_DIR": str(self.home / "notes"),
             "USER_ZONE": "America/New_York", "PATH": os.defpath,
         }, clear=True)))
-        _ = self.enterContext(scratch_showrunner_registry(self.home))
         _ = self.enterContext(patch.object(role_map, "ROLE_MAP_HOST", "natedev"))
         _ = self.enterContext(patch.object(socket, "gethostname", return_value="macbook"))
         _ = self.enterContext(patch.object(role_map, "_login_home", return_value=role_map.LoginHome(self.home)))
@@ -180,8 +179,8 @@ class RoleMapTests(unittest.TestCase):
 
     def remote(self, arguments: tuple[str, ...]) -> str:
         """Run the real remote CLI against a second scratch home, never a shell or ssh."""
-        with (patch.dict(os.environ, {"HOME": str(self.server_home),
-                                     "AGENT_NOTES_DIR": str(self.server_home / "notes")}),
+        with (scratch_account_home(self.server_home, {
+                  "AGENT_NOTES_DIR": str(self.server_home / "notes")}, clear=False),
               patch.object(socket, "gethostname", return_value="natedev")):
             code, output, error = self.cli(*arguments)
         self.assertEqual((code, error), (0, ""))
@@ -218,7 +217,7 @@ class RoleMapTests(unittest.TestCase):
         alias.symlink_to(self.home, target_is_directory=True)
         for process_home, login_home in ((alias, self.home), (self.home, alias)):
             with (self.subTest(process_home=process_home, login_home=login_home),
-                  patch.dict(os.environ, {"HOME": str(process_home)}),
+                  scratch_account_home(process_home, {}, clear=False),
                   patch.object(role_map, "_login_home", return_value=role_map.LoginHome(login_home)),
                   patch.object(role_map, "ssh_role_map", side_effect=self.remote) as ssh):
                 selected = role_map.read_role_map()
@@ -283,7 +282,7 @@ class RoleMapTests(unittest.TestCase):
             mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
 
         def identity(path: Path) -> agent_accounts.NumberedAccount:
-            label = path.name.removeprefix(".")
+            label = accounts.claude_config_label(path)
             return agent_accounts.NumberedAccount(label, path, label + "@example.invalid")
 
         reading = refusals.FreshReading(refusals.ReadingWindow(0,

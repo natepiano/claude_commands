@@ -20,6 +20,7 @@ from types import FrameType
 from typing import NoReturn, cast, final
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.process_failure import failure_detail
 from scripts.agents import codex_mesh
 from scripts.direct import workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
@@ -385,11 +386,15 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         if isinstance(context_tokens, int) and context_tokens > threshold:
             compact = dispatch.mesh_call("compact", capture=True, check=False)
             if compact.returncode:
-                detail = (compact.stderr.strip() or compact.stdout.strip() or f"exit {compact.returncode}").splitlines()[-1]
+                detail = failure_detail(compact, lines=1).replace("\n", "; ")
                 if compact.returncode == 3:
                     dispatch.board(slot, "status", f"launcher: {dispatch.worker} still has a live turn after compaction: {detail}; follow-up not sent")
                     refuse(f"{dispatch.worker} still has a live turn after compaction; end the worker "
                            + f"(codex_mesh.py end --to {dispatch.worker}) and start a fresh one")
+                if compact.returncode == codex_mesh.COMPACT_ROSTER_CHANGED:
+                    dispatch.board(slot, "status", f"launcher: {detail}; follow-up not sent")
+                    refuse(f"{dispatch.worker}: roster changed during compaction; follow-up not sent; "
+                           + f"inspect the worker and use codex_mesh.py reopen --to {dispatch.worker} if idle")
                 dispatch.board(slot, "status", f"launcher: compaction failed for {dispatch.worker}: {detail}; continuing follow-up")
             else:
                 dispatch.board(slot, "status", f"launcher: {compact.stdout.strip() or f'compacted {dispatch.worker}'}")

@@ -24,16 +24,101 @@ import coverage_report
 import unit_files
 
 
-from ledger_test_support import (LedgerTestCase, LedgerStatus)
+from ledger_test_support import (remove_generation_schema, LedgerTestCase, LedgerStatus)
 
 
 @final
 class StyleLedgerTicketsTests(LedgerTestCase):
+    def test_proposal_migration_preserves_generations_and_backfills_legacy_decisions(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        issue = self.root / "decision.md"
+        ledger.ticket_add("legacy-1", "legacy", "proposal", "names", "crates/alpha", [finding.path], [rule],
+                          proposal=str(issue), finding_ids=(finding.finding_id,))
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("DROP TABLE ticket_proposals")
+            _ = connection.execute("UPDATE schema_version SET version=30")
+            generations = connection.execute("SELECT * FROM rule_generations").fetchall()
+            judgments = connection.execute("SELECT * FROM active_judgments").fetchall()
+        for _ in range(2):
+            with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
+                self.assertEqual(upgraded.ticket_proposals("legacy-1"), (issue,))
+                self.assertEqual(upgraded.ticket_proposals("judge-1"), ())
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (31,))
+            self.assertEqual(connection.execute("SELECT * FROM ticket_proposals").fetchall(), [("legacy-1", str(issue))])
+            self.assertEqual(connection.execute("SELECT * FROM rule_generations").fetchall(), generations)
+            self.assertEqual(connection.execute("SELECT * FROM active_judgments").fetchall(), judgments)
+
+    def test_cancelled_checkpoint_reservation_is_retried_after_reopening(self) -> None:
+        session = self.held_reservation("modules-unit-1")
+        self.checkpointed_structure_ticket("modules-unit-1", "--session-dir", str(session), "--phase", "7")
+        with self.ledger() as ledger:
+            ticket, = ledger.ticket_open("modules-unit")
+            definition = next(item for item in rules.load_rules(self.repo) if item.rule_id == ticket["rules"][0])
+            _ = definition.path.write_text(definition.path.read_text() + "Changed body.\n")
+            _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+        # A crash here leaves the committed dropped state and its pending release intact.
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("dropped", str(session), "7"))
+        self.write("README.md", "Move off the held checkpoint.\n")
+        _ = self.commit("Reservation release must wait")
+        with self.ledger() as reopened:
+            changes = reopened.reconcile("main", "main")
+        self.assertTrue(any("reservation r1 stays held" in line for line in changes), changes)
+        self.assertEqual(self.ticket_row("modules-unit-1"), ("dropped", str(session), "7"))
+        _ = self.git("reset", "-q", "--hard", self.initial_tip)
+        with self.ledger() as reopened:
+            self.assertIn("ticket modules-unit-1: phase 7: released reservation r1", reopened.reconcile("main", "main"))
+            self.assertEqual(self.ticket_row("modules-unit-1"), ("dropped", "", ""))
+            calls = self.berth_calls()
+            _ = reopened.reconcile("main", "main")
+            self.assertEqual(self.berth_calls(), calls)
+        self.assertFalse((session / "phases/7/delegated_phase_reservation_state.json").exists())
+
+    def test_removed_judgment_rechecks_cancellation_after_its_git_proof(self) -> None:
+        ledger, rule, _ = self.removed_ticket()
+        path = self.sources[1]
+        (self.repo / path).unlink()
+        deleting = self.commit("Ticket deletes the file")
+        original = style_ledger._cell_scope  # pyright: ignore[reportPrivateUsage]
+
+        def cancel_then_scope(definition: rules.Rule, cell: str, tip: style_ledger.RepositoryTip) -> style_ledger.CellInputScope:
+            with self.ledger() as other:
+                other.ticket_drop("names-1")
+            return original(definition, cell, tip)
+
+        with (mock.patch.object(style_ledger, "_cell_scope", side_effect=cancel_then_scope),
+              self.assertRaisesRegex(style_ledger.LedgerError, "cannot judge from dropped")):
+            ledger.record(rule, path, deleting, self.blob(rule), "removed", ticket="names-1", worker="test")
+        self.assertEqual(self.cell_rows(ledger, path), [])
+
+    def test_old_body_ticket_cannot_add_or_record_before_or_after_cancellation(self) -> None:
+        rule = self.rule("changed")
+        with self.ledger() as ledger:
+            ledger.set_tip(self.initial_tip, "main")
+            ledger.ticket_add("reader-1", "reader", "read", "names", "crates/alpha", [self.sources[0]], [rule])
+            ledger.ticket_assign("reader-1", "main")
+            old_blob = self.blob(rule)
+            rule_file = self.rule_dir / "changed.md"
+            _ = rule_file.write_text(rule_file.read_text() + "New body.\n")
+            for cancelled in (False, True):
+                if cancelled:
+                    _ = ledger.withdraw_superseded({item.rule_id: item for item in rules.load_rules(self.repo)})
+                for blob in (old_blob, self.blob(rule)):
+                    with self.subTest(cancelled=cancelled, blob=blob):
+                        with self.assertRaises(style_ledger.LedgerError):
+                            _ = ledger.hold(rule, self.sources[0], 1, "change", "rename", "old", "new", blob, "reader-1")
+                        with self.assertRaises(style_ledger.LedgerError):
+                            ledger.record(rule, self.sources[0], self.initial_tip, blob, "clean", ticket="reader-1")
+            self.assertEqual(ledger.held_findings(style_ledger.AllHeldFindings()), ())
+            self.assertEqual(ledger.latest_ticket_judgments("reader-1"), ())
+            self.assertEqual(ledger.ticket_open("reader"), ())
+
     def test_batch_owner_migration_reruns_after_process_loss_before_version_write(self) -> None:
         ledger, rule, finding = self.site_fixture()
         ledger.ticket_add("legacy-1", "legacy", "read", "names", ".", [finding.path], [rule])
         with closing(sqlite3.connect(ledger.database)) as older_reader:
             _ = older_reader.execute("DROP TABLE ticket_batch_owners")
+            remove_generation_schema(older_reader)
             _ = older_reader.execute("UPDATE schema_version SET version=27")
             older_reader.commit()
             before = list(older_reader.iterdump())
@@ -701,7 +786,9 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         _ = path.write_text(path.read_text() + "Additional rule requirement\n")
 
         self.assertEqual(self.states(rule_id), dict.fromkeys(self.sources, "stale"))
-        self.record(rule_id, self.sources[0], self.initial_tip, rule_blob=old_blob)
+        refused = self.cli("record", "--rule", rule_id, "--path", self.sources[0], "--commit", self.initial_tip,
+                           "--rule-blob", old_blob, "--verdict", "clean", "--ticket", "unit-1", "--worker", "test", success=False)
+        self.assertIn("rule body changed", refused.stderr)
         self.assertEqual(self.states(rule_id)[self.sources[0]], "stale")
         self.record(rule_id, self.sources[0], self.initial_tip)
         self.assertEqual(self.states(rule_id)[self.sources[0]], "current")
@@ -2424,14 +2511,16 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         new_blob = self.blob(rule_id)
         self.add_ticket("read-1", [rule_id])
 
-        self.record(rule_id, self.sources[0], self.initial_tip, rule_blob=old_blob, ticket="read-1")
+        refused_old = self.cli("record", "--rule", rule_id, "--path", self.sources[0], "--commit", self.initial_tip,
+                               "--rule-blob", old_blob, "--verdict", "clean", "--ticket", "read-1", "--worker", "test", success=False)
+        self.assertIn("rule body changed", refused_old.stderr)
         _ = self.cli(
             "record", "--rule", rule_id, "--path", self.sources[1], "--commit", self.initial_tip,
-            "--verdict", "clean", "--ticket", "read-1", "--worker", "test",
+            "--verdict", "clean", "--ticket", "read-1", "--worker", "test", success=False,
         )
 
-        self.assertEqual(self.states(rule_id)[self.sources[0]], "stale")
-        self.assertEqual(self.states(rule_id)[self.sources[1]], "stale")
+        self.assertEqual(self.states(rule_id)[self.sources[0]], "open")
+        self.assertEqual(self.states(rule_id)[self.sources[1]], "open")
         refused = self.cli(
             "record", "--rule", rule_id, "--path", self.sources[0], "--commit", self.initial_tip,
             "--rule-blob", new_blob, "--verdict", "clean", "--ticket", "read-1", "--worker", "test",
@@ -2439,7 +2528,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         )
         self.assertEqual(refused.returncode, 2)
         self.assertIn(rule_id, refused.stderr)
-        self.assertEqual(self.states(rule_id)[self.sources[0]], "stale")
+        self.assertEqual(self.states(rule_id)[self.sources[0]], "open")
         unpinned = self.cli(
             "record", "--rule", rule_id, "--path", self.sources[2], "--commit", self.initial_tip,
             "--verdict", "clean", "--ticket", "external", "--worker", "test", success=False,
@@ -3070,6 +3159,7 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             _ = connection.execute("ALTER TABLE processed_tips DROP COLUMN reason")
             _ = connection.execute("DROP TABLE refill_results")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            remove_generation_schema(connection)
             _ = connection.execute("UPDATE schema_version SET version=6")
             connection.commit()
         with style_ledger.open_ledger(self.repo) as migrated:

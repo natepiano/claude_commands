@@ -146,8 +146,6 @@ class PushTextTests(unittest.TestCase):
     def test_failed_restart_catalog_examples_show_named_sessions(self) -> None:
         entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.restart_failed")
         self.assertEqual({example.name for example in entry.examples}, {"typical", "one_long_name"})
-        stop = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.stop_failed")
-        self.assertEqual({example.name for example in stop.examples}, {"typical", "many_long_names"})
         for example in entry.examples:
             with self.subTest(example=example.name):
                 push = push_texts.render_entry(entry, example.values)
@@ -283,14 +281,6 @@ class PushTextTests(unittest.TestCase):
                   self.assertRaises(ValueError)):
                 _ = push_texts.catalog()
 
-    def test_holdout_begins_with_the_users_four_lines(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.holdout")
-        values = dict(entry.examples[0].values, session="widget", operation="shutdown")
-        push = push_texts.render_entry(entry, values)
-        self.assertEqual(push.title + "\n" + push.message.split("\n\n", 1)[0],
-            "widget shutdown is blocked\nSession: widget\n"
-            + "Action: answer the open form\n"
-            + "Reason: shutdown is blocked because widget's claude session is showing a form and it can't proceed.")
 
     def test_remote_control_push_is_absent_from_catalog_and_approvals(self) -> None:
         removed_id = "shutdown." + "remote_control"
@@ -298,31 +288,7 @@ class PushTextTests(unittest.TestCase):
         approvals = cast(dict[str, object], json.loads(push_texts.REVIEWED_FILE.read_text()))
         self.assertNotIn(removed_id, approvals)
 
-    def test_holdout_offers_one_stop_command_on_the_named_machine(self) -> None:
-        for entry in push_texts.catalog():
-            if entry.id not in {"shutdown.holdout", "shutdown.holdout_unanswered"}:
-                continue
-            for example in entry.examples:
-                with self.subTest(id=entry.id, example=example.name):
-                    push = push_texts.render_entry(entry, example.values)
-                    expected = ([f"Answer the form (recommended): the session pauses, and the {example.values['operation']} goes on.",
-                                 "Stop the session: it ends, its uncommitted work stays, and the "
-                                 + f"{example.values['operation']} goes on without it. In a terminal on {example.values['machine']}, run:",
-                                 example.values["command"]]
-                                if entry.id == "shutdown.holdout"
-                                else ["Stopping it ends only that session and keeps its uncommitted work. "
-                                      + f"Then the {example.values['operation']} goes on.", example.values["command"]])
-                    self.assertEqual(push.body.split("\n\n")[1:], expected)
-                    self.assertIn(f"In a terminal on {example.values['machine']}", push.message)
 
-    def test_unanswered_holdout_asks_to_stop_the_session_without_a_form(self) -> None:
-        entry = next(entry for entry in push_texts.catalog() if entry.id == "shutdown.holdout_unanswered")
-        push = push_texts.render_entry(entry, entry.examples[0].values)
-        self.assertEqual(push.title + "\n" + push.message.split("\n\n", 1)[0],
-            "Your Claude restart is stuck\nSession: pm-move-ghostty\n"
-            + "Action: In a terminal on natedev, stop pm-move-ghostty with the command below\n"
-            + "Your Claude restart waits for each session to pause. The session pm-move-ghostty has not paused, so the restart is stuck.")
-        self.assertNotIn("form", push.title + "\n" + push.message)
 
     def test_template_change_with_same_example_output_invalidates_every_approval(self) -> None:
         entry = self.entry()

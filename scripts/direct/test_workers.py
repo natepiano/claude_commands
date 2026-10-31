@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from scripts.lib.test_agents_registry import write_registry
+from scripts.lib.test_hang_guard import LauncherHangGuard
 
+import contextlib
 import fcntl
 import io
 import json
@@ -105,6 +107,19 @@ def json_object(path: Path) -> dict[str, object]:
 
 
 class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
+    def test_restarted_director_comes_from_its_current_unit_mark(self) -> None:
+        from scripts.production import unit_lookup
+        from scripts.message import sessions
+        from herdr import HerdrPlace
+
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps({"production": "demo", "unit": "builders"}))
+        _ = (self.session_dir / "director").write_text("old-director")
+        current = unit_lookup.MarkedUnit("builders", unit_lookup.LiveClaude("Builders", "new-director", "/socket", 4321),
+                                         HerdrPlace("agents", "w1:p2"))
+        with patch.object(sessions, "live_sessions", return_value=[]), patch.object(unit_lookup, "marked_unit", return_value=current):
+            found = workers.live_unit_director(self.session_dir)
+        self.assertEqual(found, workers.LiveUnitDirector("new-director", 4321))
+
     def test_ledger_uses_canonical_production_for_both_headers_and_saved_metadata(self) -> None:
         worktree = self.session_dir.parent / "repository"
         plan = worktree / "plan.md"
@@ -1927,6 +1942,67 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
             self.assertTrue(opened[0].cause)
         self.assertFalse((self.session_dir / "workers").exists(),
                          "the unit ledger must not overwrite the launch log")
+
+    def test_adoption_recovery_excludes_stale_settlement_and_preserves_transferred_work(self) -> None:
+        self.open_worker("worker")
+        destination = self.next_run("recovered-owner")
+        pending = self.session_dir / "worker.pending.json"
+        _ = pending.write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID,
+            "messages": ["transferred work"], "accepting_messages": True}))
+
+        def interrupt(stage: str) -> None:
+            if stage == "intent":
+                raise AdoptionWriteInterrupted(stage)
+
+        with observe_adoption_writes(self.session_dir, destination, interrupt):
+            with self.assertRaises(AdoptionWriteInterrupted):
+                _ = workers.adopt(self.session_dir, destination, "worker")
+        self.live_turn: str = "transferred-turn"
+        queued: list[dict[str, object]] = [{"id": "transferred-task"}]
+        self.queued: list[dict[str, object]] = queued.copy()
+        recovered, release, settling = threading.Event(), threading.Event(), threading.Event()
+        guard = LauncherHangGuard("adoption recovery versus stale settlement")
+        write = workers._write_roster  # pyright: ignore[reportPrivateUsage]
+
+        def publish(handle: TextIO, roster: dict[str, object]) -> None:
+            if Path(handle.name) == self.session_dir / codex_mesh.ROSTER_FILE:
+                self.assert_lifecycle_is_held()
+                recovered.set()
+                guard.event(release)
+            write(handle, roster)
+
+        with contextlib.closing(codex_mesh.Client(self.server.port, "old-launcher")) as client:
+            stream = self.stream_for(client)
+
+            def settle() -> codex_mesh.RunOutcome:
+                return codex_mesh._finish_stream(stream)  # pyright: ignore[reportPrivateUsage]
+
+            with patch.object(workers, "_write_roster", publish), ThreadPoolExecutor(max_workers=2) as executor:
+                recovery = executor.submit(workers.recover_adoptions, destination)
+                recovery.add_done_callback(lambda completed: recovered.set())
+                try:
+                    guard.event(recovered)
+                    if recovery.done():
+                        guard.result(recovery)
+                    with self.observe_lifecycle_attempt(settling):
+                        settlement = executor.submit(settle)
+                        guard.event(settling)
+                finally:
+                    release.set()
+                guard.result(recovery)
+                _ = guard.result(settlement)
+        self.assertEqual(self.worker_record()["adopted_to"], str(destination))
+        target = cast(dict[str, object], json_object(destination / codex_mesh.ROSTER_FILE)["worker"])
+        self.assertEqual(target["thread_id"], mesh_fixture.THREAD_ID)
+        self.assertEqual(target["status"], "paused")
+        self.assertEqual(self.live_turn, "transferred-turn")
+        self.assertEqual(self.queued, queued)
+        messages = json_object(destination / "worker.pending.json")
+        self.assertEqual(messages["messages"], ["transferred work"])
+        self.assertIs(messages["accepting_messages"], True)
+        self.assertEqual(self.methods("thread/queue/delete"), [])
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(json_object(workers.ledger_for_run(destination).path)["adoptions"], {})
 
     def test_adoption_recovers_every_durable_write_before_the_next_command_on_either_run(self) -> None:
         for stage in ("intent", "source", "destination", "ledger", "complete"):

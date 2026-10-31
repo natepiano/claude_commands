@@ -80,6 +80,17 @@ class SummaryReport(TypedDict):
     synced_at: str
     synced_tip: str
 
+def remove_generation_schema(connection: sqlite3.Connection) -> None:
+    """Reconstruct the pre-30 judgment schema before a fixture tests an older upgrade."""
+    _ = connection.execute("DROP VIEW active_judgments")
+    _ = connection.execute("DROP TABLE rule_generations")
+    _ = connection.execute("ALTER TABLE judgments DROP COLUMN generation")
+    # Migration 29's view exists on copies that have already run it.
+    for statement in style_ledger.MIGRATIONS[29].split(";"):
+        if statement.strip():
+            _ = connection.execute(statement)
+
+
 class LedgerTestCase(unittest.TestCase):
     root: Path = Path()
 
@@ -219,6 +230,7 @@ class LedgerTestCase(unittest.TestCase):
     def site_fixture(self, family: rules.Family = "names", *, rule_name: str = "site-rule",
                      scope: str = "file", source: str = "fn work() {\n    let old = 791;\n}\n",
                      line: int = 2, before: str = "old", kind: style_ledger.FindingKind = "rename",
+                     keep_ticket_open: bool = False,
                      ) -> tuple[style_ledger.Ledger, str, style_ledger.HeldFinding]:
         rule = self.rule(rule_name, f"tier: C\nfamily: {family}\ninput_scope: {scope}\n")
         self.write(PARENT_FILE, source)
@@ -232,7 +244,8 @@ class LedgerTestCase(unittest.TestCase):
                               self.blob(rule), "judge-1")
         ledger.record(rule, PARENT_FILE, tip, self.blob(rule), "held", ticket="judge-1", worker="test",
                       input_scope=style_ledger.DeclaredInputScope.RULE)
-        ledger.ticket_drop("judge-1")
+        if not keep_ticket_open:
+            ledger.ticket_drop("judge-1")
         ledger.file_held(finding.finding_id, self.root / "decision.md")
         return ledger, rule, ledger.named_held([finding.finding_id])[0]
 

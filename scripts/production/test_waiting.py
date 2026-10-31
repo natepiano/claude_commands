@@ -28,10 +28,12 @@ import add_unit
 import production_units
 import dailies_render
 import merge_checkpoint
-from scripts.production import production_doc
+from scripts.production import production_doc, staff
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+from fake_showrunner import write_timer
 import update_registration
 import waiting
-from cli_fixture import invoke_cli
+from cli_fixture import invoke_cli, production_paths
 from fake_herdr import CommandResponse
 import fake_unit_host
 
@@ -105,6 +107,8 @@ class WaitingTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        staff_environment: dict[str, str] = {}
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", staff_environment))
         self.checkout = self.root / "checkout"
         self.alpha = self.root / "alpha"
         self.beta = self.root / "beta"
@@ -139,6 +143,7 @@ class WaitingTests(unittest.TestCase):
         }))
         self.enterContext(mock.patch.dict(os.environ, {
             "HOME": str(home),
+            "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
             "CODEX_HOME": str(home / "codex-fixture"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
             "HERDR_BIN": str(SCRIPT.parents[1] / "herdr/fake_herdr.py"),
@@ -156,6 +161,7 @@ class WaitingTests(unittest.TestCase):
         self.env = {**os.environ, "HOME": str(home), "WAITING_TEST_BOARD": str(self.board),
                     "WAITING_TEST_SENDS": str(self.sends),
                     "PATH": str(self.bin_path) + os.pathsep + os.environ.get("PATH", "")}
+        _ = self.enterContext(production_paths(self.env))
         self.board_ready()
         self.origin = self.root / "origin.git"
         _ = self.git("init", "--bare", str(self.origin), cwd=self.root)
@@ -254,7 +260,12 @@ class WaitingTests(unittest.TestCase):
             "", "## Production rules", "", "- Merge each phase and push the merge branch.", "",
         )))
 
+        _ = write_timer(self.root / "notifier", "example", "example-session", "", self.doc)
+        for unit in (ALPHA, BETA):
+            _ = unit_membership("showrunner-example", unit)
+
     def add_gamma(self) -> None:
+        _ = unit_membership("showrunner-example", GAMMA)
         content = self.doc.read_text(encoding="utf-8")
         row = f"| `{GAMMA}` | `docs/gamma.md` | `{self.root / 'gamma'}` | `gamma-branch` | — | — |\n"
         self.write(self.doc, content.replace("\n\n## Gates", f"\n{row}\n## Gates"))
@@ -294,6 +305,7 @@ class WaitingTests(unittest.TestCase):
 
 
     def test_named_unit_refuses_retired_row(self) -> None:
+        _ = staff.retire(unit_membership("showrunner-example", ALPHA).id)
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "(retired by the user)", 1))
         production = production_units.read_production(self.doc)
@@ -541,7 +553,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         lines = [line for line in result.stdout.splitlines() if line.startswith("scratch-test:")]
         self.assertEqual(len(lines), 2, result.stdout)
         self.assertIn("ok — green", lines[0])
-        self.assertIn("failed — temporary worktree cleanup: cleanup refused by test wrapper", lines[1])
+        self.assertIn("failed — temporary worktree cleanup: stderr: cleanup refused by test wrapper", lines[1])
 
     def test_search_reports_other_unit_branch_and_uncommitted_worktree_sites(self) -> None:
         _ = self.commit(self.beta, "src/beta.py", "old_public_name()\n")
@@ -729,6 +741,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertNotIn(f"{BETA} on {ALPHA}: open", output.getvalue())
 
     def test_waits_hide_retired_waiting_unit_but_keep_live_wait_on_it(self) -> None:
+        _ = staff.retire(unit_membership("showrunner-example", ALPHA).id)
         content = self.doc.read_text(encoding="utf-8")
         self.write(self.doc, content.replace("`docs/alpha.md`", "retired after completion", 1))
         now = datetime.now(ZoneInfo("America/Los_Angeles"))

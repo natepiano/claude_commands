@@ -16,16 +16,18 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from typing import cast, override
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib.socket_test_support import short_socket_directory
 import broadcast
 import codex_winddown
 import fake_unit_host
 import fake_showrunner
-import showrunners
+from scripts.production import showrunners
 import roster
 from process_table import Process
 from sessions import SessionRecord
-from showrunners import Showrunner
+from scripts.production.showrunners import Showrunner
 
 SCRIPT = Path(__file__).with_name("codex_winddown.py")
 MESH = "/run/current-system/sw/bin/python3 /home/u/.claude/scripts/direct/../agents/codex_mesh.py"
@@ -558,6 +560,10 @@ class MessageTests(unittest.TestCase):
             "UNIT_HISTORY_DIR": str(self.root / "history"),
         }
         self.environment.update(fake_unit_host.environment(self.root))
+        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = unit_membership("show", "trunk-unit")
         fake_unit_host.write({**os.environ, **self.environment}, [
             fake_unit_host.HostedUnit("trunk", "w1:p1", {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "trunk-unit"})])
         fake_unit_host.place_process(self.environment, os.getppid(), "w1:p1")

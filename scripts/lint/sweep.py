@@ -177,6 +177,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast, overload, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from process_failure import failure_detail
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from . import tmp_sweep
@@ -2411,7 +2412,7 @@ def send_holder_message(session: str, message: str) -> bool:
     if result.returncode in (0, 1):
         print(f"lint sweep: message to {session} {'queued' if result.returncode == 1 else 'delivered'}")
         return True
-    print(f"lint sweep: message to {session} failed ({result.returncode}): {result.stderr.strip() or result.stdout.strip()}",
+    print(f"lint sweep: message to {session} failed ({result.returncode}): {failure_detail(result)}",
           file=sys.stderr)
     return False
 
@@ -2445,7 +2446,7 @@ def send_floor_alert(message: str, channels: FloorAlertChannels, *,
                 state = "queued" if result.returncode == 1 else "delivered"
                 print(f"lint sweep: {channel} alert {state}")
             else:
-                print(f"lint sweep: {channel} alert failed ({result.returncode}): {result.stderr.strip() or result.stdout.strip()}", file=sys.stderr)
+                print(f"lint sweep: {channel} alert failed ({result.returncode}): {failure_detail(result)}", file=sys.stderr)
         except (OSError, subprocess.TimeoutExpired) as error:
             print(f"lint sweep: {channel} alert failed: {error}", file=sys.stderr)
     return delivered

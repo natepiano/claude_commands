@@ -85,6 +85,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Pr
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.direct import plan_history
+from scripts.agents import worker_lifecycle
 from scripts.lib import nix_env, unit_runs
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
@@ -289,6 +290,8 @@ COMPACT_IDLE_WAIT_SECS = 60
 COMPACT_IDLE_POLL_SECS = 1
 # `compact` exits with this when the thread still has a live turn, so no follow-up can be sent.
 COMPACT_TURN_STILL_LIVE = 3
+# The compaction finished, but its result no longer belongs to the roster entry.
+COMPACT_ROSTER_CHANGED = 4
 SERVER_START_TIMEOUT_SECS = 30
 # Keep the dev-shell server's startup allowance and sweep grace consistent.
 DEV_SHELL_START_TIMEOUT_SECS = 300
@@ -460,6 +463,7 @@ class WorkerTaskRecord(TypedDict):
 
 
 class FollowableRecord(WorkerTaskRecord):
+    settled_launcher_pid: NotRequired[int]
     paused_from: NotRequired[str]
     paused_turn: NotRequired[bool]
     thread_id: str
@@ -517,6 +521,7 @@ class WaitingCapacityRecord(WorkerTaskRecord):
 
 
 class ExhaustedRecord(WorkerTaskRecord):
+    settled_launcher_pid: NotRequired[int]
     thread_id: str
     status: Literal["capacity_exhausted"]
     revision: NotRequired[int]
@@ -1177,6 +1182,7 @@ class Client:
         self.port: int = port
         self.name: str = name
         self.session_dir: str = ""
+        self.launcher_pid: int = os.getpid()
         self.serving: CodexServingState = NotBoundCodexServer()
         self.turn_submitted_at: float = time.time()
         # Every call ends by this wall-clock time, whatever timeout it asks for.
@@ -1335,6 +1341,33 @@ class RosterOnThread:
 
 
 @dataclass(frozen=True)
+class RosterActiveLauncher:
+    """Only the launcher still watching worker work may record its notices."""
+
+    thread_id: str
+    launcher_pids: tuple[int, ...]
+
+    def owns(self, record: dict[str, object]) -> bool:
+        return (record.get("thread_id") == self.thread_id and not record.get("adopted_to")
+                and record.get("status") in ("starting", "running", WAITING_CAPACITY)
+                and record.get("launcher_pid") in self.launcher_pids)
+
+
+@dataclass(frozen=True)
+class RosterRefusingLauncher:
+    """Only the active or just-settled launcher may hand its refusal off."""
+
+    thread_id: str
+    launcher_pids: tuple[int, ...]
+
+    def owns(self, record: dict[str, object]) -> bool:
+        return (RosterActiveLauncher(self.thread_id, self.launcher_pids).owns(record)
+                or (record.get("thread_id") == self.thread_id and not record.get("adopted_to")
+                    and record.get("status") in ("failed", "capacity_exhausted")
+                    and record.get("settled_launcher_pid") in self.launcher_pids))
+
+
+@dataclass(frozen=True)
 class RosterAbsent:
     pass
 
@@ -1350,7 +1383,15 @@ class RosterUnchanged:
     revision: RosterRevision
 
 
-ExpectedRoster = RosterOnThread | RosterAbsent | RosterEndedOnThread | RosterUnchanged
+ExpectedRoster = RosterOnThread | RosterActiveLauncher | RosterRefusingLauncher | RosterAbsent | RosterEndedOnThread | RosterUnchanged
+
+
+@dataclass(frozen=True)
+class RosterAdministrativeWrite:
+    """Explicit low-level writes used by existing probes and fixture setup."""
+
+
+ROSTER_ADMINISTRATIVE_WRITE = RosterAdministrativeWrite()
 
 
 @dataclass(frozen=True)
@@ -1467,19 +1508,9 @@ def _write_roster_record(handle: TextIO, roster: dict[str, object], name: str,
     handle.flush()
 
 
-def _update_roster(session_dir: str, name: str, record: ThreadRecord) -> None:
-    path = _session_path(session_dir, ROSTER_FILE)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        _ = handle.seek(0)
-        roster = _load_roster_for_write(handle)
-        _write_roster_record(handle, roster, name, record)
-
-
-def _update_roster_if_expected(session_dir: str, name: str, record: ThreadRecord,
-                              expected: ExpectedRoster) -> bool:
-    """Compare the name's owner and write while holding the same roster lock."""
+def _update_roster(session_dir: str, name: str, record: ThreadRecord, *,
+                   expected: ExpectedRoster | RosterAdministrativeWrite = ROSTER_ADMINISTRATIVE_WRITE) -> bool:
+    """One lock scope for guarded production writes and existing administrative callers."""
     path = _session_path(session_dir, ROSTER_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
@@ -1487,42 +1518,54 @@ def _update_roster_if_expected(session_dir: str, name: str, record: ThreadRecord
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         previous = _as_dict(roster.get(name))
-        if isinstance(expected, RosterAbsent):
+        if previous.get("adopted_to"):
+            return False
+        if isinstance(expected, RosterAdministrativeWrite):
+            matches = True
+        elif isinstance(expected, RosterAbsent):
             matches = name not in roster
         else:
             matches = previous.get("thread_id") == expected.thread_id
-            if previous.get("adopted_to"):
-                matches = False
             if isinstance(expected, RosterEndedOnThread):
                 matches = matches and previous.get("status") == "ended"
             elif isinstance(expected, RosterUnchanged):
                 matches = matches and _roster_revision(previous) == expected.revision
+            elif isinstance(expected, (RosterActiveLauncher, RosterRefusingLauncher)):
+                matches = expected.owns(previous)
         if not matches:
             return False
         _write_roster_record(handle, roster, name, record)
         return True
 
 
-def _set_roster_assignment(session_dir: str, name: str, role: WorkerRole, task: str) -> None:
+def _update_roster_if_expected(session_dir: str, name: str, record: ThreadRecord,
+                              expected: ExpectedRoster) -> bool:
+    """Compare the name's owner and write while holding the same roster lock."""
+    return _update_roster(session_dir, name, record, expected=expected)
+
+
+def _set_roster_assignment(session_dir: str, name: str, role: WorkerRole, task: str,
+                           expected: RosterActiveLauncher) -> None:
     """Record the work assigned to an existing worker without changing its state."""
-    path = _session_path(session_dir, ROSTER_FILE)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        _ = handle.seek(0)
-        roster = _load_roster_for_write(handle)
-        entry = _as_dict(roster.get(name))
-        if entry and not entry.get("adopted_to"):
-            entry["role"] = role
-            if entry.get("unit_ledger") and not entry.get("held_design_id") and not entry.get("instructions_file"):
-                entry["access_policy"] = {"kind": "ReadOnlyReviewer" if role == "review" else "WorkerLaunchPolicy"}
-            if task:
-                entry["task"] = task
-            _advance_roster_revision(entry)
-            roster[name] = entry
+    with worker_lifecycle.lock_worker(session_dir, name):
+        path = _session_path(session_dir, ROSTER_FILE)
+        with path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             _ = handle.seek(0)
-            _ = handle.truncate()
-            _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
-            handle.flush()
+            roster = _load_roster_for_write(handle)
+            entry = _as_dict(roster.get(name))
+            if expected.owns(entry):
+                entry["role"] = role
+                if entry.get("unit_ledger") and not entry.get("held_design_id") and not entry.get("instructions_file"):
+                    entry["access_policy"] = {"kind": "ReadOnlyReviewer" if role == "review" else "WorkerLaunchPolicy"}
+                if task:
+                    entry["task"] = task
+                _advance_roster_revision(entry)
+                roster[name] = entry
+                _ = handle.seek(0)
+                _ = handle.truncate()
+                _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+                handle.flush()
 
 
 def _mark_all_roster_ended(session_dir: str) -> None:
@@ -1577,19 +1620,21 @@ def _role_fence(record: dict[str, object]) -> None:
 
 
 @contextlib.contextmanager
-def _design_claim_lock(session_dir: str, name: str) -> Generator[None]:
+def _design_claim_lock(session_dir: str, name: str, *, lock_inbox: bool = True) -> Generator[None]:
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
     _role_fence(record)
     design_id = _as_str(record.get("held_design_id"))
     if not design_id:
-        yield
+        with worker_lifecycle.lock_worker(session_dir, name):
+            yield
         return
     from scripts.astra import design_roles
     directory = design_roles.design_directory(design_id)
     with (directory / "lock").open("a", encoding="utf-8") as design_lock:
         fcntl.flock(design_lock, fcntl.LOCK_EX)
-        with _pending_file(session_dir, name):
-            yield
+        with worker_lifecycle.lock_worker(session_dir, name):
+            with _pending_file(session_dir, name) if lock_inbox else contextlib.nullcontext():
+                yield
 
 
 def _validate_held_claim(name: str, entry: dict[str, object], thread_id: str) -> bool:
@@ -1652,8 +1697,23 @@ def _claim_follow(
     lens: agents_log.Lens | None = None,
 ) -> bool:
     """Take a finished roster entry before another follow can take it."""
+    with _design_claim_lock(session_dir, name):
+        observed = _lookup_state(session_dir, name)
+        # Only abandoned live statuses need recovery evidence at claim time.
+        # A normal claim reserves the entry; its caller checks server requests
+        # with the command's own error and idle-state semantics before submission.
+        if _launcher_died(observed) and _follow_refusal(session_dir, observed, name=name):
+            return False
+        return _claim_follow_locked(session_dir, name, thread_id, launcher_pid, role, lens)
+
+
+def _claim_follow_locked(
+    session_dir: str, name: str, thread_id: str, launcher_pid: int, role: WorkerRole,
+    lens: agents_log.Lens | None = None,
+) -> bool:
+    """Publish a claim after the operation proved eligibility under its lifecycle lock."""
     path = _session_path(session_dir, ROSTER_FILE)
-    with _design_claim_lock(session_dir, name), path.open("a+", encoding="utf-8") as handle:
+    with path.open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
@@ -1671,6 +1731,7 @@ def _claim_follow(
         previous_status = current.status if isinstance(current, FollowableThread) else "failed"
         previous_role = _roster_role(entry.get("role"))
         claimed = dict(entry)
+        _ = claimed.pop("settled_launcher_pid", None)
         unit_workers.clear_allocation(claimed)
         _ = claimed.pop("turn_id", None)
         _ = claimed.pop("paused_from", None)
@@ -1678,6 +1739,8 @@ def _claim_follow(
         _ = claimed.pop("previous_role", None)
         if isinstance(previous_role, AssignedWorkerRole):
             claimed["previous_role"] = previous_role.role
+        if stale:
+            claimed["dead_launcher_recovery"] = True
         claimed.update({
             "thread_id": thread_id,
             "status": "starting",
@@ -1700,55 +1763,56 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
                           live_turn: str = "", *, finished: bool = False,
                           expected_thread_id: str = "") -> None:
     """Release only this launcher's unstarted claim; retain a peer's live turn."""
-    path = _session_path(session_dir, ROSTER_FILE)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        _ = handle.seek(0)
-        roster = _load_roster_for_write(handle)
-        entry = _as_dict(roster.get(name))
-        status = entry.get("status")
-        if entry.get("adopted_to"):
-            return
-        if expected_thread_id and entry.get("thread_id") != expected_thread_id:
-            return
-        if entry.get("launcher_pid") != launcher_pid or not (
-            status == "starting" or (finished and status == "running")
-        ):
-            return
-        thread_id = _as_str(entry.get("thread_id"))
-        previous_status = entry.get("previous_status")
-        previous_role = _roster_role(entry.get("previous_role"))
-        restored = dict(entry)
-        _advance_roster_revision(restored)
-        if isinstance(previous_role, AssignedWorkerRole):
-            restored["role"] = previous_role.role
-        else:
-            _ = restored.pop("role", None)
-        if live_turn and not finished:
-            restored.update({
-                "thread_id": thread_id,
-                "status": "running",
-                "turn_id": live_turn,
-                "launcher_pid": launcher_pid,
-            })
-            roster[name] = restored
-        else:
-            _ = restored.pop("previous_status", None)
-            _ = restored.pop("previous_role", None)
-            _ = restored.pop("turn_id", None)
-            _ = restored.pop("launcher_pid", None)
-            _ = restored.pop("port", None)
-            restored.update({
-                "thread_id": thread_id,
-                "status": previous_status if previous_status in FOLLOWABLE_STATES else "failed",
-            })
-            roster[name] = restored
-        _ = handle.seek(0)
-        _ = handle.truncate()
-        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
-        handle.flush()
-        if isinstance(previous_role, AssignedWorkerRole) and entry.get("role") != previous_role.role:
-            _record_assignment(thread_id, previous_role.role, None)
+    with worker_lifecycle.lock_worker(session_dir, name):
+        path = _session_path(session_dir, ROSTER_FILE)
+        with path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            _ = handle.seek(0)
+            roster = _load_roster_for_write(handle)
+            entry = _as_dict(roster.get(name))
+            status = entry.get("status")
+            if entry.get("adopted_to"):
+                return
+            if expected_thread_id and entry.get("thread_id") != expected_thread_id:
+                return
+            if entry.get("launcher_pid") != launcher_pid or not (
+                status == "starting" or (finished and status == "running")
+            ):
+                return
+            thread_id = _as_str(entry.get("thread_id"))
+            previous_status = entry.get("previous_status")
+            previous_role = _roster_role(entry.get("previous_role"))
+            restored = dict(entry)
+            _advance_roster_revision(restored)
+            if isinstance(previous_role, AssignedWorkerRole):
+                restored["role"] = previous_role.role
+            else:
+                _ = restored.pop("role", None)
+            if live_turn and not finished:
+                restored.update({
+                    "thread_id": thread_id,
+                    "status": "running",
+                    "turn_id": live_turn,
+                    "launcher_pid": launcher_pid,
+                })
+                roster[name] = restored
+            else:
+                _ = restored.pop("previous_status", None)
+                _ = restored.pop("previous_role", None)
+                _ = restored.pop("turn_id", None)
+                _ = restored.pop("launcher_pid", None)
+                _ = restored.pop("port", None)
+                restored.update({
+                    "thread_id": thread_id,
+                    "status": previous_status if previous_status in FOLLOWABLE_STATES else "failed",
+                })
+                roster[name] = restored
+            _ = handle.seek(0)
+            _ = handle.truncate()
+            _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+            handle.flush()
+            if isinstance(previous_role, AssignedWorkerRole) and entry.get("role") != previous_role.role:
+                _record_assignment(thread_id, previous_role.role, None)
 
 
 def _wait_for_claimed_peer(client: Client, thread_id: str, turn_id: str,
@@ -1772,10 +1836,13 @@ def _wait_for_claimed_peer(client: Client, thread_id: str, turn_id: str,
 
 
 def _pid_alive(pid: int) -> bool:
+    """A recorded pid is live only if the OS can represent and find it."""
     if pid <= 0:
         return False
     try:
         os.kill(pid, 0)
+    except OverflowError:
+        return False
     except OSError as exc:
         return exc.errno == errno.EPERM
     return True
@@ -1787,6 +1854,15 @@ def _free_port() -> int:
         return _bound_port(probe)
 
 
+def _recorded_server_availability(record: Mapping[str, object]) -> ServerAvailability:
+    """Only a valid endpoint and live process identify a recorded server."""
+    port, pid = record.get("port"), record.get("pid")
+    if (type(port) is int and 0 < port <= 65535
+            and type(pid) is int and pid > 0 and _pid_alive(pid)):
+        return LiveServer(port)
+    return ServerRestartRequired()
+
+
 def _server_availability(session_dir: str) -> ServerAvailability:
     """The running app-server or the need to restart it.
 
@@ -1794,12 +1870,7 @@ def _server_availability(session_dir: str) -> ServerAvailability:
     must not, or ending a worker whose server already died would leave a
     fresh server behind for nothing.
     """
-    record = _read_json_object(_session_path(session_dir, SERVER_FILE))
-    port = record.get("port")
-    pid = record.get("pid")
-    if isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid):
-        return LiveServer(port)
-    return ServerRestartRequired()
+    return _recorded_server_availability(_read_json_object(_session_path(session_dir, SERVER_FILE)))
 
 
 def _worker_port(session_dir: str, record: ThreadRecord) -> int:
@@ -1839,9 +1910,9 @@ def _run_servers(session_dir: str) -> list[int]:
     """Ports of the run's servers still running: those it retired, oldest first, then its current one."""
     ports: list[int] = []
     for record in _recorded_run_servers(session_dir):
-        port, pid = record.get("port"), record.get("pid")
-        if isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid) and port not in ports:
-            ports.append(port)
+        server = _recorded_server_availability(record)
+        if isinstance(server, LiveServer) and server.port not in ports:
+            ports.append(server.port)
     return ports
 
 
@@ -2042,20 +2113,28 @@ def _close_messages_if_empty(
     runs: DetachedRunWatch | FreshDetachedRunScan = FRESH_DETACHED_RUN_SCAN,
 ) -> bool:
     """Exclude senders while claiming an empty inbox and closing its launcher."""
-    with _pending_file(session_dir, name) as handle:
-        current = _run_watch(session_dir, name, runs).current()
-        if _pending_for_thread(handle, thread_id) or current.live or current.dead:
-            return False
-        _write_pending(handle, thread_id, [], accepting_messages=False)
-        return True
+    with worker_lifecycle.lock_worker(session_dir, name):
+        entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        if not RosterActiveLauncher(thread_id, (os.getpid(),)).owns(entry):
+            return True
+        with _pending_file(session_dir, name) as handle:
+            current = _run_watch(session_dir, name, runs).current()
+            if _pending_for_thread(handle, thread_id) or current.live or current.dead:
+                return False
+            _write_pending(handle, thread_id, [], accepting_messages=False)
+            return True
 
 
 def _close_messages_and_keep_pending(session_dir: str, name: str, thread_id: str) -> int:
     """Close the launcher's inbox while keeping its parked messages for the next launch."""
-    with _pending_file(session_dir, name) as handle:
-        messages = _pending_for_thread(handle, thread_id)
-        _write_pending(handle, thread_id, messages, accepting_messages=False)
-        return len(messages)
+    with worker_lifecycle.lock_worker(session_dir, name):
+        entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        if not RosterActiveLauncher(thread_id, (os.getpid(),)).owns(entry):
+            return 0
+        with _pending_file(session_dir, name) as handle:
+            messages = _pending_for_thread(handle, thread_id)
+            _write_pending(handle, thread_id, messages, accepting_messages=False)
+            return len(messages)
 
 
 def _detached_run_live(
@@ -2536,6 +2615,20 @@ def _design_context(session_dir: str) -> dict[str, object]:
 
 def _release_held_server(session_dir: str) -> None:
     """Park every queue before releasing a proven-idle server. Keep evidence on uncertainty."""
+    identities = _run_lifecycle_workers(session_dir)
+    held = set(worker_lifecycle.held_workers())
+    if set(identities).issubset(held):
+        _release_held_server_locked(session_dir)
+    elif any(worker.session == Path(session_dir).resolve() for worker in held):
+        raise SystemExit("RoleNeedsRecovery: server environment changed during the worker operation; "
+                         + "run release-held-server, then retry through the holder")
+    else:
+        with worker_lifecycle.lock_workers(*identities):
+            _release_held_server_locked(session_dir)
+
+
+def _release_held_server_locked(session_dir: str) -> None:
+    """Release a shared server while the caller owns all of its worker identities."""
     roster = _read_json_object(_session_path(session_dir, ROSTER_FILE))
     record = _read_json_object(_session_path(session_dir, SERVER_FILE))
     if record.get("codex_home"):
@@ -2556,7 +2649,7 @@ def _release_held_server(session_dir: str) -> None:
             thread_id = _as_str(entry.get("thread_id"))
             if not thread_id:
                 continue
-            client = Client(port, "held-environment-release")
+            client = Client(port, "held-environment-release", deadline=time.time() + THREAD_RELEASE_TIMEOUT_SECS)
             try:
                 with _pending_file(session_dir, name) as pending:
                     def park(message: str) -> None:
@@ -2681,9 +2774,9 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
         dev_shell_worktree = str(dev_shell.worktree) if isinstance(dev_shell, WorktreeDevShell) else ""
         path = _session_path(session_dir, SERVER_FILE)
         record = _read_json_object(path)
-        port = record.get("port")
-        pid = record.get("pid")
-        if isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid):
+        server = _recorded_server_availability(record)
+        if isinstance(server, LiveServer):
+            port, pid = server.port, _as_int(record.get("pid"))
             recorded_home = server_record_home(record)
             matching_home = recorded_home == selected_home
             old_sign_in = matching_home and _holds_old_sign_in(pid, recorded_home)
@@ -3023,9 +3116,28 @@ class RunCompleted:
 
 @dataclass(frozen=True)
 class WorkerHandedOff:
-    """This launcher lost ownership; its assignment has no completion result."""
+    """Another run adopted this worker before its assignment completed."""
 
     to_run: str
+
+    def message(self) -> str:
+        return f"worker handed off to {self.to_run}; assignment completion unknown"
+
+
+@dataclass(frozen=True)
+class WorkerOwnershipLost:
+    """The launcher lost its claim without a recorded adoption destination."""
+
+    def message(self) -> str:
+        return "worker ownership changed; assignment completion unknown"
+
+
+ReleasedWorker = WorkerHandedOff | WorkerOwnershipLost
+
+
+def _worker_ownership_loss(record: object) -> ReleasedWorker:
+    owner = _roster_thread(record)
+    return WorkerHandedOff(owner.to_run) if isinstance(owner, AdoptedThread) else WorkerOwnershipLost()
 
 
 @dataclass(frozen=True)
@@ -3108,7 +3220,12 @@ class CapacityRetriesExhausted:
         )
 
 
-RunOutcome = RunCompleted | WorkerHandedOff | FailedBeforeThread | FailedWithThread | CapacityRetriesExhausted
+@dataclass(frozen=True)
+class WorkerLaunchRefused:
+    """The existing worker cannot be replaced; no launch was attempted."""
+
+
+RunOutcome = RunCompleted | WorkerLaunchRefused | ReleasedWorker | FailedBeforeThread | FailedWithThread | CapacityRetriesExhausted
 
 
 @dataclass(frozen=True)
@@ -3250,9 +3367,10 @@ def _continuation_is_owed(session_dir: str, name: str) -> bool:
 
 def _owe_quota_continuation(client: Client, thread_id: str) -> None:
     if client.session_dir and thread_id:
-        _ = _update_roster_if_expected(client.session_dir, client.name,
+        if not _update_roster_if_expected(client.session_dir, client.name,
             {"thread_id": thread_id, "status": "starting", "continuation_owed": True},
-            RosterOnThread(thread_id))
+            RosterActiveLauncher(thread_id, (client.launcher_pid, os.getpid()))):
+            raise SystemExit(f"codex_mesh: {client.name}: roster ownership changed; quota continuation not recorded")
 
 
 def _worker_director(folder: Path) -> KnownWorkerDirector | UnknownWorkerDirector:
@@ -3312,9 +3430,16 @@ def _report_quota_refusal(name: str, serving: CodexServingState, detail: str = "
             if isinstance(director, KnownWorkerDirector):
                 stopped_arguments = ["--stopped", director.session_id, name, shlex.join(sys.argv)]
             if isinstance(stopped, CommandStoppedOnThread):
-                _ = _update_roster_if_expected(stopped.session_dir, name,
-                    {"thread_id": stopped.thread_id, "status": "failed", "continuation_owed": False},
-                                               RosterOnThread(stopped.thread_id))
+                with worker_lifecycle.lock_worker(stopped.session_dir, name):
+                    if not _update_roster_if_expected(stopped.session_dir, name,
+                        {"thread_id": stopped.thread_id, "status": "failed", "continuation_owed": False,
+                         "settled_launcher_pid": os.getpid()},
+                        RosterRefusingLauncher(stopped.thread_id, (os.getpid(),))):
+                        # Still report the account's refusal, but never request a
+                        # rerun of work now owned by another launcher.
+                        stopped_arguments = []
+                        print(f"codex_mesh: {name}: roster ownership changed; quota handoff did not change the worker",
+                              file=sys.stderr)
         done = subprocess.run(
             [sys.executable, str(QUOTA_REPORT), "blocked", *identity,
              "--window", _quota_window(detail), "--refused-at", datetime.now(timezone.utc).isoformat(), *stopped_arguments],
@@ -3327,67 +3452,29 @@ def _report_quota_refusal(name: str, serving: CodexServingState, detail: str = "
         print(f"codex_mesh: {name}: quota: {line}", file=sys.stderr)
 
 
+def _relaunch_refusal(name: str, record: dict[str, object]) -> str:
+    """A live capacity waiter owns its worker even if its server record is gone."""
+    thread_id = _as_str(record.get("thread_id"))
+    if thread_id and record.get("status") == WAITING_CAPACITY and _pid_alive(_as_int(record.get("launcher_pid"))):
+        return (f"thread {thread_id} is waiting for capacity; "
+                + f"use codex_mesh.py end --to {name} before relaunching")
+    return ""
+
+
 def command_start(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     resident = getattr(args, "resident", False) is True
-    existing = _read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)
-    if isinstance(existing, dict):
-        _role_fence(_as_dict(cast(object, existing)))
-        if _as_dict(cast(object, existing)).get("held_design_id"):
-            raise SystemExit("codex_mesh: held roles must resume through their holder")
-    availability = _server_availability(session_dir)
-    old_port = availability.port if isinstance(availability, LiveServer) else None
-    if isinstance(existing, dict):
-        old_entry = _as_dict(cast("object", existing))
-        old_thread = _as_str(old_entry.get("thread_id"))
-        if old_thread:
-            launcher_pid = old_entry.get("launcher_pid")
-            if old_entry.get("status") == "failed":
-                # A failed entry is always its launcher's last write.
-                if old_port is not None:
-                    cleanup = _end_unwatched_turn(
-                        old_port, old_thread, Path(_as_str(_attr(args, "log_file")))
-                    )
-                    if isinstance(cleanup, RelaunchBlockedByLiveTurn):
-                        print(
-                            f"codex_mesh: {name}: thread {old_thread} still has a live turn that could not be interrupted; relaunch once it ends",
-                            file=sys.stderr,
-                        )
-                        return 2
-                old_thread = ""
-            elif old_entry.get("status") == WAITING_CAPACITY:
-                if isinstance(launcher_pid, int) and _pid_alive(launcher_pid):
-                    print(
-                        f"codex_mesh: {name}: thread {old_thread} is waiting for capacity; use codex_mesh.py end --to {name} before relaunching",
-                        file=sys.stderr,
-                    )
-                    return 2
-                # A dead waiting launcher cannot resume this thread.
-                old_thread = ""
-        if old_thread and old_port is not None:
-            try:
-                check = Client(old_port, f"relaunch-{os.getpid()}")
-                try:
-                    live = _read_live_turn(check, old_thread)
-                finally:
-                    check.close()
-            except (ConnectionError, OSError, SystemExit) as exc:
-                live = ThreadStateUnknown(str(exc) or exc.__class__.__name__)
-            if isinstance(live, ThreadStateUnknown):
-                print(
-                    f"codex_mesh: {name}: thread {old_thread}'s state could not be read ({live.reason}); use codex_mesh.py end --to {name} before relaunching",
-                    file=sys.stderr,
-                )
-                return 2
-            if not isinstance(live, ThreadIdle):
-                print(
-                    f"codex_mesh: {name}: thread {old_thread} has a live turn; use codex_mesh.py end --to {name} before relaunching",
-                    file=sys.stderr,
-                )
-                return 2
-    port, fresh_server = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
+    with worker_lifecycle.lock_worker(session_dir, name):
+        record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        reason = _relaunch_refusal(name, record)
+        if reason:
+            print(f"codex_mesh: {name}: {reason}", file=sys.stderr)
+            return 2
+        port, fresh_server = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
     outcome = _run_worker(args, port, started_here=fresh_server)
+    if isinstance(outcome, WorkerLaunchRefused):
+        return 2
     tested = fresh_server
     if _retry_warranted(outcome, fresh_server, resident):
         _ = _retire_server(session_dir, port)
@@ -3421,8 +3508,10 @@ def command_start(args: argparse.Namespace) -> int:
     if isinstance(outcome, CapacityRetriesExhausted):
         print(f"codex_mesh: {name}: {outcome.message(name)}", file=sys.stderr)
         return 1
-    if isinstance(outcome, WorkerHandedOff):
-        print(f"codex_mesh: {name}: worker handed off to {outcome.to_run}; assignment completion unknown", file=sys.stderr)
+    if isinstance(outcome, WorkerLaunchRefused):
+        return 2
+    if isinstance(outcome, (WorkerHandedOff, WorkerOwnershipLost)):
+        print(f"codex_mesh: {name}: {outcome.message()}", file=sys.stderr)
         return 2
     return 0
 
@@ -3479,7 +3568,8 @@ def _follow_worker(args: argparse.Namespace) -> int:
     ):
         print(f"codex_mesh: {display_name} was already claimed", file=sys.stderr)
         return 2
-    _set_roster_assignment(session_dir, name, role, _as_str(_attr(args, "task")))
+    _set_roster_assignment(session_dir, name, role, _as_str(_attr(args, "task")),
+                           RosterActiveLauncher(thread_id, (claim_pid or os.getpid(), os.getpid())))
     display_name = unit_workers.shown_name(Path(session_dir), name)
     if claim_pid:
         _record_assignment(thread_id, role, _dispatch_lens(args), only_if_changed=True)
@@ -3488,48 +3578,53 @@ def _follow_worker(args: argparse.Namespace) -> int:
     client: Client | None = None
     live_turn = ""
     try:
-        home = workers_home()
-        port, _fresh = ensure_server(session_dir, home, cwd=_as_str(_attr(args, "turn_cwd")) or None)
-        _note_worker_port(session_dir, name, owner_pid, port)
-        adopted_from = _as_str(record.get("adopted_from"))
-        if adopted_from:
-            _release_adopted_writer(adopted_from, name, thread_id, port)
-        released = _release_other_worker_writers(session_dir, name, thread_id, port)
-        if isinstance(released, WorkerThreadStateUnknown):
-            raise SystemExit(f"thread {thread_id}: {released.reason}; follow-up did not start")
-        if isinstance(released, WorkerWaitingOnLiveTurn):
-            raise SystemExit(released.reason)
-        client = Client(port, name)
-        _ = _bind_serving_server(client, session_dir, started_here=_fresh)
-        # Held under the pending lock: a message held while the roster moves to a replacement
-        # thread waits here, then lands on the replacement with the ones carried over.
-        with _pending_file(session_dir, name) as handle:
-            resumed = _resume_worker_thread(args, session_dir, name, thread_id, client, home)
+        _ = ensure_server(session_dir, workers_home(), cwd=_as_str(_attr(args, "turn_cwd")) or None)
+        with worker_lifecycle.lock_worker(session_dir, name):
+            current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+            if not RosterActiveLauncher(thread_id, (owner_pid, os.getpid())).owns(current):
+                raise SystemExit("worker ownership changed before resume; follow-up did not start")
+            home = workers_home()
+            port, _fresh = ensure_server(session_dir, home, cwd=_as_str(_attr(args, "turn_cwd")) or None)
+            _note_worker_port(session_dir, name, owner_pid, port)
+            adopted_from = _as_str(record.get("adopted_from"))
+            if adopted_from:
+                _release_adopted_writer(adopted_from, name, thread_id, port)
+            released = _release_other_worker_writers(session_dir, name, thread_id, port)
+            if isinstance(released, WorkerThreadStateUnknown):
+                raise SystemExit(f"thread {thread_id}: {released.reason}; follow-up did not start")
+            if isinstance(released, WorkerWaitingOnLiveTurn):
+                raise SystemExit(released.reason)
+            client = Client(port, name)
+            _ = _bind_serving_server(client, session_dir, started_here=_fresh)
+            # Held under the pending lock: a message held while the roster moves to a replacement
+            # thread waits here, then lands on the replacement with the ones carried over.
+            with _pending_file(session_dir, name) as handle:
+                resumed = _resume_worker_thread(args, session_dir, name, thread_id, client, home)
+                if resumed.thread_replaced:
+                    carried = _pending_for_thread(handle, thread_id)
+                    if carried:
+                        _write_pending(handle, resumed.thread_id, carried,
+                                       accepting_messages=not _messages_closed(handle, thread_id))
             if resumed.thread_replaced:
-                carried = _pending_for_thread(handle, thread_id)
-                if carried:
-                    _write_pending(handle, resumed.thread_id, carried,
-                                   accepting_messages=not _messages_closed(handle, thread_id))
+                thread_id = resumed.thread_id
+                if not _update_roster_if_expected(session_dir, name, {
+                    "thread_id": thread_id, "status": "starting", "launcher_pid": owner_pid, "port": port,
+                }, RosterOnThread(thread_id)):
+                    _refuse_taken_follow_up(client, thread_id, session_dir)
+                _record_assignment(thread_id, role, _dispatch_lens(args))
+            live = _read_live_turn(client, thread_id)
+            if not isinstance(live, ThreadIdle):
+                if isinstance(live, ThreadLive):
+                    live_turn = live.turn_id
+                reason = live.reason if isinstance(live, ThreadStateUnknown) else "live turn"
+                raise SystemExit(f"thread {thread_id}: {reason}; follow-up failed")
+            if record.get("unit_ledger"):
+                _ = _require(client.call("thread/name/set", {
+                    "threadId": thread_id,
+                    "name": unit_workers.shown_name(Path(session_dir), name, role=role),
+                }), "thread/name/set")
         if record.get("unit_ledger"):
             unit_workers.note_backend(Path(session_dir), name, resumed.thread_id, home)
-        if resumed.thread_replaced:
-            thread_id = resumed.thread_id
-            if not _update_roster_if_expected(session_dir, name, {
-                "thread_id": thread_id, "status": "starting", "launcher_pid": owner_pid, "port": port,
-            }, RosterOnThread(thread_id)):
-                _refuse_taken_follow_up(client, thread_id, session_dir)
-            _record_assignment(thread_id, role, _dispatch_lens(args))
-        live = _read_live_turn(client, thread_id)
-        if not isinstance(live, ThreadIdle):
-            if isinstance(live, ThreadLive):
-                live_turn = live.turn_id
-            reason = live.reason if isinstance(live, ThreadStateUnknown) else "live turn"
-            raise SystemExit(f"thread {thread_id}: {reason}; follow-up failed")
-        if record.get("unit_ledger"):
-            _ = _require(client.call("thread/name/set", {
-                "threadId": thread_id,
-                "name": unit_workers.shown_name(Path(session_dir), name, role=role),
-            }), "thread/name/set")
         prompt = _message_text(args)
         timeout = _as_float(_attr(args, "timeout"), 86400.0)
         outcome = _stream_turn(args, client, port, session_dir, name, thread_id, prompt, timeout, opened, follow=True)
@@ -3540,8 +3635,8 @@ def _follow_worker(args: argparse.Namespace) -> int:
         if isinstance(outcome, CapacityRetriesExhausted):
             print(f"codex_mesh: {display_name}: {outcome.message(name)}", file=sys.stderr)
             return 1
-        if isinstance(outcome, WorkerHandedOff):
-            print(f"codex_mesh: {display_name}: worker handed off to {outcome.to_run}; assignment completion unknown", file=sys.stderr)
+        if isinstance(outcome, (WorkerHandedOff, WorkerOwnershipLost)):
+            print(f"codex_mesh: {display_name}: {outcome.message()}", file=sys.stderr)
             return 2
         return 0
     except (ConnectionError, OSError, SystemExit, unit_workers.WorkerUnavailable, ValueError) as exc:
@@ -3665,82 +3760,91 @@ def _abandon_compaction(client: Client, name: str, thread_id: str, timeout: Comp
 def command_compact(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "to"))
-    try:
-        record = _lookup(session_dir, name)
-        state = _roster_thread(record)
-    except SystemExit as exc:
-        print(exc, file=sys.stderr)
-        return 2
-    if not isinstance(state, FollowableThread):
-        print(
-            f"codex_mesh: {name}: worker is running or otherwise busy; compact requires a finished worker",
-            file=sys.stderr,
-        )
-        return 2
-    before = _context_size_from_record(record)
-    revision = _roster_revision(record)
-    if isinstance(before, NotMeasuredSinceCompaction):
-        print(
-            f"codex_mesh: {name}: size not measured since its last compaction; compact refused",
-            file=sys.stderr,
-        )
-        return 2
-    if not isinstance(before, KnownContextSize):
-        print(
-            f"codex_mesh: {name}: no recorded context size; compact refused",
-            file=sys.stderr,
-        )
-        return 2
-    client: Client | None = None
-    try:
-        home = workers_home()
-        port, _fresh = ensure_server(session_dir, home)
-        released = _release_other_worker_writers(session_dir, name, state.thread_id, port)
-        if not isinstance(released, _ReleasedWorkerThread):
-            line = f"{name}: {released.reason}; compact refused; follow-up checks release again"
-            _post_board_status(session_dir, name, line)
-            print(f"codex_mesh: {line}", file=sys.stderr)
-            return COMPACT_TURN_STILL_LIVE if isinstance(released, WorkerWaitingOnLiveTurn) else 2
-        client = Client(port, f"compact-{name}")
-        _ = _require(
-            client.call("thread/resume", _resume_params(session_dir, name, state.thread_id)),
-            "thread/resume",
-        )
-        # A finished worker with a live turn is finishing one nobody waits on; give it time to end.
-        live = _wait_for_idle(client, state.thread_id)
-        if isinstance(live, ThreadStateUnknown):
-            print(f"codex_mesh: {name}: {live.reason}; compact refused", file=sys.stderr)
-            return 2
-        if not isinstance(live, ThreadIdle):
-            print(f"codex_mesh: {name}: thread has a live turn; compact refused", file=sys.stderr)
-            return COMPACT_TURN_STILL_LIVE
+    with worker_lifecycle.lock_worker(session_dir, name):
         try:
-            after = _compact_thread(client, state.thread_id)
-        except CompactionTimedOut as timeout:
-            return _abandon_compaction(client, name, state.thread_id, timeout)
-        size: RecordedContextSize = after if after.tokens > 0 else NotMeasuredSinceCompaction()
-        compacted_record: FollowableRecord = {"thread_id": state.thread_id, "status": state.status}
-        if isinstance(size, KnownContextSize):
-            compacted_record["context_tokens"] = size.tokens
-        else:
-            compacted_record["context_tokens"] = "not_measured_since_compaction"
-        _ = _update_roster_if_expected(
-            session_dir,
-            name,
-            compacted_record,
-            RosterUnchanged(state.thread_id, revision),
-        )
-        if isinstance(size, KnownContextSize):
-            print(f"compacted {name}: {before.tokens} -> {size.tokens} tokens")
-        else:
-            print(f"compacted {name}: {before.tokens} tokens, size not measured until its next turn")
-        return 0
-    except (ConnectionError, OSError, SystemExit) as exc:
-        print(f"codex_mesh: {name}: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        if client is not None:
-            client.close()
+            record = _lookup(session_dir, name)
+            state = _roster_thread(record)
+        except SystemExit as exc:
+            print(exc, file=sys.stderr)
+            return 2
+        if not isinstance(state, FollowableThread):
+            detail = ("launcher died; use follow or reopen to recover its idle thread" if _launcher_died(state)
+                      else "worker is running or otherwise busy; compact requires a finished worker")
+            print(
+                f"codex_mesh: {name}: {detail}",
+                file=sys.stderr,
+            )
+            return 2
+        before = _context_size_from_record(record)
+        revision = _roster_revision(record)
+        if isinstance(before, NotMeasuredSinceCompaction):
+            print(
+                f"codex_mesh: {name}: size not measured since its last compaction; compact refused",
+                file=sys.stderr,
+            )
+            return 2
+        if not isinstance(before, KnownContextSize):
+            print(
+                f"codex_mesh: {name}: no recorded context size; compact refused",
+                file=sys.stderr,
+            )
+            return 2
+        client: Client | None = None
+        try:
+            home = workers_home()
+            port, _fresh = ensure_server(session_dir, home)
+            released = _release_other_worker_writers(session_dir, name, state.thread_id, port)
+            if not isinstance(released, _ReleasedWorkerThread):
+                line = f"{name}: {released.reason}; compact refused; follow-up checks release again"
+                _post_board_status(session_dir, name, line)
+                print(f"codex_mesh: {line}", file=sys.stderr)
+                return COMPACT_TURN_STILL_LIVE if isinstance(released, WorkerWaitingOnLiveTurn) else 2
+            client = Client(port, f"compact-{name}")
+            _ = _require(
+                client.call("thread/resume", _resume_params(session_dir, name, state.thread_id)),
+                "thread/resume",
+            )
+            # A finished worker with a live turn is finishing one nobody waits on; give it time to end.
+            live = _wait_for_idle(client, state.thread_id)
+            if isinstance(live, ThreadStateUnknown):
+                print(f"codex_mesh: {name}: {live.reason}; compact refused", file=sys.stderr)
+                return 2
+            if not isinstance(live, ThreadIdle):
+                print(f"codex_mesh: {name}: thread has a live turn; compact refused", file=sys.stderr)
+                return COMPACT_TURN_STILL_LIVE
+            try:
+                after = _compact_thread(client, state.thread_id)
+            except CompactionTimedOut as timeout:
+                return _abandon_compaction(client, name, state.thread_id, timeout)
+            size: RecordedContextSize = after if after.tokens > 0 else NotMeasuredSinceCompaction()
+            compacted_record: FollowableRecord = {"thread_id": state.thread_id, "status": state.status}
+            if isinstance(size, KnownContextSize):
+                compacted_record["context_tokens"] = size.tokens
+            else:
+                compacted_record["context_tokens"] = "not_measured_since_compaction"
+            if not _update_roster_if_expected(
+                session_dir,
+                name,
+                compacted_record,
+                RosterUnchanged(state.thread_id, revision),
+            ):
+                current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+                detail = (f"status={current.get('status', 'missing')}, thread={current.get('thread_id', 'missing')}, "
+                          + f"turn={current.get('turn_id', 'none')}, revision={_roster_revision(current).value}")
+                print(f"codex_mesh: {name}: compacted, but the roster changed during compaction ({detail}); "
+                      + "follow-up not sent; inspect the worker and use reopen if its thread is idle", file=sys.stderr)
+                return COMPACT_ROSTER_CHANGED
+            if isinstance(size, KnownContextSize):
+                print(f"compacted {name}: {before.tokens} -> {size.tokens} tokens")
+            else:
+                print(f"compacted {name}: {before.tokens} tokens, size not measured until its next turn")
+            return 0
+        except (ConnectionError, OSError, SystemExit) as exc:
+            print(f"codex_mesh: {name}: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            if client is not None:
+                client.close()
 
 
 def _launcher_died(state: RosterThread) -> bool:
@@ -3760,25 +3864,37 @@ def _follow_refusal(session_dir: str, state: RosterThread, *, name: str) -> str:
     record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
     if record.get("adopted_to"):
         return f"worker adopted to {record['adopted_to']}"
-    if record.get("adopted_from"):
+    adopted_from = _as_str(record.get("adopted_from"))
+    if adopted_from and not stale_launcher:
         # The taking server may not know this thread until thread/resume.
         # follow claims it first, releases the giving writer, then checks idle
         # on the resumed thread before submitting any work.
         return ""
     availability = _server_availability(session_dir)
     if isinstance(availability, ServerRestartRequired):
+        if stale_launcher:
+            return "launcher died; no live server can prove the thread idle; pending work kept; use reopen to recover"
         return ""
     try:
-        probe = Client(availability.port, f"follow-check-{os.getpid()}")
+        probe = Client(availability.port, f"follow-check-{os.getpid()}",
+                       deadline=time.time() + THREAD_RELEASE_TIMEOUT_SECS)
         try:
             live = _read_live_turn(probe, state.thread_id)
         finally:
             probe.close()
     except (ConnectionError, OSError, SystemExit) as exc:
-        return f"thread/read failed: {exc}"
+        return ("launcher died; " if stale_launcher else "") + f"thread/read failed: {exc}; use follow or reopen once idle"
     if isinstance(live, ThreadIdle):
         return ""
-    return live.reason if isinstance(live, ThreadStateUnknown) else "live turn"
+    if stale_launcher and isinstance(live, ThreadStateUnknown) and (
+            adopted_from or any(port != availability.port for port in _run_servers(session_dir))):
+        # Missing or stale roster port telemetry cannot establish placement.
+        # A recorded giving server permits claiming and resuming
+        # the exact thread through the same retired-writer release/idle checks
+        # as adoption; an unknown read here is not evidence that work stopped.
+        return ""
+    reason = live.reason if isinstance(live, ThreadStateUnknown) else "live turn"
+    return ("launcher died; " if stale_launcher else "") + reason + "; pending work kept; use follow or reopen once idle"
 
 
 def command_can_follow(args: argparse.Namespace) -> int:
@@ -3861,44 +3977,98 @@ def _attach_and_run(
     prompt = Path(_as_str(_attr(args, "prompt_file"))).read_text(encoding="utf-8")
     log_path = Path(_as_str(_attr(args, "log_file")))
 
-    client = Client(port, name)
-    _ = _bind_serving_server(client, session_dir, started_here=started_here)
-    started = _serving_request(client, "thread/start", _thread_start_params(args),
-                               submits_work=True, stopped=CommandStoppedBeforeThread(session_dir))
-    thread_id = _as_str(_as_dict(started.get("thread")).get("id"))
-    if not thread_id:
-        raise SystemExit("codex_mesh: thread/start returned no thread id")
+    with worker_lifecycle.lock_worker(session_dir, name):
+        existing = _read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)
+        if isinstance(existing, dict):
+            _role_fence(_as_dict(cast(object, existing)))
+            if _as_dict(cast(object, existing)).get("held_design_id"):
+                raise SystemExit("codex_mesh: held roles must resume through their holder")
+        availability = _server_availability(session_dir)
+        old_port = availability.port if isinstance(availability, LiveServer) else None
+        if isinstance(existing, dict):
+            old_entry = _as_dict(cast("object", existing))
+            reason = _relaunch_refusal(name, old_entry)
+            if reason:
+                print(f"codex_mesh: {name}: {reason}", file=sys.stderr)
+                return WorkerLaunchRefused()
+            old_thread = _as_str(old_entry.get("thread_id"))
+            if old_thread:
+                if old_entry.get("status") == "failed":
+                    # A failed entry is always its launcher's last write.
+                    if old_port is not None:
+                        cleanup = _end_unwatched_turn(
+                            old_port, old_thread, Path(_as_str(_attr(args, "log_file")))
+                        )
+                        if isinstance(cleanup, RelaunchBlockedByLiveTurn):
+                            print(
+                                f"codex_mesh: {name}: thread {old_thread} still has a live turn that could not be interrupted; relaunch once it ends",
+                                file=sys.stderr,
+                            )
+                            return WorkerLaunchRefused()
+                    old_thread = ""
+                elif old_entry.get("status") == WAITING_CAPACITY:
+                    # A dead waiting launcher cannot resume this thread.
+                    old_thread = ""
+            if old_thread and old_port is not None:
+                try:
+                    check = Client(old_port, f"relaunch-{os.getpid()}")
+                    try:
+                        live = _read_live_turn(check, old_thread)
+                    finally:
+                        check.close()
+                except (ConnectionError, OSError, SystemExit) as exc:
+                    live = ThreadStateUnknown(str(exc) or exc.__class__.__name__)
+                if isinstance(live, ThreadStateUnknown):
+                    print(
+                        f"codex_mesh: {name}: thread {old_thread}'s state could not be read ({live.reason}); use codex_mesh.py end --to {name} before relaunching",
+                        file=sys.stderr,
+                    )
+                    return WorkerLaunchRefused()
+                if not isinstance(live, ThreadIdle):
+                    print(
+                        f"codex_mesh: {name}: thread {old_thread} has a live turn; use codex_mesh.py end --to {name} before relaunching",
+                        file=sys.stderr,
+                    )
+                    return WorkerLaunchRefused()
+        client = Client(port, name)
+        _ = _bind_serving_server(client, session_dir, started_here=started_here)
+        started = _serving_request(client, "thread/start", _thread_start_params(args),
+                                   submits_work=True, stopped=CommandStoppedBeforeThread(session_dir))
+        thread_id = _as_str(_as_dict(started.get("thread")).get("id"))
+        if not thread_id:
+            raise SystemExit("codex_mesh: thread/start returned no thread id")
 
-    with _pending_file(session_dir, name) as pending_file:
-        previous = _as_dict(_read_json_object(
-            _session_path(session_dir, ROSTER_FILE)
-        ).get(name))
-        previous_thread = _as_str(previous.get("thread_id"))
-        if previous_thread and previous_thread != thread_id:
-            dropped = len(_pending_for_thread(pending_file, previous_thread))
-            _ = pending_file.seek(0)
-            _ = pending_file.truncate()
-            with log_path.open("a", encoding="utf-8") as log:
-                stamp = datetime.now().astimezone().isoformat(timespec="seconds")
-                _ = log.write(
-                    f"[{stamp}] mesh: dropped {dropped} held messages for thread {previous_thread} on relaunch\n"
-                )
-        starting: StartingRecord = {
-            "model": _as_str(_attr(args, "model")), "effort": _as_str(_attr(args, "effort")),
-            "thread_id": thread_id,
-            "status": "starting",
-            "port": port,
-            "launcher_pid": os.getpid(),
-        }
-        task = _as_str(_attr(args, "task"))
-        if task:
-            starting["task"] = task
-        role = _roster_role(_attr(args, "role"))
-        if isinstance(role, AssignedWorkerRole):
-            starting["role"] = role.role
-        _update_roster(session_dir, name, starting)
-        if isinstance(role, AssignedWorkerRole):
-            _record_assignment(thread_id, role.role, _dispatch_lens(args))
+        with _pending_file(session_dir, name) as pending_file:
+            previous = _as_dict(cast(object, existing))
+            previous_thread = _as_str(previous.get("thread_id"))
+            if previous_thread and previous_thread != thread_id:
+                dropped = len(_pending_for_thread(pending_file, previous_thread))
+                _ = pending_file.seek(0)
+                _ = pending_file.truncate()
+                with log_path.open("a", encoding="utf-8") as log:
+                    stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                    _ = log.write(
+                        f"[{stamp}] mesh: dropped {dropped} held messages for thread {previous_thread} on relaunch\n"
+                    )
+            starting: StartingRecord = {
+                "model": _as_str(_attr(args, "model")), "effort": _as_str(_attr(args, "effort")),
+                "thread_id": thread_id,
+                "status": "starting",
+                "port": port,
+                "launcher_pid": os.getpid(),
+            }
+            task = _as_str(_attr(args, "task"))
+            if task:
+                starting["task"] = task
+            role = _roster_role(_attr(args, "role"))
+            if isinstance(role, AssignedWorkerRole):
+                starting["role"] = role.role
+            expected: ExpectedRoster = (RosterUnchanged(previous_thread, _roster_revision(previous))
+                                        if previous else RosterAbsent())
+            if not _update_roster_if_expected(session_dir, name, starting, expected):
+                raise SystemExit(f"codex_mesh: {name}: roster changed while opening the worker; launch refused")
+            if isinstance(role, AssignedWorkerRole):
+                _record_assignment(thread_id, role.role, _dispatch_lens(args))
 
     return _stream_turn(args, client, port, session_dir, name, thread_id, prompt, timeout, opened)
 
@@ -3920,14 +4090,16 @@ def _resume_account_move(
             return resumed
         if not resumed.turn_id:
             raise SystemExit("account move continuation returned no turn id")
-        _ = _update_roster_if_expected(
-            session_dir,
-            name,
-            {"thread_id": resumed.thread_id, "turn_id": resumed.turn_id,
-             "status": "running", "port": resumed.port},
-            RosterOnThread(resumed.thread_id),
-        )
-        _finish_account_move(session_dir, name, marker)
+        with worker_lifecycle.lock_worker(session_dir, name):
+            if not _update_roster_if_expected(
+                session_dir,
+                name,
+                {"thread_id": resumed.thread_id, "turn_id": resumed.turn_id,
+                 "status": "running", "port": resumed.port},
+                RosterActiveLauncher(resumed.thread_id, (client.launcher_pid, os.getpid())),
+            ):
+                raise SystemExit(f"codex_mesh: {name}: roster ownership changed during account move; continuation not acknowledged")
+            _finish_account_move(session_dir, name, marker)
         return resumed
     except (ConnectionError, OSError, SystemExit) as error:
         _fail_account_move(session_dir, name, marker, f"resume failed: {error}")
@@ -3979,6 +4151,10 @@ class TurnStream:
     room_wait_logged: bool = False
     events: FollowEvents | SocketOnlyWait = SOCKET_ONLY_WAIT
     state_change_owed: bool = False
+    # A prior launcher can remain subscribed after another process settled its work.
+    ownership_released: bool = False
+    ownership_loss: ReleasedWorker = field(default_factory=WorkerOwnershipLost)
+    completed_turns: set[tuple[str, str]] = field(default_factory=set)
 
 
 class StreamStep(Enum):
@@ -4076,12 +4252,12 @@ def _stream_turn(
 ) -> RunOutcome:
     """Stream a new or resumed thread's turn through the same lifecycle."""
     client.session_dir = session_dir
+    client.launcher_pid = _as_int(_attr(args, "claim_pid")) or os.getpid()
     log_path = Path(_as_str(_attr(args, "log_file")))
     summary_path = Path(_as_str(_attr(args, "summary_file")))
     reply_file = _as_str(_attr(args, "reply_file"))
     resident = getattr(args, "resident", False) is True
     end_marker = _end_marker_path(session_dir, name)
-    end_marker.unlink(missing_ok=True)
     director = UnknownWorkerDirector() if follow else _worker_director(Path(session_dir))
     failure_serving = client.serving
     stream = TurnStream(
@@ -4093,8 +4269,13 @@ def _stream_turn(
         client=client, port=initial_port, thread_id=initial_thread_id, failure_serving=failure_serving,
         runs=DetachedRunWatch(session_dir, name),
     )
-    with _pending_file(session_dir, name) as handle:
-        _write_pending(handle, initial_thread_id, _pending_for_thread(handle, initial_thread_id))
+    with worker_lifecycle.lock_worker(session_dir, name):
+        record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        if not _stream_launcher(stream).owns(record):
+            return _worker_ownership_loss(record)
+        end_marker.unlink(missing_ok=True)
+        with _pending_file(session_dir, name) as handle:
+            _write_pending(handle, initial_thread_id, _pending_for_thread(handle, initial_thread_id))
     try:
         with contextlib.closing(FollowEvents(session_dir, name)) as events, log_path.open("a", encoding="utf-8") as log:
             stream.events = events
@@ -4111,10 +4292,7 @@ def _stream_turn(
     except (ConnectionError, OSError, SystemExit) as exc:
         return _fail_stream(stream, exc)
     finally:
-        if not end_marker.exists():
-            with _pending_file(session_dir, name) as handle:
-                _write_pending(handle, stream.thread_id, _pending_for_thread(handle, stream.thread_id),
-                               accepting_messages=False)
+        _close_stream_inbox(stream)
         stream.client.close()
 
 
@@ -4122,8 +4300,11 @@ def _start_streamed_turn(stream: TurnStream, prompt: str, log: TextIO) -> Stream
     """Name the thread, submit its first turn and mark it running on the roster."""
     # The roster is written before this call: a disconnect after thread
     # creation must still leave its id reachable.
-    _ = stream.client.call("thread/name/set", {"threadId": stream.thread_id,
-                                               "name": unit_workers.shown_name(Path(stream.session_dir), stream.name)})
+    with worker_lifecycle.lock_worker(stream.session_dir, stream.name):
+        if _stream_was_released(stream):
+            return StreamStep.FINISH
+        _ = stream.client.call("thread/name/set", {"threadId": stream.thread_id,
+                                                   "name": unit_workers.shown_name(Path(stream.session_dir), stream.name)})
     initial_move = (_read_account_move(stream.session_dir, stream.name, stream.thread_id)
                     if _attr(stream.args, "account_move") is True else NoAccountMove())
     started = _start_workers_turn(
@@ -4135,17 +4316,13 @@ def _start_streamed_turn(stream: TurnStream, prompt: str, log: TextIO) -> Stream
         raise SystemExit("codex_mesh: turn/start returned no turn id")
     if isinstance(initial_move, AccountMoveMarker):
         _finish_account_move(stream.session_dir, stream.name, initial_move)
-    _ = _update_roster_if_expected(
-        stream.session_dir,
-        stream.name,
-        {
+    if not _record_stream_state(stream, {
             "thread_id": stream.thread_id,
             "turn_id": stream.turn_id,
             "status": "running",
             "port": stream.port,
-        },
-        RosterOnThread(stream.thread_id),
-    )
+        }):
+        return StreamStep.FINISH
     return StreamStep.NEXT_FRAME
 
 
@@ -4297,8 +4474,7 @@ def _on_quiet_poll(stream: TurnStream, log: TextIO) -> StreamStep | FailedWithTh
         stream.state_change_owed = True
         return StreamStep.NEXT_FRAME
     stream.state_change_owed = False
-    if isinstance(_roster_thread(_read_json_object(
-            _session_path(stream.session_dir, ROSTER_FILE)).get(stream.name)), AdoptedThread):
+    if _stream_was_released(stream):
         return StreamStep.FINISH
     if not stream.resume_owed:
         stream.pending_refusal = _pending_after_completion_readback(stream.pending_refusal, stream.client)
@@ -4414,8 +4590,17 @@ def _on_frame(stream: TurnStream, log: TextIO, frame: RpcMessage) -> StreamStep 
     params = _as_dict(frame.get("params"))
     if _as_str(params.get("threadId")) not in ("", stream.thread_id):
         return StreamStep.NEXT_FRAME
-    if stream.turn_id and stream.turn_id in (
-            _as_str(params.get("turnId")), _as_str(_as_dict(params.get("turn")).get("id"))):
+    if stream.ownership_released:
+        return StreamStep.FINISH
+    # Notices for our watched turn need no extra roster read. A maintenance
+    # turn broadcast to an old subscriber has a different (or unknown) id.
+    # Completed items only collect buffered output, which may omit a turn id.
+    own_turn = bool(stream.turn_id and stream.turn_id in (
+        _as_str(params.get("turnId")), _as_str(_as_dict(params.get("turn")).get("id"))))
+    if (method in ("turn/started", "thread/tokenUsage/updated", "turn/completed", "turn/failed")
+            and not own_turn and _stream_was_released(stream)):
+        return StreamStep.FINISH
+    if own_turn:
         stream.turn_start_seen = True
     if method == "turn/started":
         _on_turn_started(stream, params)
@@ -4428,6 +4613,52 @@ def _on_frame(stream: TurnStream, log: TextIO, frame: RpcMessage) -> StreamStep 
     return StreamStep.NEXT_FRAME
 
 
+def _stream_launcher(stream: TurnStream) -> RosterActiveLauncher:
+    return RosterActiveLauncher(stream.thread_id,
+                               (_as_int(_attr(stream.args, "claim_pid")) or os.getpid(), os.getpid()))
+
+
+def _stream_was_released(stream: TurnStream) -> bool:
+    """A subscriber may act only while its launcher still owns worker work.
+
+    A paused, finished, adopted or newly claimed entry belongs to someone else.
+    Broadcast maintenance notices must never settle or clean up that entry.
+    """
+    if stream.ownership_released:
+        return True
+    record = _as_dict(_read_json_object(_session_path(stream.session_dir, ROSTER_FILE)).get(stream.name))
+    if not _stream_launcher(stream).owns(record):
+        stream.ownership_loss = _worker_ownership_loss(record)
+        stream.ownership_released = True
+    return stream.ownership_released
+
+
+def _record_stream_state(stream: TurnStream, record: ThreadRecord) -> bool:
+    """A failed notice write releases the subscriber, rather than being ignored."""
+    with worker_lifecycle.lock_worker(stream.session_dir, stream.name):
+        if stream.ownership_released:
+            return False
+        if not _update_roster_if_expected(stream.session_dir, stream.name, record, _stream_launcher(stream)):
+            stream.ownership_released = True
+            return False
+        return True
+
+
+def _close_stream_inbox(stream: TurnStream) -> None:
+    with worker_lifecycle.lock_worker(stream.session_dir, stream.name):
+        _close_stream_inbox_locked(stream)
+
+
+def _close_stream_inbox_locked(stream: TurnStream) -> None:
+    """Close only this launcher's inbox, excluding a concurrent follow claim."""
+    if stream.end_marker.exists() or stream.ownership_released:
+        return
+    with _pending_file(stream.session_dir, stream.name) as handle:
+        if not _stream_was_released(stream):
+            _write_pending(handle, stream.thread_id, _pending_for_thread(handle, stream.thread_id),
+                           accepting_messages=False)
+
+
 def _on_turn_started(stream: TurnStream, params: dict[str, object]) -> None:
     live = _as_str(_as_dict(params.get("turn")).get("id"))
     if live and (not stream.follow or not stream.followed_turn or live == stream.followed_turn):
@@ -4436,28 +4667,20 @@ def _on_turn_started(stream: TurnStream, params: dict[str, object]) -> None:
             stream.capacity_backoff_owed = False
         if stream.follow:
             stream.followed_turn = live
-        _ = _update_roster_if_expected(
-            stream.session_dir,
-            stream.name,
-            {"thread_id": stream.thread_id, "turn_id": live, "status": "running"},
-            RosterOnThread(stream.thread_id),
-        )
+        if not _record_stream_state(stream, {"thread_id": stream.thread_id, "turn_id": live, "status": "running"}):
+            stream.ownership_released = True
 
 
 def _record_context_size(stream: TurnStream, params: dict[str, object]) -> None:
     context_size = _context_size_from_usage(params)
     if isinstance(context_size, KnownContextSize):
-        _ = _update_roster_if_expected(
-            stream.session_dir,
-            stream.name,
-            {
+        if not _record_stream_state(stream, {
                 "thread_id": stream.thread_id,
                 "turn_id": stream.turn_id,
                 "status": "running",
                 "context_tokens": context_size.tokens,
-            },
-            RosterOnThread(stream.thread_id),
-        )
+            }):
+            stream.ownership_released = True
 
 
 def _log_completed_item(stream: TurnStream, log: TextIO, params: dict[str, object]) -> None:
@@ -4476,11 +4699,7 @@ def _on_turn_end(
     stream: TurnStream, log: TextIO, method: str, params: dict[str, object],
 ) -> StreamStep | FailedWithThread:
     """Handle a completed or failed turn: resume, continue, retry, reply or finish."""
-    if isinstance(_roster_thread(_read_json_object(
-            _session_path(stream.session_dir, ROSTER_FILE)).get(stream.name)), AdoptedThread):
-        if stream.client.has_pending_frames:
-            stream.state_change_owed = True
-            return StreamStep.NEXT_FRAME
+    if _stream_was_released(stream):
         return StreamStep.FINISH
     notice_turn = _as_str(_as_dict(params.get("turn")).get("id"))
     account_move = _read_account_move(stream.session_dir, stream.name, stream.thread_id)
@@ -4493,6 +4712,8 @@ def _on_turn_end(
     if stream.follow:
         stream.followed_turn = ""
     turn_outcome = _turn_outcome(method, params)
+    if isinstance(turn_outcome, TurnCompleted):
+        stream.completed_turns.add((stream.thread_id, notice_turn or stream.turn_id))
     _settle_quota_continuation(stream, notice_turn, turn_outcome)
     if (isinstance(account_move, AccountMoveMarker) and not stream.end_marker.exists()
             and (not notice_turn or notice_turn == account_move.turn_id)):
@@ -4537,7 +4758,8 @@ def _record_turn_failure(stream: TurnStream, notice_turn: str, turn_outcome: Tur
     if identity not in stream.reported_turns:
         stream.reported_turns.add(identity)
         if _quota_refused(failed, serving.started_here, False):
-            _owe_quota_continuation(stream.client, stream.thread_id)
+            with worker_lifecycle.lock_worker(stream.session_dir, stream.name):
+                _owe_quota_continuation(stream.client, stream.thread_id)
             _report_quota_refusal(stream.name, serving, turn_outcome.detail,
                                   session_dir=stream.session_dir, thread_id=stream.thread_id)
             stream.pending_refusal = PendingQuotaRefusal(serving, turn_outcome.detail)
@@ -4571,12 +4793,8 @@ def _continue_after_context_overflow(stream: TurnStream, log: TextIO, notice_tur
     if isinstance(started, WorkerWaitingForRoom):
         return _wait_for_room(stream, log, started)
     _adopt_started_turn(stream, started)
-    _ = _update_roster_if_expected(
-        stream.session_dir,
-        stream.name,
-        {"thread_id": stream.thread_id, "turn_id": stream.turn_id, "status": "running"},
-        RosterOnThread(stream.thread_id),
-    )
+    if not _record_stream_state(stream, {"thread_id": stream.thread_id, "turn_id": stream.turn_id, "status": "running"}):
+        return StreamStep.FINISH
     stream.waiting_for_progress_after_overflow = True
     return StreamStep.NEXT_FRAME
 
@@ -4598,15 +4816,6 @@ def _on_capacity_refusal(stream: TurnStream, log: TextIO, notice_turn: str) -> S
         )
         stream.run_outcome = exhausted
         stream.failure = exhausted.message(stream.name)
-        _ = _update_roster_if_expected(
-            stream.session_dir,
-            stream.name,
-            {
-                "thread_id": stream.thread_id,
-                "status": CAPACITY_EXHAUSTED,
-            },
-            RosterOnThread(stream.thread_id),
-        )
         return StreamStep.FINISH
     # A queued peer message may already have opened a turn.
     # Stream it, then return here with the task still owed.
@@ -4682,17 +4891,14 @@ def _wait_out_capacity(stream: TurnStream, log: TextIO) -> bool:
     remaining = CAPACITY_BUDGET_SECS - stream.capacity_waited
     wait = min(CAPACITY_WAIT_SECS * 2.0 ** stream.capacity_retries,
                CAPACITY_MAX_WAIT_SECS, remaining)
-    with _pending_file(stream.session_dir, stream.name):
-        _ = _update_roster_if_expected(
-            stream.session_dir,
-            stream.name,
-            {
+    with worker_lifecycle.lock_worker(stream.session_dir, stream.name), _pending_file(stream.session_dir, stream.name):
+        if not _update_roster_if_expected(stream.session_dir, stream.name, {
                 "thread_id": stream.thread_id,
                 "status": WAITING_CAPACITY,
                 "launcher_pid": os.getpid(),
-            },
-            RosterOnThread(stream.thread_id),
-        )
+            }, _stream_launcher(stream)):
+            stream.ownership_released = True
+            return False
     live = _read_known_turn(stream)
     if isinstance(live, ThreadLive) and live.turn_id != stream.turn_id:
         stream.capacity_backoff_owed = False
@@ -4723,27 +4929,19 @@ def _watch_turn_opened_while_owed(
         if stopped is not None:
             return stopped
         if stream.turn_id:
-            _ = _update_roster_if_expected(
-                stream.session_dir,
-                stream.name,
-                {
+            if not _record_stream_state(stream, {
                     "thread_id": stream.thread_id,
                     "turn_id": stream.turn_id,
                     "status": "running",
-                },
-                RosterOnThread(stream.thread_id),
-            )
+                }):
+                return StreamStep.FINISH
         else:
-            _ = _update_roster_if_expected(
-                stream.session_dir,
-                stream.name,
-                {
+            if not _record_stream_state(stream, {
                     "thread_id": stream.thread_id,
                     "status": "starting",
                     "launcher_pid": os.getpid(),
-                },
-                RosterOnThread(stream.thread_id),
-            )
+                }):
+                return StreamStep.FINISH
     return StreamStep.NEXT_FRAME
 
 
@@ -4783,12 +4981,8 @@ def _after_turn_end(stream: TurnStream, log: TextIO, turn_outcome: TurnOutcome) 
             return StreamStep.NEXT_FRAME
     if not stream.resident:
         return _finish_one_turn_launch(stream, log)
-    _ = _update_roster_if_expected(
-        stream.session_dir,
-        stream.name,
-        {"thread_id": stream.thread_id, "turn_id": stream.turn_id, "status": "running"},
-        RosterOnThread(stream.thread_id),
-    )
+    if not _record_stream_state(stream, {"thread_id": stream.thread_id, "turn_id": stream.turn_id, "status": "running"}):
+        return StreamStep.FINISH
     return StreamStep.FINISH if stream.end_marker.exists() else StreamStep.NEXT_FRAME
 
 
@@ -4821,68 +5015,112 @@ def _finish_one_turn_launch(stream: TurnStream, log: TextIO) -> StreamStep:
     return StreamStep.NEXT_FRAME
 
 
-def _finish_stream(stream: TurnStream) -> RunOutcome:
-    """End the watch: close an unwatched turn, write the summary and settle the roster."""
-    owner = _roster_thread(_read_json_object(_session_path(stream.session_dir, ROSTER_FILE)).get(stream.name))
-    if isinstance(owner, AdoptedThread):
-        return WorkerHandedOff(owner.to_run)
-    if not stream.resume_owed:
-        stream.pending_refusal = _pending_after_completion_readback(stream.pending_refusal, stream.client)
-    if (not stream.failure and isinstance(stream.pending_refusal, PendingQuotaRefusal)
-            and _continuation_is_owed(stream.session_dir, stream.name)):
-        stream.failure = stream.pending_refusal.detail
-    # A queued peer message can open a turn after the last completion
-    # notification. Check once more before this launcher stops watching.
-    if not stream.resident or stream.failure or stream.end_marker.exists():
-        _ = _end_unwatched_turn(stream.port, stream.thread_id, stream.log_path)
-    if not stream.resident or stream.replies == 0:
-        _finish_summary(stream.summary_path, stream.reply_path,
-                        unit_workers.shown_name(Path(stream.session_dir), stream.name), stream.replies + 1,
-                        stream.final_answer or stream.failure or f"The worker {stream.name} produced no summary.")
+def _released_stream_outcome[Outcome: RunOutcome](stream: TurnStream, outcome: Outcome) -> Outcome | ReleasedWorker:
+    """Keep observed turn completion; ownership loss alone cannot prove it."""
+    if isinstance(outcome, RunCompleted) and (stream.thread_id, stream.turn_id) in stream.completed_turns:
+        return outcome
+    record = _as_dict(_read_json_object(_session_path(stream.session_dir, ROSTER_FILE)).get(stream.name))
+    current_loss = _worker_ownership_loss(record)
+    if isinstance(current_loss, WorkerHandedOff):
+        stream.ownership_loss = current_loss
+    if isinstance(stream.ownership_loss, WorkerHandedOff):
+        return stream.ownership_loss
+    # A resident can be marked done, or explicitly ended, without changing its
+    # launcher. That terminal publication is not a transfer to another owner.
+    same_launcher = (record.get("thread_id") == stream.thread_id
+                     and record.get("launcher_pid") in _stream_launcher(stream).launcher_pids)
+    if same_launcher and record.get("status") in ("done", "ended"):
+        return outcome
+    return stream.ownership_loss if isinstance(outcome, RunCompleted) else outcome
+
+
+def _finished_stream_outcome(stream: TurnStream) -> RunOutcome:
     if isinstance(stream.run_outcome, CapacityRetriesExhausted):
         return replace(stream.run_outcome, pending_refusal=stream.pending_refusal, director=stream.director)
-    _ = _update_roster_if_expected(
-        stream.session_dir,
-        stream.name,
-        {"thread_id": stream.thread_id, "status": "failed" if stream.failure else "done"},
-        RosterOnThread(stream.thread_id),
-    )
-    return FailedWithThread(stream.thread_id, stream.failure, time.time() - stream.opened, stream.failure_serving,
-                            isinstance(stream.pending_refusal, PendingQuotaRefusal), True,
-                            pending_refusal=stream.pending_refusal, director=stream.director) if stream.failure else RunCompleted()
+    if stream.failure:
+        return FailedWithThread(stream.thread_id, stream.failure, time.time() - stream.opened, stream.failure_serving,
+                                isinstance(stream.pending_refusal, PendingQuotaRefusal), True,
+                                pending_refusal=stream.pending_refusal, director=stream.director)
+    return RunCompleted()
 
 
-def _fail_stream(stream: TurnStream, exc: ConnectionError | OSError | SystemExit) -> FailedWithThread | WorkerHandedOff:
-    """Record a run that stopped on an error after its thread existed."""
-    owner = _roster_thread(_read_json_object(
-        _session_path(stream.session_dir, ROSTER_FILE)).get(stream.name))
-    if isinstance(owner, AdoptedThread):
-        # Cleanup on the outgoing server could interrupt the new owner's work.
-        return WorkerHandedOff(owner.to_run)
-    # Once thread/start returned, even a disconnected turn/start may have
-    # begun work. Keep its id and never resubmit the original prompt.
-    if isinstance(exc, WorkerQuotaRecoveryStopped):
-        stream.port, stream.thread_id = exc.port, exc.thread_id
-    elif isinstance(exc, WorkerMoveUncertain) and isinstance(exc.cleanup, WorkerTurnCleanup):
-        stream.port = exc.cleanup.port
-        stream.thread_id = exc.cleanup.thread_id
-    if not stream.resume_owed:
-        stream.pending_refusal = _pending_after_completion_readback(stream.pending_refusal, stream.client)
-    _ = _end_unwatched_turn(stream.port, stream.thread_id, stream.log_path)
-    failure = str(exc) or exc.__class__.__name__
-    _ = _update_roster_if_expected(
-        stream.session_dir,
-        stream.name,
-        {"thread_id": stream.thread_id, "status": "failed"},
-        RosterOnThread(stream.thread_id),
-    )
-    serving = exc.serving if isinstance(exc, (ServingRequestFailure, WorkerMoveUncertain)) else stream.client.serving
-    reported = exc.reported if isinstance(exc, (ServingRequestFailure, WorkerMoveUncertain)) else False
-    if reported:
-        stream.pending_refusal = PendingQuotaRefusal(serving, failure)
-    return FailedWithThread(stream.thread_id, failure, time.time() - stream.opened, serving,
-                            isinstance(stream.pending_refusal, PendingQuotaRefusal), True,
-                            pending_refusal=stream.pending_refusal, director=stream.director)
+def _finish_stream(stream: TurnStream) -> RunOutcome:
+    """Clean up outside the roster lock; fence the terminal write by launcher ownership."""
+    with worker_lifecycle.lock_worker(stream.session_dir, stream.name):
+        _close_stream_inbox_locked(stream)
+        if _stream_was_released(stream):
+            return _released_stream_outcome(stream, _finished_stream_outcome(stream))
+        if not stream.resume_owed:
+            stream.pending_refusal = _pending_after_completion_readback(stream.pending_refusal, stream.client)
+        if (not stream.failure and isinstance(stream.pending_refusal, PendingQuotaRefusal)
+                and _continuation_is_owed(stream.session_dir, stream.name)):
+            stream.failure = stream.pending_refusal.detail
+        # Readbacks, cleanup and summary callbacks can send messages or look up the
+        # worker. None may run under the roster lock. Check ownership after each
+        # boundary, then compare it again inside the final locked write.
+        if _stream_was_released(stream):
+            return _released_stream_outcome(stream, _finished_stream_outcome(stream))
+        if not stream.resident or stream.failure or stream.end_marker.exists():
+            _ = _end_unwatched_turn(stream.port, stream.thread_id, stream.log_path)
+        if _stream_was_released(stream):
+            return _released_stream_outcome(stream, _finished_stream_outcome(stream))
+        if not stream.resident or stream.replies == 0:
+            shown = unit_workers.shown_name(Path(stream.session_dir), stream.name)
+            _finish_summary(stream.summary_path, stream.reply_path, shown, stream.replies + 1,
+                            stream.final_answer or stream.failure or f"The worker {stream.name} produced no summary.")
+        outcome = _finished_stream_outcome(stream)
+        terminal: FollowableRecord | ExhaustedRecord
+        if isinstance(outcome, CapacityRetriesExhausted):
+            terminal = {"thread_id": stream.thread_id, "status": "capacity_exhausted",
+                        "settled_launcher_pid": os.getpid()}
+        else:
+            terminal = {"thread_id": stream.thread_id, "status": "failed" if stream.failure else "done"}
+            if stream.failure:
+                terminal["settled_launcher_pid"] = os.getpid()
+        if not _update_roster_if_expected(stream.session_dir, stream.name,
+                                         terminal, _stream_launcher(stream)):
+            stream.ownership_released = True
+            return _released_stream_outcome(stream, outcome)
+        return outcome
+
+
+def _fail_stream(stream: TurnStream, exc: ConnectionError | OSError | SystemExit) -> FailedWithThread | ReleasedWorker:
+    """Keep the error outcome without cleaning up or changing another launcher's worker."""
+    with worker_lifecycle.lock_worker(stream.session_dir, stream.name):
+        # The first ownership check permanently releases this subscriber. Normalize
+        # replacement identity before that check, closing the inbox or building the result.
+        if isinstance(exc, WorkerQuotaRecoveryStopped):
+            stream.port, stream.thread_id = exc.port, exc.thread_id
+        elif isinstance(exc, WorkerMoveUncertain) and isinstance(exc.cleanup, WorkerTurnCleanup):
+            stream.port, stream.thread_id = exc.cleanup.port, exc.cleanup.thread_id
+        failure = str(exc) or exc.__class__.__name__
+        serving = exc.serving if isinstance(exc, (ServingRequestFailure, WorkerMoveUncertain)) else stream.client.serving
+        reported = exc.reported if isinstance(exc, (ServingRequestFailure, WorkerMoveUncertain)) else False
+        pending = PendingQuotaRefusal(serving, failure) if reported else stream.pending_refusal
+        outcome = FailedWithThread(stream.thread_id, failure, time.time() - stream.opened, serving,
+                                   isinstance(pending, PendingQuotaRefusal), True,
+                                   pending_refusal=pending, director=stream.director)
+        _close_stream_inbox_locked(stream)
+        if _stream_was_released(stream):
+            return _released_stream_outcome(stream, outcome)
+        # Once thread/start returned, even a disconnected turn/start may have
+        # begun work. Keep its id and never resubmit the original prompt.
+        if not stream.resume_owed:
+            stream.pending_refusal = _pending_after_completion_readback(stream.pending_refusal, stream.client)
+        if _stream_was_released(stream):
+            return _released_stream_outcome(stream, outcome)
+        _ = _end_unwatched_turn(stream.port, stream.thread_id, stream.log_path)
+        if reported:
+            stream.pending_refusal = PendingQuotaRefusal(serving, failure)
+        outcome = replace(outcome, thread_id=stream.thread_id, seconds=time.time() - stream.opened,
+                          refusal_reported=isinstance(stream.pending_refusal, PendingQuotaRefusal),
+                          pending_refusal=stream.pending_refusal)
+        if not _update_roster_if_expected(stream.session_dir, stream.name,
+                                         {"thread_id": stream.thread_id, "status": "failed",
+                                          "settled_launcher_pid": os.getpid()}, _stream_launcher(stream)):
+            stream.ownership_released = True
+            return _released_stream_outcome(stream, outcome)
+        return outcome
 
 
 @dataclass(frozen=True)
@@ -5039,12 +5277,13 @@ def _resume_worker_thread(
     resumed = client.call("thread/resume", params)
     if not resumed.get("error"):
         result = _require(resumed, "thread/resume")
-        if (held or own_reviewer or previous_record.get("adopted_from")) and _as_str(_as_dict(result.get("thread")).get("id")) != thread_id:
+        if (held or own_reviewer or previous_record.get("adopted_from")
+                or previous_record.get("dead_launcher_recovery")) and _as_str(_as_dict(result.get("thread")).get("id")) != thread_id:
             raise SystemExit("RoleNeedsRecovery: resumed thread identity differs; replacement refused")
         return _WorkerThreadForHome(thread_id, False)
     if isinstance(_read_account_move(session_dir, name, thread_id), AccountMoveMarker):
         _ = _require(resumed, "thread/resume")
-    if own_reviewer or previous_record.get("adopted_from"):
+    if own_reviewer or previous_record.get("adopted_from") or previous_record.get("dead_launcher_recovery"):
         _ = _require(resumed, "thread/resume")
     if held:
         raise SystemExit("RoleNeedsRecovery: held thread could not resume; replacement refused")
@@ -5058,14 +5297,16 @@ def _resume_worker_thread(
     replacement = _as_str(_as_dict(started.get("thread")).get("id"))
     if not replacement:
         raise SystemExit("thread/start returned no replacement thread id")
-    record: StartingRecord = {"thread_id": replacement, "status": "starting", "port": client.port}
+    record: StartingRecord = {"thread_id": replacement, "status": "starting", "port": client.port,
+                              "launcher_pid": _as_int(previous_record.get("launcher_pid")) or client.launcher_pid}
     if "access_policy" in previous_record:
         # Assignment policy is durable for unit workers, even on a new thread.
         # Ordinary workers without one still take each launch's sandbox.
         record["access_policy"] = dict(previous_record["access_policy"])
     if instructions_file:
         record["instructions_file"] = instructions_file
-    if not _update_roster_if_expected(session_dir, name, record, RosterOnThread(thread_id)):
+    if not _update_roster_if_expected(session_dir, name, record,
+                                     RosterUnchanged(thread_id, _roster_revision(previous_record))):
         _refuse_taken_follow_up(client, replacement, session_dir)
     _ = client.call("thread/name/set", {"threadId": replacement, "name": unit_workers.shown_name(Path(session_dir), name)})
     _post_board_status(
@@ -5094,7 +5335,7 @@ def _release_other_worker_writers(
             continue
         client: Client | None = None
         try:
-            client = Client(port, f"release-{name}")
+            client = Client(port, f"release-{name}", deadline=time.time() + THREAD_RELEASE_TIMEOUT_SECS)
             if thread_id not in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS):
                 continue
             state = _read_live_turn(client, thread_id)
@@ -5215,132 +5456,151 @@ def _move_idle_worker(
     *, message: str = "",
 ) -> WorkerMoveResult:
     """Check one new-turn boundary and move an idle thread onto the workers home."""
-    state = _read_live_turn(client, thread_id)
-    if isinstance(state, ThreadStateUnknown):
-        return WorkerThreadStateUnknown(state.reason)
-    if not isinstance(state, ThreadIdle):
-        return WorkerWaitingOnLiveTurn()
-    if isinstance(client.serving, NotBoundCodexServer):
-        _ = _bind_serving_server(client, session_dir)
-    source = client.serving
-    worker_home_for_turn = workers_home()
-    request = _requested_worker_move(source, worker_home_for_turn)
-    cleanup: WorkerTurnCleanup | NoWorkerTurnToCleanUp = NoWorkerTurnToCleanUp()
-    moved = client
-    replaced = False
-    try:
-        with _pending_file(session_dir, name) as handle:
-            if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
-                return WorkerThreadStateUnknown("worker ended or was replaced before the new turn")
-            state = _read_live_turn(client, thread_id)
-            if isinstance(state, ThreadStateUnknown):
-                return WorkerThreadStateUnknown(state.reason)
-            if not isinstance(state, ThreadIdle):
-                return WorkerWaitingOnLiveTurn()
-            messages = _pending_for_thread(handle, thread_id)
+    with worker_lifecycle.lock_worker(session_dir, name):
+        owner = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        if not RosterActiveLauncher(thread_id, (client.launcher_pid, os.getpid())).owns(owner):
+            return WorkerThreadStateUnknown("worker ownership changed before the new turn")
+        state = _read_live_turn(client, thread_id)
+        if isinstance(state, ThreadStateUnknown):
+            return WorkerThreadStateUnknown(state.reason)
+        if not isinstance(state, ThreadIdle):
+            return WorkerWaitingOnLiveTurn()
+        if isinstance(client.serving, NotBoundCodexServer):
+            _ = _bind_serving_server(client, session_dir)
+        source = client.serving
+        worker_home_for_turn = workers_home()
+        request = _requested_worker_move(source, worker_home_for_turn)
+        cleanup: WorkerTurnCleanup | NoWorkerTurnToCleanUp = NoWorkerTurnToCleanUp()
+        moved = client
+        replaced = False
+        try:
+            with _pending_file(session_dir, name) as handle:
+                if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
+                    return WorkerThreadStateUnknown("worker ended or was replaced before the new turn")
+                state = _read_live_turn(client, thread_id)
+                if isinstance(state, ThreadStateUnknown):
+                    return WorkerThreadStateUnknown(state.reason)
+                if not isinstance(state, ThreadIdle):
+                    return WorkerWaitingOnLiveTurn()
+                messages = _pending_for_thread(handle, thread_id)
 
-            def park(text: str) -> None:
-                messages.append(text)
-                _write_pending(handle, thread_id, messages)
+                def park(text: str) -> None:
+                    messages.append(text)
+                    _write_pending(handle, thread_id, messages)
 
-            _move_queue_to_pending(client, thread_id, park)
-            state = _read_live_turn(client, thread_id)
-            if isinstance(state, ThreadStateUnknown):
-                return WorkerThreadStateUnknown(state.reason)
-            if not isinstance(state, ThreadIdle):
-                return WorkerWaitingOnLiveTurn()
-        # Refresh may park every role's queue, so it must run without a pending lock.
-        port, _fresh = ensure_server(
-            session_dir, worker_home_for_turn,
-            cwd=_as_str(_attr(args, "turn_cwd")) or _as_str(_attr(args, "cwd")) or None,
-        )
-        with _pending_file(session_dir, name) as handle:
-            if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
-                return WorkerThreadStateUnknown("worker ended or was replaced before the new turn")
-            messages = _pending_for_thread(handle, thread_id)
-            previous = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-            old_port = client.port
-            owes_continuation = previous.get("continuation_owed") is True
-            if owes_continuation and not _quota_continuation_ready(client, worker_home_for_turn):
-                from scripts.accounts import refusals
-                identity = client.serving.account
-                if isinstance(identity, UnknownCodexAccount):
-                    return WorkerThreadStateUnknown("quota handoff did not establish a recoverable account; continuation is held")
-                if refusals.key("codex", identity.login) not in refusals.load():
-                    return WorkerWaitingForRoom("no fresh reading shows room on the account", client, old_port, thread_id)
-                return WorkerWaitingForRoom("the refused account has not recovered", client, old_port, thread_id)
-            if isinstance(client.serving, NotBoundCodexServer):
-                _ = _bind_serving_server(client, session_dir, started_here=_fresh)
-            if _fresh and port == old_port:
-                serving = client.serving
-                client.serving = replace(serving, started_here=True)
-            if port != old_port:
-                released = _release_worker_thread(client, thread_id, session_dir)
-                if isinstance(released, WorkerThreadStateUnknown):
-                    _record_worker_move_failure(request, released.reason)
-                    return released
-                moved = Client(port, name)
-                _ = _bind_serving_server(moved, session_dir, started_here=_fresh)
-                try:
-                    resumed = _resume_worker_thread(args, session_dir, name, thread_id, moved, worker_home_for_turn)
-                    thread_id, replaced = resumed.thread_id, resumed.thread_replaced
-                    if replaced:
-                        _write_pending(handle, thread_id, messages)
-                        _update_roster(session_dir, name, {"thread_id": thread_id, "status": "starting",
-                            "port": port, "continuation_owed": owes_continuation})
-                        role = _roster_role(previous.get("role"))
-                        if isinstance(role, AssignedWorkerRole):
-                            _record_assignment(thread_id, role.role, _dispatch_lens(args))
-                except (ConnectionError, OSError, SystemExit) as error:
-                    _record_worker_move_failure(request, str(error) or type(error).__name__)
-                    moved.close()
-                    current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-                    current_thread = _as_str(current.get("thread_id")) or thread_id
-                    cleanup = (WorkerTurnCleanup(port, current_thread)
-                               if replaced or current_thread != thread_id else NoWorkerTurnToCleanUp())
-                    return WorkerThreadStateUnknown(str(error) or type(error).__name__, cleanup,
-                        error.serving if isinstance(error, ServingRequestFailure) else moved.serving,
-                        error.reported if isinstance(error, ServingRequestFailure) else False)
-                _confirm_worker_move(session_dir, name, request, moved.serving)
-                client.close()
-            turn_id = ""
-            if owes_continuation or message or messages:
-                _update_roster(session_dir, name, {"thread_id": thread_id, "status": "starting", "port": port})
-                if previous.get("preserved_work"):
-                    messages.sort(key=lambda text: 0 if text.startswith(("Run finished:", "Run ended with no result:")) else 1)
-                    inputs = [*messages, *(["Continue where you stopped."] if owes_continuation else []),
-                              *([message] if message else [])]
-                else:
-                    inputs = (["Continue where you stopped.", *([message] if message else []), *messages] if owes_continuation
-                              else [message, *messages] if message else messages)
-                cleanup = WorkerTurnCleanup(port, thread_id)
-                turn_id = _start_turn(moved, args, thread_id, _worker_sandbox(args, session_dir, name),
-                                      inputs[0], tuple(inputs[1:]))
-                if owes_continuation and not turn_id:
-                    raise SystemExit("quota continuation was not confirmed by turn/start; task is still owed")
-                _write_pending(handle, thread_id, [])
-            prior_turn = _as_str(previous.get("turn_id")) if not replaced else ""
-            _update_roster(session_dir, name, {
-                "thread_id": thread_id, "turn_id": turn_id or prior_turn, "status": "running", "port": port,
-                "continuation_owed": False, "preserved_work": False
-            })
-        # Submission records telemetry on the roster first. Refresh the ledger
-        # after releasing the inbox lock, preserving ledger -> roster lock order.
-        if turn_id and previous.get("unit_ledger"):
-            unit_workers.note_backend(Path(session_dir), name, thread_id, moved.serving.home)
-        return MovedWorker(moved, port, turn_id, thread_id, replaced, moved.serving,
-            submission=QuotaContinuationTurn() if owes_continuation and turn_id else UNRELATED_WORKER_TURN)
-    except (ConnectionError, OSError, SystemExit) as error:
-        if isinstance(error, ServingRequestFailure) and error.reported:
-            return WorkerAwaitingQuotaRecovery(moved, moved.port, "", thread_id, replaced, moved.serving, refusal=error)
-        _record_worker_move_failure(request, str(error) or type(error).__name__)
-        if isinstance(cleanup, NoWorkerTurnToCleanUp):
-            raise
-        if moved is not client:
-            moved.close()
-        return WorkerThreadStateUnknown(str(error) or type(error).__name__, cleanup,
-            error.serving if isinstance(error, ServingRequestFailure) else moved.serving,
-            error.reported if isinstance(error, ServingRequestFailure) else False)
+                _move_queue_to_pending(client, thread_id, park)
+                state = _read_live_turn(client, thread_id)
+                if isinstance(state, ThreadStateUnknown):
+                    return WorkerThreadStateUnknown(state.reason)
+                if not isinstance(state, ThreadIdle):
+                    return WorkerWaitingOnLiveTurn()
+            # Refresh may park every role's queue, so it must run without a pending lock.
+            port, _fresh = ensure_server(
+                session_dir, worker_home_for_turn,
+                cwd=_as_str(_attr(args, "turn_cwd")) or _as_str(_attr(args, "cwd")) or None,
+            )
+            with _pending_file(session_dir, name) as handle:
+                if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
+                    return WorkerThreadStateUnknown("worker ended or was replaced before the new turn")
+                messages = _pending_for_thread(handle, thread_id)
+                previous = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+                old_port = client.port
+                owes_continuation = previous.get("continuation_owed") is True
+                if owes_continuation and not _quota_continuation_ready(client, worker_home_for_turn):
+                    from scripts.accounts import refusals
+                    identity = client.serving.account
+                    if isinstance(identity, UnknownCodexAccount):
+                        return WorkerThreadStateUnknown("quota handoff did not establish a recoverable account; continuation is held")
+                    if refusals.key("codex", identity.login) not in refusals.load():
+                        return WorkerWaitingForRoom("no fresh reading shows room on the account", client, old_port, thread_id)
+                    return WorkerWaitingForRoom("the refused account has not recovered", client, old_port, thread_id)
+                if isinstance(client.serving, NotBoundCodexServer):
+                    _ = _bind_serving_server(client, session_dir, started_here=_fresh)
+                if _fresh and port == old_port:
+                    serving = client.serving
+                    client.serving = replace(serving, started_here=True)
+                if port != old_port:
+                    released = _release_worker_thread(client, thread_id, session_dir)
+                    if isinstance(released, WorkerThreadStateUnknown):
+                        _record_worker_move_failure(request, released.reason)
+                        return released
+                    moved = Client(port, name)
+                    moved.launcher_pid = client.launcher_pid
+                    _ = _bind_serving_server(moved, session_dir, started_here=_fresh)
+                    try:
+                        resumed = _resume_worker_thread(args, session_dir, name, thread_id, moved, worker_home_for_turn)
+                        thread_id, replaced = resumed.thread_id, resumed.thread_replaced
+                        if replaced:
+                            _write_pending(handle, thread_id, messages)
+                            if not _update_roster_if_expected(session_dir, name,
+                                {"thread_id": thread_id, "status": "starting", "port": port,
+                                 "continuation_owed": owes_continuation},
+                                RosterActiveLauncher(thread_id, (client.launcher_pid, os.getpid()))):
+                                raise SystemExit(f"codex_mesh: {name}: roster ownership changed during replacement")
+                            role = _roster_role(previous.get("role"))
+                            if isinstance(role, AssignedWorkerRole):
+                                _record_assignment(thread_id, role.role, _dispatch_lens(args))
+                    except (ConnectionError, OSError, SystemExit) as error:
+                        _record_worker_move_failure(request, str(error) or type(error).__name__)
+                        moved.close()
+                        current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+                        current_thread = _as_str(current.get("thread_id")) or thread_id
+                        cleanup = (WorkerTurnCleanup(port, current_thread)
+                                   if replaced or current_thread != thread_id else NoWorkerTurnToCleanUp())
+                        return WorkerThreadStateUnknown(str(error) or type(error).__name__, cleanup,
+                            error.serving if isinstance(error, ServingRequestFailure) else moved.serving,
+                            error.reported if isinstance(error, ServingRequestFailure) else False)
+                    _confirm_worker_move(session_dir, name, request, moved.serving)
+                    client.close()
+                turn_id = ""
+                if owes_continuation or message or messages:
+                    if not _update_roster_if_expected(session_dir, name,
+                        {"thread_id": thread_id, "status": "starting", "port": port},
+                        RosterActiveLauncher(thread_id, (client.launcher_pid, os.getpid()))):
+                        raise SystemExit(f"codex_mesh: {name}: roster ownership changed before continuation")
+                    if previous.get("preserved_work") and not message:
+                        # Preserve the existing result-first recovery order when
+                        # there is no new assignment. New tasks retain held order.
+                        messages.sort(key=lambda text: 0 if text.startswith(("Run finished:", "Run ended with no result:")) else 1)
+                    inputs = list(messages)
+                    if owes_continuation:
+                        # Without an assignment, ordinary recovery still leads
+                        # with continuation; every new task follows all held text.
+                        continuation_at = len(inputs) if message or previous.get("preserved_work") else 0
+                        inputs.insert(continuation_at, "Continue where you stopped.")
+                    if message:
+                        inputs.append(message)
+                    cleanup = WorkerTurnCleanup(port, thread_id)
+                    turn_id = _start_turn(moved, args, thread_id, _worker_sandbox(args, session_dir, name),
+                                          inputs[0], tuple(inputs[1:]))
+                    if owes_continuation and not turn_id:
+                        raise SystemExit("quota continuation was not confirmed by turn/start; task is still owed")
+                    _write_pending(handle, thread_id, [])
+                prior_turn = _as_str(previous.get("turn_id")) if not replaced else ""
+                if not _update_roster_if_expected(session_dir, name, {
+                    "thread_id": thread_id, "turn_id": turn_id or prior_turn, "status": "running", "port": port,
+                    "continuation_owed": False, "preserved_work": False
+                }, RosterActiveLauncher(thread_id, (client.launcher_pid, os.getpid()))):
+                    raise SystemExit(f"codex_mesh: {name}: roster ownership changed during continuation")
+            result = MovedWorker(moved, port, turn_id, thread_id, replaced, moved.serving,
+                submission=QuotaContinuationTurn() if owes_continuation and turn_id else UNRELATED_WORKER_TURN)
+        except (ConnectionError, OSError, SystemExit) as error:
+            if isinstance(error, ServingRequestFailure) and error.reported:
+                return WorkerAwaitingQuotaRecovery(moved, moved.port, "", thread_id, replaced, moved.serving, refusal=error)
+            _record_worker_move_failure(request, str(error) or type(error).__name__)
+            if isinstance(cleanup, NoWorkerTurnToCleanUp):
+                raise
+            if moved is not client:
+                moved.close()
+            return WorkerThreadStateUnknown(str(error) or type(error).__name__, cleanup,
+                error.serving if isinstance(error, ServingRequestFailure) else moved.serving,
+                error.reported if isinstance(error, ServingRequestFailure) else False)
+
+    # Submission records telemetry on the roster first. Refresh the ledger
+    # after releasing the inbox lock, preserving ledger -> roster lock order.
+    if turn_id and previous.get("unit_ledger"):
+        unit_workers.note_backend(Path(session_dir), name, thread_id, moved.serving.home)
+    return result
 
 
 def _start_workers_turn(
@@ -5525,7 +5785,8 @@ def _end_unwatched_turn(
 ) -> UnwatchedTurnCleanupResult:
     """Best effort cleanup when this launcher cannot watch another turn."""
     try:
-        client = Client(port, f"cleanup-{os.getpid()}")
+        deadline = time.time() + THREAD_RELEASE_TIMEOUT_SECS
+        client = Client(port, f"cleanup-{os.getpid()}", deadline=deadline)
         try:
             _ = _drop_queued_messages(client, thread_id)
             live = _read_live_turn(client, thread_id)
@@ -5594,49 +5855,54 @@ def command_send(args: argparse.Namespace) -> int:
 def command_steer(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
-    record = _lookup(session_dir, target)
-    turn_id = record.get("turn_id", "")
-    status = record.get("status", "unknown")
-    if not turn_id or status != "running":
-        detail = f"status {status}"
-        raise SystemExit(
-            f"codex_mesh: {target} has no running turn to steer ({detail}); use `send`"
-        )
-    client = Client(_worker_port(session_dir, record), f"steer-{os.getpid()}")
-    message = _message_text(args)
-    reply = client.call(
-        "turn/steer",
-        {
-            "threadId": record["thread_id"],
-            "expectedTurnId": turn_id,
-            "input": [{"type": "text", "text": message}],
-        },
-    )
-    # The roster learns a new turn id only from the `start` loop streaming
-    # `turn/started`. Once that launcher is gone, a queued message still opens
-    # a new turn and the recorded id goes stale; the server names the live one
-    # in its refusal, so steer that turn and record it.
-    live = _live_turn_from_mismatch(reply)
-    if live:
+    with worker_lifecycle.lock_worker(session_dir, target):
+        record = _lookup(session_dir, target)
+        turn_id = record.get("turn_id", "")
+        status = record.get("status", "unknown")
+        if not turn_id or status != "running":
+            detail = f"status {status}"
+            raise SystemExit(
+                f"codex_mesh: {target} has no running turn to steer ({detail}); use `send`"
+            )
+        client = Client(_worker_port(session_dir, record), f"steer-{os.getpid()}")
+        message = _message_text(args)
         reply = client.call(
             "turn/steer",
             {
                 "threadId": record["thread_id"],
-                "expectedTurnId": live,
+                "expectedTurnId": turn_id,
                 "input": [{"type": "text", "text": message}],
             },
         )
-        if not reply.get("error"):
-            _ = _update_roster_if_expected(
-                session_dir,
-                target,
-                {"thread_id": record["thread_id"], "turn_id": live, "status": "running"},
-                RosterOnThread(record["thread_id"]),
+        # The roster learns a new turn id only from the `start` loop streaming
+        # `turn/started`. Once that launcher is gone, a queued message still opens
+        # a new turn and the recorded id goes stale; the server names the live one
+        # in its refusal, so steer that turn and record it.
+        live = _live_turn_from_mismatch(reply)
+        if live:
+            reply = client.call(
+                "turn/steer",
+                {
+                    "threadId": record["thread_id"],
+                    "expectedTurnId": live,
+                    "input": [{"type": "text", "text": message}],
+                },
             )
-    _ = _require(reply, "turn/steer")
-    client.close()
-    print(f"steered {target}")
-    return 0
+            if not reply.get("error"):
+                if not _update_roster_if_expected(
+                    session_dir,
+                    target,
+                    {"thread_id": record["thread_id"], "turn_id": live, "status": "running"},
+                    RosterUnchanged(record["thread_id"], _roster_revision(record)),
+                ):
+                    client.close()
+                    print(f"codex_mesh: {target}: steered, but the roster changed; current worker state preserved",
+                          file=sys.stderr)
+                    return 2
+        _ = _require(reply, "turn/steer")
+        client.close()
+        print(f"steered {target}")
+        return 0
 
 
 def command_interrupt(args: argparse.Namespace) -> int:
@@ -5657,40 +5923,41 @@ def command_interrupt(args: argparse.Namespace) -> int:
             return 2
         held = ("; the message opens its next turn" if isinstance(outcome, HeldForLauncher)
                 else "; no launcher is attached, so the message waits for its next dispatch")
-    record = _lookup(session_dir, target)
-    launcher_pid = _as_int(record.get("launcher_pid"))
-    if _pid_alive(launcher_pid):
-        port = _worker_port(session_dir, record)
-    else:
-        availability = _server_availability(session_dir)
-        if not isinstance(availability, LiveServer):
-            print(f"{target} has no running app-server; no turn to interrupt{held}")
-            return 0
-        port = availability.port
-    thread_id = record["thread_id"]
-    client = Client(port, f"interrupt-{os.getpid()}")
-    try:
-        state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
-        if isinstance(state, ThreadIdle):
-            print(f"{target} has no running turn; nothing interrupted{held}")
-            return 0
-        if isinstance(state, ThreadStateUnknown):
-            print(f"codex_mesh: {target}: thread {thread_id} could not be read ({state.reason}){held}",
-                  file=sys.stderr)
+    with worker_lifecycle.lock_worker(session_dir, target):
+        record = _lookup(session_dir, target)
+        launcher_pid = _as_int(record.get("launcher_pid"))
+        if _pid_alive(launcher_pid):
+            port = _worker_port(session_dir, record)
+        else:
+            availability = _server_availability(session_dir)
+            if not isinstance(availability, LiveServer):
+                print(f"{target} has no running app-server; no turn to interrupt{held}")
+                return 0
+            port = availability.port
+        thread_id = record["thread_id"]
+        client = Client(port, f"interrupt-{os.getpid()}")
+        try:
+            state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
+            if isinstance(state, ThreadIdle):
+                print(f"{target} has no running turn; nothing interrupted{held}")
+                return 0
+            if isinstance(state, ThreadStateUnknown):
+                print(f"codex_mesh: {target}: thread {thread_id} could not be read ({state.reason}){held}",
+                      file=sys.stderr)
+                return 1
+            if isinstance(state, ThreadActiveWithoutTurn):
+                print(f"codex_mesh: {target}: thread {thread_id} could not be interrupted (no turn id){held}",
+                      file=sys.stderr)
+                return 1
+            reply = _interrupt_turn(client, thread_id, state.turn_id)
+        finally:
+            client.close()
+        error = _as_str(_as_dict(reply.get("error")).get("message"))
+        if error:
+            print(f"codex_mesh: {target}: turn {state.turn_id} not interrupted: {error}{held}", file=sys.stderr)
             return 1
-        if isinstance(state, ThreadActiveWithoutTurn):
-            print(f"codex_mesh: {target}: thread {thread_id} could not be interrupted (no turn id){held}",
-                  file=sys.stderr)
-            return 1
-        reply = _interrupt_turn(client, thread_id, state.turn_id)
-    finally:
-        client.close()
-    error = _as_str(_as_dict(reply.get("error")).get("message"))
-    if error:
-        print(f"codex_mesh: {target}: turn {state.turn_id} not interrupted: {error}{held}", file=sys.stderr)
-        return 1
-    print(f"interrupted {target}'s turn {state.turn_id}{held}")
-    return 0
+        print(f"interrupted {target}'s turn {state.turn_id}{held}")
+        return 0
 
 
 def _live_turn_from_mismatch(reply: RpcMessage) -> str:
@@ -5716,6 +5983,14 @@ def command_end(args: argparse.Namespace) -> int:
     retries cleanup that may have exhausted its budget.
     Cleanup-only refuses any status other than ended before changing worker state.
     """
+    session_dir = _as_str(_attr(args, "session_dir"))
+    target = _as_str(_attr(args, "to"))
+    with worker_lifecycle.lock_worker(session_dir, target):
+        return end_worker_locked(args)
+
+
+def end_worker_locked(args: argparse.Namespace) -> int:
+    """Run the one end operation for a caller already holding its lifecycle lock."""
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
     with _pending_file(session_dir, target) as pending_file:
@@ -5906,52 +6181,109 @@ def command_reopen(args: argparse.Namespace) -> int:
         except (unit_workers.WorkerUnavailable, OSError, ValueError) as error:
             print(f"codex_mesh: reopen: {error}", file=sys.stderr)
             return 2
-    record = _lookup(session_dir, name)
-    if record.get("held_design_id"):
-        raise SystemExit("codex_mesh: held roles recover through design_roles.py")
-    finished = _finished_run(session_dir)
-    if finished:
-        print(f"codex_mesh: run finished ({finished}); use progress_history.py start-phase to reactivate this run, "
-              + f"or workers.py resolve --session-dir <new-run> --role {_as_str(record.get('role')) or 'impl'} "
-              + "to carry its worker forward", file=sys.stderr)
-        return 2
-    path = _session_path(session_dir, ROSTER_FILE)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        _ = handle.seek(0)
-        roster = _load_roster_for_write(handle)
-        entry = _as_dict(roster.get(name))
-        status = _as_str(entry.get("status"))
-        port = _as_int(entry.get("port"))
+    with worker_lifecycle.lock_worker(session_dir, name):
+        record = _lookup(session_dir, name)
+        if record.get("held_design_id"):
+            raise SystemExit("codex_mesh: held roles recover through design_roles.py")
+        finished = _finished_run(session_dir)
+        if finished:
+            print(f"codex_mesh: run finished ({finished}); use progress_history.py start-phase to reactivate this run, "
+                  + f"or workers.py resolve --session-dir <new-run> --role {_as_str(record.get('role')) or 'impl'} "
+                  + "to carry its worker forward", file=sys.stderr)
+            return 2
+        status = _as_str(record.get("status"))
+        thread_id = _as_str(record.get("thread_id"))
+        launcher = _as_int(record.get("launcher_pid"))
+        revision = _roster_revision(record)
         reason = ""
-        if entry.get("adopted_to"):
-            reason = f"worker adopted to {entry['adopted_to']}"
+        if record.get("adopted_to"):
+            reason = f"worker adopted to {record.get('adopted_to')}"
         elif status not in ("ended", "running", "starting"):
             reason = "worker is not ended, running or starting"
-        elif not _as_str(entry.get("thread_id")):
+        elif not thread_id:
             reason = "missing thread id"
-        elif _pid_alive(_as_int(entry.get("launcher_pid"))):
+        elif _pid_alive(launcher):
             reason = "launcher is alive"
-        elif status != "ended" and any(
-            _pid_alive(_as_int(server.get("pid")))
-            for server in _recorded_run_servers(session_dir)
-            if port <= 0 or server.get("port") == port
-        ):
-            reason = "app-server is alive"
+        recovered_idle = False
+        # An ended worker with no server retains the established reopen behavior.
+        # An abandoned live status always needs positive same-thread evidence.
+        if not reason and (status != "ended" or _run_servers(session_dir)):
+            reason = _recovery_idle_reason(session_dir, name, thread_id)
+            recovered_idle = not reason
         if reason:
-            print(f"codex_mesh: {name}: {reason}", file=sys.stderr)
+            prefix = "launcher died; " if status in ("running", "starting") and launcher > 0 and not _pid_alive(launcher) else ""
+            print(f"codex_mesh: {name}: {prefix}{reason}; pending work kept; reopen refused", file=sys.stderr)
             return 2
-        _end_marker_path(session_dir, name).unlink(missing_ok=True)
-        entry.update({"status": "paused", "paused_from": status, "paused_turn": status != "ended"})
-        _advance_roster_revision(entry)
-        roster[name] = entry
-        _ = handle.seek(0)
-        _ = handle.truncate()
-        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
-    if _attr(args, "quiet") is not True:
-        print(f"reopened {name}; send its next turn with --to {name}")
-    return 0
+        path = _session_path(session_dir, ROSTER_FILE)
+        with path.open("r+", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            roster = _load_roster_for_write(handle)
+            entry = _as_dict(roster.get(name))
+            if (entry.get("thread_id") != thread_id or _roster_revision(entry) != revision
+                    or _as_int(entry.get("launcher_pid")) != launcher
+                    or entry.get("status") != status or entry.get("adopted_to")):
+                print(f"codex_mesh: {name}: worker changed during idle recovery; reopen refused", file=sys.stderr)
+                return 2
+            _end_marker_path(session_dir, name).unlink(missing_ok=True)
+            entry.update({"status": "paused", "paused_from": status, "paused_turn": status != "ended"})
+            if recovered_idle:
+                entry.update({"context_tokens": "not_measured_since_compaction", "paused_turn": False})
+                _ = entry.pop("turn_id", None)
+                _ = entry.pop("launcher_pid", None)
+            _advance_roster_revision(entry)
+            roster[name] = entry
+            _ = handle.seek(0)
+            _ = handle.truncate()
+            _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+        if _attr(args, "quiet") is not True:
+            if recovered_idle:
+                print(f"reopened {name} on its idle thread {thread_id}; "
+                      + "context size not measured since compaction; " + f"send its next turn with --to {name}")
+            else:
+                print(f"reopened {name}; send its next turn with --to {name}")
+        return 0
+
+
+def _recovery_idle_reason(session_dir: str, name: str, thread_id: str) -> str:
+    """Prove idle on the recorded servers, or resume that exact thread to prove it.
+
+    The lifecycle lock is held, but never the roster lock, during these probes.
+    A retired server can be the only process that knows the thread.
+    """
+    deadline = time.time() + THREAD_RELEASE_TIMEOUT_SECS
+    availability = _server_availability(session_dir)
+    current_idle = False
+    try:
+        for port in _run_servers(session_dir):
+            client = Client(port, f"recover-{name}", deadline=deadline)
+            try:
+                if thread_id not in _loaded_thread_ids(client, time.monotonic() + max(0.0, deadline - time.time())):
+                    continue
+                live = _read_live_turn(client, thread_id)
+                if not isinstance(live, ThreadIdle):
+                    return live.reason if isinstance(live, ThreadStateUnknown) else "thread has a live turn"
+                current_idle |= isinstance(availability, LiveServer) and port == availability.port
+            finally:
+                client.close()
+        if current_idle:
+            return ""
+        port, _fresh = ensure_server(session_dir)
+        released = _release_other_worker_writers(session_dir, name, thread_id, port)
+        if not isinstance(released, _ReleasedWorkerThread):
+            return released.reason
+        client = Client(port, f"recover-{name}", deadline=deadline)
+        try:
+            result = _require(client.call("thread/resume", _resume_params(session_dir, name, thread_id)), "thread/resume")
+            if _as_str(_as_dict(result.get("thread")).get("id")) != thread_id:
+                return "resumed thread identity differs; replacement refused"
+            live = _read_live_turn(client, thread_id)
+            if not isinstance(live, ThreadIdle):
+                return live.reason if isinstance(live, ThreadStateUnknown) else "thread has a live turn"
+        finally:
+            client.close()
+        return ""
+    except (ConnectionError, OSError, SystemExit) as error:
+        return f"cannot establish idle state: {error}"
 
 
 def _worker_source_runs(session_dir: str, name: str) -> list[str]:
@@ -6113,52 +6445,53 @@ class UnrecordedWorkerThread:
 def open_unit_worker(session_dir: str, name: str, role: str, *, model: str = "",
                      effort: str = "") -> dict[str, object]:
     """Open an idle thread; assignment starts its first turn later through follow."""
-    command = ['bash', '-c',
-               'source "$1"; agents_resolve "direct.$2" || exit; printf "%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"', 'workers',
-               str(Path(__file__).with_name("agents_config.sh")), role]
-    resolved = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
-    fields = resolved.stdout.strip().split()
-    if resolved.returncode or len(fields) != 4:
-        raise unit_workers.WorkerUnavailable(resolved.stderr.strip() or "cannot resolve worker model")
-    family, configured_model, configured_effort, service_tier = fields
-    model = model or configured_model
-    effort = effort or configured_effort
-    if family != "codex":
-        raise unit_workers.WorkerUnavailable("new persistent worker requires a Codex assignment")
-    state = _read_json_object(_session_path(session_dir, plan_history.STATE_FILENAME))
-    cwd = _as_str(state.get("working_dir")) or str(Path.cwd())
-    home = workers_home()
-    port, fresh = ensure_server(session_dir, home, cwd=cwd)
-    client = Client(port, name)
-    allocation: NoThreadToRelease | UnrecordedWorkerThread = NoThreadToRelease()
-    try:
-        _ = _bind_serving_server(client, session_dir, started_here=fresh)
-        policy: dict[str, object] = {"kind": "ReadOnlyReviewer" if role == "review" else "WorkerLaunchPolicy"}
-        launch = argparse.Namespace(cwd=cwd, model=model,
-                                    sandbox=READ_ONLY_SANDBOX if role == "review" else WORKER_SANDBOX,
-                                    service_tier=service_tier)
-        result = _serving_request(client, "thread/start", _thread_start_params(launch))
-        thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
-        if not thread_id:
-            raise unit_workers.WorkerUnavailable("thread/start returned no thread id")
-        allocation = UnrecordedWorkerThread(thread_id)
-        display_name = unit_workers.shown_name(Path(session_dir), name, role=role)
-        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": display_name}), "thread/name/set")
-        record: FollowableRecord = {"thread_id": thread_id, "status": "paused", "role": cast(WorkerRole, role),
-                                    "model": model, "effort": effort, "access_policy": policy}
-        if not _update_roster_if_expected(session_dir, name, record, RosterAbsent()):
-            raise unit_workers.WorkerUnavailable(f"{name}: worker name was claimed")
-        allocation = NoThreadToRelease()
-        return {**record, "codex_home": str(home)}
-    finally:
+    with worker_lifecycle.lock_worker(session_dir, name):
+        command = ['bash', '-c',
+                   'source "$1"; agents_resolve "direct.$2" || exit; printf "%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"', 'workers',
+                   str(Path(__file__).with_name("agents_config.sh")), role]
+        resolved = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
+        fields = resolved.stdout.strip().split()
+        if resolved.returncode or len(fields) != 4:
+            raise unit_workers.WorkerUnavailable(resolved.stderr.strip() or "cannot resolve worker model")
+        family, configured_model, configured_effort, service_tier = fields
+        model = model or configured_model
+        effort = effort or configured_effort
+        if family != "codex":
+            raise unit_workers.WorkerUnavailable("new persistent worker requires a Codex assignment")
+        state = _read_json_object(_session_path(session_dir, plan_history.STATE_FILENAME))
+        cwd = _as_str(state.get("working_dir")) or str(Path.cwd())
+        home = workers_home()
+        port, fresh = ensure_server(session_dir, home, cwd=cwd)
+        client = Client(port, name)
+        allocation: NoThreadToRelease | UnrecordedWorkerThread = NoThreadToRelease()
         try:
-            if isinstance(allocation, UnrecordedWorkerThread):
-                released = _release_worker_thread(client, allocation.thread_id, session_dir)
-                if isinstance(released, WorkerThreadStateUnknown):
-                    print(f"codex_mesh: unrecorded thread {allocation.thread_id}: {released.reason}; release unconfirmed",
-                          file=sys.stderr)
+            _ = _bind_serving_server(client, session_dir, started_here=fresh)
+            policy: dict[str, object] = {"kind": "ReadOnlyReviewer" if role == "review" else "WorkerLaunchPolicy"}
+            launch = argparse.Namespace(cwd=cwd, model=model,
+                                        sandbox=READ_ONLY_SANDBOX if role == "review" else WORKER_SANDBOX,
+                                        service_tier=service_tier)
+            result = _serving_request(client, "thread/start", _thread_start_params(launch))
+            thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
+            if not thread_id:
+                raise unit_workers.WorkerUnavailable("thread/start returned no thread id")
+            allocation = UnrecordedWorkerThread(thread_id)
+            display_name = unit_workers.shown_name(Path(session_dir), name, role=role)
+            _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": display_name}), "thread/name/set")
+            record: FollowableRecord = {"thread_id": thread_id, "status": "paused", "role": cast(WorkerRole, role),
+                                        "model": model, "effort": effort, "access_policy": policy}
+            if not _update_roster_if_expected(session_dir, name, record, RosterAbsent()):
+                raise unit_workers.WorkerUnavailable(f"{name}: worker name was claimed")
+            allocation = NoThreadToRelease()
+            return {**record, "codex_home": str(home)}
         finally:
-            client.close()
+            try:
+                if isinstance(allocation, UnrecordedWorkerThread):
+                    released = _release_worker_thread(client, allocation.thread_id, session_dir)
+                    if isinstance(released, WorkerThreadStateUnknown):
+                        print(f"codex_mesh: unrecorded thread {allocation.thread_id}: {released.reason}; release unconfirmed",
+                              file=sys.stderr)
+            finally:
+                client.close()
 
 
 def command_adopt(args: argparse.Namespace) -> int:
@@ -6188,7 +6521,19 @@ def _preserve_paused_thread(client: Client, session_dir: str, name: str, thread_
     return isinstance(state, ThreadLive)
 
 
-def _pause_roster(session_dir: str) -> None:
+def _run_lifecycle_workers(session_dir: str) -> tuple[worker_lifecycle.WorkerIdentity, ...]:
+    return tuple(worker_lifecycle.WorkerIdentity(Path(session_dir), name)
+                 for name in _read_json_object(_session_path(session_dir, ROSTER_FILE)))
+
+
+def _pause_roster(session_dir: str, *, stop_servers: bool = False) -> None:
+    with worker_lifecycle.lock_workers(*_run_lifecycle_workers(session_dir)):
+        _pause_roster_locked(session_dir)
+        if stop_servers:
+            _reap_run_servers(session_dir)
+
+
+def _pause_roster_locked(session_dir: str) -> None:
     """Fence launcher completion writes before interrupting each retained thread."""
     for value in _read_json_object(_session_path(session_dir, ROSTER_FILE)).values():
         entry = _as_dict(value)
@@ -6274,9 +6619,16 @@ def command_stop(args: argparse.Namespace) -> int:
         # Queue preservation may refuse a server that cannot answer. The work
         # remains owned and protected even when that server must stay alive.
         unit_workers.pause_run(Path(session_dir))
-        _pause_roster(session_dir)
+        _pause_roster(session_dir, stop_servers=True)
     else:
-        _mark_all_roster_ended(session_dir)
+        with worker_lifecycle.lock_workers(*_run_lifecycle_workers(session_dir)):
+            _mark_all_roster_ended(session_dir)
+            _reap_run_servers(session_dir)
+    return 0
+
+
+def _reap_run_servers(session_dir: str) -> None:
+    """Reap this operation's run servers while its worker locks remain held."""
     retired_path = _session_path(session_dir, RETIRED_FILE)
     stored = _read_json_object(retired_path).get("servers")
     retired = cast("list[object]", stored) if isinstance(stored, list) else []
@@ -6291,9 +6643,8 @@ def command_stop(args: argparse.Namespace) -> int:
     path.unlink(missing_ok=True)
     if not stopped:
         print("no app-server running")
-        return 0
-    print(f"stopped app-server {', '.join(str(pid) for pid in stopped)}")
-    return 0
+    else:
+        print(f"stopped app-server {', '.join(str(pid) for pid in stopped)}")
 
 
 def _reap(pid: int) -> bool:
@@ -7899,46 +8250,51 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
             print(f"codex_mesh: {name}: {outcome.reason}", file=sys.stderr)
             return 1
         return 0
-    role = _roster_role(record.get("role"))
-    if not isinstance(role, AssignedWorkerRole):
-        _fail_account_move(session_dir, name, marker, "resume failed: worker has no recorded role")
-        return 1
-    launcher_pid = _as_int(record.get("launcher_pid"))
-    if launcher_pid > 0 and _pid_alive(launcher_pid):
-        _fail_account_move(session_dir, name, marker, "resume failed: existing launcher is still running")
-        return 1
-    summary = _session_path(session_dir, f"{name}.account-move-summary.txt")
-    if record.get("held_design_id"):
-        from scripts.astra import astra_work
-        header = astra_work.read_header(Path(_as_str(record.get("instructions_file"))))
-        if (not isinstance(header, astra_work.AstraWork) or header.member != name
-                or not Path(header.reply_path).is_absolute()):
-            _fail_account_move(session_dir, name, marker, "resume failed: saved assignment header is invalid")
+    with worker_lifecycle.lock_worker(session_dir, name):
+        current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        if current != record:
+            print(f"codex_mesh: {name}: worker changed before account move claim", file=sys.stderr)
+            return 2
+        role = _roster_role(record.get("role"))
+        if not isinstance(role, AssignedWorkerRole):
+            _fail_account_move(session_dir, name, marker, "resume failed: worker has no recorded role")
             return 1
-        summary = Path(header.reply_path)
-        summary.parent.mkdir(parents=True, exist_ok=True)
-    assignment = agents_log.role_at(
-        agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
-        marker.thread_id, datetime.now(timezone.utc),
-    )
-    lens = assignment.lens if isinstance(assignment, agents_log.Assignment) and assignment.role == role.role else None
-    claimed: StartingRecord = {
-        "thread_id": marker.thread_id, "status": "starting", "launcher_pid": os.getpid(),
-        "role": role.role, "previous_role": role.role, "previous_status": "failed",
-    }
-    if not _update_roster_if_expected(session_dir, name, claimed,
-                                     RosterUnchanged(marker.thread_id, _roster_revision(record))):
-        _fail_account_move(session_dir, name, marker, "resume failed: worker changed before launcher claim")
-        return 1
-    message = _session_path(session_dir, f"{name}.account-move-prompt.txt")
-    _ = message.write_text(ACCOUNT_MOVE_CONTINUATION, encoding="utf-8")
-    follow_args = argparse.Namespace(
-        session_dir=session_dir, to=name, role=role.role, lens=lens, claim_pid=os.getpid(),
-        message_file=str(message), summary_file=str(summary),
-        reply_file="", log_file=str(_session_path(session_dir, f"{name}.account-move.log")),
-        model="", effort="", service_tier="", turn_cwd="", read_only=False, image=[],
-        timeout=86400.0, account_move=True,
-    )
+        launcher_pid = _as_int(record.get("launcher_pid"))
+        if launcher_pid > 0 and _pid_alive(launcher_pid):
+            _fail_account_move(session_dir, name, marker, "resume failed: existing launcher is still running")
+            return 1
+        summary = _session_path(session_dir, f"{name}.account-move-summary.txt")
+        if record.get("held_design_id"):
+            from scripts.astra import astra_work
+            header = astra_work.read_header(Path(_as_str(record.get("instructions_file"))))
+            if (not isinstance(header, astra_work.AstraWork) or header.member != name
+                    or not Path(header.reply_path).is_absolute()):
+                _fail_account_move(session_dir, name, marker, "resume failed: saved assignment header is invalid")
+                return 1
+            summary = Path(header.reply_path)
+            summary.parent.mkdir(parents=True, exist_ok=True)
+        assignment = agents_log.role_at(
+            agents_log.assignments(agents_log.state_dir() / "agents.jsonl"),
+            marker.thread_id, datetime.now(timezone.utc),
+        )
+        lens = assignment.lens if isinstance(assignment, agents_log.Assignment) and assignment.role == role.role else None
+        claimed: StartingRecord = {
+            "thread_id": marker.thread_id, "status": "starting", "launcher_pid": os.getpid(),
+            "role": role.role, "previous_role": role.role, "previous_status": "failed",
+        }
+        if not _update_roster_if_expected(session_dir, name, claimed,
+                                         RosterUnchanged(marker.thread_id, _roster_revision(record))):
+            _fail_account_move(session_dir, name, marker, "resume failed: worker changed before launcher claim")
+            return 1
+        message = _session_path(session_dir, f"{name}.account-move-prompt.txt")
+        _ = message.write_text(ACCOUNT_MOVE_CONTINUATION, encoding="utf-8")
+        follow_args = argparse.Namespace(
+            session_dir=session_dir, to=name, role=role.role, lens=lens, claim_pid=os.getpid(),
+            message_file=str(message), summary_file=str(summary),
+            reply_file="", log_file=str(_session_path(session_dir, f"{name}.account-move.log")),
+            model="", effort="", service_tier="", turn_cwd="", read_only=False, image=[],
+            timeout=86400.0, account_move=True,
+        )
     try:
         result = command_follow(follow_args)
     except (ConnectionError, OSError, SystemExit) as error:
@@ -7977,11 +8333,13 @@ def _wait_account_move_resumes(
                 del pending[key]
         if not pending:
             break
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             for key in pending:
                 outcomes[key] = WorkerMoveFailed("resume not confirmed before timeout", _account_move_command(*key))
             break
-        time.sleep(0.05)
+        # The last poll ends at the deadline: summed 0.05 s steps can fall one rounding short of it.
+        time.sleep(min(0.05, remaining))
     return outcomes
 
 
@@ -8049,51 +8407,55 @@ def _finish_run_moves(
 def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[str, object],
                                        port: int, label: str) -> SwitchingWorker | InterruptedWorkerMove:
     _role_fence(entry)
-    thread_id = _as_str(entry.get("thread_id"))
-    marker: AccountMoveMarker | NoAccountMove = NoAccountMove()
-    client: Client | None = None
-    try:
-        if not thread_id:
-            raise SystemExit("worker has no recorded thread")
-        client = Client(port, f"account-move-{name}")
-        state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
-        if isinstance(state, ThreadStateUnknown):
-            raise SystemExit(state.reason)
-        if isinstance(state, ThreadActiveWithoutTurn):
-            raise SystemExit("live turn has no interruptible id")
-        # The turn may have just ended. It still needs a continuation if its launcher
-        # has not consumed that completion, so retain the roster's last turn id.
-        turn_id = state.turn_id if isinstance(state, ThreadLive) else _as_str(entry.get("turn_id"))
-        if not turn_id:
-            return SwitchingWorker(name, False)
-        marker = AccountMoveMarker(thread_id, turn_id, label, secrets.token_hex(16))
-        stored: StoredAccountMove = {"thread_id": marker.thread_id, "turn_id": marker.turn_id,
-                                    "label": marker.label, "move_id": marker.move_id}
-        with _pending_file(session_dir, name):
-            if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
-                raise SystemExit("worker ended or was replaced before interruption")
-            _write_account_move_json(_account_move_path(session_dir, name), stored)
-        with _pending_file(session_dir, name) as pending:
-            def park(message: str) -> None:
-                _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
-            _move_queue_to_pending(client, thread_id, park)
-        if isinstance(state, ThreadLive):
-            reply = _interrupt_turn(client, thread_id, state.turn_id)
-            if "error" in reply and not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
-                _account_move_path(session_dir, name).unlink(missing_ok=True)
-                _ = _require(reply, "turn/interrupt")
-        client.close()
-        client = None
-        return InterruptedWorkerMove(session_dir, name, marker, _as_int(entry.get("launcher_pid")))
-    except (ConnectionError, OSError, SystemExit) as error:
-        reason = f"interrupt failed: {error}"
-        if isinstance(marker, AccountMoveMarker):
-            with contextlib.suppress(OSError):
-                _fail_account_move(session_dir, name, marker, reason)
-        return SwitchingWorker(name, True, WorkerMoveFailed(reason, _account_move_command(session_dir, name)))
-    finally:
-        if client is not None:
+    with worker_lifecycle.lock_worker(session_dir, name):
+        current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+        if current != entry or current.get("adopted_to") or current.get("status") != "running":
+            return SwitchingWorker(name, False, WorkerMoveFailed("worker ownership changed before account move", _account_move_command(session_dir, name)))
+        thread_id = _as_str(entry.get("thread_id"))
+        marker: AccountMoveMarker | NoAccountMove = NoAccountMove()
+        client: Client | None = None
+        try:
+            if not thread_id:
+                raise SystemExit("worker has no recorded thread")
+            client = Client(port, f"account-move-{name}")
+            state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
+            if isinstance(state, ThreadStateUnknown):
+                raise SystemExit(state.reason)
+            if isinstance(state, ThreadActiveWithoutTurn):
+                raise SystemExit("live turn has no interruptible id")
+            # The turn may have just ended. It still needs a continuation if its launcher
+            # has not consumed that completion, so retain the roster's last turn id.
+            turn_id = state.turn_id if isinstance(state, ThreadLive) else _as_str(entry.get("turn_id"))
+            if not turn_id:
+                return SwitchingWorker(name, False)
+            marker = AccountMoveMarker(thread_id, turn_id, label, secrets.token_hex(16))
+            stored: StoredAccountMove = {"thread_id": marker.thread_id, "turn_id": marker.turn_id,
+                                        "label": marker.label, "move_id": marker.move_id}
+            with _pending_file(session_dir, name):
+                if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
+                    raise SystemExit("worker ended or was replaced before interruption")
+                _write_account_move_json(_account_move_path(session_dir, name), stored)
+            with _pending_file(session_dir, name) as pending:
+                def park(message: str) -> None:
+                    _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
+                _move_queue_to_pending(client, thread_id, park)
+            if isinstance(state, ThreadLive):
+                reply = _interrupt_turn(client, thread_id, state.turn_id)
+                if "error" in reply and not isinstance(_read_live_turn(client, thread_id), ThreadIdle):
+                    _account_move_path(session_dir, name).unlink(missing_ok=True)
+                    _ = _require(reply, "turn/interrupt")
             client.close()
+            client = None
+            return InterruptedWorkerMove(session_dir, name, marker, _as_int(entry.get("launcher_pid")))
+        except (ConnectionError, OSError, SystemExit) as error:
+            reason = f"interrupt failed: {error}"
+            if isinstance(marker, AccountMoveMarker):
+                with contextlib.suppress(OSError):
+                    _fail_account_move(session_dir, name, marker, reason)
+            return SwitchingWorker(name, True, WorkerMoveFailed(reason, _account_move_command(session_dir, name)))
+        finally:
+            if client is not None:
+                client.close()
 
 
 def _switch_run_workers(
@@ -8110,18 +8472,21 @@ def _switch_run_workers(
             workers.append(_interrupt_worker_for_account_move(str(folder), name, entry, port, label))
         else:
             if entry.get("held_design_id") and not dry_run:
-                thread_id = _as_str(entry.get("thread_id"))
-                client = Client(port, "held-idle-account-move")
-                try:
-                    with _pending_file(str(folder), name) as pending:
-                        def park(message: str) -> None:
-                            _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
-                        _move_queue_to_pending(client, thread_id, park)
-                        released = _release_worker_thread(client, thread_id, str(folder))
-                        if isinstance(released, WorkerThreadStateUnknown):
-                            raise SystemExit("RoleNeedsRecovery: " + released.reason)
-                finally:
-                    client.close()
+                with worker_lifecycle.lock_worker(folder, name):
+                    if _as_dict(_read_json_object(folder / ROSTER_FILE).get(name)) != entry:
+                        raise SystemExit(f"{name}: ownership changed before account move")
+                    thread_id = _as_str(entry.get("thread_id"))
+                    client = Client(port, "held-idle-account-move")
+                    try:
+                        with _pending_file(str(folder), name) as pending:
+                            def park(message: str) -> None:
+                                _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
+                            _move_queue_to_pending(client, thread_id, park)
+                            released = _release_worker_thread(client, thread_id, str(folder))
+                            if isinstance(released, WorkerThreadStateUnknown):
+                                raise SystemExit("RoleNeedsRecovery: " + released.reason)
+                    finally:
+                        client.close()
             workers.append(SwitchingWorker(name, entry.get("status") == "running"))
     return tuple(workers)
 
@@ -8216,149 +8581,156 @@ def command_prime(args: argparse.Namespace) -> int:
     """Create a read-only reviewer template without starting a turn."""
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
-    client: Client | None = None
-    try:
-        existing = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-        _role_fence(existing)
-        if existing.get("held_design_id"):
-            raise SystemExit("held role already has a thread; use design_roles.py resume")
-        held_design = _as_str(_attr(args, "held_design"))
-        held_role = _as_str(_attr(args, "held_role"))
-        if held_design:
-            from scripts.astra import design_roles
-            design = design_roles.read_design(held_design)
-            instance = next((value for value in design.roles if value.name == name and value.role == held_role), None)
-            reach = design_roles.resolve_holder(design.holder)
-            if (instance is None or not isinstance(instance.lifecycle, design_roles.RoleNotOpened)
-                    or not instance.lifecycle.claim or not isinstance(reach, design_roles.HolderReach)
-                    or reach.session_id != os.environ.get("CLAUDE_CODE_SESSION_ID")):
-                raise SystemExit("held thread creation lacks its holder's reserved claim")
-            claim = design_roles.design_directory(held_design) / f"{held_role}.creation-claimed"
-            with claim.open("x", encoding="utf-8") as handle:
-                _ = handle.write(instance.lifecycle.claim)
-        instructions_path = Path(_as_str(_attr(args, "instructions_file"))).resolve()
-        instructions = instructions_path.read_text(encoding="utf-8")
-        params: dict[str, object] = {
-            "developerInstructions": instructions,
-            "cwd": _as_str(_attr(args, "cwd")),
-            "sandbox": _as_str(_attr(args, "sandbox")) or READ_ONLY_SANDBOX,
-            "approvalPolicy": "never",
-        }
-        if held_design:
-            params["sandbox"] = READ_ONLY_SANDBOX if held_role == "reviewer" else WORKER_SANDBOX
-        model = _as_str(_attr(args, "model"))
-        if model:
-            params["model"] = model
-        service_tier = _as_str(_attr(args, "service_tier"))
-        if service_tier:
-            params["serviceTier"] = service_tier
-        port, _fresh = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
-        client = Client(port, name)
-        _ = _bind_serving_server(client, session_dir, started_here=_fresh)
-        result = _serving_request(client, "thread/start", params)
-        thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
-        if not thread_id:
-            raise SystemExit("thread/start returned no thread id")
-        # The held design's holder names the thread before its mesh record exists.
-        title = unit_workers.shown_name(Path(session_dir), name, role="review",
-                                        held_design_id=held_design, held_role=held_role)
-        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": title}), "thread/name/set")
-        record: FollowableRecord = {
-            "thread_id": thread_id, "status": "done", "role": "review",
-            "context_tokens": 0, "instructions_file": str(instructions_path),
-        }
-        record["model"] = model
-        record["effort"] = _as_str(_attr(args, "effort"))
-        record["access_policy"] = {"kind": "ReadOnlyReviewer"}
-        if held_design:
-            context = _read_json_object(_session_path(session_dir, "design_context.json"))
-            record.update({"held_design_id": held_design, "held_role": held_role,
-                           "access_policy": {"kind": "ReadOnlyReviewer"} if held_role == "reviewer" else {
-                               "kind": "PhaseBoundDesigner", "binding_generation": context.get("generation"),
-                               "launch_sandbox": params["sandbox"]}})
-        task = _as_str(_attr(args, "task"))
-        if task:
-            record["task"] = task
-        _update_roster(session_dir, name, record)
-        print(thread_id)
-        return 0
-    except (ConnectionError, OSError, UnicodeError, SystemExit) as exc:
-        if isinstance(exc, ServingRequestFailure):
-            detail = _failure_account_detail(exc, exc.serving)
-        else:
-            detail = str(exc)
-        print(f"codex_mesh: {name}: {detail}", file=sys.stderr)
-        return 1
-    finally:
-        if client is not None:
-            client.close()
+    with worker_lifecycle.lock_worker(session_dir, name):
+        client: Client | None = None
+        try:
+            existing = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+            _role_fence(existing)
+            if existing.get("held_design_id"):
+                raise SystemExit("held role already has a thread; use design_roles.py resume")
+            held_design = _as_str(_attr(args, "held_design"))
+            held_role = _as_str(_attr(args, "held_role"))
+            if held_design:
+                from scripts.astra import design_roles
+                design = design_roles.read_design(held_design)
+                instance = next((value for value in design.roles if value.name == name and value.role == held_role), None)
+                reach = design_roles.resolve_holder(design.holder)
+                if (instance is None or not isinstance(instance.lifecycle, design_roles.RoleNotOpened)
+                        or not instance.lifecycle.claim or not isinstance(reach, design_roles.HolderReach)
+                        or reach.session_id != os.environ.get("CLAUDE_CODE_SESSION_ID")):
+                    raise SystemExit("held thread creation lacks its holder's reserved claim")
+                claim = design_roles.design_directory(held_design) / f"{held_role}.creation-claimed"
+                with claim.open("x", encoding="utf-8") as handle:
+                    _ = handle.write(instance.lifecycle.claim)
+            instructions_path = Path(_as_str(_attr(args, "instructions_file"))).resolve()
+            instructions = instructions_path.read_text(encoding="utf-8")
+            params: dict[str, object] = {
+                "developerInstructions": instructions,
+                "cwd": _as_str(_attr(args, "cwd")),
+                "sandbox": _as_str(_attr(args, "sandbox")) or READ_ONLY_SANDBOX,
+                "approvalPolicy": "never",
+            }
+            if held_design:
+                params["sandbox"] = READ_ONLY_SANDBOX if held_role == "reviewer" else WORKER_SANDBOX
+            model = _as_str(_attr(args, "model"))
+            if model:
+                params["model"] = model
+            service_tier = _as_str(_attr(args, "service_tier"))
+            if service_tier:
+                params["serviceTier"] = service_tier
+            port, _fresh = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
+            client = Client(port, name)
+            _ = _bind_serving_server(client, session_dir, started_here=_fresh)
+            result = _serving_request(client, "thread/start", params)
+            thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
+            if not thread_id:
+                raise SystemExit("thread/start returned no thread id")
+            # The held design's holder names the thread before its mesh record exists.
+            title = unit_workers.shown_name(Path(session_dir), name, role="review",
+                                            held_design_id=held_design, held_role=held_role)
+            _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": title}), "thread/name/set")
+            record: FollowableRecord = {
+                "thread_id": thread_id, "status": "done", "role": "review",
+                "context_tokens": 0, "instructions_file": str(instructions_path),
+            }
+            record["model"] = model
+            record["effort"] = _as_str(_attr(args, "effort"))
+            record["access_policy"] = {"kind": "ReadOnlyReviewer"}
+            if held_design:
+                context = _read_json_object(_session_path(session_dir, "design_context.json"))
+                record.update({"held_design_id": held_design, "held_role": held_role,
+                               "access_policy": {"kind": "ReadOnlyReviewer"} if held_role == "reviewer" else {
+                                   "kind": "PhaseBoundDesigner", "binding_generation": context.get("generation"),
+                                   "launch_sandbox": params["sandbox"]}})
+            task = _as_str(_attr(args, "task"))
+            if task:
+                record["task"] = task
+            expected: ExpectedRoster = (RosterUnchanged(_as_str(existing.get("thread_id")), _roster_revision(existing))
+                                        if existing else RosterAbsent())
+            if not _update_roster_if_expected(session_dir, name, record, expected):
+                _refuse_taken_follow_up(client, thread_id, session_dir)
+            print(thread_id)
+            return 0
+        except (ConnectionError, OSError, UnicodeError, SystemExit) as exc:
+            if isinstance(exc, ServingRequestFailure):
+                detail = _failure_account_detail(exc, exc.serving)
+            else:
+                detail = str(exc)
+            print(f"codex_mesh: {name}: {detail}", file=sys.stderr)
+            return 1
+        finally:
+            if client is not None:
+                client.close()
 
 
 def command_fork(args: argparse.Namespace) -> int:
     """Load a template and create a named read-only reviewer from it."""
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
-    client: Client | None = None
-    try:
-        existing = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-        if _as_str(existing.get("thread_id")) and existing.get("status") != "ended":
-            print(f"codex_mesh: {name}: name already belongs to a thread; fork refused", file=sys.stderr)
-            return 2
-        expected: ExpectedRoster = (RosterEndedOnThread(_as_str(existing.get("thread_id")))
-                                    if _as_str(existing.get("thread_id")) else RosterAbsent())
-        source_name = _as_str(_attr(args, "from_name"))
-        source_record = _lookup(session_dir, source_name)
-        if source_record.get("held_design_id"):
-            raise SystemExit("held role thread cannot be forked; use its holder route")
-        source = _roster_thread(source_record)
-        if isinstance(source, InvalidThread):
-            raise SystemExit(source.reason)
-        port, _fresh = ensure_server(session_dir)
-        released = _release_other_worker_writers(session_dir, source_name, source.thread_id, port)
-        if not isinstance(released, _ReleasedWorkerThread):
-            print(f"codex_mesh: {name}: {released.reason}; fork refused", file=sys.stderr)
-            return 2
-        client = Client(port, name)
-        _ = _bind_serving_server(client, session_dir, started_here=_fresh)
-        params = _resume_params(session_dir, source_name, source.thread_id)
-        _ = _serving_request(client, "thread/resume", params)
-        fork_params = dict(params)
-        fork_params.update({"sandbox": READ_ONLY_SANDBOX, "approvalPolicy": "never"})
-        result = _serving_request(client, "thread/fork", fork_params)
-        thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
-        if not thread_id:
-            raise SystemExit("thread/fork returned no thread id")
-        _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": unit_workers.shown_name(Path(session_dir), name, role="review")}), "thread/name/set")
-        record: FollowableRecord = {
-            "thread_id": thread_id, "status": "done", "role": "review", "context_tokens": 0,
-            "access_policy": {"kind": "ReadOnlyReviewer"},
-        }
-        task = _as_str(source_record.get("task"))
-        if task:
-            record["task"] = task
-        instructions_file = _as_str(source_record.get("instructions_file"))
-        if instructions_file:
-            record["instructions_file"] = instructions_file
-        if not _update_roster_if_expected(session_dir, name, record, expected):
-            released = _release_worker_thread(client, thread_id, session_dir)
-            if isinstance(released, WorkerThreadStateUnknown):
-                print(f"codex_mesh: {name}: name was taken while the fork ran; "
-                      + f"fork thread {thread_id} not released: {released.reason}", file=sys.stderr)
-                return 1
-            print(f"codex_mesh: {name}: name was taken while the fork ran; fork refused", file=sys.stderr)
-            return 2
-        print(thread_id)
-        return 0
-    except (ConnectionError, OSError, SystemExit) as exc:
-        if isinstance(exc, ServingRequestFailure):
-            detail = _failure_account_detail(exc, exc.serving)
-        else:
-            detail = str(exc)
-        print(f"codex_mesh: {name}: {detail}", file=sys.stderr)
-        return 1
-    finally:
-        if client is not None:
-            client.close()
+    with worker_lifecycle.lock_workers(
+            worker_lifecycle.WorkerIdentity(Path(session_dir), name),
+            worker_lifecycle.WorkerIdentity(Path(session_dir), _as_str(_attr(args, "from_name")))):
+        client: Client | None = None
+        try:
+            existing = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+            if _as_str(existing.get("thread_id")) and existing.get("status") != "ended":
+                print(f"codex_mesh: {name}: name already belongs to a thread; fork refused", file=sys.stderr)
+                return 2
+            expected: ExpectedRoster = (RosterEndedOnThread(_as_str(existing.get("thread_id")))
+                                        if _as_str(existing.get("thread_id")) else RosterAbsent())
+            source_name = _as_str(_attr(args, "from_name"))
+            source_record = _lookup(session_dir, source_name)
+            if source_record.get("held_design_id"):
+                raise SystemExit("held role thread cannot be forked; use its holder route")
+            source = _roster_thread(source_record)
+            if isinstance(source, InvalidThread):
+                raise SystemExit(source.reason)
+            port, _fresh = ensure_server(session_dir)
+            released = _release_other_worker_writers(session_dir, source_name, source.thread_id, port)
+            if not isinstance(released, _ReleasedWorkerThread):
+                print(f"codex_mesh: {name}: {released.reason}; fork refused", file=sys.stderr)
+                return 2
+            client = Client(port, name)
+            _ = _bind_serving_server(client, session_dir, started_here=_fresh)
+            params = _resume_params(session_dir, source_name, source.thread_id)
+            _ = _serving_request(client, "thread/resume", params)
+            fork_params = dict(params)
+            fork_params.update({"sandbox": READ_ONLY_SANDBOX, "approvalPolicy": "never"})
+            result = _serving_request(client, "thread/fork", fork_params)
+            thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
+            if not thread_id:
+                raise SystemExit("thread/fork returned no thread id")
+            _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": unit_workers.shown_name(Path(session_dir), name, role="review")}), "thread/name/set")
+            record: FollowableRecord = {
+                "thread_id": thread_id, "status": "done", "role": "review", "context_tokens": 0,
+                "access_policy": {"kind": "ReadOnlyReviewer"},
+            }
+            task = _as_str(source_record.get("task"))
+            if task:
+                record["task"] = task
+            instructions_file = _as_str(source_record.get("instructions_file"))
+            if instructions_file:
+                record["instructions_file"] = instructions_file
+            if not _update_roster_if_expected(session_dir, name, record, expected):
+                released = _release_worker_thread(client, thread_id, session_dir)
+                if isinstance(released, WorkerThreadStateUnknown):
+                    print(f"codex_mesh: {name}: name was taken while the fork ran; "
+                          + f"fork thread {thread_id} not released: {released.reason}", file=sys.stderr)
+                    return 1
+                print(f"codex_mesh: {name}: name was taken while the fork ran; fork refused", file=sys.stderr)
+                return 2
+            print(thread_id)
+            return 0
+        except (ConnectionError, OSError, SystemExit) as exc:
+            if isinstance(exc, ServingRequestFailure):
+                detail = _failure_account_detail(exc, exc.serving)
+            else:
+                detail = str(exc)
+            print(f"codex_mesh: {name}: {detail}", file=sys.stderr)
+            return 1
+        finally:
+            if client is not None:
+                client.close()
 
 
 def command_set_instructions(args: argparse.Namespace) -> int:
@@ -8369,35 +8741,36 @@ def command_set_instructions(args: argparse.Namespace) -> int:
     """
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "to"))
-    if _lookup(session_dir, name).get("held_design_id"):
-        raise SystemExit("codex_mesh: held-role set-instructions refused; use design_roles.py resume")
-    instructions = Path(_as_str(_attr(args, "instructions_file"))).resolve()
-    if not instructions.is_file():
-        print(f"codex_mesh: {name}: no instructions file at {instructions}", file=sys.stderr)
-        return 1
-    state = _lookup_state(session_dir, name)
-    if not isinstance(state, FollowableThread):
-        reason = state.reason if isinstance(state, InvalidThread) else "worker is busy or not followable"
-        print(f"codex_mesh: {name}: {reason}; instructions unchanged", file=sys.stderr)
-        return 2
-    path = _session_path(session_dir, ROSTER_FILE)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        _ = handle.seek(0)
-        roster = _load_roster_for_write(handle)
-        entry = _as_dict(roster.get(name))
-        if entry.get("thread_id") != state.thread_id or entry.get("status") != "done":
-            print(f"codex_mesh: {name}: worker changed while setting instructions; instructions unchanged",
-                  file=sys.stderr)
+    with worker_lifecycle.lock_worker(session_dir, name):
+        if _lookup(session_dir, name).get("held_design_id"):
+            raise SystemExit("codex_mesh: held-role set-instructions refused; use design_roles.py resume")
+        instructions = Path(_as_str(_attr(args, "instructions_file"))).resolve()
+        if not instructions.is_file():
+            print(f"codex_mesh: {name}: no instructions file at {instructions}", file=sys.stderr)
+            return 1
+        state = _lookup_state(session_dir, name)
+        if not isinstance(state, FollowableThread):
+            reason = state.reason if isinstance(state, InvalidThread) else "worker is busy or not followable"
+            print(f"codex_mesh: {name}: {reason}; instructions unchanged", file=sys.stderr)
             return 2
-        entry["instructions_file"] = str(instructions)
-        _advance_roster_revision(entry)
-        roster[name] = entry
-        _ = handle.seek(0)
-        _ = handle.truncate()
-        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
-        handle.flush()
-    return 0
+        path = _session_path(session_dir, ROSTER_FILE)
+        with path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            _ = handle.seek(0)
+            roster = _load_roster_for_write(handle)
+            entry = _as_dict(roster.get(name))
+            if entry.get("thread_id") != state.thread_id or entry.get("status") != "done":
+                print(f"codex_mesh: {name}: worker changed while setting instructions; instructions unchanged",
+                      file=sys.stderr)
+                return 2
+            entry["instructions_file"] = str(instructions)
+            _advance_roster_revision(entry)
+            roster[name] = entry
+            _ = handle.seek(0)
+            _ = handle.truncate()
+            _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+            handle.flush()
+        return 0
 
 
 def _clear_reset_context(session_dir: str, name: str, thread_id: str, launcher_pid: int) -> bool:
@@ -8430,51 +8803,52 @@ def command_reset(args: argparse.Namespace) -> int:
     claimed_thread_id = ""
     owner_pid = os.getpid()
     try:
-        state = _lookup_state(session_dir, name)
-        if not isinstance(state, FollowableThread):
-            reason = state.reason if isinstance(state, InvalidThread) else "worker is busy or not followable"
-            print(f"codex_mesh: {name}: {reason}; reset refused", file=sys.stderr)
-            return 2
-        role = _roster_role(_lookup(session_dir, name).get("role"))
-        reset_role = role.role if isinstance(role, AssignedWorkerRole) else "review"
-        if not _claim_follow(session_dir, name, state.thread_id, owner_pid, reset_role):
-            print(f"codex_mesh: {name}: worker was already claimed; reset refused", file=sys.stderr)
-            return 2
-        claimed = True
-        claimed_thread_id = state.thread_id
-        port, _fresh = ensure_server(session_dir)
-        released = _release_other_worker_writers(session_dir, name, state.thread_id, port)
-        if not isinstance(released, _ReleasedWorkerThread):
-            print(f"codex_mesh: {name}: {released.reason}; reset refused", file=sys.stderr)
-            return 2
-        client = Client(port, name)
-        _ = _bind_serving_server(client, session_dir, started_here=_fresh)
-        _ = _serving_request(client, "thread/resume", _resume_params(session_dir, name, state.thread_id))
-        read = _serving_request(client, "thread/read", {
-            "threadId": state.thread_id, "includeTurns": False,
-        })
-        thread = _as_dict(read.get("thread"))
-        status = _as_str(_as_dict(thread.get("status")).get("type"))
-        if not _thread_has_no_active_turn(status):
-            print(f"codex_mesh: {name}: thread state is {status or 'unknown'}; reset refused", file=sys.stderr)
-            return 2
-        result = _serving_request(client, "thread/turns/list", {
-            "threadId": state.thread_id, "sortDirection": "asc", "limit": 1,
-        })
-        turns = result.get("data")
-        if not isinstance(turns, list):
-            raise SystemExit("thread/turns/list returned no turn list")
-        if turns:
-            first_turn_id = _as_str(_as_dict(cast("list[object]", turns)[0]).get("id"))
-            if not first_turn_id:
-                raise SystemExit("thread/turns/list returned no first turn id")
-            _ = _serving_request(client, "thread/revert", {
-                "threadId": state.thread_id, "beforeTurnId": first_turn_id,
+        with _design_claim_lock(session_dir, name, lock_inbox=False):
+            state = _lookup_state(session_dir, name)
+            if not isinstance(state, FollowableThread):
+                reason = state.reason if isinstance(state, InvalidThread) else "worker is busy or not followable"
+                print(f"codex_mesh: {name}: {reason}; reset refused", file=sys.stderr)
+                return 2
+            role = _roster_role(_lookup(session_dir, name).get("role"))
+            reset_role = role.role if isinstance(role, AssignedWorkerRole) else "review"
+            port, _fresh = ensure_server(session_dir)
+            released = _release_other_worker_writers(session_dir, name, state.thread_id, port)
+            if not isinstance(released, _ReleasedWorkerThread):
+                print(f"codex_mesh: {name}: {released.reason}; reset refused", file=sys.stderr)
+                return 2
+            client = Client(port, name)
+            _ = _bind_serving_server(client, session_dir, started_here=_fresh)
+            _ = _serving_request(client, "thread/resume", _resume_params(session_dir, name, state.thread_id))
+            read = _serving_request(client, "thread/read", {
+                "threadId": state.thread_id, "includeTurns": False,
             })
-        if not _clear_reset_context(session_dir, name, state.thread_id, owner_pid):
-            print(f"codex_mesh: {name}: worker claim changed; reset refused", file=sys.stderr)
-            return 2
-        return 0
+            thread = _as_dict(read.get("thread"))
+            status = _as_str(_as_dict(thread.get("status")).get("type"))
+            if not _thread_has_no_active_turn(status):
+                print(f"codex_mesh: {name}: thread state is {status or 'unknown'}; reset refused", file=sys.stderr)
+                return 2
+            if not _claim_follow_locked(session_dir, name, state.thread_id, owner_pid, reset_role):
+                print(f"codex_mesh: {name}: worker was already claimed; reset refused", file=sys.stderr)
+                return 2
+            claimed = True
+            claimed_thread_id = state.thread_id
+            result = _serving_request(client, "thread/turns/list", {
+                "threadId": state.thread_id, "sortDirection": "asc", "limit": 1,
+            })
+            turns = result.get("data")
+            if not isinstance(turns, list):
+                raise SystemExit("thread/turns/list returned no turn list")
+            if turns:
+                first_turn_id = _as_str(_as_dict(cast("list[object]", turns)[0]).get("id"))
+                if not first_turn_id:
+                    raise SystemExit("thread/turns/list returned no first turn id")
+                _ = _serving_request(client, "thread/revert", {
+                    "threadId": state.thread_id, "beforeTurnId": first_turn_id,
+                })
+            if not _clear_reset_context(session_dir, name, state.thread_id, owner_pid):
+                print(f"codex_mesh: {name}: worker claim changed; reset refused", file=sys.stderr)
+                return 2
+            return 0
     except (ConnectionError, OSError, SystemExit) as exc:
         if isinstance(exc, ServingRequestFailure):
             detail = _failure_account_detail(exc, exc.serving)
