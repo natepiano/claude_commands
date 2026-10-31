@@ -47,7 +47,6 @@ import unit_lookup
 import unit_move
 import unit_names
 from production_units import Production
-from shutdown_record import InvalidRecord
 from atomic_file import write_text_atomic
 
 ADD_UNIT = Path(__file__).resolve().parent / "add_unit.py"
@@ -178,15 +177,11 @@ def refusals(unit: RetiredUnit) -> list[str]:
     return refused
 
 
-def plan_arguments(unit: RetiredUnit) -> list[str]:
-    return [f"--{unit.plan}"] if unit.plan in ("standby", "permanent") else ["--plan", unit.plan]
-
-
 def launch_command(unit: RetiredUnit) -> list[str]:
     if not unit.session_id:
         raise Refused(f"{unit.name}: its Units row names no session to resume")
     return [sys.executable, str(ADD_UNIT), "--production", str(unit.production.doc), unit.name,
-            "--resume", unit.session_id, "--cwd", str(resume_folder(unit)), *plan_arguments(unit)]
+            "--resume", unit.session_id, "--cwd", str(resume_folder(unit)), *production_units.plan_arguments(unit.plan)]
 
 
 def make_worktree(unit: RetiredUnit) -> None:
@@ -283,7 +278,7 @@ def _main(argv: list[str]) -> int:
         return dry_run(unit) if cast(bool, options.dry_run) else resume(unit)
     except (staff.StaffRefused, staff.StaffUnreadable):
         raise
-    except (Refused, retire_unit.Refused, production_units.Refusal, unit_names.BadName, InvalidRecord, OSError) as error:
+    except (Refused, retire_unit.Refused, production_units.Refusal, unit_names.BadName, OSError) as error:
         print(f"refused: {error}")
         return 1
 

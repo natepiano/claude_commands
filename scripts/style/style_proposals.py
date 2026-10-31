@@ -39,6 +39,7 @@ from proposal_issue import (GOAL, INHERITED_FIELDS, STAR, ApprovedDecision, Decl
                             UnansweredDecision, approve_unanswered, decision_answer, fill_ranking, refresh_decision, require_generated_body)
 from unit_files import file_text, git, unit_file_holders
 from unit_plans import PilotScope, crate_in_scope, family_pilot_scopes
+from process_failure import failure_detail
 from user_zone import user_zone
 
 
@@ -48,14 +49,14 @@ def proposal_command(*arguments: str) -> None:
         capture_output=True, text=True, check=False,
     )
     if result.returncode:
-        raise style_ledger.LedgerError(result.stderr.strip() or result.stdout.strip())
+        raise style_ledger.LedgerError(failure_detail(result))
 
 
 def renumber() -> None:
     result = subprocess.run([sys.executable, str(SCRIPTS / "prioritize/renumber.py"), "--apply"],
                             capture_output=True, text=True, check=False)
     if result.returncode:
-        raise style_ledger.LedgerError(result.stderr.strip() or result.stdout.strip())
+        raise style_ledger.LedgerError(failure_detail(result))
 
 
 def is_decision(issue: Issue) -> bool:
@@ -878,7 +879,7 @@ def close_finished_decision(ledger: style_ledger.Ledger, issue: Path) -> bool:
     if not findings or left_to_build(findings):
         return False
     tickets = sorted(ticket["id"] for ticket in ledger.proposal_tickets()
-                     if ticket["state"] == "merged" and Path(ticket["proposal"]) == issue)
+                     if ticket["state"] == "merged" and issue in ledger.ticket_proposals(ticket["id"]))
     if tickets:
         reason = BUILT_REASON + ", ".join(tickets)
     else:
@@ -1034,7 +1035,7 @@ def plan_moves(ledger: style_ledger.Ledger, proposals: Path, issues: list[Issue]
     all_findings = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
     open_tickets = tuple(ticket for ticket in ledger.proposal_tickets()
                          if ticket["state"] not in style_ledger.FINAL_TICKET_STATES)
-    holding = {Path(ticket["proposal"]): ticket for ticket in open_tickets}
+    holding = {issue: ticket for ticket in open_tickets for issue in ledger.ticket_proposals(ticket["id"])}
     open_ids = {ticket["id"] for ticket in open_tickets}
     refile: Mapping[str, style_ledger.PersonReading] = scope.refilings if isinstance(scope, FileBuiltAgain) else {}
     directories = workspace_directories(ledger)
@@ -1330,7 +1331,8 @@ def file_unapplied_again(ledger: style_ledger.Ledger, issue: Path, parent: str, 
     Every refusal comes before the first write.
     """
     building = [ticket["id"] for ticket in ledger.proposal_tickets()
-                if Path(ticket["proposal"]) == issue and ticket["state"] not in style_ledger.FINAL_TICKET_STATES]
+                if ticket["state"] not in style_ledger.FINAL_TICKET_STATES
+                and issue in ledger.ticket_proposals(ticket["id"])]
     if building:
         raise style_ledger.LedgerError(f"{issue}: open ticket {building[0]} builds it")
     commit = ledger.synced_commit()

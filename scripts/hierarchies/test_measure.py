@@ -112,6 +112,10 @@ def named_holder_fixture(resource_kind: str = "slot", resource: str = "natedev/s
             "holder": {"state": "SessionHolder", "session_id": "other-project-director"}}
 
 
+def merge_history_fixture(merges: Sequence[m.HanaMerge]) -> m.HanaTrunkMerges:
+    return m.HanaTrunkMerges(tuple(merges), "fixture trunk history")
+
+
 def receipt_fixture(commit: str, at: datetime) -> log_records.JsonObject:
     return {
         "event_type": "merge_receipt", "schema_version": 1, "project": "hana",
@@ -906,10 +910,10 @@ class WaitRecordsTest(unittest.TestCase):
     def test_candidate_cells_count_distinct_notes_in_first_seen_order(self) -> None:
         first: log_records.JsonObject = {"run_id": "hana-run", "phase_id": "4", "phase_instance_id": "hana-phase"}
         second: log_records.JsonObject = {"run_id": "hana-run", "phase_id": "5", "phase_instance_id": "hana-next"}
-        first_label = "run=hana-run; phase=4; instance=hana-phase; cwd="
-        second_label = "run=hana-run; phase=5; instance=hana-next; cwd="
-        for candidates, expected in (([first] * 6, first_label + " (6 times)"),
-                                     ([first, second, first], first_label + " (2 times) | " + second_label)):
+        first_label = "run=hana-run; phase=4; instance=hana-phase; cwd=not recorded"
+        second_label = "run=hana-run; phase=5; instance=hana-next; cwd=not recorded"
+        for candidates, expected in (([first] * 6, first_label),
+                                     ([first, second, first], first_label + " | " + second_label)):
             with self.subTest(expected=expected):
                 phase = wait_phase_fixture("UncertainCoverage")
                 phase.update(reason="ambiguous coverage", candidates=candidates, recorded_wait_n=0)
@@ -917,12 +921,129 @@ class WaitRecordsTest(unittest.TestCase):
                 missing["wait_attribution"] = {"state": "UnresolvedAttribution", "reason": "ambiguous attribution",
                                                 "candidates": candidates}
                 history = m.parse_wait_report(wait_report_fixture(self.window, [missing], [phase]))
-                rows = m.hana_wait_rows(history, self.window, ())
+                output = log_records.blocks("Waits", m.hana_wait_rows(history, self.window, ()))
+                rows = read_report_blocks(output)
                 for label, reason in (("Hana wait coverage / UncertainCoverage", "ambiguous coverage"),
                                       ("Hana wait attribution / Unresolved", "ambiguous attribution")):
                     cells = [row for row in rows if row.measure == label]
                     self.assertEqual([(row.value, row.n) for row in cells],
                                      [(reason + "; candidates: " + expected, 1)])
+
+    def test_full_wait_report_collapses_twenty_six_phases_and_three_waits_without_merging_other_reasons(self) -> None:
+        candidates: list[log_records.JsonObject] = [
+            {"run_id": "hana-run", "phase_id": str(index), "phase_instance_id": f"candidate-{index}",
+             "working_dir": "" if index == 0 else f"/archive/hana-{index}"}
+            for index in range(6)
+        ]
+        phases: list[log_records.JsonObject] = []
+        for index in range(26):
+            phase = wait_phase_fixture("UncertainCoverage")
+            phase.update(phase_instance_id=f"phase-{index}", reason="overlapping phase records",
+                         candidates=candidates * 26)
+            phases.append(phase)
+        different = wait_phase_fixture("UncertainCoverage")
+        different.update(phase_instance_id="different-phase", reason="another coverage reason", candidates=candidates)
+        phases.append(different)
+        waits: list[log_records.JsonObject] = []
+        for index in range(4):
+            wait = wait_fixture(f"miss-{index}", "WaitingForUser", self.start)
+            wait["wait_attribution"] = {
+                "state": "UnresolvedAttribution", "reason": "ambiguous owner" if index < 3 else "different owner",
+                "candidates": candidates * 26,
+            }
+            waits.append(wait)
+        history = m.parse_wait_report(wait_report_fixture(self.window, waits, phases))
+        rows = m.hana_wait_rows(history, self.window, ())
+        sources = m.BaselineSources([], [], [], [], [], notification_report([], [], self.window),
+                                    [], [], [], [], [], merge_history_fixture([]), history)
+        output = m.render(sources, self.window, self.window.until, full=True)
+        parsed = read_report_blocks(output)
+        shared_source = "progress_history.py waits; phase starts and wait starts in window; completed durations only"
+        labels = [f"run=hana-run; phase={index}; instance=candidate-{index}; cwd="
+                  + ("not recorded" if index == 0 else f"/archive/hana-{index}") for index in range(6)]
+        detail = " | ".join(labels)
+        grouped_phases = [row for row in parsed if row.measure == "Hana wait coverage / UncertainCoverage"]
+        self.assertEqual(grouped_phases, [
+            log_records.MeasureRow("Hana wait coverage / UncertainCoverage",
+                                   "overlapping phase records; candidates: " + detail, 26, self.window.label,
+                                   shared_source + "; phases: "
+                                   + ", ".join(f"hana-run/phase-{index}" for index in range(26))),
+            log_records.MeasureRow("Hana wait coverage / UncertainCoverage",
+                                   "another coverage reason; candidates: " + detail, 1, self.window.label,
+                                   shared_source + "; phases: hana-run/different-phase"),
+        ])
+        attribution = [row for row in parsed if row.measure == "Hana wait attribution / Unresolved"]
+        self.assertEqual(attribution, [
+            log_records.MeasureRow("Hana wait attribution / Unresolved", "ambiguous owner; candidates: " + detail,
+                                   3, self.window.label, shared_source + "; waits: miss-0, miss-1, miss-2"),
+            log_records.MeasureRow("Hana wait attribution / Unresolved", "different owner; candidates: " + detail,
+                                   1, self.window.label, shared_source + "; waits: miss-3"),
+        ])
+        original = next(row for row in rows if row.measure == "Hana wait coverage / UncertainCoverage")
+        for measure, quantities in (
+            ("Hana wait coverage / UncertainCoverage", [
+                log_records.Diagnostic(26, "overlapping phase records; candidates: " + detail),
+                log_records.Diagnostic(1, "another coverage reason; candidates: " + detail),
+            ]),
+            ("Hana wait attribution / Unresolved", [
+                log_records.Diagnostic(3, "ambiguous owner; candidates: " + detail),
+                log_records.Diagnostic(1, "different owner; candidates: " + detail),
+            ]),
+        ):
+            with self.subTest(measure=measure):
+                self.assertEqual([row.quantity for row in rows if row.measure == measure], quantities)
+        self.assertEqual(original.source, shared_source + "; phases: "
+                         + ", ".join(f"hana-run/phase-{index}" for index in range(26)))
+        self.assertEqual(len(history.phases), 27)
+        self.assertEqual(len(history.attribution_misses), 4)
+        self.assertNotRegex(output, r"\(\d+ times\)")
+        self.assertNotRegex(output, r"cwd=(?:\s*\||\s*$)")
+        self.assertEqual(phone_overflow_lines(output), [])
+
+    def test_unresolved_origins_and_source_problems_group_only_equal_reasons(self) -> None:
+        phases: list[log_records.JsonObject] = []
+        waits: list[log_records.JsonObject] = []
+        for index in range(4):
+            phase = wait_phase_fixture()
+            phase.update(run_id="unknown-run", phase_instance_id=f"unknown-{index}", unit="unknown-unit")
+            for field in ("plan_doc", "production", "repository"):
+                phase[field] = {"state": "NotRecorded", "reason": "origin absent" if index < 3 else "older origin absent"}
+            phases.append(phase)
+            wait = wait_fixture(f"bad-{index}", "invalid-kind" if index < 3 else "other-invalid-kind", self.start)
+            waits.append(wait)
+        history = m.parse_wait_report(wait_report_fixture(self.window, waits, phases))
+        diagnostics = m.hana_wait_rows(history, self.window, ())
+        output = log_records.blocks("Wait diagnostics", diagnostics)
+        rows = read_report_blocks(output)
+        source = "progress_history.py waits; phase starts and wait starts in window; completed durations only"
+        origins = [row for row in rows if row.measure == "Hana wait origin / UnresolvedPhaseOrigin"]
+        self.assertEqual(origins, [
+            log_records.MeasureRow("Hana wait origin / UnresolvedPhaseOrigin", "; ".join(["origin absent"] * 3),
+                                   3, self.window.label,
+                                   source + "; phases: unknown-run/unknown-0, unknown-run/unknown-1, unknown-run/unknown-2"),
+            log_records.MeasureRow("Hana wait origin / UnresolvedPhaseOrigin", "; ".join(["older origin absent"] * 3),
+                                   1, self.window.label, source + "; phases: unknown-run/unknown-3"),
+        ])
+        problems = [row for row in rows if row.measure == "Hana wait / source problem"]
+        self.assertEqual(problems, [
+            log_records.MeasureRow("Hana wait / source problem", "unknown wait kind: invalid-kind", 3,
+                                   self.window.label, source + "; waits: wait bad-0, wait bad-1, wait bad-2"),
+            log_records.MeasureRow("Hana wait / source problem", "unknown wait kind: other-invalid-kind", 1,
+                                   self.window.label, source + "; waits: wait bad-3"),
+        ])
+        for measure, quantities in (
+            ("Hana wait origin / UnresolvedPhaseOrigin", [
+                log_records.Diagnostic(3, "; ".join(["origin absent"] * 3)),
+                log_records.Diagnostic(1, "; ".join(["older origin absent"] * 3)),
+            ]),
+            ("Hana wait / source problem", [
+                log_records.Diagnostic(3, "unknown wait kind: invalid-kind"),
+                log_records.Diagnostic(1, "unknown wait kind: other-invalid-kind"),
+            ]),
+        ):
+            with self.subTest(measure=measure):
+                self.assertEqual([row.quantity for row in diagnostics if row.measure == measure], quantities)
+        self.assertEqual(phone_overflow_lines(output), [])
 
     def test_completed_wait_with_unresolved_supplier_adds_no_hana_minutes(self) -> None:
         reason = "supplier address is not recorded"
@@ -1694,13 +1815,13 @@ class MergeReceiptsTest(unittest.TestCase):
 
     def test_receipt_names_the_merge_commit_and_missing_merge_stays_visible(self) -> None:
         receipt = m.parse_receipt(receipt_fixture("a" * 40, self.start))
-        merges = [m.HanaMerge("a" * 40, self.start), m.HanaMerge("c" * 40, self.start)]
+        merges = merge_history_fixture([m.HanaMerge("a" * 40, self.start), m.HanaMerge("c" * 40, self.start)])
         rows = m.receipt_rows([receipt], merges, self.window)
         output = log_records.blocks("Receipt fixtures", rows)
         self.assertIn("ReceiptMissing", output)
         self.assertIn("c" * 40, output)
         self.assertEqual((receipt.commit, receipt.checkpoint), ("a" * 40, "b" * 40))
-        self.assertIsInstance(m.receipt_for_merge(merges[1], [receipt]), m.ReceiptMissing)
+        self.assertIsInstance(m.receipt_for_merge(merges.merges[1], [receipt]), m.ReceiptMissing)
         coverage = next(row for row in rows if row.measure == "Hana merge receipts / origin/init/catalyst")
         self.assertEqual((coverage.value, coverage.n), ("1/2", 2))
 
@@ -1712,14 +1833,14 @@ class MergeReceiptsTest(unittest.TestCase):
         other_branch = receipt_fixture(commit, self.start)
         other_branch["target_branch"] = "sdlc"
         receipts = [m.parse_receipt(record) for record in (wrong_commit, other_project, other_branch)]
-        rows = m.receipt_rows(receipts, [m.HanaMerge(commit, self.start)], self.window)
+        rows = m.receipt_rows(receipts, merge_history_fixture([m.HanaMerge(commit, self.start)]), self.window)
         coverage = next(row for row in rows if row.measure == "Hana merge receipts / origin/init/catalyst")
         self.assertEqual((coverage.value, coverage.n), ("0/1", 1))
         self.assertIn("ReceiptMissing", log_records.blocks("Receipt fixtures", rows))
 
     def test_receipt_at_window_end_does_not_cover_an_in_window_merge(self) -> None:
         later = m.parse_receipt(receipt_fixture("a" * 40, self.window.until))
-        rows = m.receipt_rows([later], [m.HanaMerge("a" * 40, self.start)], self.window)
+        rows = m.receipt_rows([later], merge_history_fixture([m.HanaMerge("a" * 40, self.start)]), self.window)
         totals = {row.measure: (row.value, row.n) for row in rows}
         self.assertEqual(totals["merge receipts / all projects"], ("0", 0))
         self.assertEqual(totals["Hana merge receipts / origin/init/catalyst"], ("0/1", 1))
@@ -1741,7 +1862,7 @@ class MergeReceiptsTest(unittest.TestCase):
             receipts = m.read_receipts(path)
             self.assertNotIsInstance(receipts, m.HistoryNotRecorded)
             rows = {row.measure: row for row in m.receipt_rows(
-                receipts, [m.HanaMerge("a" * 40, self.start)], self.window)}
+                receipts, merge_history_fixture([m.HanaMerge("a" * 40, self.start)]), self.window)}
             self.assertEqual((rows["merge receipts / all projects"].value,
                               rows["merge receipts / all projects"].n), ("1", 1))
             self.assertEqual((rows["Hana merge receipts / origin/init/catalyst"].value,
@@ -1754,7 +1875,7 @@ class MergeReceiptsTest(unittest.TestCase):
             receipts = m.read_receipts(path)
             self.assertIsInstance(receipts, m.HistoryNotRecorded)
             self.assertFalse(path.parent.exists())
-            rows = m.receipt_rows(receipts, [m.HanaMerge("c" * 40, self.start)], self.window)
+            rows = m.receipt_rows(receipts, merge_history_fixture([m.HanaMerge("c" * 40, self.start)]), self.window)
             missing = [row for row in rows if row.measure == "Hana merge / ReceiptMissing"]
             self.assertEqual([(row.value, row.n) for row in missing], [("c" * 40, 1)])
             self.assertIn("HistoryNotRecorded", rows[0].value)
@@ -1769,7 +1890,7 @@ class MergeReceiptsTest(unittest.TestCase):
                                      m.HistoryNotRecorded("merge receipts not recorded"), problems)
             self.assertIsInstance(receipts, m.HistoryNotRecorded)
             self.assertEqual(len(problems), 1)
-            rows = m.receipt_rows(receipts, [], self.window)
+            rows = m.receipt_rows(receipts, merge_history_fixture([]), self.window)
             self.assertIn("HistoryNotRecorded", rows[0].value)
             self.assertIn(str(path), log_records.blocks(
                 "Source problems", log_records.source_problem_rows(problems, self.window)))
@@ -1802,7 +1923,7 @@ class BaselineOutputTest(unittest.TestCase):
         merges = [m.HanaMerge("one", start), m.HanaMerge("two", start + timedelta(days=1)),
                   m.HanaMerge("later", end)]
         return m.BaselineSources([], [], [], [], [], notification_report(pushes, reviews, self.window),
-                                 [], found, [], [], [], merges)
+                                 [], found, [], [], [], merge_history_fixture(merges))
 
     def output(self, sources: m.BaselineSources, full: bool = False) -> str:
         arguments = ["baseline", "--since", "2026-10-21", "--until", "2026-10-27"]
@@ -1883,7 +2004,7 @@ class BaselineOutputTest(unittest.TestCase):
             self.window, [wait_fixture("user-wait", "WaitingForUser", self.window.since, 8)],
             [wait_phase_fixture(wait_n=1)],
         ))
-        sources.merges = [m.HanaMerge("a" * 40, self.window.since), m.HanaMerge("c" * 40, self.window.since)]
+        sources.merges = merge_history_fixture([m.HanaMerge("a" * 40, self.window.since), m.HanaMerge("c" * 40, self.window.since)])
         sources.receipts = (m.parse_receipt(receipt_fixture("a" * 40, self.window.since)),)
         summary = self.output(sources)
         output = self.output(sources, full=True)
@@ -1963,7 +2084,7 @@ class ComparisonTest(unittest.TestCase):
         sources = m.BaselineSources(
             [m.Unit("hana", "current-unit", "hana", "/current", True, "")], [], [], [], phases,
             notification_report(pushes, reviews, window), [], found, [],
-            [m.WaitingItem("changes", at)], [], [m.HanaMerge(f"merge-{index}", at) for index in range(count)],
+            [m.WaitingItem("changes", at)], [], merge_history_fixture([m.HanaMerge(f"merge-{index}", at) for index in range(count)]),
             history,
         )
         return m.ComparisonWindow(window, sources, {source: m.RecordedCoverage((window,)) for source in m.EventSource},
@@ -2279,7 +2400,7 @@ class ComparisonTest(unittest.TestCase):
         missing_hash = "1234567890" + "a" * 30
         for part, commits in ((before, ("b" * 40, missing_hash)), (after, ("c" * 40, "d" * 40))):
             at = part.window.since + timedelta(hours=1)
-            part.sources.merges = [m.HanaMerge(commit, at) for commit in commits]
+            part.sources.merges = merge_history_fixture([m.HanaMerge(commit, at) for commit in commits])
             part.sources.receipts = tuple(m.parse_receipt(receipt_fixture(commit, at))
                                           for commit in commits if commit != missing_hash)
         before.coverage[m.EventSource.PHASES] = m.SourceUnavailable("phase history unavailable")
@@ -2716,7 +2837,7 @@ class ComparisonTest(unittest.TestCase):
         for window in (self.before_window, self.after_window):
             part = self.part(window, 0)
             at = window.since + timedelta(hours=1)
-            part.sources.merges = [m.HanaMerge(commit, at) for commit in ("b" * 40, "c" * 40)]
+            part.sources.merges = merge_history_fixture([m.HanaMerge(commit, at) for commit in ("b" * 40, "c" * 40)])
             part.sources.receipts = (m.parse_receipt(receipt_fixture("b" * 40, at)),)
             parts.append(part)
         row = self.rows(parts[0], parts[1])["Hana merge receipts / origin/init/catalyst"]
@@ -2971,22 +3092,135 @@ class ComparisonTest(unittest.TestCase):
             self.assertEqual(path.read_bytes(), original)
 
 
+class TrunkGitFixture:
+    ref: str = "refs/remotes/origin/init/catalyst"
+    root_time: str = "2026-10-12T12:00:00Z"
+
+    def __init__(self, repo: Path) -> None:
+        self.repo: Path = repo
+        _ = self.git(["init", "--initial-branch=main"])
+        _ = self.git(["config", "core.logAllRefUpdates", "always"])
+        _ = self.git(["commit", "--allow-empty", "-m", "start"])
+
+    def git(self, arguments: list[str], at: str = root_time) -> str:
+        env = dict(os.environ, GIT_AUTHOR_DATE=at, GIT_COMMITTER_DATE=at,
+                   GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.test",
+                   GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.test")
+        result = subprocess.run(["git", "-C", str(self.repo), "-c", "core.hooksPath=/dev/null",
+                                 "-c", "commit.gpgsign=false", *arguments],
+                                env=env, check=True, capture_output=True, text=True)
+        return result.stdout.strip()
+
+    def trunk_checkpoint(self) -> tuple[str, str, tuple[str, ...]]:
+        root = self.git(["rev-parse", "HEAD"])
+        _ = self.git(["update-ref", "-m", "initial trunk", self.ref, root])
+        _ = self.git(["checkout", "-b", "unit"])
+        _ = self.git(["commit", "--allow-empty", "-m", "unit work"], "2026-10-13T12:00:00Z")
+        _ = self.git(["checkout", "main"])
+        merges: list[str] = []
+        for index, at in enumerate(("2026-10-14T12:00:00Z", "2026-10-16T12:00:00Z")):
+            _ = self.git(["checkout", "-b", f"topic-{index}"], at)
+            _ = self.git(["commit", "--allow-empty", "-m", "topic work"], at)
+            _ = self.git(["checkout", "main"], at)
+            _ = self.git(["merge", "--no-ff", f"topic-{index}", "-m", "trunk merge"], at)
+            tip = self.git(["rev-parse", "HEAD"])
+            merges.append(tip)
+            _ = self.git(["update-ref", "-m", "advance trunk", self.ref, tip], at)
+        trunk = self.git(["rev-parse", "HEAD"])
+        _ = self.git(["checkout", "unit"])
+        _ = self.git(["merge", "--no-ff", "main", "-m", "unit checkpoint merges trunk"],
+                     "2026-10-21T12:00:00Z")
+        checkpoint = self.git(["rev-parse", "HEAD"])
+        return trunk, checkpoint, tuple(merges)
+
+
 class SourcesTest(unittest.TestCase):
+    def test_closed_window_keeps_trunk_merges_after_a_unit_checkpoint_fast_forward(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = TrunkGitFixture(Path(directory))
+            trunk, checkpoint, expected = fixture.trunk_checkpoint()
+            window = log_records.window_bounds("2026-10-13", "2026-10-19", log_records.required_time("2026-10-23"))
+            before = m.read_hana_merges(fixture.repo)
+            self.assertEqual({merge.commit for merge in before.merges if window.contains(merge.at)}, set(expected))
+            _ = fixture.git(["update-ref", "-m", "fast-forward to checkpoint", fixture.ref, checkpoint],
+                            "2026-10-21T13:00:00Z")
+            after = m.read_hana_merges(fixture.repo)
+            self.assertEqual({merge.commit for merge in after.merges if window.contains(merge.at)}, set(expected))
+            self.assertEqual([(merge.commit, merge.at) for merge in after.merges if window.contains(merge.at)],
+                             [(merge.commit, merge.at) for merge in before.merges if window.contains(merge.at)])
+            self.assertEqual((m.merge_flow(before, window)[0].value, m.merge_flow(after, window)[0].value), ("2", "2"))
+            self.assertIn(checkpoint, {merge.commit for merge in after.merges})
+            self.assertEqual(fixture.git(["rev-parse", fixture.ref]), checkpoint)
+            self.assertEqual(fixture.git(["rev-parse", "main"]), trunk)
+            receipts = [m.parse_receipt(receipt_fixture(commit, log_records.required_time("2026-10-17")))
+                        for commit in expected]
+            self.assertEqual(m.receipt_rows(receipts, after, window)[1].value, "2/2")
+            comparison = ComparisonTest()
+            before_part, after_part = comparison.part(window, 0), comparison.part(window, 0)
+            before_part.sources.merges, after_part.sources.merges = before, after
+            row = comparison.rows(before_part, after_part)["Hana merges / origin/init/catalyst"]
+            self.assertEqual(row.value, "before: 2.0/week; 7 covered days; after: 2.0/week; 7 covered days; "
+                             + "change: +0.0/week; n before=2; after=2")
+
+    def test_a_force_push_tip_is_skipped_without_losing_the_older_trunk_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = TrunkGitFixture(Path(directory))
+            trunk, checkpoint, expected = fixture.trunk_checkpoint()
+            _ = fixture.git(["checkout", "--orphan", "unrelated"])
+            _ = fixture.git(["commit", "--allow-empty", "-m", "unrelated root"], "2026-10-18T12:00:00Z")
+            _ = fixture.git(["checkout", "-b", "unrelated-topic"])
+            _ = fixture.git(["commit", "--allow-empty", "-m", "unrelated work"], "2026-10-19T12:00:00Z")
+            _ = fixture.git(["checkout", "unrelated"])
+            _ = fixture.git(["merge", "--no-ff", "unrelated-topic", "-m", "unrelated merge"], "2026-10-19T12:00:00Z")
+            unrelated = fixture.git(["rev-parse", "HEAD"])
+            for tip, message in ((unrelated, "force push"), (checkpoint, "restore trunk at checkpoint")):
+                _ = fixture.git(["update-ref", "-m", message, fixture.ref, tip], "2026-10-22T12:00:00Z")
+            merges = m.read_hana_merges(fixture.repo)
+            self.assertEqual({merge.commit for merge in merges.merges}, {*expected, checkpoint})
+            self.assertNotIn(unrelated, {merge.commit for merge in merges.merges})
+            self.assertIn(trunk, {merge.commit for merge in merges.merges})
+
+    def test_merge_source_counts_distinct_recorded_tips_and_names_the_oldest_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = TrunkGitFixture(Path(directory))
+            trunk, checkpoint, expected = fixture.trunk_checkpoint()
+            for tip in (checkpoint, trunk, checkpoint):
+                _ = fixture.git(["update-ref", "-m", "repeat recorded tip", fixture.ref, tip],
+                                "2026-10-22T12:00:00Z")
+            merges = m.read_hana_merges(fixture.repo)
+            window = log_records.window_bounds("2026-10-13", "2026-10-22", log_records.required_time("2026-10-23"))
+            rows = m.merge_flow(merges, window)
+            self.assertEqual({merge.commit for merge in merges.merges}, {*expected, checkpoint})
+            limit = ("trunk path from 4 recorded tips back to 2026-10-12T12:00:00+00:00; "
+                     + "first parent before that; git expires reflog entries after 90 days")
+            self.assertTrue(all(limit in row.source for row in rows))
+            output = log_records.blocks("Hana merges", rows)
+            displayed = read_report_blocks(output)
+            self.assertEqual([(row.value, row.n, row.window, row.source) for row in displayed],
+                             [(row.value, row.n, row.window, row.source) for row in rows])
+            self.assertEqual(phone_overflow_lines(output), [])
+
+    def test_no_reflog_keeps_first_parent_merges_and_reports_the_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = TrunkGitFixture(Path(directory))
+            trunk, checkpoint, expected = fixture.trunk_checkpoint()
+            _ = fixture.git(["update-ref", "-m", "fast-forward to checkpoint", fixture.ref, checkpoint])
+            (fixture.repo / ".git/logs" / fixture.ref).unlink()
+            merges = m.read_hana_merges(fixture.repo)
+            self.assertEqual({merge.commit for merge in merges.merges}, {checkpoint})
+            window = log_records.window_bounds("2026-10-13", "2026-10-22", log_records.required_time("2026-10-23"))
+            row = m.merge_flow(merges, window)[0]
+            self.assertEqual((row.value, row.n), ("1", 1))
+            self.assertIn("no recorded tips; first parent only", row.source)
+            self.assertEqual(fixture.git(["rev-parse", "main"]), trunk)
+            self.assertTrue(set(expected).isdisjoint(merge.commit for merge in merges.merges))
+
     def test_merge_count_uses_fixture_ref_commit_dates_and_exact_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
 
-            def git(arguments: list[str], at: str) -> str:
-                env = dict(os.environ, GIT_AUTHOR_DATE=at, GIT_COMMITTER_DATE=at,
-                           GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.test",
-                           GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.test")
-                result = subprocess.run(["git", "-C", str(repo), "-c", "core.hooksPath=/dev/null",
-                                         "-c", "commit.gpgsign=false", *arguments],
-                                        env=env, check=True, capture_output=True, text=True)
-                return result.stdout.strip()
-
-            _ = git(["init", "--initial-branch=main"], "2026-10-12T12:00:00Z")
-            _ = git(["commit", "--allow-empty", "-m", "start"], "2026-10-12T12:00:00Z")
+            fixture = TrunkGitFixture(repo)
+            git = fixture.git
             for index, at in enumerate(("2026-10-13T21:23:59Z", "2026-10-13T21:24:00Z",
                                         "2026-10-15T12:00:00Z", "2026-10-20T21:24:00Z")):
                 _ = git(["checkout", "-b", f"topic-{index}"], at)
@@ -3009,9 +3243,11 @@ class SourcesTest(unittest.TestCase):
             self.assertEqual(days["Hana merges / 2026-10-15"], "1")
             self.assertEqual(days["Hana merges / 2026-10-20"], "0")
             self.assertEqual(sum(row.n for row in rows[1:]), rows[0].n)
-            self.assertIn("--first-parent", rows[0].source)
+            self.assertEqual(rows[0].source, "git origin/init/catalyst merge commits; local ref; commit time; no fetch; "
+                             + "trunk path from 1 recorded tips back to 2026-10-20T21:24:00+00:00; "
+                             + "first parent before that; git expires reflog entries after 90 days")
             self.assertEqual(git(["rev-parse", "HEAD"], "2026-10-20T21:24:00Z"), before)
-            self.assertEqual(m.merge_flow([], window)[0].value, "0")
+            self.assertEqual(m.merge_flow(merge_history_fixture([]), window)[0].value, "0")
             self.assertEqual(m.merge_flow(m.MergeHistoryNotRecorded.MISSING, window)[0].value, "not recorded")
 
     def test_running_phase_uses_newest_run_and_removes_finished_phases(self) -> None:

@@ -1380,9 +1380,11 @@ class HerdrTests(unittest.TestCase):
         isolated = self.root / "isolated/scripts/herdr"
         isolated.mkdir(parents=True)
         _ = shutil.copy2(Path(herdr.__file__), isolated / "herdr.py")
+        _ = shutil.copy2(Path(herdr.__file__).with_name("place.py"), isolated / "place.py")
         library = isolated.parent / "lib"
         library.mkdir()
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
+        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/process_failure.py", library / "process_failure.py")
         probe = (
             "import sys; sys.path.insert(0,sys.argv[1]); import herdr; "
             "herdr._PLATFORM='linux'; print(herdr.attached_clients('fixture'))"
@@ -1714,7 +1716,7 @@ class HerdrTests(unittest.TestCase):
             herdr.HerdrProcess(71, herdr.HerdrPlace("writing", "w1:p1"), {"SHOWRUNNER_UNIT": "prod", "SHOWRUNNER_UNIT_ID": "unit"}, "zsh", "/work folder"),
             herdr.HerdrProcess(72, herdr.HerdrPlace("writing", "w1:p1"), {}, "claude", "/work folder"),
             herdr.HerdrProcess(76, herdr.HerdrPlace("writing", "w1:p2"), {}, "claude",
-                               herdr.UnreadableCwd("process 76 cwd: gone"))])
+                               herdr.UnreadableCwd("process 76 cwd: stderr: gone"))])
         self.assertEqual(herdr.herdr_place_of(72), herdr.HerdrPlace("writing", "w1:p1"))
         self.assertEqual(herdr.herdr_place_of(74), herdr.NotInHerdr())
         for pid in (73, 77):
@@ -1868,38 +1870,67 @@ class HerdrTests(unittest.TestCase):
         with self.assertRaises(herdr.HerdrFailure):
             _ = self.herdr.panes()
 
-    def test_session_of_keeps_the_conversation_workspace_and_pane_after_claude_exits(self) -> None:
+    def test_session_of_keeps_the_terminal_but_clears_the_conversation_after_claude_exits(self) -> None:
         pane, session_id = "w1:p2", "71356b6b-bf7b-4996-b27e-49da9f90b719"
         start = self.configure_tab_start(pane, "alpha", session_id)
         self.configure_herdr(["workspace", "list"], json.dumps({"result": {"workspaces": [
             {"workspace_id": "w1", "label": "production"}]}}))
-        running = self.root / "claude-running"
-        self.responses[" ".join(["--session", "fixture", *start])] = {
-            "stdout": "{}", "code": 0, "write_files": {str(running): "4242"}}
-        self.responses["--session fixture agent stop alpha"] = {
-            "stdout": "{}", "code": 0, "require_paths": [str(running)], "remove_paths": [str(running)]}
-        self.configure([], "")
+        marks = {"HERDR_SESSION": "fixture", "HERDR_PANE_ID": pane}
+        _ = self.process(4241, 1, ["zsh"], marks)
+        running = self.process(4242, 4241, ["claude"], marks)
         client = self.herdr
         self.assertEqual(client.session_of("alpha"), herdr.TabSession(pane, "alpha", "production", None))
         _ = client.run(*start)
         self.assertTrue(running.exists())
         expected = herdr.TabSession(pane, "alpha", "production", session_id)
         self.assertEqual(client.session_of("alpha"), expected)
-        _ = client.run("agent", "stop", "alpha")
+        terminal = client.panes()[0].get("terminal_id", "")
+        self.assertTrue(terminal)
+        shutil.rmtree(running)
         self.assertFalse(running.exists())
-        self.assertEqual(client.session_of("alpha"), expected)
+        self.assertEqual(client.session_of("alpha"), herdr.TabSession(pane, "alpha", "production", None))
         raw = herdr.json_object(herdr.json_items(client.result("pane", "list")["panes"], "panes")[0], "pane")
         self.assertEqual(raw["workspace_id"], "w1")
-        self.assertEqual(raw["agent_session"], {"agent": "claude", "kind": "id",
-                                               "source": "herdr:claude", "value": session_id})
+        self.assertIsNone(raw["agent_session"])
+        self.assertEqual(raw["terminal_id"], terminal)
+
+    def test_moved_terminal_clears_its_conversation_when_the_agent_with_old_pane_marks_exits(self) -> None:
+        pane, session_id = "w1:p2", "71356b6b-bf7b-4996-b27e-49da9f90b719"
+        start = self.configure_tab_start(pane, "alpha", session_id)
+        marks = {"HERDR_SESSION": "fixture", "HERDR_PANE_ID": pane}
+        shell = self.process(4241, 1, ["zsh"], marks)
+        agent = self.process(4242, 4241, ["claude"], marks)
+        _ = self.herdr.run(*start)
+        before = self.herdr.panes()[0]
+        self.assertEqual(before["session_id"], session_id)
+        terminal = before.get("terminal_id", "")
+        self.assertTrue(terminal)
+        self.configure_herdr(["pane", "move", pane, "--new-tab", "--workspace", "w2"], json.dumps({"result": {
+            "move_result": {"created_tab": {"tab_id": "w2:t7"}, "pane": {"pane_id": "w2:p9"}}}}))
+        moved = self.herdr.move_pane_to_tab(pane, "w2", "alpha")
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": moved.pane, "label": "alpha"}]}}))
+        after_move = self.herdr.panes()[0]
+        self.assertEqual(after_move["session_id"], session_id)
+        self.assertEqual(after_move.get("terminal_id"), terminal)
+        inherited = (shell / "environ").read_bytes()
+        shutil.rmtree(agent)
+        after_exit = self.herdr.panes()[0]
+        self.assertEqual(after_exit["pane_id"], moved.pane)
+        self.assertIsNone(after_exit["session_id"])
+        self.assertEqual(after_exit.get("terminal_id"), terminal)
+        self.assertEqual((shell / "environ").read_bytes(), inherited)
 
     def test_a_failed_agent_start_does_not_supply_a_pane_conversation(self) -> None:
         start = self.configure_tab_start("w1:p2", "alpha", "71356b6b-bf7b-4996-b27e-49da9f90b719")
+        self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
+            {"pane_id": "w1:p2", "label": "alpha", "terminal_id": "terminal-alpha"}]}}))
         self.configure_herdr(start, code=1, stderr="agent failed to start")
         with self.assertRaisesRegex(herdr.HerdrFailure, "agent failed to start"):
             _ = self.herdr.run(*start)
         self.assertEqual(self.herdr.panes(), [{"pane_id": "w1:p2", "label": "alpha",
-                                               "workspace_id": "w1", "session_id": None}])
+                                               "workspace_id": "w1", "session_id": None,
+                                               "terminal_id": "terminal-alpha"}])
 
     def test_an_agent_start_with_a_missing_required_path_does_not_supply_a_conversation(self) -> None:
         start = self.configure_tab_start("w1:p2", "alpha", "71356b6b-bf7b-4996-b27e-49da9f90b719")
@@ -1960,10 +1991,12 @@ class HerdrTests(unittest.TestCase):
     def test_panes_reads_session_values_and_allows_absent_conversations(self) -> None:
         sessions: tuple[object, ...] = (None, {}, {"value": None}, {"value": "sid-alpha"})
         self.configure_herdr(["pane", "list"], json.dumps({"result": {"panes": [
-            {"pane_id": f"w1:p{index}", "workspace_id": "w2", "label": "alpha", "agent_session": session}
+            {"pane_id": f"w1:p{index}", "workspace_id": "w2", "label": "alpha", "agent_session": session,
+             "terminal_id": f"terminal-{index}"}
             for index, session in enumerate(sessions)]}}))
         self.assertEqual(self.herdr.panes(), [
-            {"pane_id": f"w1:p{index}", "workspace_id": "w2", "label": "alpha", "session_id": session_id}
+            {"pane_id": f"w1:p{index}", "workspace_id": "w2", "label": "alpha", "session_id": session_id,
+             "terminal_id": f"terminal-{index}"}
             for index, session_id in enumerate((None, None, None, "sid-alpha"))])
 
     def test_panes_rejects_invalid_workspace_ids(self) -> None:
@@ -3022,6 +3055,7 @@ class HerdrTests(unittest.TestCase):
             + '        import time\n'
             + '        time.sleep(0.3)\n'
             + '    responses = cast(',
+            1,
         )
         _ = self.fake.write_text(source)
         self.configure_herdr(["pane", "process-info", "--pane", "pane-1"], code=1, stderr="unreadable")
@@ -3539,6 +3573,7 @@ class HerdrTests(unittest.TestCase):
         })
         _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex"})
         import unit_lookup as lookup
+        import unit_marks
 
         def current_slug(slug: str) -> str:
             return slug
@@ -3549,7 +3584,7 @@ class HerdrTests(unittest.TestCase):
               }]),
               patch.object(lookup, "_claudes", return_value=(
                   {12: live}, lookup.UnreadAt({}, lookup.RecordsRead()))),
-              patch.object(lookup, "_lookup_slug", side_effect=current_slug),
+              patch.object(unit_marks, "lookup_slug", side_effect=current_slug),
               patch.object(roster, "_process_account", return_value=roster.AccountLabel("codex2")),
               patch.object(herdr, "_process_sessions", wraps=PROCESS_SESSIONS) as scans):
             def read_callers() -> tuple[object, object, object]:

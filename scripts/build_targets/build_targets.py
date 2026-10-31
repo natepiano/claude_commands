@@ -330,13 +330,30 @@ def wait_diagnostic(reason: str, caller: str = "") -> str:
     return f"{speaker(caller)}: natedev's hold state cannot be read ({display_field(reason)}); not starting."
 
 
+@dataclass(frozen=True)
+class NoBlockingHold:
+    """No hold in force prevents this session from starting."""
+
+
+def hold_waited_on(holds: build_hold.NatedevHolds,
+                   owner: build_hold.OwningSession | build_hold.NoOwningSession,
+                   directory: Path) -> build_hold.Holder | NoBlockingHold:
+    """Choose the oldest hold in force that the caller does not own."""
+    own_key = ""
+    if isinstance(owner, build_hold.OwningSession):
+        try:
+            own_key = build_hold.holder_path(directory, owner.session_id).name
+        except ValueError:
+            pass
+    for holder in holds.in_force:
+        if holder.key != own_key:
+            return holder
+    return NoBlockingHold()
+
+
 def holds_only_own(owner: build_hold.OwningSession, directory: Path) -> bool:
-    try:
-        holds = build_hold.natedev_holds(directory)
-        key = build_hold.holder_path(directory, owner.session_id).name
-    except ValueError:
-        return False
-    return bool(holds.in_force) and all(holder.key == key for holder in holds.in_force)
+    holds = build_hold.natedev_holds(directory)
+    return bool(holds.in_force) and isinstance(hold_waited_on(holds, owner, directory), NoBlockingHold)
 
 
 def caller_holds_only_own() -> bool:
@@ -392,16 +409,20 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
             if isinstance(state, StateUnreadable):
                 print(wait_diagnostic(state.reason, caller), file=sys.stderr, flush=True)
                 return 12
-            holds = build_hold.natedev_holds(build_hold.holder_directory()).in_force
-            if not holds or caller_holds_only_own():
+            directory = build_hold.holder_directory()
+            holds = build_hold.natedev_holds(directory)
+            if not holds.in_force:
+                return 0
+            blocking = hold_waited_on(holds, build_hold.owning_session(), directory)
+            if isinstance(blocking, NoBlockingHold):
                 return 0
             if not isinstance(state, Held):
                 print(wait_diagnostic("holder file exists; target state disagrees", caller), file=sys.stderr, flush=True)
                 return 12
             if not announced:
                 announced = True
-                print(f"{name}: natedev is held by {display_field(state.holder)} for "
-                      + f"{display_field(state.reason)}{waiting}",
+                print(f"{name}: natedev is held by {display_field(blocking.name)} for "
+                      + f"{display_field(blocking.purpose)}{waiting}",
                       file=sys.stderr, flush=True)
             # A held natedev cannot start this step, so a free Mac wins and the
             # call can leave without an allocation. As in memory_gate.sh, the
@@ -411,8 +432,8 @@ def command_wait_local(call_id: str, *, pid: int = 0, leave_hook: str = "", call
                 print(f"{name}: the Mac is free: leaving natedev's hold wait to run there.",
                       file=sys.stderr, flush=True)
                 return LEFT_QUEUE_STATUS
-            if not escalated and (wait_clock() - state.since).total_seconds() >= escalation:
-                print(f"{name}: natedev has been held for 2 h by {display_field(state.holder)}; ask them.",
+            if not escalated and (wait_clock() - blocking.since).total_seconds() >= escalation:
+                print(f"{name}: natedev has been held for 2 h by {display_field(blocking.name)}; ask them.",
                       file=sys.stderr, flush=True)
                 escalated = True
             wait_sleep(interval)
@@ -467,23 +488,27 @@ def command_check_local(caller: str = "") -> int:
         if isinstance(state, StateUnreadable):
             print(wait_diagnostic(state.reason, "" if caller == "verify" else caller), file=output)
             return 12
-        holds = build_hold.natedev_holds(build_hold.holder_directory()).in_force
-        if not holds or caller_holds_only_own():
+        directory = build_hold.holder_directory()
+        holds = build_hold.natedev_holds(directory)
+        if not holds.in_force:
+            return 0
+        owner = build_hold.owning_session()
+        blocking = hold_waited_on(holds, owner, directory)
+        if isinstance(blocking, NoBlockingHold):
             return 0
         if not isinstance(state, Held):
             print(wait_diagnostic("holder file exists; target state disagrees", caller), file=output)
             return 12
         if caller:
             label = speaker("" if caller == "verify" else caller)
-            print(f"{label}: natedev is held by {display_field(state.holder)} for {display_field(state.reason)}.", file=output)
+            print(f"{label}: natedev is held by {display_field(blocking.name)} for {display_field(blocking.purpose)}.", file=output)
             escalation = float(os.environ.get("BUILD_TARGETS_ESCALATE_S", "7200"))
-            if (wait_clock() - state.since).total_seconds() >= escalation:
-                print(f"{label}: natedev has been held for 2 h by {display_field(state.holder)}; ask them.", file=output)
+            if (wait_clock() - blocking.since).total_seconds() >= escalation:
+                print(f"{label}: natedev has been held for 2 h by {display_field(blocking.name)}; ask them.", file=output)
         else:
-            owner = build_hold.owning_session()
             if isinstance(owner, build_hold.OwningSession):
                 _ = build_hold.register_wait(owner.session_id)
-            print(f"natedev is held by {display_field(state.holder)} for {display_field(state.reason)}; launch after the release.")
+            print(f"natedev is held by {display_field(blocking.name)} for {display_field(blocking.purpose)}; launch after the release.")
         return 10
     except (ConfigError, OSError, build_hold.ReleaseRecordReadError) as error:
         print(wait_diagnostic(str(error), "" if caller == "verify" else caller), file=sys.stderr if caller else sys.stdout)

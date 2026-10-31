@@ -5,8 +5,10 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 import io
+import fcntl
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 import time
@@ -14,11 +16,12 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
-from scripts.build_queue import build_queue, build_why, head_facts
+from scripts.build_queue import build_why, head_facts
+from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_head_facts import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
 from scripts.lint import memory_admit as gate
 from scripts.lib.user_zone import user_zone
-from scripts.message import roster
+from scripts.message import roster, unit_labels
 
 GIB = gate.GIB
 NOW = datetime(2026, 10, 30, 1, 51, tzinfo=UTC).timestamp()
@@ -76,9 +79,10 @@ class BuildWhyTests(unittest.TestCase):
         for number in range(16):
             _ = self.waiter(600 + number, f"younger-{number}", number + 1, 20 - number)
         entries = [self.entry(name) for name in ("widget", "demo", "organon", "frame-cost", "inspectors-fix")]
-        _ = self.enterContext(mock.patch.object(build_queue, "read_roster", return_value=roster.Roster(entries, [])))
+        labels = roster.unit_labels(entries)
+        _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value=labels))
         _ = self.enterContext(mock.patch.object(roster, "roster", return_value=roster.Roster(entries, [])))
-        _ = self.enterContext(mock.patch.object(roster, "unit_labels_for", return_value=roster.unit_labels(entries)))
+        _ = self.enterContext(mock.patch.object(roster, "unit_labels_for", return_value=labels))
 
     def entry(self, name: str) -> roster.RosterEntry:
         return roster.RosterEntry(
@@ -90,16 +94,9 @@ class BuildWhyTests(unittest.TestCase):
             session=roster.NoClaudeSession(),
         )
 
-    def process(self, pid: int, used: float = 0) -> None:
-        directory = self.proc / str(pid)
-        directory.mkdir()
-        fields = ["S", "1", *(["0"] * 17), str(pid)]
-        _ = (directory / "stat").write_text(f"{pid} (verify) {' '.join(fields)}\n")
-        _ = (directory / "status").write_text(f"VmRSS: {gib(used) // 1024} kB\nVmSwap: 0 kB\n")
-
     def running(self, pid: int, name: str, step: str, need: float, used: float,
                 age: int, *, peak: float = 0) -> Path:
-        self.process(pid, used)
+        write_process(self.proc, pid, gib(used))
         folder = "/tmp/p34-merge" if name == "widget" else f"/tmp/{name}"
         row: dict[str, object] = {
             "pid": pid, "start_time": str(pid), "need": gib(need), "repo": "hana", "step": step,
@@ -115,7 +112,7 @@ class BuildWhyTests(unittest.TestCase):
         return path
 
     def waiter(self, pid: int, name: str, need: float, minutes: int) -> Path:
-        self.process(pid)
+        write_process(self.proc, pid)
         row: dict[str, object] = {
             "pid": pid, "start_time": str(pid), "need": gib(need), "since": NOW - minutes * 60,
             "session_id": f"id-{name}", "session_name": name, "step": "nextest", "folder": f"/tmp/{name}",
@@ -159,6 +156,23 @@ class BuildWhyTests(unittest.TestCase):
         self.assertNotIn("still leaves", final)
         result = gate.head_after_steps_end(gate.explain_queue(), (0,))
         self.assertIsInstance(result, gate.HeadAdmitsAfterEnd)
+
+    def test_override_free_memory_terms_add_up_to_its_printed_threshold(self) -> None:
+        self.reset_running(available=23, need=12)
+        _ = self.running(800, "growing", "clippy", 20, 1, 30)
+        starts = {pid: identity.start for pid, identity in gate.process_table(self.proc).items()}
+        with mock.patch.object(gate, "showrunner_is_registered", return_value=True), \
+                mock.patch.object(gate, "process_start_time", side_effect=starts.get), \
+                mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "showrunner-id", "CODEX_THREAD_ID": ""}):
+            _ = gate.admit_head("arithmetic regression")
+        output = self.output()
+        free = self.line(output, "Free memory:")
+        match = re.search(r"need ([0-9.]+) \+ earlyoom ([0-9.]+) \+ promise not yet used ([0-9.]+) = ([0-9.]+) GiB: pass", free)
+        self.assertIsNotNone(match, free)
+        if match is not None:
+            need, reserve, growth, threshold = (float(value) for value in match.groups())
+            self.assertEqual((need, reserve, threshold), (12.0, 3.0, 15.0))
+            self.assertEqual(need + reserve + growth, threshold, free)
 
     def test_release_advice_names_only_the_smaller_step_that_frees_enough_memory(self) -> None:
         self.reset_running(available=3, need=8)
@@ -284,7 +298,7 @@ class BuildWhyTests(unittest.TestCase):
         self.assertIn("64.25", output)
         self.assertIn("32", output)
         self.assertRegex(output, r"Total:.*charged\s+18\.1 GiB.*using\s+12\.4 GiB")
-        self.assertRegex(output, r"(?i)strict until 21:59.*younger steps wait")
+        self.assertRegex(output, r"younger steps may use 9\.2 GiB of the budget until 21:59.*8 min 0 s left")
         self.assertRegex(output, r"16 waiting behind it;\s*2 would fit now")
         self.assertRegex(output, r"needs from 1\.0 to 16\.0 GiB.*oldest wait 20 min")
         final = self.line(output, "Waiting because:").lower()
@@ -394,6 +408,67 @@ class BuildWhyTests(unittest.TestCase):
                 for word in words:
                     self.assertIn(word, changed)
 
+    def test_shape_need_text_names_each_tier_and_its_run_count(self) -> None:
+        for basis, words in (
+            (gate.ShapeP90(12), ("same-shape", "p90", "12 runs")),
+            (gate.ShapeLargest(3), ("same-shape", "largest", "3 runs")),
+            (gate.ShapeFallback(), ("same-profile", "fallback")),
+        ):
+            with self.subTest(basis=basis):
+                source = gate.RecordedNeed("shape", 12 if isinstance(basis, gate.ShapeP90) else 3,
+                                           14, "full", "", (), gate.WidthNotRecorded(), basis)
+                text = build_why.need_text(source)
+                for word in (*words, "14 days"):
+                    self.assertIn(word, text)
+                if not isinstance(basis, gate.ShapeP90):
+                    self.assertNotIn("p90", text)
+
+    def test_shape_need_text_names_floor_release_factor_and_budget_cap(self) -> None:
+        ended_at = "2026-10-29T09:09:52Z"
+        floor = gate.FailedPeakFloor(gib(15.76), ended_at)
+        for tier in (
+            gate.ShapeP90(10, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(gib(24))),
+            gate.ShapeLargest(2, floor, gate.ReleaseHeadroom(), gate.CappedAtBudget(gib(24))),
+            gate.ShapeFallback(gate.CappedAtBudget(gib(24))),
+        ):
+            with self.subTest(tier=tier):
+                text = build_why.need_text(gate.RecordedNeed(
+                    "shape", 10, 14, "full", "", (), gate.WidthNotRecorded(), tier))
+                words = (("cap", "21.0 GiB", "24.0 GiB", "no headroom factor")
+                         if isinstance(tier, gate.ShapeFallback) else
+                         ("floor", "15.8 GiB", "05:09", "1.314", "cap", "21.0 GiB", "24.0 GiB"))
+                for word in words:
+                    self.assertIn(word, text)
+
+    def test_fallback_need_text_names_its_base_and_cap_without_a_floor_or_factor(self) -> None:
+        basis = gate.ShapeFallback(cap=gate.CappedAtBudget(gib(24)))
+        source = gate.RecordedNeed("shape", 0, 14, "full", "", (), gate.WidthNotRecorded(), basis)
+        self.assertEqual(build_why.need_text(source),
+                         "same-shape fallback: no runs; heavier of fallback and same-profile builds, last 14 days"
+                         + "; no headroom factor; capped at 21.0 GiB (uncapped 24.0 GiB)")
+
+    def test_lifetime_charge_text_says_the_promise_holds_until_the_step_ends(self) -> None:
+        text = build_why.charge_text(gate.LifetimePromise(16 * GIB), user_zone())
+        self.assertIn("promise", text)
+        self.assertIn("until the step ends", text)
+        self.assertNotIn("first 2 min", text)
+        self.assertEqual(build_why.charge_text(gate.RampPromise(16 * GIB), user_zone()),
+                         "ramp promise: first 2 min after admission")
+
+    def test_failed_floor_clause_uses_the_users_local_clock(self) -> None:
+        basis = gate.ShapeLargest(1, gate.FailedPeakFloor(gib(15.76), "2026-10-29T02:09:52Z"))
+        source = gate.RecordedNeed("shape", 1, 14, "full", "", (), gate.WidthNotRecorded(), basis)
+        with mock.patch.dict(os.environ, {"USER_ZONE": "America/New_York"}):
+            text = build_why.need_text(source)
+        self.assertEqual(text.split("; ")[1], "failed-build floor 15.8 GiB from 22:09")
+
+    def test_dev_shape_names_its_measured_promise_factor(self) -> None:
+        source = gate.RecordedNeed("shape", 2, 14, "full", "", (), gate.WidthNotRecorded(),
+                                   gate.ShapeLargest(2, factor=gate.DevHeadroom()))
+        text = build_why.need_text(source)
+        self.assertEqual(text.split("; ")[2], "dev promise factor × 4.203")
+        self.assertNotIn("release headroom", text)
+
     def test_old_waiter_without_need_source_is_reported_and_not_rewritten(self) -> None:
         row = cast(dict[str, object], json.loads(self.head_path.read_text()))
         for key in ("need_source", "need_runs", "test_threads"):
@@ -479,7 +554,7 @@ class BuildWhyTests(unittest.TestCase):
                           bump_line(NOW - 2, actor="actor-two", session="bumped-two")])
         with mock.patch.object(roster, "unit_labels_for", return_value={}) as labels, \
              mock.patch.object(roster, "roster", side_effect=AssertionError("no full roster")), \
-             mock.patch.object(gate, "locked_queue_read", wraps=gate.locked_queue_read) as reading, \
+             mock.patch.object(gate, "queue_read", wraps=gate.queue_read) as reading, \
              mock.patch.object(head_facts, "read_head_facts", wraps=head_facts.read_head_facts) as facts:
             output = self.output()
         labels.assert_called_once()
@@ -499,10 +574,18 @@ class BuildWhyTests(unittest.TestCase):
         self.assertNotIn("the admission state could not be read", output)
         self.assertIn("First in line:", output)
 
+    def test_order_rule_names_no_room_when_head_uses_all_the_budget(self) -> None:
+        for need in (21, 22):
+            with self.subTest(need=need):
+                self.change_head(need=need * GIB)
+                line = self.line(self.output(), "Order rule:")
+                self.assertIn("younger steps wait until 21:59", line)
+                self.assertNotIn("may use", line)
+
     def test_backfill_and_position_bump_report_the_admission_deadlines(self) -> None:
         self.change_head(priority_since=NOW - 630, bump_order=-1)
         output = self.output()
-        self.assertRegex(output, r"(?i)backfill until 21:52.*younger steps that fit may start")
+        self.assertRegex(output, r"younger steps may start until 21:52.*1 min 30 s left")
         self.assertIn("bumped by position at 21:40", output)
 
     def test_pressure_hold_and_recovery_spacing_are_explicit(self) -> None:
@@ -518,11 +601,30 @@ class BuildWhyTests(unittest.TestCase):
         self.assertIn("recovery", recovery)
         self.assertIn("21:51", recovery)
 
+    def test_missing_or_corrupt_snapshot_with_held_lock_answers_busy_in_under_a_second(self) -> None:
+        for content in (None, "{"):
+            with self.subTest(content=content):
+                path = self.directory / "queue.json"
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _ = path.write_text(content)
+                output, errors = io.StringIO(), io.StringIO()
+                with (self.directory / "lock").open("a+") as lock, \
+                     redirect_stdout(output), redirect_stderr(errors), mock.patch("sys.argv", ["build_why.py"]):
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    started = time.perf_counter()
+                    status = build_why.main()
+                    elapsed = time.perf_counter() - started
+                self.assertLess(elapsed, 1.0)
+                self.assertEqual((status, output.getvalue(), errors.getvalue()),
+                                 (0, "queue busy; try again\n", ""))
+
     def test_read_failure_is_one_fixed_line_with_exit_two(self) -> None:
         for error in (OSError("cannot read ledger"), ValueError("invalid ledger"), TimeoutError("lock busy")):
             with self.subTest(error=type(error).__name__):
                 output, errors = io.StringIO(), io.StringIO()
-                with mock.patch.object(gate, "locked_queue_read", side_effect=error), \
+                with mock.patch.object(gate, "queue_read", side_effect=error), \
                      redirect_stdout(output), redirect_stderr(errors), mock.patch("sys.argv", ["build_why.py"]):
                     result = build_why.main()
                 self.assertEqual(result, 2)

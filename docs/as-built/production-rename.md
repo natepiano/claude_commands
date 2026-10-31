@@ -203,29 +203,15 @@ showrunner's own checkout, a linked worktree, to a new path. The default path
 is the checkout's basename with a Formerly name replaced by the slug
 (`claude-build-followups-trunk` becomes `claude-natedev-trunk`); a basename
 with no Formerly name in it needs the path argument. The showrunner cannot
-move the folder it runs in, so the move happens in the shutdown conductor
-between its stop and its launch:
-
-1. The first run refuses an existing destination, a main worktree, and a
-   showrunner that already has a shutdown record. It then runs
-   `shutdown.py down --only <session> --restart --here --checkout-move OLD NEW`
-   for the session the update timer's `TARGET` names, and refuses when the
-   record it made does not carry `checkout_move`.
-2. The conductor's launch (`restart.move_checkout`) calls
-   `rename_checkout.move(old, new)`: `git worktree move` and `git worktree
-   repair`, the Claude project folder and each account's folder trust, every
-   timer's `CHECK` and `RUN` line, each child doc's Parent production line,
-   herdr pane `cwd` keys, and a commit on the merge branch of the doc's
-   Showrunner checkout line. The git move refuses processes still inside the
-   folder before it moves anything; every later part repeats safely.
-3. A run after the restart finds the doc naming the new path. It commits the
-   Showrunner checkout line if the callback could not, then pushes the merge
-   branch when its tip is that commit.
-
-When the callback fails part way, the showrunner still launches: in the new
-folder when the git move happened, else in the old one (see
-`shutdown-and-restart.md`). Only the doc line states where the checkout is;
-logs and design docs that name the old path are history and keep it.
+move the folder it runs in. `rename_checkout.checkout` calls `stop_resume.stop`,
+moves the checkout with `rename_checkout.move`, then calls `stop_resume.resume`.
+An existing destination, a main worktree, or a pre-existing shutdown record refuses.
+The move runs `git worktree move` and `git worktree repair`. It updates the
+Claude project folder, folder trust, timer commands, child doc parent lines,
+herdr pane cwd keys, and the Showrunner checkout line. Processes still inside
+the folder block the git move. A failed step reports its error; a rerun finishes
+idempotent updates. A later run pushes the doc commit. Only the doc line states
+where the checkout is; logs and design docs keep historical paths.
 
 ## Journal and recovery
 

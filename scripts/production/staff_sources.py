@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -18,90 +17,20 @@ import production_units  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import unit_names  # noqa: E402
 from scripts.production import staff  # noqa: E402
-from scripts.shutdown import pane_record  # noqa: E402
-import herdr  # noqa: E402
 
 
-@dataclass(frozen=True)
-class ShowrunnerMember:
-    slug: str
-
-
-@dataclass(frozen=True)
-class UnitMember:
-    slug: str
-    unit: str
-
-
-MemberSelector = ShowrunnerMember | UnitMember
-
-
-@dataclass(frozen=True)
-class MemberFound:
-    row: staff.StaffRow
-
-
-@dataclass(frozen=True)
-class NoSuchMember:
-    selector: MemberSelector
-
-
-@dataclass(frozen=True)
-class _MemberSources:
-    productions: dict[str, showrunners.ShowrunnerSource]
-    launches: tuple[pane_record.PaneLaunch, ...]
-
-    def member(self, selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
-        source = self.productions.get(selector.slug)
-        if isinstance(selector, ShowrunnerMember):
-            if source is None:
-                return NoSuchMember(selector)
-            launches = [launch for launch in self.launches
-                        if f"session:{launch['session_id']}" == source.timer.target]
-        else:
-            launches = [launch for launch in self.launches
-                        if launch["environment"].get("SHOWRUNNER_UNIT") == selector.slug
-                        and launch["environment"].get("SHOWRUNNER_UNIT_ID") == selector.unit]
-        if launches:
-            newest = max(launches, key=lambda launch: launch["written_at"])
-            staff_id = newest["environment"].get("STAFF_ID", "")
-            if staff_id:
-                row = record.by_id(staff.StaffId(staff_id))
-                kind = "showrunner" if isinstance(selector, ShowrunnerMember) else "unit"
-                return MemberFound(row) if row is not None and row.kind == kind else NoSuchMember(selector)
-        if isinstance(selector, ShowrunnerMember):
-            assert source is not None
-            row = record.by_path(showrunners.space_from_text(selector.slug, source.document))
-        else:
-            parent = self.member(ShowrunnerMember(selector.slug), record)
-            if isinstance(parent, NoSuchMember):
-                return NoSuchMember(selector)
-            row = record.by_path(f"{parent.row.name}/{unit_names.name(selector.unit)}")
-        return MemberFound(row) if row is not None else NoSuchMember(selector)
-
-    def showrunner_members(self, record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
-        found: dict[str, staff.StaffRow] = {}
-        for slug in self.productions:
-            selected = self.member(ShowrunnerMember(slug), record)
-            if isinstance(selected, MemberFound):
-                found[slug] = selected.row
-        return found
-
-
-def _member_sources() -> _MemberSources:
-    session = herdr.shared_session()
-    try:
-        launches = pane_record.read_strict(session)
-    except OSError as error:
-        raise staff.StaffUnreadable(f"{pane_record.record_path(session)}: {error}") from error
-    except ValueError as error:
-        raise staff.StaffUnreadable(str(error)) from error
-    sources = showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.SKIP)
-    return _MemberSources({source.timer.slug: source for source in sources}, tuple(launches.values()))
+# Matchers live below production_units, so lower readers use the same join without an import cycle.
+from unit_lookup import (  # noqa: E402
+    ShowrunnerMember as ShowrunnerMember, UnitMember as UnitMember, ObservedUnit as ObservedUnit,
+    MemberSelector as MemberSelector, MemberFound as MemberFound, NoSuchMember as NoSuchMember,
+    UnitProduction as UnitProduction, MemberSources as _MemberSources,
+    member_sources as _member_sources,
+)
+import unit_lookup  # noqa: E402
 
 
 def member(selector: MemberSelector, record: staff.StaffSnapshot) -> MemberFound | NoSuchMember:
-    """Resolve the newest launch identity first, converting missing rows at the boundary."""
+    """Resolve pane identity or current production membership through the shared join."""
     return _member_sources().member(selector, record)
 
 
@@ -110,40 +39,9 @@ def showrunner_members(record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]
     return _member_sources().showrunner_members(record)
 
 
-@dataclass(frozen=True)
-class UnitProduction:
-    """The current parent and its source document, resolved from the staff edge."""
-
-    slug: str
-    doc: str
-
-
-def _unit_member(unit: str, session_id: str, record: staff.StaffSnapshot,
-                 sources: _MemberSources) -> staff.StaffRow:
-    launches = [launch for launch in sources.launches
-                if session_id and launch["session_id"] == session_id]
-    if launches:
-        environment = max(launches, key=lambda launch: launch["written_at"])["environment"]
-        found = sources.member(UnitMember(environment.get("SHOWRUNNER_UNIT", ""),
-                                          environment.get("SHOWRUNNER_UNIT_ID", unit)), record)
-        members = [found.row] if isinstance(found, MemberFound) else []
-    else:
-        members = list({found.row.id: found.row for slug in sources.productions
-                        if isinstance(found := sources.member(UnitMember(slug, unit), record), MemberFound)}.values())
-    if len(members) != 1:
-        raise staff.StaffUnreadable(f"{unit}: no unique staff entry")
-    return members[0]
-
-
 def unit_parent(unit: str, session_id: str = "") -> UnitProduction:
     """Resolve the current staff edge; old launch marks supply identity only."""
-    record, sources = staff.snapshot(), _member_sources()
-    parent = _unit_member(unit, session_id, record, sources).parent
-    parents = [slug for slug, row in sources.showrunner_members(record).items() if row.id == parent]
-    if len(parents) != 1:
-        raise staff.StaffUnreadable(f"{unit}: staff parent has no unique production document")
-    slug = parents[0]
-    return UnitProduction(slug, str(sources.productions[slug].timer.doc))
+    return unit_lookup.unit_parent(unit, session_id, record=staff.snapshot())
 
 
 def _showrunner_key(slug: str) -> str:
@@ -166,7 +64,6 @@ def _collect(record: staff.StaffSnapshot, sources: _MemberSources) -> staff.Seed
             production_members = [_seed_member(_showrunner_key(slug), "showrunner",
                                                showrunners.space_from_text(slug, source.document), found,
                                                staff.KeepSeedParent())]
-            marks = production_units.SessionMarks(slug)
             for unit_cells in cells:
                 unit = production_units.cell_value(unit_cells.get("Unit", ""))
                 name = unit_names.name(unit)
@@ -180,7 +77,7 @@ def _collect(record: staff.StaffSnapshot, sources: _MemberSources) -> staff.Seed
                     continue
                 path_text = production_units.cell_value(unit_cells.get("Worktree", ""))
                 if (not path_text or not Path(path_text).expanduser().is_dir()
-                        or production_units.unit_is_retired(unit_cells, marks)):
+                        or production_units.plan_cell_is_retired(unit_cells.get("Plan", ""))):
                     continue
                 production_members.append(_seed_member(f"unit:{slug}/{unit}", "unit", name, selected,
                                                        staff.SeedParent(_showrunner_key(slug))))

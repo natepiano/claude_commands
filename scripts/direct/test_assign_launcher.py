@@ -230,6 +230,40 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertIn(names[-1], board)
         self.assertTrue((self.session_dir / "phases/7/review_status_contract_1").exists())
 
+    def test_a_compaction_roster_conflict_refuses_assignment_before_claim_or_follow(self) -> None:
+        _ = self.successful()
+        name, record = next(iter(self.assignment_records().items()))
+        record["context_tokens"] = 126299
+        roster_path = self.session_dir / codex_mesh.ROSTER_FILE
+        _ = roster_path.write_text(json.dumps({name: record}))
+        before = roster_path.read_bytes()
+        turns_before = self.turn_starts
+        script = self.prepare_launcher()[0]
+        trace = self.session_dir / "compact-refusal.jsonl"
+        # Only the transport's compaction result is injected. The real coordinator
+        # decides whether to claim, follow, alter artifacts or announce continuation.
+        _ = script.with_suffix(".py").write_text(
+            "import json, subprocess\nfrom pathlib import Path\nfrom scripts.direct import assign\n" +
+            f"trace = Path({str(trace)!r})\nreal_call = assign.Dispatch.mesh_call\n" +
+            "def mesh_call(dispatch, verb, *options, **kwargs):\n" +
+            "    with trace.open('a') as handle: handle.write(json.dumps(verb) + '\\n')\n" +
+            "    if verb == 'compact':\n" +
+            "        return subprocess.CompletedProcess(['compact'], 4, '', " +
+            "'codex_mesh: compacted, but the roster changed during compaction (status=paused)\\n')\n" +
+            "    return real_call(dispatch, verb, *options, **kwargs)\n" +
+            "assign.Dispatch.mesh_call = mesh_call\nraise SystemExit(assign.main())\n")
+        result = self.launch("implement", "--to", name, script=script)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("roster changed during compaction", result.stderr)
+        self.assertIn("reopen --to " + name, result.stderr)
+        self.assertEqual([json.loads(line) for line in trace.read_text().splitlines()], ["compact"])
+        self.assertEqual(roster_path.read_bytes(), before)
+        self.assertEqual(self.turn_starts, turns_before)
+        self.assertFalse(list(self.session_dir.glob("impl_claim_*.json")))
+        board = (self.session_dir / "board.log").read_text()
+        self.assertIn("follow-up not sent", board)
+        self.assertNotIn("continuing follow-up", board)
+
     def test_named_dispatch_reuses_a_thread_and_advances_the_manifest_number(self) -> None:
         _ = self.successful()
         name, original = next(iter(self.assignment_records().items()))
