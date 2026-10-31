@@ -2058,7 +2058,7 @@ build_seconds() {
 # or when the tree has changed since that verdict.
 # The time in the user's zone setting, with its label; UTC (labeled) when the setting cannot be read.
 user_clock() {
-    TZ="$("$PY" "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%Y-%m-%d %H:%M:%S %Z'
+    TZ="$(python3 -S "$(dirname "${BASH_SOURCE[0]}")/../lib/user_zone.py" 2>/dev/null)" date '+%Y-%m-%d %H:%M:%S %Z'
 }
 
 cache_record() {

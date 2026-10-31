@@ -35,7 +35,9 @@ class VerifyPythonStartsTests(VerifyLintCacheFixture):
         self.assertNotIn("STDIN_PY", counts, rows)
         # Baseline: 14 tree starts, including four lint pairs. The fifth paired site is Mac-only.
         self.assertEqual(counts["tree_watch.py"], 10, rows)
-        self.assertEqual(len(rows), 41, counts)  # Baseline 47, minus four pairs and two code hashes.
+        # Baseline 47, minus four pairs and two code hashes. The no-site
+        # user clock runs outside the trace runner and contributes no row.
+        self.assertEqual(len(rows), 40, counts)
 
     def test_lint_code_key_tracks_inputs_and_clears_unreadable_keys_with_both_hash_tools(self) -> None:
         home = self.root / "key-home"

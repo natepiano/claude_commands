@@ -170,21 +170,22 @@ esac
             + "path = Path(os.environ['BUILDLOG_MEMINFO'])\n"
             + "wait_until(lambda: len(values := path.read_text().split()) > 1 and values[1] != '0', path.parent, "
             + f"timeout={TEST_HANG_GUARD_SECS})\n")
-        # Memory changes are events. Token retry tests may replace this stub
-        # with their own acquisition marker or clock advancement.
-        _ = (stubs / "sleep").write_text(
-            '#!/bin/sh\n'
+        # Memory changes are events; ordinary delays must still elapse so the
+        # renewal heartbeat cannot overwrite an intentionally expired lease.
+        tool_path = stub_build_tool_path(stubs)
+        sleep = stubs / "sleep"
+        _ = sleep.write_text(sleep.read_text().replace(
+            '#!/bin/sh\n', '#!/bin/sh\n'
             + 'if [ "$1" = "${BUILDLOG_MEM_POLL_S:-5}" ]; then\n'
             + '    read -r label available unit < "$BUILDLOG_MEMINFO"\n'
             + '    if [ "$available" = 0 ]; then exec python3 "$TEST_MEMORY_EVENT"; fi\n'
-            + 'fi\nexit 0\n')
-        (stubs / "sleep").chmod(0o755)
+            + 'fi\n', 1))
         self.environment = {
             **{name: value for name, value in os.environ.items()
                if name not in {"UNIT_RUN_DIR", "UNIT_TEAM_ROLE", "CODEX_THREAD_ID",
                                "CODEX_SESSION_ID", "UNIT_DETACHED_RUN", "BASH_ENV", "ENV"}
                and not name.startswith(("PLAN_DELEGATE_", "BASH_FUNC_"))},
-            "PATH": stub_build_tool_path(stubs),
+            "PATH": tool_path,
             "HOME": str(home),
             # These tests supply the complete build toolchain; nix discovery is
             # covered separately and need not spawn its two interpreters here.
