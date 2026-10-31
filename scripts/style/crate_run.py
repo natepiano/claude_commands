@@ -76,6 +76,7 @@ class CrateRecord(TypedDict):
     intent: str
     result_path: str
     selected: list[FrozenFinding]
+    finding_holders: NotRequired[dict[str, list[str]]]
     stage: str
     owner: NotRequired[str]
     tickets: NotRequired[dict[str, str]]
@@ -333,7 +334,14 @@ class CrateRun:
                 if isinstance(finding.state, ledger_api.Filed):
                     proposals[str(finding.state.proposal)].add(style_proposals.crate_for(directories, finding.path))
             records: dict[str, CrateRecord] = {}
-            refusals = [asdict(item) for item in selected.skipped]
+            refusals: list[dict[str, str]] = [
+                {"finding_id": item.finding_id, "reason": item.reason} for item in selected.skipped
+            ]
+            held_by_crate: dict[str, dict[str, list[str]]] = defaultdict(dict)
+            for skipped in selected.skipped:
+                if isinstance(skipped, run.OpenTicketRefusal):
+                    directory = style_proposals.crate_for(directories, skipped.path)
+                    held_by_crate[directory][skipped.finding_id] = list(skipped.ticket_ids)
             for member in members:
                 if not re.fullmatch(r"[A-Za-z0-9_-]+", member.package_name):
                     raise bulk.BulkRenameError("unsafe package name")
@@ -358,6 +366,7 @@ class CrateRun:
                     "intent": str(checkout / ".git/style-batch-intent.json"),
                     "result_path": str(self.folder / (member.package_name + ".result.json")),
                     "selected": frozen, "stage": CrateStage.SELECTED,
+                    "finding_holders": held_by_crate.get(member.directory, {}),
                 }
             self.save({"version": 2, "run": self.run_id, "canonical": str(self.repo),
                        "database": str(self.ledger.database.resolve()), "base": base,
@@ -474,7 +483,13 @@ class CrateRun:
                 return manifest
             if stage == CrateStage.SELECTED:
                 if not record["selected"]:
-                    self.abandon(manifest, record, "no selected findings")
+                    holders = record.get("finding_holders", {})
+                    reason = "no selected findings"
+                    if holders:
+                        ticket_ids = sorted({ticket for tickets in holders.values() for ticket in tickets})
+                        noun = "finding" if len(holders) == 1 else "findings"
+                        reason += f": {len(holders)} {noun} held by open tickets: " + ", ".join(ticket_ids)
+                    self.abandon(manifest, record, reason)
                     return manifest
                 with ledger_api.refill_lock(self.repo):
                     # The canonical worker branch must precede ticket assignment and base recording.

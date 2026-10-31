@@ -69,6 +69,14 @@ def require_base(repo: Path, tree: str) -> str:
 
 
 @dataclass(frozen=True)
+class OpenTicketRefusal(bulk.Refusal):
+    """Selection blocked by the named open tickets, on this finding's path."""
+
+    path: str
+    ticket_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Selection:
     findings: tuple[ledger_api.HeldFinding, ...]
     skipped: tuple[bulk.Refusal, ...]
@@ -83,7 +91,10 @@ def select(ledger: ledger_api.Ledger, definition: rules.Rule) -> Selection:
     """
     tickets = tuple(ticket for ticket in ledger.proposal_tickets() if ticket["state"] not in ledger_api.FINAL_TICKET_STATES)
     owners = {ticket["id"] for ticket in tickets}
-    busy = {path for ticket in tickets for path in (*ticket["files"], *(item["path"] for item in ticket["widened"]))}
+    busy: dict[str, set[str]] = defaultdict(set)
+    for ticket in tickets:
+        for path in (*ticket["files"], *(item["path"] for item in ticket["widened"])):
+            busy[path].add(ticket["id"])
     approvals: dict[Path, bool] = {}
     ready: list[ledger_api.HeldFinding] = []
     skipped: list[bulk.Refusal] = []
@@ -91,12 +102,15 @@ def select(ledger: ledger_api.Ledger, definition: rules.Rule) -> Selection:
         if finding.rule.removesuffix("#uncovered") != definition.rule_id:
             continue
         reason = ""
+        ticket_ids: tuple[str, ...] = ()
         if not isinstance(finding.state, ledger_api.Filed):
             reason = ledger_api.held_state_name(finding.state)
         elif isinstance(finding.build_ticket, ledger_api.BuildTicket) and finding.build_ticket.ticket in owners:
             reason = "held by another open ticket"
+            ticket_ids = (finding.build_ticket.ticket,)
         elif finding.path in busy:
             reason = "file held by another open ticket"
+            ticket_ids = tuple(sorted(busy[finding.path]))
         elif not rules.judged_text_unchanged(finding.rule_blob, definition):
             reason = "rule changed since judged"
         else:
@@ -109,7 +123,8 @@ def select(ledger: ledger_api.Ledger, definition: rules.Rule) -> Selection:
             if not approvals[proposal]:
                 reason = "decision not approved"
         if reason:
-            skipped.append(bulk.Refusal(finding.finding_id, reason))
+            skipped.append(OpenTicketRefusal(finding.finding_id, reason, finding.path, ticket_ids)
+                           if ticket_ids else bulk.Refusal(finding.finding_id, reason))
         else:
             ready.append(finding)
     return Selection(tuple(ready), tuple(skipped))
