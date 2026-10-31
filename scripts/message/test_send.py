@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import shlex
 import sys
@@ -15,7 +16,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Generator
-from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, closing, contextmanager, redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO, cast, override
@@ -24,7 +25,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.socket_test_support import short_socket_directory
+from scripts.lib.socket_test_support import ShortUnixSocket, short_socket_directory
 import send
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
@@ -35,6 +36,7 @@ import postmaster
 import silence
 from test_postmaster import FakeClock
 import codex_daemon
+from codex_test_support import FakeDaemon, daemon_session_row, receive_frame, reply, write_codex_account
 import shutdown_record
 import restart
 import roster
@@ -206,6 +208,35 @@ def local_options(arguments: list[str]) -> send.Options:
 
 
 class SendTests(ShutdownTestCase):
+    def test_outcome_parser_preserves_first_header_payload_and_acknowledgement(self) -> None:
+        acknowledged = send.acknowledged_skip_reason("shutdown-fixture", "2026-10-30T12:00:00+00:00")
+        self.assertEqual(acknowledged, "key 'shutdown-fixture' acknowledged at 2026-10-30T12:00:00+00:00; `send.py reopen` to resume")
+        window = "key 'shutdown-fixture' last sent to Unit at 2026-10-30T12:00:00+00:00, inside its 60-minute window"
+        cases: tuple[tuple[str, send.Outcome, str, str, bool], ...] = (
+            ("SENT: to the user\n", "sent", "to the user", "", False),
+            ("SKIPPED: " + window + "\n", "skipped", window, "", False),
+            ("SKIPPED: " + acknowledged + "\n", "skipped", acknowledged, "", True),
+            ("KEPT: until silence ends\n", "kept", "until silence ends", "", False),
+            ("REPLACED: newer push\n", "replaced", "newer push", "", False),
+            ("QUEUED: recipient offline\n", "queued", "recipient offline", "", False),
+            ("HELD: review refused\n", "held", "review refused", "", False),
+            ("FAILED: transport failed\n", "failed", "transport failed", "", False),
+            ("REFUSED: action required\n", "refused", "action required", "", False),
+            ("reviewing draft\nunknown: progress\nSENT: delivered\n", "sent", "delivered", "", False),
+            ("SENT: rewritten:\nnew body\nFAILED: quoted earlier result\n\n", "sent", "rewritten:", "new body\nFAILED: quoted earlier result\n", False),
+            ("SENT", "sent", "", "", False),
+        )
+        for output, outcome, detail, payload, is_acknowledged in cases:
+            with self.subTest(output=output):
+                parsed = send.parse_outcome(output)
+                self.assertIsInstance(parsed, send.OutcomeHeader)
+                assert isinstance(parsed, send.OutcomeHeader)
+                self.assertEqual((parsed.outcome, parsed.detail, parsed.payload), (outcome, detail, payload))
+                self.assertEqual(send.is_acknowledged_skip(parsed.detail), is_acknowledged)
+        for output in ("", "reviewing draft\nunknown: still working\n", "sent: not a protocol header\n"):
+            with self.subTest(output=output):
+                self.assertIsInstance(send.parse_outcome(output), send.NoOutcomeHeader)
+
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -254,6 +285,13 @@ class SendTests(ShutdownTestCase):
         _ = self.enterContext(
             mock.patch.object(roster, "roster", return_value=roster.Roster([], []))
         )
+
+    def daemon_owner(self) -> codex_daemon.CodexDaemon:
+        home = self.root / ".codex2"
+        return codex_daemon.CodexDaemon(home, home / "app-server-control/app-server-control.sock")
+
+    def daemon_row(self, thread: str, name: str = "") -> roster.RosterEntry:
+        return daemon_session_row(self.daemon_owner(), thread, name or thread)
 
     def session(self, session_id: str, name: str, *former: str) -> None:
         """Record a live Claude session, or its rename: this test process stands in for it."""
@@ -414,9 +452,10 @@ class SendTests(ShutdownTestCase):
         received = send.parse(["--here", "--to", "codex:remote-thread", "--from", "sender-address",
                                "--forwarded-shown-sender", "sdlc · roles · worker test", "--summary", "Preview", "--text", "body"])
         with mock.patch.object(names, "runtime_names", side_effect=AssertionError("receiver must not apply its names")), \
-                mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue:
+                mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue, \
+                mock.patch.object(roster, "roster", return_value=roster.Roster([self.daemon_row("remote-thread")], [])):
             self.assertEqual(send.send(received).outcome, "sent")
-        queue.assert_called_once_with("remote-thread", "body\nShown sender: sdlc · roles · worker test", timeout=send.TIMEOUT)
+        queue.assert_called_once_with(self.daemon_owner(), "remote-thread", "body\nShown sender: sdlc · roles · worker test", timeout=send.TIMEOUT)
 
     def test_queued_sender_display_survives_roster_changes_and_legacy_records_use_raw_sender(self) -> None:
         queued_at = datetime(2026, 10, 20, tzinfo=timezone.utc)
@@ -450,7 +489,7 @@ class SendTests(ShutdownTestCase):
         original = "Message from sender-address: Preview\n\nbody"
         expected = "Message from sender-address: Preview\nShown sender: sdlc · roles · worker test\n\nbody"
         with (
-            mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry()], [])),
+            mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry(), self.daemon_row("thread-address")], [])),
             mock.patch.object(send, "run", return_value=(0, "sent", "")) as launch,
             mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue,
         ):
@@ -465,7 +504,7 @@ class SendTests(ShutdownTestCase):
         self.assertEqual(command[command.index("--to") + 1], "mesh-address")
         self.assertEqual(command[command.index("--session-dir") + 1], "/fixture/run")
         self.assertEqual(command[command.index("--message") + 1], expected)
-        queue.assert_called_once_with("thread-address", expected, timeout=send.TIMEOUT)
+        queue.assert_called_once_with(self.daemon_owner(), "thread-address", expected, timeout=send.TIMEOUT)
         self.assertEqual([(row["from"], row["to"], row["text"]) for row in self.log()], [
             ("sender-address", "mesh-address", original), ("sender-address", "codex:thread-address", original),
         ])
@@ -511,14 +550,14 @@ class SendTests(ShutdownTestCase):
                 self.assertEqual(ssh.call_args.args[1], original)
                 received = send.parse([*arguments, "--text", original])
                 with (
-                    mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry("wrong-host")], [])),
+                    mock.patch.object(roster, "roster", return_value=roster.Roster([self.sender_entry("wrong-host"), self.daemon_row("remote-thread")], [])),
                     mock.patch.object(send, "sender_shown_name", side_effect=AssertionError("receiver must not resolve sender")),
                     mock.patch.object(codex_daemon, "queue", return_value=codex_daemon.Queued()) as queue,
                 ):
                     self.assertEqual(send.send(received).outcome, "sent")
                 expected = (original if display == "sender-address" else
                             "Message from sender-address: Preview\nShown sender: sdlc · roles · worker test\n\nbody")
-                queue.assert_called_once_with("remote-thread", expected, timeout=send.TIMEOUT)
+                queue.assert_called_once_with(self.daemon_owner(), "remote-thread", expected, timeout=send.TIMEOUT)
                 logged = self.log()[-1]
                 self.assertEqual((logged["from"], logged["to"], logged["key"], logged["text"]),
                                  ("sender-address", "codex:remote-thread", "reply-key", original))
@@ -700,6 +739,52 @@ class SendTests(ShutdownTestCase):
         with mock.patch.object(send, "now", return_value=later):
             self.assertEqual(self.send("--key", "k", "--repeat-minutes", "30", "--text", "four").outcome, "sent")
         self.assertEqual([entry["outcome"] for entry in self.log()], ["sent", "skipped", "sent", "sent"])
+
+    def test_a_failed_keyed_session_send_retries_but_a_delivered_send_keeps_its_window(self) -> None:
+        options = local_options(["--to", "Recipient", "--from", "Sender", "--key", "result",
+                                 "--repeat-minutes", "30", "--text", "The unit is back."])
+        started = send.now()
+        self.outcome = send.Result("failed", "transport refused the message")
+        with mock.patch.object(send, "now", return_value=started):
+            self.assertEqual(send.send(options).outcome, "failed")
+        self.outcome = send.Result("sent", "delivered")
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)):
+            self.assertEqual(send.send(options).outcome, "sent")
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=2)):
+            self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual([message.text for message in self.relayed], [options.text, options.text])
+        self.assertEqual([entry["outcome"] for entry in self.log()], ["failed", "sent", "skipped"])
+
+    def test_a_queued_keyed_session_send_keeps_one_copy_and_its_window(self) -> None:
+        self.session("recipient", "Recipient")
+        options = local_options(["--to", "session:recipient", "--from", "Sender", "--key", "result",
+                                 "--repeat-minutes", "30", "--text", "The unit is back."])
+        started = send.now()
+        self.outcome = send.Result("queued", "relay unavailable")
+        with mock.patch.object(send, "now", return_value=started):
+            self.assertEqual(send.send(options).outcome, "queued")
+        self.outcome = send.Result("sent", "delivered")
+        with mock.patch.object(send, "now", return_value=started + timedelta(seconds=1)):
+            self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(send.pending("session:recipient").count("The unit is back."), 1)
+        self.assertEqual(send.pending("session:recipient"), "")
+
+    def test_a_failed_send_does_not_clear_a_later_runs_window(self) -> None:
+        started = send.now()
+        options = local_options(["--to", "bogus", "--from", "Sender", "--key", "result",
+                                 "--repeat-minutes", "30", "--text", "The unit is back."])
+        def overlap(message: send.Message, timeout: float) -> send.Result:
+            del message, timeout
+            with (mock.patch.object(send, "now", return_value=started + timedelta(minutes=31)),
+                  mock.patch.object(send, "relay", return_value=send.Result("sent", "later delivery"))):
+                self.assertEqual(send.send(options).outcome, "sent")
+            return send.Result("failed", "earlier delivery failed")
+        with mock.patch.object(send, "now", return_value=started), mock.patch.object(send, "relay", overlap):
+            self.assertEqual(send.send(options).outcome, "failed")
+        with mock.patch.object(send, "now", return_value=started + timedelta(minutes=32)):
+            self.assertEqual(send.send(options).outcome, "skipped")
+        self.assertEqual([entry["outcome"] for entry in self.log()], ["sent", "failed", "skipped"])
 
     @staticmethod
     def emergency(*extra: str) -> list[str]:
@@ -1903,7 +1988,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
     def test_codex_thread_address_queues_after_one_local_roster_read(self) -> None:
         output = io.StringIO()
         with (
-            mock.patch.object(roster, "roster", return_value=roster.Roster([], [])) as read_roster,
+            mock.patch.object(roster, "roster", return_value=roster.Roster([self.daemon_row("thread-one")], [])) as read_roster,
             mock.patch.object(
                 codex_daemon, "queue", return_value=codex_daemon.Queued(),
             ) as queue,
@@ -1915,15 +2000,11 @@ runpy.run_path(sys.argv[0], run_name="__main__")
 
         self.assertEqual(code, 0)
         self.assertEqual(output.getvalue(), "SENT: queued on Codex session thread-one\n")
-        queue.assert_called_once_with("thread-one", "hello", timeout=send.TIMEOUT)
+        queue.assert_called_once_with(self.daemon_owner(), "thread-one", "hello", timeout=send.TIMEOUT)
         read_roster.assert_called_once()
 
     def test_named_codex_session_uses_its_display_name_in_the_outcome(self) -> None:
-        session = roster.RosterEntry(
-            "machine", "codex", "freestanding", "Codex window", "idle",
-            roster.Messageable("codex:thread-window"), "/work",
-            roster.NoShowrunner(), roster.NoDirector(), roster.NotAWorker(),
-        )
+        session = self.daemon_row("thread-window", "Codex window")
         with (
             mock.patch.object(
                 roster, "roster", return_value=roster.Roster([session], []),
@@ -1937,7 +2018,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             ]))
 
         self.assertEqual(result, send.Result("sent", "queued on Codex session Codex window"))
-        queue.assert_called_once_with("thread-window", "hello", timeout=send.TIMEOUT)
+        queue.assert_called_once_with(self.daemon_owner(), "thread-window", "hello", timeout=send.TIMEOUT)
 
     def test_codex_queue_failure_and_timeout_are_failed_and_never_kept(self) -> None:
         failures = (
@@ -1948,7 +2029,7 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             output = io.StringIO()
             with self.subTest(queue_result=queue_result), mock.patch.object(
                 codex_daemon, "queue", return_value=queue_result,
-            ), redirect_stdout(output):
+            ), mock.patch.object(roster, "roster", return_value=roster.Roster([self.daemon_row("thread-one")], [])), redirect_stdout(output):
                 code = send.main(["--here",
                     "--to", "codex:thread-one", "--from", "test", "--text", "hello",
                 ])
@@ -3007,7 +3088,8 @@ class PeerSendTests(ShutdownTestCase):
         self.mesh_calls.append((message, directory))
         return send.Result("sent", "fixture mesh")
 
-    def daemon(self, thread: str, _text: str, **_options: object) -> codex_daemon.QueueResult:
+    def daemon(self, owner: codex_daemon.CodexDaemon, thread: str, _text: str, **_options: object) -> codex_daemon.QueueResult:
+        self.assertIsInstance(owner, codex_daemon.CodexDaemon)
         self.daemon_calls.append(thread)
         return codex_daemon.Queued()
 
@@ -3020,6 +3102,8 @@ class PeerSendTests(ShutdownTestCase):
             roster.WorkerAssignment("impl", "/fixture/run") if worker else roster.NotAWorker(),
             roster.CodexThread(address.removeprefix("codex:")) if kind == "codex" else roster.NoCodexThread(),
             roster.ClaudeSession(address.removeprefix("session:")) if kind == "claude" else roster.NoClaudeSession(),
+            daemon=(codex_daemon.CodexDaemon(self.root / ".codex2", self.root / "daemon.sock")
+                    if address.startswith("codex:") else roster.NotDaemonSession()),
         )
 
     def peer(self, rows: list[roster.RosterEntry], *, problems: tuple[str, ...] = ()) -> None:
@@ -3132,7 +3216,7 @@ class PeerSendTests(ShutdownTestCase):
         self.assertIn("--here", self.forwarded()[0])
 
     def test_clean_peer_misses_keep_each_forms_local_outcome(self) -> None:
-        for target, expected in (("session:gone", 1), ("codex:gone", 0), ("worker:gone/impl", 2), ("bare missing", 0)):
+        for target, expected in (("session:gone", 1), ("codex:gone", 3), ("worker:gone/impl", 2), ("bare missing", 0)):
             with self.subTest(target=target):
                 before = len(self.ssh_calls())
                 status, output, errors = self.run_main(target)
@@ -3142,7 +3226,9 @@ class PeerSendTests(ShutdownTestCase):
                     self.assertIn("fixture text", send.queue_path("session-gone").read_text())
                 elif target.startswith("worker:"):
                     self.assertIn("no roster session has address", errors)
-        self.assertEqual(self.daemon_calls, ["gone"])
+                elif target.startswith("codex:"):
+                    self.assertIn("FAILED: no live Codex daemon has thread gone loaded; checked ~/.codex", output)
+        self.assertEqual(self.daemon_calls, [])
         self.assertEqual(len(self.relayed), 1)
         self.assertEqual(self.forwarded(), [])
 
@@ -3245,6 +3331,171 @@ class ReadRelayTests(ShutdownTestCase):
         self.assertEqual(result.outcome, "queued")
         self.assertIn("MODE default, NOT auto", result.detail)
         self.assertIn("I cannot do that", result.detail)
+
+
+class AccountDaemonRoutingTests(unittest.TestCase):
+    root: Path = Path()
+    homes: tuple[Path, Path] = (Path(), Path())
+    queue_contents: dict[Path, bytes] = {}
+    queued: list[dict[str, object]] = []
+
+    @override
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(short_socket_directory()))
+        self.homes = (self.root / ".codex", self.root / ".codex2")
+        notes = self.root / "agents"
+        self.queue_contents, self.queued = {}, []
+        for home, label in zip(self.homes, ("codex1", "codex2")):
+            write_codex_account(home, notes, label)
+            (home / "app-server-control").mkdir()
+            queue = home / "queue_1.sqlite"
+            with closing(sqlite3.connect(queue)) as database, database:
+                _ = database.execute("CREATE TABLE sentinel (message TEXT)")
+                _ = database.execute("INSERT INTO sentinel VALUES (?)", (label,))
+            self.queue_contents[queue] = queue.read_bytes()
+        (self.homes[0] / "sessions").mkdir()
+        (self.homes[1] / "sessions").symlink_to(self.homes[0] / "sessions", target_is_directory=True)
+        (self.root / "claude-sessions").mkdir()
+        binaries = self.root / "bin"
+        binaries.mkdir()
+        ps = binaries / "ps"
+        _ = ps.write_text("#!/bin/sh\nexit 0\n")
+        ps.chmod(0o755)
+        for command in ("ssh", "codex", "claude"):
+            blocked = binaries / command
+            _ = blocked.write_text("#!/bin/sh\necho 'unexpected external tool' >&2\nexit 91\n")
+            blocked.chmod(0o755)
+        _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {
+            "HOME": str(self.root), "PATH": str(binaries), "AGENT_NOTES_DIR": str(notes),
+            "PROCESS_TABLE_PS": str(ps), "XDG_STATE_HOME": str(self.root / "state"),
+            "NOTIFIER_SESSIONS_DIR": str(self.root / "claude-sessions"),
+            "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
+            "ROSTER_RUN_ROOT": str(self.root / "runs"),
+            "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
+            "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership"),
+            "REVIEW_POOL_STATE": str(self.root / "review-pool"),
+            "UNIT_HISTORY_DIR": str(self.root / "history"),
+        }, clear=True)))
+
+    def serve_loaded_thread(self, connection: socket.socket) -> None:
+        initialize = receive_frame(connection)
+        self.assertEqual(initialize["method"], "initialize")
+        reply(connection, initialize, {})
+        self.assertEqual(receive_frame(connection)["method"], "initialized")
+        while True:
+            try:
+                request = receive_frame(connection)
+            except EOFError:
+                return
+            method = request["method"]
+            params = cast(dict[str, object], request["params"])
+            if method == "thread/loaded/list":
+                reply(connection, request, {"data": ["account-thread"]})
+            elif method == "thread/read":
+                reply(connection, request, {"thread": {
+                    "id": "account-thread", "name": "Account window", "cwd": str(self.root),
+                    "status": {"type": "idle"},
+                }})
+            elif method == "thread/queue/add":
+                self.queued.append(params)
+                reply(connection, request, {"queuedSubmission": {"id": "reply"}})
+            else:
+                self.fail(f"unexpected daemon method: {method}")
+
+    def daemon(self, home: Path) -> FakeDaemon:
+        return FakeDaemon(home / "app-server-control/app-server-control.sock", self.serve_loaded_thread, repeat=True)
+
+    def command(self, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([sys.executable, str(Path(send.__file__).with_name(script)), *arguments],
+                              capture_output=True, text=True, check=False, timeout=30)
+
+    def assert_queues_unchanged(self) -> None:
+        for queue, before in self.queue_contents.items():
+            self.assertEqual(queue.read_bytes(), before, str(queue))
+
+    def test_shared_history_routes_a_named_session_through_its_owning_account_daemon(self) -> None:
+        with self.daemon(self.homes[1]):
+            listed = self.command("roster.py", "--here", "--snapshot")
+            self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+            found = roster.RosterSnapshot.decode(listed.stdout).result
+            self.assertEqual(found.problems, [])
+            self.assertEqual(len(found.entries), 1)
+            entry = found.entries[0]
+            self.assertEqual(entry.account, roster.AccountLabel("codex2"))
+            self.assertEqual(entry.daemon, codex_daemon.CodexDaemon(
+                self.homes[1], self.homes[1] / "app-server-control/app-server-control.sock"))
+            delivered = self.command("send.py", "--here", "--to", entry.name, "--from", "sdlc", "--text", "named reply")
+        self.assertEqual(delivered.returncode, 0, delivered.stderr)
+        self.assertEqual(delivered.stdout, "SENT: queued on Codex session Account window\n")
+        self.assertEqual([(row["threadId"], row["input"]) for row in self.queued],
+                         [("account-thread", [{"type": "text", "text": "named reply"}])])
+        self.assert_queues_unchanged()
+
+    def test_an_unloaded_thread_fails_and_names_every_account_without_writing_a_queue(self) -> None:
+        delivered = self.command("send.py", "--here", "--to", "codex:account-thread", "--from", "sdlc", "--text", "reply")
+        self.assertEqual(delivered.returncode, 3, delivered.stderr)
+        self.assertEqual(delivered.stdout, "FAILED: no live Codex daemon has thread account-thread loaded; checked ~/.codex, ~/.codex2\n")
+        self.assertEqual(self.queued, [])
+        self.assert_queues_unchanged()
+
+    def test_a_thread_loaded_in_two_accounts_is_refused_with_both_account_names(self) -> None:
+        with self.daemon(self.homes[0]), self.daemon(self.homes[1]):
+            delivered = self.command("send.py", "--here", "--to", "codex:account-thread", "--from", "sdlc", "--text", "reply")
+        self.assertEqual(delivered.returncode, 2)
+        self.assertIn("codex:account-thread matches 2 sessions:", delivered.stderr)
+        for label in ("codex1", "codex2"):
+            self.assertIn(label, delivered.stderr)
+        self.assertEqual(self.queued, [])
+        self.assert_queues_unchanged()
+
+    def test_a_process_reply_without_a_process_home_reaches_the_loaded_account_socket(self) -> None:
+        with self.daemon(self.homes[1]):
+            delivered = self.command("send.py", "--to", "codex:account-thread", "--from", "sdlc", "--text", "survey reply")
+        self.assertEqual(delivered.returncode, 0, delivered.stderr)
+        self.assertEqual(delivered.stdout, "SENT: queued on Codex session Account window\n")
+        self.assertEqual([(row["threadId"], row["input"]) for row in self.queued],
+                         [("account-thread", [{"type": "text", "text": "survey reply"}])])
+        self.assert_queues_unchanged()
+
+    def test_a_process_message_to_a_nondefault_account_receives_a_reply_at_the_senders_socket(self) -> None:
+        (self.root / ".claude").mkdir()
+        _ = (self.root / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "sender@example.invalid"}}))
+        executable = self.root / ".local/bin/claude"
+        executable.parent.mkdir(parents=True)
+        _ = executable.write_text(
+            f"#!{sys.executable}\n"
+            + "import json, socket, sys\n"
+            + f"sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+            + "from test_send import INIT, OK, answer, call, stream\n"
+            + "prompt = sys.stdin.read()\n"
+            + "target = json.loads(next(line[6:] for line in prompt.splitlines() if line.startswith('- to: ')))\n"
+            + "text = prompt.split('----- BEGIN MESSAGE -----\\n', 1)[1].rsplit('\\n----- END MESSAGE -----', 1)[0]\n"
+            + "with socket.socket(socket.AF_UNIX) as connection:\n"
+            + "    connection.connect(target.removeprefix('uds:'))\n"
+            + "    connection.sendall(text.encode())\n"
+            + "print(stream(INIT, call(text), answer(OK)), end='')\n")
+        executable.chmod(0o755)
+        question, response = "Can you confirm the survey?", "The survey is confirmed."
+        with ShortUnixSocket() as sender, self.daemon(self.homes[1]):
+            address = f"uds:{sender.bind_socket()}"
+            sender.listen(1)
+            sender.settimeout(5)
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_MESSAGING_SOCKET": address}):
+                delivered = self.command("send.py", "--to", "codex:account-thread", "--from", "sdlc", "--text", question)
+            self.assertEqual(delivered.returncode, 0, delivered.stderr)
+            self.assertEqual(delivered.stdout, "SENT: queued on Codex session Account window\n")
+            self.assertEqual([(row["threadId"], row["input"]) for row in self.queued],
+                             [("account-thread", [{"type": "text", "text": question}])])
+            with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "account-thread"}):
+                returned = self.command("send.py", "--to", address, "--from", "Account window", "--text", response)
+            self.assertEqual(returned.returncode, 0, returned.stderr)
+            self.assertTrue(returned.stdout.startswith("SENT:"), returned.stdout)
+            with sender.accept()[0] as connection:
+                connection.settimeout(5)
+                with connection.makefile("r", encoding="utf-8") as inbox:
+                    self.assertEqual(inbox.read(), response + "\nShown sender: codex:account-thread")
+        self.assert_queues_unchanged()
 
 
 if __name__ == "__main__":

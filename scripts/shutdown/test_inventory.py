@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib.socket_test_support import short_socket_directory
 from test_support import ShutdownTestCase, linux_process_fixture
 from test_restart import entry, top_level
@@ -25,7 +27,7 @@ import shutdown_record
 import inventory
 import conversation_pause
 import unit_runs
-import account
+from scripts.whoami import account
 import herdr
 import sessions
 import showrunners
@@ -355,8 +357,10 @@ class InventoryTests(ShutdownTestCase):
                     self.assertEqual(light.production, session["production"])
                     self.assertEqual(light.doc, session["doc"])
                 elif session["kind"] == "unit":
-                    self.assertEqual(light.production, session["host"]["production"])
-                    self.assertEqual(light.doc, session["host"]["doc"])
+                    self.assertEqual(light.production, "build-followups")
+                    self.assertNotIn("production", session["host"])
+                    self.assertEqual(light.doc, str(self.root / "build-followups-production.md"))
+                    self.assertNotIn("doc", session["host"])
 
     def test_listing_and_absent_target_check_share_timer_reads_without_resolving_sockets(self) -> None:
         stale = self.notifier / "showrunner-stale"
@@ -950,9 +954,7 @@ elif "comm=" in joined:
             unit["host"],
             {
                 "kind": "unit",
-                "production": "build-followups",
                 "unit": "shutdown-unit",
-                "doc": str(self.root / "build-followups-production.md"),
                 "plan": {"kind": "plan", "path": "docs/shutdown-plan.md"},
                 "session_name": "unit-renamed",
                 "session_host": "herdr",
@@ -1063,7 +1065,7 @@ elif "comm=" in joined:
         self.assertEqual(unit["host"].get("session_name"), "unit-herdr")
         self.assertEqual(unit["host"].get("session_host"), "herdr")
         self.assertEqual(inventory.parse_inventory(json.dumps(found)), found)
-        self.assertEqual(shutdown._host_text(unit["host"]), "unit build-followups/shutdown-unit (herdr unit-herdr)")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(shutdown._host_text(unit["host"]), "unit shutdown-unit (herdr unit-herdr)")  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(unit["host"].get("plan"), {"kind": "plan", "path": "docs/shutdown-plan.md"})
 
     def test_herdr_host_cleanup_leaves_its_pane_and_server_running(self) -> None:

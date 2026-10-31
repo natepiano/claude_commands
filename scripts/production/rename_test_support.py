@@ -11,34 +11,54 @@ import socket
 import subprocess
 import sys
 import tempfile
-import unittest
 from pathlib import Path
-from typing import ClassVar, cast, override
+from typing import ClassVar, Literal, cast, override
 from unittest import mock
-from collections.abc import Sequence
-from contextlib import ExitStack
+from collections.abc import Callable, Generator, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from types import SimpleNamespace
 
 from scripts.astra import design_roles
 from scripts.direct import workers
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production import fake_unit_host
+from scripts.production import staff
+from scripts.production.staff_test_support import StaffTestCase, isolated_source_readers
+from scripts.lib.atomic_file import write_text_atomic
 import fake_herdr
+import merge_checkpoint
+import production_units
 import rename
 import rename_unit
+import rename_state
 import showrunners
 import stall_watch
 import tidy_wrapped
 import unit_move
+import unit_names
+import unit_lookup
 from cli_fixture import invoke_cli
 
 SCRIPT = Path(__file__).with_name("rename.py")
+
+
+def legacy_staff_journal(path: Path) -> None:
+    """Restore the shipped pre-staff journal format without changing its progress."""
+    fields = cast(dict[str, object], rename_state.read_json(path))
+    for name in ("staff_id", "parent_staff_id"):
+        _ = fields.pop(name, None)
+    rename_state.write_json(path, fields)
 
 OLD = "old"
 
 NEW = "new"
 
 UNITS = ("alpha-unit", "beta-unit")
+
+# The staff fixture suppresses live discovery. These lifecycle fixtures provide
+# their own fake host and session records, which the original readers must see.
+FIXTURE_SOCKET_FOR = showrunners.socket_for
+FIXTURE_MARKED_UNITS = unit_lookup.marked_units
 
 FAIL_STATE_MOVE = '''import os, runpy, sys
 from pathlib import Path
@@ -236,7 +256,52 @@ def run_rename(arguments: list[str], environment: dict[str, str], cwd: Path,
         return invoke_cli(rename, main, arguments, environment, cwd)
 
 
-class ProductionRenameFixture(unittest.TestCase):
+@contextmanager
+def stop_at_staff_write(verb: Literal["rename", "move"], *, after: bool) -> Generator[None]:
+    """Stop one writer just before or just after its real staff transaction."""
+    original = cast(Callable[..., staff.StaffRow], getattr(staff, verb))
+
+    def stop(*args: object, **kwargs: object) -> staff.StaffRow:
+        if after:
+            _ = original(*args, **kwargs)
+        raise OSError("stopped at staff step")
+
+    with mock.patch.object(staff, verb, side_effect=stop):
+        yield
+
+
+def bind_staff_fixture(case: StaffTestCase, environment: dict[str, str], members: dict[str, tuple[str, ...]]) -> None:
+    """Bind legacy source fixtures to the one staff fixture and seed their members."""
+    case.staff_file = case.root / "state/staff/staff.json"
+    environment.update(STAFF_FILE=str(case.staff_file), STAFF_TEST_OWNER_FILE=str(case.staff_file))
+    _ = case.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, environment)))
+    _ = case.enterContext(isolated_source_readers())
+    for name, attribute, reader in (
+        ("showrunners", "socket_for", FIXTURE_SOCKET_FOR),
+        ("scripts.production.showrunners", "socket_for", FIXTURE_SOCKET_FOR),
+        ("unit_lookup", "marked_units", FIXTURE_MARKED_UNITS),
+        ("scripts.production.unit_lookup", "marked_units", FIXTURE_MARKED_UNITS),
+    ):
+        module = sys.modules.get(name)
+        if module is not None:
+            _ = case.enterContext(cast(AbstractContextManager[object], mock.patch.object(module, attribute, reader)))
+    if members:
+        state = Path(environment["SHOWRUNNER_STATE_DIR"])
+        with mock.patch.object(tidy_wrapped, "STATE_DIR", state), unit_move.production_lock():
+            pass
+    for source in showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.RAISE):
+        if source.timer.slug in members:
+            production = production_units.read_production(source.timer.doc)
+            with merge_checkpoint.merge_lock(production.checkout, source.timer.slug):
+                pass
+    with staff.operation():
+        for slug, units in members.items():
+            row = staff.ensure("showrunner", name=slug)
+            for unit in units:
+                _ = staff.ensure("unit", name=unit_names.name(unit), parent=row.id)
+
+
+class ProductionRenameFixture(StaffTestCase):
     def __init__(self, methodName: str = "runTest") -> None:
         super().__init__(methodName)
         self.root: Path = Path()
@@ -275,12 +340,16 @@ class ProductionRenameFixture(unittest.TestCase):
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         # Linked worktree metadata and the committed documents name absolute
         # paths. Restore private files, refs and origin at the seed's same path.
         _ = shutil.copytree(self.fixture_snapshot, self.fixture_root, symlinks=True)
         self.addCleanup(shutil.rmtree, self.fixture_root)
         self.bind_fixture(self.fixture_root)
         self.old_tip = self.fixture_tip
+        bind_staff_fixture(self, self.env, {OLD: UNITS})
+        production = next(row for row in staff.find(kind="showrunner") if row.name == OLD)
+        _ = staff.ensure("showrunner", name="child", parent=production.id)
 
     def bind_fixture(self, root: Path) -> None:
         self.root = root
@@ -371,7 +440,7 @@ class ProductionRenameFixture(unittest.TestCase):
 
     def write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        _ = path.write_text(content, encoding="utf-8")
+        write_text_atomic(path, content)
 
     def git(self, *arguments: str) -> str:
         result = subprocess.run(["git", *arguments], cwd=self.checkout, env=self.env,

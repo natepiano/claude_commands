@@ -2,44 +2,21 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import registry_text, write_registry
+from scripts.lib import test_hang_guard
 
 import json
-import os
 import shutil
 import subprocess
-import sys
-import tempfile
-import unittest
 from pathlib import Path
-from typing import TypedDict, ClassVar, cast, override
+from typing import TypedDict, cast, override
 
-from scripts.direct.recorder_fixture import (
-    STUB_ATOMIC_JSON_WRITER, TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS,
-    communicate_launcher, invoke_recorder,
-)
+from scripts.direct.recorder_fixture import LauncherFixture, STUB_ATOMIC_JSON_WRITER, communicate_launcher, configure_launcher_fixture, launcher_environment, launcher_registry, prepare_launcher_runtime
 
 
 DIRECT_DIR = Path(__file__).parent
 AGENTS_DIR = DIRECT_DIR.parent / "agents"
 
-LEGACY_RECORDER_ARGUMENTS = """
-# Compatibility for older launch cases whose subject is root-level artifacts.
-# The new launch-boundary tests remove this flag and use the recorder unchanged.
-import json as _fixture_json
-import os as _fixture_os
-from pathlib import Path as _FixturePath
-import sys as _fixture_sys
-if (_fixture_os.environ.get("TEST_LEGACY_LAUNCH") == "1"
-        and len(_fixture_sys.argv) > 1 and _fixture_sys.argv[1] in ("start-pass", "check-launch")):
-    if "--phase-id" not in _fixture_sys.argv:
-        _fixture_session = _FixturePath(
-            _fixture_sys.argv[_fixture_sys.argv.index("--session-dir") + 1])
-        _fixture_state = _fixture_json.loads(
-            (_fixture_session / "progress_history_state.json").read_text())
-        _fixture_sys.argv.extend(["--phase-id", _fixture_state["phase"]["id"]])
 
-"""
 
 # The wrapper calls this as: <task> readonly <working_dir> <prompt> <findings> <log>.
 # Writing both outputs and exiting immediately drives the wrapper's completion
@@ -279,10 +256,10 @@ class OpenPass(TypedDict):
 ProgressState = TypedDict("ProgressState", {"pass": dict[str, OpenPass]})
 
 
-AGENTS_REGISTRY = registry_text({'assignments': {'direct': 'codex'}, 'direct.codex': {'impl': 'gpt-called:xhigh', 'review': 'gpt-blind:max'}, 'codex.agents': {'gpt-called': 'low,medium,high,xhigh,max', 'gpt-blind': 'low,medium,high,xhigh,max'}, 'direct.options': {'codex_mesh': '1'}})
+AGENTS_REGISTRY = launcher_registry(("impl",), mesh=True)
 
 
-class ReviewLauncherFixture(unittest.TestCase):
+class ReviewLauncherFixture(LauncherFixture):
     """The early-launch contract: before the sentinel, no pass is recorded.
 
     The reviewer starts while the writer is still working, so the
@@ -292,65 +269,25 @@ class ReviewLauncherFixture(unittest.TestCase):
     reconciles it against the diff it never saw.
     """
 
-    fixture_seed: ClassVar[Path]
-
-    temporary: tempfile.TemporaryDirectory[str]  # pyright: ignore[reportUninitializedInstanceVariable]
-    root: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    history_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    working_dir: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    config_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    review_script: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-    prompt_file: Path  # pyright: ignore[reportUninitializedInstanceVariable]
-
-    @classmethod
-    @override
-    def setUpClass(cls) -> None:
-        super().setUpClass()
-        seed_directory = tempfile.TemporaryDirectory()
-        cls.addClassCleanup(seed_directory.cleanup)
-        cls.fixture_seed = Path(seed_directory.name)
-        seed = cls("runTest")
-        seed.root = cls.fixture_seed
-        seed.prepare_fixture()
+    review_script: Path = Path()
 
     @override
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
-        # Private files and Git objects/index/refs: mutations never reach another test.
-        _ = shutil.copytree(self.fixture_seed, self.root, dirs_exist_ok=True)
-        self.history_dir = self.root / "history"
-        self.working_dir = self.root / "project"
-        self.config_file = self.root / "direct.conf"
-        self.prompt_file = self.root / "review_prompt.md"
+        super().setUp()
+        self.prompt_file: Path = self.root / "review_prompt.md"
         self.review_script = self.root / "scripts" / "direct" / "review.sh"
 
+    @override
     def prepare_fixture(self) -> None:
-        self.history_dir = self.root / "history"
-        self.working_dir = self.root / "project"
-        self.working_dir.mkdir()
-        _ = subprocess.run(
-            ["git", "init", "-b", "feature/review"],
-            cwd=self.working_dir,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self.config_file = self.root / "direct.conf"
-        _ = self.config_file.write_text(
-            "\n".join([
+        self.prepare_project(
+            "feature/review", "review_prompt.md", "Review the diff.\n",
+            (
                 "UNIT_PROGRESS_INTERVAL_SECONDS=180",
                 "UNIT_COMPACT_ABOVE_TOKENS=100000",
                 "ROUTING_FROM_ROUND=4", "ASTRA_AFTER_FAILED_FIXES=2",
                 "",
-            ]),
-            encoding="utf-8",
+            ), AGENTS_REGISTRY,
         )
-        registry = self.root / ".claude" / "config" / "agents.conf"
-        registry.parent.mkdir(parents=True)
-        _ = write_registry(registry, base_text=AGENTS_REGISTRY)
-        self.prompt_file = self.root / "review_prompt.md"
-        _ = self.prompt_file.write_text("Review the diff.\n", encoding="utf-8")
         reviewed = self.working_dir / "reviewed.txt"
         _ = reviewed.write_text("original\n", encoding="utf-8")
         _ = subprocess.run(
@@ -371,10 +308,6 @@ class ReviewLauncherFixture(unittest.TestCase):
         )
         self.review_script = self.build_script_tree()
 
-    @override
-    def tearDown(self) -> None:
-        self.temporary.cleanup()
-
     def build_script_tree(self) -> Path:
         """Copy the real wrapper beside a stub agent, so nothing calls a model.
 
@@ -382,43 +315,13 @@ class ReviewLauncherFixture(unittest.TestCase):
         Mesh, agent execution and pool allocation are controlled so tests spend
         no model tokens. The real heartbeat watcher uses a short interval.
         """
-        direct_dir = self.root / "scripts" / "direct"
-        agents = self.root / "scripts" / "agents"
-        lib = self.root / "scripts" / "lib"
-        direct_dir.mkdir(parents=True)
-        agents.mkdir(parents=True)
-        lib.mkdir(parents=True)
-        production = self.root / "scripts" / "production"
-        production.mkdir(parents=True)
-        _ = shutil.copy2(DIRECT_DIR.parent / "production" / "showrunners.py", production / "showrunners.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "production" / "production_doc.py", production / "production_doc.py")
-        # The wrapper reaches python3 through ../lib/py, resolved from its own
-        # directory.
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "py", lib / "py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "atomic_file.py", lib / "atomic_file.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "user_zone.py", lib / "user_zone.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "unit_runs.py", lib / "unit_runs.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "agents_registry.py", lib / "agents_registry.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "codex_models_cache.py", lib / "codex_models_cache.py")
-        _ = shutil.copy2(DIRECT_DIR.parent / "lib" / "probe_session.py", lib / "probe_session.py")
-        for name in (
-            "review.sh", "implement.sh", "progress_history.py", "plan_history.py", "phase_reservation.py", "recorder_state.py",
-            "findings.py", "review_tree.py", "board.sh", "worker_name.sh", "worker_state.py", "tag_inventory.py",
-        ):
+        direct_dir, agents, lib = prepare_launcher_runtime(self.root)
+        _ = shutil.copy2(DIRECT_DIR.parent / "production/showrunners.py",
+                         self.root / "scripts/production/showrunners.py")
+        _ = shutil.copy2(DIRECT_DIR.parent / "lib/probe_session.py", lib / "probe_session.py")
+        for name in ("review.sh", "review_tree.py", "tag_inventory.py"):
             _ = shutil.copy2(DIRECT_DIR / name, direct_dir / name)
-        recorder = direct_dir / "progress_history.py"
-        _ = recorder.write_text(recorder.read_text().replace(
-            "from __future__ import annotations\n",
-            "from __future__ import annotations\n" + LEGACY_RECORDER_ARGUMENTS, 1,
-        ))
-        launcher = direct_dir / "review.sh"
-        _ = launcher.write_text(
-            launcher.read_text(encoding="utf-8").replace(
-                "HEARTBEAT_INTERVAL_SECS=60", "HEARTBEAT_INTERVAL_SECS=1"
-            ), encoding="utf-8",
-        )
-        for name in ("agents_config.sh", "agents_overlay.sh", "agents_overlay.awk", "heartbeat.sh", "heartbeat_watch.sh"):
-            _ = shutil.copy2(AGENTS_DIR / name, agents / name)
+        configure_launcher_fixture(direct_dir / "review.sh")
         stub = agents / "agent_exec.sh"
         _ = stub.write_text(STUB_AGENT_EXEC, encoding="utf-8")
         stub.chmod(0o755)
@@ -429,28 +332,12 @@ class ReviewLauncherFixture(unittest.TestCase):
         _ = (direct_dir / "workers.py").write_text(STUB_WORKERS, encoding="utf-8")
         return direct_dir / "review.sh"
 
+    @override
     def environment(self) -> dict[str, str]:
-        environment = os.environ.copy()
-        environment["HOME"] = str(self.root)
-        environment["XDG_CACHE_HOME"] = str(self.root / "cache")
-        cache = self.root / "cache" / "claude" / "python3-3.11"
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        _ = cache.write_text(sys.executable + "\n")
-        _ = environment.pop("CLAUDE_PYTHON", None)
+        environment = launcher_environment(self.root)
         environment["UNIT_EARLY_POLL_SECS"] = "0.01"
-        environment["UNIT_WORKER_POLL_SECS"] = "0.01"
-        environment["UNIT_WORKER_WAIT_ATTEMPTS"] = "30000"
-        environment["UNIT_SYNC_WRITES"] = "0"
         environment["TEST_WAIT_HELPER_DIR"] = str(DIRECT_DIR.resolve())
-        environment["UNIT_HISTORY_DIR"] = str(self.history_dir)
-        environment["TEST_LEGACY_LAUNCH"] = "1"
-        environment["UNIT_CONFIG"] = str(self.config_file)
-        environment["AGENTS_CONFIG_FILE"] = str(self.root / ".claude" / "config" / "agents.conf")
-        environment["TZ"] = "UTC"
-        environment["USER_ZONE"] = "UTC"
         environment["REVIEW_POOL_STATE"] = str(self.root / "pool-state")
-        _ = environment.pop("CODEX_THREAD_ID", None)
-        _ = environment.pop("CLAUDE_CODE_SESSION_ID", None)
         # Early mode starts a detached Stage 2 run; the stub records its arguments instead.
         mesh_runs = self.root / "mesh_runs_stub.py"
         if not mesh_runs.exists():
@@ -462,12 +349,6 @@ class ReviewLauncherFixture(unittest.TestCase):
         environment["MESH_RUNS_CALLS"] = str(self.root / "mesh_runs_calls.jsonl")
         return environment
 
-    def recorder(self, *arguments: str) -> None:
-        environment = self.environment()
-        environment["UNIT_PASS_OWNER"] = "launcher"
-        result = invoke_recorder(arguments, environment, Path.cwd())
-        self.assertEqual(result.returncode, 0, result.stderr)
-
     def checked_review(
         self, session: Path, *options: str, lens: str = "", early: str = "",
     ) -> subprocess.CompletedProcess[str]:
@@ -477,30 +358,17 @@ class ReviewLauncherFixture(unittest.TestCase):
         return subprocess.run(
             ["bash", str(self.review_script), *options, str(session), str(self.working_dir),
              str(self.prompt_file), "review", "blind review", "reviewing the diff", "1", lens, early],
-            check=False, capture_output=True, text=True, env=environment, timeout=TEST_HANG_GUARD_SECS,
+            check=False, capture_output=True, text=True, env=environment, timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def finish_early_launcher(self, process: subprocess.Popen[str], ready: Path,
-                              finish: Path, timeout: float = TEST_HANG_GUARD_SECS) -> tuple[str, str]:
+                              finish: Path, timeout: float = test_hang_guard.TEST_HANG_GUARD_SECS) -> tuple[str, str]:
         ready.touch()
         finish.touch()
         return communicate_launcher(process, timeout)
 
     def start_implementation(self, name: str) -> Path:
-        session_dir = self.root / name
-        session_dir.mkdir()
-        plan = self.working_dir / "plan.md"
-        _ = plan.write_text("## Delegation Context\n\n- **Project:** Test\n", encoding="utf-8")
-        self.recorder(
-            "start-run", "--session-dir", str(session_dir),
-            "--working-dir", str(self.working_dir), "--plan-doc", "plan.md",
-            "--main-family", "codex", "--main-model", "gpt-main",
-            "--main-effort", "xhigh", "--main-session-id", f"main-{name}",
-        )
-        self.recorder(
-            "start-phase", "--session-dir", str(session_dir),
-            "--phase-id", "3", "--phase-title", "Retry handling",
-        )
+        session_dir = self.start_phase(name)
         self.recorder(
             "start-pass", "--session-dir", str(session_dir), "--phase-id", "3",
             "--pass-kind", "impl", "--activity", "writing the retry path",
@@ -531,7 +399,7 @@ class ReviewLauncherFixture(unittest.TestCase):
             capture_output=True,
             text=True,
             env=self.environment(),
-            timeout=TEST_HANG_GUARD_SECS,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def run_assigned_review(
@@ -554,7 +422,7 @@ class ReviewLauncherFixture(unittest.TestCase):
             capture_output=True,
             text=True,
             env=environment,
-            timeout=TEST_HANG_GUARD_SECS,
+            timeout=test_hang_guard.TEST_HANG_GUARD_SECS,
         )
 
     def finish_implementation(self, session_dir: Path) -> None:
@@ -670,5 +538,5 @@ os.execv(sys.executable, [sys.executable, str(Path(__file__).with_name("progress
             environment["STUB_REVIEW_COMMIT"] = "1"
         command = self.pool_command(session)
         command[2:2] = ["--phase", "3"]
-        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=False, timeout=test_hang_guard.TEST_HANG_GUARD_SECS)
         return result, session / "phases" / "3"

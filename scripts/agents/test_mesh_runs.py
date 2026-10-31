@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 from scripts.agents import codex_mesh, mesh_runs
 from scripts.buildlog import treekey
 from scripts.astra import design_roles
+from scripts.lib.test_hang_guard import LauncherHangGuard
 from scripts.lib.socket_test_support import short_socket_directory
 
 WORKER = "unit-impl"
@@ -176,17 +177,18 @@ class MeshRunsTests(unittest.TestCase):
         command line names mesh_runs.py supervise and the record, unless pid names another process."""
         path = self.record(command)
         if not pid:
+            guard = LauncherHangGuard("detached supervisor startup and cleanup")
             stand_in = subprocess.Popen([sys.executable, "-c",
                                          "import sys; print('ready', flush=True); sys.stdin.read()",
                                          "mesh_runs.py", "supervise", str(path)],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-            self.addCleanup(stand_in.wait)
+            self.addCleanup(lambda: stand_in.wait(timeout=guard.remaining()))
             self.addCleanup(stand_in.kill)
             assert stand_in.stdin is not None and stand_in.stdout is not None
             self.addCleanup(stand_in.stdin.close)
             self.addCleanup(stand_in.stdout.close)
             # Wait for Python to start before the test reads the child's command line.
-            self.assertTrue(select.select([stand_in.stdout], [], [], 300)[0], "supervisor did not start")
+            self.assertTrue(select.select([stand_in.stdout], [], [], guard.remaining())[0], "supervisor did not start")
             self.assertEqual(stand_in.stdout.readline(), "ready\n")
             pid = stand_in.pid
         self.update_record(path, cwd=os.getcwd(), tree_key="key-1", pid=pid)

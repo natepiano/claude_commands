@@ -39,8 +39,11 @@ class ScriptedServer:
         self.changes: list[str] = []
         self.opened: str = ""
         self.documents: dict[Path, str] = {}
+        self.sources: bulk.RunSourceIndex = bulk.RunSourceIndex(self)
+        self.derive_origins: dict[str, bulk.DefinitionTarget] = {}
 
     def open(self, path: Path, text: str) -> None:
+        self.sources.update(path, text)
         if path in self.documents:
             self.change(path, text)
         else:
@@ -48,6 +51,7 @@ class ScriptedServer:
             self.documents[path] = text
 
     def change(self, path: Path, text: str) -> None:
+        self.sources.update(path, text)
         self.documents[path] = text
         self.changes.append(text)
 
@@ -60,6 +64,9 @@ class ScriptedServer:
         answers: list[bulk.DefinitionResolution] = []
         for offset in offsets:
             token = next(span.token.value for span in spans if span.start == offset)
+            if token in self.derive_origins:
+                answers.append(self.derive_origins[token])
+                continue
             declaration = next(span for span in spans if span.token.value == token)
             begin, end = bulk.lsp_position(text, declaration.start), bulk.lsp_position(text, declaration.end)
             answers.append(bulk.DefinitionTarget(path.as_uri(), (begin["line"], begin["character"]),
@@ -113,6 +120,18 @@ class CargoProjectTests(unittest.TestCase):
     def rename(self, source: str, findings: tuple[bulk.RenameFinding, ...], server: ScriptedServer) -> bulk.FileRenames:
         return bulk.rename_file(server, self.repo / "src/lib.rs", "src/lib.rs", source, findings, bulk.repository_docs(self.repo))
 
+    def derive_server(self, edit: Callable[[str, int, str], tuple[bulk.SourceEdit, ...]]) -> ScriptedServer:
+        server = ScriptedServer(edit)
+        for package, names in (("serde_derive", ("Serialize", "Deserialize")), ("clap_derive", ("Parser", "Args"))):
+            folder = self.root / package
+            folder.mkdir(exist_ok=True)
+            _ = (folder / "Cargo.toml").write_text('[package]\nname="' + package + '"\nversion="1.0.0"\n')
+            source = folder / "lib.rs"
+            _ = source.write_text("fn derive() {}\n")
+            for name in names:
+                server.derive_origins[name] = bulk.DefinitionTarget(source.as_uri(), (0, 3), (0, 9))
+        return server
+
     def ledger(self) -> style_ledger.Ledger:
         rule_folder = self.root / "style/rust"
         rule_folder.mkdir(parents=True, exist_ok=True)
@@ -141,6 +160,212 @@ class CargoProjectTests(unittest.TestCase):
 
 
 class RenameTests(CargoProjectTests):
+    def test_parameter_own_docs_are_coordinated_without_editing_external_or_neighbor_docs(self) -> None:
+        source = ("/// Neighbor uses `old`.\nfn neighbor() {}\n"
+                  "/// Add `old`; older is ordinary prose.\nfn run(old: usize) -> usize { old + 1 }\n")
+        _ = (self.repo / "README.md").write_text("Call run with `old`.\n")
+        result = self.rename(source, (self.finding(source, line=4),), ScriptedServer(
+            lambda text, offset, new: word_edits(text, "old", new)))
+        self.assertEqual(result.refusals, ())
+        self.assertEqual(result.edited, source[:source.index("/// Add")] + source[source.index("/// Add"):].replace("`old`", "`number`").replace("run(old:", "run(number:").replace("{ old +", "{ number +"))
+        self.assertEqual((self.repo / "README.md").read_text(), "Call run with `old`.\n")
+
+    def test_parameter_ambiguous_doc_word_refuses_without_an_overlay(self) -> None:
+        for doc in ("/// The old behavior is retained.", "/** The old behavior is retained. */"):
+            with self.subTest(doc=doc):
+                source = doc + "\nfn run(old: usize) -> usize { old + 1 }\n"
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+                result = self.rename(source, (self.finding(source),), server)
+                self.assertEqual(result.edited, source)
+                self.assertIn("parameter doc word is ambiguous", result.refusals[0].reason)
+                self.assertEqual(server.calls, [])
+
+    def test_parameter_refactor_cannot_change_a_neighbors_doc_comment(self) -> None:
+        source = '/// Neighbor mentions `old`.\nfn neighbor() {}\n/// Use `old`.\nfn run(old: usize) -> usize { old }\n'
+        def edits(text: str, _offset: int, new: str) -> tuple[bulk.SourceEdit, ...]:
+            start = text.index('old')
+            return (*word_edits(text, 'old', new), bulk.SourceEdit(start, start + 3, new))
+        server = ScriptedServer(edits)
+        result = self.rename(source, (self.finding(source, line=4),), server)
+        self.assertEqual(result.edited, source)
+        self.assertIn('outside its proved comment mentions', result.refusals[0].reason)
+        self.assertEqual(server.documents[self.repo / 'src/lib.rs'], source)
+
+    def test_clap_field_keeps_its_argument_id_and_generated_value_name(self) -> None:
+        for kind, expected in (('bool', '#[arg(id = "old", long = "old")]'),
+                               ('usize', '#[arg(id = "old", long = "old", value_name = "OLD")]')):
+            with self.subTest(kind=kind):
+                source = '#[derive(clap::Parser)]\nstruct R {\n #[arg(long)] old: ' + kind + ',\n #[arg(long, requires = "old")] dependent: bool,\n}\n'
+                server = self.derive_server(lambda text, offset, new: word_edits(text, 'old', new))
+                result = self.rename(source, (self.finding(source, line=3),), server)
+                self.assertEqual(result.refusals, ())
+                self.assertIn(expected + ' number: ' + kind, result.edited)
+                self.assertIn('requires = "old"', result.edited)
+
+    def test_clap_unproved_id_positional_and_help_forms_refuse_before_rename(self) -> None:
+        for attribute, kind in (('#[arg(id = "custom", long)]', 'bool'),
+                                ('', 'usize'), ('#[arg(long, value_name = "VALUE")]', 'usize'),
+                                ('#[arg(long, help = "Use old")]', 'bool'),
+                                ('/// Use `old`.\n #[arg(long)]', 'bool'),
+                                ('#[arg(long)]', 'String')):
+            with self.subTest(attribute=attribute, kind=kind):
+                source = '#[derive(clap::Parser)]\nstruct R {\n ' + attribute + ' old: ' + kind + ',\n}\n'
+                line = next(i for i, text in enumerate(source.splitlines(), 1) if ' old:' in text)
+                server = self.derive_server(lambda text, offset, new: word_edits(text, 'old', new))
+                result = self.rename(source, (self.finding(source, line=line),), server)
+                self.assertEqual(result.kept, ())
+                self.assertIn('derive field CLI', result.refusals[0].reason)
+                self.assertEqual(server.calls, [])
+                self.assertEqual(server.documents[self.repo / 'src/lib.rs'], source)
+
+    def test_parameter_intra_doc_links_are_not_parameter_mentions(self) -> None:
+        for mention in ('[old]', '[`old`]', '[the function](old)', '[call]: old', '[call]: `old`'):
+            with self.subTest(mention=mention):
+                source = 'fn old() {}\n/// Call ' + mention + '\nfn run(old: usize) -> usize { old }\n'
+                server = ScriptedServer(lambda text, offset, new: tuple(
+                    edit for edit in word_edits(text, 'old', new) if edit.start >= offset))
+                result = self.rename(source, (self.finding(source, line=3),), server)
+                self.assertEqual(result.kept, ())
+                self.assertIn('parameter doc', result.refusals[0].reason)
+                self.assertEqual(server.calls, [])
+                self.assertEqual(server.documents[self.repo / 'src/lib.rs'], source)
+
+    def test_outer_parameter_preserves_nested_item_docs_and_refuses_analyzer_doc_edits(self) -> None:
+        source = '/// Outer `old`.\nfn run(old: usize) -> usize {\n /// Inner `old`.\n fn inner(old: usize) -> usize { old }\n old + inner(1)\n}\n'
+        nested = source.index('Inner `old`') + len('Inner `')
+        def edits(text: str, _offset: int, new: str) -> tuple[bulk.SourceEdit, ...]:
+            return tuple(edit for edit in word_edits(text, 'old', new)
+                         if edit.start < text.index('fn inner') or edit.start > text.index(' old + inner'))
+        for malicious in (False, True):
+            with self.subTest(malicious=malicious):
+                server = ScriptedServer(lambda text, offset, new: (
+                    *edits(text, offset, new), *((bulk.SourceEdit(nested, nested + 3, new),) if malicious else ())))
+                result = self.rename(source, (self.finding(source, line=2),), server)
+                if malicious:
+                    self.assertEqual(result.kept, ())
+                    self.assertIn('outside its proved comment mentions', result.refusals[0].reason)
+                    self.assertEqual(server.documents[self.repo / 'src/lib.rs'], source)
+                else:
+                    self.assertEqual(result.refusals, ())
+                    self.assertIn('/// Outer `number`.', result.edited)
+                    self.assertIn('/// Inner `old`.\n fn inner(old: usize) -> usize { old }', result.edited)
+                    self.assertIn(' number + inner(1)', result.edited)
+
+    def test_derive_fields_freeze_wire_and_implicit_long_names(self) -> None:
+        for derive, attribute, expected in (
+                ("serde::Serialize, serde::Deserialize, Clone", "", '#[serde(rename = "old")]'),
+                ("clap::Parser", "#[arg(long)]", '#[arg(id = "old", long = "old", value_name = "OLD")]'),
+                ("serde::Serialize, clap::Args", "#[arg(long)]", '#[serde(rename = "old")] #[arg(id = "old", long = "old", value_name = "OLD")]')):
+            with self.subTest(derive=derive):
+                source = '#[derive(' + derive + ')]\nstruct R {\n ' + attribute + ' old: usize,\n}\n'
+                result = self.rename(source, (self.finding(source, line=3),), self.derive_server(
+                    lambda text, offset, new: word_edits(text, "old", new)))
+                self.assertEqual(result.refusals, ())
+                self.assertIn(expected + ' number: usize', result.edited)
+                self.assertTrue(bulk.file_edits_preserved(result, result.edited.replace(' usize', '  usize')))
+                self.assertFalse(bulk.file_edits_preserved(result, result.edited.replace('"old"', '"number"')))
+
+    def test_cli_snake_case_flag_keeps_its_original_kebab_case(self) -> None:
+        source = '#[derive(clap::Parser)]\nstruct R {\n #[arg(long)] old_name: usize,\n}\n'
+        result = self.rename(source, (self.finding(source, 'old_name', 'number', 3),), self.derive_server(
+            lambda text, offset, new: word_edits(text, 'old_name', new)))
+        self.assertEqual(result.refusals, ())
+        self.assertIn('#[arg(id = "old_name", long = "old-name", value_name = "OLD_NAME")] number:', result.edited)
+
+    def test_derive_field_unproved_names_and_metadata_are_refused(self) -> None:
+        for derive, outer, field in (
+                ('serde::Serialize', '#[serde(rename_all = "camelCase")]', ''),
+                ('serde::Serialize', '', '#[serde(rename = "wire")]'),
+                ('serde::Serialize', '', '#[serde(flatten)]'),
+                ('serde::Serialize, Unknown', '', ''),
+                ('clap::Parser', '', '#[arg(long = "flag")]'),
+                ('clap::Parser', '#[command(rename_all = "camelCase")]', '#[arg(long)]'),
+                ('clap::Parser', '', '#[arg(short, long)]'),
+                ('serde::Serialize', '', '#[cfg_attr(unix, serde(rename = "wire"))]')):
+            with self.subTest(derive=derive, outer=outer, field=field):
+                source = '#[derive(' + derive + ')] ' + outer + '\nstruct R {\n ' + field + ' old: usize,\n}\n'
+                server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+                result = self.rename(source, (self.finding(source, line=3),), server)
+                self.assertEqual(result.edited, source)
+                self.assertRegex(result.refusals[0].reason, 'derive field.*(unproved|already|flatten|requires)')
+                self.assertEqual(server.calls, [])
+
+    def test_familiar_derive_spelling_requires_its_provider_definition(self) -> None:
+        source = '#[derive(serde::Serialize)]\nstruct R { old: usize }\n'
+        for provider in ('missing', 'same_crate', 'other_crate'):
+            with self.subTest(provider=provider):
+                server = self.derive_server(lambda text, offset, new: word_edits(text, 'old', new))
+                if provider == 'missing':
+                    server.derive_origins['Serialize'] = bulk.DefinitionTarget((self.repo / 'src/lib.rs').as_uri(), (0, 16), (0, 25))
+                elif provider == 'same_crate':
+                    _ = (self.repo / 'Cargo.toml').write_text('[package]\nname="serde_derive"\nversion="1.0.0"\n')
+                    server.derive_origins['Serialize'] = bulk.DefinitionTarget((self.repo / 'src/lib.rs').as_uri(), (0, 16), (0, 25))
+                else:
+                    _ = (self.root / 'serde_derive/Cargo.toml').write_text('[package]\nname="other_derive"\nversion="1.0.0"\n')
+                result = self.rename(source, (self.finding(source),), server)
+                self.assertEqual(result.edited, source)
+                self.assertIn('derive field origin unproved', result.refusals[0].reason)
+                self.assertEqual(server.calls, [])
+
+    def test_refactor_cannot_overwrite_the_preserved_field_attribute(self) -> None:
+        source = '#[derive(clap::Parser)]\nstruct R { #[arg(long)] old: usize }\n'
+        def edits(text: str, _offset: int, new: str) -> tuple[bulk.SourceEdit, ...]:
+            start = text.index('#[arg')
+            return (*word_edits(text, 'old', new), bulk.SourceEdit(start, text.index(']', start) + 1, '#[arg(long = "changed")]'))
+        server = self.derive_server(edits)
+        result = self.rename(source, (self.finding(source),), server)
+        self.assertEqual(result.edited, source)
+        self.assertIn('overlaps the preserved external name', result.refusals[0].reason)
+        self.assertEqual(server.documents[self.repo / 'src/lib.rs'], source)
+
+    def test_f009_several_globs_and_proof_share_one_coverage_walk(self) -> None:
+        source = ''.join(f"mod provider{i} {{}} use provider{i}::*;\n" for i in range(5))
+        source += "fn f() { let old = 1; consume(old); }\n"
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
+        with mock.patch.object(bulk, "crate_source_coverage", wraps=bulk.crate_source_coverage) as walk:
+            result = self.rename(source, (self.finding(source, line=6),), server)
+        self.assertEqual(result.refusals, ())
+        self.assertEqual(walk.call_count, 1)
+
+    def test_f007_index_reads_once_and_tracks_accepted_and_rolled_back_edits(self) -> None:
+        root, child = self.repo / "src/lib.rs", self.repo / "src/child.rs"
+        source = "mod child; fn f() { let old = 1; consume(old); }\n"
+        other = "fn f() { let other = 2; consume(other); }\n"
+        _ = root.write_text(source)
+        _ = child.write_text(other)
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, "old" if new == "number" else "other", new))
+        read_text = Path.read_text
+        reads: list[Path] = []
+        def read(path: Path, *_args: object, **_kwargs: object) -> str:
+            reads.append(path)
+            return read_text(path)  # All indexed sources use the same UTF-8 text boundary.
+        with mock.patch.object(Path, "read_text", read), mock.patch.object(
+                bulk, "crate_source_coverage", wraps=bulk.crate_source_coverage) as walk:
+            self.assertEqual(bulk.crate_name_documents(server, root, "number"), ())
+            edit = {"changes": {child.as_uri(): [{"range": {"start": {"line": 0, "character": 0},
+                                                             "end": {"line": 0, "character": 0}}, "newText": "// note\n"}]}}
+            with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("WorkspaceEdit reread indexed source")):
+                workspace = bulk.workspace_edits(edit, root, source, 1,
+                                                  read_source=lambda path: server.sources.read(path).source)
+            self.assertEqual(workspace.documents[0].source, other)
+            accepted = self.rename(source, (self.finding(source, line=1),), server)
+            self.assertEqual(accepted.refusals, ())
+            self.assertEqual({doc.path for doc in bulk.crate_name_documents(server, root, "number")}, {root})
+            definitions = server.definitions
+            def refuse(path: Path, text: str, offsets: tuple[int, ...]) -> tuple[bulk.DefinitionResolution, ...]:
+                if "count" in text:
+                    return tuple(bulk.DefinitionUnavailable("test rollback") for _ in offsets)
+                return definitions(path, text, offsets)
+            with mock.patch.object(server, "definitions", side_effect=refuse):
+                rolled_back = bulk.rename_file(server, child, "src/child.rs", other,
+                                               (self.finding(other, "other", "count", 1),))
+            self.assertIn("test rollback", rolled_back.refusals[0].reason)
+            self.assertEqual(server.documents[child], other)
+            self.assertEqual(bulk.crate_name_documents(server, root, "count"), ())
+            self.assertIn("number", bulk.crate_name_documents(server, root, "number")[0].source)
+        self.assertEqual((reads.count(root), reads.count(child)), (1, 1))
+        self.assertEqual(walk.call_count, 1)
+
     def test_direct_call_and_multiple_bindings_use_the_refactor(self) -> None:
         source = "fn f() { let first = 1; let second = consume(first); }\n"
         findings = (self.finding(source, "first", "first_number", 1, "first"),
@@ -154,7 +379,7 @@ class RenameTests(CargoProjectTests):
 
     def test_comments_and_parameter_docs_include_prose(self) -> None:
         for source, line in (("fn run() {\n let old = 1;\n // old is useful.\n let _ = old + 1;\n}\n", 2),
-                             ("/// Use `old` and [old].\nfn run(old: usize) -> usize { old + 1 }\n", 2)):
+                             ("/// Use `old` twice: `old`.\nfn run(old: usize) -> usize { old + 1 }\n", 2)):
             result = self.rename(source, (self.finding(source, line=line),), ScriptedServer(
                 lambda text, offset, new: word_edits(text, "old", new)))
             self.assertEqual(result.refusals, ())
@@ -172,7 +397,7 @@ class RenameTests(CargoProjectTests):
     def test_capture_and_external_text_guards_precede_edits(self) -> None:
         for source, line, cause in (
                 ("fn f() {\n let old = 1;\n let number = old + 1;\n}\n", 2, "capture 'number'"),
-                ("#[derive(serde::Serialize)]\nstruct R {\n old: usize,\n}\n", 3, "derive field"),
+                ("#[derive(serde::Serialize)]\nstruct R {\n #[serde(rename = \"wire\")] old: usize,\n}\n", 3, "derive field"),
                 ("#[derive(Wire)]\nstruct R {\n old: usize,\n}\n", 3, "custom derive may expose names: Wire"),
                 ("pub struct R {\n pub old: usize,\n}\n", 2, "public item of a published crate")):
             server = ScriptedServer(lambda text, offset, new: word_edits(text, "old", new))
@@ -425,8 +650,41 @@ class SourceCoverageTests(CargoProjectTests):
         self.assertFalse(bulk.module_exports(server, root, source, module, "number", set()))
         self.assertTrue(bulk.module_exports(server, root, source, module, "replacement", set()))
 
+    def test_f008_twice_loaded_unrelated_glob_provider_needs_no_instance_query(self) -> None:
+        root = self.repo / "src/lib.rs"
+        source = '#[path="shared.rs"] mod first; #[path="shared.rs"] mod second; use first::*; fn old() {}'
+        _ = self.write_modules({"src/lib.rs": source, "src/shared.rs": "pub fn unrelated() {}"})
+        server = self.server()
+        module = bulk.glob_modules(bulk.BindingText(source))[0]
+        try:
+            self.assertFalse(bulk.module_exports(server, root, source, module, "number", set()))
+            self.assertTrue(bulk.module_exports(server, root, source, module, "unrelated", set()))
+        except bulk.BulkRenameError as error:
+            self.fail(str(error))
+
 
 class ProtocolTests(CargoProjectTests):
+    def test_f006_non_shorthand_multi_target_stays_unresolved(self) -> None:
+        source = "fn f() {} fn g() {}"
+        root = self.repo / "src/lib.rs"
+        server = ScriptedServer(lambda text, offset, new: ())
+        server.open(root, source)
+        rows = [{"uri": root.as_uri(), "range": {"start": bulk.lsp_position(source, point),
+                                                   "end": bulk.lsp_position(source, point + 1)}}
+                for point in (source.index("f()"), source.index("g()"))]
+        result = bulk.definition_result(rows, server.sources, source, source.index("f()"))
+        self.assertIsInstance(result, bulk.DefinitionUnavailable)
+        self.assertIn("ambiguous definition", cast(bulk.DefinitionUnavailable, result).reason)
+        source = ("macro_rules! fields { () => { struct R { number: usize } } }\n"
+                  + "fn f() { let number = 1; let _ = R { number }; }")
+        server.open(root, source)
+        rows = [{"uri": root.as_uri(), "range": {"start": bulk.lsp_position(source, point),
+                                                   "end": bulk.lsp_position(source, point + len("number"))}}
+                for point in (source.index("number"), source.index("number", source.index("fn f")))]
+        result = bulk.definition_result(rows, server.sources, source, source.rindex("number"))
+        self.assertIsInstance(result, bulk.DefinitionUnavailable)
+        self.assertIn("ambiguous definition", cast(bulk.DefinitionUnavailable, result).reason)
+
     def test_stdio_handshake_enables_build_scripts_and_proc_macros_and_prepares_each_rename(self) -> None:
         folder = self.root / "bin"
         folder.mkdir()
@@ -795,6 +1053,50 @@ class RustAnalyzerTests(CargoProjectTests):
     def set_up_tools(self) -> None:
         """Keep the caller's PATH, CARGO_HOME and RUSTUP_HOME."""
 
+    def test_real_f006_shorthand_preserves_both_targets_and_detects_either_capture(self) -> None:
+        source = ("struct Pair { old: usize }\nstruct R { number: usize }\n"
+                  + "fn f() { let number = 1; let _ = R { number }; let _ = Pair { old: number }; }\n")
+        root = self.repo / "src/lib.rs"
+        _ = root.write_text(source)
+        with bulk.RustAnalyzer(self.repo, timeout=120) as analyzer:
+            definitions = analyzer.definitions
+            pairs: list[bulk.FieldShorthandTargets] = []
+            changed_role = ""
+            def answers(path: Path, text: str, offsets: tuple[int, ...]) -> tuple[bulk.DefinitionResolution, ...]:
+                result = list(definitions(path, text, offsets))
+                for i, answer in enumerate(result):
+                    if isinstance(answer, bulk.FieldShorthandTargets):
+                        pairs.append(answer)
+                        if changed_role and "struct Pair { number" in text:
+                            result[i] = (replace(answer, field=replace(answer.field, end=(99, 0))) if changed_role == "field"
+                                         else replace(answer, binding=replace(answer.binding, end=(99, 0))))
+                return tuple(result)
+            with mock.patch.object(analyzer, "definitions", side_effect=answers):
+                result = bulk.rename_file(analyzer, root, "src/lib.rs", source, (self.finding(source, line=1),))
+                self.assertEqual(result.refusals, ())
+                self.assertIn("Pair { number }", result.edited)
+                self.assertEqual(len(pairs), 3)
+                self.assertEqual(pairs[0], pairs[1])
+                self.assertEqual(pairs[1].binding, pairs[2].binding)
+                self.assertNotEqual(pairs[1].field, pairs[2].field)
+                for changed_role in ("field", "binding"):
+                    analyzer.open(root, source)
+                    captured = bulk.rename_file(analyzer, root, "src/lib.rs", source, (self.finding(source, line=1),))
+                    self.assertEqual(captured.kept, ())
+                    self.assertIn("capture 'number'", captured.refusals[0].reason)
+                    self.assertEqual(analyzer.documents[root], source)
+
+    def test_real_f008_twice_loaded_unrelated_glob_allows_rename(self) -> None:
+        source = ('#[path="shared.rs"] mod first; #[path="shared.rs"] mod second;\n'
+                  + 'use first::*; fn f() { let old = 1; consume(old); }\nfn consume(_: usize) {}\n')
+        _ = (self.repo / "src/lib.rs").write_text(source)
+        _ = (self.repo / "src/shared.rs").write_text("pub fn unrelated() {}\n")
+        with bulk.RustAnalyzer(self.repo, timeout=120) as analyzer:
+            result = bulk.rename_file(analyzer, self.repo / "src/lib.rs", "src/lib.rs", source,
+                                      (self.finding(source),))
+        self.assertEqual(result.refusals, ())
+        self.assertIn("consume(number)", result.edited)
+
     def test_real_lsp_renames_all_site_kinds_shorthand_captures_and_shadowing_then_cargo_checks(self) -> None:
         source = '''struct Record { value: usize }
 pub fn run(parameter: usize) -> usize {
@@ -979,15 +1281,59 @@ pub fn run(parameter: usize) -> usize {
         self.assertEqual(reverted, {"finding": "workspace diagnostics"})
         self.assertEqual((self.repo / "src/lib.rs").read_text(), source)
 
-    def test_real_refactor_serde_field_is_refused_before_request(self) -> None:
-        source = "#[derive(serde::Serialize)]\nstruct Options { old: usize }\n"
+    def test_real_clap_binary_keeps_requires_id_flag_help_and_usage(self) -> None:
+        source = ('use clap::{Parser, CommandFactory};\n#[derive(Parser)]\n'
+                  'struct Options {\n #[arg(long)] old: bool,\n'
+                  ' #[arg(long, requires = "old")] dependent: bool,\n}\n'
+                  'fn main() {\n'
+                  ' let matches = Options::command().try_get_matches_from(["tool", "--old", "--dependent"]).unwrap();\n'
+                  ' assert_eq!(matches.get_one::<bool>("old"), Some(&true));\n'
+                  ' let parsed = Options::try_parse_from(["tool", "--old", "--dependent"]).unwrap();\n'
+                  ' assert!(parsed.old && parsed.dependent);\n'
+                  ' assert!(Options::try_parse_from(["tool", "--dependent"]).is_err());\n'
+                  ' let mut command = Options::command();\n'
+                  ' println!("{}", command.render_help());\n'
+                  ' println!("{}", command.render_long_help());\n'
+                  ' println!("{}", command.render_usage());\n}\n')
+        manifest = self.repo / 'Cargo.toml'
+        _ = manifest.write_text(manifest.read_text() + '\n[dependencies]\nclap={version="=4.6.7", features=["derive"]}\n')
+        path = self.repo / 'src/main.rs'
+        _ = path.write_text(source)
+        before = subprocess.run(['cargo', 'run', '--offline', '--quiet'], cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(before.returncode, 0, before.stdout + before.stderr)
+        with bulk.RustAnalyzer(self.repo, timeout=120) as analyzer:
+            finding = replace(self.finding(source, line=4), path='src/main.rs')
+            result = bulk.rename_file(analyzer, path, 'src/main.rs', source, (finding,))
+        self.assertEqual(result.refusals, ())
+        self.assertIn('#[arg(id = "old", long = "old")] number: bool', result.edited)
+        _ = path.write_text(result.edited)
+        after = subprocess.run(['cargo', 'run', '--offline', '--quiet'], cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
+        self.assertEqual(after.stdout, before.stdout)
+
+    def test_real_refactor_serde_field_preserves_its_wire_name(self) -> None:
+        source = ('#[derive(serde::Serialize, serde::Deserialize, clap::Parser)]\n'
+                  'struct Options { #[arg(long)] old_name: usize }\n'
+                  '#[test] fn stable_names() { use clap::{Parser, CommandFactory};\n'
+                  ' let matches = Options::command().try_get_matches_from(["tool", "--old-name", "7"]).unwrap();\n'
+                  ' assert_eq!(matches.get_one::<usize>("old_name"), Some(&7));\n'
+                  ' let help = Options::command().render_help().to_string();\n'
+                  ' assert!(help.contains("--old-name <OLD_NAME>"));\n'
+                  ' let parsed = Options::try_parse_from(["tool", "--old-name", "7"]).unwrap();\n'
+                  ' assert_eq!(serde_json::to_string(&parsed).unwrap(), "{\\\"old_name\\\":7}");\n'
+                  ' let decoded: Options = serde_json::from_str("{\\\"old_name\\\":8}").unwrap();\n'
+                  ' assert_eq!(decoded.old_name, 8); }\n')
+        manifest = self.repo / 'Cargo.toml'
+        _ = manifest.write_text(manifest.read_text() + '\n[dependencies]\nserde={version="=1.0.229", features=["derive"]}\nclap={version="=4.6.7", features=["derive"]}\nserde_json="=1.0.154"\n')
         _ = (self.repo / "src/lib.rs").write_text(source)
-        with bulk.RustAnalyzer(self.repo, timeout=120) as analyzer, mock.patch.object(
-                analyzer, "rename", wraps=analyzer.rename) as rename:
+        with bulk.RustAnalyzer(self.repo, timeout=120) as analyzer:
             result = bulk.rename_file(analyzer, self.repo / "src/lib.rs", "src/lib.rs", source,
-                                      (self.finding(source, line=2),))
-            self.assertEqual(rename.call_count, 0)
-        self.assertIn("serde/clap/confique derive field", result.refusals[0].reason)
+                                      (self.finding(source, old='old_name', line=2),))
+        self.assertEqual(result.refusals, ())
+        self.assertIn('#[serde(rename = "old_name")] #[arg(id = "old_name", long = "old-name", value_name = "OLD_NAME")] number: usize', result.edited)
+        _ = (self.repo / 'src/lib.rs').write_text(result.edited)
+        checked = subprocess.run(['cargo', 'test', '--offline', '--quiet'], cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
 
     def test_real_refactor_applies_other_documents_in_the_same_crate(self) -> None:
         source = "mod record;\nfn f(r: record::Record) -> usize { r.old }\n"

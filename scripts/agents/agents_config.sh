@@ -25,10 +25,36 @@ CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
 CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
 CODEX_PACER_TIER_FILE="${CODEX_PACER_TIER_FILE:-$HOME/.local/state/codex-pacer/tier}"
-# Readers see the committed defaults with this machine's overlay over them, and
-# writers store only the rows that differ in the overlay (agents_overlay.sh).
-# shellcheck source=/dev/null
-source "$AGENTS_CONFIG_DIR/agents_overlay.sh"
+# One shared registry for every reader and writer.
+agents_registry_text() {
+    if [[ "${AGENTS_REGISTRY_BASE+x}" == x ]]; then
+        printf '%s\n' "$AGENTS_REGISTRY_BASE"
+    else
+        cat "$AGENTS_CONFIG_FILE"
+    fi
+}
+
+# Validation and transformation see the same snapshot. Storage alone reads the
+# latest file and replays the intended row delta onto concurrent changes.
+agents_registry_edit() {
+    local AGENTS_REGISTRY_BASE
+    AGENTS_REGISTRY_BASE="$(cat "$AGENTS_CONFIG_FILE")" || return 1
+    "$@"
+}
+
+# All editors use the same atomic row replay and publication path. The caller's
+# local snapshot identifies its changes without reverting a concurrent editor.
+agents_registry_store() {
+    local registry="$1" description="${2:-update registry}" result=0
+    local extra=()
+    [[ "${3:-}" != additive-catalog ]] || extra+=(--additive-catalog)
+    "$AGENTS_CONFIG_DIR/../lib/py" "$AGENTS_CONFIG_DIR/../lib/agents_registry.py" store \
+        --registry "$AGENTS_CONFIG_FILE" --after "$registry" \
+        --before <(printf '%s\n' "$AGENTS_REGISTRY_BASE") --description "$description" \
+        "${extra[@]}" || result=$?
+    rm -f "$registry"
+    return "$result"
+}
 
 # Keep the materialized registry current between periodic launchd runs.
 if [[ "${AGENTS_CONFIG_TIER_ONLY:-}" != 1 && -f "$AGENTS_CONFIG_FILE" \
@@ -100,9 +126,7 @@ _agents_section_keys_inline() {
 # substitution. Returning early from `while read ... < <(producer)` leaves the
 # producer writing into a pipe with no reader, and every remaining printf in
 # _agents_config_section_values reports "write error: Broken pipe" on stderr.
-# On the Mac that went to /tmp/style-fix-stderr.log and nobody looked; on NixOS
-# the systemd journal carries it, which is where the 39 lines per fix run came
-# from. The functions below that read their input to the end are fine as-is.
+# Reading the complete section avoids these errors in callers and job logs.
 _agents_registry_get() {
     local section="$1" key="$2" values line row_key value
     values="$(_agents_config_section_values "$section")"
@@ -619,7 +643,9 @@ agents_list_function() {
     fi
 }
 
-agents_set_assignment() {
+agents_set_assignment() { agents_registry_edit _agents_set_assignment "$@"; }
+
+_agents_set_assignment() {
     local function="$1" family="$2" section line subtask pair tmp_file allowed_families current pinned
 
     if [[ -z "$function" || "$function" == *.* ]]; then
@@ -673,13 +699,15 @@ agents_set_assignment() {
         echo "ERROR: no [assignments] entry for '$function'; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    agents_registry_store "$tmp_file"
+    agents_registry_store "$tmp_file" "set $function assignment to $family" || return $?
 }
 
 # Switch every [assignments] entry — functions and any exact-task overrides —
 # to one family. Validated wholesale first, so a switch that would leave any
 # task unresolvable is rejected before a single line is written.
-agents_set_all_assignments() {
+agents_set_all_assignments() { agents_registry_edit _agents_set_all_assignments "$@"; }
+
+_agents_set_all_assignments() {
     local family="$1" line key fn subtask section row pinned seen="" tmp_file
     AGENT_KEPT_FUNCTIONS=""
 
@@ -764,7 +792,7 @@ agents_set_all_assignments() {
         echo "ERROR: [assignments] has no entries; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    agents_registry_store "$tmp_file"
+    agents_registry_store "$tmp_file" "set all assignments to $family" || return $?
 }
 
 # Put every function -- or just <function> -- on one agent, keeping each row's
@@ -776,7 +804,9 @@ agents_set_all_assignments() {
 # wholesale first -- a missing set, an override with no row, or a kept effort
 # the agent's catalog lacks rejects the change with the file untouched -- then
 # one awk pass writes it. Sets AGENT_SWEEP_FAMILY.
-agents_set_model() {
+agents_set_model() { agents_registry_edit _agents_set_model "$@"; }
+
+_agents_set_model() {
     local agent="$1" only="${2:-}" family line key value fn section row pair pinned
     local sections="" matched=0 tmp_file
     AGENT_KEPT_FUNCTIONS=""
@@ -892,7 +922,7 @@ agents_set_model() {
         echo "ERROR: rewrite failed; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    agents_registry_store "$tmp_file"
+    agents_registry_store "$tmp_file" "set ${only:-all functions} model to $agent" || return $?
     AGENT_SWEEP_FAMILY="$family"
 }
 
@@ -902,7 +932,9 @@ agents_set_model() {
 # `caller` included), AGENT_ROW_ACTIVE_FAMILY (what the task resolves through
 # today; empty for an undetectable caller), and AGENT_ROW_ACTIVE (yes when the
 # row's family is the one resolving today).
-agents_set_row() {
+agents_set_row() { agents_registry_edit _agents_set_row "$@"; }
+
+_agents_set_row() {
     local task="$1" pair="$2" function subtask family families active
     local section tmp_file configured pinned
 
@@ -982,7 +1014,7 @@ agents_set_row() {
         echo "ERROR: no [$section] row '$subtask'; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    agents_registry_store "$tmp_file"
+    agents_registry_store "$tmp_file" "set $task to $pair" || return $?
 
     AGENT_ROW_FAMILY="$family"
     AGENT_ROW_ASSIGNMENT="$active"
@@ -1003,7 +1035,9 @@ agents_set_row() {
 # function's last row, and a section left empty by `inherit` goes with it, so a
 # set and its inherit round-trip byte for byte. Sets AGENT_TIER_FUNCTIONS, the
 # functions in scope.
-agents_set_service_tier() {
+agents_set_service_tier() { agents_registry_edit _agents_set_service_tier "$@"; }
+
+_agents_set_service_tier() {
     local tier="$1" scope="${2:-}" function subtask="" line fn fns="" value="" tmp_file
 
     case "$tier" in
@@ -1138,7 +1172,7 @@ agents_set_service_tier() {
         echo "ERROR: rewrite failed; $AGENTS_CONFIG_FILE was not changed." >&2
         return 1
     fi
-    agents_registry_store "$tmp_file"
+    agents_registry_store "$tmp_file" "set ${scope:-all functions} service tier to $tier" || return $?
     AGENT_TIER_FUNCTIONS="${fns# }"
 }
 

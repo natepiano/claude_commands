@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import random
+import re
 import shutil
 import shlex
 import subprocess
@@ -36,7 +37,7 @@ import berth_board
 import style_footprint
 import style_ledger
 from approved_renames import (BindingComments, BindingRename, BindingScope, NoBindingScope,
-                              RenameDeclaration, rename_declaration, refactor_rename, refactor_comments,
+                              RenameDeclaration, rename_declaration, refactor_rename, refactor_comments, binding_comments,
                               PatternBindingCollision, pattern_binding_check,
                               backtick_mentions, identifier_mentions)
 
@@ -109,7 +110,16 @@ class DefinitionUnavailable:
     reason: str
 
 
-DefinitionResolution = DefinitionTarget | DefinitionUnavailable
+@dataclass(frozen=True)
+class FieldShorthandTargets:
+    """The two meanings of one record shorthand token, with neither discarded."""
+
+    field: DefinitionTarget
+    binding: DefinitionTarget
+
+
+ResolvedReference = DefinitionTarget | FieldShorthandTargets
+DefinitionResolution = ResolvedReference | DefinitionUnavailable
 
 
 @dataclass(frozen=True)
@@ -135,6 +145,9 @@ class RenamedDocument:
 
 class RenameServer(Protocol):
     @property
+    def sources(self) -> RunSourceIndex: ...
+
+    @property
     def documents(self) -> Mapping[Path, str]: ...
 
     def open(self, path: Path, text: str) -> None: ...
@@ -143,13 +156,8 @@ class RenameServer(Protocol):
     def definitions(self, path: Path, text: str, offsets: tuple[int, ...]) -> tuple[DefinitionResolution, ...]: ...
 
 
-def definition_result(value: object) -> DefinitionResolution:
-    if value is None or value == []:
-        return DefinitionUnavailable("missing definition")
-    rows = cast(list[object], value) if isinstance(value, list) else [value]
-    if len(rows) != 1:
-        return DefinitionUnavailable("ambiguous definition")
-    row = object_fields(rows[0])
+def definition_target(value: object) -> DefinitionTarget | DefinitionUnavailable:
+    row = object_fields(value)
     uri = row.get("targetUri", row.get("uri"))
     bounds = object_fields(row.get("targetSelectionRange", row.get("range")))
     positions: list[tuple[int, int]] = []
@@ -164,6 +172,54 @@ def definition_result(value: object) -> DefinitionResolution:
     if positions[0] > positions[1]:
         return DefinitionUnavailable("reversed definition range")
     return DefinitionTarget(uri, positions[0], positions[1])
+
+
+def definition_result(value: object, sources: RunSourceIndex, source: str, offset: int) -> DefinitionResolution:
+    if value is None or value == []:
+        return DefinitionUnavailable("missing definition")
+    rows = cast(list[object], value) if isinstance(value, list) else [value]
+    if len(rows) == 1:
+        return definition_target(rows[0])
+    parsed = sources.tokens(source)
+    site = next((i for i, span in enumerate(parsed.spans) if span.start == offset), -1)
+    if (len(rows) != 2 or site < 0 or not style_footprint.shorthand_field(parsed.words, site)
+            or parsed.contains(parsed.macros, site)):
+        return DefinitionUnavailable("ambiguous definition: not field shorthand")
+    targets = tuple(definition_target(row) for row in rows)
+    if any(isinstance(target, DefinitionUnavailable) for target in targets):
+        return DefinitionUnavailable("ambiguous definition: shorthand target unavailable")
+    return field_shorthand_targets(tuple(target for target in targets if isinstance(target, DefinitionTarget)),
+                                   sources, frozenset({parsed.words[site]}))
+
+
+def field_shorthand_targets(targets: tuple[DefinitionTarget, ...], sources: RunSourceIndex,
+                            names: frozenset[str]) -> FieldShorthandTargets | DefinitionUnavailable:
+    """Classify exactly one field and one binding, retaining both complete selection ranges."""
+    if len(targets) != 2:
+        return DefinitionUnavailable("ambiguous definition: not one field and one binding")
+    roles: dict[str, DefinitionTarget] = {}
+    for target in targets:
+        declaration = sources.read(Path(unquote(urlparse(target.uri).path)))
+        point = source_offset(declaration.source, {"line": target.start[0], "character": target.start[1]})
+        token = next((i for i, span in enumerate(declaration.spans) if span.start == point), -1)
+        if declaration.contains(declaration.macros, token):
+            return DefinitionUnavailable("ambiguous definition: macro-made shorthand target")
+        if (token < 0 or declaration.words[token] not in names
+                or lsp_position(declaration.source, declaration.spans[token].end)
+                != {"line": target.end[0], "character": target.end[1]}):
+            return DefinitionUnavailable("ambiguous definition: shorthand target is not a declaration")
+        # Reuse the declaration parser with one token per line to select this exact token.
+        scope = rename_declaration("\n".join(declaration.words),
+                                   BindingRename(token + 1, declaration.words[token], declaration.words[token], "unused_name"))
+        if not isinstance(scope, RenameDeclaration):
+            return DefinitionUnavailable("ambiguous definition: shorthand target role unavailable")
+        role = "field" if scope.scope.kind == "field" else "binding"
+        if scope.scope.kind in {"item", "variant"} or role in roles:
+            return DefinitionUnavailable("ambiguous definition: not one field and one binding")
+        roles[role] = target
+    if set(roles) != {"field", "binding"}:
+        return DefinitionUnavailable("ambiguous definition: not one field and one binding")
+    return FieldShorthandTargets(roles["field"], roles["binding"])
 
 
 def lsp_position(text: str, offset: int) -> dict[str, int]:
@@ -194,7 +250,8 @@ EMPTY_VERSIONS: Mapping[Path, int] = MappingProxyType({})
 
 
 def workspace_edits(value: object, path: Path, text: str, version: int,
-                    opened: Mapping[Path, str] = EMPTY_DOCUMENTS, versions: Mapping[Path, int] = EMPTY_VERSIONS) -> WorkspaceRename:
+                    opened: Mapping[Path, str] = EMPTY_DOCUMENTS, versions: Mapping[Path, int] = EMPTY_VERSIONS,
+                    read_source: Callable[[Path], str] = Path.read_text) -> WorkspaceRename:
     """Read the entire WorkspaceEdit; reject resource operations and stale or unsafe documents."""
     fields = object_fields(value)
     documents: dict[Path, list[object]] = {}
@@ -218,7 +275,7 @@ def workspace_edits(value: object, path: Path, text: str, version: int,
         add(str(document.get("uri")), row.get("edits"), document.get("version"))
     result: list[DocumentEdits] = []
     for target, rows in documents.items():
-        source = text if target == path else opened.get(target, target.read_bytes().decode())
+        source = text if target == path else opened[target] if target in opened else read_source(target)
         edits: list[SourceEdit] = []
         for item in rows:
             row = object_fields(item)
@@ -238,11 +295,14 @@ def workspace_edits(value: object, path: Path, text: str, version: int,
 
 def apply_edits(text: str, edits: Sequence[SourceEdit]) -> str:
     end = len(text) + 1
+    previous_was_insertion = False
     for edit in sorted(edits, key=lambda edit: (edit.start, edit.end), reverse=True):
-        if not 0 <= edit.start <= edit.end <= len(text) or edit.end > end or edit.start == end:
+        if (not 0 <= edit.start <= edit.end <= len(text) or edit.end > end
+                or edit.start == end and previous_was_insertion):
             raise BulkRenameError("overlapping or invalid edits")
         text = text[:edit.start] + edit.text + text[edit.end:]
         end = edit.start
+        previous_was_insertion = edit.start == edit.end
     return text
 
 
@@ -258,6 +318,7 @@ class RustAnalyzer:
         self.sequence: int = 0
         self.versions: dict[Path, int] = {}
         self.documents: dict[Path, str] = {}
+        self.sources: RunSourceIndex = RunSourceIndex(self)
         self.ready: bool = False
         self.settings: dict[str, object] = {
             "cargo": {"buildScripts": {"enable": True}}, "procMacro": {"enable": True}, "checkOnSave": False,
@@ -378,6 +439,7 @@ class RustAnalyzer:
         self.close()
 
     def open(self, path: Path, text: str) -> None:
+        self.sources.update(path, text)
         if path in self.versions:
             self.change(path, text)
             return
@@ -387,6 +449,7 @@ class RustAnalyzer:
             "uri": path.as_uri(), "languageId": "rust", "version": 1, "text": text}})
 
     def change(self, path: Path, text: str) -> None:
+        self.sources.update(path, text)
         self.documents[path] = text
         self.versions[path] += 1
         self.notify("textDocument/didChange", {"textDocument": {"uri": path.as_uri(), "version": self.versions[path]},
@@ -397,7 +460,8 @@ class RustAnalyzer:
         if self.request("textDocument/prepareRename", params) is None:
             raise BulkRenameError("rust-analyzer refused prepareRename")
         value = self.request("textDocument/rename", {**params, "newName": new})
-        return workspace_edits(value, path, text, self.versions[path], self.documents, self.versions)
+        return workspace_edits(value, path, text, self.versions[path], self.documents, self.versions,
+                               lambda target: self.sources.read(target).source)
 
     def definitions(self, path: Path, text: str, offsets: tuple[int, ...]) -> tuple[DefinitionResolution, ...]:
         """Pipeline one file's definition requests; one deadline bounds the entire round."""
@@ -422,8 +486,8 @@ class RustAnalyzer:
             index = pending.pop(identity)
             try:
                 answers[index] = (DefinitionUnavailable("server error: " + str(message["error"])) if "error" in message
-                                  else definition_result(message.get("result")))
-            except BulkRenameError as error:
+                                  else definition_result(message.get("result"), self.sources, text, offsets[index]))
+            except (BulkRenameError, OSError, UnicodeError, ValueError) as error:
                 answers[index] = DefinitionUnavailable(str(error))
         return tuple(answers)
 
@@ -454,26 +518,6 @@ class BindingText:
     @staticmethod
     def contains(ranges: tuple[tuple[int, int], ...], index: int) -> bool:
         return any(start <= index < end for start, end in ranges)
-
-    def derive_field(self, rename: BindingRename) -> bool:
-        for index, word in enumerate(self.words):
-            if word not in {"struct", "enum"}:
-                continue
-            body = next((i for i in range(index + 1, len(self.words)) if self.words[i] in {"{", "(", ";"}), -1)
-            if body not in self.ends:
-                continue
-            finish = self.ends[body]
-            start_line = self.source[:self.spans[body].start].count("\n") + 1
-            end_line = self.source[:self.spans[finish].end].count("\n") + 1
-            if not start_line <= rename.line <= end_line:
-                continue
-            start = index - 1
-            while start >= 0 and self.words[start] not in {";", "}"}:
-                start -= 1
-            attributes = set(self.words[start + 1:index])
-            if "derive" in attributes and attributes & {"Serialize", "Deserialize", "Parser", "Args", "Subcommand", "ValueEnum", "Config"}:
-                return True
-        return False
 
     def format_literals(self) -> frozenset[int]:
         """Literal format arguments, excluding ordinary strings in the same standard macro."""
@@ -507,6 +551,110 @@ def repository_docs(repo: Path) -> tuple[str, ...]:
 def docs_name_binding(docs: tuple[str, ...], comments: BindingComments, old: str) -> bool:
     return any(identifier_mentions(document, function) and backtick_mentions(document, old)
                for document in docs for function in comments.functions)
+
+
+@dataclass(frozen=True)
+class PreservedFieldNames:
+    """Attributes proved safe together with edits that freeze the original external names."""
+
+    attributes: frozenset[int] = frozenset()
+    edits: tuple[SourceEdit, ...] = ()
+
+
+def preserved_field_names(server: RenameServer, path: Path, parsed: BindingText, declaration: RenameDeclaration,
+                          rename: BindingRename) -> PreservedFieldNames:
+    if declaration.scope.kind != "field":
+        return PreservedFieldNames()
+    words = parsed.words
+    owner = declaration.scope.ranges[0][0]
+    spans = style_footprint.attribute_spans(words)
+    owners = style_footprint.attribute_owners(words)
+    owner_attributes = [(a, b) for a, b in spans if owners.get(a) == owner]
+    derives: set[str] = set()
+    for a, b in owner_attributes:
+        if words[a + 2:a + 4] == ("derive", "("):
+            derives.update(''.join(words[a + 4:b - 2]).split(','))
+    supported = {"Serialize", "Deserialize", "serde::Serialize", "serde::Deserialize",
+                 "Parser", "Args", "clap::Parser", "clap::Args"}
+    if not derives & supported:
+        return PreservedFieldNames()
+    if words[owner] != "struct" or derives - supported - style_footprint.STD_DERIVES - {""}:
+        raise BulkRenameError("derive field has an unproved derive or owner")
+    body = next(i for i in range(owner + 1, len(words)) if words[i] == "{")
+    field = declaration.scope.declaration
+    # Field metadata belongs to the next field at the struct body's own depth.
+    previous = max((i for i in range(body + 1, field) if words[i] == "," and parsed.parents.get(i) == body), default=body)
+    field_attributes = [(a, b) for a, b in spans if previous < a < field]
+    handled: set[int] = set()
+    for a, b in owner_attributes:
+        if words[a + 2] not in {"derive", "cfg", "doc"}:
+            raise BulkRenameError("derive field has unproved struct metadata (including rename_all)")
+        handled.add(a)
+    # Flattening anywhere in this record can merge keys with the renamed field.
+    for a, b in spans:
+        if body < a < parsed.ends[body] and set(words[a:b]) & {"flatten", "cfg_attr"}:
+            raise BulkRenameError("derive field has flatten or conditional metadata")
+    serde = bool(derives & {"Serialize", "Deserialize", "serde::Serialize", "serde::Deserialize"})
+    clap = bool(derives & {"Parser", "Args", "clap::Parser", "clap::Args"})
+    long_attributes: list[tuple[int, int]] = []
+    for a, b in field_attributes:
+        attribute = words[a + 2:b - 1]
+        if attribute[0] in {"cfg", "doc"}:
+            handled.add(a)
+        elif serde and attribute == ("serde", "(", "default", ")"):
+            handled.add(a)
+        elif clap and attribute in {("arg", "(", "long", ")"), ("clap", "(", "long", ")")}:
+            long_attributes.append((a, b))
+            handled.add(a)
+        else:
+            raise BulkRenameError("derive field CLI id, name or help metadata is unproved" if clap else
+                                  "derive field already sets its name or has unproved field metadata")
+    if clap and len(long_attributes) != 1:
+        raise BulkRenameError("derive field CLI name requires exactly one implicit long flag")
+    value_names: tuple[str, ...] = ()
+    if clap:
+        kind = words[field + 2:field + 3]
+        if (words[field + 1:field + 2] != (":",) or kind not in {("bool",), ("usize",)}
+                or words[field + 3:field + 4] not in {(",",), ("}",)}):
+            raise BulkRenameError("derive field CLI type and generated help name are unproved")
+        gaps = style_footprint.comment_gaps(parsed.source, parsed.spans, lambda text: text)
+        if any(style_footprint.outer_doc(line) for gap in gaps[previous + 1:field + 1] for line in gap):
+            raise BulkRenameError("derive field CLI doc help is unproved")
+        if kind == ("usize",):
+            value_names = (rename.old.removeprefix("r#").upper(),)
+    old = rename.old.removeprefix("r#")
+    if clap and (old != old.lower() or any(not part for part in old.split("_"))):
+        raise BulkRenameError("derive field CLI case conversion is unproved")
+    # A familiar spelling can be imported from an unrelated procedural macro.
+    for a, b in owner_attributes:
+        if words[a + 2:a + 4] != ("derive", "("):
+            continue
+        for index in range(a + 4, b - 2):
+            name = words[index]
+            if name not in {"Serialize", "Deserialize", "Parser", "Args"}:
+                continue
+            answers = server.definitions(path, parsed.source, (parsed.spans[index].start,))
+            if len(answers) != 1 or not isinstance(answers[0], DefinitionTarget):
+                raise BulkRenameError("derive field origin unproved: " + name)
+            origin = Path(unquote(urlparse(answers[0].uri).path)).resolve()
+            package_root = crate_directory(origin)
+            package = object_fields(tomllib.loads((package_root / "Cargo.toml").read_text()).get("package"))
+            expected = "serde_derive" if name in {"Serialize", "Deserialize"} else "clap_derive"
+            if package.get("name") != expected or package_root.is_relative_to(crate_directory(path)):
+                raise BulkRenameError("derive field origin unproved: " + name)
+    edits: list[SourceEdit] = []
+    if serde:
+        # Insert before this field's metadata and visibility, using the field boundary.
+        anchor = parsed.spans[previous + 1].start
+        edits.append(SourceEdit(anchor, anchor, '#[serde(rename = "' + old + '")] '))
+    for a, b in long_attributes:
+        # Freeze the generated id, flag and value placeholder together. These two
+        # supported field types are checked against real clap help and parsing.
+        flag = old.replace("_", "-")
+        value_name = ''.join(', value_name = "' + name + '"' for name in value_names)
+        edits.append(SourceEdit(parsed.spans[a].start, parsed.spans[b - 1].end,
+                                '#[arg(id = "' + old + '", long = "' + flag + '"' + value_name + ')]'))
+    return PreservedFieldNames(frozenset(handled), tuple(edits))
 
 
 def mapped_offset(offset: int, edits: Sequence[SourceEdit]) -> int:
@@ -577,7 +725,7 @@ def glob_modules(parsed: BindingText, *, exported_only: bool = False) -> tuple[i
 
 def module_exports(server: RenameServer, path: Path, source: str, module: int, new: str,
                    visited: set[tuple[str, tuple[int, int]]]) -> bool:
-    parsed = BindingText(source)
+    parsed = server.sources.tokens(source)
     answers = server.definitions(path, source, (parsed.spans[module].start,))
     if len(answers) != 1 or not isinstance(answers[0], DefinitionTarget):
         cause = answers[0].reason if answers and isinstance(answers[0], DefinitionUnavailable) else "ambiguous module"
@@ -589,31 +737,27 @@ def module_exports(server: RenameServer, path: Path, source: str, module: int, n
     visited.add(key)
     target_path = Path(unquote(urlparse(target.uri).path))
     target_path = target_path.resolve()
-    module_source = server.documents.get(target_path, source if target_path == path else "")
-    if not module_source:
-        module_source = target_path.read_text()
-    tokens = BindingText(module_source)
+    tokens = server.sources.read(target_path)
+    module_source = tokens.source
     offset = source_offset(module_source, {"line": target.start[0], "character": target.start[1]})
     selection = next((i for i, span in enumerate(tokens.spans) if span.start <= offset < span.end), -1)
-    coverage = crate_source_coverage(server, path)
+    coverage = server.sources.coverage(path)
     covered = {document.path: document.source for document in coverage.documents}
     if selection > 0 and tokens.words[selection - 1] == "mod":
-        selected = [entry for entry in coverage.modules
-                    if entry.instance.canonical_path == target_path and entry.declaration_offset == offset]
+        selected = {(entry.path, entry.begin, entry.end): entry for entry in coverage.modules
+                    if entry.instance.canonical_path == target_path and entry.declaration_offset == offset}
         if len(selected) != 1:
             raise BulkRenameError("glob import module instance coverage unavailable")
-        entry = selected[0]
-        coverage.require_single_instance({entry.path})
+        entry = next(iter(selected.values()))
         target_path = entry.path
         module_source = covered[target_path]
         # Keep definition offsets when examining an inline module's body.
         module_source = ''.join(char if entry.begin <= i < entry.end or char == "\n" else ' '
                                 for i, char in enumerate(module_source))
-        tokens = BindingText(module_source)
+        tokens = server.sources.tokens(module_source)
     elif target_path in covered:
-        coverage.require_single_instance({target_path})
         module_source = covered[target_path]
-        tokens = BindingText(module_source)
+        tokens = server.sources.tokens(module_source)
     else:
         # External module files can be inspected directly, but cannot use guessed child paths.
         if module_path_attributes(target_path, tokens):
@@ -633,6 +777,8 @@ def module_exports(server: RenameServer, path: Path, source: str, module: int, n
                 or isinstance(declaration, RenameDeclaration) and declaration.scope.kind == "item"):
             return True
     for child in glob_modules(tokens, exported_only=True):
+        # Resolving a re-export needs its module instance. Plain absence needs only source text.
+        coverage.require_single_instance({target_path})
         if module_exports(server, target_path, module_source, child, new, visited):
             return True
     if "macro_rules" in tokens.words or any(word == "include" for word in tokens.words):
@@ -641,16 +787,17 @@ def module_exports(server: RenameServer, path: Path, source: str, module: int, n
 
 
 def rename_guard(server: RenameServer, path: Path, source: str, declaration: RenameDeclaration,
-                 rename: BindingRename) -> None:
-    parsed = BindingText(source)
+                 rename: BindingRename) -> PreservedFieldNames:
+    parsed = server.sources.tokens(source)
+    preservation = preserved_field_names(server, path, parsed, declaration, rename)
     collision = pattern_binding_check(source, declaration, rename)
     if isinstance(collision, PatternBindingCollision):
         raise BulkRenameError(collision.reason)
-    if parsed.derive_field(rename):
-        raise BulkRenameError("serde/clap/confique derive field or variant")
     if declaration.scope.kind in {"field", "variant", "item"}:
         owners = style_footprint.attribute_owners(parsed.words)
         for start, owner in owners.items():
+            if start in preservation.attributes:
+                continue
             applies = (owner == declaration.scope.ranges[0][0]
                        or owner <= declaration.scope.declaration
                        and not set(parsed.words[owner:declaration.scope.declaration]) & {";", ",", "{", "}"})
@@ -685,6 +832,7 @@ def rename_guard(server: RenameServer, path: Path, source: str, declaration: Ren
             if parsed.contains(declaration.scope.ranges, i) and parsed.words[max(0, i - 1):i] not in {(".",), ("::",)}:
                 line = source.count("\n", 0, parsed.spans[i].start) + 1
                 raise BulkRenameError(f"rename could capture {rename.new!r} at line {line}")
+    return preservation
 
 
 @cache
@@ -750,19 +898,20 @@ class ReferenceMustResolve:
     """A post-rename offset and the exact definition that must survive the rename."""
 
     offset: int
-    target: DefinitionTarget
+    target: ResolvedReference
 
 
-def named_offsets(source: str, name: str) -> tuple[int, ...]:
-    """Identifiers and explicit format captures; comments are documentation, not references."""
-    parsed = BindingText(source)
-    offsets: list[int] = []
+def source_name_index(parsed: BindingText) -> dict[str, tuple[int, ...]]:
+    """Index all identifiers once, including explicit format captures but excluding comments."""
+    offsets: dict[str, list[int]] = defaultdict(list)
     for i, span in enumerate(parsed.spans):
-        if span.token.kind == "identifier" and span.token.value.removeprefix("r#") == name.removeprefix("r#"):
-            offsets.append(span.start)
+        if span.token.kind == "identifier":
+            offsets[span.token.value.removeprefix("r#")].append(span.start)
         elif i in parsed.formats:
-            offsets.extend(span.start + start for start, _ in identifier_mentions(span.token.value, name))
-    return tuple(offsets)
+            names = {match.group().removeprefix("r#") for match in style_footprint.IDENTIFIER.finditer(span.token.value)}
+            for name in names:
+                offsets[name].extend(span.start + start for start, _ in identifier_mentions(span.token.value, name))
+    return {name: tuple(points) for name, points in offsets.items()}
 
 
 def target_after_edits(target: DefinitionTarget, replacements: Sequence[tuple[DocumentEdits, str]]) -> DefinitionTarget:
@@ -776,6 +925,13 @@ def target_after_edits(target: DefinitionTarget, replacements: Sequence[tuple[Do
             positions.append((after["line"], after["character"]))
         return DefinitionTarget(target.uri, positions[0], positions[1])
     return target
+
+
+def reference_after_edits(target: ResolvedReference, replacements: Sequence[tuple[DocumentEdits, str]]) -> ResolvedReference:
+    if isinstance(target, FieldShorthandTargets):
+        return FieldShorthandTargets(target_after_edits(target.field, replacements),
+                                    target_after_edits(target.binding, replacements))
+    return target_after_edits(target, replacements)
 
 
 @dataclass(frozen=True)
@@ -848,6 +1004,114 @@ class CrateSourceCoverage:
             if count > 1:
                 raise BulkRenameError(f"module instance coverage unavailable: {path} has {count} instances; "
                                       + "definition evidence does not cover every instance")
+
+
+@dataclass(frozen=True)
+class ModuleLoadingSite:
+    """A stable loading edge and its current source boundaries, independent of other tokens."""
+
+    spelling: tuple[str, ...]
+    declaration: int
+    begin: int
+    end: int
+
+
+@dataclass(frozen=True)
+class SourceCoverageUnavailable:
+    reason: str
+
+
+class RunSourceIndex:
+    """One session's source graph and tokens; definition answers are deliberately never cached."""
+
+    def __init__(self, server: RenameServer) -> None:
+        self.server: RenameServer = server
+        self.files: dict[Path, BindingText] = {}
+        self.parsed: dict[str, BindingText] = {}
+        self.names: dict[str, dict[str, tuple[int, ...]]] = {}
+        self.packages: dict[Path, CrateSourceCoverage | SourceCoverageUnavailable] = {}
+        self.views: dict[Path, tuple[int, CrateSourceCoverage]] = {}
+        self.layouts: dict[tuple[Path, str], tuple[ModuleLoadingSite, ...]] = {}
+        self.revision: int = 0
+
+    def tokens(self, source: str) -> BindingText:
+        if source not in self.parsed:
+            self.parsed[source] = BindingText(source)
+        return self.parsed[source]
+
+    def update(self, path: Path, source: str) -> None:
+        canonical = path.resolve()
+        if canonical not in self.files or self.files[canonical].source != source:
+            self.files[canonical] = self.tokens(source)
+            self.revision += 1
+
+    def read(self, path: Path) -> BindingText:
+        canonical = path.resolve()
+        if canonical in self.server.documents:
+            self.update(canonical, self.server.documents[canonical])
+        elif canonical not in self.files:
+            self.update(canonical, canonical.read_text())
+        return self.files[canonical]
+
+    def named(self, source: str, name: str) -> tuple[int, ...]:
+        if source not in self.names:
+            self.names[source] = source_name_index(self.tokens(source))
+        return self.names[source].get(name.removeprefix("r#"), ())
+
+    def module_layout(self, path: Path, parsed: BindingText) -> tuple[ModuleLoadingSite, ...]:
+        key = (path, parsed.source)
+        if key in self.layouts:
+            return self.layouts[key]
+        explicit = module_path_attributes(path, parsed)
+        sites: list[ModuleLoadingSite] = []
+        for i, word in enumerate(parsed.words):
+            if word != "mod" or parsed.contains(parsed.macros, i) or i + 2 >= len(parsed.words):
+                continue
+            body = i + 2
+            sites.append(ModuleLoadingSite((*parsed.words[i:i + 3], explicit.get(i, "")), parsed.spans[i + 1].start,
+                                            parsed.spans[body].end, parsed.spans[parsed.ends.get(body, body)].start))
+        self.layouts[key] = tuple(sites)
+        return self.layouts[key]
+
+    def coverage(self, path: Path) -> CrateSourceCoverage:
+        crate = crate_directory(path)
+        if crate not in self.packages:
+            try:
+                self.packages[crate] = crate_source_coverage(self.server, path)
+            except (BulkRenameError, OSError, UnicodeError, ValueError) as error:
+                self.packages[crate] = SourceCoverageUnavailable(str(error))
+        # Opening, accepted edits and rollback all come through the same source update boundary.
+        base = self.packages[crate]
+        if isinstance(base, SourceCoverageUnavailable):
+            raise BulkRenameError(base.reason)
+        for document in base.documents:
+            _ = self.read(document.path)
+        if crate in self.views and self.views[crate][0] == self.revision:
+            return self.views[crate][1]
+        boundaries: dict[Path, dict[int, int]] = {}
+        documents: list[ModuleSource] = []
+        for document in base.documents:
+            current = self.files[document.path]
+            documents.append(ModuleSource(document.path, current.source))
+            if current.source == document.source:
+                continue
+            before = self.module_layout(document.path, self.tokens(document.source))
+            after = self.module_layout(document.path, current)
+            if tuple(site.spelling for site in before) != tuple(site.spelling for site in after):
+                raise BulkRenameError("source coverage unavailable: module loading changed during rename run: " + str(document.path))
+            # Only module anchors need rebasing. Token edits elsewhere cannot change the graph.
+            points = {old: new for a, b in zip(before, after, strict=True)
+                      for old, new in ((a.declaration, b.declaration), (a.begin, b.begin), (a.end, b.end))}
+            points.update({0: 0, len(document.source): len(current.source)})
+            boundaries[document.path] = points
+        def boundary(path: Path, offset: int) -> int:
+            return boundaries[path][offset] if path in boundaries else offset
+        modules = tuple(replace(entry,
+                                declaration_offset=boundary(entry.instance.canonical_path, entry.declaration_offset),
+                                begin=boundary(entry.path, entry.begin), end=boundary(entry.path, entry.end)) for entry in base.modules)
+        coverage = CrateSourceCoverage(tuple(documents), base.instances, modules)
+        self.views[crate] = (self.revision, coverage)
+        return coverage
 
 
 def cargo_target_roots(crate: Path) -> tuple[CargoSourceTarget, ...]:
@@ -956,10 +1220,10 @@ def crate_source_coverage(server: RenameServer, path: Path) -> CrateSourceCovera
             canonical = candidate.resolve(strict=True)
             if canonical in active:
                 raise BulkRenameError(f"source coverage unavailable: cyclic module {candidate}")
-            source = server.documents[canonical] if canonical in server.documents else canonical.read_text()
+            parsed = server.sources.read(canonical)
+            source = parsed.source
         except (OSError, UnicodeError, RuntimeError) as error:
             raise BulkRenameError(f"source coverage unavailable: cannot read module {candidate}: {error}") from error
-        parsed = BindingText(source)
         explicit_paths = module_path_attributes(candidate, parsed)
         document = ModuleSource(canonical, source)
         documents[canonical] = document
@@ -1015,22 +1279,52 @@ def crate_source_coverage(server: RenameServer, path: Path) -> CrateSourceCovera
 
 
 def crate_source_documents(server: RenameServer, path: Path) -> tuple[ModuleSource, ...]:
-    return crate_source_coverage(server, path).documents
+    return server.sources.coverage(path).documents
 
 
 def crate_name_documents(server: RenameServer, path: Path, name: str,
                          changed_paths: tuple[Path, ...] = ()) -> tuple[DocumentEdits, ...]:
     """Check coverage first; single-target definitions cannot prove shared-file instances."""
-    coverage = crate_source_coverage(server, path)
+    coverage = server.sources.coverage(path)
     covered = {document.path for document in coverage.documents}
     edited = {path.resolve(), *(changed.resolve() for changed in changed_paths)}
     outside = edited - covered
     if outside:
         raise BulkRenameError("source coverage unavailable: edit is outside reached modules: " + str(min(outside)))
     inspected = tuple(DocumentEdits(document.path, document.source, ()) for document in coverage.documents
-                      if name.removeprefix("r#") in document.source and named_offsets(document.source, name))
+                      if server.sources.named(document.source, name))
     coverage.require_single_instance(edited | {document.path for document in inspected})
     return inspected
+
+
+@dataclass(frozen=True)
+class CollapsedFieldShorthand:
+    """An explicit field and binding that the refactor combines into one shorthand token."""
+
+    offset: int
+    before_offsets: tuple[int, int]
+
+
+def collapsed_field_shorthands(sources: RunSourceIndex, document: DocumentEdits, edited: str,
+                               rename: BindingRename) -> tuple[CollapsedFieldShorthand, ...]:
+    before, after = sources.tokens(document.source), sources.tokens(edited)
+    reverse = tuple(SourceEdit(mapped_offset(edit.start, document.edits),
+                               mapped_offset(edit.start, document.edits) + len(edit.text),
+                               document.source[edit.start:edit.end]) for edit in document.edits)
+    collapsed: list[CollapsedFieldShorthand] = []
+    for i, span in enumerate(after.spans):
+        if (span.token.value != rename.new or not style_footprint.shorthand_field(after.words, i)
+                or after.contains(after.macros, i)):
+            continue
+        # The unchanged delimiters bound this record field even when RA deletes `old:`
+        # and retains the following binding token instead of replacing the whole field.
+        begin = mapped_offset(after.spans[i - 1].end, reverse)
+        end = mapped_offset(after.spans[i + 1].start, reverse)
+        field = tuple(token for token in before.spans if begin <= token.start and token.end <= end)
+        words = tuple(token.token.value for token in field)
+        if words in ((rename.old, ":", rename.new), (rename.new, ":", rename.old)):
+            collapsed.append(CollapsedFieldShorthand(span.start, (field[0].start, field[2].start)))
+    return tuple(collapsed)
 
 
 def verify_rename_references(server: RenameServer, path: Path, offset: int, rename: BindingRename,
@@ -1039,7 +1333,7 @@ def verify_rename_references(server: RenameServer, path: Path, offset: int, rena
     declaration_document, declaration_text = next((document, edited) for document, edited in replacements
                                                   if document.path == path)
     renamed_offset = mapped_offset(offset, declaration_document.edits)
-    declaration_span = next(span for span in BindingText(declaration_text).spans if span.start == renamed_offset)
+    declaration_span = next(span for span in server.sources.tokens(declaration_text).spans if span.start == renamed_offset)
     begin = lsp_position(declaration_text, renamed_offset)
     end = lsp_position(declaration_text, declaration_span.end)
     renamed_target = DefinitionTarget(path.as_uri(), (begin["line"], begin["character"]),
@@ -1051,22 +1345,39 @@ def verify_rename_references(server: RenameServer, path: Path, offset: int, rena
                                  if document.path not in changed_paths)]
     for document, edited in inspected:
         checks: list[ReferenceMustResolve] = []
+        collapsed = collapsed_field_shorthands(server.sources, document, edited, rename) if document.edits else ()
+        combined = {point for shorthand in collapsed for point in shorthand.before_offsets}
         # Existing uses of the destination name must not become captured by the new declaration.
-        untouched = tuple(point for point in named_offsets(document.source, rename.new)
-                          if not any(edit.start <= point < edit.end for edit in document.edits))
-        if untouched:
+        untouched = tuple(point for point in server.sources.named(document.source, rename.new)
+                          if point not in combined and not any(edit.start <= point < edit.end for edit in document.edits))
+        requested = (*untouched, *(point for shorthand in collapsed for point in shorthand.before_offsets))
+        if requested:
             server.open(document.path, document.source)
-        answers = server.definitions(document.path, document.source, untouched) if untouched else ()
-        if len(answers) != len(untouched):
+        answers = server.definitions(document.path, document.source, requested) if requested else ()
+        if len(answers) != len(requested):
             raise BulkRenameError("rename resolution unavailable: incomplete before-definition response")
-        for point, answer in zip(untouched, answers, strict=True):
+        for point, answer in zip(requested, answers, strict=True):
             line = document.source.count("\n", 0, point) + 1
             if isinstance(answer, DefinitionUnavailable):
                 raise BulkRenameError(f"rename resolution unavailable for {rename.new!r} at line {line} in {document.path.name}: {answer.reason}")
-            checks.append(ReferenceMustResolve(mapped_offset(point, document.edits), target_after_edits(answer, replacements)))
+        for point, answer in zip(untouched, answers[:len(untouched)], strict=True):
+            if isinstance(answer, DefinitionUnavailable):
+                raise AssertionError("unavailable definitions were refused above")
+            checks.append(ReferenceMustResolve(mapped_offset(point, document.edits), reference_after_edits(answer, replacements)))
+        for i, shorthand in enumerate(collapsed):
+            pair = answers[len(untouched) + i * 2:len(untouched) + i * 2 + 2]
+            expected = field_shorthand_targets(tuple(target for target in pair if isinstance(target, DefinitionTarget)),
+                                               server.sources, frozenset({rename.old, rename.new}))
+            if isinstance(expected, DefinitionUnavailable):
+                raise BulkRenameError("rename resolution unavailable for collapsed field shorthand: " + expected.reason)
+            mapped = reference_after_edits(expected, replacements)
+            if not isinstance(mapped, FieldShorthandTargets) or renamed_target not in (mapped.field, mapped.binding):
+                raise BulkRenameError("rename resolution unavailable: collapsed field shorthand does not refer to the renamed declaration")
+            checks.append(ReferenceMustResolve(shorthand.offset, mapped))
         intervals = tuple((mapped_offset(edit.start, document.edits), len(edit.text)) for edit in document.edits)
-        checks.extend(ReferenceMustResolve(point, renamed_target) for point in named_offsets(edited, rename.new)
-                      if any(start <= point < start + size for start, size in intervals))
+        shorthand_offsets = {shorthand.offset for shorthand in collapsed}
+        checks.extend(ReferenceMustResolve(point, renamed_target) for point in server.sources.named(edited, rename.new)
+                      if point not in shorthand_offsets and any(start <= point < start + size for start, size in intervals))
         obligations[document.path] = checks
     try:
         for document, edited in replacements:
@@ -1100,8 +1411,38 @@ def file_edits_preserved(file: FileRenames, after: str) -> bool:
             == style_footprint.comment_gaps(after, after_spans, lambda text: text))
 
 
+def parameter_comments(source: str, declaration: RenameDeclaration, rename: BindingRename) -> BindingComments | NoBindingScope:
+    """Use the shared mention proof, excluding docs owned by nested items and all Markdown links."""
+    parsed = BindingText(source)
+    gaps = tuple(zip((0, *(span.end for span in parsed.spans)),
+                     (*(span.start for span in parsed.spans), len(source)), strict=True))
+    comments = style_footprint.comment_gaps(source, parsed.spans, lambda text: text)
+    masked = source
+    for index, (start, end) in reversed(tuple(enumerate(gaps))):
+        if index > declaration.scope.declaration and any(style_footprint.outer_doc(line) for line in comments[index]):
+            # Outer docs are attributes of their following item, never of the
+            # surrounding function. Preserve coordinates for the shared checker.
+            masked = masked[:start] + ''.join('\n' if char == '\n' else ' ' for char in source[start:end]) + masked[end:]
+    plan = binding_comments(masked, rename)
+    if isinstance(plan, NoBindingScope):
+        return plan
+    for edit in plan.edits:
+        for start, end in gaps:
+            if not start <= edit.start < edit.end <= end:
+                continue
+            for link in re.finditer(r"\[[^\]\n]*\](?:\([^\)\n]*\)|\s*:[^\n]*)?", source[start:end]):
+                if start + link.start() < edit.end and edit.start < start + link.end():
+                    return NoBindingScope("intra-doc link is not a parameter mention")
+    return plan
+
+
+def unreserved_files(_paths: tuple[str, ...]) -> None:
+    """Callers without file reservations rely on their own final write guard."""
+
+
 def rename_file(server: RenameServer, path: Path, relative: str, source: str,
-                findings: tuple[RenameFinding, ...], docs: tuple[str, ...] = ()) -> FileRenames:
+                findings: tuple[RenameFinding, ...], docs: tuple[str, ...] = (), *,
+                check_files: Callable[[tuple[str, ...]], None] = unreserved_files) -> FileRenames:
     refused: list[Refusal] = []
     located: list[tuple[RenameFinding, RenameDeclaration]] = []
     for finding in findings:
@@ -1129,27 +1470,44 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
             declaration = rename_declaration(current, rename)
             if isinstance(declaration, NoBindingScope) or declaration.offset != offset:
                 raise BulkRenameError("earlier rename changed this finding's declaration")
-            rename_guard(server, path, current, declaration, rename)
-            comments = refactor_comments(current, declaration, rename)
-            if docs_name_binding(docs, comments, rename.old):
+            preservation = rename_guard(server, path, current, declaration, rename)
+            comments = (parameter_comments(current, declaration, rename) if declaration.scope.kind == "fn parameter"
+                        else refactor_comments(current, declaration, rename))
+            if isinstance(comments, NoBindingScope):
+                raise BulkRenameError("parameter doc word is ambiguous: " + comments.reason)
+            companion = tuple(SourceEdit(edit.start, edit.end, edit.replacement) for edit in comments.edits)
+            own_doc = declaration.scope.kind == "fn parameter" and any(edit.end <= offset for edit in companion)
+            if not own_doc and docs_name_binding(docs, comments, rename.old):
                 raise BulkRenameError("repository Markdown names the parameter; requires a coordinated documentation edit")
             workspace = server.rename(path, current, offset, rename.new)
             documents: list[DocumentEdits] = []
             for document in workspace.documents:
                 if not document.path.is_relative_to(root) or crate_directory(document.path) != crate_directory(path):
                     raise BulkRenameError("WorkspaceEdit leaves the finding's crate: " + str(document.path))
+                if declaration.scope.kind == "fn parameter":
+                    spans = server.sources.tokens(document.source).spans
+                    if any(not any(span.start <= edit.start and edit.end <= span.end for span in spans)
+                           and (document.path != path or edit not in companion) for edit in document.edits):
+                        raise BulkRenameError("parameter refactor changes text outside its proved comment mentions")
                 text_name_guard(server, document, rename)
                 public_edit_guard(document, rename)
                 edits = list(document.edits)
                 if document.path == path:
-                    edits.extend(SourceEdit(edit.start, edit.end, edit.replacement) for edit in comments.edits
+                    edits.extend(edit for edit in companion
                                  if not any(other.start < edit.end and edit.start < other.end for other in edits))
+                    for edit in preservation.edits:
+                        if any(other.start < edit.end and edit.start < other.end for other in edits):
+                            raise BulkRenameError("WorkspaceEdit overlaps the preserved external name")
+                        edits.append(edit)
                 if any(edit.start < end and start < edit.end for edit in edits for start, end in occupied[document.path]):
                     raise BulkRenameError("WorkspaceEdit overlaps an earlier finding's edit")
                 documents.append(replace(document, edits=tuple(edits)))
             if not any(document.path == path and any(edit.start <= offset < edit.end for edit in document.edits)
                        for document in documents):
                 raise BulkRenameError("WorkspaceEdit does not rename the finding's declaration")
+            # This finding's edit set is still separate. Refuse before any proposed
+            # overlay can become evidence for a later finding's resolution proof.
+            check_files(tuple(document.path.relative_to(root).as_posix() for document in documents))
             # Validate every document before changing any server document.
             replacements = [(document, apply_edits(document.source, document.edits)) for document in documents]
             verify_rename_references(server, path, offset, rename, replacements)
@@ -1495,7 +1853,7 @@ def run_batch(repo: Path, ticket_id: str) -> Path:
                                               capture_output=True, check=False)
                     if previous.returncode or previous.stdout != (repo / path).read_bytes():
                         raise BulkRenameError("file changed since the ticket base")
-                    file = rename_file(server, repo / path, path, server.documents.get(repo / path, (repo / path).read_text()), tuple(findings), docs)
+                    file = rename_file(server, repo / path, path, server.sources.read(repo / path).source, tuple(findings), docs)
                     files.append(file)
                     refused.extend(file.refusals)
                 except BulkRenameError as error:

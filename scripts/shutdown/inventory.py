@@ -27,7 +27,9 @@ if str(SCRIPTS / "shutdown") not in sys.path:
 for dependency in ("whoami", "message", "production", "herdr", "direct", "lib", "hooks"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
-import account
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.whoami import account
 import conversation_pause
 from probe_session import PROBE_ENV
 import unit_runs
@@ -42,7 +44,7 @@ import sessions
 from sessions import process_start as _process_start
 import showrunners
 import unit_lookup
-from account import Account, label_for
+from scripts.whoami.account import Account, label_for
 
 
 from session_types import (
@@ -679,9 +681,7 @@ def _host(
         plan = plans.get(session_id)
         return {
             "kind": "unit",
-            "production": unit.production,
             "unit": unit.unit,
-            "doc": unit.doc,
             "session_name": unit.session_name,
             "session_host": unit.session_host,
             "plan": (

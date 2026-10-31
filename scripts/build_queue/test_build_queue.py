@@ -19,7 +19,9 @@ from unittest import mock
 from typing import Protocol, cast, override
 from zoneinfo import ZoneInfo
 
-from scripts.build_queue import build_queue
+from scripts.build_queue import build_queue, head_facts
+from scripts.build_queue.test_head_facts import bump_line, head_reading, queue_read_fixture, queue_time_line, token_gap_line, write_bumps, write_token_gaps
+from scripts.buildlog import store
 from scripts.lint import memory_admit
 from scripts.message import roster
 
@@ -27,45 +29,6 @@ GIB = memory_admit.GIB
 NOW = 1793214000.0
 NO_SHOWRUNNER = roster.NoShowrunner()
 NO_DIRECTOR = roster.NoDirector()
-
-
-def queue_read_fixture(view: memory_admit.QueueView) -> memory_admit.QueueRead:
-    """Pair legacy rendering fixtures with explicit, already-decided explanation fields."""
-    running = tuple(memory_admit.ExplainedRunningStep(step, memory_admit.AdmissionTimeNotRecorded(),
-        step.promise, step.measured.bytes if isinstance(step.measured, memory_admit.MeasuredMemory) else 0,
-        memory_admit.build_charge(step.measured), memory_admit.charge_basis(step.measured)) for step in view.running)
-    first: memory_admit.HeadExplanation | memory_admit.NoWaiter = memory_admit.NoWaiter()
-    host: memory_admit.HostAvailable | memory_admit.ReadingUnavailable = memory_admit.HostAvailable(
-        view.available, memory_admit.UnknownHostTotal(), view.reserve, 21 * GIB, memory_admit.NoPressureHold())
-    if view.waiting:
-        step = view.waiting[0]
-        reason = step.reason
-        row: memory_admit.Waiter = {"pid": step.pid, "start_time": "", "need": step.need, "since": step.since}
-        order = memory_admit.head_window(row, view.now)
-        decision = memory_admit.AdmissionDecision("admit", step.need + view.reserve, view.promised, view.reserve, 0)
-        if isinstance(reason, memory_admit.HeadAdmissionStatus):
-            decision, order = reason.decision, reason.backfill
-        elif isinstance(reason, memory_admit.NeedsBuildBudget):
-            decision = memory_admit.AdmissionDecision("hold", step.need + view.reserve, view.promised, view.reserve,
-                0, charged=reason.charged, budget=reason.budget, budget_passes=False)
-        elif isinstance(reason, memory_admit.NeedsMemory):
-            decision = memory_admit.AdmissionDecision("hold", reason.threshold, reason.growth, reason.reserve,
-                0, free_passes=False, head_need=reason.head_need)
-        elif isinstance(reason, memory_admit.MemoryPressure):
-            decision = memory_admit.AdmissionDecision("hold", step.need + view.reserve, view.promised,
-                                                      view.reserve, 0, pressure=reason)
-        elif isinstance(reason, memory_admit.ReadingUnavailable):
-            host = reason
-        first = memory_admit.HeadExplanation(step, memory_admit.NeedSourceNotRecorded(), decision,
-            memory_admit.BudgetCheck(decision.charged, step.need, decision.head_need, decision.budget,
-                decision.budget - step.need - decision.head_need, decision.budget_passes),
-            memory_admit.FreeCheck(view.available, step.need, decision.reserve, decision.promised,
-                decision.head_need, decision.threshold, decision.free_passes),
-            order, False, memory_admit.NoBump())
-    explanation = memory_admit.QueueExplanation(view.now, host, running,
-        memory_admit.QueueMemoryTotals(sum(step.charged for step in running), sum(step.measured for step in running), view.promised),
-        first, memory_admit.WaitingLine((), 0, 0, 0, 0, view.now))
-    return memory_admit.QueueRead(view, explanation, [])
 
 
 class RosterReadMock(Protocol):
@@ -134,13 +97,14 @@ class QueueTests(unittest.TestCase):
         reading = memory_admit.locked_queue_read()
         labels = roster.unit_labels_for([row.step.session_id for row in reading.explanation.running]
                                        + [reading.view.waiting[0].session_id], os.environ)
-        why = "\n".join(build_why.render_explanation(reading.explanation, ZoneInfo("America/New_York"), labels))
+        facts = head_facts.read_head_facts(reading)
+        why = "\n".join(build_why.render_explanation(reading.explanation, ZoneInfo("America/New_York"), labels, facts))
         # Disagreeing legacy fields cannot override the explanation or trigger another decision.
         legacy_head = replace(reading.view.waiting[0], reason=memory_admit.ReadyForAdmission(), need=GIB)
         reading = replace(reading, view=replace(reading.view, available=0, waiting=(legacy_head,)))
         with mock.patch.object(memory_admit, "decide", side_effect=AssertionError("no second decision")), \
              mock.patch.object(memory_admit, "build_charge", side_effect=AssertionError("use recorded charges")):
-            head = build_queue.head_line(reading.explanation, labels, ZoneInfo("America/New_York"))
+            head = build_queue.head_line(reading.explanation, labels, ZoneInfo("America/New_York"), facts)
         for value in ("18.1", "11.8", "16.3", "9.2"):
             self.assertIn(value, head["text"])
             self.assertIn(value, why)
@@ -173,6 +137,106 @@ class QueueTests(unittest.TestCase):
             numeric = {"#", "Promised", "Using", "Delta", "Waiting since", "Needs", "Free"}
             self.assertEqual(markers, ["---:" if heading in numeric else "---" for heading in headings])
         self.assertEqual(tables, 2)
+
+    def test_head_line_short_forms_share_the_recorded_head_and_bump_facts(self) -> None:
+        reading = head_reading(since=NOW - 158 * 60, now=NOW,
+                               fields={"head_since": NOW - 125, "priority_since": NOW - 3600})
+        write_bumps(NOW, [bump_line(NOW - 5, folder="/tmp/alpha"),
+                          bump_line(NOW - 4, folder="/tmp/beta", step="clippy"),
+                          bump_line(NOW - 3, folder="/tmp/alpha")])
+        snapshot = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))
+        self.assertIn("head for 2 min", snapshot["head"]["text"])
+        self.assertIn("3 bumps since it joined, most: alpha check (2)", snapshot["head"]["text"])
+        self.assertIn("no head priority: younger steps that fit may start", snapshot["head"]["text"])
+        self.assertNotIn("head for 158 min", snapshot["head"]["text"])
+
+    def test_missing_head_time_and_empty_bump_history_have_distinct_short_forms(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW, fields={"priority_since": NOW - 60})
+        snapshot = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))
+        self.assertIn("head for: unknown", snapshot["head"]["text"])
+        self.assertIn("no bumps since it joined", snapshot["head"]["text"])
+        self.assertNotIn("head for 10 min", snapshot["head"]["text"])
+
+    def test_no_strict_window_without_admissions_head_priority(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW)
+        head = reading.explanation.head
+        if not isinstance(head, memory_admit.HeadExplanation):
+            self.fail("fixture needs a head")
+        reading = replace(reading, explanation=replace(reading.explanation,
+            head=replace(head, order=memory_admit.StrictUntil(NOW + 123), has_priority=False)))
+        text = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))["head"]["text"]
+        self.assertIn("no head priority: younger steps that fit may start", text)
+        self.assertNotIn("strict", text)
+        self.assertNotIn("until", text)
+        self.assertNotIn("younger steps wait", text)
+
+    def test_bump_read_failure_is_unknown_and_snapshot_keys_stay_unchanged(self) -> None:
+        write_bumps(NOW, [])
+        path = store.host_file(store.host_name(), NOW)
+        path.unlink()
+        path.mkdir()
+        snapshot = build_queue.queue_snapshot(head_reading(since=NOW - 600, now=NOW), ZoneInfo("UTC"))
+        self.assertIn("bumps: unknown", snapshot["head"]["text"])
+        self.assertNotIn("no bumps since it joined", snapshot["head"]["text"])
+        self.assertEqual(set(snapshot), {"running_header", "running", "waiting_header", "waiting",
+                                         "head", "totals", "problems"})
+        self.assertEqual(set(snapshot["head"]), {"text", "tone"})
+        self.assertEqual(set(snapshot["totals"]), {"promised", "measured", "free", "reserve"})
+
+    def test_missing_token_return_never_adds_a_current_token_wait_row(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW, fields={"token_left_at": NOW - 60})
+        follower = replace(reading.view.waiting[0], pid=124, session_id="follower", session_name="follower")
+        reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, follower)))
+        write_token_gaps([queue_time_line(NOW - 60, kind="token_gap", session_id="head-session",
+                                         step="nextest", pid=123, start_time="123", token_left_at=NOW - 60)])
+        snapshot = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))
+        self.assertEqual([row[0] for row in snapshot["waiting"]], ["1", "2"])
+        self.assertFalse(any("waiting for the cargo token" in row[-1] for row in snapshot["waiting"]))
+
+    def test_a_returned_token_record_does_not_add_a_current_token_wait_row(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW)
+        write_token_gaps([token_gap_line(NOW - 200, NOW - 46)])
+        snapshot = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))
+        self.assertEqual([row[0] for row in snapshot["waiting"]], ["1"])
+
+    def test_head_line_shows_a_recorded_cargo_token_wait(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW)
+        write_token_gaps([token_gap_line(NOW - 200, NOW - 46)])
+        snapshot = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))
+        self.assertTrue(snapshot["head"]["text"].endswith("; cargo token waited 154 s"))
+        self.assertEqual(set(snapshot["head"]), {"text", "tone"})
+        self.assertEqual(set(snapshot), {"running_header", "running", "waiting_header", "waiting",
+                                         "head", "totals", "problems"})
+
+    def test_head_line_cargo_token_sum_excludes_other_waiting_steps(self) -> None:
+        reading = head_reading(since=NOW - 1000, now=NOW)
+        follower = replace(reading.view.waiting[0], pid=456, session_id="follower", step="clippy",
+                           since=NOW - 800)
+        reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, follower)))
+        write_token_gaps([
+            token_gap_line(NOW - 900, NOW - 800),
+            token_gap_line(NOW - 700, NOW - 400, session="follower", step="clippy", pid=456),
+            token_gap_line(NOW - 200, NOW - 46),
+        ])
+        text = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))["head"]["text"]
+        self.assertTrue(text.endswith("; cargo token waited 254 s"))
+        self.assertNotIn("cargo token waited 554 s", text)
+
+    def test_head_line_distinguishes_missing_history_from_no_head_token_wait(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW)
+        missing = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))["head"]["text"]
+        self.assertTrue(missing.endswith("; cargo token: unknown"))
+        write_token_gaps([token_gap_line(NOW - 200, NOW - 46, session="unrelated", pid=999)])
+        recorded = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))["head"]["text"]
+        self.assertTrue(recorded.endswith("; no cargo token wait"))
+
+    def test_head_line_partial_token_history_does_not_claim_a_complete_sum(self) -> None:
+        reading = head_reading(since=NOW - 600, now=NOW)
+        write_token_gaps([token_gap_line(NOW - 200, NOW - 46)],
+                         tail=token_gap_line(NOW - 40, NOW - 20).rstrip(b"\n"))
+        text = build_queue.queue_snapshot(reading, ZoneInfo("UTC"))["head"]["text"]
+        self.assertTrue(text.endswith("; cargo token: unknown"))
+        self.assertNotIn("cargo token waited", text)
 
     def test_json_cli_matches_text_cells_and_preserves_all_roster_problems(self) -> None:
         self.roster_read.return_value = roster.Roster([
@@ -248,8 +312,9 @@ class QueueTests(unittest.TestCase):
         head = memory_admit.WaitingStep(10, "head", "head-worker", "check", "/tmp/head", row["since"], need,
                                        memory_admit.head_wait_reason(decision, need, available, row, NOW))
         view = memory_admit.QueueView((head,), (), available, 0, 3 * GIB, NOW)
+        reading = queue_read_fixture(view)
         with mock.patch.object(memory_admit, "decide", side_effect=AssertionError("Do not decide again")):
-            line = build_queue.head_line(queue_read_fixture(view).explanation, {}, ZoneInfo("UTC"))
+            line = build_queue.head_line(reading.explanation, {}, ZoneInfo("UTC"), head_facts.read_head_facts(reading))
         self.assertIn("needs 11.0 GiB free: this step 8.0, earlyoom 3.0", line["text"])
         self.assertIn("free 7.0 GiB, step needs 8.0 GiB", line["text"])
         self.assertEqual(line["tone"], "default")
@@ -265,8 +330,8 @@ class QueueTests(unittest.TestCase):
                                        memory_admit.head_wait_reason(decision, need, available, row, NOW))
         running = memory_admit.RunningStep("other", "other", "doc", "/tmp/other", 19 * GIB,
                                           memory_admit.MeasuredMemory(19 * GIB))
-        line = build_queue.head_line(queue_read_fixture(memory_admit.QueueView((head,), (running,), available, 0, 3 * GIB, NOW)).explanation,
-                                     {}, ZoneInfo("UTC"))
+        reading = queue_read_fixture(memory_admit.QueueView((head,), (running,), available, 0, 3 * GIB, NOW))
+        line = build_queue.head_line(reading.explanation, {}, ZoneInfo("UTC"), head_facts.read_head_facts(reading))
         self.assertIn("memory pressure: full avg10 23.4", line["text"])
         self.assertNotIn("charged", line["text"])
         self.assertNotIn("budget", line["text"])
@@ -285,7 +350,8 @@ class QueueTests(unittest.TestCase):
     def test_unavailable_head_never_claims_a_stall_even_after_fifteen_minutes(self) -> None:
         head = memory_admit.WaitingStep(10, "head", "worker", "check", "/tmp/head", NOW - 1800,
                                        0, memory_admit.ReadingUnavailable())
-        line = build_queue.head_line(queue_read_fixture(memory_admit.QueueView((head,), (), 0, 0, 0, NOW)).explanation, {}, ZoneInfo("UTC"))
+        reading = queue_read_fixture(memory_admit.QueueView((head,), (), 0, 0, 0, NOW))
+        line = build_queue.head_line(reading.explanation, {}, ZoneInfo("UTC"), head_facts.read_head_facts(reading))
         self.assertIn("memory reading unavailable", line["text"])
         self.assertNotIn("Stalled:", line["text"])
         self.assertNotIn("free 0.0", line["text"])
@@ -439,26 +505,36 @@ class QueueTests(unittest.TestCase):
         line = next(line for line in build_queue.render_queue(queue_read_fixture(view), ZoneInfo("UTC")) if "head:" in line)
         self.assertTrue(line.endswith(
             "10.9 GiB | 12.0 GiB | head: builds use 16.1 of the 21.0 GiB budget "
-            + "(starts when build use falls to 10.1 GiB); needs 13.9 GiB free: this step 10.9, earlyoom 3.0; younger steps wait until 19:10 |"))
+            + "(starts when build use falls to 10.1 GiB); needs 13.9 GiB free: this step 10.9, earlyoom 3.0; no head priority: younger steps that fit may start |"))
 
-    def test_bump_by_unique_shown_label_moves_and_logs_the_actual_waiter(self) -> None:
-        _ = self.write_waiter(100, "head-id", "head")
-        waiter_path = self.write_waiter(200, "worker-id", "clone88ci")
-        self.roster_read.return_value = roster.Roster([self.entry("worker-id", "organon-ci88", codex=True)], [])
-        output = io.StringIO()
-        with mock.patch.object(memory_admit, "bump_waiter", wraps=memory_admit.bump_waiter) as bump, \
-             mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "actor-id"}), \
-             mock.patch("sys.argv", ["build_queue.py", "bump", "organon-ci88"]), redirect_stdout(output):
-            self.assertEqual(build_queue.main(), 0)
-        bump.assert_called_once_with(memory_admit.WaiterRowSelector(waiter_path.name, "organon-ci88"), "actor-id")
-        self.assertEqual(memory_admit.queue_view().waiting[0].session_id, "worker-id")
-        self.assertEqual(output.getvalue(),
-                         "actor-id moved organon-ci88: nextest in /tmp/tree-200 to the head; memory limits still apply\n")
-        rows = [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
-                for line in path.read_text().splitlines()]
-        self.assertEqual([(row["session"], row["step"], row["folder"]) for row in rows],
-                         [("worker-id", "nextest", "/tmp/tree-200")])
-        self.roster_read.assert_called_once_with(os.environ, roster.ThisMachine())
+    def test_older_fitting_step_reason_uses_the_shown_session_label(self) -> None:
+        waiting = memory_admit.WaitingStep(200, "younger", "young", "check", "/tmp/young", NOW - 60,
+            3 * GIB, memory_admit.BehindOlderFit("recorded-older", NOW - 120, "older-id"))
+        view = memory_admit.QueueView((waiting,), (), 20 * GIB, 0, 3 * GIB, NOW)
+        reading = queue_read_fixture(view)
+        self.assertEqual(build_queue.reason_text(waiting, reading, ZoneInfo("UTC"),
+            {"older-id": roster.UnitLabels("shown-older")}, memory_admit.NoWaiter()), "behind older step shown-older")
+        self.assertEqual(build_queue.reason_text(waiting, reading, ZoneInfo("UTC"), {}, memory_admit.NoWaiter()),
+                         "behind older step recorded-older")
+
+    def test_bump_refuses_raw_selectors_without_moving_or_logging(self) -> None:
+        first = self.write_waiter(100, "head-id", "head")
+        second = self.write_waiter(200, "worker-id", "worker")
+        self.roster_read.return_value = roster.Roster(
+            [self.entry("head-id", "shared"), self.entry("worker-id", "shared", codex=True)], [])
+        before = (first.read_bytes(), second.read_bytes())
+        for selector in ("2", "worker-id", "worker", "/tmp/tree-200", "tree-200", "shared", "unknown"):
+            with self.subTest(selector=selector), \
+                 mock.patch.object(memory_admit, "bump_waiter", wraps=memory_admit.bump_waiter) as bump, \
+                 mock.patch.object(build_queue, "read_queue_and_roster", side_effect=AssertionError("bump read the queue")):
+                status, output, errors = self.bump_output(selector)
+                self.assertEqual(status, 3)
+                self.assertEqual(output, "build queue: only the user can bump; bump is off until /showrunner:bump sets queue priority\n")
+                self.assertEqual(errors, "")
+                bump.assert_called_once_with(selector, "actor-id")
+                self.assertEqual((first.read_bytes(), second.read_bytes()), before)
+                self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [100, 200])
+                self.assertEqual(list((self.root / "buildlog").glob("*/*.jsonl")), [])
 
     def bump_output(self, selector: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
@@ -468,136 +544,6 @@ class QueueTests(unittest.TestCase):
             status = build_queue.main()
         return status, output.getvalue(), errors.getvalue()
 
-    def test_shown_name_removed_between_reads_refuses_without_moving_its_successor(self) -> None:
-        head = self.write_waiter(100, "head-id", "head")
-        chosen = self.write_waiter(200, "worker-id", "recorded-worker")
-        successor = self.write_waiter(300, "successor-id", "successor")
-        self.roster_read.return_value = roster.Roster([self.entry("worker-id", "shown-worker", codex=True)], [])
-        before = (head.read_bytes(), successor.read_bytes())
-        queue_read = memory_admit.locked_queue_read
-
-        def remove_chosen_after_read() -> memory_admit.QueueRead:
-            reading = queue_read()
-            self.assertEqual([step.pid for step in reading.view.waiting], [100, 200, 300])
-            chosen.unlink()
-            return reading
-
-        with mock.patch.object(memory_admit, "locked_queue_read", side_effect=remove_chosen_after_read):
-            status, output, errors = self.bump_output("shown-worker")
-        self.assertEqual(status, 3)
-        self.assertIn("build queue: 'shown-worker':", output)
-        self.assertEqual(len(output.splitlines()), 1)
-        self.assertEqual(errors, "")
-        self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [100, 300])
-        self.assertEqual((head.read_bytes(), successor.read_bytes()), before)
-        self.assertEqual(list((self.root / "buildlog").glob("*/*.jsonl")), [])
-
-    def test_shown_name_reordered_between_reads_moves_only_its_original_row(self) -> None:
-        head = self.write_waiter(100, "head-id", "head")
-        chosen = self.write_waiter(200, "worker-id", "recorded-worker")
-        younger = self.write_waiter(300, "younger-id", "younger")
-        self.roster_read.return_value = roster.Roster([self.entry("worker-id", "shown-worker", codex=True)], [])
-        head_before = head.read_bytes()
-        queue_read = memory_admit.locked_queue_read
-
-        def reorder_after_read() -> memory_admit.QueueRead:
-            reading = queue_read()
-            self.assertEqual([step.pid for step in reading.view.waiting], [100, 200, 300])
-            row = cast(memory_admit.Waiter, json.loads(younger.read_text()))
-            row["bump_order"] = -1
-            _ = younger.write_text(json.dumps(row))
-            self.assertEqual([step.pid for step in queue_read().view.waiting], [300, 100, 200])
-            return reading
-
-        with mock.patch.object(memory_admit, "locked_queue_read", side_effect=reorder_after_read):
-            status, output, errors = self.bump_output("shown-worker")
-        self.assertEqual(status, 0, errors)
-        self.assertIn("moved shown-worker: nextest in /tmp/tree-200", output)
-        self.assertEqual(errors, "")
-        self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [200, 300, 100])
-        self.assertEqual(head.read_bytes(), head_before)
-        self.assertEqual(cast(memory_admit.Waiter, json.loads(chosen.read_text())).get("session_id"), "worker-id")
-        rows = [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
-                for line in path.read_text().splitlines()]
-        self.assertEqual([(row["session"], row["folder"], row["old_position"]) for row in rows],
-                         [("worker-id", "/tmp/tree-200", 3)])
-
-    def test_exact_shown_name_and_repeat_never_move_the_session_with_a_longer_name(self) -> None:
-        head = self.write_waiter(100, "head-id", "head")
-        longer = self.write_waiter(200, "longer-id", "recorded-longer")
-        _ = self.write_waiter(300, "chosen-id", "recorded-chosen")
-        self.roster_read.return_value = roster.Roster([
-            self.entry("longer-id", "frame-cost-fix3", codex=True),
-            self.entry("chosen-id", "frame-cost-fix", codex=True),
-        ], [])
-        before = (head.read_bytes(), longer.read_bytes())
-        for attempt in range(2):
-            with self.subTest(attempt=attempt):
-                status, output, errors = self.bump_output("frame-cost-fix")
-                self.assertEqual(status, 0, errors)
-                self.assertIn("moved frame-cost-fix: nextest in /tmp/tree-300", output)
-                self.assertEqual(errors, "")
-                self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [300, 100, 200])
-                self.assertEqual((head.read_bytes(), longer.read_bytes()), before)
-        rows = [cast(dict[str, object], json.loads(line)) for path in (self.root / "buildlog").glob("*/*.jsonl")
-                for line in path.read_text().splitlines()]
-        self.assertTrue(rows)
-        self.assertEqual({(row["session"], row["folder"]) for row in rows}, {("chosen-id", "/tmp/tree-300")})
-
-    def test_departed_row_key_does_not_match_another_step_in_the_same_session(self) -> None:
-        head = self.write_waiter(100, "head-id", "head")
-        chosen = self.write_waiter(200, "shared-id", "recorded-chosen", "clippy")
-        sibling = self.write_waiter(300, "shared-id", "recorded-sibling", "nextest")
-        reading = memory_admit.locked_queue_read()
-        selector = memory_admit.WaiterRowSelector(chosen.name, "shared-worker")
-        self.assertEqual([step.session_id for step in reading.view.waiting], ["head-id", "shared-id", "shared-id"])
-        before = (head.read_bytes(), sibling.read_bytes())
-        chosen.unlink()
-        for attempt in range(2):
-            with self.subTest(attempt=attempt), self.assertRaises(memory_admit.UnmatchedWaiter) as refused:
-                _ = memory_admit.bump_waiter(selector, "actor-id")
-            self.assertIn("shared-worker", str(refused.exception))
-            self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [100, 300])
-            self.assertEqual((head.read_bytes(), sibling.read_bytes()), before)
-        self.assertEqual(list((self.root / "buildlog").glob("*/*.jsonl")), [])
-
-    def test_bump_unique_fallback_label_with_shared_session_and_unreadable_roster(self) -> None:
-        for pid, folder in ((100, "/tmp/alpha"), (200, "/tmp/beta")):
-            path = self.write_waiter(pid, "shared-session", "")
-            row = cast(dict[str, object], json.loads(path.read_text()))
-            row["folder"] = folder
-            _ = path.write_text(json.dumps(row))
-        self.roster_read.side_effect = RuntimeError("roster lookup failed")
-        self.assertEqual([step.folder for step in memory_admit.queue_view().waiting],
-                         ["/tmp/alpha", "/tmp/beta"])
-        output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "actor-id"}), \
-             mock.patch("sys.argv", ["build_queue.py", "bump", "beta"]), \
-             redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_queue.main(), 0, errors.getvalue())
-        self.assertEqual([step.folder for step in memory_admit.queue_view().waiting],
-                         ["/tmp/beta", "/tmp/alpha"])
-        self.assertEqual(output.getvalue(),
-                         "actor-id moved beta: nextest in /tmp/beta to the head; memory limits still apply\n")
-        self.assertEqual(errors.getvalue(), "")
-        self.roster_read.assert_called_once_with(os.environ, roster.ThisMachine())
-
-    def test_bump_shared_shown_label_is_ambiguous_even_when_recorded_name_is_unique(self) -> None:
-        first = self.write_waiter(100, "first-id", "first")
-        second = self.write_waiter(200, "second-id", "shared")
-        self.roster_read.return_value = roster.Roster(
-            [self.entry("first-id", "shared"), self.entry("second-id", "shared", codex=True)], [])
-        before = (first.read_text(), second.read_text())
-        errors, output = io.StringIO(), io.StringIO()
-        with mock.patch.object(memory_admit, "bump_waiter", wraps=memory_admit.bump_waiter) as bump, \
-             mock.patch("sys.argv", ["build_queue.py", "bump", "shared"]), \
-             redirect_stderr(errors), redirect_stdout(output):
-            self.assertEqual(build_queue.main(), 3)
-        bump.assert_not_called()
-        self.assertIn("'shared': ambiguous waiter; matches:", output.getvalue())
-        self.assertEqual(errors.getvalue(), "")
-        self.assertEqual((first.read_text(), second.read_text()), before)
-        self.assertEqual(list((self.root / "buildlog").glob("*/*.jsonl")), [])
 
     def test_waiting_row_names_head_and_age_with_local_time(self) -> None:
         with mock.patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "21"}):
@@ -619,7 +565,7 @@ class QueueTests(unittest.TestCase):
         output = "\n".join(lines)
         self.assertIn("| 1 | — | — | clone88ci | check | clone88 | 14:20 (40 min) | 10.9 GiB | 23.1 GiB | "
                       + "head: builds use 15.0 of the 21.0 GiB budget "
-                      + "(starts when build use falls to 10.1 GiB); younger steps wait until 15:10 |", output)
+                      + "(starts when build use falls to 10.1 GiB); no head priority: younger steps that fit may start |", output)
         self.assertIn("| 2 | — | — | tree | doc | tree | 14:55 (5 min) | 11.6 GiB | 23.1 GiB | "
                       + "behind clone88ci (waiting 40 min) |", output)
         self.assertNotIn("head-id", output)
@@ -687,7 +633,7 @@ class QueueTests(unittest.TestCase):
         line = next(line for line in build_queue.render_queue(queue_read_fixture(view), ZoneInfo("UTC")) if "head:" in line)
         self.assertTrue(line.endswith(
             "head: needs 10.0 GiB free: this step 3.0, running steps may grow 4.0, earlyoom 3.0; "
-            + "younger steps wait until 19:10 |"), line)
+            + "no head priority: younger steps that fit may start |"), line)
 
     def test_budget_reason_names_charged_builds_and_the_limit(self) -> None:
         waiting = memory_admit.WaitingStep(
@@ -711,7 +657,7 @@ class QueueTests(unittest.TestCase):
         view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
         line = next(line for line in build_queue.render_queue(queue_read_fixture(view), ZoneInfo("UTC")) if "head:" in line)
         self.assertTrue(line.endswith("head: builds use 13.2 of the 20.0 GiB budget "
-                                      + "(starts when build use falls to 4.9 GiB); younger steps wait until 19:10 |"))
+                                      + "(starts when build use falls to 4.9 GiB); no head priority: younger steps that fit may start |"))
 
     def test_head_reason_names_only_free_memory_when_budget_passes(self) -> None:
         need, available = int(15.1 * GIB), 18 * GIB
@@ -723,14 +669,16 @@ class QueueTests(unittest.TestCase):
         )
         view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
         line = next(line for line in build_queue.render_queue(queue_read_fixture(view), ZoneInfo("UTC")) if "head:" in line)
-        self.assertTrue(line.endswith("head: needs 18.1 GiB free: this step 15.1, earlyoom 3.0; younger steps wait until 19:10 |"))
+        self.assertTrue(line.endswith("head: needs 18.1 GiB free: this step 15.1, earlyoom 3.0; no head priority: younger steps that fit may start |"))
 
     def test_head_backfill_label_uses_the_since_zone_and_becomes_strict_at_ten_minutes(self) -> None:
         need, available = int(15.1 * GIB), 18 * GIB
         decision = memory_admit.decide(available, 60 * GIB, need, [memory_admit.MeasuredMemory(GIB)])
-        for waited, bump, suffix in ((540, 0, "younger steps may start until 15:01"),
-                                      (600, 0, "younger steps wait until 15:10"),
-                                      (60, -1, "younger steps wait until 15:10")):
+        for waited, bump, suffix in (
+            (540, 0, "backfill until 15:01:00 (1 min 0 s left): younger steps that fit may start"),
+            (600, 0, "strict until 15:10:00 (10 min 0 s left): younger steps wait"),
+            (60, -1, "strict until 15:10:00 (10 min 0 s left): younger steps wait"),
+        ):
             with self.subTest(waited=waited, bump=bump):
                 row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need,
                                            "since": NOW - waited, "bump_order": bump}
@@ -738,7 +686,13 @@ class QueueTests(unittest.TestCase):
                     10, "waiting-id", "unit", "nextest", "/tmp/tree", row["since"], need,
                     memory_admit.head_wait_reason(decision, need, available, row, NOW))
                 view = memory_admit.QueueView((waiting,), (), available, 0, 3 * GIB, NOW)
-                line = next(line for line in build_queue.render_queue(queue_read_fixture(view), ZoneInfo("America/New_York")) if "head:" in line)
+                reading = queue_read_fixture(view)
+                head = reading.explanation.head
+                if not isinstance(head, memory_admit.HeadExplanation):
+                    self.fail("fixture needs a head")
+                reading = replace(reading, explanation=replace(reading.explanation,
+                    head=replace(head, has_priority=True)))
+                line = next(line for line in build_queue.render_queue(reading, ZoneInfo("America/New_York")) if "head:" in line)
                 self.assertTrue(line.endswith("head: needs 18.1 GiB free: this step 15.1, earlyoom 3.0; " + suffix + " |"))
 
     def test_live_queue_pressure_reason_reaches_the_cli(self) -> None:
@@ -871,139 +825,18 @@ class QueueTests(unittest.TestCase):
         self.assertLess(elapsed, 1.0, f"render took {elapsed:.6f} s")
         print(f"queue render: 20000 rows in {elapsed:.6f} s")
 
-    def test_bump_passes_selector_and_caller_and_reports_ambiguous_match(self) -> None:
-        output = io.StringIO()
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "caller-id", "CODEX_THREAD_ID": ""}), \
-             mock.patch.object(memory_admit, "bump_waiter", side_effect=memory_admit.UnmatchedWaiter("two folders match; use position")) as bump, \
-             mock.patch("sys.argv", ["build_queue.py", "bump", "tree"]), redirect_stdout(output):
-            self.assertEqual(build_queue.main(), 3)
-        bump.assert_called_once_with("tree", "caller-id")
-        self.assertIn("two folders match; use position", output.getvalue())
 
-    def test_unknown_bump_selector_exits_three_with_refusal_only_on_stdout(self) -> None:
-        _ = self.write_waiter(100, "head-id", "head")
-        output, errors = io.StringIO(), io.StringIO()
-        with mock.patch("sys.argv", ["build_queue.py", "bump", "unknown-worker"]), \
-             redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_queue.main(), 3)
-        self.assertEqual(output.getvalue(),
-                         "build queue: 'unknown-worker': unknown waiter; matches: 1: head /tmp/tree-100\n")
-        self.assertEqual(errors.getvalue(), "")
-        self.assertEqual(memory_admit.queue_view().waiting[0].session_id, "head-id")
-        self.assertEqual(list((self.root / "buildlog").glob("*/*.jsonl")), [])
-
-    def test_ambiguous_shown_bump_selector_exits_three_without_calling_bump_waiter(self) -> None:
-        _ = self.write_waiter(100, "first-id", "first")
-        _ = self.write_waiter(200, "second-id", "second")
-        self.roster_read.return_value = roster.Roster([
-            self.entry("first-id", "shared"), self.entry("second-id", "shared", codex=True)], [])
-        output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(memory_admit, "bump_waiter") as bump, \
-             mock.patch("sys.argv", ["build_queue.py", "bump", "shared"]), \
-             redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_queue.main(), 3)
-        bump.assert_not_called()
-        self.assertEqual(output.getvalue(),
-                         "build queue: 'shared': ambiguous waiter; matches: 1: shared /tmp/tree-100, 2: shared /tmp/tree-200\n")
-        self.assertEqual(errors.getvalue(), "")
-
-    def test_bump_queue_read_failures_exit_two_with_diagnostics_only_on_stderr(self) -> None:
+    def test_queue_read_failures_exit_two_with_diagnostics_only_on_stderr(self) -> None:
         for error in (PermissionError(13, "Permission denied", "/private/admission/lock"),
                       ValueError("queue reading invalid")):
             with self.subTest(error=error):
                 output, errors = io.StringIO(), io.StringIO()
                 with mock.patch.object(memory_admit, "locked_queue_read", side_effect=error), \
-                     mock.patch.object(memory_admit, "bump_waiter") as bump, \
-                     mock.patch("sys.argv", ["build_queue.py", "bump", "unknown-worker"]), \
+                     mock.patch("sys.argv", ["build_queue.py"]), \
                      redirect_stdout(output), redirect_stderr(errors):
                     self.assertEqual(build_queue.main(), 2)
-                bump.assert_not_called()
                 self.assertEqual(output.getvalue(), "")
                 self.assertEqual(errors.getvalue(), f"build queue: {error}\n")
-
-    def test_bump_lock_oserror_exits_two_with_diagnostics_only_on_stderr(self) -> None:
-        output, errors = io.StringIO(), io.StringIO()
-        error = PermissionError(13, "Permission denied", "/private/admission/lock")
-        with mock.patch.object(memory_admit, "bump_waiter", side_effect=error), \
-             mock.patch("sys.argv", ["build_queue.py", "bump", "unknown-worker"]), \
-             redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_queue.main(), 2)
-        self.assertEqual(output.getvalue(), "")
-        self.assertEqual(errors.getvalue(), f"build queue: {error}\n")
-
-    def test_bump_locked_queue_valueerror_is_not_a_selector_refusal(self) -> None:
-        _ = self.write_waiter(100, "head-id", "head")
-        view = memory_admit.queue_view()
-        output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(memory_admit, "locked_queue_read", return_value=queue_read_fixture(view)), \
-             mock.patch.object(memory_admit, "read_queue", side_effect=ValueError("PRIVATE locked queue reading invalid")) as read, \
-             mock.patch("sys.argv", ["build_queue.py", "bump", "unknown-worker"]), \
-             redirect_stdout(output), redirect_stderr(errors):
-            self.assertEqual(build_queue.main(), 2)
-        read.assert_called_once()
-        self.assertEqual(output.getvalue(), "")
-        self.assertEqual(errors.getvalue(), "build queue: PRIVATE locked queue reading invalid\n")
-
-    def test_bump_refusal_escapes_control_characters_in_candidate_folders(self) -> None:
-        waiter = self.write_waiter(100, "head-id", "head")
-        row = cast(memory_admit.Waiter, json.loads(waiter.read_text()))
-        row["folder"] = "/tmp/tree\nsecond\rpart\t\x1b\x7f\u0085\u2028"
-        _ = waiter.write_text(json.dumps(row))
-        for selector, entries in (
-            ("unknown-worker", []),
-            ("shared", [self.entry("head-id", "shared"), self.entry("other-id", "shared")]),
-        ):
-            with self.subTest(selector=selector):
-                if entries:
-                    _ = self.write_waiter(200, "other-id", "other")
-                self.roster_read.return_value = roster.Roster(entries, [])
-                output, errors = io.StringIO(), io.StringIO()
-                with mock.patch("sys.argv", ["build_queue.py", "bump", selector]), \
-                     redirect_stdout(output), redirect_stderr(errors):
-                    self.assertEqual(build_queue.main(), 3)
-                self.assertEqual(len(output.getvalue().splitlines()), 1)
-                self.assertIn("/tmp/tree\\nsecond\\rpart\\t\\u001b\\u007f\\u0085\\u2028", output.getvalue())
-                self.assertEqual(errors.getvalue(), "")
-
-    def test_bump_cli_moves_the_step_and_names_the_actor_in_output_and_log(self) -> None:
-        for pid in (100, 200):
-            process = self.root / "proc" / str(pid)
-            process.mkdir()
-            fields = ["S", "1", *(["0"] * 17), str(pid)]
-            _ = (process / "stat").write_text(f"{pid} (verify) {' '.join(fields)}\n")
-        directory = self.root / "buildlog" / "admission"
-        directory.mkdir(parents=True)
-        actors = (
-            ("claude-parent", "codex-worker", "codex-worker"),
-            ("claude-session", "", "claude-session"),
-            ("", "", "user:test-user"),
-        )
-        for index, (claude, codex, actor) in enumerate(actors, 1):
-            with self.subTest(actor=actor):
-                for pid, name, since in ((100, "head", NOW - 2400), (200, "warmup", NOW - 300)):
-                    row: memory_admit.Waiter = {
-                        "pid": pid, "start_time": str(pid), "need": 12 * GIB, "since": since,
-                        "session_id": f"session-{pid}", "session_name": name,
-                        "step": "check", "folder": f"/tmp/{name}",
-                    }
-                    _ = (directory / f"{pid}.waiting").write_text(json.dumps(row))
-                output = io.StringIO()
-                with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": claude,
-                                                   "CODEX_THREAD_ID": codex, "USER": "test-user"}), \
-                     mock.patch("time.time", return_value=NOW), \
-                     mock.patch("sys.argv", ["build_queue.py", "bump", "2"]), redirect_stdout(output):
-                    self.assertEqual(build_queue.main(), 0)
-                    self.assertEqual(memory_admit.queue_view().waiting[0].pid, 200)
-                self.assertEqual(output.getvalue(),
-                                 f"{actor} moved warmup: check in /tmp/warmup to the head; memory limits still apply\n")
-                rows = [cast(dict[str, object], json.loads(line))
-                        for path in (self.root / "buildlog").glob("*/*.jsonl")
-                        for line in path.read_text().splitlines()]
-                self.assertEqual(len(rows), index)
-                self.assertEqual({key: rows[-1][key] for key in ("kind", "actor", "session", "step", "folder", "old_position")}, {
-                    "kind": "queue_bump", "actor": actor, "session": "session-200",
-                    "step": "check", "folder": "/tmp/warmup", "old_position": 2,
-                })
 
 
 if __name__ == "__main__":

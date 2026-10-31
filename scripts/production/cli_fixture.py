@@ -13,8 +13,10 @@ import shutil
 import subprocess
 import sys
 from types import ModuleType
-from typing import TYPE_CHECKING, cast
+from typing import cast
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str],
@@ -51,10 +53,7 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
                 # These imports only retrieve the caller-initialized modules.
                 import dailies_render
                 import showrunners
-                if TYPE_CHECKING:
-                    from ..whoami import note_file
-                else:
-                    import note_file
+                from scripts.whoami import note_file
 
                 home = Path.home()
                 for name, value in {

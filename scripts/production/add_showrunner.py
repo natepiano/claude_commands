@@ -17,6 +17,7 @@ but the showrunner did not appear or attach (the session is left running); 2 on 
 """
 from __future__ import annotations
 
+
 import argparse
 import os
 import re
@@ -24,11 +25,16 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.production import completion_receipt, staff, staff_sources
+
 import showrunners
+import showrunner_tree
 from production_units import Production, read_production
 from production_units import Refusal
 import herdr
@@ -58,6 +64,43 @@ EndingTab = EndingUnitTab | NoEndingTab
 NO_ENDING_TAB = NoEndingTab()
 
 
+@dataclass(frozen=True)
+class ShowrunnerLaunch:
+    session_id: str
+    config_dir: Path
+    started_at: datetime
+
+    @classmethod
+    def from_receipt(cls, fields: dict[str, object]) -> ShowrunnerLaunch:
+        session_id, config_dir, started_at = (fields.get(key) for key in ("session_id", "config_dir", "started_at"))
+        if not all(isinstance(value, str) and value for value in (session_id, config_dir, started_at)):
+            raise Refusal("showrunner receipt has no launch identity")
+        assert isinstance(session_id, str) and isinstance(config_dir, str) and isinstance(started_at, str)
+        return cls(session_id, Path(config_dir), datetime.fromisoformat(started_at))
+
+
+@dataclass(frozen=True)
+class NewShowrunnerLaunch:
+    pass
+
+
+NEW_SHOWRUNNER_LAUNCH = NewShowrunnerLaunch()
+
+
+def launch_place(identity: ShowrunnerLaunch) -> herdr.HerdrPlace | herdr.NotInHerdr:
+    from scripts.message import sessions
+
+    observed = sessions.session_liveness(identity.session_id)
+    if isinstance(observed, sessions.SessionLivenessUnknown):
+        raise Refusal(f"cannot locate session {identity.session_id}: {observed.reason}")
+    if isinstance(observed, sessions.SessionNotLive):
+        return herdr.NotInHerdr()
+    place = herdr.herdr_place_of(observed.pid)
+    if isinstance(place, herdr.NotInHerdr):
+        raise Refusal(f"session {identity.session_id} runs outside herdr")
+    return place
+
+
 def running(slug: str) -> bool:
     """Whether the production's showrunner runs now: it has an update timer and that timer's session is live.
 
@@ -85,7 +128,7 @@ def checked(child: Production, caller: str, ending: EndingTab = NO_ENDING_TAB, s
         raise Refusal(f"this session runs no production, so it has nothing to attach {child.slug} to")
     if child.slug == caller:
         raise Refusal(f"{child.slug} is this session's own production")
-    if caller in showrunners.descendants_of(child.slug):
+    if caller in showrunner_tree.descendants_of(child.slug, record=staff.initial_snapshot()):
         raise Refusal(f"{caller} already reports to {child.slug}, directly or through others")
     try:
         taken = running(child.slug)
@@ -137,14 +180,19 @@ def account_for_launch(child: Production, resume: str | None, target: str = "", 
         raise Refusal(str(error)) from error
 
 
-def launch(child: Production, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount) -> herdr.PromptSubmitOutcome:
+def launch(child: Production, model: str, effort: str, resume: str | None, cwd: Path, selected: ClaudeLaunchAccount,
+           *, identity: ShowrunnerLaunch | NewShowrunnerLaunch = NEW_SHOWRUNNER_LAUNCH) -> herdr.PromptSubmitOutcome:
     """Start once and prove the opening prompt reached this showrunner's transcript."""
+    from scripts.message import sessions
     from scripts.whoami.account import named_account_environment
 
-    prompt = f"/showrunner:produce {child.doc}" + (" resume" if resume else "")
+    session_id = identity.session_id if isinstance(identity, ShowrunnerLaunch) else resume or str(uuid4())
+    transcript = herdr.SessionTranscript(selected.dir, session_id)
+    resuming = bool(resume) or (isinstance(identity, ShowrunnerLaunch)
+        and sessions.latest_transcript(transcript.session_id, transcript.config_dir / "projects") is not None)
+    prompt = f"/showrunner:produce {child.doc}" + (" resume" if resuming else "")
     arguments = ["--model", model, "--effort", effort]
-    session_id = resume or str(uuid4())
-    arguments.extend(["--resume" if resume else "--session-id", session_id])
+    arguments.extend(["--resume" if resuming else "--session-id", session_id])
     arguments.extend(["--remote-control", child.slug, "-n", child.slug, "--settings", '{"disableAgentView": true}'])
     environment = {"ENABLE_TOOL_SEARCH": "true"}
     environment.update(named_account_environment(selected.dir))
@@ -152,7 +200,7 @@ def launch(child: Production, model: str, effort: str, resume: str | None, cwd: 
     _ = herdr.start_server(host, 90_000)
     launched = herdr.launch_agent(host, showrunners.herdr_space(child.slug, str(child.doc)), child.slug, str(cwd),
         environment, kind="claude", agent=child.slug, agent_arguments=arguments,
-        opening=herdr.OpeningPrompt(prompt, herdr.SessionTranscript(selected.dir, session_id)), timeout_ms=90_000)
+        opening=herdr.OpeningPrompt(prompt, transcript), timeout_ms=90_000)
     if isinstance(launched, herdr.nix_env.Refused):
         raise herdr.HerdrFailure(launched.reason)
     outcome = launched.outcome
@@ -182,7 +230,20 @@ def showrunner_appeared(slug: str) -> bool:
         time.sleep(POLL_S)
 
 
-def main(argv: list[str]) -> int:
+
+def ensure_staff_showrunner(child: Production, caller: str) -> staff.StaffRow:
+    record = staff.initial_snapshot()
+    found = staff_sources.member(staff_sources.ShowrunnerMember(child.slug), record)
+    parent = staff_sources.member(staff_sources.ShowrunnerMember(caller), record)
+    if isinstance(parent, staff_sources.NoSuchMember):
+        doc = showrunners.timer_docs().get(caller)
+        if doc is not None:
+            parent = staff_sources.MemberFound(staff.ensure("showrunner", name=showrunners.herdr_space(caller, str(doc))))
+    row = (found.row if isinstance(found, staff_sources.MemberFound)
+           else staff.ensure("showrunner", name=showrunners.herdr_space(child.slug, str(child.doc))))
+    return row
+
+def _main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Start a lower production's showrunner in herdr and attach it.")
     _ = parser.add_argument("--production", required=True, type=Path)
     _ = parser.add_argument("--model", required=True, help="pass your own model id")
@@ -200,21 +261,57 @@ def main(argv: list[str]) -> int:
     caller = showrunners.own_slug()
     try:
         child = read_production(cast(Path, args.production))
+        where = cwd or child.checkout
         selected = account_for_launch(child, resume, cast(str, args.account), cast(str, args.config_dir))
-        checked(child, caller, start_in=cwd, config_dir=account_directory(selected))
-        if resume:
+        identity = ShowrunnerLaunch(resume or str(uuid4()), selected.dir, datetime.now(UTC))
+        place: herdr.HerdrPlace | herdr.NotInHerdr = herdr.NotInHerdr()
+        receipt = showrunners.SHOWRUNNER_STATE_DIR / child.slug / "add_showrunner.json"
+        saved = completion_receipt.read_receipt(receipt, staff.initial_snapshot())
+        if isinstance(saved, completion_receipt.OwnedReceipt) and not cast(bool, args.check):
+            fields = saved.fields
+            if (saved.owner.kind == "showrunner" and fields.get("doc") == str(child.doc)
+                    and fields.get("caller") == caller and fields.get("resume") == resume
+                    and fields.get("cwd") == str(where)):
+                if running(child.slug):
+                    _ = ensure_staff_showrunner(child, caller)
+                    print(f"{child.slug} already started")
+                    return showrunners.main(["attach", child.slug, caller])
+                identity = ShowrunnerLaunch.from_receipt(fields)
+                if identity.config_dir != selected.dir:
+                    raise Refusal(f"{child.slug}: unfinished launch belongs to {identity.config_dir}")
+                place = launch_place(identity)
+                if isinstance(place, herdr.HerdrPlace) and not any(
+                    pane["pane_id"] == place.pane and pane.get("label") == child.slug
+                    for pane in herdr.Herdr(place.session).panes()
+                ):
+                    raise Refusal(f"session {identity.session_id} does not own {child.slug}'s tab")
+        ending = EndingUnitTab(place.pane) if isinstance(place, herdr.HerdrPlace) else NO_ENDING_TAB
+        checked(child, caller, ending=ending, start_in=cwd, config_dir=account_directory(selected))
+        if resume and isinstance(place, herdr.NotInHerdr):
             from scripts.message import sessions
             if any(item["sessionId"] == resume for item in sessions.live_sessions()):
                 raise Refusal(f"session {resume} is still live")
     except (Refusal, OSError) as refusal:
         print(f"add_showrunner: {refusal}", file=sys.stderr)
         return 2
-    where = cwd or child.checkout
     if cast(bool, args.check):
         print(f"check: ok — would start {child.slug} in {where} and attach it to {caller}")
         return 0
+    row = ensure_staff_showrunner(child, caller)
+    completion_receipt.write_receipt(receipt, row.id, {"doc": str(child.doc), "caller": caller, "resume": resume, "cwd": str(where),
+                                  "session_id": identity.session_id, "config_dir": str(identity.config_dir),
+                                  "started_at": identity.started_at.isoformat()})
     try:
-        outcome = launch(child, cast(str, args.model), cast(str, args.effort), resume, where, selected)
+        if isinstance(place, herdr.HerdrPlace):
+            prompt = f"/showrunner:produce {child.doc}" + (" resume" if resume else "")
+            transcript = herdr.SessionTranscript(identity.config_dir, identity.session_id)
+            outcome = herdr.submitted_prompt(transcript, prompt, identity.started_at)
+            if not isinstance(outcome, herdr.PromptSubmitted):
+                outcome = herdr.Herdr(place.session).submit_opening_prompt(
+                    place.pane, herdr.OpeningPrompt(prompt, transcript), identity.started_at, 90_000)
+        else:
+            outcome = launch(child, cast(str, args.model), cast(str, args.effort), resume, where, selected,
+                             identity=identity)
     except herdr.AgentNotReady as error:
         print(f"add_showrunner: the session is not ready:\n{error.screen}", file=sys.stderr)
         return SESSION_NOT_READY
@@ -238,11 +335,18 @@ def main(argv: list[str]) -> int:
     if not appeared:
         print(f"{child.slug} has no running showrunner after {WAIT_S:g} s, so it is not attached. {later}")
         return 1
-    # A resumed child kept the parent it had: an edge is stored, and counts again once both ends have a timer.
-    if showrunners.parent_of(child.slug) == caller:
+    # A resumed child keeps the parent recorded for its stable staff id.
+    if showrunner_tree.parent_of(child.slug) == caller:
         print(f"{child.slug} already reports to {caller}")
         return 0
     return showrunners.main(["attach", child.slug, caller])
+
+
+def main(argv: list[str]) -> int:
+    def run() -> int:
+        with staff.operation():
+            return _main(argv)
+    return staff.cli_result(run)
 
 
 if __name__ == "__main__":

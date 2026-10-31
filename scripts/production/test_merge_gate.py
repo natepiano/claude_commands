@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import fcntl
 
 import json
 import io
@@ -13,11 +14,157 @@ from typing import cast, final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import change_review, merge_gate
-from scripts.production.merge_gate_test_support import EXPECTED_SUITES, MergeGateFixture, gate_suites
+from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, MergeGateFixture, SUITE_MODULE, gate_suites
 
 
 @final
 class MergeGateCheckpointTests(MergeGateFixture):
+    def test_checkout_holds_a_shared_copy_lock_through_suites_and_releases_it_on_error(self) -> None:
+        copies = self.root / "copies"
+        checkout = copies / "show-maker" / "21-gate"
+        checkout.parent.mkdir(parents=True)
+        _ = self.git(self.checkout, "clone", str(self.checkout), str(checkout))
+        self.environment["SCRATCH_COPIES_ROOT"] = str(copies)
+        observed: list[Path] = []
+
+        def suites(repo: Path, *_arguments: object, **_keywords: object) -> merge_gate.GateRun:
+            self.assertEqual(repo, checkout)
+            with (repo / ".claude-busy").open("a") as contender:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(contender, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            observed.append(repo)
+            raise merge_gate.GateRefused("injected suite stop")
+
+        with mock.patch.object(merge_gate, "run_suites", side_effect=suites):
+            result = self.run_gate("--tests-only", "--checkout", str(checkout))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("injected suite stop", result.stderr)
+        self.assertEqual(observed, [checkout])
+        excludes = (checkout / ".git/info/exclude").read_text().splitlines()
+        self.assertEqual(excludes.count("/.claude-busy"), 1)
+        self.assertEqual(excludes.count("/.scratch.json"), 1)
+        with (checkout / ".claude-busy").open("a") as contender:
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_checkpoint_retries_its_merge_after_a_stop_before_push(self) -> None:
+        checked = merge_gate.checked_git
+
+        def stop_at_push(repo: Path, *arguments: str) -> str:
+            if arguments == ("push", "origin", "integration"):
+                raise merge_gate.GateRefused("injected stop before push")
+            return checked(repo, *arguments)
+
+        with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
+            stopped = self.run_gate()
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("injected stop before push", stopped.stderr)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.assertNotEqual(merged, self.base)
+        self.assert_not_pushed()
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
+        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), merged)
+        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
+                         [merged, self.base, self.checkpoint])
+
+    def test_checkpoint_retry_refuses_a_remote_rewound_below_its_base(self) -> None:
+        self.write(self.checkout / "published.txt", "published code\n")
+        published = self.commit(self.checkout, "published non-doc change")
+        _ = self.git(self.checkout, "push", "origin", "integration")
+        checked = merge_gate.checked_git
+
+        def stop_at_push(repo: Path, *arguments: str) -> str:
+            if arguments == ("push", "origin", "integration"):
+                raise merge_gate.GateRefused("injected stop before push")
+            return checked(repo, *arguments)
+
+        with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
+            stopped = self.run_gate()
+        self.assertNotEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("injected stop before push", stopped.stderr)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.assertEqual(self.git(self.checkout, "rev-list", "--parents", "-n", "1", "HEAD").split(),
+                         [merged, published, self.checkpoint])
+        _ = self.git(self.origin, "update-ref", "refs/heads/integration", self.base, published)
+
+        result = self.run_gate()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("merge HEAD differs from origin merge branch", result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
+        self.assertEqual(self.git(self.origin, "rev-parse", "integration"), self.base)
+
+    def test_checkpoint_retry_refuses_a_recorded_merge_for_another_checkpoint(self) -> None:
+        checked = merge_gate.checked_git
+
+        def stop_at_push(repo: Path, *arguments: str) -> str:
+            if arguments == ("push", "origin", "integration"):
+                raise merge_gate.GateRefused("injected push failure")
+            return checked(repo, *arguments)
+
+        with mock.patch.object(merge_gate, "checked_git", side_effect=stop_at_push):
+            stopped = self.run_gate()
+        self.assertIn("injected push failure", stopped.stderr)
+        merged = self.git(self.checkout, "rev-parse", "HEAD")
+        self.write(self.unit / "next.txt", "next checkpoint\n")
+        checkpoint = self.commit(self.unit, "next checkpoint")
+        _ = self.git(self.unit, "push", "origin", "unit-phase")
+        result = self.run_gate(checkpoint=checkpoint)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git(self.checkout, "rev-parse", "HEAD"), merged)
+        self.assert_not_pushed()
+
+    @gate_suites("folder_from_the_checkout")
+    def test_a_folder_without_a_registry_entry_runs_and_is_reported(self) -> None:
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_all_modules_started()
+        self.assertRegex(result.stdout, r"(?m)^folder_from_the_checkout: OK \d+\.\d+s$")
+        self.assertEqual(self.pass_records()[0]["suites"], ["folder_from_the_checkout"])
+
+    def test_nested_modules_run_and_retry_from_their_own_folder_under_the_top_suite(self) -> None:
+        nested = self.checkout / "scripts" / "hooks" / "tests" / "test_first.py"
+        self.write(nested, SUITE_MODULE)
+        _ = self.commit(self.checkout, "nested test fixture")
+        self.write(self.state / "fail-first-hooks", "fail")
+        result = self.run_gate("--tests-only", "--full")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        starts = [(row["suite"], row["module"]) for row in self.module_events() if row["event"] == "start"]
+        self.assertCountEqual(starts, [("hooks", "test_first.py"), ("hooks", "tests/test_first.py")] * 2)
+        self.assertIn("Rerun alone: hooks/tests/test_first.py passed", result.stdout)
+        self.assertIn("Rerun alone: hooks/test_first.py passed", result.stdout)
+        self.assertRegex(result.stdout, r"(?m)^hooks: OK \d+\.\d+s$")
+        self.assertNotRegex(result.stdout, r"(?m)^tests:")
+        launches = [call for call in self.calls() if call["tool"] == "suite-python"]
+        folders = [call["args"][call["args"].index("-s") + 1] for call in launches]
+        self.assertCountEqual(folders, [str(nested.parent), str(nested.parent.parent)] * 2)
+        self.assertTrue(all(call["cwd"] == str(self.checkout) for call in launches))
+        timings = merge_gate.read_measures(self.state / "runner" / "module_seconds.json")
+        self.assertEqual(set(timings), {"hooks/test_first.py", "hooks/tests/test_first.py"})
+        self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
+
+    def test_folders_without_test_modules_and_cached_files_are_not_suites(self) -> None:
+        scripts = self.checkout / "scripts"
+        self.write(scripts / "empty" / "helper.py", "raise AssertionError('helper was run')\n")
+        self.write(scripts / "cached" / "__pycache__" / "test_cached.py",
+                   "raise AssertionError('cached test was run')\n")
+        (scripts / "empty" / "test_directory.py").mkdir()
+        _ = self.commit(self.checkout, "non-test folder fixture")
+        result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_all_modules_started()
+        self.assertNotRegex(result.stdout, r"(?m)^(?:empty|cached|__pycache__):")
+        self.assertEqual(self.pass_records()[0]["suites"], ["hooks"])
+
+    @gate_suites()
+    def test_an_empty_test_list_is_refused_before_any_job_runs(self) -> None:
+        result = self.run_gate("--tests-only")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("the test list is empty", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.module_events(), [])
+
     def test_dirty_merge_checkout_is_refused_without_destroying_changes(self) -> None:
         self.write(self.checkout / "subject.txt", "uncommitted\n")
         self.assert_refused_before_gate(self.run_gate())
@@ -164,7 +311,7 @@ class MergeGateCheckpointTests(MergeGateFixture):
         self.assertIn("Change review: the production doc has no Change review line; no rows written",
                       result.stdout)
 
-    @gate_suites(*EXPECTED_SUITES)
+    @gate_suites(*FIXTURE_FOLDERS)
     def test_green_gate_pushes_no_ff_merge_with_subject_body_and_all_modules(self) -> None:
         self.write(self.state / "types-barrier", "overlap")
         self.write(self.state / "types-hold", "hold")

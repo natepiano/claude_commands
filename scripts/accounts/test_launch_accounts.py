@@ -455,7 +455,7 @@ def _resume_parts(session: Session, prompt: str):
 
     def test_shell_launches_without_any_account_selection_are_rejected(self) -> None:
         for path, source in (
-                ("fix/style-eval-review-all.sh", 'claude --print --dangerously-skip-permissions -- "$prompt" > "$log" 2>&1'),
+                ("fixtures/unresolved-launch.sh", 'claude --print --dangerously-skip-permissions -- "$prompt" > "$log" 2>&1'),
                 ("berth_fix/launch.sh", 'exec env -u CLAUDE_CODE_MESSAGING_SOCKET \\\n    claude -n "$session_name" --permission-mode auto /berth_fix\n'
                  + 'open_window claude -n "$session_name" /berth_fix'),
                 ("agents/agent_bg.sh", '"${CLAUDE_BIN}" "${launch_args[@]}"')):

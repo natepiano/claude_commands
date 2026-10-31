@@ -10,7 +10,7 @@ from typing import final
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
-from scripts.production.merge_gate_test_support import EXPECTED_SUITES, gate_suites
+from scripts.production.merge_gate_test_support import FIXTURE_FOLDERS, gate_suites
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
 
 
@@ -94,7 +94,6 @@ class MergeGateRerunsTests(GateSuitesFixture):
                 (self.state / "tools.jsonl").unlink(missing_ok=True)
                 output = io.StringIO()
                 with mock.patch.dict(os.environ, self.environment), \
-                        mock.patch.object(merge_gate, "TEST_SUITES", ("hooks",)), \
                         mock.patch.object(merge_gate, "in_builds_slice", return_value=reason == "existing"), \
                         redirect_stdout(output):
                     run = merge_gate.run_suites(self.checkout)
@@ -105,7 +104,7 @@ class MergeGateRerunsTests(GateSuitesFixture):
                            "existing": "gate already runs in builds.slice"}[reason]
                 self.assertIn("Module scope skipped: " + message, output.getvalue())
 
-    @gate_suites(*EXPECTED_SUITES[:merge_gate.RERUN_LIMIT])
+    @gate_suites(*FIXTURE_FOLDERS[:merge_gate.RERUN_LIMIT])
     def test_more_than_the_rerun_limit_keeps_all_first_failures(self) -> None:
         failed_suites = self.suites[:merge_gate.RERUN_LIMIT]
         for suite in failed_suites:

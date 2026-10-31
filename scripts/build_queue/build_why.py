@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from scripts.build_queue import build_queue
+from scripts.build_queue import build_queue, head_facts
 from scripts.lint import memory_admit as gate
 from scripts.lib.user_zone import user_zone
 from scripts.message import roster
@@ -129,24 +129,35 @@ def pressure_text(pressure: gate.MemoryPressure, zone: ZoneInfo) -> str:
 
 
 def release_text(explanation: gate.QueueExplanation,
-                 labels: Mapping[str, roster.UnitLabels]) -> str:
+                 labels: Mapping[str, roster.UnitLabels], zone: ZoneInfo) -> str:
     release = gate.smallest_head_release(explanation)
-    if isinstance(release, gate.HeadAdmitsAfterEnd):
+    if isinstance(release, gate.HeadRelease):
         if not release.ended:
-            return "no running step needs to end"
-        names = [build_queue.step_labels(explanation.running[index].step, labels).session
-                 + " " + explanation.running[index].step.step for index in release.ended]
-        return (f"{' + '.join(names)} end (budget charge drops {gib(release.charge_drop)}; "
-                + f"free memory rises {gib(release.freed)} and promise not yet used drops {gib(release.growth_drop)})")
-    if isinstance(release, gate.HeadStillHeld):
-        return "all running steps ending still leaves " + ", ".join(release.causes) + " holding the head"
-    if isinstance(release, gate.ReadingUnavailable):
-        return "admission memory reading unavailable"
-    return "nothing waits"
+            text = "no running step needs to end"
+        else:
+            names = [build_queue.step_labels(explanation.running[index].step, labels).session
+                     + " " + explanation.running[index].step.step for index in release.ended]
+            text = (f"{' + '.join(names)} end (budget charge drops {gib(release.charge_drop)}; "
+                    + f"free memory rises {gib(release.freed)} and promise not yet used drops {gib(release.growth_drop)})")
+        if isinstance(release, gate.HeadStartsAt):
+            starts_at = datetime.fromtimestamp(release.at, zone).strftime("%H:%M:%S %Z")
+            text += ("; then " if release.ended else "; ") + f"recovery spacing starts it at {starts_at}"
+    elif isinstance(release, gate.HeadStillHeld):
+        text = "all running steps ending still leaves " + ", ".join(release.causes) + " holding the head"
+    elif isinstance(release, gate.ReadingUnavailable):
+        text = "admission memory reading unavailable"
+    else:
+        text = "nothing waits"
+    head = explanation.head
+    if (isinstance(head, gate.HeadExplanation) and isinstance(head.decision.pressure, gate.MemoryPressure)
+            and not isinstance(release, gate.HeadStartsAt)):
+        text += "; the pressure hold or recovery spacing must also clear"
+    return text
 
 
 def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
-                       labels: Mapping[str, roster.UnitLabels]) -> list[str]:
+                       labels: Mapping[str, roster.UnitLabels],
+                       facts: head_facts.HeadFacts | gate.NoWaiter) -> list[str]:
     host = explanation.host
     if isinstance(host, gate.ReadingUnavailable):
         raise ValueError("host memory unavailable")
@@ -177,24 +188,24 @@ def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
         lines.append("None.")
     lines.append(f"Total: charged {gib(explanation.totals.charged)}, using {gib(explanation.totals.measured)}")
     head = explanation.head
-    if isinstance(head, gate.NoWaiter):
+    if isinstance(head, gate.NoWaiter) or isinstance(facts, gate.NoWaiter):
         return [*lines, "", "Nothing waits."]
     identity = build_queue.step_labels(head.waiter, labels)
     lines.extend(("", f"First in line: {identity.showrunner} / {identity.unit} / {identity.session}, "
         + f"{head.waiter.step}; waiting {build_queue.age(head.waiter.since, explanation.now)} min; "
-        + f"need {gib(head.waiter.need)}; {need_text(head.need_source)}", "",
-        budget_text(head.budget), free_text(head.free)))
+        + f"need {gib(head.waiter.need)}; {need_text(head.need_source)}",
+        head_facts.head_time_text(facts, zone), head_facts.bump_text(facts, zone)))
+    bumps = [[build_queue.field(cell) for cell in row] for row in head_facts.bump_rows(facts, zone, labels)]
+    if bumps:
+        lines.extend(aligned_table(("Step", "Session", "Folder", "Bumps", "By", "Last bump"), bumps, frozenset((3,))))
+    remainder = head_facts.bump_remainder(facts)
+    if remainder:
+        lines.append(remainder)
+    lines.append("Order rule: " + head_facts.order_text(facts, zone))
+    lines.extend(head_facts.cargo_token_lines(facts, zone, labels))
+    lines.extend(("", budget_text(head.budget), free_text(head.free)))
     if isinstance(head.decision.pressure, gate.MemoryPressure):
         lines.append("Pressure: " + pressure_text(head.decision.pressure, zone))
-    deadline = minute(head.order.deadline, zone)
-    order = (f"strict until {deadline}: younger steps wait" if isinstance(head.order, gate.StrictUntil)
-             else f"backfill until {deadline}: younger steps that fit may start")
-    if not head.has_priority and isinstance(head.order, gate.StrictUntil):
-        order += "; head priority is not active"
-    if isinstance(head.bump, gate.QueueBump):
-        kind = "bumped by position" if head.bump.by_position else "head priority recorded"
-        order += f"; {kind} at {minute(head.bump.priority_since, zone)}"
-    lines.extend(("", "Order rule: " + order))
     line = explanation.line
     lines.append(f"The line: {line.count} waiting behind it; {line.fitting} would fit now under both checks; "
                  + f"needs from {line.smallest_need / gate.GIB:.1f} to {gib(line.largest_need)}; "
@@ -210,9 +221,7 @@ def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
         causes = ["ready for the next admission check"]
     elif not causes:
         causes = ["queue order"]
-    releases = release_text(explanation, labels)
-    if isinstance(head.decision.pressure, gate.MemoryPressure):
-        releases += "; the pressure hold or recovery spacing must also clear"
+    releases = release_text(explanation, labels, zone)
     lines.extend(("", "Waiting because: " + ", ".join(causes) + ". Frees when: " + releases + "."))
     return lines
 
@@ -221,12 +230,15 @@ def main() -> int:
     try:
         # A damaged recovery record must not turn the one-line failure protocol into a traceback.
         with redirect_stderr(io.StringIO()):
-            explanation = gate.explain_queue()
+            reading = gate.locked_queue_read()
+            explanation = reading.explanation
+            facts = head_facts.read_head_facts(reading)
             session_ids = [row.step.session_id for row in explanation.running]
             if isinstance(explanation.head, gate.HeadExplanation):
                 session_ids.append(explanation.head.waiter.session_id)
+            session_ids.extend(head_facts.session_ids(facts))
             labels = roster.unit_labels_for(session_ids, os.environ)
-            lines = render_explanation(explanation, user_zone(), labels)
+            lines = render_explanation(explanation, user_zone(), labels, facts)
     except Exception:
         print("build-why: the admission state could not be read.")
         return 2

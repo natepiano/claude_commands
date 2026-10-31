@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
+
 import unittest
 from scripts.direct import review_launcher_test_support as support
 from scripts.direct.test_review_launcher_pool import own_review_with_legacy_flags
 from typing import override
 from pathlib import Path
 from scripts.direct.review_launcher_test_support import ProgressState as ProgressState
-from scripts.direct.review_launcher_test_support import TEST_HANG_GUARD_SECS as TEST_HANG_GUARD_SECS
 from typing import cast
 import json
 import os

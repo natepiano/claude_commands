@@ -8,7 +8,7 @@ import io
 import json
 from contextlib import contextmanager, redirect_stdout
 from contextvars import ContextVar
-from collections.abc import Callable, Generator, Iterable, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 import os
 import re
 import shlex
@@ -26,13 +26,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, Never, Protocol, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.accounts import outage_alerts
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
-from account import (  # noqa: E402
+from scripts.whoami.account import (  # noqa: E402
     Account,
     UnknownAccountName,
     UnreadableAccount,
@@ -41,7 +43,10 @@ from account import (  # noqa: E402
     own_claude_account,
     NAMED_ACCOUNT_VARIABLES,
 )
+from scripts.shutdown import stop_resume  # noqa: E402
+import pane_record  # noqa: E402
 import production_units  # noqa: E402
+from scripts.production import staff, staff_sources  # noqa: E402
 import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import inventory as inventory_work  # noqa: E402
@@ -106,24 +111,14 @@ from push_texts import RenderedPush, render  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 
 
-class RestartMessageSent(TypedDict):
-    kind: Literal["sent"]
-
-
-class RestartMessageQueued(TypedDict):
-    kind: Literal["queued"]
-    reason: str
-
-
-RestartMessageDelivery = RestartMessageSent | RestartMessageQueued
-
-
 class ShutdownServices(Protocol):
     NOTIFIER: Path
     SHOWRUNNER_TOLD_BACK: str
 
     def _unit_showrunner(self, saved: SessionShutdown) -> str: ...
-    def _reserve_showrunner_line(self, saved: SessionShutdown, told: str) -> bool: ...
+    def showrunner_was_told(self, saved: SessionShutdown) -> bool: ...
+    def send_showrunner_line(self, saved: SessionShutdown, told: str, showrunner: str,
+                            summary: str, text: str) -> SessionShutdown: ...
 
     def record_time(self) -> str: ...
     def local_machine(self) -> str: ...
@@ -135,7 +130,8 @@ class ShutdownServices(Protocol):
     def send_message(
         self, recipient: str, summary: str, text: str, *,
         machine: str = "", key: str = "",
-    ) -> RestartMessageDelivery: ...
+    ) -> Mapping[str, str]: ...
+    def message_was_delivered(self, outcome: Mapping[str, object]) -> bool: ...
     def unrecorded_local_sessions(
         self, login: str, ids: tuple[str, ...], records: list[SessionShutdown],
     ) -> dict[str, str]: ...
@@ -156,7 +152,7 @@ SEND = SCRIPTS / "message" / "send.py"
 RESTART_LAUNCH_WORKERS = 256
 SESSION_WAIT_SECONDS = 90.0
 SESSION_POLL_SECONDS = 0.5
-CONDUCTOR_ONLY_VARIABLES = frozenset({"REFUSAL_WATCH_INVENTORY", "PYTHONUNBUFFERED", "SHUTDOWN_PARENT_LAUNCH_CLAIM"})
+CONDUCTOR_ONLY_VARIABLES = frozenset({"REFUSAL_WATCH_INVENTORY", "PYTHONUNBUFFERED", "SHUTDOWN_PARENT_LAUNCH_CLAIM", "STAFF_OPERATION_FD"})
 # herdr lists a stopped agent as live for a few seconds after its process ends.
 AGENT_EXIT_SECONDS = 15.0
 REMOTE_CONTROL_WAIT_SECONDS = 10.0
@@ -275,7 +271,7 @@ class IncompleteShutdownStillLive:
     """The owner is running, so its unfinished shutdown remains unchanged."""
 
 
-INCOMPLETE_PROGRESS = frozenset({"waiting", "ready", "held by usage limit", "reaping", "stopping"})
+INCOMPLETE_PROGRESS = frozenset({"waiting", "ready", "held by usage limit", "reaping", "stopping", "stop failed"})
 
 
 def _recover_incomplete_shutdown(
@@ -290,15 +286,23 @@ def _recover_incomplete_shutdown(
             return IncompleteShutdownRefused(reason)
         case SessionNotLive():
             pass
+    # The session's Claude process is gone, so its stop is done. An unconfirmed
+    # worker pause or cleanup never holds the restart: every thread can resume.
+    gone: SessionProgress = {"kind": "already gone", "at": settle.record_time()}
     if dry_run:
-        return {**saved, "progress": {"kind": "already gone", "at": settle.record_time()}}
-    # The stop path proves worker and host cleanup too, and owns its stopping claim.
-    cleaned = stop_work.stop_session(saved)
-    if cleaned["request_id"] != saved["request_id"]:
+        return {**saved, "progress": gone}
+
+    def mark_gone(current: SessionShutdown) -> None:
+        if current["request_id"] == saved["request_id"] and current["progress"]["kind"] in INCOMPLETE_PROGRESS:
+            current["progress"] = gone
+
+    try:
+        marked = update_session(saved["login"], saved["session"]["session_id"], mark_gone)
+    except NoLiveRecord:
         return IncompleteShutdownRefused("shutdown request changed during recovery")
-    if cleaned["progress"]["kind"] not in RESTARTABLE_PROGRESS or _unfinished_cleanup(cleaned):
-        return IncompleteShutdownRefused("owner cleanup not confirmed: " + cleaned["progress"]["kind"])
-    return cleaned
+    if marked["request_id"] != saved["request_id"] or marked["progress"]["kind"] not in RESTARTABLE_PROGRESS:
+        return IncompleteShutdownRefused("shutdown request changed during recovery")
+    return marked
 
 
 @dataclass(frozen=True)
@@ -612,12 +616,9 @@ def restart_note(
         note += (f" {record['force_stop_note']}. Before continuing, check your tree: "
                  "git status, MERGE_HEAD, .git/index.lock and your workers. "
                  "Do not remove index.lock automatically.")
-    if record.get("codex_seats") and "Your Codex workers are paused" not in note:
-        note += (" Your Codex workers are paused, not ended. Read the resume-workers message "
-                 "and run its implement.sh --to or codex_mesh.py resume commands before dispatching work; "
-                 "keep each worker on its existing thread.")
     seats = record.get("codex_seats", [])
     if seats:
+        note += " " + stop_resume.resume_message("", workers=stop_resume.ResumeWorkers(seats, record["session"]["cwd"]))
         note += " Saved workers: " + ", ".join(seat["seat"] + (" (paused mid-turn)" if seat["turn_live"] else "") for seat in seats) + "."
     # A unit renamed while it was stopped learns its new names before anything else it reads.
     return f"{record['renamed']} {note}" if "renamed" in record else note
@@ -669,12 +670,7 @@ def _stop_note(record: SessionShutdown, restarted_at: str) -> str:
             "It left no note of where it was; read your branch and plan before "
             "you continue. "
         )
-    return opening + (
-        "First run `~/.claude/scripts/lib/py "
-        "~/.claude/scripts/message/send.py pending` for messages kept while you "
-        "were down, then continue from there; if you were waiting on the user, "
-        "keep waiting."
-    )
+    return stop_resume.resume_message("", context=opening)
 
 
 @dataclass(frozen=True)
@@ -772,18 +768,13 @@ def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str
         environment[PROBE_ENV] = "1"
     launch_config_dir = accounts.account_dir(target) if target else config_dir
     conversation = _conversation_launch(session["session_id"], launch_config_dir)
-    argv = [
-        "--resume" if isinstance(conversation, ResumeConversation) else "--session-id",
-        session["session_id"],
-        "-n",
-        session["name"],
-        "--remote-control",
-        session["name"],
-    ]
     model = session["model"]
-    if model["kind"] == "model":
-        argv.extend(("--model", model["name"]))
-    argv.extend(("--settings", '{"disableAgentView": true}'))
+    entry = pane_record.PaneLaunch(pane_id="", session_id=session["session_id"], config_dir=str(config_dir),
+        cwd=session["cwd"], name=session["name"], model=model["name"] if model["kind"] == "model" else "",
+        remote_control=True, environment=environment, flags_read=True, ended=False, written_at=at)
+    argv = stop_resume.resume_arguments(entry)
+    if isinstance(conversation, StartFreshConversation):
+        argv[0] = "--session-id"
     return ResumeParts(session["cwd"], environment, tuple(argv), prompt, account, conversation)
 
 
@@ -806,18 +797,13 @@ def _resume_command(session: Session, prompt: str, target: str = "", *, login: s
 def account_move_note(session: Session, target: str, source_label: str, why: str = "", *,
                       codex_seats: Sequence[PausedSeat] = (),
                       times: MoveNoteTimes | MoveNoteTimesUnrecorded = _MOVE_NOTE_TIMES_UNRECORDED) -> str:
-    """One stable explanation for every moved conversation and host."""
+    """Explain a legacy record's account change with the common resume message."""
     reason = why or f"{source_label} is out of usage"
     continuation = (" Continue your /unit:direct run." if session["kind"] == "unit" else "")
-    workers = (" Your Codex workers are paused, not ended; a message lists the command that resumes each."
-               if codex_seats else "")
     timing = (f"Paused {_user_time(times.paused_at)}; resumed {_user_time(times.resumed_at)}. "
               if isinstance(times, MoveNoteTimes) else "Pause and resume times are not yet recorded. ")
-    return (f"You were moved from {source_label} to {target} because {reason}. " + timing
-            + "This was an account move, not a stop. Continue where you stopped."
-            + continuation + workers + " First run `~/.claude/scripts/lib/py "
-            + "~/.claude/scripts/message/send.py pending` for messages kept while you "
-            + "were down; if you were waiting on the user, keep waiting.")
+    return stop_resume.resume_message(reason, moved_from=source_label, moved_to=target,
+        workers=stop_resume.ResumeWorkers(codex_seats, session["cwd"])) + " " + timing + continuation
 
 
 def resume_command(session: Session, target: str, source_label: str = "", why: str = "", *,
@@ -825,7 +811,7 @@ def resume_command(session: Session, target: str, source_label: str = "", why: s
     """The stable manual move command printed before shutdown and at restart."""
     if not source_label:
         directory = Path(session.get("config_dir", str(Path.home() / ".claude")))
-        from account import claude_account
+        from scripts.whoami.account import claude_account
         identity = claude_account(directory)
         source_label = identity.label if identity is not None else str(directory)
     note = account_move_note(session, target, source_label, why, times=times)
@@ -970,9 +956,10 @@ def _unit_argv(record: SessionShutdown, *, source_fallback: bool = False) -> lis
     # A legacy tmux unit recorded no plan; its Units row names one.
     recorded_plan = host["plan"] if host["kind"] == "unit" else None
     # The Units row first: a brief unit's row names its stub plan before any run record exists.
-    row_plan = _units_row_plan(host["doc"], host["unit"])
+    parent = staff_sources.unit_parent(host["unit"], session["session_id"])
+    row_plan = _units_row_plan(parent.doc, host["unit"])
     if row_plan is not None and production_units.plan_cell_is_retired(row_plan):
-        raise UnitRetired(f"{host['unit']} is retired in the Units table of {host['doc']}")
+        raise UnitRetired(f"{host['unit']} is retired in the Units table of {parent.doc}")
     plan_arguments: list[str]
     if row_plan in ("standby", "permanent"):
         plan_arguments = ["--" + row_plan]
@@ -981,12 +968,12 @@ def _unit_argv(record: SessionShutdown, *, source_fallback: bool = False) -> lis
     elif recorded_plan is not None and recorded_plan["kind"] == "plan":
         plan_arguments = ["--plan", recorded_plan["path"]]
     else:
-        raise NoUnitPlan(f"{host['unit']} has no Plan in the Units table of {host['doc']} and no run record")
+        raise NoUnitPlan(f"{host['unit']} has no Plan in the Units table of {parent.doc} and no run record")
     note_path = _note_path(record, session["session_id"])
     argv = [
         *_add_unit_command(),
         "--production",
-        host["doc"],
+        parent.doc,
         # The recorded id, exactly: add_unit strips one "-unit" before adding its own.
         host["unit"],
         *plan_arguments,
@@ -1421,7 +1408,7 @@ def _send_restart_note(
     note: str,
     *,
     dry_run: bool,
-) -> RestartMessageDelivery:
+) -> Mapping[str, str]:
     session_id = record["session"]["session_id"]
     if dry_run:
         argv = [
@@ -1436,7 +1423,7 @@ def _send_restart_note(
             _message_key(record, session_id),
         ]
         _display(argv)
-        return RestartMessageSent(kind="sent")
+        return {"kind": "sent"}
     return settle.send_message(
         f"session:{session_id}",
         f"{record['label']} restarted",
@@ -1511,6 +1498,8 @@ def _restore_timers(
                 notifier = [override] if override else ["zsh", str(settle.NOTIFIER)]
                 _display([*notifier, "start", timer["instance"]])
             else:
+                undo_errors: list[Exception] = []
+
                 def stop_if_claim_lost(current: SessionShutdown) -> None:
                     assert claim is not None
                     same_attempt = (current["request_id"] == claim.request_id
@@ -1523,7 +1512,13 @@ def _restore_timers(
                     covers_resumed = (claim.resumed is not None
                                       and recovery_store.request_matches_process(current, claim.resumed))
                     if not same_attempt and stopping and covers_resumed:
-                        settle.run_notifier("stop", timer["instance"])
+                        current["timers"] = recovery_store.merge_timer_restores(current["timers"], [timer])
+                        try:
+                            settle.run_notifier("stop", timer["instance"])
+                        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+                            # update_session publishes only after this callback
+                            # returns. Keep the intent even if undoing start fails.
+                            undo_errors.append(error)
 
                 try:
                     if claim_error:
@@ -1537,6 +1532,8 @@ def _restore_timers(
                         # Missing/unreadable records are reconciliation failures,
                         # never evidence that a stop owns this process generation.
                         _update_timer_owner(record, stop_if_claim_lost, claim=claim)
+                        if undo_errors:
+                            raise undo_errors[0]
                 except (NoLiveRecord, OSError, RuntimeError, ValueError, UnreadableAccount, subprocess.SubprocessError) as error:
                     failures.append(
                         PendingTimer(
@@ -1602,16 +1599,9 @@ def _set_entry_progress(record: SessionShutdown, progress: SessionProgress) -> b
         return False
     if written:
         record["progress"] = progress
-        if record.get("target") and progress["kind"] in {"restart failed", "manual restart"}:
-            _journal_move_failure(record, progress["reason"] if progress["kind"] == "restart failed" else "manual restart")
     return written
 
 
-def _journal_move_failure(record: SessionShutdown, reason: str) -> None:
-    from scripts.accounts import moves
-    session = record["session"]
-    moves.append_move(moves.FailedMove(kind="failed", at=settle.record_time(), tool="claude",
-        subject=session["session_id"] + ": " + session["name"], move_id=record.get("move_id", record["request_id"]), request_id=record["request_id"], reason=reason))
 
 
 @dataclass(frozen=True)
@@ -1653,7 +1643,7 @@ def _target_config_dir(record: SessionShutdown) -> RecordedConfigDir | NoRecorde
 
 
 def _live_config_dir(record: SessionShutdown) -> ObservedConfigDir | LiveObservationUnavailable:
-    import account
+    from scripts.whoami import account
     live = next((item for item in sessions.live_sessions() if item["sessionId"] == record["session"]["session_id"]), None)
     if live is None:
         return LiveObservationUnavailable("not live")
@@ -1671,36 +1661,8 @@ def _clear_assumed_refusal(session_id: str) -> None:
     clear(session_id)
 
 
-def _confirm_move(record: SessionShutdown, outcome: herdr.PromptSubmitOutcome | LaunchPromptProofNotRead = _LAUNCH_PROMPT_PROOF_NOT_READ) -> None:
-    from scripts.accounts import moves
-    if not _require_submitted_prompt(record, outcome):
-        return
-    session = record["session"]
-    target = _target_config_dir(record)
-    if isinstance(target, NoRecordedConfigDir):
-        return
-    moves.append_move(moves.ConfirmedMove(kind="confirmed", at=settle.record_time(), tool="claude",
-        subject=session["session_id"] + ": " + session["name"], move_id=record.get("move_id", record["request_id"]), request_id=record["request_id"],
-        config_dir=str(target.path)))
-    _clear_assumed_refusal(session["session_id"])
 
 
-def _prove_move(record: SessionShutdown, outcome: herdr.PromptSubmitOutcome | LaunchPromptProofNotRead = _LAUNCH_PROMPT_PROOF_NOT_READ) -> bool:
-    """A registry entry alone does not prove that the session adopted the target."""
-    if not _require_submitted_prompt(record, outcome):
-        return False
-    if not record.get("target", ""):
-        return True
-    directory, target = _live_config_dir(record), _target_config_dir(record)
-    if isinstance(directory, LiveObservationUnavailable) or isinstance(target, NoRecordedConfigDir):
-        mark_restart_failed(record, "resumed account unreadable")
-        return False
-    if directory.path.resolve() != target.path.resolve():
-        reason = "still on " + record.get("source_label", record["label"])
-        mark_restart_failed(record, reason)
-        return False
-    _confirm_move(record, outcome)
-    return True
 
 
 NOT_BACK_PROGRESS = frozenset({"manual restart", "restart failed"})
@@ -1737,8 +1699,6 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
             remaining.append(record)
             continue
         _clear_live_outage(record, observed_at)
-        if record.get("target", ""):
-            _confirm_move(record)
         if not _finish_timer_restore(record, record["timers"], dry_run=False):
             found = lookup_session(record["login"], record["session"]["session_id"])
             if isinstance(found, ShutdownFound):
@@ -1878,13 +1838,13 @@ def _restart_note_delivered(
                 f"restart note not delivered: {_error_reason(error)}",
             )
         return False
-    if delivery["kind"] == "sent":
+    if settle.message_was_delivered(delivery):
         return True
     if not dry_run:
         mark_restart_failed(
             record,
             "restart note not delivered: "
-            + _first_line(delivery["reason"], "queued"),
+            + _first_line(delivery.get("reason", "send not delivered"), "queued"),
         )
     return False
 
@@ -2017,7 +1977,7 @@ def move_checkout(record: SessionShutdown, *, dry_run: bool) -> SessionShutdown:
             fields = cast(dict[str, object], cast(object, session))
             if isinstance(cwd := fields.get("cwd"), str):
                 fields["cwd"] = _under(cwd, old, folder)
-            for part, key in (("checkout", "path"), ("host", "doc")):
+            for part, key in (("checkout", "path"),):
                 inner = cast(dict[str, object], fields.get(part, {}))
                 if isinstance(value := inner.get(key), str):
                     inner[key] = _under(value, old, folder)
@@ -2132,7 +2092,6 @@ def _try_source_fallback(saved: SessionShutdown, error: BaseException,
         current.setdefault("restart_issues", []).append(line)
     _ = update_session(saved["login"], saved["session"]["session_id"], remember)
     saved.setdefault("restart_issues", []).append(line)
-    _journal_move_failure(saved, line)
     print(line)
     confirm_entry(saved, saved["progress"].get("at", settle.record_time()), True, observed_at=confirmation.observed_at)
     return SourceFallbackSettled()
@@ -2140,12 +2099,11 @@ def _try_source_fallback(saved: SessionShutdown, error: BaseException,
 
 def _tell_source_fallback(saved: SessionShutdown) -> None:
     lines = [line for line in saved.get("restart_issues", []) if " came back on " in line]
-    if not lines or "showrunner_told" not in saved or saved["showrunner_told"] == settle.SHOWRUNNER_TOLD_BACK:
+    if not lines or not settle.showrunner_was_told(saved):
         return
     showrunner = settle._unit_showrunner(saved)  # pyright: ignore[reportPrivateUsage]
-    if showrunner and settle._reserve_showrunner_line(saved, settle.SHOWRUNNER_TOLD_BACK):  # pyright: ignore[reportPrivateUsage]
-        _ = settle.send_message(showrunner, lines[-1], lines[-1], key=f"shutdown-unit-{saved['session']['session_id']}")
-        saved["showrunner_told"] = settle.SHOWRUNNER_TOLD_BACK
+    if showrunner:
+        _ = settle.send_showrunner_line(saved, settle.SHOWRUNNER_TOLD_BACK, showrunner, lines[-1], lines[-1])
 
 
 def _host_needs_manual_restart(host: Host) -> bool:
@@ -2187,7 +2145,7 @@ def launch_entry(
                     # Read the existing launch's receipt against its pending state;
                     # keep the fresh claim on record for guarded progress writes.
                     outcome = _prompt_outcome({**record, "progress": progress})
-                    if not _prove_move(record, outcome):
+                    if not _require_submitted_prompt(record, outcome):
                         return EntrySettled()
                     _clear_live_outage(record, observed_at)
                 timers = _pending_timer_restores(record, progress["timers"])
@@ -2227,7 +2185,7 @@ def launch_entry(
     note = restart_note(record, restarted_at)
     if was_live:
         if not dry_run:
-            if not _prove_move(record):
+            if not _require_submitted_prompt(record):
                 return EntrySettled()
             _clear_live_outage(record, observed_at)
         if progress["kind"] != "manual restart" and not _restart_note_delivered(
@@ -2263,7 +2221,7 @@ def launch_entry(
                 f"restart prompt not recorded: {_error_reason(error)}",
             )
         return EntrySettled()
-    except (NoUnitPlan, UnitRetired) as error:
+    except (NoUnitPlan, UnitRetired, staff.StaffUnreadable) as error:
         if dry_run:
             print(f"cannot restart {session['name']}: {error}")
         else:
@@ -2318,106 +2276,22 @@ def launch_entry(
     return EntryLaunched(relaunching_pending_timers)
 
 
-def _resume_phase_id(seat: PausedSeat) -> str:
-    """Use the phase recorded for this worker; a slot can belong to another worker."""
-    try:
-        raw = cast(object, json.loads((Path(seat["run_dir"]) / "progress_history_state.json").read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return ""
-    if not isinstance(raw, dict):
-        return ""
-    passes = cast(dict[str, object], raw).get("pass")
-    if not isinstance(passes, dict):
-        return ""
-    recorded_passes = cast(dict[str, object], passes)
-    # Older state holds one pass directly; newer state holds a pass per slot.
-    candidates = [recorded_passes] if "instance_id" in recorded_passes else recorded_passes.values()
-    phase_ids: set[str] = set()
-    for candidate in candidates:
-        if not isinstance(candidate, dict):
-            continue
-        record = cast(dict[str, object], candidate)
-        if record.get("worker_name") != seat["seat"]:
-            continue
-        phase = record.get("phase")
-        if not isinstance(phase, dict):
-            return ""
-        phase_id = cast(dict[str, object], phase).get("id")
-        if not isinstance(phase_id, str) or not phase_id.strip():
-            return ""
-        phase_ids.add(phase_id)
-    return next(iter(phase_ids)) if len(phase_ids) == 1 else ""
 
 
-def _resume_worker_command(seat: PausedSeat, cwd: str) -> str:
-    """Build a complete launcher invocation that continues this worker's thread."""
-    launcher = "review.sh" if seat["role"] == "review" else "implement.sh"
-    prompt = str(Path(seat["run_dir"]) / f"{seat['seat']}.resume-prompt.md")
-    resumed = _resumed_launcher_command(seat["launcher_command"], seat["seat"], prompt) if seat["turn_live"] else None
-    if resumed is not None:
-        return resumed
-    from scripts.direct.worker_state import worker_slot
-
-    # The roster role is the last pass kind; implement.sh claims the worker by the slot its identity names.
-    recorded_slot = worker_slot(Path(seat["run_dir"]), seat["seat"]) or ""
-    team_role = recorded_slot or seat["role"]
-    phase_id = _resume_phase_id(seat)
-    # The launchers are not executable files: `bash` runs them as pasted.
-    start = ["bash", str(SCRIPTS / "direct" / launcher), "--to", seat["seat"]]
-    if phase_id:
-        start.extend(("--phase", phase_id))
-    kind = team_role if team_role in {"impl", "test", "fix"} else "impl"
-    if seat["role"] == "fix":
-        kind = "fix"
-    if launcher == "implement.sh" and kind == "fix":
-        start.extend(("--fix-cause", "resume after a move"))
-    start.extend((seat["run_dir"], cwd, prompt))
-    if launcher == "review.sh":
-        return shlex.join([*start, "review", "resume after a move", "resuming after a move"])
-    return shlex.join([*start, kind, "resume after a move", kind, "resuming after a move", "0", team_role])
+_resume_worker_command = stop_resume.resume_worker_command
 
 
-def _resumed_launcher_command(command: list[str], seat: str, prompt: str) -> str | None:
-    """Keep the recorded task arguments, following the worker with its resume prompt; None when incomplete."""
-    index = next((i for i, arg in enumerate(command) if Path(arg).name in {"implement.sh", "review.sh"}), -1)
-    if index < 0:
-        return None
-    # Launchers accept option/value pairs followed by session_dir, cwd, prompt_file.
-    position = index + 1
-    options: list[str] = []
-    while position < len(command) and command[position].startswith("--"):
-        if position + 1 >= len(command):
-            return None
-        option, value = command[position], command[position + 1]
-        if option not in {"--slot", "--pool", "--lease", "--to"}:
-            options.extend((option, value))
-        position += 2
-    arguments = command[position:]
-    # implement.sh requires its team role as the ninth argument; review.sh has defaults after three.
-    if len(arguments) < (9 if Path(command[index]).name == "implement.sh" else 3):
-        return None
-    arguments[2] = prompt
-    return shlex.join([*command[:index + 1], *options, "--to", seat, *arguments])
 
 
 def _send_worker_resume(record: SessionShutdown) -> None:
     seats = record.get("codex_seats", [])
     if not seats:
         return
-    lines = ["Resume your Codex workers; do not open new ones."]
-    cwd = record["session"]["cwd"]
-    for seat in seats:
-        # An idle worker stays paused on its thread until the next dispatch; a command now would need an open phase.
-        if seat["turn_live"]:
-            lines.append(f"{seat['seat']} ({seat['role']}, was working): {_resume_worker_command(seat, cwd)}")
-        else:
-            lines.append(f"{seat['seat']} ({seat['role']}, idle): paused on its thread; nothing to run now. "
-                         + f"Your next dispatch with --to {seat['seat']} resumes it.")
-    lines.append("Each worker continues its own thread; after resuming, send later work with --to as usual.")
+    message = stop_resume.resume_message("", workers=stop_resume.ResumeWorkers(seats, record["session"]["cwd"]))
     identity = record["session"]["session_id"]
     try:
         result = _run([*_send_command(), "--to", f"session:{identity}", "--from", "shutdown",
-                       "--key", f"resume-workers-{identity}", "--text", "\n".join(lines)],
+                       "--key", f"resume-workers-{identity}", "--text", message],
                       dry_run=False, check=False)
         if result is not None and result.returncode != 0:
             print(f"shutdown: worker resume message: {_first_line(result.stderr, 'send failed')}", file=sys.stderr)
@@ -2460,7 +2334,7 @@ def confirm_entry(
         finally:
             desktop_state.restore(dry_run=False)
         return
-    if not _prove_move(record):
+    if not _require_submitted_prompt(record):
         return
     _clear_live_outage(record, observed_at)
     if record["session"]["kind"] == "showrunner" and record["requested_by"]["kind"] != "snapshot":
@@ -2703,7 +2577,8 @@ def relaunch_session(
 
 def _unfinished_cleanup(record: SessionShutdown) -> bool:
     return bool(recovery_store.legacy_tmux_leftovers(record)) or any(
-        (issue["kind"] == "codex server left running" or issue["kind"] == "unit session left running")
+        recovery_store.stop_issue_blocks_completion(issue)
+        and (issue["kind"] == "codex server left running" or issue["kind"] == "unit session left running")
         and issue["cause"] == "stop not confirmed"
         for issue in record["stop_issues"]
     )
@@ -2921,7 +2796,8 @@ def watchdog_crash_signal(owner: Session) -> AgentCrashConfirmed | NoCrashSignal
     if host["kind"] != "unit":
         return NoCrashSignal()
     try:
-        marked = unit_lookup.marked_unit(host["production"], host["unit"])
+        parent = staff_sources.unit_parent(host["unit"], owner["session_id"])
+        marked = unit_lookup.marked_unit(parent.slug, host["unit"])
         if marked is None or marked.place.session != host["session_name"]:
             return NoCrashSignal()
         agents = herdr.Herdr(marked.place.session).agents()
@@ -2972,7 +2848,7 @@ def progress_line(action: str, name: str, detail: str = "") -> None:
 
 
 def _restore_workspace_names(records: Sequence[SessionShutdown]) -> frozenset[str]:
-    from showrunners import herdr_space as production_space, production_slug
+    from showrunners import herdr_space as production_space
     names: set[str] = set()
     for saved in records:
         owner = saved["session"]
@@ -2980,8 +2856,9 @@ def _restore_workspace_names(records: Sequence[SessionShutdown]) -> frozenset[st
             host = owner["host"]
             if host["kind"] in {"unit", "legacy tmux unit"}:
                 try:
-                    names.add(production_space(production_slug(host["doc"]), host["doc"]))
-                except ValueError:
+                    parent = staff_sources.unit_parent(host["unit"], owner["session_id"])
+                    names.add(production_space(parent.slug, parent.doc))
+                except (OSError, ValueError):
                     pass
         else:
             try:
@@ -3371,6 +3248,20 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         or (record["progress"]["kind"] == "restarting" and
             (at - datetime.fromisoformat(record["progress"]["at"])).total_seconds() >= CLAIM_STALE_SECONDS)
     ]
+    if all_accounts and not ids:
+        restoring: list[SessionShutdown] = []
+        for saved in eligible:
+            if (saved["then"] == "stop" and saved["hold"] == "session"
+                    and saved["requested_by"]["kind"] != "snapshot"):
+                origin = saved["requested_by"]
+                reason = ("session stopped itself" if origin["kind"] == "session"
+                          and origin["session_id"] == saved["session"]["session_id"] else "single-session stop")
+                command = settle.shutdown_command("restart", saved["login"], "--here", "--only",
+                                                  saved["session"]["session_id"])
+                print(f"{saved['session']['name']}: skipped: {reason}; to restore it: {command}")
+            else:
+                restoring.append(saved)
+        eligible = restoring
     if not dry_run and (eligible or codex_entries):
         first = sum(saved["session"]["kind"] != "unit" for saved in eligible) + len(codex_entries)
         print(f"restoring {len(eligible) + len(codex_entries)} sessions: {first} showrunners and top-level, then {len(eligible) + len(codex_entries) - first} units", flush=True)

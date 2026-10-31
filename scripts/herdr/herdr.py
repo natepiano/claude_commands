@@ -33,13 +33,16 @@ from enum import Enum
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Generator, Sequence, Set
-from typing import NamedTuple, NotRequired, TypedDict, cast, override
+from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, TypeVar, cast, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import nix_env as nix_env
+
+if TYPE_CHECKING:
+    from scripts.production import staff
 
 # Herdr requires agent-start timeouts strictly above this boundary.
 _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
@@ -50,8 +53,9 @@ _PLATFORM = sys.platform
 # The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
 # server started from inside a unit, drops them so that the unit's lookup never finds a second session.
 UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
+MEMBER_MARKS = (*UNIT_MARKS, "STAFF_ID")
 NO_ENVIRONMENT_REMOVALS: frozenset[str] = frozenset()
-_NO_NEW_UNIT_DIRECTOR_TITLES: frozenset[str] = frozenset()
+_NO_WORKSPACE_FILTER: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
 # The slice of the pane scopes. A pane shell in its own scope keeps the agent load out of the server's cgroup.
 PANE_SLICE = "app-agents.slice"
@@ -573,6 +577,14 @@ class HerdrPlace:
 
 
 @dataclass(frozen=True)
+class TabWithPane:
+    """The identities returned when a live pane moves into a new tab."""
+
+    pane: str
+    tab: str
+
+
+@dataclass(frozen=True)
 class NotInHerdr:
     """The process has no identifiable herdr pane and listening server."""
 
@@ -652,6 +664,29 @@ class SeveralPanes:
 
 
 @dataclass(frozen=True)
+class TabSession:
+    """A labelled pane and its last known conversation, including after the agent exits."""
+
+    pane_id: str
+    label: str
+    workspace: str
+    session_id: str | None
+
+
+_LabelledPane = TypeVar("_LabelledPane")
+
+
+def _match_label(label: str, panes: Sequence[_LabelledPane],
+                 label_of: Callable[[_LabelledPane], str | None]) -> _LabelledPane | NoPane | SeveralPanes:
+    matches = [pane for pane in panes if label_of(pane) == label]
+    if not matches:
+        return NoPane(label)
+    if len(matches) > 1:
+        return SeveralPanes(label, len(matches))
+    return matches[0]
+
+
+@dataclass(frozen=True)
 class PaneAtShell:
     """The pane's foreground process group is its original shell."""
 
@@ -710,6 +745,8 @@ class SessionListResult(TypedDict):
 class PaneIdentity(TypedDict):
     pane_id: str
     label: NotRequired[str | None]
+    workspace_id: str
+    session_id: str | None
 
 
 class PaneListResult(TypedDict):
@@ -834,7 +871,7 @@ def child_environment(environment: dict[str, str]) -> dict[str, str]:
 
 def unmarked_environment() -> dict[str, str]:
     """Exclude unit identity and one-launch heal proof from inherited child environments."""
-    return child_environment({key: value for key, value in os.environ.items() if key not in UNIT_MARKS})
+    return child_environment({key: value for key, value in os.environ.items() if key not in MEMBER_MARKS})
 
 
 def run_program(argv: list[str], timeout: float = 10.0, *,
@@ -1033,6 +1070,10 @@ class Herdr:
         require_success(result, context)
         return result.stdout
 
+    def run_in_pane(self, pane: str, command: list[str]) -> None:
+        """Run an argv command in an existing pane; herdr types its text into the shell."""
+        _ = self.run("pane", "run", pane, shlex.join(command))
+
     def result(self, *arguments: str) -> dict[str, object]:
         reply = decode_object(self.run(*arguments), "herdr response")
         return json_object(reply.get("result"), "herdr result")
@@ -1045,16 +1086,35 @@ class Herdr:
             label = pane.get("label")
             if label is not None and not isinstance(label, str):
                 raise HerdrFailure("herdr pane label: expected text or null")
-            panes.append({"pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label})
+            agent_session = pane.get("agent_session")
+            session_id = (json_object(agent_session, "herdr pane agent session").get("value")
+                          if agent_session is not None else None)
+            if session_id is not None and not isinstance(session_id, str):
+                raise HerdrFailure("herdr pane agent session value: expected text or null")
+            panes.append({"pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label,
+                          "workspace_id": json_text(pane.get("workspace_id"), "herdr pane workspace id"),
+                          "session_id": session_id})
         return panes
 
     def lookup(self, label: str) -> PaneFound | NoPane | SeveralPanes:
-        matches = [pane["pane_id"] for pane in self.panes() if pane.get("label") == label]
-        if not matches:
-            return NoPane(label)
-        if len(matches) > 1:
-            return SeveralPanes(label, len(matches))
-        return PaneFound(matches[0])
+        found = _match_label(label, self.panes(), lambda pane: pane.get("label"))
+        return found if isinstance(found, (NoPane, SeveralPanes)) else PaneFound(found["pane_id"])
+
+    def tab_sessions(self) -> list[TabSession]:
+        """Read labelled panes with workspace names and their last known conversation ids."""
+        panes = self.panes()
+        spaces: dict[str, str] = {}
+        for item in json_items(self.result("workspace", "list").get("workspaces"), "herdr workspace list"):
+            workspace = json_object(item, "herdr workspace")
+            ident = json_text(workspace.get("workspace_id"), "herdr workspace id")
+            label = workspace.get("label")
+            spaces[ident] = "" if label is None else json_text(label, "herdr workspace label")
+        return [TabSession(pane["pane_id"], label, spaces.get(pane["workspace_id"], ""), pane["session_id"])
+                for pane in panes if (label := pane.get("label")) is not None]
+
+    def session_of(self, label: str) -> TabSession | NoPane | SeveralPanes:
+        """Find exactly one labelled tab, whether its agent is running or has exited."""
+        return _match_label(label, self.tab_sessions(), lambda tab: tab.label)
 
     def pane_activity(self, pane: str) -> PaneAtShell | PaneRunning:
         """Describe whether the pane is at its shell or running foreground work."""
@@ -1088,11 +1148,7 @@ class Herdr:
         options = ["--label", title, "--cwd", cwd]
         for key, value in {**child_environment(environment), "HERDR_AGENT_PANE": "1"}.items():
             options.extend(["--env", f"{key}={value}"])
-        with _LayoutLock(self.session):
-            saved = saved_layout(self.session)
-            workspace = self._workspace_named(space)
-            if workspace is None and self._place_saved_workspaces(saved, frozenset({space})):
-                workspace = self._workspace_named(space)
+        def open_pane(workspace: str | None) -> str:
             if workspace is not None:
                 result = self.result("tab", "create", "--workspace", workspace, *options, "--no-focus")
             else:
@@ -1105,8 +1161,21 @@ class Herdr:
             _ = self.run("pane", "rename", pane, title)
             if workspace is not None:
                 self._close_placeholders(workspace)
-                unit_director_titles = {title} if has_unit_marks(environment) else _NO_NEW_UNIT_DIRECTOR_TITLES
-                pane = self.order_tabs(workspace, saved, unit_director_titles).get(pane, pane)
+            return pane
+
+        return self._place_tab_in_workspace(space, open_pane, create_workspace=True)
+
+    def _place_tab_in_workspace(self, space: str, place_pane: Callable[[str | None], str],
+                                *, create_workspace: bool = False, record: staff.StaffSnapshot | None = None) -> str:
+        """Serialize workspace resolution, pane placement, tab ordering and the saved layout."""
+        with _LayoutLock(self.session):
+            saved = saved_layout(self.session)
+            workspace = self._workspace_named(space)
+            if workspace is None and create_workspace and self._place_saved_workspaces(saved, frozenset({space})):
+                workspace = self._workspace_named(space)
+            pane = place_pane(workspace)
+            if workspace is not None:
+                pane = self.order_tabs(workspace, saved, record=record).get(pane, pane)
             self.save_layout()
             return pane
 
@@ -1230,8 +1299,27 @@ class Herdr:
             self.save_layout()
         return True
 
+    def move_pane_to_tab(self, pane: str, workspace: str, title: str) -> TabWithPane:
+        """Move the running pane into a new tab in a workspace id, preserving its process and title."""
+        result = json_object(self.result("pane", "move", pane, "--new-tab", "--workspace", workspace)
+                             .get("move_result"), "herdr pane move")
+        tab = json_text(json_object(result.get("created_tab"), "herdr moved tab").get("tab_id"), "herdr tab id")
+        moved = json_text(json_object(result.get("pane"), "herdr moved pane").get("pane_id"), "herdr pane id")
+        _ = self.run("tab", "rename", tab, title)
+        return TabWithPane(moved, tab)
+
+    def move_pane_to_workspace(self, pane: str, space: str, title: str,
+                               *, record: staff.StaffSnapshot | None = None) -> str:
+        """Move a live pane to a named workspace, order its tab and save its place."""
+        def move_pane(workspace: str | None) -> str:
+            if workspace is None:
+                raise HerdrFailure(f"no workspace named {space!r}")
+            return self.move_pane_to_tab(pane, workspace, title).pane
+
+        return self._place_tab_in_workspace(space, move_pane, record=record)
+
     def order_tabs(self, workspace: str, saved: SavedLayout,
-                   new_unit_director_titles: Set[str] = _NO_NEW_UNIT_DIRECTOR_TITLES) -> dict[str, str]:
+                   *, record: staff.StaffSnapshot | None = None) -> dict[str, str]:
         """Keep saved order; sort other tabs by showrunner, unit directors A-Z, then other tabs A-Z.
 
         `sort-tabs` passes an empty saved layout to sort all tabs. The first tab stays first.
@@ -1253,10 +1341,16 @@ class Herdr:
         for row in rows:
             tab = json_text(row.get("tab_id"), "herdr pane tab id")
             panes_of.setdefault(tab, []).append(json_text(row.get("pane_id"), "herdr pane id"))
-        unit_panes = unit_director_panes(self.session, herdr_processes())
-        unit_director_titles = new_unit_director_titles | {
+        from scripts.production import staff
+
+        membership = staff.initial_snapshot() if record is None else record
+        parent = next((row for row in membership.find(kind="showrunner") if row.name == name), None)
+        unit_names: set[str] = {row.name for row in membership.find(kind="unit", parent=parent.id)} if parent else set()
+        unit_panes = unit_director_panes(self.session, herdr_processes(), membership)
+        unit_director_titles = {
             json_text(tab.get("label"), "herdr tab label") for tab in tabs
-            if any(pane in unit_panes for pane in panes_of.get(json_text(tab.get("tab_id"), "herdr tab id"), []))}
+            if tab.get("label") in unit_names
+            or any(pane in unit_panes for pane in panes_of.get(json_text(tab.get("tab_id"), "herdr tab id"), []))}
         titles = [json_text(tab.get("label"), "herdr tab label") for tab in tabs]
         unsaved: list[SavedName] = []
         kept = next((space["tabs"] for space in saved["workspaces"] if space["name"] == name), unsaved)
@@ -1271,30 +1365,33 @@ class Herdr:
         for index in order[start:]:
             tab = json_text(tabs[index].get("tab_id"), "herdr tab id")
             pane = panes_of[tab][0]
-            result = json_object(self.result("pane", "move", pane, "--new-tab", "--workspace", workspace)
-                                 .get("move_result"), "herdr pane move")
-            created = json_text(json_object(result.get("created_tab"), "herdr moved tab").get("tab_id"), "herdr tab id")
-            moved[pane] = json_text(json_object(result.get("pane"), "herdr moved pane").get("pane_id"), "herdr pane id")
-            _ = self.run("tab", "rename", created, titles[index])
+            placed = self.move_pane_to_tab(pane, workspace, titles[index])
+            moved[pane] = placed.pane
             if tab == active:
-                active_tab = created
+                active_tab = placed.tab
         if isinstance(active_tab, str):
             _ = self.run("tab", "focus", active_tab)
         if focused is not None and focused.get("workspace_id") != workspace:
             self.focus_workspace(json_text(focused.get("workspace_id"), "herdr workspace id"))
         return moved
 
-    def sort_tabs(self) -> WorkspacesKeptForSplitTabs:
-        """Sort each workspace by showrunner, units A-Z, then other tabs A-Z; save and return split workspaces kept."""
+    def sort_tabs(self, *, workspace_names: Set[str] = _NO_WORKSPACE_FILTER,
+                  record: staff.StaffSnapshot | None = None) -> WorkspacesKeptForSplitTabs:
+        """Sort selected workspaces (all by default) by the tab rule; save and return split workspaces kept."""
+        from scripts.production import staff
+
         kept: list[str] = []
         with _LayoutLock(self.session):
+            membership = staff.initial_snapshot() if record is None else record
             for space in self.live_layout():
+                if workspace_names and space.label not in workspace_names:
+                    continue
                 tabs = [json_object(item, "herdr tab") for item in json_items(
                     self.result("tab", "list", "--workspace", space.workspace_id).get("tabs"), "herdr tab list")]
                 if any(tab.get("pane_count") != 1 for tab in tabs):
                     kept.append(space.label)
                     continue
-                _ = self.order_tabs(space.workspace_id, SavedLayout(at=0.0, workspaces=[]))
+                _ = self.order_tabs(space.workspace_id, SavedLayout(at=0.0, workspaces=[]), record=membership)
             self.save_layout()
         return WorkspacesKeptForSplitTabs(kept)
 
@@ -1759,7 +1856,12 @@ class Herdr:
         _ = self.run("pane", "send-keys", pane, *keys)
 
     def close_pane(self, pane: str) -> None:
-        _ = self.run("pane", "close", pane)
+        """Close one pane; a pane already gone is the closed state this asks for."""
+        try:
+            _ = self.run("pane", "close", pane)
+        except HerdrFailure as error:
+            if error.code != "pane_not_found":
+                raise
 
     def agents(self) -> list[AgentOccupant]:
         result = self.result("agent", "list")
@@ -2718,7 +2820,7 @@ def _pane_shell_pids(session: str) -> list[int]:
     return shells
 
 
-def _pane_scopes(groups: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
+def pane_scopes(groups: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
     """The pane scopes under PANE_SLICE that hold a process, from its systemd memberships."""
     return [(hierarchy, scope) for hierarchy, path in groups
             for scope in (path, *path.parents) if scope.parent.name == PANE_SLICE]
@@ -2727,7 +2829,7 @@ def _pane_scopes(groups: list[tuple[str, Path]]) -> list[tuple[str, Path]]:
 def _add_scope_owners(owners: dict[tuple[str, Path], set[str]], pids: Sequence[int], sessions: dict[int, str]) -> None:
     """Record the session of each matched process in its pane scope."""
     for pid in pids:
-        for scope in _pane_scopes(_systemd_cgroups(_proc_root() / str(pid))):
+        for scope in pane_scopes(_systemd_cgroups(_proc_root() / str(pid))):
             owners.setdefault(scope, set()).add(sessions[pid])
 
 
@@ -2791,7 +2893,7 @@ def _process_sessions(candidates: list[Path], servers: dict[int, str]) -> dict[i
                         break
                 if pid in sessions:
                     break
-            if pid not in sessions and (scopes := _pane_scopes(groups)):
+            if pid not in sessions and (scopes := pane_scopes(groups)):
                 loose[pid] = scopes
         # A pane scope holds one pane's processes, as the unit's cgroup held
         # them before. Only a scope that no matched process explains needs the
@@ -2968,7 +3070,7 @@ def _darwin_herdr_processes() -> list[HerdrProcess]:
             pane = environment.get("HERDR_PANE_ID", "")
             if environment.get("TMUX_PANE") or not pane:
                 continue
-            marks = {key: environment[key] for key in UNIT_MARKS if key in environment}
+            marks = {key: environment[key] for key in MEMBER_MARKS if key in environment}
             processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks,
                                           Path(by_pid[pid].executable).name, _darwin_process_cwd(pid)))
         except (HerdrFailure, subprocess.TimeoutExpired):
@@ -2980,10 +3082,11 @@ def has_unit_marks(environment: dict[str, str]) -> bool:
     return all(environment.get(mark) for mark in UNIT_MARKS)
 
 
-def unit_director_panes(session: str, processes: Sequence[HerdrProcess]) -> set[str]:
-    """The session's pane ids whose processes carry both unit marks."""
+def unit_director_panes(session: str, processes: Sequence[HerdrProcess], record: staff.StaffSnapshot) -> set[str]:
+    """The session's panes whose durable identity names a recorded unit."""
+    units = {row.id for row in record.find(kind="unit")}
     return {process.place.pane for process in processes
-            if process.place.session == session and has_unit_marks(process.marks)}
+            if process.place.session == session and process.marks.get("STAFF_ID") in units}
 
 
 def _scan_herdr_processes() -> list[HerdrProcess]:
@@ -3014,7 +3117,7 @@ def _scan_herdr_processes() -> list[HerdrProcess]:
                 cwd = str(process.joinpath("cwd").resolve(strict=True))
             except (OSError, ValueError, RuntimeError) as error:
                 cwd = UnreadableCwd(str(error))
-            marks = {key: environment[key] for key in UNIT_MARKS if key in environment}
+            marks = {key: environment[key] for key in MEMBER_MARKS if key in environment}
             processes.append(HerdrProcess(pid, HerdrPlace(session, pane), marks, Path(arguments[0]).name, cwd))
         except (OSError, ValueError, RuntimeError):
             continue
@@ -3147,7 +3250,7 @@ def agent_base_environment(environment: dict[str, str], unset_environment: froze
     for key in tuple(base_env):
         # scripts/lib/unit_env.sh and unit_runs.environ map every PLAN_DELEGATE_ alias to UNIT_.
         if (key.startswith(("HERDR_", "CODEX_", "UNIT_", "PLAN_DELEGATE_", "SHOWRUNNER_", "CLAUDE_", "NIX_HEAL_"))
-                or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE", "SHUTDOWN_PARENT_LAUNCH_CLAIM"}):
+                or key in {"ANTHROPIC_API_KEY", "SHELL", "TMUX", "TMUX_PANE", "SHUTDOWN_PARENT_LAUNCH_CLAIM", "STAFF_ID"}):
             del base_env[key]
     base_env.update(environment)
     for key in unset_environment:

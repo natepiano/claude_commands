@@ -12,6 +12,8 @@ file replaced by its last chat reply.
 
 from __future__ import annotations
 
+from scripts.lib.test_hang_guard import LauncherHangGuard, TEST_HANG_GUARD_SECS
+
 from scripts.lib.test_agents_registry import write_registry
 
 from scripts.lib import names
@@ -31,6 +33,7 @@ import os
 import pwd
 import select
 import shlex
+import shutil
 import signal
 import socket
 import struct
@@ -44,6 +47,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
+from collections import deque
 from collections.abc import Generator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Literal, TextIO, TypedDict, cast, final, override
@@ -51,7 +55,7 @@ from unittest.mock import MagicMock, patch
 
 from scripts.agents import codex_mesh
 from scripts.direct import plan_history, workers as unit_workers
-from scripts.direct.recorder_fixture import LauncherHangGuard, invoke_recorder
+from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.lib import nix_env
 from scripts.message import process_table, sessions, roster as message_roster
 from scripts.usage import agents_log
@@ -99,14 +103,13 @@ def refuse_real_home(path: Path, source: str) -> None:
 
 
 def assert_fixture_environment() -> None:
-    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE", "AGENTS_LOCAL_CONFIG_FILE"):
+    for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE"):
         value = os.environ.get(name)
         if not value:
             raise AssertionError(f"{name} is unset; codex_mesh fixture requires setUpModule")
         refuse_real_home(Path(value), name)
 
 
-TEST_HANG_GUARD_SECS = 300  # load 136 on natedev, 2026-10-29
 
 
 LegacyWorkerMoveRequest = TypedDict("LegacyWorkerMoveRequest", {
@@ -132,14 +135,16 @@ class FixtureLoopBudget:
     """Fail a repeating fixture before fake time or retained calls exhaust memory."""
 
     name: str
-    seconds: float = 120.0
+    seconds: float = TEST_HANG_GUARD_SECS
     max_calls: int = 2_000
     clock: Callable[[], float] = time.perf_counter
     started: float = dataclasses.field(init=False)
+    hang_guard: LauncherHangGuard = dataclasses.field(init=False)
     calls: int = 0
 
     def __post_init__(self) -> None:
         self.started = self.clock()
+        self.hang_guard = LauncherHangGuard(self.name)
 
     def check_calls(self) -> None:
         self.calls += 1
@@ -148,7 +153,7 @@ class FixtureLoopBudget:
 
     def check(self) -> float:
         self.check_calls()
-        remaining = self.seconds - (self.clock() - self.started)
+        remaining = min(self.hang_guard.remaining(), self.seconds - (self.clock() - self.started))
         if remaining <= 0:
             raise AssertionError(f"{self.name}: exceeded {self.seconds}s fixture deadline")
         return remaining
@@ -231,6 +236,48 @@ class LifecycleTestClock:
         return future.result()
 
 
+class FixtureModelDefaults:
+    """Reuse real resolution only for the module's unchanged baseline fixture.
+
+    Custom registries and injected subprocess failures always run the product
+    resolver. No second registry parser or model-selection rule lives here.
+    """
+
+    def __init__(self, resolve: Callable[[argparse.Namespace], tuple[str, str]]) -> None:
+        self.resolve: Callable[[argparse.Namespace], tuple[str, str]] = resolve
+        self.environment: dict[str, str] = self.resolver_environment()
+        self.files: dict[Path, tuple[int, bytes]] = {
+            Path(os.environ[key]): (Path(os.environ[key]).stat().st_mtime_ns, Path(os.environ[key]).read_bytes())
+            for key in ("AGENTS_CONFIG_FILE", "CODEX_CONFIG_FILE", "CODEX_PACER_TIER_FILE",
+                        "CODEX_CATALOG_SYNC_STATE_FILE")
+        }
+        self.run: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run
+        self.defaults: dict[tuple[str, ...], tuple[str, str]] = {}
+
+    @staticmethod
+    def resolver_environment() -> dict[str, str]:
+        return {key: value for key, value in os.environ.items()
+                if (key.startswith(("AGENTS_", "CODEX_")) or key in ("BASH_ENV", "ENV", "PATH", "SHELLOPTS", "BASHOPTS"))
+                and key not in ("CODEX_HOME",)}
+
+    def unchanged(self) -> bool:
+        if self.resolver_environment() != self.environment or subprocess.run is not self.run:
+            return False
+        return all(path.is_file() and (path.stat().st_mtime_ns, path.read_bytes()) == value
+                   for path, value in self.files.items())
+
+    def __call__(self, args: argparse.Namespace) -> tuple[str, str]:
+        if getattr(args, "model", "") not in ("", "gpt-test") or not self.unchanged():
+            return self.resolve(args)
+        key = tuple(str(getattr(args, name, "")) for name in ("role", "task", "model", "effort"))
+        if key not in self.defaults:
+            value = self.resolve(args)
+            if self.unchanged():
+                self.defaults[key] = value
+            return value
+        return self.defaults[key]
+
+
 def bounded_fixture[**P, R](callback: Callable[P, R]) -> Callable[P, R]:
     # Created inside each test: no call histories or budgets survive across tests.
     budget = FixtureLoopBudget(callback.__qualname__)
@@ -293,10 +340,10 @@ def setUpModule() -> None:
     restore_usage = set_environment("USAGE_STATE_DIR", usage.name)
     restore_home = set_environment("HOME", home.name)
     restore_notes = set_environment("AGENT_NOTES_DIR", home.name)
+    unittest.addModuleCleanup(set_environment("AGENTS_CONFIG_PUBLISH", "0"))
     # Tier tests never read the caller's registry, config, or pacer choice.
     tier_files = {
         "AGENTS_CONFIG_FILE": str(Path(home.name) / "agents.conf"),
-        "AGENTS_LOCAL_CONFIG_FILE": str(Path(home.name) / "agents.local.conf"),
         "CODEX_CATALOG_SYNC_STATE_FILE": str(Path(home.name) / "catalog-sync"),
         "CODEX_CONFIG_FILE": str(Path(home.name) / "codex.toml"),
         "CODEX_PACER_TIER_FILE": str(Path(home.name) / "pacer-tier"),
@@ -306,6 +353,18 @@ def setUpModule() -> None:
     _ = write_registry(Path(tier_files["AGENTS_CONFIG_FILE"]))
     for key, value in tier_files.items():
         unittest.addModuleCleanup(set_environment(key, value))
+    # The complete shared fixture costs seconds to validate in Bash. Reuse
+    # its proven defaults; every changed registry/config and fault injection
+    # still takes the real send-time resolver path.
+    baseline = FixtureModelDefaults(codex_mesh._turn_model_effort)  # pyright: ignore[reportPrivateUsage]
+
+    @functools.wraps(codex_mesh._turn_model_effort)  # pyright: ignore[reportPrivateUsage]
+    def baseline_defaults(args: argparse.Namespace) -> tuple[str, str]:
+        return baseline(args)
+
+    defaults = patch.object(codex_mesh, "_turn_model_effort", baseline_defaults)
+    _ = defaults.start()
+    unittest.addModuleCleanup(defaults.stop)
     authority = patch.object(role_map, "is_role_map_host", new=lambda: True)
     _ = authority.start()
     unittest.addModuleCleanup(authority.stop)
@@ -369,7 +428,7 @@ def running_holder(session_id: str) -> sessions.SessionRecord:
 
 def _read_exact(sock: socket.socket, count: int) -> bytes:
     received = bytearray()
-    budget = FixtureLoopBudget("stub socket read", seconds=120, max_calls=100_000)
+    budget = FixtureLoopBudget("stub socket read", max_calls=100_000)
     while len(received) < count:
         _ = budget.check()
         chunk = sock.recv(count - len(received))
@@ -420,15 +479,13 @@ class StubAppServer:
         self.respond: Callable[[dict[str, object]], list[dict[str, object]] | None] = respond
         self.requests: list[dict[str, object]] = []
         self.hang_guard: LauncherHangGuard = LauncherHangGuard("stub app-server")
-        self.request_budget = FixtureLoopBudget("stub RPC requests", seconds=180)
-        self.connection_budget = FixtureLoopBudget("stub connections", seconds=180, max_calls=128)
+        self.request_budget = FixtureLoopBudget("stub RPC requests")
+        self.connection_budget = FixtureLoopBudget("stub connections", max_calls=128)
         self.errors: list[Exception] = []
         self.close_after_turn_start: bool = False
         self.hold_turn_completion: bool = False
         self.coalesce_response_frames: bool = False
-        self.delta_batch_pause: float = 0.0
         self.held_turn_completes_successfully: bool = False
-        self.hold_turn_timeout: float = 30.0
         self.answer_requests_during_held_turn: bool = False
         self.held_turn_ready: threading.Event = threading.Event()
         self.held_turn_interrupted: threading.Event = threading.Event()
@@ -453,8 +510,8 @@ class StubAppServer:
         self.release_compact_turn_completion.set()
         self.release_held_turn.set()
         _ = self.close_writer.send(b"close")
-        shutdown_deadline = time.perf_counter() + 5
-        self.thread.join(timeout=5)
+        guard = LauncherHangGuard("stub app-server shutdown")
+        guard.join(self.thread)
         self.listener.close()
         for connection in self.connections:
             with contextlib.suppress(OSError):
@@ -462,9 +519,9 @@ class StubAppServer:
         self.close_reader.close()
         self.close_writer.close()
         for conversation in self.conversations:
-            conversation.join(timeout=max(0, shutdown_deadline - time.perf_counter()))
+            guard.join(conversation)
             if conversation.is_alive():
-                raise AssertionError("stub conversation did not stop within 5s")
+                raise AssertionError("stub conversation did not stop before the shared hang deadline")
         if self.thread.is_alive():
             raise AssertionError("stub app-server did not stop")
         if self.errors:
@@ -535,15 +592,10 @@ class StubAppServer:
                 with send_lock:
                     connection.sendall(b"".join(_encoded_frame(frame) for frame in frames))
                 continue
-            delta_count = 0
-            frame_budget = FixtureLoopBudget("stub response frames", seconds=30, max_calls=20_000)
+            frame_budget = FixtureLoopBudget("stub response frames", max_calls=20_000)
             for frame in frames:
                 frame_budget.check_calls()
                 connection.settimeout(self.hang_guard.remaining())
-                if frame.get("method") == "item/agentMessage/delta":
-                    delta_count += 1
-                    if self.delta_batch_pause and delta_count % 100 == 0:
-                        _ = self.stopping.wait(timeout=self.delta_batch_pause)
                 params = _as_test_dict(frame.get("params"))
                 turn = _as_test_dict(params.get("turn"))
                 if (
@@ -552,7 +604,7 @@ class StubAppServer:
                     and turn.get("id") == "compact-turn"
                 ):
                     self.compaction_event_sent.set()
-                    _ = self.release_compact_turn_completion.wait(timeout=2)
+                    self.hang_guard.event(self.release_compact_turn_completion)
                 send_frame(frame)
             if self.hold_turn_completion and request.get("method") == "turn/interrupt":
                 if any("result" in frame for frame in frames):
@@ -574,19 +626,18 @@ class StubAppServer:
         self, send_frame: Callable[[dict[str, object]], None],
         request: dict[str, object], reply: dict[str, object],
     ) -> None:
-        released = self.release_held_turn.wait(timeout=self.hold_turn_timeout)
+        self.hang_guard.event(self.release_held_turn)
         if self.stopping.is_set():
             return
         params = _as_test_dict(request.get("params"))
         result = _as_test_dict(reply.get("result"))
         turn_id = _as_test_dict(result.get("turn")).get("id")
-        if released and self.held_turn_completes_successfully:
+        if self.held_turn_completes_successfully:
             turn: dict[str, object] = {"id": turn_id, "status": "completed"}
         elif self.held_turn_interrupted.is_set():
             turn = {"id": turn_id, "status": "interrupted"}
         else:
-            turn = {"id": turn_id, "error": {"message": "held test turn was not interrupted" if released
-                                           else "held test turn timed out"}}
+            turn = {"id": turn_id, "error": {"message": "held test turn was not interrupted"}}
         with contextlib.suppress(ConnectionError, OSError):
             send_frame(_notice("turn/completed", {"threadId": params["threadId"], "turn": turn}))
 
@@ -603,11 +654,41 @@ def _as_test_dict(value: object) -> dict[str, object]:
     return cast("dict[str, object]", value) if isinstance(value, dict) else {}
 
 
+class FixtureModelDefaultsTests(unittest.TestCase):
+    def test_only_unchanged_baseline_results_are_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            registry = write_registry(Path(root) / "agents.conf")
+            with patch.dict(os.environ, {"AGENTS_CONFIG_FILE": str(registry)}):
+                resolve = MagicMock(return_value=("gpt-test", "high"))
+                defaults = FixtureModelDefaults(resolve)
+                args = argparse.Namespace(role="impl", task="", model="gpt-test", effort="high")
+                self.assertEqual(defaults(args), ("gpt-test", "high"))
+                self.assertEqual(defaults(args), ("gpt-test", "high"))
+                self.assertEqual(resolve.call_count, 1)
+                _ = write_registry(registry, {"direct.codex": {"impl": "gpt-test:max"}}, update=True)
+                resolve.return_value = ("gpt-test", "max")
+                self.assertEqual(defaults(args), ("gpt-test", "max"))
+                self.assertEqual(defaults(args), ("gpt-test", "max"))
+                self.assertEqual(resolve.call_count, 3, "changed registries must resolve on every turn")
+
+    def test_custom_registry_and_subprocess_faults_bypass_baseline_reuse(self) -> None:
+        resolve = MagicMock(return_value=("gpt-test", "high"))
+        defaults = FixtureModelDefaults(resolve)
+        args = argparse.Namespace(role="review", task="", model="gpt-test", effort="high")
+        self.assertEqual(defaults(args), ("gpt-test", "high"))
+        with patch.dict(os.environ, {"AGENTS_CONFIG_FILE": "/tmp/custom-mesh-registry"}):
+            self.assertEqual(defaults(args), ("gpt-test", "high"))
+            self.assertEqual(defaults(args), ("gpt-test", "high"))
+        with patch.object(subprocess, "run"):
+            self.assertEqual(defaults(args), ("gpt-test", "high"))
+        self.assertEqual(resolve.call_count, 4)
+
+
 class StubServerShutdownTests(unittest.TestCase):
     def test_close_wakes_a_blocking_listener_and_reaps_its_thread(self) -> None:
         server = StubAppServer(lambda _request: [])
         try:
-            self.assertTrue(server.accept_waiting.wait(timeout=300))
+            LauncherHangGuard('test_close_wakes_a_blocking_listener_and_reaps_its_thread').event(server.accept_waiting)
             self.assertIsNone(server.listener.gettimeout())
         finally:
             server.close()
@@ -674,6 +755,7 @@ class MeshCommandFixture(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(patch.object(names, "load_names", return_value=fixture_names()))
         assert_fixture_environment()
+        _ = self.enterContext(LauncherHangGuard(self.id()).protect())
         self.loop_budget = FixtureLoopBudget(self.id())
         self.temporary = tempfile.TemporaryDirectory(dir="/tmp", prefix="codex-mesh-test-")
         self.addCleanup(self.temporary.cleanup)
@@ -725,7 +807,7 @@ class MeshCommandFixture(unittest.TestCase):
         self.auto_turn_starts = 0
         self.waits = []
         self.elapsed = 0.0
-        self.start_args_timeout = 300.0
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         select_fixture_workers(self.home, notes=self.home)
         self.server = StubAppServer(self.respond)
         _ = (self.session_dir / codex_mesh.SERVER_FILE).write_text(
@@ -1152,6 +1234,90 @@ class MeshCommandFixture(unittest.TestCase):
             timeout=self.start_args_timeout, resident=False, role="impl", lens=None,
         )
 
+    def controlled_stream_deadlines(self, *, submission_method: str = "turn/start",
+                                    activity_method: str = "") -> None:
+        """Advance scripted quiet waits, preserving every real notice before their boundary.
+
+        Opt in only for deterministic scripts. Event-wakeup tests keep the real
+        synchronization path. Activity deadlines are monotonic; frame deadlines
+        are wall time. Both advance the same LifecycleTestClock.
+        """
+        self.lifecycle_clock.freeze()
+        self.server.coalesce_response_frames = True
+        respond = self.server.respond
+        read = codex_mesh.Client.next_frame
+        raw_read = codex_mesh.Client._read  # pyright: ignore[reportPrivateUsage]
+        raw_pending = cast(property, vars(codex_mesh.Client)["has_pending_frames"])
+        wire_frames: dict[codex_mesh.Client, deque[codex_mesh.RpcMessage]] = {}
+        quiet_ready = False
+        activity_ready = False
+        first_submission = self.turn_starts + 1
+        waits = FixtureLoopBudget("controlled stream waits", max_calls=32)
+
+        def response(request: dict[str, object]) -> list[dict[str, object]] | None:
+            frames = respond(request)
+            method = request.get("method")
+            if frames is None:
+                return None
+            return [*frames, _notice("fixture/quiet", {
+                "activity": method == activity_method and self.turn_starts < first_submission,
+                "stream": method == submission_method and (
+                    submission_method != "turn/start" or self.turn_starts >= first_submission),
+            })]
+
+        def advance(seconds: float) -> None:
+            waits.check_calls()
+            self.lifecycle_clock.advance(max(0.0, seconds))
+
+        def response_frames(client: codex_mesh.Client, deadline: float,
+                            wake: codex_mesh.FollowEvents | codex_mesh.SocketOnlyWait = codex_mesh.SOCKET_ONLY_WAIT
+                            ) -> codex_mesh.RpcMessage | None:
+            # Consume the fixture boundary below both RPC and stream reads.
+            # Keep read-ahead frames here, not in Client._pending: call appends
+            # each notice returned by _read, so preloading its queue reorders it.
+            nonlocal quiet_ready, activity_ready
+            frames = wire_frames.setdefault(client, deque())
+            if frames:
+                return frames.popleft()
+            boundary = FixtureLoopBudget("scripted response boundary", max_calls=128)
+            while True:
+                boundary.check_calls()
+                value = raw_read(client, deadline, wake)
+                if value is None:
+                    if frames:
+                        raise AssertionError("scripted response ended before its quiet boundary")
+                    return None
+                if value.get("method") == "fixture/quiet":
+                    params = _as_test_dict(value.get("params"))
+                    quiet_ready = quiet_ready or bool(params.get("stream"))
+                    activity_ready = activity_ready or bool(params.get("activity"))
+                    break
+                frames.append(value)
+            if not frames:
+                return None
+            return frames.popleft()
+
+        def pending(client: codex_mesh.Client) -> bool:
+            return bool(wire_frames.get(client)) or cast(bool, raw_pending.__get__(client))
+
+        def frame(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            if quiet_ready and not client.has_pending_frames:
+                advance(min(codex_mesh.UNSEEN_END_CHECK_SECS,
+                            max(0.0, deadline - self.lifecycle_clock.time())))
+                return None
+            return read(client, deadline)
+
+        def activity(_client: codex_mesh.Client, _wake: codex_mesh.FollowEvents, deadline: float) -> None:
+            self.assertTrue(activity_ready, "activity wait preceded its scripted response boundary")
+            advance(deadline - self.lifecycle_clock.monotonic())
+
+        self.server.respond = response
+        _ = self.patches.enter_context(patch.object(codex_mesh.Client, "_read", response_frames))
+        _ = self.patches.enter_context(patch.object(codex_mesh.Client, "has_pending_frames", property(pending)))
+        _ = self.patches.enter_context(patch.object(codex_mesh.Client, "next_frame", frame))
+        if activity_method:
+            _ = self.patches.enter_context(patch.object(codex_mesh.Client, "wait_for_activity", activity))
+
     def roster(self) -> dict[str, object]:
         with (self.session_dir / codex_mesh.ROSTER_FILE).open(encoding="utf-8") as handle:
             fcntl.flock(handle, fcntl.LOCK_SH)
@@ -1358,7 +1524,7 @@ class WorkerShownNameTests(MeshCommandFixture):
 
     def test_a_refused_unit_reviewer_follow_keeps_the_existing_thread_title(self) -> None:
         self.configure_context()
-        self.start_args_timeout = 0.1
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done",
                                           "role": "review", "port": self.server.port,
                                           "unit_ledger": str(unit_workers.ledger_for_run(self.session_dir).path)}})
@@ -1376,7 +1542,13 @@ class WorkerShownNameTests(MeshCommandFixture):
             return respond(request)
 
         self.server.respond = remember_title
-        code, errors = self.run_follow(role="review")
+        self.lifecycle_clock.freeze()
+
+        def expire(_client: codex_mesh.Client, deadline: float) -> None:
+            self.lifecycle_clock.advance(max(0.0, deadline - self.lifecycle_clock.time()))
+
+        with patch.object(codex_mesh.Client, "next_frame", expire):
+            code, errors = self.run_follow(role="review")
         self.assertNotEqual(code, 0, errors)
         self.assertIn("live turn", errors)
         self.assertTrue(self.methods("thread/resume"), "follow must reach the later idle check")
@@ -1541,8 +1713,8 @@ class FixtureHomeSafetyTests(unittest.TestCase):
         root = Path(self.enterContext(tempfile.TemporaryDirectory(dir="/tmp")))
         real = root / "real"
         real.mkdir()
-        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE", "AGENTS_LOCAL_CONFIG_FILE"):
-            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE", "AGENTS_LOCAL_CONFIG_FILE")}
+        for name in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE"):
+            environment = {key: str(root / "safe") for key in ("HOME", "CODEX_HOME", "AGENT_NOTES_DIR", "AGENTS_CONFIG_FILE")}
             environment[name] = str(real / "nested")
             with (self.subTest(variable=name), patch(f"{__name__}.REAL_HOME", real),
                   patch.dict(os.environ, environment),
@@ -1611,8 +1783,67 @@ class FixtureHomeSafetyTests(unittest.TestCase):
 
 
 @final
+class RecordedTurnSettingsTests(unittest.TestCase):
+    def test_accepted_turn_settings_take_precedence_over_legacy_roster_fields(self) -> None:
+        settings = codex_mesh.recorded_turn_settings({
+            "turn_model": "accepted-model", "turn_effort": "high",
+            "model": "historical-model", "effort": "low",
+        })
+        self.assertEqual((settings.model, settings.effort), ("accepted-model", "high"))
+
+    def test_an_accepted_model_without_effort_does_not_borrow_the_legacy_effort(self) -> None:
+        for effort in ({}, {"turn_effort": ""}, {"turn_effort": 123}):
+            with self.subTest(effort=effort):
+                settings = codex_mesh.recorded_turn_settings({
+                    "turn_model": "accepted-model", "model": "historical-model", "effort": "max", **effort,
+                })
+                self.assertEqual((settings.model, settings.effort), ("accepted-model", ""))
+
+    def test_a_missing_or_empty_accepted_model_uses_the_legacy_pair(self) -> None:
+        for model in ({}, {"turn_model": ""}, {"turn_model": 123}):
+            with self.subTest(model=model):
+                settings = codex_mesh.recorded_turn_settings({
+                    "turn_effort": "max", "model": "historical-model", "effort": "low", **model,
+                })
+                self.assertEqual((settings.model, settings.effort), ("historical-model", "low"))
+
+    def test_unrecorded_settings_are_empty_and_legacy_fields_remain_supported(self) -> None:
+        for record, expected in (({}, ("", "")), ({"model": "older-model"}, ("older-model", "")),
+                                 ({"model": "older-model", "effort": "medium"}, ("older-model", "medium"))):
+            with self.subTest(record=record):
+                settings = codex_mesh.recorded_turn_settings(record)
+                self.assertEqual((settings.model, settings.effort), expected)
+
+
+@final
 class MeshCommandTests(MeshCommandFixture):
     """Launcher and recovery behavior against the shared bounded fake server."""
+
+    def test_accelerated_reader_preserves_wire_order_around_an_rpc_reply(self) -> None:
+        notices = [_notice(f"notice/{name}", {}) for name in ("A", "B", "C")]
+        respond = self.server.respond
+
+        def response(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if request.get("method") == "fixture/ordered":
+                return [*notices[:2], _reply(request, {"acknowledged": True}), notices[2]]
+            return respond(request)
+
+        self.server.respond = response
+        self.controlled_stream_deadlines(submission_method="fixture/ordered")
+        with contextlib.closing(codex_mesh.Client(self.server.port, "ordered-reader")) as client:
+            self.assertEqual(client.call("fixture/ordered", {}).get("result"), {"acknowledged": True})
+            started_at = self.lifecycle_clock.monotonic()
+            received: list[codex_mesh.RpcMessage | None] = []
+            for notice in notices:
+                self.assertTrue(client.has_pending_frames, f"a buffered wire notice was hidden: {notice}")
+                received.append(client.next_frame(self.lifecycle_clock.time() + codex_mesh.UNSEEN_END_CHECK_SECS))
+                self.assertEqual(self.lifecycle_clock.monotonic(), started_at,
+                                 "the accelerated reader advanced past a buffered wire notice")
+            self.assertEqual(received, notices)
+            self.assertFalse(client.has_pending_frames)
+            self.assertIsNone(client.next_frame(self.lifecycle_clock.time() + codex_mesh.UNSEEN_END_CHECK_SECS),
+                              "the fixture quiet boundary reached the product")
+            self.assertGreater(self.lifecycle_clock.monotonic(), started_at)
 
     def test_held_turn_with_current_binding_reuses_the_server_without_blocking(self) -> None:
         design = self.held_reviewer_record(design_roles.RoleOpen(THREAD_ID))
@@ -1647,7 +1878,7 @@ class MeshCommandTests(MeshCommandFixture):
                 patch.object(codex_mesh, "_start_server", side_effect=AssertionError("the fixture server must be reused")):
             launcher = threading.Thread(target=follow, daemon=True)
             launcher.start()
-            launcher.join(timeout=5)
+            LauncherHangGuard('test_held_turn_with_current_binding_reuses_the_server_without_blocking').join(launcher)
         self.assertFalse(launcher.is_alive(), "unchanged binding blocked the turn on its server lock")
         if errors:
             raise errors[0]
@@ -1730,7 +1961,7 @@ class MeshCommandTests(MeshCommandFixture):
                         else:
                             code = codex_mesh.command_sweep(argparse.Namespace(root=str(outside_roots), stop=True))
                     self.assertEqual(code, 0)
-                    reaper.join(timeout=5)
+                    LauncherHangGuard('test_sweep_or_idle_stop_of_a_held_design_server_resumes_same_thread_with_pending_text').join(reaper)
                     self.assertFalse(reaper.is_alive(), "the stopped child was not reaped")
                     self.assertIsNotNone(process.poll())
                     self.assertFalse(codex_mesh._pid_alive(process.pid))  # pyright: ignore[reportPrivateUsage]
@@ -1785,7 +2016,7 @@ class MeshCommandTests(MeshCommandFixture):
                 finally:
                     if process.poll() is None:
                         process.kill()
-                    reaper.join(timeout=5)
+                    LauncherHangGuard('test_sweep_or_idle_stop_of_a_held_design_server_resumes_same_thread_with_pending_text').join(reaper)
                 self.session_dir = fixture_root
 
     def test_account_move_resume_refuses_a_fenced_source_before_touching_its_queue(self) -> None:
@@ -3500,6 +3731,38 @@ class MeshCommandTests(MeshCommandFixture):
         follow_params = cast("dict[str, object]", starts[1]["params"])
         self.assertEqual(follow_params["model"], "gpt-test")
 
+    def prepare_turn_display_worker(self) -> dict[str, str]:
+        registry = {"direct.codex": {"review": "gpt-current:high"},
+                    "codex.agents": {"gpt-current": "low,high"}}
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "role": "review",
+                                          "model": "legacy-model", "effort": "legacy-effort",
+                                          "turn_model": "previous-turn", "turn_effort": "low"}})
+        return self.tier_environment(registry)
+
+    def test_an_accepted_turn_records_display_settings_without_replacing_legacy_identity_fields(self) -> None:
+        with patch.dict(os.environ, self.prepare_turn_display_worker()):
+            code, _output, errors = self.run_mesh(self.follow_cli())
+        self.assertEqual((code, errors), (0, ""))
+        turn = _as_test_dict(self.methods("turn/start")[-1]["params"])
+        self.assertEqual((turn["model"], turn["effort"]), ("gpt-current", "high"))
+        record = self.worker_record()
+        self.assertEqual((record["turn_model"], record["turn_effort"]), ("gpt-current", "high"))
+        self.assertEqual((record["model"], record["effort"]), ("legacy-model", "legacy-effort"))
+
+    def test_follow_chooses_current_registry_settings_instead_of_either_roster_model_pair(self) -> None:
+        with patch.dict(os.environ, self.prepare_turn_display_worker()):
+            first, _output, errors = self.run_mesh(self.follow_cli())
+            self.assertEqual((first, errors), (0, ""))
+            registry_path = Path(os.environ["AGENTS_CONFIG_FILE"])
+            _ = write_registry(registry_path, {"direct.codex": {"review": "gpt-current:low"}}, update=True)
+            second, _output, errors = self.run_mesh(self.follow_cli())
+        self.assertEqual((second, errors), (0, ""))
+        turns = [_as_test_dict(item["params"]) for item in self.methods("turn/start")]
+        self.assertEqual([(turn["model"], turn["effort"]) for turn in turns],
+                         [("gpt-current", "high"), ("gpt-current", "low")])
+        self.assertEqual((self.worker_record()["turn_model"], self.worker_record()["turn_effort"]),
+                         ("gpt-current", "low"))
+
     def follow_with_name_taken(self, take_at: str, *, release_unknown: bool = False) -> tuple[int, str]:
         self.write_pool_roster({"worker": {"thread_id": "old-follow-thread", "status": "done",
                                        "role": "impl", "context_tokens": 123, "port": self.server.port}})
@@ -4208,10 +4471,10 @@ class MeshCommandTests(MeshCommandFixture):
 
         worker = threading.Thread(target=compact)
         worker.start()
-        self.assertTrue(self.server.compaction_event_sent.wait(timeout=2))
+        LauncherHangGuard('test_compact_waits_for_turn_completion_after_the_compaction_event').event(self.server.compaction_event_sent)
         self.assertTrue(worker.is_alive(), "compact returned before turn/completed")
         self.server.release_compact_turn_completion.set()
-        worker.join(timeout=2)
+        LauncherHangGuard('test_compact_waits_for_turn_completion_after_the_compaction_event').join(worker)
 
         self.assertFalse(worker.is_alive())
         self.assertEqual(failures, [])
@@ -4220,7 +4483,9 @@ class MeshCommandTests(MeshCommandFixture):
 
     def compact_with_short_waits(self) -> tuple[int, str]:
         args = argparse.Namespace(session_dir=str(self.session_dir), to="worker")
+        self.controlled_stream_deadlines(submission_method="thread/compact/start")
         with (
+            patch.object(self.lifecycle_clock, "sleep", side_effect=self.lifecycle_clock.advance),
             patch.object(codex_mesh, "CALL_TIMEOUT_SECS", 1),
             patch.object(codex_mesh, "COMPACT_IDLE_WAIT_SECS", 0.3),
             patch.object(codex_mesh, "COMPACT_IDLE_POLL_SECS", 0.05),
@@ -4342,7 +4607,7 @@ class MeshCommandTests(MeshCommandFixture):
 
     def prepare_stream_refusal_wait(self) -> agent_accounts.KnownCodexAccount:
         source = self.prepare_refusing_account()
-        self.start_args_timeout = 2.0
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         original = self.respond
         self.server.respond = lambda request: (self.quota_completion(request)
             if request.get("method") == "turn/start" else original(request))
@@ -4489,16 +4754,14 @@ class MeshCommandTests(MeshCommandFixture):
 
     def skip_quota_wait_time(self) -> None:
         """Let one quota wait reach the deadline without a real sleep."""
-        epoch = time.time()
-        elapsed = 0.0
+        self.lifecycle_clock.freeze()
 
         @bounded_fixture
         def sleep(_seconds: float) -> None:
-            nonlocal elapsed
-            elapsed += self.start_args_timeout + 1
+            self.lifecycle_clock.advance(self.start_args_timeout + 1)
 
         _ = self.patches.enter_context(patch.object(codex_mesh, "time", SimpleNamespace(
-            time=bounded_fixture(lambda: epoch + elapsed), monotonic=bounded_fixture(lambda: elapsed), sleep=sleep)))
+            time=self.lifecycle_clock.time, monotonic=self.lifecycle_clock.monotonic, sleep=sleep)))
 
     @contextlib.contextmanager
     def quota_reports(self, report: Callable[[list[str]], subprocess.CompletedProcess[str]]) -> Generator[None]:
@@ -4515,7 +4778,7 @@ class MeshCommandTests(MeshCommandFixture):
 
     def assert_finished_quota_continuation_has_no_rerun(self, later_failure: str) -> None:
         source = self.prepare_refusing_account()
-        self.start_args_timeout = 2.0
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         original = self.respond
         commands: list[list[str]] = []
         submissions = 0
@@ -4526,8 +4789,6 @@ class MeshCommandTests(MeshCommandFixture):
                 submissions += 1
                 if submissions == 1:
                     return self.quota_completion(request)
-                if later_failure == "disconnect":
-                    self.server.close_after_turn_start = True
                 frames = original(request)
                 assert frames is not None
                 frames.insert(-1, _notice("item/completed", {"threadId": THREAD_ID,
@@ -4548,7 +4809,54 @@ class MeshCommandTests(MeshCommandFixture):
             self.record_fixture_refusal(source, recovered=True)
             return subprocess.CompletedProcess(command, 0, "", "")
 
+        delivered_continuation = threading.Event()
+        if later_failure == "disconnect":
+            # "Completed, then disconnected" means the client processed the
+            # completion, not merely that the server queued its bytes. Force a
+            # file-wake readback in the gap before final output; keep serving
+            # RPCs until the continuation's completion is actually handled.
+            output_prefix = threading.Event()
+            readback_started = threading.Event()
+            send = _send_frame
+            call = codex_mesh.Client.call
+            on_frame = codex_mesh._on_frame  # pyright: ignore[reportPrivateUsage]
+
+            def send_with_gap(connection: socket.socket, frame: dict[str, object]) -> None:
+                send(connection, frame)
+                item = _as_test_dict(_as_test_dict(frame.get("params")).get("item"))
+                if submissions == 2 and item.get("type") == "userMessage":
+                    output_prefix.set()
+                    with codex_mesh._pending_file(str(self.session_dir), "worker") as handle:  # pyright: ignore[reportPrivateUsage]
+                        codex_mesh._write_pending(handle, THREAD_ID, [], accepting_messages=True)  # pyright: ignore[reportPrivateUsage]
+                    LauncherHangGuard("readback before continuation output").event(readback_started)
+
+            def readback(client: codex_mesh.Client, method: str, params: dict[str, object],
+                         timeout: float = codex_mesh.CALL_TIMEOUT_SECS) -> codex_mesh.RpcMessage:
+                if method == "thread/read" and output_prefix.is_set():
+                    readback_started.set()
+                return call(client, method, params, timeout)
+
+            def processed_frame(stream: codex_mesh.TurnStream, log: TextIO,
+                                frame: codex_mesh.RpcMessage) -> codex_mesh.StreamStep | codex_mesh.FailedWithThread:
+                result = on_frame(stream, log, frame)
+                if (submissions == 2 and frame.get("method") == "turn/completed"
+                        and stream.replies == 2):
+                    delivered_continuation.set()
+                    # EOF follows delivery even if a lifecycle RPC overtook
+                    # the final frames; closing with unread RPCs used to race it.
+                    for connection in self.server.connections:
+                        with contextlib.suppress(OSError):
+                            connection.shutdown(socket.SHUT_WR)
+                return result
+
+            _ = self.patches.enter_context(patch(f"{__name__}._send_frame", send_with_gap))
+            _ = self.patches.enter_context(patch.object(codex_mesh.Client, "call", readback))
+            _ = self.patches.enter_context(patch.object(codex_mesh, "_on_frame", processed_frame))
+            self.addCleanup(readback_started.set)
+
         self.server.respond = respond
+        if later_failure == "timeout":
+            self.controlled_stream_deadlines()
         args = self.start_args()
         args.resident = True
         with (patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
@@ -4558,6 +4866,8 @@ class MeshCommandTests(MeshCommandFixture):
               contextlib.redirect_stderr(io.StringIO()) as errors):
             code = codex_mesh.command_start(args)
         self.assertEqual(code, 1, errors.getvalue())
+        if later_failure == "disconnect":
+            self.assertTrue(delivered_continuation.is_set(), "disconnect preceded continuation delivery")
         self.assertEqual(submissions, 2)
         self.assertEqual(self.turn_inputs, ["Continue where you stopped."])
         self.assertIn("recovered task finished", (self.session_dir / "worker.log").read_text())
@@ -4584,7 +4894,7 @@ class MeshCommandTests(MeshCommandFixture):
 
     def assert_retried_quota_continuation_timeout(self, *, continuation_completed: bool) -> None:
         source = self.prepare_refusing_account()
-        self.start_args_timeout = 2.0
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         original = self.respond
         commands: list[list[str]] = []
         recovery_reads: list[dict[str, object]] = []
@@ -4624,6 +4934,7 @@ class MeshCommandTests(MeshCommandFixture):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         self.server.respond = respond
+        self.controlled_stream_deadlines()
         args = self.start_args()
         args.resident = True
         with (patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
@@ -4657,7 +4968,7 @@ class MeshCommandTests(MeshCommandFixture):
 
     def test_failed_quota_continuation_then_completed_held_message_still_sends_one_rerun(self) -> None:
         source = self.prepare_refusing_account()
-        self.start_args_timeout = 2.0
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         original = self.respond
         deliver = codex_mesh._deliver_reply  # pyright: ignore[reportPrivateUsage]
         commands: list[list[str]] = []
@@ -4691,6 +5002,7 @@ class MeshCommandTests(MeshCommandFixture):
             return subprocess.CompletedProcess(command, 0, "", "")
 
         self.server.respond = respond
+        self.controlled_stream_deadlines()
         args = self.start_args()
         args.resident = True
         with (patch.object(codex_mesh, "_marker_sessions", return_value=["own-director"]),
@@ -4738,7 +5050,7 @@ class MeshCommandTests(MeshCommandFixture):
 
     def test_replacement_thread_refusal_waits_for_room_and_keeps_its_continuation(self) -> None:
         target, replacement = self.prepare_workers_move()
-        self.start_args_timeout = 2.0
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         original = self.respond
         commands: list[list[str]] = []
 
@@ -4960,7 +5272,7 @@ class MeshCommandTests(MeshCommandFixture):
             return frame
         args = self.start_args()
         args.resident = True
-        args.timeout = 3
+        args.timeout = TEST_HANG_GUARD_SECS
         with patch.object(codex_mesh.Client, "next_frame", park), \
                 patch.object(codex_mesh, "_report_quota_refusal") as report, contextlib.redirect_stderr(io.StringIO()):
             code = codex_mesh.command_start(args)
@@ -5097,7 +5409,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.server.respond = respond
         client = codex_mesh.Client(self.server.port, "worker")
         try:
-            with patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", 0.02), \
+            with patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", TEST_HANG_GUARD_SECS), \
                     patch.object(codex_mesh, "_report_quota_refusal") as report:
                 result = codex_mesh._move_resident(self.start_args(), str(self.session_dir), "worker", THREAD_ID, client)  # pyright: ignore[reportPrivateUsage]
         finally:
@@ -5235,7 +5547,7 @@ class MeshCommandTests(MeshCommandFixture):
             return read(client, deadline)
         def swap() -> None:
             try:
-                if not waiting.wait(timeout=30):
+                if not waiting.wait(timeout=LauncherHangGuard('swap').remaining()):
                     raise AssertionError("launcher never waited for its running turn")
                 if sign_in_change:
                     def old_sign_in(_pid: int, _home: Path) -> bool:
@@ -5272,7 +5584,7 @@ class MeshCommandTests(MeshCommandFixture):
                 code, errors = self.run_start()
             finally:
                 self.server.release_held_turn.set()
-                mover.join(timeout=30)
+                LauncherHangGuard('assert_waiting_launcher_account_move').join(mover)
         self.assertFalse(mover.is_alive(), "swap did not finish after launcher continuation")
         if failures:
             raise failures[0]
@@ -5360,7 +5672,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.outcomes = ["disconnect", "completed"]
         # The run ends on the resumed turn's completion; the budget only bounds
         # a failure, so it sits far above full-suite load.
-        self.start_args_timeout = 120
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         marker_injected = False
         on_frame = codex_mesh._on_frame  # pyright: ignore[reportPrivateUsage]
 
@@ -5536,12 +5848,13 @@ class MeshCommandTests(MeshCommandFixture):
                 return [_reply(request, {})]
             return respond(request)
         self.server.respond = old
+        self.lifecycle_clock.freeze()
         @bounded_fixture
         def advance(seconds: float) -> None:
+            self.lifecycle_clock.advance(seconds)
             self.elapsed += seconds
         with (patch.object(codex_mesh, "ACCOUNT_MOVE_RESUME_TIMEOUT_SECS", 0.2),
-              patch.object(time, "monotonic", new=self.clock),
-              patch.object(time, "sleep", new=advance),
+              patch.object(self.lifecycle_clock, "sleep", new=advance),
               patch.object(codex_mesh, "_resume_account_move_detached") as detached,
               contextlib.redirect_stdout(io.StringIO())):
             if sign_in_change:
@@ -5603,7 +5916,7 @@ class MeshCommandTests(MeshCommandFixture):
             self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
             switches = codex_mesh.retire_workers_servers(target, "codex1")
             for launcher in launchers:
-                launcher.join(timeout=30)
+                LauncherHangGuard('assert_detached_account_move').join(launcher)
         self.assertEqual(len(launchers), 1)
         self.assertTrue(all(not launcher.is_alive() for launcher in launchers))
         if failures:
@@ -5757,7 +6070,7 @@ class MeshCommandTests(MeshCommandFixture):
     def assert_quota_continuation_after_move(self, held: tuple[str, ...]) -> None:
         # This checks the handoff's ordering. Its many socket/file round trips must
         # not race a five-second task deadline when the machine is busy.
-        self.start_args_timeout = 30.0
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         target, new = self.prepare_workers_move()
         respond = self.server.respond
         def refuse(request: dict[str, object]) -> list[dict[str, object]] | None:
@@ -5841,7 +6154,7 @@ class MeshCommandTests(MeshCommandFixture):
 
     def assert_destination_refusal_continues(self, *, initial_submission_refused: bool) -> None:
         # Real socket servers, two moves and two one-second retry waits need more than the default deadline.
-        self.start_args_timeout = 30.0
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         target, rejected = self.prepare_workers_move()
         final_home = target.parent / ".codex2"
         final_home.mkdir()
@@ -6111,7 +6424,7 @@ class MeshCommandTests(MeshCommandFixture):
                                           "continuation_owed": True, "port": self.server.port}})
         pending = self.session_dir / "worker.pending.json"
         _ = pending.write_text(json.dumps({"thread_id": THREAD_ID, "messages": ["Keep this result"]}))
-        self.start_args_timeout = 0.2
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         with (patch.object(refusals, "load", return_value={}),
               patch.object(refusals, "stored_reading", return_value=refusals.NoReading()),
               patch.object(codex_mesh, "_stream_frames", side_effect=AssertionError("no turn to watch")),
@@ -6264,7 +6577,7 @@ class MeshCommandTests(MeshCommandFixture):
             client.serving = codex_mesh.ServingCodexServer(self.server.port, os.getpid(), account.home,
                                                            account, started_here=True)
             stream = codex_mesh.TurnStream(args=args, session_dir=str(self.session_dir), name="worker",
-                follow=False, resident=True, timeout=5, opened=time.time(), deadline=time.time() + 5,
+                follow=False, resident=True, timeout=TEST_HANG_GUARD_SECS, opened=time.time(), deadline=time.time() + TEST_HANG_GUARD_SECS,
                 log_path=self.session_dir / "worker.log", summary_path=self.session_dir / "summary.txt",
                 reply_path=None, end_marker=self.session_dir / "worker.end",
                 director=codex_mesh.UnknownWorkerDirector(), client=client, port=self.server.port,
@@ -6379,14 +6692,47 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(record["port"], new.port)
 
     def test_checked_initial_turn_waits_for_a_live_thread_then_starts_once(self) -> None:
+        self.assert_checked_initial_turn_waits_for_a_live_thread_then_starts_once()
+
+    def assert_checked_initial_turn_waits_for_a_live_thread_then_starts_once(self) -> None:
         self.live_turn = "outgoing-turn"
         self.announce_live_completion = True
+        self.controlled_stream_deadlines(activity_method="thread/read")
+        started_at = self.lifecycle_clock.monotonic()
+        respond = self.server.respond
+
+        def checked_response(request: dict[str, object]) -> list[dict[str, object]] | None:
+            if self.live_turn:
+                self.assertEqual(self.methods("turn/start"), [])
+            return respond(request)
+
+        self.server.respond = checked_response
         code, errors = self.run_start()
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(len(self.methods("turn/start")), 1)
         self.assertGreaterEqual(len(self.methods("thread/read")), 2)
         self.assertEqual(self.live_turn, "")
         self.assertEqual(self.worker_record()["status"], "done")
+        self.assertGreaterEqual(self.lifecycle_clock.monotonic() - started_at, 60,
+                                "controlled initial wait did not advance lifecycle time")
+
+    def test_controlled_initial_wait_requires_clock_advancement(self) -> None:
+        with patch.object(self.lifecycle_clock, "advance"):
+            with self.assertRaisesRegex(AssertionError, "controlled initial wait did not advance|controlled stream waits"):
+                self.assert_checked_initial_turn_waits_for_a_live_thread_then_starts_once()
+
+    def test_controlled_initial_wait_never_submits_without_the_scripted_transition(self) -> None:
+        self.live_turn = "outgoing-turn"
+        self.controlled_stream_deadlines(activity_method="thread/read")
+        started_at = self.lifecycle_clock.monotonic()
+        code, errors = self.run_start()
+        self.assertEqual(code, 1, errors)
+        self.assertIn("still live at the timeout", errors)
+        self.assertEqual(self.methods("turn/start"), [])
+        # Failed-launch cleanup interrupts the old turn; it never submits new work.
+        self.assertEqual([_as_test_dict(item["params"]).get("turnId")
+                          for item in self.methods("turn/interrupt")], ["outgoing-turn"])
+        self.assertGreaterEqual(self.lifecycle_clock.monotonic() - started_at, self.start_args_timeout)
 
     def test_initial_turn_waits_for_an_event_before_retrying_live_state(self) -> None:
         with contextlib.closing(codex_mesh.Client(self.server.port, "worker")) as client:
@@ -6525,7 +6871,7 @@ class MeshCommandTests(MeshCommandFixture):
         code, errors = self.run_start()
         self.assertEqual((code, errors), (0, ""))
         self.outcomes = ["earlier_only"]
-        self.start_args_timeout = 0.1
+        self.controlled_stream_deadlines()
 
         code, errors = self.run_follow()
 
@@ -6535,11 +6881,9 @@ class MeshCommandTests(MeshCommandFixture):
     def test_follow_sees_a_peer_turn_end_when_the_thread_read_still_names_the_followed_turn(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["completed_then_instant_peer"]
-        self.start_args_timeout = 3
+        self.controlled_stream_deadlines()
 
-        # The interval wake only makes the stand-in server hand over the peer turn's end.
-        with patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", 0.2):
-            code, errors = self.run_follow()
+        code, errors = self.run_follow()
 
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.worker_record()["status"], "done")
@@ -6548,10 +6892,9 @@ class MeshCommandTests(MeshCommandFixture):
     def test_a_launcher_finishes_when_the_thread_is_idle_and_no_completion_notice_came(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["answered_without_completion"]
-        self.start_args_timeout = 5
+        self.controlled_stream_deadlines()
 
-        with patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", 0.2):
-            code, errors = self.run_follow()
+        code, errors = self.run_follow()
 
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.worker_record()["status"], "done")
@@ -6563,10 +6906,9 @@ class MeshCommandTests(MeshCommandFixture):
         # The server can read a thread idle just after its turn starts, before it lists the turn.
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["idle_before_listed"]
-        self.start_args_timeout = 5
+        self.controlled_stream_deadlines()
 
-        with patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", 0.05):
-            code, errors = self.run_follow()
+        code, errors = self.run_follow()
 
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.unlisted_reads, 2)
@@ -6577,10 +6919,9 @@ class MeshCommandTests(MeshCommandFixture):
     def test_an_idle_thread_with_no_notice_and_no_answer_finishes_as_failed(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["earlier_only"]
-        self.start_args_timeout = 5
+        self.controlled_stream_deadlines()
 
-        with patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", 0.2):
-            code, errors = self.run_follow()
+        code, errors = self.run_follow()
 
         self.assertNotEqual(code, 0)
         self.assertIn("went idle with no completion notice and no answer", errors)
@@ -6592,20 +6933,19 @@ class MeshCommandTests(MeshCommandFixture):
             self.assertEqual(self.run_start()[0], 0)
         stalled_turn = self.turn_starts + 1
         self.outcomes = ["disconnect", "completed"]
-        self.start_args_timeout = 180
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
+        self.lifecycle_clock.freeze()
         runs = self.session_dir / codex_mesh.DETACHED_RUNS_DIR
         runs.mkdir()
         run = runs / "scratch-run.json"
         _ = run.write_text(json.dumps({"worker": "worker", "status": "running", "pid": os.getpid()}))
         result = "Run finished: scratch verification passed"
-        now = time.time()
         elapsed = 0.0
         quiet_polls = 0
         read = codex_mesh.Client.next_frame
         call = codex_mesh.Client.call
-        progress = FixtureLoopBudget("finished-run recovery frames", seconds=15, max_calls=64)
-        requests = FixtureLoopBudget("finished-run recovery RPCs", seconds=15, max_calls=128)
-        started = time.perf_counter()
+        progress = FixtureLoopBudget("finished-run recovery frames", max_calls=64)
+        requests = FixtureLoopBudget("finished-run recovery RPCs", max_calls=128)
 
         @bounded_fixture
         def rpc(client: codex_mesh.Client, method: str, params: dict[str, object],
@@ -6614,25 +6954,18 @@ class MeshCommandTests(MeshCommandFixture):
             return call(client, method, params, timeout=min(timeout, remaining))
 
         @bounded_fixture
-        def monotonic() -> float:
-            # Fake time jumps over the scan interval; real time can still expire it.
-            return elapsed + time.perf_counter() - started
-
-        @bounded_fixture
-        def wall_clock() -> float:
-            return now + monotonic()
-
-        @bounded_fixture
         def frame(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
             nonlocal elapsed, quiet_polls
             remaining = progress.check()
-            deadline = min(deadline, wall_clock() + remaining)
+            deadline = min(deadline, self.lifecycle_clock.time() + remaining)
             # Readback RPCs can buffer notices before their reply. Never hide them.
             if client.has_pending_frames:
                 return read(client, deadline)
             if self.turn_starts == stalled_turn and quiet_polls < 2:
                 quiet_polls += 1
-                elapsed += 1 if quiet_polls == 1 else 59
+                tick = 1 if quiet_polls == 1 else 59
+                elapsed += tick
+                self.lifecycle_clock.advance(tick)
                 self.error_threads.add(THREAD_ID)
                 if quiet_polls == 2:
                     # The first quiet poll must keep the launcher for the live run.
@@ -6653,8 +6986,8 @@ class MeshCommandTests(MeshCommandFixture):
 
         with (patch.object(codex_mesh.Client, "next_frame", frame),
               patch.object(codex_mesh.Client, "call", rpc),
-              patch.object(codex_mesh, "time", SimpleNamespace(time=wall_clock,
-                  monotonic=monotonic, sleep=fixture_no_sleep))):
+              patch.object(codex_mesh, "time", SimpleNamespace(time=self.lifecycle_clock.time,
+                  monotonic=self.lifecycle_clock.monotonic, sleep=fixture_no_sleep))):
             code, errors = self.run_follow() if follow else self.run_start()
 
         self.assertEqual(quiet_polls, 2)
@@ -6718,7 +7051,7 @@ class MeshCommandTests(MeshCommandFixture):
     def test_follow_failure_without_turn_id_finishes_as_failed(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
         self.outcomes = ["failed"]
-        self.start_args_timeout = 300
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
 
         code, errors = self.run_follow()
 
@@ -6731,7 +7064,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.outcomes = ["completed_without_id"]
         # The socket completion notice advances this test; its deadline only
         # catches a hung launcher, including when the server is starved of CPU.
-        self.start_args_timeout = 300
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         submission_delay = [0.0]
         respond = self.server.respond
 
@@ -7045,7 +7378,7 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.worker_record()["status"], "done")
 
     def run_after_peer_readback(self, *, completion_notice: bool) -> tuple[int, str]:
-        self.start_args_timeout = 3
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.server.coalesce_response_frames = True
         respond = self.respond
 
@@ -7078,7 +7411,7 @@ class MeshCommandTests(MeshCommandFixture):
     def test_disconnect_after_turn_start_never_repeats_the_prompt(self) -> None:
         self.outcomes = ["disconnect"]
         self.server.close_after_turn_start = True
-        self.start_args_timeout = 0.1
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         code, _errors = self.run_start()
         self.assertEqual(code, 1)
         self.assertEqual(len(self.methods("thread/start")), 1)
@@ -7419,14 +7752,29 @@ class MeshCommandTests(MeshCommandFixture):
             "worker": {"thread_id": THREAD_ID, "turn_id": "", "status": "running"}
         }), encoding="utf-8")
         self.read_failure = "timeout"
+        self.lifecycle_clock.freeze()
         original_call = codex_mesh.Client.call
+        original_read = codex_mesh.Client._read  # pyright: ignore[reportPrivateUsage]
+        expiring_read = False
 
-        def short_read(client: codex_mesh.Client, method: str,
-                       params: dict[str, object], timeout: float = 300.0) -> codex_mesh.RpcMessage:
-            return original_call(client, method, params,
-                                 timeout=0.01 if method == "thread/read" else timeout)
+        def expire_read(client: codex_mesh.Client, deadline: float,
+                        wake: codex_mesh.FollowEvents | codex_mesh.SocketOnlyWait = codex_mesh.SOCKET_ONLY_WAIT) -> codex_mesh.RpcMessage | None:
+            if expiring_read:
+                self.lifecycle_clock.advance(max(0.0, deadline - self.lifecycle_clock.time()) + 1)
+                return None
+            return original_read(client, deadline, wake)
 
-        with patch.object(codex_mesh.Client, "call", short_read):
+        def timed_read(client: codex_mesh.Client, method: str,
+                       params: dict[str, object], timeout: float = codex_mesh.CALL_TIMEOUT_SECS) -> codex_mesh.RpcMessage:
+            nonlocal expiring_read
+            expiring_read = method == "thread/read"
+            try:
+                return original_call(client, method, params, timeout=timeout)
+            finally:
+                expiring_read = False
+
+        with (patch.object(codex_mesh.Client, "call", timed_read),
+              patch.object(codex_mesh.Client, "_read", expire_read)):
             code, errors = self.run_start()
         self.assertEqual(code, 2)
         self.assertIn("timed out", errors)
@@ -7844,6 +8192,11 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertEqual(self.worker_record()["status"], "done")
 
     def test_resident_idle_ticks_skip_move_requests_when_home_and_port_match(self) -> None:
+        self.assert_resident_idle_ticks_skip_move_requests_when_home_and_port_match()
+
+    def assert_resident_idle_ticks_skip_move_requests_when_home_and_port_match(self) -> None:
+        self.controlled_stream_deadlines()
+        started_at = self.lifecycle_clock.monotonic()
         args = self.start_args()
         args.resident = True
         empty = [0]
@@ -7861,6 +8214,13 @@ class MeshCommandTests(MeshCommandFixture):
         self.assertIsInstance(outcome, codex_mesh.RunCompleted)
         self.assertEqual(empty[0], 3)
         self.assertEqual(move.call_count, 2)
+        self.assertGreaterEqual(self.lifecycle_clock.monotonic() - started_at, 120,
+                                "controlled resident ticks did not advance lifecycle time")
+
+    def test_controlled_resident_ticks_require_clock_advancement(self) -> None:
+        with patch.object(self.lifecycle_clock, "advance"):
+            with self.assertRaisesRegex(AssertionError, "controlled resident ticks did not advance"):
+                self.assert_resident_idle_ticks_skip_move_requests_when_home_and_port_match()
 
     def test_lost_new_server_turn_reply_cleans_up_that_server_and_thread(self) -> None:
         self.assertEqual(self.run_start()[0], 0)
@@ -7891,13 +8251,12 @@ class MeshCommandTests(MeshCommandFixture):
         target, new = self.prepare_workers_move()
         args = self.start_args()
         args.resident = True
-        args.timeout = 600
+        args.timeout = TEST_HANG_GUARD_SECS
         resumes: list[int] = []
         resume_ticks: list[int] = []
         ticks = 0
-        offset = 0.0
+        self.lifecycle_clock.freeze()
         first_reply_delivered = False
-        monotonic = time.monotonic
         call = codex_mesh.Client.call
         read = codex_mesh.Client.next_frame
         deliver = codex_mesh._deliver_reply  # pyright: ignore[reportPrivateUsage]
@@ -7919,12 +8278,15 @@ class MeshCommandTests(MeshCommandFixture):
 
         @bounded_fixture
         def poll(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
-            nonlocal ticks, offset
-            frame = read(client, min(deadline, time.time() + 0.02))
+            nonlocal ticks
+            if first_reply_delivered and not client.has_pending_frames:
+                self.lifecycle_clock.advance(max(0.0, deadline - self.lifecycle_clock.time()))
+                frame = None
+            else:
+                frame = read(client, deadline)
             if frame is None and first_reply_delivered:
                 ticks += 1
                 self.assertLessEqual(ticks, 8, "resume retry exceeded its tick budget")
-                offset += 61
                 if not resumes:
                     self.assertEqual(accounts.main(["set-role", "workers", "codex1"]), 0)
                 elif client.port == new.port:
@@ -7933,11 +8295,10 @@ class MeshCommandTests(MeshCommandFixture):
 
         # Finish the original turn before selecting the new account: startup
         # file wakes do not establish an idle resident or a retry tick.
-        # Advance the simulated clock after real quiet reads, independently of load.
+        # Advance only after the original reply; buffered notices still precede each tick.
         with (patch.object(codex_mesh.Client, "call", rpc),
               patch.object(codex_mesh.Client, "next_frame", poll),
               patch.object(codex_mesh, "_deliver_reply", reply),
-              patch.object(time, "monotonic", new=lambda: monotonic() + offset),
               patch.object(codex_mesh, "_stop_unused", return_value=False),
               contextlib.redirect_stdout(io.StringIO())):
             outcome = codex_mesh._run_worker(args, self.server.port)  # pyright: ignore[reportPrivateUsage]
@@ -7953,6 +8314,8 @@ class MeshCommandTests(MeshCommandFixture):
         self, messages: tuple[str, ...], *, late: bool = False,
     ) -> tuple[StubAppServer, Callable[[], None], Callable[[], None]]:
         """Keep the old writer loaded while selecting a different fake server."""
+        self.start_args_timeout = 10 * TEST_HANG_GUARD_SECS
+        self.lifecycle_clock.freeze()
         target, new = self.prepare_workers_move()
         selected_home = [target.parent / ".codex"]
         loaded = [True]
@@ -7961,12 +8324,16 @@ class MeshCommandTests(MeshCommandFixture):
         _ = self.patches.enter_context(patch.object(agent_accounts, "workers_home", side_effect=lambda: selected_home[0]))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_stop_unused", return_value=False))
         _ = self.patches.enter_context(patch.object(codex_mesh, "_stop_unused_with_lock_held", return_value=False))
-        _ = self.patches.enter_context(patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", 0.03))
-        _ = self.patches.enter_context(patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", 0.02))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", TEST_HANG_GUARD_SECS))
+        _ = self.patches.enter_context(patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", TEST_HANG_GUARD_SECS))
         respond = self.server.respond
 
         def old(request: dict[str, object]) -> list[dict[str, object]] | None:
             if request.get("method") == "thread/loaded/list":
+                if loaded[0]:
+                    # Force scheduling to exceed the old 30ms fixture deadline
+                    # before its readback returns. Load must not skip the probe.
+                    self.lifecycle_clock.advance(1)
                 return [_reply(request, {"data": [THREAD_ID] if loaded[0] else [], "nextCursor": None})]
             if request.get("method") == "thread/unsubscribe":
                 return [_reply(request, {})]
@@ -7992,9 +8359,17 @@ class MeshCommandTests(MeshCommandFixture):
                     )), 0)
 
         read = codex_mesh.Client.next_frame
+        def release_read(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            if loaded[0] and client.port == self.server.port:
+                self.lifecycle_clock.advance(TEST_HANG_GUARD_SECS)
+                return None
+            return read(client, deadline)
+
 
         @bounded_fixture
         def frame(client: codex_mesh.Client, deadline: float) -> codex_mesh.RpcMessage | None:
+            if client.port == self.server.port and loaded[0] and self.methods("thread/unsubscribe"):
+                return release_read(client, deadline)
             notice = read(client, deadline)
             if not late and notice is not None and notice.get("method") in ("turn/completed", "turn/failed", "item/completed"):
                 if notice.get("method") != "item/completed" or _as_test_dict(_as_test_dict(notice.get("params")).get("item")).get("type") == "agentMessage":
@@ -8363,20 +8738,20 @@ class FollowEventRegressionTests(MeshCommandFixture):
         ready = threading.Event()
         with (contextlib.closing(codex_mesh.FollowEvents(str(self.session_dir), "worker")) as events,
               contextlib.closing(codex_mesh.Client(self.server.port, "adoption-wait",
-                                                  deadline=time.time() + 4)) as client,
+                                                  deadline=time.time() + TEST_HANG_GUARD_SECS)) as client,
               ThreadPoolExecutor(max_workers=1) as executor):
             def wait_for_handoff() -> None:
                 ready.set()
-                client.wait_for_activity(events, time.monotonic() + 3)
+                client.wait_for_activity(events, time.monotonic() + TEST_HANG_GUARD_SECS)
 
             future = executor.submit(wait_for_handoff)
-            self.assertTrue(ready.wait(timeout=1))
+            LauncherHangGuard('test_adopted_worker_wakes_a_real_file_wait_and_refuses_old_follow').event(ready)
             record = self.worker_record()
             # Change only ownership: a status change alone would let this test
             # pass even if the event filter forgot adopted_to.
             record["adopted_to"] = str(destination)
             self.write_pool_roster({"worker": record})
-            _ = future.result(timeout=1)
+            _ = LauncherHangGuard('test_adopted_worker_wakes_a_real_file_wait_and_refuses_old_follow').result(future)
         before = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
         try:
             code, output, errors = self.run_mesh(self.follow_cli())
@@ -8397,7 +8772,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
             "UNIT_WORKERS_STATE": str(self.session_dir.parent / "unit-workers"),
         }))
         self.assertEqual(self.run_start(), (0, ""))
-        self.start_args_timeout = 4
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.outcomes = ["disconnect"]
         self.server.hold_turn_completion = True
         self.server.answer_requests_during_held_turn = True
@@ -8420,7 +8795,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self.run_follow)
             try:
-                self.assertTrue(self.lifecycle_clock.wait_for_submission(self.server.held_turn_ready, timeout=4))
+                LauncherHangGuard('test_an_attached_follow_stops_on_handoff_without_overwriting_the_new_owner').event(self.server.held_turn_ready)
                 # A recovering handoff can fence an old launcher after its
                 # original idle precondition was checked. Only ownership
                 # changes, so the watcher must observe adopted_to itself.
@@ -8438,7 +8813,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                 record["unit_ledger"] = str(store.path)
                 self.write_pool_roster({"worker": record})
                 fenced = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
-                code, errors = future.result(timeout=1)
+                code, errors = LauncherHangGuard('test_an_attached_follow_stops_on_handoff_without_overwriting_the_new_owner').result(future)
             finally:
                 self.live_turn = ""
                 self.server.release_held_turn.set()
@@ -8469,7 +8844,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running",
                                            "adopted_to": str(self.session_dir.parent / "owner")}})
         before = (self.session_dir / codex_mesh.ROSTER_FILE).read_bytes()
-        with contextlib.closing(codex_mesh.Client(self.server.port, "worker", deadline=time.time() + 4)) as client:
+        with contextlib.closing(codex_mesh.Client(self.server.port, "worker", deadline=time.time() + TEST_HANG_GUARD_SECS)) as client:
             _ = client.call("test/answer-before-handoff", {})
             self.assertTrue(client.has_pending_frames)
             stream = self.stream_for(client)
@@ -8631,7 +9006,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.started_turns["buffered-turn"] = "completed"
         return codex_mesh.TurnStream(
             args=args, session_dir=str(self.session_dir), name="worker", follow=True, resident=resident,
-            timeout=3, opened=time.time(), deadline=time.time() + 3,
+            timeout=TEST_HANG_GUARD_SECS, opened=time.time(), deadline=time.time() + TEST_HANG_GUARD_SECS,
             log_path=self.session_dir / "worker.log", summary_path=self.session_dir / "summary.txt",
             reply_path=None, end_marker=self.session_dir / "worker.end",
             director=codex_mesh.UnknownWorkerDirector(), client=client, port=self.server.port,
@@ -8657,7 +9032,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.server.respond = buffer_completion
         self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running"}})
         frame_handler = codex_mesh._on_frame  # pyright: ignore[reportPrivateUsage]
-        budget = FixtureLoopBudget("due scan frame handling", seconds=4, max_calls=8)
+        budget = FixtureLoopBudget("due scan frame handling", max_calls=8)
         due = 0.0
 
         def expire_scan_after_answer(
@@ -8674,7 +9049,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                 stream.runs.next_check = due
             return step
 
-        with contextlib.closing(codex_mesh.Client(self.server.port, "worker", deadline=time.time() + 4)) as client:
+        with contextlib.closing(codex_mesh.Client(self.server.port, "worker", deadline=time.time() + TEST_HANG_GUARD_SECS)) as client:
             _ = client.call("test/buffer-completion", {})
             stream = self.stream_for(client)
             with (contextlib.closing(codex_mesh.FollowEvents(str(self.session_dir), "worker")) as events,
@@ -8689,7 +9064,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
             self.assertEqual(self.worker_record()["status"], "done")
 
     def assert_retry_does_not_wake_itself(self, *, room_wait: bool) -> None:
-        self.start_args_timeout = 3
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         if room_wait:
             account = self.prepare_refusing_account(stub_ensure=False)
         else:
@@ -8698,35 +9073,18 @@ class FollowEventRegressionTests(MeshCommandFixture):
             "port": self.server.port, "continuation_owed": True}})
         pending = self.session_dir / "worker.pending.json"
         _ = pending.write_text(json.dumps({"thread_id": THREAD_ID, "messages": [], "accepting_messages": False}))
-        first_pass = threading.Event()
-        repeated = threading.Event()
         quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
-        budget = FixtureLoopBudget("owed retry quiet passes", seconds=5, max_calls=8)
-        passes = 0
-
-        def observed_quiet(stream: codex_mesh.TurnStream, log: TextIO) -> codex_mesh.StreamStep | codex_mesh.FailedWithThread:
-            nonlocal passes
-            _ = budget.check()
-            step = quiet(stream, log)
-            passes += 1
-            if passes == 1:
-                first_pass.set()
-            else:
-                repeated.set()
-            return step
-
         def no_refusals() -> dict[str, refusals.AccountRefusal]:
             return {}
 
         with contextlib.ExitStack() as stack:
             client = stack.enter_context(contextlib.closing(
-                codex_mesh.Client(self.server.port, "worker", deadline=time.time() + 4)))
+                codex_mesh.Client(self.server.port, "worker", deadline=time.time() + TEST_HANG_GUARD_SECS)))
             client.serving = codex_mesh.ServingCodexServer(self.server.port, os.getpid(), account.home, account)
             stream = self.stream_for(client, resident=room_wait)
             stream.state_change_owed = True
             events = stack.enter_context(contextlib.closing(codex_mesh.FollowEvents(str(self.session_dir), "worker")))
             stream.events = events
-            _ = stack.enter_context(patch.object(codex_mesh, "_on_quiet_poll", observed_quiet))
             if room_wait:
                 _ = stack.enter_context(patch.object(refusals, "load", new=no_refusals))
                 # These mocks are scoped to this test's eight-pass budget.
@@ -8742,18 +9100,17 @@ class FollowEventRegressionTests(MeshCommandFixture):
             else:
                 _ = stack.enter_context(patch.object(codex_mesh, "_move_resident",
                     new=bounded_fixture(lambda *_args: codex_mesh.WorkerThreadStateUnknown("readback unavailable"))))
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(codex_mesh._stream_frames, stream, io.StringIO())  # pyright: ignore[reportPrivateUsage]
-                try:
-                    self.assertTrue(first_pass.wait(timeout=1), "owed retry never ran")
-                    self.assertFalse(repeated.wait(timeout=0.3), "retry woke itself without new work")
-                    self.assertFalse(future.done(), "owed continuation was abandoned")
-                finally:
-                    # Cleanup must also stop the one-turn quota wait, whose
-                    # end-marker check follows its normal lifecycle deadline.
-                    stream.deadline = time.time()
-                    _ = stream.end_marker.write_text("end")
-                _ = future.result(timeout=3)
+            step = quiet(stream, io.StringIO())
+            self.assertIs(step, codex_mesh.StreamStep.NEXT_FRAME, "owed continuation was abandoned")
+            # The retry has finished all its writes before this wait. A readable
+            # sentinel prevents blocking, while the real watcher first drains
+            # every earlier self-write. A self-wake must win over the sentinel.
+            wake, peer = socket.socketpair()
+            with wake, peer:
+                peer.sendall(b"ready")
+                result = events.wait(wake, self.lifecycle_clock.monotonic() + TEST_HANG_GUARD_SECS)
+                self.assertIs(result, codex_mesh.SocketReady.READY,
+                              "retry woke itself without new work")
         self.assertEqual(self.turn_starts, 0)
         self.assertLess(len(self.server.requests), 16, "self wakes accumulated RPCs")
 
@@ -8868,14 +9225,14 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.assert_trailing_status_finishes_promptly(failed=True)
 
     def assert_inbox_stays_open_for_late_run(self, *, resident: bool) -> None:
-        self.start_args_timeout = 4
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.assertEqual(self.run_start(), (0, ""))
         self.outcomes = ["answered_without_completion"]
         created = threading.Event()
         checked = threading.Event()
         frame_handler = codex_mesh._on_frame  # pyright: ignore[reportPrivateUsage]
         quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
-        budget = FixtureLoopBudget("new detached run discovery", seconds=6, max_calls=24,
+        budget = FixtureLoopBudget("new detached run discovery", max_calls=24,
                                    clock=self.lifecycle_clock.monotonic)
         run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "new.json"
         run.parent.mkdir()
@@ -8914,14 +9271,8 @@ class FollowEventRegressionTests(MeshCommandFixture):
               ThreadPoolExecutor(max_workers=1) as executor):
             future = executor.submit(self.run_follow)
             try:
-                # Submission/setup time is separate from the file-wake bound below.
-                submitted = self.lifecycle_clock.wait_for_submission(created, timeout=3)
-                if not submitted and future.done():
-                    self.assertEqual(future.result(), (0, ""), "follow exited before the answer")
-                self.assertTrue(submitted,
-                                f"answer never started the run fixture; requests={self.server.requests!r}; " +
-                                f"server errors={self.server.errors!r}")
-                self.assertTrue(checked.wait(timeout=1), "file event never checked the new run")
+                LauncherHangGuard("answer never started the run fixture").event(created)
+                LauncherHangGuard("file event never checked the new run").event(checked)
                 self.assertFalse(future.done(), "launcher abandoned a detached run created after its scan")
                 inbox = _as_test_dict(cast(object, json.loads((self.session_dir / "worker.pending.json").read_text())))
                 self.assertIs(inbox.get("accepting_messages"), True)
@@ -8933,7 +9284,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                     with contextlib.redirect_stdout(io.StringIO()):
                         _ = codex_mesh.command_send(argparse.Namespace(session_dir=str(self.session_dir),
                             to="worker", message="detached run result", message_file=""))
-            code, errors = self.lifecycle_clock.result(future, timeout=3)
+            code, errors = LauncherHangGuard(self.id()).result(future)
         self.assertEqual((code, errors), (0, ""))
         # A full-history read queues a notice that kept the idle check from
         # ever reaching delivery.
@@ -8944,7 +9295,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.assertTrue(run.exists(), "run discovery removed a lookup record")
 
     def test_last_detached_run_result_turn_is_watched_not_interrupted(self) -> None:
-        self.start_args_timeout = 60
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.assertEqual(self.run_start(), (0, ""))
         self.outcomes = ["completed", "listed_before_notices"]
         run = self.session_dir / codex_mesh.DETACHED_RUNS_DIR / "last.json"
@@ -8955,7 +9306,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         steps: list[codex_mesh.StreamStep | codex_mesh.FailedWithThread] = []
         waiting = codex_mesh._waiting_on_detached_run  # pyright: ignore[reportPrivateUsage]
         quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
-        budget = FixtureLoopBudget("last run result turn", seconds=20, max_calls=200)
+        budget = FixtureLoopBudget("last run result turn", max_calls=200)
 
         def note_wait(session_dir: str, name: str, thread_id: str, runs: codex_mesh.DetachedRunWatch) -> bool:
             held = waiting(session_dir, name, thread_id, runs)
@@ -8979,8 +9330,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
               ThreadPoolExecutor(max_workers=1) as executor):
             future = executor.submit(self.run_follow)
             try:
-                self.assertTrue(self.lifecycle_clock.wait_for_submission(held_on_run, timeout=5),
-                                "launcher never waited on the live run")
+                LauncherHangGuard("launcher never waited on the live run").event(held_on_run)
                 self.server.hold_turn_completion = True
                 self.server.answer_requests_during_held_turn = True
                 self.server.held_turn_completes_successfully = True
@@ -8988,14 +9338,13 @@ class FollowEventRegressionTests(MeshCommandFixture):
                 held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
                                                without_launcher=False)
                 self.assertIsInstance(held, codex_mesh.HeldForLauncher)
-                self.assertTrue(self.lifecycle_clock.wait_for_submission(self.server.held_turn_ready, timeout=5),
-                                "the held result opened no turn")
-                self.assertTrue(polled_result_turn.wait(timeout=5), "no lifecycle check ran on the result turn")
+                LauncherHangGuard("the held result opened no turn").event(self.server.held_turn_ready)
+                LauncherHangGuard("no lifecycle check ran on the result turn").event(polled_result_turn)
                 self.assertNotIn(codex_mesh.StreamStep.FINISH, steps)
                 self.assertFalse(future.done(), "launcher left the result turn before its completion")
             finally:
                 self.server.release_held_turn.set()
-            code, errors = future.result(timeout=10)
+            code, errors = LauncherHangGuard('test_last_detached_run_result_turn_is_watched_not_interrupted').result(future)
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.methods("turn/interrupt"), [])
         self.assertEqual(self.turn_inputs[-1], "detached run result")
@@ -9013,7 +9362,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         clock_jumped = threading.Event()
         waiting = codex_mesh._waiting_on_detached_run  # pyright: ignore[reportPrivateUsage]
         quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
-        budget = FixtureLoopBudget("held result past the deadline", seconds=TEST_HANG_GUARD_SECS, max_calls=200)
+        budget = FixtureLoopBudget("held result past the deadline", max_calls=200)
 
         def note_wait(session_dir: str, name: str, thread_id: str, runs: codex_mesh.DetachedRunWatch) -> bool:
             held = waiting(session_dir, name, thread_id, runs)
@@ -9039,19 +9388,17 @@ class FollowEventRegressionTests(MeshCommandFixture):
               patch.object(codex_mesh, "_on_quiet_poll", jump_wall_clock),
               ThreadPoolExecutor(max_workers=1) as executor):
             future = executor.submit(self.run_follow)
-            self.assertTrue(held_on_run.wait(timeout=TEST_HANG_GUARD_SECS),
-                            "launcher never waited on the live run")
+            LauncherHangGuard("launcher never waited on the live run").event(held_on_run)
             # The live-run check can precede the quiet poll that applies the jump.
             (self.session_dir / "worker.pending.json").touch()
-            self.assertTrue(clock_jumped.wait(timeout=TEST_HANG_GUARD_SECS),
-                            "launcher never observed the deadline jump")
+            LauncherHangGuard("launcher never observed the deadline jump").event(clock_jumped)
             held = codex_mesh.hold_message(str(self.session_dir), "worker", "detached run result",
                                            without_launcher=False)
             self.assertIsInstance(held, codex_mesh.HeldForLauncher)
             # Keep the inbox owned until its result is held, then announce run completion.
             _ = run.write_text(json.dumps({"worker": "worker", "status": "finished", "pid": os.getpid()}))
             (self.session_dir / "worker.pending.json").touch()
-            code, errors = future.result(timeout=TEST_HANG_GUARD_SECS)
+            code, errors = LauncherHangGuard('test_a_result_held_past_the_wall_clock_deadline_opens_the_next_turn').result(future)
         self.assertTrue(clock_jumped.is_set())
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.turn_inputs[-1], "detached run result")
@@ -9064,23 +9411,23 @@ class FollowEventRegressionTests(MeshCommandFixture):
 
     def assert_event_driven_follow(self) -> None:
         """Observe real socket and marker waits while a turn stays live."""
-        self.start_args_timeout = 8
+        self.start_args_timeout = 2 * TEST_HANG_GUARD_SECS
+        self.lifecycle_clock.freeze()
         self.assertEqual(self.run_start(), (0, ""))
         self.outcomes = ["disconnect"]
         self.server.hold_turn_completion = True
-        self.server.hold_turn_timeout = 8
         self.server.answer_requests_during_held_turn = True
         self.server.held_turn_completes_successfully = True
         ready = threading.Event()
-        finished = threading.Event()
+        wait_entered = threading.Event()
+        allow_wait = threading.Event()
         marker_seen = threading.Event()
-        quiet_wakes: list[float] = []
-        thread_reads: list[float] = []
+        scheduled_waits: list[float] = []
         respond = self.respond
         on_frame = codex_mesh._on_frame  # pyright: ignore[reportPrivateUsage]
         on_quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
         call = codex_mesh.Client.call
-        budget = FixtureLoopBudget("real streaming follow", seconds=12, max_calls=128)
+        budget = FixtureLoopBudget("real streaming follow", max_calls=128)
 
         def measure_stream_submission(
             client: codex_mesh.Client, method: str, params: dict[str, object],
@@ -9091,8 +9438,6 @@ class FollowEventRegressionTests(MeshCommandFixture):
 
         def held_response(request: dict[str, object]) -> list[dict[str, object]] | None:
             _ = budget.check()
-            if request.get("method") == "thread/read":
-                thread_reads.append(time.monotonic())
             frames = respond(request)
             if request.get("method") == "turn/start" and frames is not None:
                 self.live_turn = f"turn-{self.turn_starts}"
@@ -9114,43 +9459,52 @@ class FollowEventRegressionTests(MeshCommandFixture):
 
         def observed_quiet(stream: codex_mesh.TurnStream, log: TextIO) -> codex_mesh.StreamStep | codex_mesh.FailedWithThread:
             _ = budget.check()
-            quiet_wakes.append(time.monotonic())
-            marker_seen.set()
+            if allow_wait.is_set():
+                marker_seen.set()
             return on_quiet(stream, log)
 
-        def follow() -> tuple[int, str]:
-            try:
-                return self.run_follow()
-            finally:
-                finished.set()
+        wait = codex_mesh.FollowEvents.wait
+
+        def observed_wait(events: codex_mesh.FollowEvents, connection: socket.socket,
+                          deadline: float) -> codex_mesh.FileWaitResult:
+            if ready.is_set():
+                scheduled_waits.append(deadline - self.lifecycle_clock.monotonic())
+                # Force the marker to be published BEFORE the real wait begins.
+                # Queued notifications must survive that ordering.
+                wait_entered.set()
+                LauncherHangGuard("marker-before-wait barrier").event(allow_wait)
+            return wait(events, connection, deadline)
 
         self.server.respond = held_response
         with (
             patch.object(codex_mesh, "_on_frame", observed_frame),
             patch.object(codex_mesh, "_on_quiet_poll", observed_quiet),
             patch.object(codex_mesh.Client, "call", measure_stream_submission),
+            patch.object(codex_mesh.FollowEvents, "wait", observed_wait),
+            patch.object(codex_mesh, "UNSEEN_END_CHECK_SECS", TEST_HANG_GUARD_SECS),
+            patch.object(codex_mesh, "DETACHED_RUN_CHECK_SECS", TEST_HANG_GUARD_SECS),
             ThreadPoolExecutor(max_workers=1) as executor,
         ):
-            future = executor.submit(follow)
+            future = executor.submit(self.run_follow)
             try:
-                self.assertTrue(self.lifecycle_clock.wait_for_submission(ready, timeout=5),
-                                "follower never consumed the stream")
-                self.assertTrue(self.server.held_turn_ready.wait(timeout=1))
-                # Allow only startup events during the first second. A 1s
-                # polling regression must then wake during the next two.
-                quiet_started = time.monotonic() + 1
-                self.assertFalse(finished.wait(timeout=3), "follow abandoned its live turn")
-                self.assertEqual([wake for wake in quiet_wakes if wake >= quiet_started], [])
-                self.assertEqual([read for read in thread_reads if read >= quiet_started], [])
+                LauncherHangGuard("follower never consumed the stream").event(ready)
+                LauncherHangGuard('assert_event_driven_follow').event(self.server.held_turn_ready)
+                LauncherHangGuard("follow never entered its blocking wait").event(wait_entered)
+                self.assertFalse(future.done(), "follow abandoned its live turn")
+                self.assertTrue(scheduled_waits)
+                self.assertGreaterEqual(min(scheduled_waits), TEST_HANG_GUARD_SECS,
+                                        "live follow scheduled a periodic polling wake")
                 marker_seen.clear()
                 marker = self.session_dir / "worker.pending.json"
                 _ = marker.write_text(marker.read_text() + "\n")
-                self.assertTrue(marker_seen.wait(timeout=1), "marker write did not wake follow within 1s")
+                allow_wait.set()
+                LauncherHangGuard("marker write did not wake follow").event(marker_seen)
                 self.assertFalse(future.done(), "a marker wake finished an in-flight turn")
             finally:
+                allow_wait.set()
                 self.live_turn = ""
                 self.server.release_held_turn.set()
-            code, errors = future.result(timeout=3)
+            code, errors = LauncherHangGuard('assert_event_driven_follow').result(future)
         self.assertEqual((code, errors), (0, ""))
         self.assertEqual(self.worker_record()["status"], "done")
         self.assertIn("stream complete", (self.session_dir / "summary.txt").read_text())
@@ -9159,7 +9513,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         self.assert_event_driven_follow()
 
     def test_file_wake_keeps_completion_frames_received_before_the_idle_readback_reply(self) -> None:
-        self.start_args_timeout = 3
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.assertEqual(self.run_start(), (0, ""))
         self.outcomes = ["disconnect"]
         respond = self.respond
@@ -9197,7 +9551,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                          (self.session_dir / "worker.log").read_text())
 
     def test_follow_consumes_ten_thousand_deltas_with_bounded_work_and_no_sleeps(self) -> None:
-        self.start_args_timeout = 60
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.assertEqual(self.run_start(), (0, ""))
         self.server.coalesce_response_frames = True
         respond = self.respond
@@ -9205,7 +9559,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
         next_frame = codex_mesh.Client.next_frame
         quiet = codex_mesh._on_quiet_poll  # pyright: ignore[reportPrivateUsage]
         counts = {"reads": 0, "passes": 0, "quiet": 0}
-        budget = FixtureLoopBudget("delta receive work", seconds=60, max_calls=30_300)
+        budget = FixtureLoopBudget("delta receive work", max_calls=30_300)
 
         def streamed(request: dict[str, object]) -> list[dict[str, object]] | None:
             frames = respond(request)
@@ -9249,7 +9603,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
 
     def assert_follow_exits_after_terminal_marker(self, *, finished_run: bool, resident: bool) -> None:
         self.assertEqual(self.run_start(), (0, ""))
-        self.start_args_timeout = 4
+        self.start_args_timeout = TEST_HANG_GUARD_SECS
         self.outcomes = ["disconnect"]
         self.server.hold_turn_completion = True
         self.server.answer_requests_during_held_turn = True
@@ -9287,8 +9641,8 @@ class FollowEventRegressionTests(MeshCommandFixture):
               ThreadPoolExecutor(max_workers=1) as executor):
             future = executor.submit(self.run_follow)
             try:
-                self.assertTrue(self.lifecycle_clock.wait_for_submission(self.server.held_turn_ready, timeout=5))
-                self.assertTrue(answer_consumed.wait(timeout=5))
+                LauncherHangGuard('assert_follow_exits_after_terminal_marker').event(self.server.held_turn_ready)
+                LauncherHangGuard('assert_follow_exits_after_terminal_marker').event(answer_consumed)
                 # The server is idle, but its turn/completed notice is lost.
                 self.live_turn = ""
                 if finished_run:
@@ -9299,7 +9653,7 @@ class FollowEventRegressionTests(MeshCommandFixture):
                     record = self.worker_record()
                     record["status"] = "ended"
                     self.write_pool_roster({"worker": record})
-                code, errors = future.result(timeout=1)
+                code, errors = LauncherHangGuard('assert_follow_exits_after_terminal_marker').result(future)
             finally:
                 self.live_turn = ""
                 self.server.release_held_turn.set()
@@ -9447,7 +9801,7 @@ runpy.run_path(script, run_name='__main__')
 ''')
         shim.chmod(0o755)
         ended = subprocess.run(["bash", str(Path(codex_mesh.__file__).parents[1] / "direct" / "end_session.sh")],
-            capture_output=True, text=True, check=False, timeout=20, env=os.environ.copy())
+            capture_output=True, text=True, check=False, timeout=LauncherHangGuard('assert_run_end_keeps_directed_workers').remaining(), env=os.environ.copy())
         self.assertEqual(ended.returncode, 0, ended.stdout + ended.stderr)
         self.assertFalse(marker.exists())
         for name, expected in roster.items():
@@ -9566,7 +9920,8 @@ class GuardedWorkerEndTests(MeshCommandFixture):
             self.assertEqual(self.methods("turn/interrupt"), [])
             self.assertEqual(self.worker_record()["status"], "ended")
             clock_offset = 0
-            code, output, errors = self.run_mesh(["end", "--to", "worker"])
+            code, output, errors = self.run_mesh(["end", "--to", "worker",
+                "--expected-thread-id", THREAD_ID, "--cleanup-only"])
         self.assertEqual(code, 0, output + errors)
         self.assertEqual(self.queued, [])
         self.assertEqual(self.live_turn, "")
@@ -9582,7 +9937,7 @@ class GuardedWorkerEndTests(MeshCommandFixture):
             path = runs / "live.json"
             child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
                 "mesh_runs.py", "supervise", str(path)], stdin=subprocess.PIPE)
-            self.addCleanup(child.communicate, timeout=4)
+            self.addCleanup(child.communicate, timeout=TEST_HANG_GUARD_SECS)
             _ = path.write_text(json.dumps({"worker": "worker", "status": "running", "pid": child.pid,
                                            "cwd": str(self.session_dir)}))
         else:
@@ -9630,13 +9985,13 @@ raise SystemExit(codex_mesh.main(['end', '--session-dir', sys.argv[1], '--to', '
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             assert child.stdout is not None
             try:
-                self.assertTrue(select.select([child.stdout], [], [], 5)[0], "end never attempted its lock")
+                self.assertTrue(select.select([child.stdout], [], [], LauncherHangGuard("end never attempted its lock").remaining())[0], "end never attempted its lock")
                 self.assertEqual(cast(TextIO, child.stdout).readline().strip(), "locking")
                 # The announcement precedes flock. Observe the actual kernel
                 # wait before allowing the launcher to compete for the roster,
                 # or an inverted order could pass by winning that race.
                 lock_wait = Path(f"/proc/{child.pid}/wchan")
-                observation = FixtureLoopBudget("end blocked in flock", seconds=5, max_calls=1_000)
+                observation = FixtureLoopBudget("end blocked in flock", max_calls=1_000)
                 while "lock" not in lock_wait.read_text():
                     remaining = observation.check()
                     self.assertIsNone(child.poll(), "end exited before blocking on the held inbox")
@@ -9645,18 +10000,18 @@ raise SystemExit(codex_mesh.main(['end', '--session-dir', sys.argv[1], '--to', '
                     update = executor.submit(codex_mesh._set_roster_assignment, str(self.session_dir),  # pyright: ignore[reportPrivateUsage]
                         "worker", "impl", "launcher lock probe")
                     try:
-                        _ = update.result(timeout=2)
+                        _ = LauncherHangGuard('test_end_and_a_launcher_holding_the_inbox_finish_without_deadlock').result(update)
                     finally:
                         # Only our child may be stopped; this also frees its roster lock when the lock order is inverted.
                         if not update.done():
                             child.kill()
-                            _ = child.wait(timeout=3)
+                            _ = child.wait(timeout=LauncherHangGuard('test_end_and_a_launcher_holding_the_inbox_finish_without_deadlock').remaining())
             except BaseException:
                 if child.poll() is None:
                     child.kill()
-                _ = child.communicate(timeout=3)
+                _ = child.communicate(timeout=LauncherHangGuard('test_end_and_a_launcher_holding_the_inbox_finish_without_deadlock').remaining())
                 raise
-        output, errors = child.communicate(timeout=5)
+        output, errors = child.communicate(timeout=LauncherHangGuard('test_end_and_a_launcher_holding_the_inbox_finish_without_deadlock').remaining())
         self.assertEqual(child.returncode, 0, output + errors)
         self.assertEqual(self.worker_record()["task"], "launcher lock probe")
         self.assertEqual(self.worker_record()["status"], "ended")
@@ -9806,7 +10161,7 @@ class WorkerPauseTests(MeshCommandFixture):
             record = records / f"command-{ordinal}.json"
             child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
                 "mesh_runs.py", "supervise", str(record)], stdin=subprocess.PIPE)
-            self.addCleanup(child.communicate, timeout=4)
+            self.addCleanup(child.communicate, timeout=TEST_HANG_GUARD_SECS)
             _ = record.write_text(json.dumps({"worker": "worker", "status": "running", "pid": child.pid,
                                              "cwd": str(checkout)}))
         @bounded_fixture
@@ -9849,7 +10204,7 @@ class WorkerPauseTests(MeshCommandFixture):
         record = records / "held-command.json"
         child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()",
             "mesh_runs.py", "supervise", str(record)], stdin=subprocess.PIPE)
-        self.addCleanup(child.communicate, timeout=4)
+        self.addCleanup(child.communicate, timeout=TEST_HANG_GUARD_SECS)
         _ = record.write_text(json.dumps({"worker": "worker", "status": "running", "pid": child.pid,
                                          "cwd": str(checkout)}))
         with patch.object(workers, "pause_run", side_effect=workers.WorkerUnavailable("ledger quarantine")):
@@ -10129,7 +10484,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
         result = subprocess.run([
             sys.executable, str(Path(codex_mesh.__file__)), "adopt", "--session-dir", str(destination),
             "--from", str(self.session_dir), "--name", "worker",
-        ], capture_output=True, text=True, timeout=8, check=False)
+        ], capture_output=True, text=True, timeout=LauncherHangGuard('adopt').remaining(), check=False)
         return result.returncode
 
     def test_idle_adoption_keeps_the_thread_and_refuses_follow_from_the_old_run(self) -> None:
@@ -10254,7 +10609,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
         original_run = self.session_dir
         self.session_dir = destination
         try:
-            self.start_args_timeout = 5
+            self.start_args_timeout = TEST_HANG_GUARD_SECS
             self.assertEqual(self.run_follow("Complete the adoption."), (0, ""))
             self.live_turn = "peer-is-still-working"
             code, _output, errors = self.run_mesh(["can-follow", "--to", "worker", "--role", "impl"])
@@ -10296,7 +10651,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
         destinations = [self.destination("queued-race-a"), self.destination("queued-race-b")]
         code, _output, errors = self.run_mesh(["send", "--to", "worker", "--message", "Deliver this once."])
         self.assertEqual(code, 0, errors)
-        gate = threading.Barrier(2, timeout=4)
+        gate = threading.Barrier(2, timeout=TEST_HANG_GUARD_SECS)
 
         def claim(destination: Path) -> int:
             _ = gate.wait()
@@ -10304,7 +10659,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(claim, destination) for destination in destinations]
-            results = [future.result(timeout=10) for future in futures]
+            results = [LauncherHangGuard('test_two_racing_adoptions_deliver_queued_work_to_exactly_one_owner').result(future) for future in futures]
         self.assertEqual(results.count(0), 1, results)
         owner = destinations[results.index(0)]
         self.assertEqual(self.worker_record()["adopted_to"], str(owner))
@@ -10322,7 +10677,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
     def test_two_racing_adoptions_leave_exactly_one_destination_owner(self) -> None:
         self.idle_worker()
         destinations = [self.destination("racing-a"), self.destination("racing-b")]
-        gate = threading.Barrier(2, timeout=4)
+        gate = threading.Barrier(2, timeout=TEST_HANG_GUARD_SECS)
 
         def claim(destination: Path) -> int:
             _ = gate.wait()
@@ -10333,7 +10688,7 @@ class WorkerAdoptionTests(MeshCommandFixture):
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(claim, destination) for destination in destinations]
-            results = [future.result(timeout=10) for future in futures]
+            results = [LauncherHangGuard('test_two_racing_adoptions_leave_exactly_one_destination_owner').result(future) for future in futures]
         self.assertEqual(results.count(0), 1, results)
         owner = destinations[results.index(0)]
         self.assertEqual(self.worker_record()["adopted_to"], str(owner))
@@ -10453,7 +10808,7 @@ class DetachedRunWatchTests(unittest.TestCase):
                 ):
                     codex_mesh._end_dead_runs(str(session), "worker", watch)  # pyright: ignore[reportPrivateUsage]
                     supervisor.terminate()
-                    _ = supervisor.wait(timeout=5)
+                    _ = supervisor.wait(timeout=LauncherHangGuard('test_a_supervisor_that_dies_is_reaped_and_its_result_is_held_by_the_next_sixty_second_scan').remaining())
                     elapsed = 59.9
                     codex_mesh._end_dead_runs(str(session), "worker", watch)  # pyright: ignore[reportPrivateUsage]
                     self.assertEqual(cast(dict[str, object], json.loads(record.read_text()))["status"], "running")
@@ -10470,7 +10825,7 @@ class DetachedRunWatchTests(unittest.TestCase):
             finally:
                 with contextlib.suppress(ProcessLookupError):
                     supervisor.terminate()
-                _ = supervisor.wait(timeout=5)
+                _ = supervisor.wait(timeout=LauncherHangGuard('test_a_supervisor_that_dies_is_reaped_and_its_result_is_held_by_the_next_sixty_second_scan').remaining())
                 if supervisor.stdin is not None:
                     supervisor.stdin.close()
 
@@ -12841,7 +13196,7 @@ class SignInChangeTests(unittest.TestCase):
         return told, [cast("int", call.args[1]) for call in watch.call_args_list]
 
     def test_each_run_on_an_older_server_moves_and_its_holder_is_told(self) -> None:
-        old, new = subprocess.Popen(["sleep", "30"]), subprocess.Popen(["sleep", "30"])
+        old, new = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)]), subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)])
         try:
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -12871,7 +13226,7 @@ class SignInChangeTests(unittest.TestCase):
         finally:
             for process in (old, new):
                 process.kill()
-                _ = process.wait(timeout=5)
+                _ = process.wait(timeout=LauncherHangGuard('test_each_run_on_an_older_server_moves_and_its_holder_is_told').remaining())
 
     def test_a_holder_that_ends_while_earlier_runs_move_leaves_its_run_ended(self) -> None:
         with tempfile.TemporaryDirectory() as directory, \
@@ -12882,7 +13237,7 @@ class SignInChangeTests(unittest.TestCase):
             self.assertFalse(codex_mesh._run_is_live(folder, ("session-b",)))  # pyright: ignore[reportPrivateUsage]
 
     def test_an_idle_run_has_its_old_server_stopped_at_once(self) -> None:
-        old = subprocess.Popen(["sleep", "30"])
+        old = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)])
         try:
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -12895,7 +13250,7 @@ class SignInChangeTests(unittest.TestCase):
                 self.assertTrue((root / "run-a" / codex_mesh.RETIRED_FILE).exists())
         finally:
             old.kill()
-            _ = old.wait(timeout=5)
+            _ = old.wait(timeout=LauncherHangGuard('test_an_idle_run_has_its_old_server_stopped_at_once').remaining())
 
     def test_live_run_with_only_retired_old_sign_in_is_not_moved_or_notified(self) -> None:
         for has_current in (False, True):
@@ -13130,7 +13485,8 @@ class SignInChangeTests(unittest.TestCase):
 
     def test_unconfirmed_old_writer_release_starts_no_thread_or_turn_on_target(self) -> None:
         calls: list[str] = []
-        quiet = threading.Event()
+        clock = LifecycleTestClock()
+        clock.freeze()
         class HeldClient:
             port: int = 4001
             def __init__(self) -> None:
@@ -13151,8 +13507,8 @@ class SignInChangeTests(unittest.TestCase):
                         "nextCursor": None if params.get("cursor") else "last"}}
                 return {"result": {}}
             @bounded_fixture
-            def next_frame(self, deadline: float) -> codex_mesh.RpcMessage | None:
-                _ = quiet.wait(timeout=max(0.0, deadline - time.time()))
+            def next_frame(self, _deadline: float) -> codex_mesh.RpcMessage | None:
+                clock.advance(TEST_HANG_GUARD_SECS)
                 return None
             def close(self) -> None:
                 raise AssertionError("An unconfirmed release keeps the outgoing connection")
@@ -13160,7 +13516,7 @@ class SignInChangeTests(unittest.TestCase):
             _ = (Path(directory) / codex_mesh.ROSTER_FILE).write_text(json.dumps({"worker": {
                 "thread_id": "old-thread", "turn_id": "old-turn", "status": "running", "port": 4001,
             }}))
-            with patch.object(codex_mesh, "ensure_server", return_value=(4002, True)), patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", 0.01), patch.object(codex_mesh, "Client") as target:
+            with patch.object(codex_mesh, "ensure_server", return_value=(4002, True)), patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", TEST_HANG_GUARD_SECS), patch.object(codex_mesh, "time", SimpleNamespace(time=clock.time, monotonic=clock.monotonic)), patch.object(codex_mesh, "Client") as target:
                 result = codex_mesh._move_resident(  # pyright: ignore[reportPrivateUsage]
                     argparse.Namespace(effort=""), directory, "worker", "old-thread",
                     cast(codex_mesh.Client, cast(object, HeldClient())))
@@ -13412,7 +13768,8 @@ class WorkersHomeTests(unittest.TestCase):
 
     def test_unsubscribe_not_subscribed_does_not_prove_a_loaded_thread_released(self) -> None:
         calls: list[str] = []
-        quiet = threading.Event()
+        clock = LifecycleTestClock()
+        clock.freeze()
         class StillLoadedClient:
             port: int = 4001
             @bounded_fixture
@@ -13422,10 +13779,10 @@ class WorkersHomeTests(unittest.TestCase):
                     return {"result": {"status": "notSubscribed"}}
                 return {"result": {"data": ["thread-1"]}}
             @bounded_fixture
-            def next_frame(self, deadline: float) -> codex_mesh.RpcMessage | None:
-                _ = quiet.wait(timeout=max(0.0, deadline - time.time()))
+            def next_frame(self, _deadline: float) -> codex_mesh.RpcMessage | None:
+                clock.advance(TEST_HANG_GUARD_SECS)
                 return None
-        with patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", 0.01):
+        with patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", TEST_HANG_GUARD_SECS), patch.object(codex_mesh, "time", SimpleNamespace(time=clock.time, monotonic=clock.monotonic)):
             result = codex_mesh._release_worker_thread(  # pyright: ignore[reportPrivateUsage]
                 cast(codex_mesh.Client, cast(object, StillLoadedClient())), "thread-1", str(self.session_dir))
         self.assertIsInstance(result, codex_mesh.WorkerThreadStateUnknown)
@@ -13554,7 +13911,8 @@ class WorkersHomeTests(unittest.TestCase):
 
     def test_loaded_idle_thread_on_reused_port_waits_for_live_writer_release(self) -> None:
         calls: list[str] = []
-        elapsed = [0.0]
+        clock = LifecycleTestClock()
+        clock.freeze()
         class HeldWriter:
             port: int = 4001
             @bounded_fixture
@@ -13571,20 +13929,21 @@ class WorkersHomeTests(unittest.TestCase):
                 raise AssertionError(f"Unreleased writer must not receive {method}")
             @bounded_fixture
             def next_frame(self, _deadline: float) -> codex_mesh.RpcMessage | None:
-                elapsed[0] += 1.0
+                clock.advance(TEST_HANG_GUARD_SECS)
                 return None
             def close(self) -> None:
                 pass
         _ = (self.session_dir / codex_mesh.RETIRED_FILE).write_text(json.dumps({"servers": [
             {"port": 4001, "pid": 123456}, {"port": 4001, "pid": os.getpid()},
         ]}))
-        with patch.object(codex_mesh, "_pid_alive", side_effect=self.writer_process_is_live), patch.object(codex_mesh, "_stop_unused", return_value=False), patch.object(codex_mesh, "Client", return_value=HeldWriter()), patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", 0.01), patch.object(time, "monotonic", new=bounded_fixture(lambda: elapsed[0])):
+        with patch.object(codex_mesh, "_pid_alive", side_effect=self.writer_process_is_live), patch.object(codex_mesh, "_stop_unused", return_value=False), patch.object(codex_mesh, "Client", return_value=HeldWriter()), patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", TEST_HANG_GUARD_SECS), patch.object(codex_mesh, "time", SimpleNamespace(time=clock.time, monotonic=clock.monotonic)):
             result = codex_mesh._release_other_worker_writers(str(self.session_dir), "worker", "thread-1", 4002)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(result, codex_mesh.WorkerThreadStateUnknown)
         self.assertIn("thread/unsubscribe", calls)
 
     def test_live_peer_on_retired_server_names_run_and_worker_until_turn_ends(self) -> None:
-        elapsed = [0.0]
+        clock = LifecycleTestClock()
+        clock.freeze()
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({
             "worker": {"thread_id": "idle-thread", "status": "done"},
             "peer": {"thread_id": "busy-thread", "turn_id": "busy-turn", "status": "running"},
@@ -13602,11 +13961,11 @@ class WorkersHomeTests(unittest.TestCase):
                 return {"result": {}}
             @bounded_fixture
             def next_frame(self, _deadline: float) -> codex_mesh.RpcMessage | None:
-                elapsed[0] += 1.0
+                clock.advance(TEST_HANG_GUARD_SECS)
                 return None
             def close(self) -> None:
                 pass
-        with patch.object(codex_mesh, "_run_servers", return_value=[4001]), patch.object(codex_mesh, "Client", return_value=HeldClient()), patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", 0.01), patch.object(time, "monotonic", new=bounded_fixture(lambda: elapsed[0])):
+        with patch.object(codex_mesh, "_run_servers", return_value=[4001]), patch.object(codex_mesh, "Client", return_value=HeldClient()), patch.object(codex_mesh, "THREAD_RELEASE_TIMEOUT_SECS", TEST_HANG_GUARD_SECS), patch.object(codex_mesh, "time", SimpleNamespace(time=clock.time, monotonic=clock.monotonic)):
             result = codex_mesh._release_other_worker_writers(str(self.session_dir), "worker", "idle-thread", 4002)  # pyright: ignore[reportPrivateUsage]
         self.assertIsInstance(result, codex_mesh.WorkerThreadStateUnknown)
         assert isinstance(result, codex_mesh.WorkerThreadStateUnknown)
@@ -14185,12 +14544,12 @@ class ServerRecordTests(unittest.TestCase):
         for process in self.spawned:
             with contextlib.suppress(OSError):
                 process.kill()
-            _ = process.wait(timeout=5)
+            _ = process.wait(timeout=LauncherHangGuard('tearDown').remaining())
         self.temporary.cleanup()
 
     def sleeper(self) -> int:
         """A live pid to stand in for an app-server, with no codex installed."""
-        process = subprocess.Popen(["sleep", "30"])
+        process = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)])
         self.spawned.append(process)
         return process.pid
 
@@ -14278,7 +14637,7 @@ class ServerRecordTests(unittest.TestCase):
         self.assertTrue(codex_mesh._pid_alive(old_pid))  # pyright: ignore[reportPrivateUsage]
 
     def test_a_server_that_never_accepts_is_stopped_before_start_fails(self) -> None:
-        process = subprocess.Popen(["sleep", "30"])
+        process = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)])
         self.spawned.append(process)
         with patch.object(codex_mesh, "SERVER_START_TIMEOUT_SECS", 0), \
                 patch.object(codex_mesh, "_free_port", return_value=4321), \
@@ -14290,7 +14649,7 @@ class ServerRecordTests(unittest.TestCase):
         self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
 
     def test_a_server_is_stopped_when_recording_its_start_fails(self) -> None:
-        process = subprocess.Popen(["sleep", "30"])
+        process = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)])
         self.spawned.append(process)
         probe = SimpleNamespace(close=lambda: None)
         with patch.object(codex_mesh, "_free_port", return_value=4321), \
@@ -14303,13 +14662,26 @@ class ServerRecordTests(unittest.TestCase):
         self.assertIsNotNone(process.poll())
         self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())
 
-    def watcher(self, pid: int) -> tuple[subprocess.Popen[bytes], Path]:
+    def watcher(self, pid: int, *, fresh_probes: int = 0) -> tuple[subprocess.Popen[bytes], Path]:
         """Start the real watcher with a stand-in for the Python that would run `idle-stop`."""
         calls = self.session_dir / "calls"
         stub = self.session_dir / "python"
         _ = stub.write_text(f'#!/bin/sh\necho "$@" >> "{calls}"\n', encoding="utf-8")
         stub.chmod(0o755)
-        with patch.object(codex_mesh, "WATCH_WAKE_SECS", 0.1), \
+        environment = os.environ.copy()
+        if fresh_probes:
+            probes = self.session_dir / "fresh-probes"
+            find = self.session_dir / "find"
+            real_find = shutil.which("find")
+            assert real_find is not None
+            script = ("#!/bin/sh\n" + f"printf x >> {shlex.quote(str(probes))}\n"
+                      + f"if [ $(wc -c < {shlex.quote(str(probes))}) -gt {fresh_probes} ]; then\n"
+                      + f"  touch -t 200001010000 {shlex.quote(str(self.session_dir / codex_mesh.SERVER_FILE))}\nfi\n"
+                      + f"exec {shlex.quote(real_find)} \"$@\"\n")
+            _ = find.write_text(script)
+            find.chmod(0o755)
+            environment["PATH"] = str(self.session_dir) + os.pathsep + environment["PATH"]
+        with patch.dict(os.environ, environment), patch.object(codex_mesh, "WATCH_WAKE_SECS", 0.1), \
                 patch.object(codex_mesh, "SERVER_IDLE_SECS", 60.0), \
                 patch.object(sys, "executable", str(stub)):
             process = codex_mesh._start_watcher(str(self.session_dir), pid, 4321)  # pyright: ignore[reportPrivateUsage]
@@ -14328,20 +14700,17 @@ class ServerRecordTests(unittest.TestCase):
         self.assertFalse(calls.exists())
         old = time.time() - 7200
         os.utime(self.session_dir / codex_mesh.SERVER_FILE, (old, old))
-        _ = process.wait(timeout=10)
+        _ = process.wait(timeout=LauncherHangGuard('test_repeated_retirement_keeps_one_watcher_until_that_watcher_exits').remaining())
         replacement = self.watcher(pid)[0]
         self.assertNotEqual(replacement.pid, process.pid)
 
     def test_the_watcher_asks_only_about_a_record_gone_untouched_and_then_leaves(self) -> None:
         pid = self.sleeper()
         self.write_server(4321, pid)
-        process, calls = self.watcher(pid)
-        time.sleep(0.5)
-        # Several wakes on a record touched this minute: nothing is asked.
-        self.assertFalse(calls.exists())
-        old = time.time() - 7200
-        os.utime(self.session_dir / codex_mesh.SERVER_FILE, (old, old))
-        self.assertEqual(process.wait(timeout=10), 0)
+        process, calls = self.watcher(pid, fresh_probes=3)
+        self.assertEqual(process.wait(timeout=LauncherHangGuard('test_the_watcher_asks_only_about_a_record_gone_untouched_and_then_leaves').remaining()), 0)
+        self.assertEqual((self.session_dir / "fresh-probes").read_text(), "xxxx",
+                         "watcher must ignore all three fresh-record probes")
         self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), [
             f"{Path(codex_mesh.__file__).resolve()} idle-stop --session-dir {self.session_dir.resolve()} "
             + f"--pid {pid} --port 4321",
@@ -14354,7 +14723,7 @@ class ServerRecordTests(unittest.TestCase):
         _ = (self.session_dir / codex_mesh.RETIRED_FILE).write_text(
             json.dumps({"servers": [{"port": 4321, "pid": pid}]}, indent=2), encoding="utf-8")
         process, calls = self.watcher(pid)
-        self.assertEqual(process.wait(timeout=10), 0)
+        self.assertEqual(process.wait(timeout=LauncherHangGuard('test_the_watcher_judges_a_retired_server_at_every_wake').remaining()), 0)
         self.assertIn(f"--pid {pid} --port 4321", calls.read_text(encoding="utf-8"))
 
     def stale(self, started: float, changed: float | None) -> tuple[tuple[int, bool], list[tuple[object, ...]]]:
@@ -14385,12 +14754,12 @@ class ServerRecordTests(unittest.TestCase):
         self.assertEqual(self.retired_ports(), [])
 
     def test_the_watcher_leaves_with_its_server(self) -> None:
-        server = subprocess.Popen(["sleep", "30"])
+        server = subprocess.Popen(["sleep", str(TEST_HANG_GUARD_SECS)])
         self.write_server(4321, server.pid)
         process, calls = self.watcher(server.pid)
         server.kill()
-        _ = server.wait(timeout=5)
-        _ = process.wait(timeout=10)
+        _ = server.wait(timeout=LauncherHangGuard('test_the_watcher_leaves_with_its_server').remaining())
+        _ = process.wait(timeout=LauncherHangGuard('test_the_watcher_leaves_with_its_server').remaining())
         self.assertFalse(calls.exists())
 
     def test_a_worker_keeps_its_server_port_until_its_launcher_lets_go(self) -> None:
@@ -14500,7 +14869,7 @@ class ServerRecordTests(unittest.TestCase):
         self.assertEqual([stale_pid, live_pid], [each.pid for each in self.spawned])
         for process in self.spawned:
             self.assertIsNotNone(
-                process.wait(timeout=5), f"app-server {process.pid} outlived stop"
+                process.wait(timeout=LauncherHangGuard('test_stop_reaps_the_retired_server_as_well_as_the_live_one').remaining()), f"app-server {process.pid} outlived stop"
             )
         self.assertFalse((self.session_dir / codex_mesh.RETIRED_FILE).exists())
         self.assertFalse((self.session_dir / codex_mesh.SERVER_FILE).exists())

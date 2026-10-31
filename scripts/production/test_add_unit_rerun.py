@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import io
 import subprocess
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 from scripts.production.add_unit_test_support import AddUnitTestCase, configure_test_zone
@@ -14,6 +15,7 @@ import unit_lookup
 import sessions
 import resume_unit
 import retire_unit
+import atomic_file
 from production_units import read_production
 
 
@@ -128,7 +130,16 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertFalse((self.checkout / ".git/add-unit-openings/alpha-unit.json").exists())
 
     def test_interrupted_brief_stub_publish_reruns_with_the_whole_source(self) -> None:
-        with patch("atomic_file.os.fsync", side_effect=OSError("full disk")):
+        write = atomic_file.write_text_atomic
+
+        def interrupted_stub(path: Path, text: str) -> None:
+            if "## Source\n\n" in text and "Keep every source word." in text:
+                with patch("atomic_file.os.fsync", side_effect=OSError("full disk")):
+                    write(path, text)
+            else:
+                write(path, text)
+
+        with patch.object(add_unit, "write_text_atomic", side_effect=interrupted_stub):
             stopped = self.cli("alpha", "--brief", "Keep every source word.")
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         # Locate by its content after the rerun, without relying on the stub naming rule.
@@ -141,7 +152,16 @@ class AddUnitRerunTests(AddUnitTestCase):
 
     def test_interrupted_row_publish_preserves_other_units_and_rerun_commits_row(self) -> None:
         original = self.doc.read_bytes()
-        with patch("atomic_file.os.replace", side_effect=OSError("stopped before publish")):
+        write = atomic_file.write_text_atomic
+
+        def interrupted_row(path: Path, text: str) -> None:
+            if path == self.doc:
+                with patch("atomic_file.os.replace", side_effect=OSError("stopped before publish")):
+                    write(path, text)
+            else:
+                write(path, text)
+
+        with patch.object(add_unit, "write_text_atomic", side_effect=interrupted_row):
             stopped = self.cli("alpha", "--plan", "docs/plans/given.md")
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         self.assertEqual(self.doc.read_bytes(), original)
