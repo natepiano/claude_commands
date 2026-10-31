@@ -28,6 +28,7 @@ else:
 import record as recorder
 import sample
 import store
+from cgroup_test_support import CPU, IO_LINES, save_scope_counters, write_cgroup
 # Hang guards allow for load 136 on natedev (2026-10-29).
 TEST_HANG_GUARD_SECS = 300
 
@@ -188,6 +189,31 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(row["idle_targets"], targets)
         self.assertIsInstance(row["id"], str)
 
+    def test_queue_priority_events_keep_action_and_user_scope_in_the_build_log(self) -> None:
+        at = float(START)
+        for offset, action in enumerate(("set", "set", "clear")):
+            recorder.queue_priority(action, "resources", "finish the queue", "showrunner-id", at + offset)
+        rows = self.records()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([row["action"] for row in rows], ["set", "set", "clear"])
+        for offset, row in enumerate(rows):
+            self.assertEqual((row["kind"], row["v"], row["host"], row["at"]),
+                ("queue_priority", recorder.RECORD_VERSION, store.host_name(), store.utc_iso(at + offset)))
+            self.assertEqual((row["unit"], row["why"], row["set_by"]),
+                ("resources", "finish the queue", "showrunner-id"))
+            self.assertNotIn("until", row)
+            self.assertIsInstance(row["id"], str)
+        self.assertEqual(len({row["id"] for row in rows}), 3)
+
+    def test_retried_priority_event_keeps_its_transition_id_and_one_row(self) -> None:
+        for action in ("set", "clear"):
+            for attempt in range(2):
+                recorder.queue_priority(action, "resources", "retry", "showrunner-id",
+                    START + attempt, transition_id=f"priority-{action}")
+        rows = self.records()
+        self.assertEqual([row["action"] for row in rows], ["set", "clear"])
+        self.assertEqual([row["id"] for row in rows], ["priority-set", "priority-clear"])
+        self.assertTrue(all(row["at"] == store.utc_iso(START) for row in rows))
 
     def handoff(self) -> Path:
         path = self.base / "handoff.log"
@@ -232,6 +258,32 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(gzip.decompress((self.root / str(log)).read_bytes()), (TESTDATA / "nextest.txt").read_bytes())
         self.assertFalse(handoff.exists())
         self.assertFalse(peak.exists())
+
+    def test_scope_capture_records_cpu_and_optional_io_before_scope_disappears(self) -> None:
+        for with_io in (False, True):
+            with self.subTest(with_io=with_io):
+                scope = self.base / f"scope-{with_io}"
+                write_cgroup(scope, with_io=with_io)
+                peak = self.peak_file().rename(self.base / f"peak-{with_io}")
+                sidecar = Path(str(peak) + ".cgroup")
+                _ = sidecar.write_text(str(scope) + "\n")
+                captured = save_scope_counters(peak, scope)
+                self.assertEqual(captured.returncode, 0, captured.stderr)
+                sidecar.unlink()
+                shutil.rmtree(scope)
+                row = self.step(0, "0", "", str(peak), SWEEP)
+                resources = cast(Record, row["scope_resources"])
+                self.assertEqual(resources["cpu"], CPU)
+                io = cast(Record, resources["io"])
+                if with_io:
+                    self.assertEqual(io["state"], "measured")
+                    devices = cast(list[Record], io["devices"])
+                    self.assertEqual([device["raw"] for device in devices], list(IO_LINES))
+                else:
+                    self.assertEqual(io, {"state": "unavailable"})
+                self.assertFalse(Path(str(peak) + ".resources").exists())
+                self.assertFalse(Path(str(peak) + ".cpu.stat").exists())
+                self.assertFalse(Path(str(peak) + ".io.stat").exists())
 
     def test_step_records_cgroup_memory_stall_seconds(self) -> None:
         peak = self.base / "peak-pressure"

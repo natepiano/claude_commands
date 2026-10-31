@@ -264,7 +264,7 @@ class UnitWatchdogTests(unittest.TestCase):
                   folder, target / ".claude.json", folder)) as trust,
               patch.object(stop_resume, "resume", return_value=stop_resume.ResumeFailed("alpha", "never started"))):
             self.assertEqual(self.shared_move(["alpha"], "claude2", why="account move"),
-                             [stop_resume.ResumeFailed("alpha", "never started")])
+                             [stop_resume.ResumePending("alpha", "claude2", "never started")])
         trust.assert_called_once_with(folder, target, accounts.account_dir("claude4"), dry_run=True)
         self.assertFalse(pane_record.read("shared")["alpha"].get("ended", False))
         for minute in (0, 2, 4):

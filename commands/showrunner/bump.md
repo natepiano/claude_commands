@@ -15,7 +15,7 @@ it changes, and say so in one line.
 
 ## Steps
 
-1. **Top priority at once.** Make the work the whole production's top priority.
+1. **Top priority at once.** The user can type `/build:queue bump <unit>` in the showrunner session. For a specific reason, run `~/.claude/scripts/lib/py ~/.claude/scripts/lint/memory_admit.py priority set --unit <unit> --why "<what>"`; a second urgent request replaces the live priority at once. Make the work the whole production's top priority.
    Log it in `LOG` as `bump: <unit> <what>`. Tell every other unit director in
    one line: the bumped unit's merge goes first, and a build hold may come. Do
    not wait for the next update tick.
@@ -40,7 +40,7 @@ it changes, and say so in one line.
    an export of the tip for the `~/.claude` repo. A red test goes to the owning
    unit as a follow-up checkpoint, and it stays the top priority until the
    tip is green.
-5. **Tell the user.** When the demo build is installed, tell the user what to
+5. **Tell the user.** Run `~/.claude/scripts/lib/py ~/.claude/scripts/lint/memory_admit.py priority clear`. When the demo build is installed, tell the user what to
    run and where, in one line, and send a `note` (<Notify/>). Then log
    `bump done: <unit>`, and the production goes back to its normal order.
 
@@ -49,5 +49,4 @@ it changes, and say so in one line.
 - A bump never skips the Change-Review line, the overlap check with other
   units, or the design check of <MergeCheckpoint/>. It skips only the full
   suite before the merge.
-- One bump at a time. A second urgent request waits for the first one's demo
-  build. Tell the user its place in one line.
+- A second urgent request replaces the live queue priority at once.

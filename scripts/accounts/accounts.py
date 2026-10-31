@@ -3049,11 +3049,14 @@ class SessionMoveRefused:
     reason: str
 
 
+SessionMoveOutcome = stop_results.ClaudeUp | stop_results.MoveHandedOff | stop_results.ResumePending | SessionMoveRefused
+
+
 class SessionBatchMove(Protocol):
     def __call__(self, sessions: list[str], target: str, *, why: str) -> list[stop_results.MoveResult]: ...
 
 
-def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_results.ClaudeUp | stop_results.MoveHandedOff | SessionMoveRefused, ...]:
+def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[SessionMoveOutcome, ...]:
     """Stop and resume each selected local owner through the shared move API."""
 
     if TYPE_CHECKING:
@@ -3070,20 +3073,17 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_
     eligible: list[str] = []
     for identity in selected:
         matches = [item for item in live if item.session_id == identity]
-        if len(matches) != 1:
-            reason = "session is not live on this machine" if not matches else "session has several live processes"
-            refused[identity] = SessionMoveRefused(identity, reason)
-        elif matches[0].kind == "worker":
+        if len(matches) > 1:
+            refused[identity] = SessionMoveRefused(identity, "session has several live processes")
+        elif matches and matches[0].kind == "worker":
             refused[identity] = SessionMoveRefused(identity, "workers move with their unit director")
-        elif matches[0].login.casefold() == checked.destination.login.casefold():
-            refused[identity] = SessionMoveRefused(identity, "already on " + checked.destination.label)
         else:
             eligible.append(identity)
-    outcomes: dict[str, stop_results.ClaudeUp | stop_results.MoveHandedOff | SessionMoveRefused] = dict(refused)
+    outcomes: dict[str, SessionMoveOutcome] = dict(refused)
     batch = cast(SessionBatchMove, import_module("scripts.shutdown.stop_resume").move_sessions)
     results = batch(eligible, checked.destination.label, why=why)
     for identity, result in zip(eligible, results):
-        if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff)):
+        if isinstance(result, (stop_results.ClaudeUp, stop_results.MoveHandedOff, stop_results.ResumePending)):
             outcomes[identity] = result
         else:
             reason = ("session has no tab on this machine" if isinstance(result, stop_results.SessionNotFound)
@@ -3092,10 +3092,12 @@ def move_sessions(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_
     return tuple(outcomes[identity] for identity in selected)
 
 
-def move_result_line(result: stop_results.ClaudeUp | stop_results.MoveHandedOff | SessionMoveRefused) -> str:
+def move_result_line(result: SessionMoveOutcome) -> str:
     if isinstance(result, SessionMoveRefused):
         return f"{result.session_id}: not moved: {result.reason}"
 
+    if isinstance(result, stop_results.ResumePending):
+        return f"{result.session_id}: stopped, resume pending: {next(iter(result.reason.splitlines()), 'unknown error')}"
     if isinstance(result, stop_results.MoveHandedOff):
         return f"{result.session_id}: moving now"
     return stop_results.claude_up_line(result)
@@ -3201,17 +3203,17 @@ def move_preview_line(member: ListedSession, target: str) -> str:
     return f"{member.name}: {member.session_id} · stop, then resume on {target} (from {session_account_label(member)})"
 
 
-def _move_output(results: tuple[stop_results.ClaudeUp | stop_results.MoveHandedOff | SessionMoveRefused, ...],
+def _move_output(results: tuple[SessionMoveOutcome, ...],
                  notices: tuple[str, ...]) -> tuple[str, str, int]:
-    stdout = "".join(line + "\n" for line in notices)
+    stdout = "" if results else "".join(line + "\n" for line in notices)
     stderr = ""
     for result in results:
-        line = move_result_line(result) + "\n"
-        if isinstance(result, SessionMoveRefused):
+        line = move_result_line(result) + ("; " + "; ".join(notices) if notices else "") + "\n"
+        if isinstance(result, (SessionMoveRefused, stop_results.ResumePending)):
             stderr += line
         else:
             stdout += line
-    return stdout, stderr, int(any(isinstance(item, SessionMoveRefused) for item in results))
+    return stdout, stderr, int(any(isinstance(item, (SessionMoveRefused, stop_results.ResumePending)) for item in results))
 
 
 @role_map.role_map_command
@@ -3288,14 +3290,19 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         if not matches:
             matches = [item for item in live if item.name == session]
         if not matches:
-            return MoveRefused(f"no live session by id or name {session} on this machine; a session on the other machine moves from there")
+            if dry_run:
+                return MoveDryRun(session, (f"{session}: would resume on {target} if its saved tab is local",))
+            results = move_sessions((session,), target, why=why or "finish account move")
+            stdout, stderr, code = _move_output(results, ())
+            outcome = MoveStartFailed if code else MoveStarted
+            return outcome(session, target, stdout, stderr, code)
         if len(matches) != 1:
             return MoveRefused(f"{session} names multiple live sessions: " + ", ".join(item.session_id for item in matches))
         owner = matches[0]
         if owner.kind == "worker":
             return MoveRefused("workers move with their unit director")
         group = session_group(owner)
-        if group != "ungrouped":
+        if group != "ungrouped" and not session_on_account(owner, target):
             return MoveRefused(f"{owner.name} belongs to {group}; in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move {group} {target}")
         if session_on_account(owner, target):
             line = f"{owner.name} is already on {checked.destination.label}"

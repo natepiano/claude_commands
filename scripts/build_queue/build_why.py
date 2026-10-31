@@ -215,7 +215,7 @@ def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
     lines.extend(("", f"First in line: {identity.showrunner} / {identity.unit} / {identity.session}, "
         + f"{head.waiter.step}; waiting {build_queue.age(head.waiter.since, explanation.now)} min; "
         + f"need {gib(head.waiter.need)}; {need_text(head.need_source)}",
-        head_facts.head_time_text(facts, zone), head_facts.bump_text(facts, zone)))
+        head_facts.bump_text(facts, zone)))
     bumps = [[build_queue.field(cell) for cell in row] for row in head_facts.bump_rows(facts, zone, labels)]
     if bumps:
         lines.extend(aligned_table(("Step", "Session", "Folder", "Bumps", "By", "Last bump"), bumps, frozenset((3,))))

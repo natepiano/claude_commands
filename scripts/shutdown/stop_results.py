@@ -55,7 +55,15 @@ class SessionNotFound:
     name: str
 
 
-MoveResult = ClaudeUp | MoveHandedOff | StopFailed | ResumeFailed | SessionNotFound
+@dataclass(frozen=True)
+class ResumePending:
+    """The move has stopped its Claude; the saved launch can finish on rerun."""
+    session_id: str
+    account: str
+    reason: str
+
+
+MoveResult = ClaudeUp | MoveHandedOff | StopFailed | ResumeFailed | ResumePending | SessionNotFound
 DownResult = Stopped | NotRunning | DownHandedOff | StopFailed | SessionNotFound
 
 

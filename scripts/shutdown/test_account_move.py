@@ -177,9 +177,27 @@ class AccountMoveTests(ShutdownTestCase):
         move.assert_not_called()
 
 
-    def test_move_refuses_a_session_absent_from_this_machines_live_registry_without_change(self) -> None:
-        with patch.object(sessions, "live_sessions", return_value=[]):
-            self.refuses_without_change("no live session", session="remote-only")
+    def test_move_absent_from_live_registry_reaches_the_saved_tab_boundary(self) -> None:
+        with (patch.object(sessions, "live_sessions", return_value=[]),
+              patch.object(stop_resume, "move_sessions", return_value=[stop_resume.SessionNotFound("remote-only")]) as moved):
+            status, output, error = self.cli(session="remote-only")
+        self.assertEqual((status, output), (1, ""))
+        self.assertIn("no tab on this machine", error)
+        moved.assert_called_once_with(["remote-only"], "claude3", why="finish account move")
+
+    def test_stopped_move_keeps_pending_outcome_then_rerun_reaches_resume(self) -> None:
+        with (patch.object(inventory, "listing", return_value=[]),
+              patch.object(stop_resume, "move_sessions", side_effect=[
+                  [stop_resume.ResumePending("move-id", "claude3", "registry unreadable")],
+                  [stop_resume.ClaudeUp("move-id", "w1:p1", "claude3")]]) as moved):
+            status, output, error = self.cli()
+            self.assertEqual((status, output), (1, ""))
+            self.assertEqual(error, "move-id: stopped, resume pending: registry unreadable\n")
+            self.assertNotIn("not moved", error)
+            status, output, error = self.cli()
+        self.assertEqual((status, error), (0, ""))
+        self.assertEqual(output, "move-id: Claude is up on claude3 in w1:p1 (0.0 s)\n")
+        self.assertEqual(moved.call_count, 2)
 
 
     def test_group_preview_starts_in_a_fresh_process_without_prior_shutdown_imports(self) -> None:
@@ -258,6 +276,12 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(error.getvalue(), "")
         move.assert_not_called()
 
+    def test_move_to_its_current_login_is_an_idempotent_success(self) -> None:
+        status, output, error = self.cli(target="claude1")
+        self.assertEqual((status, error), (0, ""))
+        self.assertEqual(len(output.splitlines()), 1)
+        self.assertIn("already on claude1", output)
+
 
     def test_retired_unit_swap_refuses_before_role_history_shutdown_or_process_changes(self) -> None:
         configuration = accounts.accounts_config_file()
@@ -329,10 +353,11 @@ class AccountMoveTests(ShutdownTestCase):
         self.assertEqual(shutdown_record.find_session(saved["login"], "move-id"), saved)
 
     def test_move_failure_prints_one_failure_line_without_a_follow_or_new_record(self) -> None:
-        self.moves.failures["move-id"] = "pane refused resume"
-        result, output, error = self.cli()
+        with patch.object(stop_resume, "move_sessions", return_value=[
+                stop_resume.ResumePending("move-id", "claude3", "pane refused resume")]):
+            result, output, error = self.cli()
         self.assertEqual(result, 1)
-        self.assertEqual(error, "move-id: not moved: pane refused resume\n")
+        self.assertEqual(error, "move-id: stopped, resume pending: pane refused resume\n")
         self.assertNotIn("follow", output + error)
         self.assertEqual(shutdown_record.all_session_records(), [])
 
@@ -364,12 +389,15 @@ class AccountMoveTests(ShutdownTestCase):
         base = self.current_listing()[0]
         members = [replace(base, session_id="failed"), replace(base, session_id="ok"), replace(base, session_id="worker", kind="worker")]
         self.moves.failures["failed"] = "stop refused"
-        with patch.object(inventory, "listing", return_value=members):
+        with (patch.object(inventory, "listing", return_value=members),
+              patch.object(stop_resume, "move_sessions", return_value=[
+                  stop_resume.StopFailed("failed", "stop refused"), stop_resume.ClaudeUp("ok", "w1:p1", "claude3"),
+                  stop_resume.SessionNotFound("missing")]) as batch):
             outcomes = accounts.move_sessions(("failed", "ok", "worker", "missing"), "claude3", why="retry")
-        self.assertEqual([call.session_id for call in self.moves.calls], ["failed", "ok"])
+        batch.assert_called_once_with(["failed", "ok", "missing"], "claude3", why="retry")
         self.assertEqual([accounts.move_result_line(item) for item in outcomes], [
             "failed: not moved: stop refused", "ok: Claude is up on claude3 in w1:p1 (0.0 s)",
-            "worker: not moved: workers move with their unit director", "missing: not moved: session is not live on this machine"])
+            "worker: not moved: workers move with their unit director", "missing: not moved: session has no tab on this machine"])
 
     def test_group_preview_and_empty_selection_do_not_move(self) -> None:
         with (patch.object(accounts, "live_group_members", return_value={"units": [], "showrunners": []}),
