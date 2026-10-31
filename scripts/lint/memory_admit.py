@@ -1143,14 +1143,13 @@ class QueueBusy:
 
 @dataclass(frozen=True)
 class QueueInputs:
-    """All resolved evidence for a queue decision; independent of the reader's host."""
+    """Queue evidence without configuration; limits are resolved by each reader."""
     ordered: list[tuple[Path, Waiter]]
     running: tuple[RunningStep, ...]
     reservations: tuple[Reservation, ...]
     host: HostMemory | ReadingUnavailable
     pressure: Pressure
     recovery: RecoverySpacing
-    limits: AdmissionLimits
     override: HeadAdmissionOverride | NoHeadAdmissionOverride
     now: float
     priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
@@ -3221,8 +3220,7 @@ def gather_queue_inputs(directory: Path, processes: dict[int, ProcessIdentity], 
         row["session_id"], row["session_name"] = identity["session_id"], identity["session_name"]
         row["step"], row["folder"] = identity["step"], identity["folder"]
     ordered, priority = resolve_queue_order(directory, rows, readings=readings)
-    limits = resolve_admission_limits(host.total if isinstance(host, HostMemory) else UnknownHostTotal())
-    return QueueInputs(ordered, tuple(running), tuple(reservations), host, pressure, recovery, limits,
+    return QueueInputs(ordered, tuple(running), tuple(reservations), host, pressure, recovery,
                        snapshot_head_override(read_head_override(directory), ordered), now, priority)
 
 
@@ -3243,7 +3241,7 @@ def decision_checks(decision: AdmissionDecision, need: int, available: int) -> t
             FreeCheck(available, need, decision.reserve, decision.promised, decision.threshold, decision.free_passes))
 
 
-def queue_read_from(inputs: QueueInputs) -> QueueRead:
+def queue_read_from(inputs: QueueInputs, limits: AdmissionLimits) -> QueueRead:
     """Apply admission to resolved evidence, with no file, process or environment reads."""
     ordered, running, reservations, now = inputs.ordered, inputs.running, inputs.reservations, inputs.now
     memory = [step.measured for step in running]
@@ -3251,7 +3249,7 @@ def queue_read_from(inputs: QueueInputs) -> QueueRead:
     unavailable = isinstance(inputs.host, ReadingUnavailable)
     host = inputs.host if isinstance(inputs.host, HostMemory) else HostMemory(0, UnknownHostTotal())
     available, total = host.available, host.total
-    recovery, override, limits = inputs.recovery, inputs.override, inputs.limits
+    recovery, override = inputs.recovery, inputs.override
     pressure = pressure_with_recovery(recovery, inputs.pressure, now)
     explained: list[ExplainedRunningStep] = []
     reservation_index = 0
@@ -3324,8 +3322,13 @@ def queue_read_from(inputs: QueueInputs) -> QueueRead:
 
 
 
+def _queue_read_live(inputs: QueueInputs) -> QueueRead:
+    limits = resolve_admission_limits(inputs.host.total if isinstance(inputs.host, HostMemory) else UnknownHostTotal())
+    return queue_read_from(inputs, limits)
+
+
 def read_queue_pass(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> QueueRead:
-    return queue_read_from(gather_queue_inputs(directory, processes, now))
+    return _queue_read_live(gather_queue_inputs(directory, processes, now))
 
 
 def read_queue(directory: Path, processes: dict[int, ProcessIdentity], now: float) -> tuple[QueueView, list[tuple[Path, Waiter]]]:
@@ -3428,7 +3431,7 @@ def parse_snapshot_value(value: object, schema: object) -> object:
 
 def write_queue_snapshot(directory: Path, inputs: QueueInputs) -> None:
     """Publish a cache atomically under LOCK_EX; durability is deliberately unnecessary."""
-    encoded = json.dumps({"v": 1, "written_at": time.time(), "inputs": snapshot_value(inputs)},
+    encoded = json.dumps({"v": 2, "written_at": time.time(), "inputs": snapshot_value(inputs)},
                          separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     temporary = directory / "queue.json.tmp"
     try:
@@ -3444,7 +3447,7 @@ def read_queue_snapshot(directory: Path) -> QueueSnapshot | NoQueueSnapshot:
         if not isinstance(raw, dict):
             return NoQueueSnapshot()
         envelope = cast(dict[str, object], raw)
-        if type(envelope.get("v")) is not int or envelope["v"] != 1:
+        if type(envelope.get("v")) is not int or envelope["v"] != 2:
             return NoQueueSnapshot()
         written_at = cast(float, parse_snapshot_value(envelope["written_at"], float))
         inputs = cast(QueueInputs, parse_snapshot_value(envelope["inputs"], QueueInputs))
@@ -3458,12 +3461,12 @@ def read_queue_snapshot(directory: Path) -> QueueSnapshot | NoQueueSnapshot:
 def queue_read() -> QueueRead | QueueBusy:
     snapshot = read_queue_snapshot(store.root() / "admission")
     if isinstance(snapshot, QueueSnapshot) and 0 <= time.time() - snapshot.written_at <= SNAPSHOT_MAX_AGE_SECONDS:
-        return queue_read_from(snapshot.inputs)
+        return _queue_read_live(snapshot.inputs)
     try:
         return locked_queue_read(timeout=QUEUE_READ_LOCK_SECONDS)
     except TimeoutError:
         if isinstance(snapshot, QueueSnapshot):
-            return replace(queue_read_from(snapshot.inputs), freshness=StaleReading(snapshot.written_at))
+            return replace(_queue_read_live(snapshot.inputs), freshness=StaleReading(snapshot.written_at))
         return QueueBusy()
 
 

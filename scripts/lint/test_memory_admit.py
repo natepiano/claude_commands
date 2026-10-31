@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import memory_admit as gate
+from memory_admit import _queue_read_live  # pyright: ignore[reportPrivateUsage]
 import nextest_budget as budget
 from build_shape import BuildShape, build_shape
 from memory_test_support import fake_memory_readings, gate_isolation_environment
@@ -5737,7 +5738,7 @@ class QueueExplanationTests(MemoryQueueFixture):
         self.assertIsInstance(reading, gate.QueueRead)
         assert isinstance(reading, gate.QueueRead)
         self.assertEqual(reading.freshness, gate.CurrentReading())
-        self.assertEqual(reading, gate.queue_read_from(snapshot.inputs))
+        self.assertEqual(reading, _queue_read_live(snapshot.inputs))
         return snapshot
 
     def test_check_generated_need_source_survives_publication_without_a_lock(self) -> None:
@@ -5754,7 +5755,7 @@ class QueueExplanationTests(MemoryQueueFixture):
         self.assertIsInstance(compiler.measured, gate.CompilerServiceMemory)
         assert isinstance(compiler.measured, gate.CompilerServiceMemory)
         self.assertEqual((compiler.session_name, compiler.measured.bytes), ("sccache.service", 2 * GIB))
-        reading = gate.queue_read_from(snapshot.inputs)
+        reading = _queue_read_live(snapshot.inputs)
         assert isinstance(reading.explanation.head, gate.HeadExplanation)
         self.assertEqual(reading.explanation.head.decision.measured, 2 * GIB)
 
@@ -5800,10 +5801,13 @@ class QueueExplanationTests(MemoryQueueFixture):
                     with patch.object(gate, "resolve_admission_limits", wraps=gate.resolve_admission_limits) as resolve:
                         inputs = self.snapshot_inputs()
                         assert isinstance(inputs.host, gate.HostMemory)
+                        reading = _queue_read_live(inputs)
                         decision = gate.decide(inputs.host.available, inputs.host.total, GIB, [])
                     self.assertEqual(resolve.call_args_list,
                                      [mock.call(inputs.host.total), mock.call(inputs.host.total)])
-                    self.assertEqual(inputs.limits, gate.AdmissionLimits(decision.budget, decision.reserve))
+                    assert isinstance(reading.explanation.host, gate.HostAvailable)
+                    self.assertEqual((reading.explanation.host.budget, reading.explanation.host.reserve),
+                                     (decision.budget, decision.reserve))
 
     def test_check_release_and_width_publish_the_changed_ledger(self) -> None:
         self.readings[400] = gate.MeasuredMemory(GIB)
@@ -5865,9 +5869,34 @@ class QueueExplanationTests(MemoryQueueFixture):
         with patch.object(gate, "locked_queue_read", side_effect=AssertionError("fresh snapshot took lock")):
             actual = gate.queue_read()
         self.assertEqual(actual, expected)
-        self.assertEqual(actual, gate.queue_read_from(inputs))
+        self.assertEqual(actual, _queue_read_live(inputs))
         raw = cast(dict[str, object], json.loads((directory / "queue.json").read_text()))
-        self.assertEqual((raw["v"], raw["written_at"]), (1, NOW.timestamp()))
+        self.assertEqual((raw["v"], raw["written_at"]), (2, NOW.timestamp()))
+
+    def test_version_one_snapshot_is_absent_and_uses_the_locked_read(self) -> None:
+        directory = gate.admission_dir(self.root)
+        inputs = self.snapshot_inputs()
+        gate.write_queue_snapshot(directory, inputs)
+        path = directory / "queue.json"
+        raw = cast(dict[str, object], json.loads(path.read_text()))
+        raw["v"] = 1
+        _ = path.write_text(json.dumps(raw))
+        self.assertIsInstance(gate.read_queue_snapshot(directory), gate.NoQueueSnapshot)
+        expected = _queue_read_live(inputs)
+        with patch.object(gate, "locked_queue_read", return_value=expected) as locked:
+            self.assertEqual(gate.queue_read(), expected)
+        locked.assert_called_once_with(timeout=gate.QUEUE_READ_LOCK_SECONDS)
+
+    def test_gather_and_publication_never_resolve_or_store_limits(self) -> None:
+        directory = gate.admission_dir(self.root)
+        with patch.object(gate, "resolve_admission_limits", side_effect=AssertionError("gather resolved limits")):
+            inputs = self.snapshot_inputs()
+            gate.write_queue_snapshot(directory, inputs)
+        raw = cast(dict[str, object], json.loads((directory / "queue.json").read_text()))
+        encoded_inputs = cast(dict[str, object], raw["inputs"])
+        self.assertNotIn("limits", encoded_inputs)
+        self.assertNotIn("budget", encoded_inputs)
+        self.assertNotIn("reserve", encoded_inputs)
 
     def test_gather_reuses_supplied_memory_and_reads_only_missing_reservations(self) -> None:
         first = self.running(100, 6)
@@ -5879,29 +5908,30 @@ class QueueExplanationTests(MemoryQueueFixture):
         self.assertEqual([call.args[0] for call in read.call_args_list], [second])
         self.assertEqual([step.measured for step in inputs.running], [supplied, self.readings[200]])
 
-    def test_queue_read_from_uses_no_files_processes_or_reader_limits(self) -> None:
+    def test_queue_read_from_uses_only_explicit_limits_without_io(self) -> None:
         _ = self.running(100, 6)
         _ = self.waiting(300, 12 * GIB, 20)
         _ = self.waiting(400, GIB, 5)
         inputs = self.snapshot_inputs()
-        expected = gate.queue_read_from(inputs)
+        limits = gate.resolve_admission_limits(60 * GIB)
+        expected = gate.queue_read_from(inputs, limits)
         with patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "1", "BUILDLOG_PROC": "/absent"}), \
              patch.object(Path, "open", side_effect=AssertionError("pure read opened file")), \
              patch.object(Path, "read_text", side_effect=AssertionError("pure read read file")), \
              patch.object(gate, "process_table", side_effect=AssertionError("pure read scanned processes")), \
              patch.object(gate, "read_pressure", side_effect=AssertionError("pure read measured pressure")), \
              patch.object(gate, "read_recovery", side_effect=AssertionError("pure read read recovery")):
-            self.assertEqual(gate.queue_read_from(inputs), expected)
+            self.assertEqual(gate.queue_read_from(inputs, limits), expected)
         gate.write_queue_snapshot(gate.admission_dir(self.root), inputs)
         with patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "1"}), \
              patch.object(gate, "locked_queue_read", side_effect=AssertionError("fresh snapshot took lock")):
-            self.assertEqual(gate.queue_read(), expected)
+            self.assertEqual(gate.queue_read(), _queue_read_live(inputs))
 
     def test_snapshot_age_boundary_and_invalid_cache_take_the_bounded_read(self) -> None:
         _ = self.waiting(300, 12 * GIB, 20)
         directory = gate.admission_dir(self.root)
         inputs = self.snapshot_inputs()
-        expected = gate.queue_read_from(inputs)
+        expected = _queue_read_live(inputs)
         for age in (0.0, 10.0, 10.1, -0.1):
             with self.subTest(age=age):
                 gate.write_queue_snapshot(directory, inputs)
@@ -5948,7 +5978,7 @@ class QueueExplanationTests(MemoryQueueFixture):
                 if cache in ("stale", "future"):
                     assert isinstance(actual, gate.QueueRead)
                     self.assertEqual(actual.freshness, gate.StaleReading(NOW.timestamp()))
-                    self.assertEqual(actual.view, gate.queue_read_from(inputs).view)
+                    self.assertEqual(actual.view, _queue_read_live(inputs).view)
                 else:
                     self.assertIsInstance(actual, gate.QueueBusy)
 
@@ -5968,14 +5998,14 @@ class QueueExplanationTests(MemoryQueueFixture):
             self.assertEqual(Path(source), directory / "queue.json.tmp")
             self.assertEqual(Path(destination), directory / "queue.json")
             self.assertEqual((directory / "queue.json").read_bytes(), old)
-            self.assertEqual(gate.queue_read(), gate.queue_read_from(inputs))
+            self.assertEqual(gate.queue_read(), _queue_read_live(inputs))
             publications.append(Path(source).read_bytes())
             replace_file(source, destination)
         with patch.object(os, "replace", side_effect=publish):
             gate.write_queue_snapshot(directory, newer)
         self.assertEqual(len(publications), 1)
         self.assertEqual((directory / "queue.json").read_bytes(), publications[0])
-        self.assertEqual(gate.queue_read(), gate.queue_read_from(newer))
+        self.assertEqual(gate.queue_read(), _queue_read_live(newer))
 
     def test_snapshot_keeps_raw_recovery_and_admits_only_one_when_start_is_due(self) -> None:
         _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
@@ -5997,7 +6027,7 @@ class QueueExplanationTests(MemoryQueueFixture):
         _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
         _ = self.waiting(300, 15 * GIB, 1)
         _ = self.waiting(400, 10 * GIB, 0)
-        reading = gate.queue_read_from(self.snapshot_inputs())
+        reading = _queue_read_live(self.snapshot_inputs())
         head = reading.explanation.head
         assert isinstance(head, gate.HeadExplanation)
         follower = reading.explanation.line.steps[0]
@@ -6014,7 +6044,7 @@ class QueueExplanationTests(MemoryQueueFixture):
     def test_waiter_and_running_identity_matching_and_place_boundaries(self) -> None:
         _ = self.waiting(300, 12 * GIB, 20)
         _ = self.waiting(400, GIB, 5)
-        view = gate.queue_read_from(self.snapshot_inputs()).view
+        view = _queue_read_live(self.snapshot_inputs()).view
         for selector, places in (("1", [1]), ("2", [2]), ("0", []), ("3", []),
                                  ("session-400", [2]), ("worker-400", [2]),
                                  ("/tmp/tree-400", [2]), ("tree-400", [2]), ("missing", [])):
