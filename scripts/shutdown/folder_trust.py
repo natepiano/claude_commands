@@ -38,7 +38,7 @@ def heal(folder: Path, target_dir: Path, source_dir: Path, *, dry_run: bool = Fa
                                        accounts.trust_sources(target_dir, source_dir), dry_run=dry_run)
     if isinstance(trust, (herdr.Trusted, herdr.TrustCopied)):
         return trust
-    command = accounts.trust_command(folder, accounts.NamedAccount(target_dir.name.removeprefix("."), target_dir))
+    command = accounts.trust_command(folder, accounts.NamedAccount(accounts.claude_config_label(target_dir), target_dir))
     if isinstance(trust, herdr.UnreadableTrustFile):
         return FolderTrustUnreadable(str(trust), command)
     return FolderNotTrusted(f"{folder}: Claude has not trusted this folder", command)

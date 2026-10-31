@@ -755,8 +755,8 @@ def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str
         selected = accounts.account_for_group_launch(role, resume=True, target=target)
         target = selected.label
     if not target:
-        number = re.fullmatch(r"\.claude([1-9][0-9]*)", config_dir.name)
-        if number is None or config_dir != accounts.account_dir("claude" + number.group(1)):
+        label = accounts.claude_config_label(config_dir)
+        if re.fullmatch(r"claude[1-9][0-9]*", label) is None or config_dir != accounts.account_dir(label):
             raise accounts.AccountsError("shutdown record must name a numbered Claude account folder")
     account: RetainResumeAccount | MoveResumeAccount = (
         MoveResumeAccount(target) if target else RetainResumeAccount(config_dir)
@@ -1102,9 +1102,11 @@ class FolderNotTrusted(OSError):
 
 def _heal_folder_trust(session: Session, folder: Path, config_dir: Path, *, dry_run: bool) -> None:
     """Adapt the shared trust result to recorded restart's reporting and failure storage."""
+    from scripts.accounts import accounts
+
     recorded = session.get("config_dir")
     trust = folder_trust.heal(folder, config_dir, Path(recorded) if recorded else config_dir, dry_run=dry_run)
-    target = config_dir.name.removeprefix(".")
+    target = accounts.claude_config_label(config_dir)
     if isinstance(trust, herdr.TrustCopied):
         copied = "would copy" if dry_run else "copied"
         print(f"{session['name']}: {copied} folder trust for {folder} from {trust.source} to {target}")

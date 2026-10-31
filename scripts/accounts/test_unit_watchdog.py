@@ -338,6 +338,73 @@ class UnitWatchdogTests(unittest.TestCase):
         self.die("alpha")
         return unit_watchdog._sources()[("fixture", "alpha")]  # pyright: ignore[reportPrivateUsage]
 
+    def test_newest_moved_launch_decides_recovery_account_after_one_tick(self) -> None:
+        _ = self.add_unit("alpha")
+        old = pane_record.read("shared")["alpha"]
+        old["written_at"] = "2026-10-30T01:00:00+00:00"
+        pane_record.write("shared", old)
+        moved = pane_record.launch("new-alpha", "alpha", old["cwd"],
+            {"CLAUDE_CONFIG_DIR": str(accounts.account_dir("claude2")), "SHOWRUNNER_UNIT": "fixture",
+             "SHOWRUNNER_UNIT_ID": "alpha"}, ["claude", "-n", "alpha"])
+        pane_record.write("shared", moved)
+        self.die("alpha")
+        self.assertEqual(pane_record.launch_for_session("alpha"), moved)
+        self.assertEqual(self.pass_at(0), [])
+        self.assertEqual(self.pending, [])
+        self.assertEqual(unit_watchdog._read_state()["alpha"]["first_seen"], NOW.isoformat())  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(self.pass_at(2), [])
+        self.assertEqual(len(self.pending), 1)
+        self.assertEqual(self.pending[0][self.pending[0].index("--recover") + 1], "claude2")
+        _ = self.pass_at(4)
+        self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude2", "--only", "alpha"]])
+
+    def test_bad_launch_beside_crashed_unit_does_not_stop_recovery(self) -> None:
+        for failure in (OSError("launch unreadable"), ValueError("launch invalid")):
+            with self.subTest(failure=type(failure).__name__):
+                _ = self.add_unit("bad")
+                _ = self.add_unit("alpha")
+                self.die("bad", "alpha")
+                original = pane_record.launch_for_session
+
+                def launch(identity: str) -> pane_record.PaneLaunch | None:
+                    if identity == "bad":
+                        raise failure
+                    return original(identity)
+
+                with patch.object(pane_record, "launch_for_session", side_effect=launch):
+                    first = self.pass_at(0)
+                    self.assertTrue(any("bad" in line and str(failure) in line for line in first), first)
+                    self.assertIn("alpha", unit_watchdog._read_state())  # pyright: ignore[reportPrivateUsage]
+                    self.assertEqual(self.pending, [])
+                    _ = self.pass_at(2)
+                    self.assertEqual(len(self.pending), 1)
+                    self.assertEqual(self.pending[0][self.pending[0].index("--recover") + 2], "alpha")
+                    _ = self.pass_at(4)
+                self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
+                self.commands.clear()
+                unit_watchdog._state_file().unlink(missing_ok=True)  # pyright: ignore[reportPrivateUsage]
+
+    def test_bad_unit_observation_does_not_skip_later_units_in_the_production(self) -> None:
+        _ = self.add_unit("bad")
+        _ = self.add_unit("alpha")
+        self.die("bad", "alpha")
+        original = unit_lookup.RunStates.state
+
+        def state(runs: unit_lookup.RunStates, worktree: Path) -> unit_lookup.UnitState:
+            if worktree.name == "bad":
+                raise ValueError("unit run state unreadable")
+            return original(runs, worktree)
+
+        with patch.object(unit_lookup.RunStates, "state", autospec=True, side_effect=state):
+            first = self.pass_at(0)
+            self.assertIn("watchdog: fixture/bad: unit run state unreadable", first)
+            self.assertIn("alpha", unit_watchdog._read_state())  # pyright: ignore[reportPrivateUsage]
+            self.assertEqual(self.pending, [])
+            _ = self.pass_at(2)
+            self.assertEqual(len(self.pending), 1)
+            _ = self.pass_at(4)
+        self.assertEqual(self.commands, [["resume", "alpha", "--to", "claude4", "--only", "alpha"]])
+
 
     def test_queued_recovery_uses_the_pane_launch_account(self) -> None:
         source = self.queued_unit()
@@ -541,7 +608,7 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertEqual(live.call_count, 2)
         self.assertEqual(result.read_text(), '"fixture evidence"')
         self.assertEqual(unit_watchdog._read_state(), state)  # pyright: ignore[reportPrivateUsage]
-        self.assertIn("watchdog: fixture: fixture unreadable", lines)
+        self.assertIn("watchdog: fixture/unit: fixture unreadable", lines)
         self.assertFalse(any("restarted on" in line or "retry from" in line for line in [*lines, *self.notices]))
         self.assertEqual(len(self.pending), 1)
         cleared.assert_not_called()
@@ -649,7 +716,7 @@ class UnitWatchdogTests(unittest.TestCase):
 
         with patch.object(Path, "unlink", remove):
             lines = self.pass_at(3)
-            self.assertIn("watchdog: fixture: fixture result cleanup denied", lines)
+            self.assertIn("watchdog: fixture/unit: fixture result cleanup denied", lines)
             self.assertTrue(result.exists())
             after_failure = unit_watchdog._read_state()["unit"]  # pyright: ignore[reportPrivateUsage]
             self.assertIn("job", after_failure)

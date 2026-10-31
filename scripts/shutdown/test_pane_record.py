@@ -65,6 +65,20 @@ class PaneRecordTests(unittest.TestCase):
     def entries(self) -> dict[str, dict[str, object]]:
         return cast(dict[str, dict[str, object]], json.loads((self.records / "agents.json").read_text()))
 
+    def test_moved_session_uses_newest_launch_across_accounts_and_record_files(self) -> None:
+        old = pane_record.launch("old-pane", "moved", "/old", {"CLAUDE_CONFIG_DIR": "/accounts/.claude4"},
+                                 ["claude", "-n", "old", "--model", "opus"])
+        old["written_at"] = "2026-10-31T01:00:00+00:00"
+        newest = pane_record.launch("new-pane", "moved", "/new", {"CLAUDE_CONFIG_DIR": "/accounts/.claude2"},
+                                    ["claude", "-n", "new", "--model", "sonnet"])
+        newest["written_at"] = "2026-10-31T02:00:00+00:00"
+        newest["ended"] = True
+        with mock.patch.object(pane_record, "RECORD_DIR", self.records):
+            pane_record.write("first", newest)
+            pane_record.write("last", old)
+            self.assertEqual(pane_record.launch_for_session("moved"), newest)
+            self.assertIsNone(pane_record.launch_for_session("absent"))
+
     def test_seed_process_info_reads_only_selected_panes_and_defaults_to_all(self) -> None:
         client = FakeClient([{"pane_id": pane, "workspace_id": "w1"} for pane in ("w1:p1", "w1:p2", "w2:p1")])
         original = client.result

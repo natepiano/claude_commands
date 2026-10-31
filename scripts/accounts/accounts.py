@@ -619,6 +619,14 @@ def account_dir(label: str) -> Path:
     return accounts_home() / f".claude{parsed.number}"
 
 
+def claude_config_label(config_dir: Path) -> str:
+    """The launch folder's account label, retaining legacy and custom folder names.
+
+    This names a folder without reading its login or validating it as a numbered account.
+    """
+    return config_dir.name.removeprefix(".")
+
+
 def codex_setup_home(label: str) -> Path:
     parsed = note_file.parse_account_label(label)
     if not isinstance(parsed, note_file.NumberedAccountLabel) or parsed.tool != "codex":
@@ -1631,7 +1639,7 @@ def trust_sources(target_dir: Path, source_dir: Path | None) -> list[tuple[str, 
     `herdr.heal_claude_trust` copies a folder's trust from the first of them that has it.
     """
     home = (accounts_home() / ".claude").resolve()
-    candidates = [NamedAccount(source_dir.name.removeprefix("."), source_dir)] if source_dir is not None else []
+    candidates = [NamedAccount(claude_config_label(source_dir), source_dir)] if source_dir is not None else []
     candidates.extend(_existing_named_accounts())
     sources: dict[Path, tuple[str, Path]] = {}
     for named in candidates:
@@ -3642,9 +3650,9 @@ def _existing_named_accounts() -> list[NamedAccount]:
         return []
     accounts: list[NamedAccount] = []
     for child in children:
-        match = re.fullmatch(r"\.claude([1-9][0-9]*)", child.name)
-        if match is not None:
-            accounts.append(NamedAccount(note_file.NumberedAccountLabel("claude", int(match.group(1))).label, child))
+        label = claude_config_label(child)
+        if child.name.startswith(".") and re.fullmatch(r"claude[1-9][0-9]*", label):
+            accounts.append(NamedAccount(label, child))
     return sorted(accounts, key=lambda account: _label_number(account.label))
 
 

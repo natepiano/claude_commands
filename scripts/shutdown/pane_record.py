@@ -120,12 +120,10 @@ def launches() -> list[PaneLaunch]:
 
 
 def launch_for_session(session_id: str) -> PaneLaunch | None:
-    """Read a conversation's newest launch; refuse conflicting account attribution."""
+    """Read a conversation's newest launch, including account moves and intentional exits."""
     matches = [entry for entry in launches() if entry["session_id"] == session_id]
     if not matches:
         return None
-    if len({entry["config_dir"] for entry in matches if entry["config_dir"]}) > 1:
-        raise ValueError(f"session {session_id}: pane launches name several accounts")
     return max(matches, key=lambda entry: entry["written_at"])
 
 

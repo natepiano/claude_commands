@@ -9,6 +9,7 @@ import tempfile
 import time
 import uuid
 from copy import deepcopy
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from importlib import import_module
@@ -153,8 +154,9 @@ def _write_state(state: dict[str, DownOutage]) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
-def _sources() -> dict[tuple[str, str], RecoverySource]:
+def _sources(report_failure: Callable[[str], None] = lambda _message: None) -> dict[tuple[str, str], RecoverySource]:
     sources: dict[tuple[str, str], RecoverySource] = {}
+    newest: dict[tuple[str, str], pane_record.PaneLaunch] = {}
     for entry in sorted(pane_record.launches(), key=lambda item: item["written_at"]):
         marks = entry["environment"]
         unit, production = marks.get("SHOWRUNNER_UNIT_ID", ""), marks.get("SHOWRUNNER_UNIT", "")
@@ -162,15 +164,20 @@ def _sources() -> dict[tuple[str, str], RecoverySource]:
             continue
         key = (production, unit)
         # The newest launch also records an intentional /exit. It supersedes older entries.
-        _ = sources.pop(key, None)
+        newest[key] = entry
+    for key, entry in newest.items():
         if entry.get("ended", False):
             continue
-        conversation = unit_move.unit_conversation(None, session_id=entry["session_id"])
-        if isinstance(conversation, unit_move.NoUnitConversation):
-            continue
-        owner = RecoverableUnit(session_id=entry["session_id"], name=entry["name"] or unit,
-            cwd=entry["cwd"], unit=unit, production=production)
-        sources[key] = RecoverySource(owner, conversation.account, json.dumps(entry, sort_keys=True))
+        production, unit = key
+        try:
+            conversation = unit_move.unit_conversation(None, session_id=entry["session_id"])
+            if isinstance(conversation, unit_move.NoUnitConversation):
+                continue
+            owner = RecoverableUnit(session_id=entry["session_id"], name=entry["name"] or unit,
+                cwd=entry["cwd"], unit=unit, production=production)
+            sources[key] = RecoverySource(owner, conversation.account, json.dumps(entry, sort_keys=True))
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            report_failure(f"watchdog: {production}/{unit} session {entry['session_id']}: {error}")
     return sources
 
 
@@ -224,6 +231,8 @@ def _start_recovery(source: RecoverySource, job: RecoveryJob, timeout: float) ->
 
 @herdr.process_action()
 def _live_account(doc: Path, unit: str) -> str:
+    from scripts.accounts import accounts
+
     for found in live_units.production_units(doc):
         if found.unit != unit or found.session is None:
             continue
@@ -234,7 +243,7 @@ def _live_account(doc: Path, unit: str) -> str:
             identity = account.process_config_dir(claude.pid)
             if not isinstance(identity, account.ConfiguredClaudeFolder):
                 raise OSError("the restarted session's account is unreadable")
-            return identity.path.name.removeprefix(".")
+            return accounts.claude_config_label(identity.path)
     return ""
 
 
@@ -280,7 +289,7 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
     try:
         state = _read_state()
         before = deepcopy(state)
-        sources = _sources()
+        sources = _sources(lines.append)
         runners = showrunners.registered_showrunners()
         runs = unit_lookup.read_run_states()
         retained: dict[str, DownOutage] = {}
@@ -294,121 +303,126 @@ def run(now: datetime, *, dry_run: bool) -> list[str]:
                 observed = {unit.unit: unit for unit in live_units.production_units(doc)}
                 for row in rows:
                     unit = production_units.cell_value(row.get("Unit", ""))
-                    worktree = production_units.cell_value(row.get("Worktree", ""))
-                    if not worktree or runs.state(Path(worktree)) != unit_lookup.UnitState.RUNNING:
-                        continue
-                    found = observed.get(unit)
-                    if found is None:
-                        raise OSError(f"{unit}: unit liveness is unavailable")
-                    claude = found.session.claude if found.session is not None else unit_lookup.ClaudeNotRunning()
-                    if not isinstance(claude, unit_lookup.LiveClaude):
-                        # A report can suggest an outage. Prove it fresh before recovery.
-                        with herdr.process_action():
-                            current = {item.unit: item for item in live_units.production_units(doc)}
-                        found = current.get(unit)
+                    try:
+                        worktree = production_units.cell_value(row.get("Worktree", ""))
+                        if not worktree or runs.state(Path(worktree)) != unit_lookup.UnitState.RUNNING:
+                            continue
+                        found = observed.get(unit)
                         if found is None:
                             raise OSError(f"{unit}: unit liveness is unavailable")
                         claude = found.session.claude if found.session is not None else unit_lookup.ClaudeNotRunning()
-                    if isinstance(claude, unit_lookup.LiveClaude):
-                        outage = state.get(claude.session_id)
-                        restored = ""
-                        if outage is not None and "job" in outage and not dry_run:
-                            restored = _live_account(doc, unit)
-                            if not restored:
-                                claude = unit_lookup.ClaudeNotRunning()
+                        if not isinstance(claude, unit_lookup.LiveClaude):
+                            # A report can suggest an outage. Prove it fresh before recovery.
+                            with herdr.process_action():
+                                current = {item.unit: item for item in live_units.production_units(doc)}
+                            found = current.get(unit)
+                            if found is None:
+                                raise OSError(f"{unit}: unit liveness is unavailable")
+                            claude = found.session.claude if found.session is not None else unit_lookup.ClaudeNotRunning()
                         if isinstance(claude, unit_lookup.LiveClaude):
-                            if not dry_run:
-                                _ = outage_alerts.clear(claude.session_id, observed_at)
+                            outage = state.get(claude.session_id)
+                            restored = ""
                             if outage is not None and "job" in outage and not dry_run:
-                                Path(outage["job"]["result"]).unlink(missing_ok=True)
-                                since = datetime.fromisoformat(outage["first_seen"]).astimezone(user_zone()).strftime("%H:%M %Z")
-                                text = f"watchdog: {unit} was down since {since}; restarted on {restored}"
-                                lines.append(text)
-                                lines.append(showrunners.tell(runner["slug"], f"unit-watchdog-{claude.session_id}-{now.isoformat()}", text))
-                            continue
-                    source = sources.get((runner["slug"], unit))
-                    if source is None:
-                        for key, outage in state.items():
-                            context = outage.get("alert_context")
-                            if context is None or (context["production"], context["unit"]) != (runner["slug"], unit):
+                                restored = _live_account(doc, unit)
+                                if not restored:
+                                    claude = unit_lookup.ClaudeNotRunning()
+                            if isinstance(claude, unit_lookup.LiveClaude):
+                                if not dry_run:
+                                    _ = outage_alerts.clear(claude.session_id, observed_at)
+                                if outage is not None and "job" in outage and not dry_run:
+                                    Path(outage["job"]["result"]).unlink(missing_ok=True)
+                                    since = datetime.fromisoformat(outage["first_seen"]).astimezone(user_zone()).strftime("%H:%M %Z")
+                                    text = f"watchdog: {unit} was down since {since}; restarted on {restored}"
+                                    lines.append(text)
+                                    lines.append(showrunners.tell(runner["slug"], f"unit-watchdog-{claude.session_id}-{now.isoformat()}", text))
                                 continue
-                            # A launch entry can disappear while a recovery job finishes. Keep its result and alert retry.
-                            retained[key] = outage
-                            if isinstance(claude, unit_lookup.ClaudeUnknown) or dry_run:
-                                continue
-                            job = outage.get("job")
-                            if job is not None:
-                                outcome = _recovery_result(job, now)
-                                if isinstance(outcome, RecoveryStillRunning):
+                        source = sources.get((runner["slug"], unit))
+                        if source is None:
+                            for key, outage in state.items():
+                                context = outage.get("alert_context")
+                                if context is None or (context["production"], context["unit"]) != (runner["slug"], unit):
                                     continue
-                                # Keep the job retryable if result cleanup fails.
-                                outcome.result_path.unlink(missing_ok=True)
-                                outage["dropped"] = outcome.failure or "restart did not make the session live"
-                                _ = outage.pop("job")
-                            if "dropped" in outage:
-                                text = f"watchdog: {unit}: {outage['dropped']}"
-                                lines.append(text)
-                                lines.append(showrunners.tell(runner["slug"], f"unit-watchdog-{key}-{now.isoformat()}", text))
-                                _alert_without_record(key, context, outage, outage["dropped"])
-                        lines.append(f"watchdog: {unit}: no pane launch entry")
-                        continue
-                    key = source.session["session_id"]
-                    outage = state.get(key)
-                    if isinstance(claude, unit_lookup.ClaudeUnknown):
-                        if key in state:
-                            retained[key] = state[key]
-                        lines.append(f"watchdog: {unit}: {claude.reason}")
-                        continue
-                    if outage is None:
-                        outage = DownOutage(first_seen=now.isoformat(), alerted=False)
+                                # A launch entry can disappear while a recovery job finishes. Keep its result and alert retry.
+                                retained[key] = outage
+                                if isinstance(claude, unit_lookup.ClaudeUnknown) or dry_run:
+                                    continue
+                                job = outage.get("job")
+                                if job is not None:
+                                    outcome = _recovery_result(job, now)
+                                    if isinstance(outcome, RecoveryStillRunning):
+                                        continue
+                                    # Keep the job retryable if result cleanup fails.
+                                    outcome.result_path.unlink(missing_ok=True)
+                                    outage["dropped"] = outcome.failure or "restart did not make the session live"
+                                    _ = outage.pop("job")
+                                if "dropped" in outage:
+                                    text = f"watchdog: {unit}: {outage['dropped']}"
+                                    lines.append(text)
+                                    lines.append(showrunners.tell(runner["slug"], f"unit-watchdog-{key}-{now.isoformat()}", text))
+                                    _alert_without_record(key, context, outage, outage["dropped"])
+                            lines.append(f"watchdog: {unit}: no pane launch entry")
+                            continue
+                        key = source.session["session_id"]
+                        outage = state.get(key)
+                        if isinstance(claude, unit_lookup.ClaudeUnknown):
+                            if key in state:
+                                retained[key] = state[key]
+                            lines.append(f"watchdog: {unit}: {claude.reason}")
+                            continue
+                        if outage is None:
+                            outage = DownOutage(first_seen=now.isoformat(), alerted=False)
+                            retained[key] = outage
+                            continue
                         retained[key] = outage
-                        continue
-                    retained[key] = outage
-                    if datetime.fromisoformat(outage["first_seen"]) >= now:
-                        continue
-                    if dry_run:
-                        lines.append(f"watchdog: would restart {unit} from {source.label}'s pane launch")
-                        continue
-                    if "dropped" in outage or not Path(source.session["cwd"]).is_dir():
-                        outage["dropped"] = f"folder {source.session['cwd']} no longer exists; restore dropped"
-                        text = f"watchdog: {unit}: {outage['dropped']}"
-                        lines.append(text)
-                        lines.append(showrunners.tell(runner["slug"], f"unit-watchdog-{key}-{now.isoformat()}", text))
-                        _alert_failure(source, outage, outage["dropped"])
-                        continue
-                    job = outage.get("job")
-                    if job is not None:
-                        outcome = _recovery_result(job, now)
-                        if isinstance(outcome, RecoveryStillRunning):
+                        if datetime.fromisoformat(outage["first_seen"]) >= now:
                             continue
-                        failure = outcome.failure
-                        restored = _live_account(doc, unit)
-                        # Keep the result and job if the fresh read is unreadable.
-                        outcome.result_path.unlink(missing_ok=True)
-                        _ = outage.pop("job")
-                        since = datetime.fromisoformat(outage["first_seen"]).astimezone(user_zone()).strftime("%H:%M %Z")
-                        text = (f"watchdog: {unit} was down since {since}; restarted on {restored}" if restored else
-                            f"watchdog: {unit} was down since {since}; {failure or 'restart did not make the session live'}; "
-                            + f"retry from {source.label}'s pane launch")
-                        lines.append(text)
-                        lines.append(showrunners.tell(runner["slug"], f"unit-watchdog-{key}-{now.isoformat()}", text))
-                        if restored:
-                            del retained[key]
-                            _ = state.pop(key, None)
+                        if dry_run:
+                            lines.append(f"watchdog: would restart {unit} from {source.label}'s pane launch")
                             continue
-                        _alert_failure(source, outage, failure or "restart did not make the session live")
-                    remaining = dispatch_deadline - time.monotonic()
-                    if remaining <= 0:
-                        continue
-                    results = _state_file().parent / "unit-watchdog-results"
-                    results.mkdir(parents=True, exist_ok=True)
-                    job = RecoveryJob(result=str(results / (uuid.uuid4().hex + ".json")), started=now.isoformat(), source=source.identity)
-                    outage["job"] = job
-                    outage["alert_context"] = RecoveryAlertContext(production=runner["slug"], unit=unit,
-                        account=source.label, session_name=source.session["name"])
-                    # Save ownership before detaching; a later pass never starts a second copy.
-                    _write_state({**state, **retained})
-                    _start_recovery(source, job, min(5, remaining))
+                        if "dropped" in outage or not Path(source.session["cwd"]).is_dir():
+                            outage["dropped"] = f"folder {source.session['cwd']} no longer exists; restore dropped"
+                            text = f"watchdog: {unit}: {outage['dropped']}"
+                            lines.append(text)
+                            lines.append(showrunners.tell(runner["slug"], f"unit-watchdog-{key}-{now.isoformat()}", text))
+                            _alert_failure(source, outage, outage["dropped"])
+                            continue
+                        job = outage.get("job")
+                        if job is not None:
+                            outcome = _recovery_result(job, now)
+                            if isinstance(outcome, RecoveryStillRunning):
+                                continue
+                            failure = outcome.failure
+                            restored = _live_account(doc, unit)
+                            # Keep the result and job if the fresh read is unreadable.
+                            outcome.result_path.unlink(missing_ok=True)
+                            _ = outage.pop("job")
+                            since = datetime.fromisoformat(outage["first_seen"]).astimezone(user_zone()).strftime("%H:%M %Z")
+                            text = (f"watchdog: {unit} was down since {since}; restarted on {restored}" if restored else
+                                f"watchdog: {unit} was down since {since}; {failure or 'restart did not make the session live'}; "
+                                + f"retry from {source.label}'s pane launch")
+                            lines.append(text)
+                            lines.append(showrunners.tell(runner["slug"], f"unit-watchdog-{key}-{now.isoformat()}", text))
+                            if restored:
+                                del retained[key]
+                                _ = state.pop(key, None)
+                                continue
+                            _alert_failure(source, outage, failure or "restart did not make the session live")
+                        remaining = dispatch_deadline - time.monotonic()
+                        if remaining <= 0:
+                            continue
+                        results = _state_file().parent / "unit-watchdog-results"
+                        results.mkdir(parents=True, exist_ok=True)
+                        job = RecoveryJob(result=str(results / (uuid.uuid4().hex + ".json")), started=now.isoformat(), source=source.identity)
+                        outage["job"] = job
+                        outage["alert_context"] = RecoveryAlertContext(production=runner["slug"], unit=unit,
+                            account=source.label, session_name=source.session["name"])
+                        # Save ownership before detaching; a later pass never starts a second copy.
+                        _write_state({**state, **retained})
+                        _start_recovery(source, job, min(5, remaining))
+                    except (OSError, ValueError, herdr.HerdrFailure) as error:
+                        # Preserve incomplete observations, then continue with the next unit.
+                        retained.update({key: value for key, value in state.items() if key not in retained})
+                        lines.append(f"watchdog: {runner['slug']}/{unit}: {error}")
             except (OSError, ValueError) as error:
                 # Do not lose an outage's alert mark when discovery is incomplete.
                 retained.update({key: value for key, value in state.items() if key not in retained})

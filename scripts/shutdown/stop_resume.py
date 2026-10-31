@@ -248,7 +248,8 @@ def resume(session: str, *, why: str, to: str | None = None, requester: str = ""
         from scripts.accounts import accounts
 
         source = Path(entry["config_dir"])
-        label = to if to is not None else source.name.removeprefix(".")
+        source_label = accounts.claude_config_label(source)
+        label = to if to is not None else source_label
         target_dir = accounts.account_dir(label) if to is not None else source
         trust = folder_trust.heal(Path(entry["cwd"]), target_dir, source)
         if isinstance(trust, (folder_trust.FolderNotTrusted, folder_trust.FolderTrustUnreadable)):
@@ -268,7 +269,7 @@ def resume(session: str, *, why: str, to: str | None = None, requester: str = ""
             tab = replace(tab, session_id=identity)
         copied_from = trust.source if isinstance(trust, herdr.TrustCopied) else ""
         workers = ResumeWorkers(codex_seats([Path(run) for run in unit_runs.held(identity)]), entry["cwd"])
-        message = resume_message(why, moved_from=source.name.removeprefix(".") if to else None,
+        message = resume_message(why, moved_from=source_label if to else None,
                                  moved_to=to, workers=workers)
         reason = "never started"
         for _attempt in range(RESUME_ATTEMPTS):

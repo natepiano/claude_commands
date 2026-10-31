@@ -303,6 +303,8 @@ class NoUnitConversation(NamedTuple):
 
 def unit_conversation(found: unit_lookup.MarkedUnit | None, *, session_id: str = "") -> UnitConversation | NoUnitConversation:
     """Use the live director's id, then its pane launch; retained launches survive a stop."""
+    from scripts.accounts import accounts
+
     if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
         session_id = found.claude.session_id
     if not session_id:
@@ -310,12 +312,12 @@ def unit_conversation(found: unit_lookup.MarkedUnit | None, *, session_id: str =
     if found is not None:
         entry = pane_record.read(found.place.session).get(found.place.pane)
         if entry is not None and entry["session_id"] == session_id and entry["config_dir"]:
-            return UnitConversation(session_id, Path(entry["config_dir"]).name.removeprefix("."))
+            return UnitConversation(session_id, accounts.claude_config_label(Path(entry["config_dir"])))
     try:
         entry = pane_record.launch_for_session(session_id)
     except ValueError as error:
         raise RenameRefused(str(error)) from error
-    return (UnitConversation(session_id, Path(entry["config_dir"]).name.removeprefix("."))
+    return (UnitConversation(session_id, accounts.claude_config_label(Path(entry["config_dir"])))
             if entry is not None and entry["config_dir"] else NoUnitConversation())
 
 
