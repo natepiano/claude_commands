@@ -29,6 +29,7 @@ sys.path.insert(0, str(SCRIPTS.parent))
 from scripts.shutdown import launch_permission  # noqa: E402
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402
+from scripts.production import staff  # noqa: E402
 
 USAGE = "usage: herdr_sessions.py list [--on <host>] | sort-tabs | attach <name> | focus <name> | attach-remote <host> <name> | start [--name N] [--cwd D] [-- <claude args>] | resume <name> --session-id ID --cwd D [--config-dir D] [--restore] [--prompt-file P] [--attach] [-- <claude args>]"
 REMOTE_LIST_TIMEOUT = 15
@@ -239,13 +240,14 @@ def claude_names() -> dict[str, str]:
     directory = sessions_dir()
     if not directory.exists():
         return {}
+    places = herdr.herdr_places()
     for path in sorted(directory.iterdir()):
         if path.suffix != ".json":
             continue
         record = read_session(path)
         if isinstance(record, UnreadableSessionRecord) or not live_session(record):
             continue
-        place = herdr.herdr_place_of(record["pid"])
+        place = places.get(record["pid"])
         if not isinstance(place, herdr.HerdrPlace) or place.session != shared:
             continue
         if place.pane not in newest or record["updatedAt"] > newest[place.pane]["updatedAt"]:
@@ -253,15 +255,20 @@ def claude_names() -> dict[str, str]:
     return {pane: record["name"] for pane, record in newest.items()}
 
 
-def unit_roles() -> dict[str, str]:
-    """Unit roles of the shared session's panes, from the marks inherited by processes in them."""
-    shared = herdr.shared_session()
+def unit_roles(client: herdr.Herdr, panes: list[herdr.PaneIdentity]) -> dict[str, str]:
+    """Classify live unit panes using the same staff join as tab ordering."""
+    classifier = herdr.UnitTabClassifier(client.session, herdr.herdr_processes(), staff.initial_snapshot())
+    spaces: dict[str, str] = {}
+    if any(classifier.has_unit_title(pane.get("label") or "") for pane in panes):
+        for item in herdr.json_items(client.result("workspace", "list").get("workspaces"), "herdr workspace list"):
+            space = herdr.json_object(item, "herdr workspace")
+            spaces[herdr.json_text(space.get("workspace_id"), "herdr workspace id")] = (
+                herdr.json_text(space.get("label"), "herdr workspace label"))
     roles: dict[str, str] = {}
-    for process in herdr.herdr_processes():
-        slug = process.marks.get("SHOWRUNNER_UNIT", "")
-        unit = process.marks.get("SHOWRUNNER_UNIT_ID", "")
-        if process.place.session == shared and herdr.has_unit_marks(process.marks):
-            _ = roles.setdefault(process.place.pane, f"unit {slug}/{unit}")
+    for pane in panes:
+        unit = classifier.classify(spaces.get(pane["workspace_id"], ""), pane.get("label") or "", [pane["pane_id"]])
+        if isinstance(unit, herdr.UnitTab):
+            roles[pane["pane_id"]] = f"unit {unit.parent.name}/{unit.row.name}"
     return roles
 
 
@@ -306,8 +313,8 @@ def _main(argv: list[str]) -> int:
             for label in herdr.Herdr(shared).sort_tabs().labels:
                 print(f"herdr_sessions: {label}: tab with several panes; order kept")
             return 0
-        panes = herdr.Herdr(shared).panes()
         if argv[1] in ("attach", "focus"):
+            panes = herdr.Herdr(shared).panes()
             name = argv[2]
             pane = _tab_pane(name)
             if not pane:
@@ -320,15 +327,17 @@ def _main(argv: list[str]) -> int:
                 print(shared)
                 return 0
             _attach(pane)
-        names = claude_names()
-        roles = unit_roles()
-        showrunner_names = {runner["session"] for runner in registered_showrunners() if runner["session"]}
-        for row in panes:
-            pane = row["pane_id"]
-            claude = names.get(pane, "")
-            role = roles.get(pane, "showrunner" if claude and claude in showrunner_names else "standalone")
-            print(f"{row.get("label") or pane}\t{role}\t{claude}")
-        return 0
+        with herdr.pane_snapshot() as read_panes:
+            panes = read_panes(shared)
+            names = claude_names()
+            roles = unit_roles(herdr.Herdr(shared), panes)
+            showrunner_names = {runner["session"] for runner in registered_showrunners() if runner["session"]}
+            for row in panes:
+                pane = row["pane_id"]
+                claude = names.get(pane, "")
+                role = roles.get(pane, "showrunner" if claude and claude in showrunner_names else "standalone")
+                print(f"{row.get("label") or pane}\t{role}\t{claude}")
+            return 0
     except (herdr.HerdrFailure, OSError) as error:
         print(f"herdr_sessions: {error}", file=sys.stderr)
         return 3

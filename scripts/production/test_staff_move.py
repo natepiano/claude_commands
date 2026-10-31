@@ -14,6 +14,7 @@ from unittest import mock
 from scripts.production import staff, staff_move, staff_sources
 from scripts.production.staff_test_support import CHECKOUT, StaffTestCase
 import unit_lookup
+import herdr
 
 
 class StaffMoveTests(StaffTestCase):
@@ -21,6 +22,7 @@ class StaffMoveTests(StaffTestCase):
     responses_path: Path = Path()
     log: Path = Path()
     members: dict[str, staff.StaffRow] = {}
+    destination_panes: list[dict[str, object]] = []
 
     @property
     def source(self) -> staff.StaffRow:
@@ -44,6 +46,7 @@ class StaffMoveTests(StaffTestCase):
         _ = self.production("sdlc", "models-unit", workspace="tools")
         _ = self.production("target", workspace="new-tools")
         self.members = {}
+        self.destination_panes = []
         self.members["source"] = staff.ensure("showrunner", name="tools")
         self.members["destination"] = staff.ensure("showrunner", name="new-tools")
         self.members["unit"] = staff.ensure("unit", name="panes", parent=self.source.id)
@@ -71,7 +74,7 @@ class StaffMoveTests(StaffTestCase):
         })
         self.reply(["tab", "rename", "w2:t2", "panes"], {})
         self.reply(["tab", "list", "--workspace", "w2"], {"tabs": [
-            {"tab_id": "w2:t2", "label": "panes"},
+            {"tab_id": "w2:t2", "label": "panes", "pane_count": 1},
         ]})
         self.reply(["tab", "list"], {"tabs": [
             {"tab_id": "w1:t0", "workspace_id": "w1", "label": "tools"},
@@ -88,7 +91,8 @@ class StaffMoveTests(StaffTestCase):
         if isinstance(move, dict):
             move = cast(dict[str, object], move)
             after = {**self.responses, "--session agents pane list": {"code": 0, "stdout": json.dumps({"result": {
-                "panes": [{"pane_id": "w1:p1", "workspace_id": "w2", "tab_id": "w2:t2", "label": self.unit.name}],
+                "panes": [{"pane_id": "w1:p1", "workspace_id": "w2", "tab_id": "w2:t2", "label": self.unit.name},
+                          *self.destination_panes],
             }})}}
             moved = {key: value for key, value in move.items() if key != "write_files"}
             after["--session agents pane move w1:p1 --new-tab --workspace w2"] = moved
@@ -100,6 +104,65 @@ class StaffMoveTests(StaffTestCase):
 
     def commands(self) -> list[list[str]]:
         return [cast(list[str], json.loads(line)) for line in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def sorting_commands(self) -> list[list[str]]:
+        return [["--session", "agents", *arguments] for arguments in (
+            ["workspace", "list"], ["tab", "list"], ["tab", "list", "--workspace", "w2"],
+            ["workspace", "list"], ["tab", "list", "--workspace", "w2"],
+            ["workspace", "list"], ["tab", "list"],
+        )]
+
+    def assert_unit_tab_is_sorted(self, *, already_placed: bool) -> None:
+        for name in ("devtools", "herdr"):
+            _ = staff.ensure("unit", name=name, parent=self.destination.id)
+        self.members["unit"] = staff.rename(self.unit.id, "style")
+        tabs = [
+            {"tab_id": "w2:t0", "workspace_id": "w2", "label": "new-tools", "pane_count": 1},
+            {"tab_id": "w2:t1", "workspace_id": "w2", "label": "devtools", "pane_count": 1},
+            {"tab_id": "w2:t2", "workspace_id": "w2", "label": "style", "pane_count": 1},
+            {"tab_id": "w2:t3", "workspace_id": "w2", "label": "herdr", "pane_count": 1},
+        ]
+        self.destination_panes = [
+            {"pane_id": f"w2:p{index}", "workspace_id": "w2", "tab_id": tab["tab_id"], "label": tab["label"]}
+            for index, tab in enumerate(tabs) if index != 2
+        ]
+        self.reply(["pane", "list"], {"panes": [
+            {"pane_id": "w1:p1", "workspace_id": "w2" if already_placed else "w1",
+             "tab_id": "w2:t2" if already_placed else "w1:t1", "label": "style"}, *self.destination_panes,
+        ]})
+        self.reply(["tab", "list", "--workspace", "w2"], {"tabs": tabs})
+        self.reply(["tab", "rename", "w2:t2", "style"], {})
+        self.reply(["pane", "move", "w2:p3", "--new-tab", "--workspace", "w2"], {
+            "move_result": {"created_tab": {"tab_id": "w2:t3"}, "pane": {"pane_id": "w2:p3"}},
+        })
+        self.reply(["tab", "rename", "w2:t3", "herdr"], {})
+        sorted_tabs = [tabs[index] for index in (0, 1, 3, 2)]
+        self.responses["--session agents tab list"] = [
+            {"stdout": json.dumps({"result": {"tabs": shown}}), "code": 0}
+            for shown in ([tabs, sorted_tabs] if already_placed else [tabs, tabs, sorted_tabs])
+        ]
+        self.write_json(self.responses_path, self.responses)
+        # Refresh the fake move's state transition with the complete tab responses.
+        self.reply(["tab", "rename", "w2:t2", "style"], {})
+        self.write_json(herdr.layout_path("agents"), {
+            "at": 0, "workspaces": [{"name": "new-tools", "seen": 0, "tabs": [
+                {"name": tab["label"], "seen": 0} for tab in tabs
+            ]}],
+        })
+        result = staff_move.move_unit("sdlc", "models-unit", "target")
+        self.assertIsInstance(result.tab, staff_move.TabAlreadyPlaced if already_placed else staff_move.TabMoved)
+        moves = [command[4] for command in self.commands() if command[2:4] == ["pane", "move"]]
+        self.assertEqual(moves, ["w2:p3", "w1:p1"] if already_placed else ["w1:p1", "w2:p3", "w1:p1"])
+        self.assertEqual([tab["name"] for space in herdr.saved_layout("agents")["workspaces"]
+                          if space["name"] == "new-tools" for tab in space["tabs"]],
+                         ["new-tools", "devtools", "herdr", "style"])
+        self.assertFalse(any(command[2:] == ["tab", "list", "--workspace", "w1"] for command in self.commands()))
+
+    def test_newly_moved_tab_sorts_units_even_when_saved_order_is_wrong(self) -> None:
+        self.assert_unit_tab_is_sorted(already_placed=False)
+
+    def test_already_present_tab_sorts_units_even_when_saved_order_is_wrong(self) -> None:
+        self.assert_unit_tab_is_sorted(already_placed=True)
 
     def test_move_changes_only_parent_and_moves_running_pane_to_parent_workspace(self) -> None:
         before = staff.snapshot()
@@ -116,7 +179,7 @@ class StaffMoveTests(StaffTestCase):
             ["workspace", "list"],
             ["pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"], ["tab", "rename", "w2:t2", "panes"],
             ["workspace", "list"], ["tab", "list", "--workspace", "w2"], ["workspace", "list"], ["tab", "list"],
-        )])
+        )] + self.sorting_commands())
         with self.assertRaises(FrozenInstanceError):
             setattr(result, "row", self.unit)
 
@@ -206,7 +269,7 @@ class StaffMoveTests(StaffTestCase):
         ]})
         self.reply(["tab", "rename", "w2:t2", "models"], {})
         self.reply(["tab", "list", "--workspace", "w2"], {"tabs": [
-            {"tab_id": "w2:t2", "label": "models"},
+            {"tab_id": "w2:t2", "label": "models", "pane_count": 1},
         ]})
         _ = staff_move.move_unit("sdlc", "models-unit", "target")
         source_doc = self.source_root / "sdlc-production.md"
@@ -305,7 +368,7 @@ class StaffMoveTests(StaffTestCase):
     def test_retry_finishes_tab_title_after_move_already_succeeded(self) -> None:
         self.reply(["tab", "rename", "w2:t2", "panes"], {}, code=1, stderr="rename refused")
         self.reply(["tab", "list", "--workspace", "w2"], {"tabs": [
-            {"tab_id": "w2:t2", "label": "untitled"},
+            {"tab_id": "w2:t2", "label": "untitled", "pane_count": 1},
         ]})
         with self.assertRaisesRegex(staff.StaffUnreadable, "rename refused"):
             _ = staff_move.move_unit("sdlc", "models-unit", "target")
@@ -314,7 +377,9 @@ class StaffMoveTests(StaffTestCase):
         _ = staff_move.move_unit("sdlc", "models-unit", "target")
         self.assertEqual(self.staff_file.read_bytes(), before)
         self.assertEqual(sum(item[2:4] == ["pane", "move"] for item in self.commands()), 1)
-        self.assertEqual(self.commands()[-1], ["--session", "agents", "tab", "rename", "w2:t2", "panes"])
+        self.assertEqual(self.commands()[-8:], [
+            ["--session", "agents", "tab", "rename", "w2:t2", "panes"], *self.sorting_commands(),
+        ])
 
     def test_retry_after_tab_failure_reconciles_tab_without_repeating_staff_change(self) -> None:
         self.reply(["pane", "move", "w1:p1", "--new-tab", "--workspace", "w2"], {}, code=1, stderr="move refused")
@@ -337,7 +402,7 @@ class StaffMoveTests(StaffTestCase):
         self.assertEqual(self.commands()[previous_commands:], [["--session", "agents", *arguments] for arguments in (
             ["pane", "list"], ["pane", "list"], ["workspace", "list"],
             ["tab", "list", "--workspace", "w2"],
-        )])
+        )] + self.sorting_commands())
 
     def test_missing_workspace_keeps_staff_parent_and_reports_the_cause_once(self) -> None:
         self.reply(["workspace", "list"], {"workspaces": [{"workspace_id": "w1", "label": "tools"}]})
