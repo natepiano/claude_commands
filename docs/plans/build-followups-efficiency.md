@@ -148,3 +148,42 @@ Outside a nix shell, `scripts/direct/verify.sh` makes one `nix_env.py exec` of i
 #### As-built
 
 The one style block in `render_markdown` keeps top-level text in a centered 48rem column; a table is `display: block; width: max-content; max-width: 100%` with sideways scroll, and `td, th` wrap only at spaces. Stored snapshots hold rendered HTML, so the five Markdown pages were re-rendered once from their stored `.md`; the service needed no restart. `copy_watch.py`'s `Wakeup` records its parent pid and requests a stop when the parent is gone, checked at least once a second in both loops. Open minors: F002 (a paragraph beside a table in one blockquote or list has no 48rem limit) and F003 (a verify.sh killed before the watcher records its parent is missed). Checkpoint 3a47b79d on branch natedev-efficiency-links.
+
+### Phase 14 — The STE rule loads into every Claude and Codex session context  · status: done
+
+**Source:** the user, 2026-10-18: "everyone needs to use simplified technical english henceforth".
+
+#### As-built
+
+`scripts/hooks/session-start-ste.py` reads `config/simplified-technical-english.md` from its own checkout and returns it as `additionalContext` for `SessionStart` and `SubagentStart`; a bad payload, a missing file or a read error exits 0 with no output. `scripts/hooks/codex_hooks.py` has two rows, `ste` (SessionStart) and `ste-subagent` (SubagentStart), both with matcher `*`; `_select_hooks` picks a hook by command, event and matcher so two events share one script with separate trust. Checkpoint 69374ebc on branch natedev-efficiency. The `settings.json` hook lines for Claude Code and the live Codex install and trust wait for the user.
+
+### Phase 15 — nix_env trusts copies.py copies  · status: done
+
+**Source:** the next item "nix_env trusts copies.py copies", approved by the showrunner of natedev 2026-10-29 and started on its go 2026-10-31 (the record format is `scratch.register_copy` on origin/natedev).
+
+#### Work Order
+
+**Goal:** `nix_env.py` approves the `.envrc` of a copy that `copies.py` registered, and refuses every other copy, so `verify.sh` in a `/tmp/claude/copies/<pair>/<copy>` no longer stops with "direnv: .envrc is blocked".
+
+**Spec:** in `scripts/lib/nix_env.py`, `trusted_envrc` also returns true when all of these hold; any failure, read error included, returns false and direnv keeps its explicit approval.
+1. The `.envrc` is a regular file (not a symlink) at the top of a copy: `scratch.copy_folder(<its folder>)` equals that folder.
+2. The copy has a readable `Registered` record from `scripts/lib/scratch.py`. Use scratch.py's own record reader; do not copy its parsing. Import `scratch` inside the function so `nix_env.py` keeps its cheap start (phase 11).
+3. The record's `source_path` resolves to a folder for which `trusted_root` is true.
+4. The `.envrc` blob at the record's `source_commit` in that source repository (`git -C <source_path> rev-parse <source_commit>:.envrc`) equals the hash of the copy's `.envrc` file (`git hash-object --no-filters -- <file>`, run with the source repository as its working directory so no code from the copy runs).
+This is the user's strict rule. Files that `.envrc` loads (for example `flake.nix`) are not checked; say so in the as-built doc. No blanket `direnv allow`.
+
+**Tests** (`scripts/lib/test_nix_env.py`, real `git`, the fake `~/rust` the module's tests already use, `COPIES_ENV` pointing at a temp copies root): a `git clone --shared` copy registered with `register_copy` and an unchanged `.envrc` is approved and loads; the same copy with an edited `.envrc` is refused; a copy with no record is refused; a record whose `source_path` is outside the trusted roots is refused; a record whose `source_commit` has no `.envrc` is refused; a folder outside the copies root with a copied record file is refused.
+
+**Files:**
+- `scripts/lib/nix_env.py` — `registered_copy` and its use in `trusted_envrc`.
+- `scripts/lib/test_nix_env.py` — the six tests.
+- `docs/as-built/nix-shell-launch.md` — states the rule and the flake.nix limit.
+
+**Workers:** 1 writer; the change is one function and its tests.
+- `impl` — all three files.
+
+**State:** none
+
+**Constraints from prior phases:** Phase 9's `registered_worktree` proves registration by reading git's pointer files only, never by running git in the untrusted tree; this phase runs git only in the trusted source repository. Phase 11 made `nix_env.py` start cheaply: lazy imports, `NamedTuple` results.
+
+**Acceptance gate:** `python3 -m unittest scripts.lib.test_nix_env scripts.lib.test_nix_env_launches scripts.lib.test_nix_env_integration` passes from the repo root; `basedpyright scripts/lib/nix_env.py scripts/lib/test_nix_env.py` reads `0 errors, 0 warnings, 0 notes`; `docs/as-built/nix-shell-launch.md` states the rule.
