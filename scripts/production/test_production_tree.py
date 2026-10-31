@@ -14,13 +14,15 @@ from pathlib import Path
 from typing import cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib.atomic_file import write_text_atomic
 from scripts.production import staff, staff_sources
 from scripts.production.staff_test_support import StaffTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import production_tree  # noqa: E402
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 import unit_lookup
 from herdr import HerdrPlace

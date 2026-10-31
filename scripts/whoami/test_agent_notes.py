@@ -1668,6 +1668,8 @@ class AgentNotesTests(unittest.TestCase):
 class ResetTimeTests(unittest.TestCase):
     """Notes travel between machines in the vault, so a reset time carries its offset."""
 
+    now: datetime = datetime(2026, 10, 15, 18, 20, tzinfo=timezone.utc)
+
     def test_a_reset_is_written_with_its_offset(self) -> None:
         at = datetime(2026, 10, 13, 7, 0, 20, tzinfo=timezone.utc)
         written = datetime.fromisoformat(local_reset(at))
@@ -1679,15 +1681,15 @@ class ResetTimeTests(unittest.TestCase):
                          note_file.KnownReset(datetime(2026, 10, 13, 10, tzinfo=timezone.utc)))
         self.assertTrue(agent_notes.still_ahead("2099-01-01T00:00:00-07:00"))
         self.assertFalse(agent_notes.still_ahead("2000-01-01T00:00:00-07:00"))
-        self.assertTrue(quota_alert.ahead("2099-01-01T00:00:00+09:00"))
-        self.assertFalse(quota_alert.ahead("2000-01-01T00:00:00+09:00"))
+        self.assertTrue(quota_alert.ahead("2099-01-01T00:00:00+09:00", now=self.now))
+        self.assertFalse(quota_alert.ahead("2000-01-01T00:00:00+09:00", now=self.now))
         self.assertEqual(codex_pacer.parse_local("2026-10-13T03:00:00-07:00"),
                          note_file.KnownReset(datetime(2026, 10, 13, 10, tzinfo=timezone.utc).astimezone().replace(tzinfo=None)))
 
     def test_a_reset_written_before_the_offset_is_read_in_the_machines_zone(self) -> None:
         self.assertEqual(note_file.reset_time("2026-10-13T03:00:00"), note_file.KnownReset(datetime(2026, 10, 13, 3).astimezone()))
         self.assertTrue(agent_notes.still_ahead("2099-01-01T00:00:00"))
-        self.assertFalse(quota_alert.ahead("2000-01-01T00:00:00"))
+        self.assertFalse(quota_alert.ahead("2000-01-01T00:00:00", now=self.now))
         self.assertEqual(codex_pacer.parse_local("2026-10-13T03:00:00"), note_file.KnownReset(datetime(2026, 10, 13, 3)))
 
     def test_an_absent_or_unreadable_reset_names_the_reason(self) -> None:
@@ -1696,7 +1698,7 @@ class ResetTimeTests(unittest.TestCase):
                 self.assertIsInstance(note_file.reset_time(value),
                                       note_file.InvalidReset if value == "soon" else note_file.NoResetKnown)
                 self.assertFalse(agent_notes.still_ahead(value))
-                self.assertFalse(quota_alert.ahead(value))
+                self.assertFalse(quota_alert.ahead(value, now=self.now))
 
 
 if __name__ == "__main__":

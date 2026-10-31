@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, nix_env_fake as fixtures
 from scripts.lib.code_kind import is_test_code
 from scripts.shutdown import launch_permission
@@ -195,7 +196,7 @@ class ExecLaunchShellTests(unittest.TestCase):
         self.home.mkdir()
         self.loader = fixtures.fake_nix_loader()
         _ = cast(object, self.enterContext(patch.object(accounts, "import_module", side_effect=fixtures.imports_with_nix_loader(self.loader))))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "PATH": os.defpath,
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {"PATH": os.defpath,
             "KEEP": "base", "UNSET_BY_SHELL": "old", "AGENT_NOTES_DIR": str(self.home / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions")}, clear=True)))

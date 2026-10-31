@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "whoami"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "production"))
-from showrunners import load_settings, registered_showrunners
+from scripts.production.showrunners import load_settings, registered_showrunners
 if TYPE_CHECKING:
     from ..whoami.agent_accounts import (KnownCodexAccount, UnknownCodexAccount, StoredCodexAccount,
                                         codex_account, workers_home)

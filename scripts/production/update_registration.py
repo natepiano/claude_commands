@@ -22,6 +22,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from production_units import Production, read_production
 from production_units import Refusal, cell_value, unit_table
 from merge_checkpoint import NoMerge, merge_branch_history, report
@@ -31,7 +33,7 @@ if TYPE_CHECKING:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
     from showrunner_footer import ReportItem, reports_path
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 from dailies_render import (UNREADABLE_LIST, InputError, plumbing, read_outstanding,
     DeferredUntil, Outstanding, OutstandingReminder, Ranking, ReviewedOutstandingQuestion,
