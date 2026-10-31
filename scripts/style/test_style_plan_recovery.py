@@ -25,6 +25,14 @@ from style_plan_test_support import StylePlanFixture
 
 @final
 class StylePlanTests(StylePlanFixture):
+    def assert_structure_wait(self, crates: str, unclassified: int = 0) -> None:
+        code, output, errors = self.run_next()
+        self.assertEqual(code, 3)
+        self.assertTrue(output.endswith(f"waiting for structure: {crates}\n"), output)
+        self.assertIn("structure stays with modules:", output)
+        self.assertIn("file busy", output)
+        self.assertEqual(errors, f"unclassified: {unclassified} rules — pull nate_style\n" if unclassified else "")
+
     def test_sync_wait_names_one_needed_main_path(self) -> None:
         path = "crates/alpha/src/a.rs"
         changes = style_plan.MainChanges(self.tip, frozenset((path, self.sources[2])))
@@ -60,11 +68,13 @@ class StylePlanTests(StylePlanFixture):
         structure = self.rule("structure", "tier: D\nfamily: modules\n")
         _ = self.rule("read")
         self.sync()
-        with mock.patch.object(style_ledger, "_now", return_value="2026-01-02T03:04:05+00:00"):
-            self.assertEqual(self.run_next(), (3, "waiting for structure: crates/alpha, crates/beta\n", ""))
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)), \
+                mock.patch.object(style_ledger, "_now", return_value="2026-01-02T03:04:05+00:00"):
+            self.assert_structure_wait("crates/alpha, crates/beta")
         self.assertEqual(self.sync_wait_rows(), [("names-unit", "2026-01-02T03:04:05+00:00")])
-        with mock.patch.object(style_ledger, "_now", return_value="2026-01-03T03:04:05+00:00"):
-            self.assertEqual(self.run_next()[0], 3)
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)), \
+                mock.patch.object(style_ledger, "_now", return_value="2026-01-03T03:04:05+00:00"):
+            self.assert_structure_wait("crates/alpha, crates/beta")
         self.assertEqual(self.sync_wait_rows(), [("names-unit", "2026-01-02T03:04:05+00:00")])
         for path in self.sources[:2]:
             self.record(structure, path, self.tip)
@@ -79,9 +89,8 @@ class StylePlanTests(StylePlanFixture):
         self.sync()
         before = self.plan.read_bytes()
 
-        self.assertEqual(self.run_next(), (
-            3, "waiting for structure: crates/alpha, crates/beta\n",
-            "unclassified: 1 rules — pull nate_style\n"))
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)):
+            self.assert_structure_wait("crates/alpha, crates/beta", unclassified=1)
         self.assertEqual(self.plan.read_bytes(), before)
         self.assertEqual(self.count_tickets(), 0)
         self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
@@ -104,7 +113,8 @@ class StylePlanTests(StylePlanFixture):
         self.sync()
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** beta\n\n## Phases"))
 
-        self.assertEqual(self.run_next(), (3, "waiting for structure: crates/beta\n", ""))
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)):
+            self.assert_structure_wait("crates/beta")
         self.assertEqual(self.count_tickets(), 0)
 
     def test_modules_refill_with_completed_structure_waits_for_sync_despite_pending_names_cells(self) -> None:
@@ -143,10 +153,10 @@ class StylePlanTests(StylePlanFixture):
                 self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
                 for path in self.sources[:2]:
                     self.record(read, path, self.tip)
-            return self.board()
+            return self.board(*self.sources)
 
         with mock.patch.object(berth_board, "read_board", side_effect=board_after_judgment):
-            self.assertEqual(self.run_next(), (3, "waiting for structure: crates/beta\n", ""))
+            self.assert_structure_wait("crates/beta")
         self.assertEqual(reads, 2)
 
     def test_refill_rechecks_after_registering_a_wait_and_finds_the_just_merged_crate(self) -> None:
@@ -163,7 +173,7 @@ class StylePlanTests(StylePlanFixture):
                 self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
                 for path in self.sources[:2]:
                     self.record(structure, path, self.tip)
-            return self.board()
+            return self.board(*(self.sources if reads == 1 else self.sources[2:]))
 
         with mock.patch.object(berth_board, "read_board", side_effect=board_after_merge):
             self.assertEqual(style_plan.next_phase("names-unit", self.plan, self.repo),
@@ -180,11 +190,13 @@ class StylePlanTests(StylePlanFixture):
         ledger.ticket_add("names-unit-1", "names-unit", "read", "names", "crates/alpha",
                           list(self.sources[:2]), [read])
         output = io.StringIO()
-        with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])) as board, redirect_stdout(output):
+        with mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources)) as board, redirect_stdout(output):
             result = style_plan.next_phase("names-unit", self.plan, self.repo)
         self.assertEqual(result, style_plan.WaitingForStructure(("crates/alpha", "crates/beta"), 0))
         self.assertEqual(board.call_count, 2)
-        self.assertEqual(output.getvalue(), "dropped names-unit-1: files busy\n")
+        self.assertEqual(output.getvalue().count("dropped names-unit-1: files busy\n"), 1)
+        self.assertIn("structure stays with modules:", output.getvalue())
+        self.assertIn("file busy", output.getvalue())
         self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
         self.assertEqual(ledger.queued_tickets("names-unit"), ())
 
@@ -202,7 +214,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.rule("read")
         self.sync()
         unavailable = berth_board.BoardUnavailable("second read failed")
-        with mock.patch.object(berth_board, "read_board", side_effect=[self.board(), unavailable]):
+        with mock.patch.object(berth_board, "read_board", side_effect=[self.board(*self.sources), unavailable]):
             result = style_plan.next_phase("names-unit", self.plan, self.repo)
         self.assertEqual(result, unavailable)
         self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
@@ -299,20 +311,29 @@ class StylePlanTests(StylePlanFixture):
                 self.assertEqual(self.count_tickets(), 2)
 
 
-    def test_rebuild_after_rule_edit_restores_old_pinned_text_and_instructions(self) -> None:
+    def test_rebuild_after_rule_edit_replaces_stale_ticket_with_current_instructions(self) -> None:
         _ = self.rule("read")
         self.sync()
         self.assertEqual(self.run_next()[0], 0)
-        expected = self.plan.read_bytes()
-        pinned = self.ledger().pinned_rule_texts("names-unit-1")[0]
+        ledger = self.ledger()
+        pinned = ledger.pinned_rule_texts("names-unit-1")[0]
         path = self.plan.parent.parent / "rules" / (pinned.blob + ".md")
         path.unlink()
         _ = self.plan.write_text(self.plan_header())
         _ = (self.rule_dir / "read.md").write_text("---\ntier: C\nfamily: names\ninput_scope: file\n---\nChanged instructions.\n")
-        self.assertEqual(self.run_next(), (0, "resume names-unit-1\n", ""))
-        self.assertEqual(self.plan.read_bytes(), expected)
-        self.assertEqual(path.read_bytes(), pinned.text)
-        self.assertEqual(self.git("hash-object", str(path)), pinned.blob)
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-2\n", ""))
+        self.assertEqual([ticket["id"] for ticket in ledger.ticket_open("names-unit")], ["names-unit-2"])
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT state FROM tickets WHERE id='names-unit-1'").fetchone(),
+                             ("dropped",))
+        current = ledger.pinned_rule_texts("names-unit-2")[0]
+        self.assertNotEqual(current.blob, pinned.blob)
+        self.assertIn(b"Changed instructions.", current.text)
+        path = path.with_name(current.blob + ".md")
+        self.assertEqual(path.read_bytes(), current.text)
+        self.assertEqual(self.git("hash-object", str(path)), current.blob)
+        self.assertIn("names-unit-2", self.plan.read_text())
+        self.assertNotIn("names-unit-1", self.plan.read_text())
 
     def test_busy_queued_ticket_is_dropped_and_replaced_with_fresh_available_work(self) -> None:
         rule = self.rule("read")

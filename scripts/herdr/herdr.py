@@ -38,8 +38,11 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, TypeVar, c
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from process_failure import failure_detail
 import nix_env as nix_env
+from place import HerdrPlace as HerdrPlace
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -571,12 +574,6 @@ class WaitTimedOut:
 
 
 @dataclass(frozen=True)
-class HerdrPlace:
-    session: str
-    pane: str
-
-
-@dataclass(frozen=True)
 class TabWithPane:
     """The identities returned when a live pane moves into a new tab."""
 
@@ -744,6 +741,7 @@ class SessionListResult(TypedDict):
 
 class PaneIdentity(TypedDict):
     pane_id: str
+    terminal_id: NotRequired[str]
     label: NotRequired[str | None]
     workspace_id: str
     session_id: str | None
@@ -887,7 +885,7 @@ def require_success(result: subprocess.CompletedProcess[str], context: str) -> N
     if result.returncode == 0:
         return
     code = ""
-    detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+    detail = failure_detail(result)
     for text in (result.stderr, result.stdout):
         try:
             error = json_object(decode_object(text, context).get("error"), context)
@@ -1000,6 +998,15 @@ def merged_order(saved: list[SavedName], live: list[str], now: float) -> list[Sa
     return result
 
 
+def _write_layout(session: str, layout: SavedLayout) -> None:
+    """The one writer of a session's saved layout: a staged file renamed over the old one."""
+    path = layout_path(session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    _ = staged.write_text(json.dumps(layout, indent=1) + "\n", encoding="utf-8")
+    _ = staged.replace(path)
+
+
 def merged_layout(saved: SavedLayout, live: list[_LiveSpace], now: float) -> SavedLayout:
     """The saved layout with the live one laid over it: live order wins, gone entries keep their places."""
     tabs = {space["name"]: space["tabs"] for space in saved["workspaces"]}
@@ -1092,6 +1099,7 @@ class Herdr:
             if session_id is not None and not isinstance(session_id, str):
                 raise HerdrFailure("herdr pane agent session value: expected text or null")
             panes.append({"pane_id": json_text(pane.get("pane_id"), "herdr pane id"), "label": label,
+                          "terminal_id": json_text(pane.get("terminal_id", ""), "herdr terminal id"),
                           "workspace_id": json_text(pane.get("workspace_id"), "herdr pane workspace id"),
                           "session_id": session_id})
         return panes
@@ -1266,12 +1274,7 @@ class Herdr:
         live = [space for space in live if space.tabs]
         if not live:
             return
-        path = layout_path(self.session)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        staged = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        _ = staged.write_text(json.dumps(merged_layout(saved_layout(self.session), live, time.time()), indent=1) + "\n",
-                              encoding="utf-8")
-        _ = staged.replace(path)
+        _write_layout(self.session, merged_layout(saved_layout(self.session), live, time.time()))
 
     def retitle(self, pane: str, title: str) -> bool:
         """Give the tab and pane the session's current name.
@@ -2362,6 +2365,33 @@ def open_tab(name: str, space: str, title: str, cwd: str, environment: dict[str,
     return Herdr(name).open_tab(space, title, cwd, environment)
 
 
+def rename_saved_tab(session: str, workspace: str, old_titles: Set[str], title: str) -> None:
+    """Give a renamed tab its old saved place, dropping any duplicate destination entry.
+
+    Other workspaces and timestamps survive. Launchers can then order the new tab
+    against this entry before recording their live layout.
+    """
+    old_titles = old_titles - {title}
+    with _LayoutLock(session):
+        saved = saved_layout(session)
+        for space in saved["workspaces"]:
+            if space["name"] != workspace or not any(tab["name"] in old_titles for tab in space["tabs"]):
+                continue
+            seen = max(tab["seen"] for tab in space["tabs"] if tab["name"] in old_titles or tab["name"] == title)
+            tabs: list[SavedName] = []
+            renamed = False
+            for tab in space["tabs"]:
+                if tab["name"] in old_titles:
+                    if not renamed:
+                        tabs.append(SavedName(name=title, seen=seen))
+                        renamed = True
+                elif tab["name"] != title:
+                    tabs.append(tab)
+            space["tabs"] = tabs
+            _write_layout(session, saved)
+            return
+
+
 def save_shared_layout(running: set[str]) -> None:
     """Save the shared session's workspace and tab order, when that session is among the `running` ones.
 
@@ -2705,16 +2735,30 @@ def server_environment(name: str) -> dict[str, str]:
         raise HerdrFailure(f"{context}: cannot read process environment") from error
 
 
+class _PaneListStatus(Enum):
+    READABLE = "readable"
+    UNREADABLE = "unreadable"
+
+
 class _LivePanePlaces:
     """One server read, with retained shell identities for panes whose ids changed."""
 
     def __init__(self, session: str) -> None:
         self.session: str = session
-        self.panes: dict[str, PaneIdentity] = {pane["pane_id"]: pane for pane in Herdr(session).panes()}
+        self.panes: dict[str, PaneIdentity] = {}
+        self.pane_list_status: _PaneListStatus = _PaneListStatus.UNREADABLE
+        try:
+            self.panes = {pane["pane_id"]: pane for pane in Herdr(session).panes()}
+        except (HerdrFailure, OSError, ValueError):
+            pass
+        else:
+            self.pane_list_status = _PaneListStatus.READABLE
         self.shell_places: dict[int, HerdrPlace] = {}
         self.shells_read: bool = False
 
     def shells(self) -> dict[int, HerdrPlace]:
+        if self.pane_list_status is _PaneListStatus.UNREADABLE:
+            return {}
         if not self.shells_read:
             self.shells_read = True
             for pane in self.panes:
@@ -2732,6 +2776,8 @@ class _LivePanePlaces:
         launch_pane = environment.get("HERDR_PANE_ID", "")
         if not launch_pane or environment.get("TMUX_PANE"):
             return NotInHerdr()
+        if self.pane_list_status is _PaneListStatus.UNREADABLE:
+            return HerdrPlace(self.session, launch_pane)
         if launch_pane in self.panes:
             return HerdrPlace(self.session, self.panes[launch_pane]["pane_id"])
         shells = self.shells()

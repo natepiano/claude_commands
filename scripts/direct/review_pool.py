@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Literal, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.process_failure import failure_detail
 from scripts.production.showrunners import canonical_slug, timer_docs  # noqa: E402
 
 ReviewerType = Literal["code", "ui"]
@@ -279,7 +280,7 @@ def _require_finished_stop(pool: Pool) -> None:
 
 
 def _failure(result: subprocess.CompletedProcess[str]) -> str:
-    return result.stderr.strip() or result.stdout.strip() or f"mesh exited {result.returncode}"
+    return f"mesh: {failure_detail(result)}"
 
 
 def _thread_id(result: subprocess.CompletedProcess[str]) -> str:

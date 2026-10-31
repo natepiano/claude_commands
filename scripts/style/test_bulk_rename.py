@@ -24,6 +24,7 @@ import bulk_rename as bulk
 import berth_board
 import rules
 import style_ledger
+from ledger_test_support import remove_generation_schema
 import style_rules
 from scripts.direct.test_verify_untested_examples import rust_tool_path, workspace_metadata
 from approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename_check, binding_scope
@@ -663,6 +664,110 @@ class SourceCoverageTests(CargoProjectTests):
             self.fail(str(error))
 
 
+class ShorthandFieldLabelTests(CargoProjectTests):
+    def analyzer_server(self, edit: Callable[[str, int, str], tuple[bulk.SourceEdit, ...]]) -> ScriptedServer:
+        """Exercise the production rename adapter with deterministic LSP responses."""
+        server = ScriptedServer(edit)
+
+        def rename(path: Path, text: str, offset: int, new: str) -> bulk.WorkspaceRename:
+            analyzer = object.__new__(bulk.RustAnalyzer)
+            analyzer.sources = server.sources
+            analyzer.documents = dict(server.documents)
+            analyzer.versions = {path: 1}
+            changes = [{"range": {"start": bulk.lsp_position(text, item.start),
+                                  "end": bulk.lsp_position(text, item.end)}, "newText": item.text}
+                       for item in edit(text, offset, new)]
+            with mock.patch.object(analyzer, "request", side_effect=[True, {"changes": {path.as_uri(): changes}}]):
+                return analyzer.rename(path, text, offset, new)
+
+        _ = self.enterContext(mock.patch.object(server, "rename", side_effect=rename))
+        return server
+
+    def test_local_rename_expands_expression_shorthand_without_changing_public_field(self) -> None:
+        source = ("pub struct Record { pub dir: usize, fingerprint: usize }\n"
+                  "fn make() -> Record {\n    let dir = 1;\n"
+                  "    Record { dir, fingerprint: 2 }\n}\n")
+        server = self.analyzer_server(lambda text, offset, new: tuple(
+            edit for edit in word_edits(text, "dir", new) if edit.start >= text.index("fn make")))
+        result = self.rename(source, (self.finding(source, "dir", "directory_path_buf", 3),), server)
+        self.assertEqual(result.refusals, ())
+        self.assertEqual(len(result.kept), 1)
+        self.assertIn("pub struct Record { pub dir: usize, fingerprint: usize }", result.edited)
+        self.assertIn("Record { dir: directory_path_buf, fingerprint: 2 }", result.edited)
+
+    def test_pattern_declaration_maps_to_the_expanded_binding_and_its_uses(self) -> None:
+        source = ("struct Record { dir: usize }\nfn read(record: Record) -> usize {\n"
+                  "    let Record { dir, .. } = record;\n    dir\n}\n")
+        for expansion in ("number", "dir: number"):
+            with self.subTest(expansion=expansion):
+                def edits(text: str, offset: int, new: str) -> tuple[bulk.SourceEdit, ...]:
+                    return tuple(replace(edit, text=expansion) if edit.start == offset else edit
+                                 for edit in word_edits(text, "dir", new) if edit.start >= text.index("fn read"))
+                server = self.analyzer_server(edits)
+                result = self.rename(source, (self.finding(source, "dir", "number", 3),), server)
+                self.assertEqual(result.refusals, ())
+                self.assertEqual(len(result.kept), 1)
+                self.assertIn("let Record { dir: number, .. } = record;", result.edited)
+                self.assertIn("\n    number\n", result.edited)
+
+    def test_macro_shorthand_keeps_raw_labels_and_existing_expansion_is_not_duplicated(self) -> None:
+        source = 'fn read(r#type: usize) { assert_eq!(record, Record { r#type }); }'
+        parsed = bulk.BindingText(source)
+        span = next(span for span in parsed.spans if span.start == source.rindex("r#type"))
+        path = self.repo / "src/lib.rs"
+        rename = BindingRename(1, source, "r#type", "number")
+        server = ScriptedServer(lambda text, offset, new: ())
+        for original in ((bulk.SourceEdit(span.start, span.end, "number"),),
+                         (bulk.SourceEdit(span.start, span.end, "r#type: number"),),
+                         (bulk.SourceEdit(span.start, span.start, "r#type: "),
+                          bulk.SourceEdit(span.start, span.end, "number"))):
+            with self.subTest(original=original):
+                workspace = bulk.WorkspaceRename((bulk.DocumentEdits(path, source, original),))
+                result = bulk.preserve_shorthand_field_labels(server.sources, workspace, rename)
+                self.assertEqual(bulk.apply_edits(source, result.documents[0].edits),
+                                 source[:span.start] + "r#type: number" + source[span.end:])
+                self.assertEqual(bulk.preserve_shorthand_field_labels(server.sources, result, rename), result)
+
+    def test_public_guard_accepts_preserved_enum_pattern_label_but_rejects_field_rename(self) -> None:
+        source = "pub enum Record { Item { dir: usize } }\nfn read(record: Record) { let Record::Item { dir } = record; }"
+        path = self.repo / "src/lib.rs"
+        _ = (self.repo / "Cargo.toml").write_text('[package]\nname="sample"\nversion="1.0.0"\n')
+        parsed = bulk.BindingText(source)
+        site = next(span for span in parsed.spans if span.start == source.rindex("dir"))
+        rename = BindingRename(2, source.splitlines()[1], "dir", "number")
+        server = ScriptedServer(lambda text, offset, new: ())
+        workspace = bulk.WorkspaceRename((bulk.DocumentEdits(path, source, (bulk.SourceEdit(site.start, site.end, "number"),)),))
+        result = bulk.preserve_shorthand_field_labels(server.sources, workspace, rename)
+        bulk.public_edit_guard(result.documents[0], rename)
+        field = next(span for span in parsed.spans if span.token.value == "dir")
+        with self.assertRaisesRegex(bulk.BulkRenameError, "public item"):
+            bulk.public_edit_guard(bulk.DocumentEdits(path, source, (bulk.SourceEdit(field.start, field.end, "number"),)), rename)
+
+    def test_trailing_call_and_tuple_arguments_in_a_closure_are_not_record_fields(self) -> None:
+        source = ("fn read(dir: usize) { let closure = || -> Result<usize, ()> {\n"
+                  "    call(0, dir,); let _ = (0, dir,); let _ = [0, dir,];\n"
+                  "    Ok(dir)\n}; }")
+        path = self.repo / "src/lib.rs"
+        workspace = bulk.WorkspaceRename((bulk.DocumentEdits(path, source, word_edits(source, "dir", "number")),))
+        server = ScriptedServer(lambda text, offset, new: ())
+        result = bulk.preserve_shorthand_field_labels(server.sources, workspace,
+                                                      BindingRename(1, source.splitlines()[0], "dir", "number"))
+        self.assertEqual(result, workspace)
+        self.assertIn("call(0, number,)", bulk.apply_edits(source, result.documents[0].edits))
+
+    def test_field_rename_and_non_shorthand_edits_keep_the_analyzer_edit_exactly(self) -> None:
+        source = "struct Record { dir: usize }\nfn read(record: Record) { let _ = record.dir; }"
+        server = self.analyzer_server(lambda text, offset, new: word_edits(text, "dir", new))
+        path = self.repo / "src/lib.rs"
+        server.open(path, source)
+        result = server.rename(path, source, source.index("dir"), "number")
+        self.assertEqual(result.documents[0].edits, word_edits(source, "dir", "number"))
+        source = "fn read(dir: usize) { call(dir); Other { different: dir }; }"
+        workspace = bulk.WorkspaceRename((bulk.DocumentEdits(path, source, word_edits(source, "dir", "number")),))
+        self.assertEqual(bulk.preserve_shorthand_field_labels(server.sources, workspace,
+                         BindingRename(1, source, "dir", "number")), workspace)
+
+
 class ProtocolTests(CargoProjectTests):
     def test_f006_non_shorthand_multi_target_stays_unresolved(self) -> None:
         source = "fn f() {} fn g() {}"
@@ -1023,6 +1128,7 @@ class LedgerTests(CargoProjectTests):
             _ = connection.execute("DROP TABLE bulk_refusals")
             _ = connection.execute("DROP TABLE refill_results")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            remove_generation_schema(connection)
             _ = connection.execute("UPDATE schema_version SET version=23")
             connection.commit()
         with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
@@ -1031,6 +1137,7 @@ class LedgerTests(CargoProjectTests):
         with closing(sqlite3.connect(ledger.database)) as connection:
             _ = connection.execute("DROP TABLE refill_results")
             _ = connection.execute("ALTER TABLE held_findings DROP COLUMN built_at")
+            remove_generation_schema(connection)
             _ = connection.execute("UPDATE schema_version SET version=23")
             connection.commit()
         with style_ledger.Ledger(self.repo, ledger.database) as replayed:
@@ -1052,6 +1159,29 @@ class RustAnalyzerTests(CargoProjectTests):
     @override
     def set_up_tools(self) -> None:
         """Keep the caller's PATH, CARGO_HOME and RUSTUP_HOME."""
+
+    def test_real_local_shorthand_in_macros_and_patterns_preserves_field_names(self) -> None:
+        source = ("#[derive(Debug, PartialEq)]\npub struct Record { pub dir: usize }\n"
+                  "fn make(dir: usize) -> Record {\n"
+                  "    assert_eq!(Record { dir }, Record { dir: 1 });\n"
+                  "    let read = || -> Result<usize, ()> { Ok(std::cmp::max(0, dir,)) };\n"
+                  "    let _ = read();\n"
+                  "    Record { dir }\n}\n"
+                  "fn read(record: Record) -> usize {\n"
+                  "    let Record { dir } = record;\n    dir\n}\n")
+        root = self.repo / "src/lib.rs"
+        _ = root.write_text(source)
+        findings = (self.finding(source, "dir", "directory_path_buf", 3, "parameter"),
+                    self.finding(source, "dir", "directory_number", 10, "pattern"))
+        with bulk.RustAnalyzer(self.repo, timeout=120) as analyzer:
+            result = bulk.rename_file(analyzer, root, "src/lib.rs", source, findings)
+        self.assertEqual(result.refusals, ())
+        self.assertEqual(len(result.kept), 2)
+        self.assertIn("pub struct Record { pub dir: usize }", result.edited)
+        self.assertIn("assert_eq!(Record { dir: directory_path_buf }, Record { dir: 1 });", result.edited)
+        self.assertIn("Ok(std::cmp::max(0, directory_path_buf,))", result.edited)
+        self.assertIn("let Record { dir: directory_number } = record;", result.edited)
+        self.assertIn("\n    directory_number\n", result.edited)
 
     def test_real_f006_shorthand_preserves_both_targets_and_detects_either_capture(self) -> None:
         source = ("struct Pair { old: usize }\nstruct R { number: usize }\n"

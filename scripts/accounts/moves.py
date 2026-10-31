@@ -324,7 +324,6 @@ def read_journal() -> list[JournalEntry]:
         return HomeAccountUnresolved(Path.home() / f".{tool}")
 
     evidence = _role_evidence(store_file().with_name("roles.jsonl"))
-    shutdown = _shutdown_evidence()
     # Never read a present-day login to interpret a past home.
     homes = {"claude": Path.home() / ".claude",
              "codex": Path.home() / ".codex"}
@@ -333,23 +332,6 @@ def read_journal() -> list[JournalEntry]:
         tool = entry["tool"]
         home = homes[tool]
         recorded_login = dict(entry).get("login", "") if field == "from" else ""
-        for record in shutdown:
-            if record.get("request_id") != entry.get("request_id", entry["move_id"]):
-                continue
-            if field == "from" and isinstance(record.get("login"), str):
-                recorded_login = record["login"]
-            if field == "to":
-                label = numbered(record.get("target"), tool)
-                if isinstance(label, str):
-                    return label
-            session = record.get("session")
-            if isinstance(session, dict):
-                values = cast(dict[str, object], session)
-                directory = values.get("config_dir", str(Path.home() / ".claude"))
-                if directory == str(home) and field != "to":
-                    label = numbered(record.get("source_label", record.get("label")), tool)
-                    if isinstance(label, str):
-                        return label
         from scripts.whoami.account import ResolvedHistoryLabel
         resolver = cast(HistoryResolver, cast(object, import_module("scripts.accounts.accounts")))
         resolved = resolver.resolve_history_label(f"~/.{tool}", entry["at"], login=recorded_login if isinstance(recorded_login, str) else "")
@@ -491,18 +473,5 @@ def _role_evidence(path: Path) -> list[HomeAccountEvidence]:
             if stamp.tzinfo is not None:
                 found.append(HomeAccountEvidence(stamp, tool, label))
         except ValueError:
-            continue
-    return found
-
-
-def _shutdown_evidence() -> list[dict[str, object]]:
-    root = Path(os.environ.get("SHUTDOWN_STATE_DIR", str(Path.home() / ".local/state/shutdown")))
-    found: list[dict[str, object]] = []
-    for path in root.glob("**/*.json"):
-        try:
-            raw = cast(object, json.loads(path.read_text(encoding="utf-8")))
-            if isinstance(raw, dict):
-                found.append(cast(dict[str, object], raw))
-        except (OSError, UnicodeError, ValueError):
             continue
     return found

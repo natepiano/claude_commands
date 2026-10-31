@@ -8603,6 +8603,7 @@ def _wait_account_move_resumes(
             for key in pending:
                 outcomes[key] = WorkerMoveFailed("resume not confirmed before timeout", _account_move_command(*key))
             break
+        # The last poll ends at the deadline: summed 0.05 s steps can fall one rounding short of it.
         time.sleep(min(0.05, remaining))
     return outcomes
 

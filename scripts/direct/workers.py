@@ -1535,19 +1535,13 @@ class LiveUnitDirector:
 
 @dataclass(frozen=True)
 class NoLiveUnitDirector:
-    """No current session matches the run's director or its recorded restart identity."""
+    """Neither the registry nor the unit mark identifies a live director."""
 
 
 def live_unit_director(run: Path) -> LiveUnitDirector | NoLiveUnitDirector:
-    """Resolve the current director once, including restarts on another account.
-
-    Shutdown history carries the unit's stable host/name when a run's director
-    file still names the former session. Run markers and folders are not proof
-    that the director died.
-    """
+    """Resolve the run's live director, then its current marked unit after a restart."""
     from scripts.lib import unit_runs
     from scripts.message import sessions
-    from scripts.shutdown.launch_permission import shutdown_state_root
     director = unit_runs.director(run)
     live = sessions.live_sessions()
     for session in live:
@@ -1555,39 +1549,11 @@ def live_unit_director(run: Path) -> LiveUnitDirector | NoLiveUnitDirector:
             return LiveUnitDirector(session["sessionId"], session["pid"])
     context = _read(run / STATE)
     production, unit = context.get("production"), context.get("unit")
-    names: set[str] = set()
-    for path in shutdown_state_root().glob("*/history/*.json"):
-        try:
-            saved = _read(path)
-        except (OSError, ValueError, WorkerUnavailable):
-            continue
-        previous = _object(saved.get("session"))
-        host = _object(previous.get("host"))
-        if host.get("kind") not in ("unit", "legacy tmux unit"):
-            continue
-        runs = previous.get("run_dirs")
-        same_run = isinstance(runs, list) and any(
-            isinstance(value, str) and Path(value).resolve() == run.resolve()
-            for value in cast(list[object], runs))
-        same_unit = False
-        if production and unit and host.get("unit") == unit:
-            from scripts.production import staff_sources
-            try:
-                same_unit = staff_sources.unit_parent(str(unit), str(previous.get("session_id", ""))).slug == production
-            except OSError:
-                pass
-        if not (same_run or same_unit or (director and previous.get("session_id") == director)):
-            continue
-        for name in (previous.get("name"), host.get("session_name")):
-            if isinstance(name, str) and name:
-                names.add(name)
-        # A restart may resume the original session id rather than create one.
-        for session in live:
-            if session["sessionId"] == previous.get("session_id"):
-                return LiveUnitDirector(session["sessionId"], session["pid"])
-    for session in live:
-        if names.intersection((session["name"], *session["formerNames"])):
-            return LiveUnitDirector(session["sessionId"], session["pid"])
+    if isinstance(production, str) and isinstance(unit, str) and production and unit:
+        from scripts.production import unit_lookup
+        marked = unit_lookup.marked_unit(production, unit)
+        if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
+            return LiveUnitDirector(marked.claude.session_id, marked.claude.pid)
     return NoLiveUnitDirector()
 
 

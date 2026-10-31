@@ -240,7 +240,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertEqual([finding.finding_id for finding in style_plan._unbuilt_findings(ledger, origin.issue)],  # pyright: ignore[reportPrivateUsage]
                          [freed.finding_id])
 
-    def test_no_magic_decision_tickets_take_one_file_and_all_its_findings(self) -> None:
+    def test_no_magic_decision_tickets_take_every_file_and_all_its_findings(self) -> None:
         rule = self.rule("no-magic-values")
         self.sync()
         issue = self.approved_decision(rule, self.sources[:2], "restructure")
@@ -250,8 +250,8 @@ class StylePlanTests(StylePlanFixture):
         ledger.file_held(second.finding_id, issue)
         _ = self.refill_decisions()
         ticket, = ledger.ticket_open("names-unit")
-        self.assertEqual(ticket["files"], [self.sources[0]])
-        self.assertEqual(set(ticket["finding_ids"]), {f.finding_id for f in ledger.proposal_findings(issue) if f.path == self.sources[0]})
+        self.assertEqual(ticket["files"], list(self.sources[:2]))
+        self.assertEqual(set(ticket["finding_ids"]), {f.finding_id for f in ledger.proposal_findings(issue)})
 
     def test_queued_and_new_decisions_share_unchanged_site_proof_and_followed_coordinates(self) -> None:
         _ = self.types_unit()

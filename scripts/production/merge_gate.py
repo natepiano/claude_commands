@@ -64,6 +64,7 @@ from scripts.build_targets import build_targets  # noqa: E402
 from scripts.build_hold import build_hold  # noqa: E402
 from scripts.buildlog.store import host_name  # noqa: E402
 from scripts.lib.user_zone import user_zone  # noqa: E402
+from scripts.lib.process_failure import failure_detail  # noqa: E402
 from scripts.lib import scratch  # noqa: E402
 from scripts.lint import memory_admit  # noqa: E402
 
@@ -509,7 +510,7 @@ def git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
 def checked_git(repo: Path, *arguments: str) -> str:
     result = git(repo, *arguments)
     if result.returncode:
-        raise GateRefused(f"git {' '.join(arguments)}: {result.stderr.strip() or result.stdout.strip()}")
+        raise GateRefused(f"git {' '.join(arguments)}: {failure_detail(result)}")
     return result.stdout.strip()
 
 
@@ -617,7 +618,7 @@ def typecheck_python() -> Path | str:
             except (OSError, subprocess.TimeoutExpired) as error:
                 return f"type-check venv missing: {error}; build it with: {command}"
             if built.returncode:
-                return f"type-check venv missing: {built.stderr.strip() or built.stdout.strip()}; build it with: {command}"
+                return f"type-check venv missing: {failure_detail(built)}; build it with: {command}"
         _ = stamp.write_text(wanted)
         print(f"Type-check venv built: {venv}", flush=True)
         return python
@@ -1239,7 +1240,7 @@ except (OSError, subprocess.SubprocessError) as error:
 def require_clean_promotion(repo: Path) -> None:
     result = command([sys.executable, "-c", PROMOTION_TRACKED_CHECK], repo)
     if result.returncode:
-        raise GateRefused("promotion refused: " + (result.stdout.strip() or result.stderr.strip()))
+        raise GateRefused("promotion refused: " + failure_detail(result))
 
 
 
@@ -1390,7 +1391,7 @@ def notify_style(repo: Path, branch: str, tip: str) -> None:
             capture_output=True, text=True, check=False, timeout=30,
         )
         if result.returncode or result.stdout.strip() or result.stderr.strip():
-            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            detail = failure_detail(result)
             print("style sync: " + detail.replace("\n", "; "), flush=True)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         print("style sync: " + str(error).replace("\n", "; "), flush=True)

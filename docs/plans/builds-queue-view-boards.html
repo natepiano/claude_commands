@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Build queue view</title>
+<style>
+:root { --bg:#0d0d0d; --text:#e6e6e6; --dim:#999999; --border:#555555; --amber:#ffc107; --blue:#b1b9f9; --green:#4eba65; --red:#ff6b80; }
+html, body { margin:0; background:var(--bg); color:var(--text); }
+body { padding:24px 16px; }
+.pane { box-sizing:content-box; width:60ch; max-width:100%; overflow-x:auto; margin:0 auto; padding:12px 16px;
+  border:1px solid var(--border); border-radius:6px; font:15px/1.35 ui-monospace, "JetBrains Mono", "DejaVu Sans Mono", Menlo, monospace;
+  white-space:pre; }
+.dim { color:var(--dim); } .amber { color:var(--amber); } .blue { color:var(--blue); }
+.green { color:var(--green); } .red { color:var(--red); } .on-blue { background:var(--blue); }
+</style>
+</head>
+<body>
+<div class="pane"><span class="dim">Build queue · 18:52</span>
+
+                                       <span class="green">free 4.4</span><span class="dim"> │ </span><span class="blue">taken 16.6</span>
+<span class="dim">budget 21.0                            </span><span class="green">████</span><span class="green on-blue">▍</span><span class="blue">████████████████</span>
+
+<span class="dim"> # showrunner   unit       step    min need</span>
+<span class="amber"> 1</span> performance  <span class="blue">metrics-v… </span>clippy  <span class="dim">113 </span><span class="amber">██████▊</span><span class="amber"> 6.8</span><span class="red"> ⊘ 09:18</span>
+<span class="dim"> 2</span> tool-based-… <span class="blue">geometry-… </span>clippy  <span class="dim">112 </span><span class="amber">███████▍</span><span class="dim"> 7.4</span>
+<span class="dim"> 3</span> tool-based-… <span class="blue">cables     </span>clippy  <span class="dim">106 </span><span class="amber">██████</span><span class="dim"> 5.9</span>
+<span class="dim"> 4</span> cargo-liner… <span class="blue">values     </span>clippy  <span class="dim">106 </span><span class="amber">███</span><span class="dim"> 3.0</span>
+<span class="dim"> 5</span> cargo-liner  <span class="blue">tile       </span>mend    <span class="dim"> 92 </span><span class="amber">███████▎</span><span class="dim"> 7.3</span>
+<span class="dim"> 6</span> cargo-liner  <span class="blue">port       </span>mend    <span class="dim"> 78 </span><span class="amber">███████▎</span><span class="dim"> 7.3</span>
+<span class="dim"> 7</span> cargo-liner  <span class="blue">port       </span>mend    <span class="dim"> 78 </span><span class="amber">███████▎</span><span class="dim"> 7.3</span>
+<span class="dim"> 8</span> cargo-liner  <span class="blue">port       </span>mend    <span class="dim"> 78 </span><span class="amber">███████▎</span><span class="dim"> 7.3</span>
+<span class="dim"> 9</span> tool-based-… <span class="blue">hana-migr… </span>mend    <span class="dim"> 77 </span><span class="amber">███████▋</span><span class="dim"> 7.6</span>
+<span class="dim">10</span> tool-based-… <span class="blue">assembly   </span>doc     <span class="dim"> 77 </span><span class="amber">████▉</span><span class="dim"> 4.9</span>
+<span class="dim">11</span> builds       <span class="blue">resources  </span>build   <span class="dim"> 76 </span><span class="amber">██████████▉</span><span class="dim"> 10.9</span>
+<span class="dim">12</span> tool-based-… <span class="blue">lfo        </span>doc     <span class="dim"> 74 </span><span class="amber">███████▍</span><span class="dim"> 7.4</span>
+<span class="dim">13</span> tool-based-… <span class="blue">trunk      </span>clippy  <span class="dim"> 68 </span><span class="amber">███████▌</span><span class="dim"> 7.5</span>
+<span class="dim">14</span> tool-based-… <span class="blue">trunk      </span>mend    <span class="dim"> 67 </span><span class="amber">████████▉</span><span class="dim"> 8.9</span>
+<span class="dim">15</span> tool-based-… <span class="blue">trunk      </span>nextest <span class="dim"> 67 </span><span class="amber">██████████▉</span><span class="dim"> 10.8</span>
+<span class="dim">16</span> cargo-liner  <span class="blue">tile       </span>build   <span class="dim"> 66 </span><span class="amber">██████████▉</span><span class="dim"> 10.9</span>
+<span class="dim">17</span> tool-based-… <span class="blue">assembly   </span>nextest <span class="dim"> 65 </span><span class="amber">███████████▏</span><span class="dim"> 11.2</span>
+<span class="dim">18</span> cargo-liner  <span class="blue">port       </span>clippy  <span class="dim"> 62 </span><span class="amber">██████▏</span><span class="dim"> 6.1</span>
+<span class="dim">19</span> cargo-liner  <span class="blue">tile       </span>clippy  <span class="dim"> 60 </span><span class="amber">██████▏</span><span class="dim"> 6.1</span>
+<span class="dim">20</span> tool-based-… <span class="blue">startup    </span>check   <span class="dim"> 59 </span><span class="amber">██▌</span><span class="dim"> 2.6</span>
+<span class="dim">21</span> cargo-liner… <span class="blue">modules    </span>clippy  <span class="dim"> 52 </span><span class="amber">███</span><span class="dim"> 3.0</span>
+<span class="dim">22</span> tool-based-… <span class="blue">lfo        </span>mend    <span class="dim"> 49 </span><span class="amber">████████▏</span><span class="dim"> 8.2</span>
+<span class="dim">23</span> performance  <span class="blue">benchmark  </span>mend    <span class="dim"> 48 </span><span class="amber">███████▋</span><span class="dim"> 7.6</span>
+<span class="dim">24</span> cargo-liner  <span class="blue">tile       </span>nextest <span class="dim"> 35 </span><span class="amber">█</span><span class="dim"> 1.0</span>
+<span class="dim">25</span> cargo-liner… <span class="blue">types      </span>clippy  <span class="dim"> 34 </span><span class="amber">███</span><span class="dim"> 3.0</span>
+<span class="dim">26</span> tool-based-… <span class="blue">research   </span>nextest <span class="dim"> 32 </span><span class="amber">███████████▏</span><span class="dim"> 11.2</span>
+<span class="dim">27</span> cargo-liner… <span class="blue">—          </span>mend    <span class="dim"> 23 </span><span class="amber">███▏</span><span class="dim"> 3.2</span>
+<span class="dim">28</span> cargo-liner  <span class="blue">berth      </span>mend    <span class="dim">  9 </span><span class="amber">███▏</span><span class="dim"> 3.2</span>
+<span class="dim">29</span> tool-based-… <span class="blue">demo       </span>nextest <span class="dim">  8 </span><span class="amber">███████████▏</span><span class="dim"> 11.2</span>
+<span class="dim">30</span> tool-based-… <span class="blue">widget     </span>nextest <span class="dim">  8 </span><span class="amber">███████████▏</span><span class="dim"> 11.1</span>
+<span class="dim">31</span> performance  <span class="blue">metrics-g… </span>nextest <span class="dim">  8 </span><span class="amber">████████▌</span><span class="dim"> 8.5</span>
+<span class="dim">32</span> tool-based-… <span class="blue">fastest    </span>nextest <span class="dim">  6 </span><span class="amber">█▋</span><span class="dim"> 1.6</span>
+<span class="dim">33</span> tool-based-… <span class="blue">cables     </span>clippy  <span class="dim">  2 </span><span class="amber">██████▊</span><span class="dim"> 6.8</span>
+<span class="dim">34</span> cargo-liner… <span class="blue">names      </span>nextest <span class="dim">  1 </span><span class="amber">█▊</span><span class="dim"> 1.8</span>
+<span class="dim">35</span> cargo-liner  <span class="blue">handler    </span>clippy  <span class="dim">  1 </span><span class="amber">███</span><span class="dim"> 3.0</span>
+<span class="dim">36</span> tool-based-… <span class="blue">inspectors </span>nextest <span class="dim">  1 </span><span class="amber">███████████▏</span><span class="dim"> 11.2</span>
+<span class="dim">37</span> cargo-liner  <span class="blue">handler    </span>nextest <span class="dim">  1 </span><span class="amber">█▊</span><span class="dim"> 1.8</span>
+<span class="dim">38</span> tool-based-… <span class="blue">—          </span>nextest <span class="dim">  0 </span><span class="amber">████████████▏</span><span class="dim"> 12.2</span></div>
+</body>
+</html>

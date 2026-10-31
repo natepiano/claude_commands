@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import style_plan
+import berth_board
 import unit_plans
 import style_proposals
 import rules
@@ -35,26 +36,6 @@ class StylePlanTests(StylePlanFixture):
                                 f"| {family}-unit | docs/style-production/units/{family}-unit.md | {worktree} | demo-style-{family} |\n")
         return self.rule(family + "-borrow", f"tier: C\nfamily: {family}\ninput_scope: file\n")
 
-    def borrowing_decision(self, rule: str, family: rules.Family, path: str, count: int = 1) -> Path:
-        folder = self.root / "borrow-issues"
-        folder.mkdir(exist_ok=True)
-        issue = folder / (family + ".md")
-        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
-        ledger = self.ledger()
-        judge = f"judge-{family}-1"
-        ledger.ticket_add(judge, f"judge-{family}", "read", family, "crates/alpha", [path], [rule])
-        ledger.ticket_assign(judge, "style/main")
-        _ = ledger.ticket_base(judge)
-        ledger.ticket_drop(judge)
-        for index in range(count):
-            finding = ledger.hold(rule, path, 1, f"change {index}", "type", "u32", "u64", blob, judge)
-            ledger.file_held(finding.finding_id, issue)
-        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nplan: approved\n"
-                             + f"unit: {family}-unit\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
-        if "**Proposals:**" not in self.doc.read_text():
-            _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
-        return issue
-
     def assert_projected_follow_count_matches_borrow(self) -> None:
         values = self.borrowing_family("values")
         source, destination = self.sources[:2]
@@ -64,6 +45,7 @@ class StylePlanTests(StylePlanFixture):
         self.write_generated_body(issue)
         _ = self.git("rm", "-q", source)
         self.commit_files({destination: "pub struct Parent {\n    old: u32,\n}\n"})
+        self.finish_judging()
         ledger = self.ledger()
         before = tuple(ledger._connection.iterdump())  # pyright: ignore[reportPrivateUsage]
         busy = style_plan.BusyFiles(self.board(source), frozenset())
@@ -142,6 +124,7 @@ class StylePlanTests(StylePlanFixture):
             self.record(types, path, self.tip)
         _ = self.borrowing_decision(types, "types", self.sources[0], 4)
         _ = self.borrowing_decision(values, "values", self.sources[2], 1)
+        self.finish_judging()
         predecessor = style_plan.WaitingCheckpoint("names-unit-1", self.tip, frozenset({self.sources[0]}),
                                                     ("crates/alpha", "crates/beta"))
         with (mock.patch.object(style_proposals, "proposal_command"),
@@ -168,9 +151,11 @@ class StylePlanTests(StylePlanFixture):
         _ = self.rule("structure", "tier: D\nfamily: modules\n")
         self.sync()
         output = io.StringIO()
-        with redirect_stdout(output):
+        with (redirect_stdout(output), mock.patch.object(berth_board, "read_board", return_value=self.board(*self.sources))):
             code = style_plan.main(["next-phase", "--unit", "names-unit", "--plan", str(self.plan), "--repo", str(self.repo)])
         self.assertEqual(code, 3)
+        self.assertIn("structure stays with modules:", output.getvalue())
+        self.assertIn("file busy", output.getvalue())
         self.assertIn("no available work:", output.getvalue())
         diagnostic = next(line for line in output.getvalue().splitlines() if line.startswith("no available work:"))
         for family in style_plan.FAMILIES:
@@ -190,6 +175,7 @@ class StylePlanTests(StylePlanFixture):
         values = self.borrowing_family("values")
         self.sync()
         _ = self.borrowing_decision(values, "values", self.sources[0], 2)
+        self.finish_judging()
         ledger = self.ledger()
         before = tuple(ledger._connection.iterdump())  # pyright: ignore[reportPrivateUsage]
         with (mock.patch.object(style_proposals, "proposal_command", side_effect=AssertionError("preview writes issue")),
@@ -239,6 +225,7 @@ class StylePlanTests(StylePlanFixture):
         def changed(finding: style_ledger.HeldFinding, _definitions: Mapping[str, rules.Rule]) -> bool:
             return finding.finding_id == stale
 
+        self.finish_judging()
         with (mock.patch.object(style_ledger, "rule_changed_since_judged", side_effect=changed),
               mock.patch.object(style_proposals, "proposal_command"), redirect_stdout(io.StringIO())):
             count = style_plan._select_phase(  # pyright: ignore[reportPrivateUsage]
@@ -270,6 +257,7 @@ class StylePlanTests(StylePlanFixture):
         for path in (self.sources[1], self.sources[2]):
             finding = ledger.hold(values, path, 1, "candidate " + path, "type", "u32", "u64", blob, "judge-values-1")
             ledger.file_held(finding.finding_id, issue)
+        self.finish_judging()
         busy = style_plan.busy_files(self.repo, self.doc, ledger, "names-unit", self.board())
         for path in (self.sources[0], self.sources[1], self.sources[2]):
             self.assertTrue(busy.contains(path), path)

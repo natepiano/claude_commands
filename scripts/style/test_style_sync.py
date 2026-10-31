@@ -355,7 +355,7 @@ class StyleSyncTests(unittest.TestCase):
         self.checkpoint_for_wake()
         self.waiting_units("names-unit", "types-unit")
         self.wake_sender("names-unit")
-        self.assertEqual(self.merge_for_wake(), (0, "style_ledger: wake names-unit: FAILED: unavailable\n", ""))
+        self.assertEqual(self.merge_for_wake(), (0, "style_ledger: wake names-unit: send.py: stdout: FAILED: unavailable\n", ""))
         self.assertEqual(self.remaining_waiters(), ["names-unit"])
         with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(connection.execute("SELECT state FROM tickets WHERE id='modules-unit-1'").fetchone(), ("merged",))
@@ -458,7 +458,7 @@ class StyleSyncTests(unittest.TestCase):
         _ = (self.root / "send.py").write_text("print('FAILED: unavailable')\nraise SystemExit(3)\n")
         code, output = self.notice()
         self.assertEqual(code, 0)
-        self.assertEqual(output, "style_sync: notify: FAILED: unavailable\n")
+        self.assertEqual(output, "style_sync: notify: send.py: stdout: FAILED: unavailable\n")
 
     def test_notify_lookup_refusal_prints_one_prefix_and_keeps_the_merge_successful(self) -> None:
         with mock.patch.object(style_sync, "standing_style_production",
@@ -1178,7 +1178,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         for outcome, code in (("FAILED: unavailable", 3), ("relay error", 1)):
             with self.subTest(outcome=outcome):
                 self.handoff_sender(outcome, code)
-                self.assertEqual(self.send_handoff(checkpoint), (1, f"style_sync: hand-off: {outcome}\n"))
+                self.assertEqual(self.send_handoff(checkpoint), (1, f"style_sync: hand-off: send.py: stdout: {outcome}\n"))
                 self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "pending", ""))
 
     def test_resume_records_a_queued_notice_as_sent(self) -> None:
