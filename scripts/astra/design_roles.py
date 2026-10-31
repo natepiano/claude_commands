@@ -408,7 +408,13 @@ def _authority_local(operation: str, payload: dict[str, object]) -> dict[str, ob
             repositories[repository_id] = payload
             _atomic(path, repositories)
             return payload
-        repository = _object(repositories.get(repository_id))
+        repository = repositories.get(repository_id)
+        if repository is None:
+            host = payload.get('host') or '<host>'
+            raise RoleRefused(f'repository {repository_id} is not registered; run design_roles.py register '
+                              + f'--repository {repository_id} --host {host} '
+                              + '--checkout <absolute path> --inventory-complete')
+        repository = _object(repository)
         if repository.get('inventory_complete') is not True:
             raise RoleRefused('legacy inventory incomplete; recovery required')
         checkouts = _object(repository.get('checkouts'))
