@@ -127,6 +127,29 @@ class NamedKeychainCredentialsTests(unittest.TestCase):
         self.assertTrue(credentials.get("claudeAiOauth", {}).get("accessToken") == "synthetic-named-token")
         self.assertEqual([call[3] for call in self.keychain.calls], [service])
 
+    def test_keychain_entry_without_a_login_token_never_sends_a_usage_request(self) -> None:
+        folder = self.home / ".claude2"
+        folder.mkdir()
+        _ = (folder / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "idle@example.invalid"}}))
+        entries = (agent_accounts.ClaudeOauth(subscriptionType="max", expiresAt=1),
+                   agent_accounts.ClaudeOauth(subscriptionType="max", expiresAt=1, accessToken=""),
+                   agent_accounts.ClaudeOauth(subscriptionType="max"))
+        for oauth in entries:
+            with self.subTest(oauth=oauth):
+                self.keychain.entries[folder_service(folder)] = json.dumps({"claudeAiOauth": oauth})
+                with (patch.object(urllib.request, "urlopen", side_effect=AssertionError("missing token sent")) as http,
+                      patch.object(usage_store, "claim_read") as claim):
+                    report = agent_accounts.claude_live(folder, use_disk_identity=True)
+                self.assertEqual(report.usage_read_outcome, agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN)
+                self.assertIn("no login token", report.quota_problem or "")
+                self.assertEqual(report.quotas, [])
+                http.assert_not_called()
+                claim.assert_not_called()
+                usage_store.save([report], datetime.now(timezone.utc))
+                self.assertEqual(usage_store.latest_read_outcome(usage_store.load()["idle@example.invalid"]),
+                                 agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN)
+
 
 @final
 class SharedUsageReadTests(unittest.TestCase):
