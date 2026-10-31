@@ -1,7 +1,7 @@
 # Frozen copies: one helper makes every build copy
 
 > **Production: builds** — unit `verify-unit`; production doc `docs/plans/builds-production.md`
-> **Status:** approved by the user 2026-10-29 (via builds). Phase 1 takes the build hold tonight on builds' go after natedev's Secure Boot sitting (see Phase 1), with resources-unit's case D. Unit-director survey of the path format closed 23:00 EDT; its answers are in Survey changes.
+> **Status:** approved by the user 2026-10-29 (via builds). Phase 1 done: measured 2026-10-30 02:00-02:41 EDT under verify-unit's build hold; the builds showrunner set the target mode to seed on 2026-10-30 (Decision, Verdict). Unit-director survey of the path format closed 23:00 EDT; its answers are in Survey changes.
 
 One helper, `scripts/copies/copies.py` (verify-unit), makes every frozen copy we build in: gate, review, merge and land copies on natedev, and the Mac test mirrors. It names each copy `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, gives it its own git, fills its target by the measured best option, and registers it with the cleanup that already exists.
 
@@ -44,6 +44,27 @@ Lifetime tools that exist: `scripts/lib/scratch.py` (tasks `run:`, `phase:`, `ga
 4. Both 1 and 2 pass: shared build-dir (no copy, least disk).
 
 Expected (unverified): rule 1 fails on the lock (`sweep.py:123`), and seeding wins only without `incremental/` and only with source times kept; a full-copy seed with `incremental/` cannot fit under the floor (Disk cost). Hardlink seeding (`cp -al`) is ruled out: cargo writes outputs in place, which would change the source target (W2 §3).
+
+**Verdict (Phase 1, 2026-10-30).** Measured on hana `c421a1a6` with cargo 1.99.0 and sccache, 02:00-02:41 EDT under verify-unit's build hold; all cases exit 0. Table: `/tmp/claude/unit/bf5b8d4c-77ff-4f7b-9318-afb6114ad8f2/copies/results/results.tsv`.
+
+| Case | Copy s | GiB added | Build C s / crates | Build C+1 s / crates | Lock wait s |
+| --- | --- | --- | --- | --- | --- |
+| A cold fresh copy | 0 | 11.70 (target) | 224.8 / 568 | 27.1 / 5 | 0 |
+| B seed + `incremental/`, fresh checkout | 40.6 | 15.07 | 78.9 / 25 | 15.8 / 5 | 0 |
+| B seed + `incremental/`, `cp -a` | 63.9 | 15.07 | 0.7 / 0 | 77.2 / 5 | 0 |
+| C seed, no `incremental/`, fresh checkout | 27.0 | 10.29 | 78.6 / 25 | 15.2 / 5 | 0 |
+| C seed, no `incremental/`, `cp -a` | 18.9 | 10.30 | 1.7 / 0 | 75.5 / 5 | 0 |
+| D shared build-dir: clone 1, clone 2 | 0 | 14.62 (folder) | 256.4 / 568, then 0.7 / 0 | pair at once: 68.8 / 5 and 69.0 / 0; clone 1 again 0.6 / 0 | 68.7 of 69.0 |
+
+Case E (resources-unit's compile-cache trial): clone builds with `CARGO_INCREMENTAL=0` got 0 workspace-crate cache hits, and mend with sccache took 132.4 s against 115.4 s without. Neither was adopted.
+
+- Rule 1 fails: with two builds at once, one waited 68.7 s of 69.0 s on the lock (99%, limit 10%). Clone 2 (0 crates) and clone 1 again (0 crates) pass.
+- Rule 2 passes: seed C with `cp -a` takes 18.9 + 1.7 = 20.6 s, 9% of A's 224.8 s, and adds 10.30 GiB against A's 11.70 GiB (-1.4 GiB net). `incremental/` cuts no build time (C+1 77.2 s against 75.5 s), so it is dropped.
+- **Target mode: seed, without `incremental/`, sources copied with `cp -a`** (builds showrunner, 2026-10-30). `copies.py` has this one mode and no option; it has no shared target mode.
+
+Risks:
+1. Each live copy holds about 10.3 GiB. The helper's cleanup must end copies on time, or copies push `/` under the 300 GiB floor and the sweep trims other targets.
+2. The first edit after a `cp -a` seed takes 75.5 s, against 15.2 s for a fresh checkout. The 25-crate rebuild that a fresh checkout pays at C moves to the first edit.
 
 ## Naming
 
@@ -144,7 +165,7 @@ Busy day: in-scope clones run about 78 a week (12 gate/merge + 31 phase + 22 oth
 
 ## Phases
 
-### Phase 1 — Measure seed vs shared build-dir on one hana commit  · status: todo
+### Phase 1 — Measure seed vs shared build-dir on one hana commit  · status: done
 
 #### Work Order
 
