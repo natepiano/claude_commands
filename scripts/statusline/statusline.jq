@@ -7,18 +7,17 @@
 # only cargo-tile. statusline.sh reads its inputs with builtins and execs this:
 # one process.
 #
-# Called as:  jq -r --arg pwd "$PWD" --arg account "$account" --arg showrunners "<ids>"
-#                --arg showrunner "<session JSON>" --arg own "<session JSON>" --arg counts "<id> <row> lines"
+# Called as:  jq -r --arg pwd "$PWD" --arg account "$account"
+#                --rawfile staff <staff.json> --arg own "<session JSON>" --arg counts "<id> <row> lines"
 #                --slurpfile labels <by-label.json> --rawfile colors <statusline.conf> -f statusline.jq
-# Input:      the status line JSON on stdin; labels, showrunner, own, showrunners, counts and
+# Input:      the status line JSON on stdin; labels, staff, own, counts and
 #             colors are optional; /dev/null stands in for missing input files.
-#             Empty or damaged showrunner text leaves the unit director unnamed.
+#             Empty or damaged staff text leaves the session unassigned.
 #             $own is this session's record; its name is used only when its sessionId
 #             is this session's.
 # Output:     Line 1: "<role> | <path>", the path with "~" for the home folder (user, 2026-10-19).
 #             A showrunner reads "<session> showrunner", a unit director "<session> unit for
-#             <showrunner name>"; the session name comes only from this session's record, and
-#             " for <name>" only when the live showrunner record has a name.
+#             <showrunner name>"; the assignment and its parent name come from the staff row.
 #             Line 2: "<account> | <model [effort]> | <tokens with thousands separators> |
 #             5-hour <N>% left until <HH:MM zone> | weekly <M>% left until <Day HH:MM zone>",
 #             each piece only when present, the 5-hour piece only when under 10% is left,
@@ -28,7 +27,7 @@
 #             from each showrunner's counts cache, with each count in bold. Each
 #             part ("2 changes") takes its type's counts.<type> color, matched by
 #             its word, so the user learns each type by its color (user, 2026-10-20).
-#             ANSI colors wrap the role (with the session name before it), account, tokens,
+#             ANSI colors wrap the staff assignment, account, tokens,
 #             percentages and the counts row's parts only.
 
 def trim: gsub("^\\s+|\\s+$"; "");
@@ -72,21 +71,66 @@ def commas: tostring | explode | reverse | to_entries
   | map(if .key > 0 and .key % 3 == 0 then [44, .value] else [.value] end)
   | flatten | reverse | implode;
 
-# The part this session plays, from the signals the production scripts use
-# (shutdown's session kinds, docs/as-built/shutdown-and-restart.md), first match wins.
-# showrunner:    its session id is one a showrunner update timer targets.
-# worker:        agent_bg.sh hands a worker UNIT_TEAM_ROLE through
-#                --settings. It comes before unit director because a background
-#                session inherits the daemon's environment, and a daemon a unit
-#                director started carries SHOWRUNNER_UNIT.
-# unit director: add_unit.py launches the unit director's tmux session with SHOWRUNNER_UNIT.
-def role:
-  (.session_id // "") as $id
-  | if $id != "" and ($ARGS.named.showrunners // "" | split(" ") | any(. == $id)) then "showrunner"
-    elif ($ENV.UNIT_TEAM_ROLE // $ENV.PLAN_DELEGATE_TEAM_ROLE // "") != "" then "worker"
-    elif ($ENV.SHOWRUNNER_UNIT // "") != "" then "unit director"
-    else "unassigned"
-    end;
+# Match StaffLabels.environment: identity, timer target, exact local worktree,
+# then the unique normalized name. An unknown explicit id never falls through.
+def staff_location($field; $kind; $states):
+  if has($field) then .kind == $kind and
+    (.[$field] | type == "object" and keys == ["machine", "path", "state"]
+     and (.machine | type) == "string" and .machine != "" and (.machine | trim) == .machine
+     and (.path | type) == "string" and (.path | startswith("/"))
+     and (.state as $state | $states | index($state)) != null)
+  else true end;
+
+def staff_rows:
+  try ($ARGS.named.staff // "" | fromjson
+       | select((.schema == 1 or .schema == 2) and (.rows | type) == "array") | .rows
+       | select(all(.[]; (.id | type) == "string" and (.name | type) == "string"
+                    and (.kind == "showrunner" or .kind == "unit" or .kind == "worker")
+                    and staff_location("worktree"; "unit"; ["present", "removed"])
+                    and staff_location("doc"; "showrunner"; ["live", "wrapped"]))))
+  catch [];
+
+# The notifier's CHECK is shell-quoted argv, parsed as shlex.split does for the
+# script and document tokens. Nothing in the command is evaluated or executed.
+def shell_words:
+  "(?:[^\\s'\"\\\\]|\\\\.|'[^']*'|\"(?:[^\"\\\\]|\\\\.)*\")+" as $word
+  | if test("^\\s*(?:" + $word + "\\s*)*$") then [scan($word)
+   | gsub("'(?<single>[^']*)'|\"(?<double>(?:[^\"\\\\]|\\\\.)*)\"|\\\\(?<escaped>.)";
+          .single // (if .double != null then (.double | gsub("\\\\(?<c>[\\\\\"$`])"; .c))
+                      else .escaped end))] else [] end;
+
+def timer_owners($rows; $session_id; $machine):
+  [$ARGS.named | to_entries[] | select(.key | startswith("timer_"))
+   | (.key | ltrimstr("timer_")) as $slug
+   | (.value | split("\n") | map(select(contains("=")) | split("=")
+                                 | {key: .[0], value: (.[1:] | join("="))}) | from_entries) as $conf
+   | select($session_id != "" and $conf.TARGET == "session:" + $session_id)
+   | ($conf.CHECK // "" | shell_words) as $check
+   | ([$check | to_entries[] | select(.value | split("/") | last == "production_check.sh") | .key][0]) as $index
+   | (if $index != null then $check[$index + 1] else null end) as $doc
+   | select(($doc | type) == "string" and ($doc | startswith("/")))
+   | [$rows[] | select(.kind == "showrunner" and .doc.state == "live"
+                      and .doc.machine == $machine and .doc.path == $doc)] as $owners
+   | (if ($owners | length) > 0 then $owners
+      else [$rows[] | select(.kind == "showrunner" and .name == $slug)] end)
+   | select(length == 1) | .[0]];
+
+def assignment($rows; $name; $session_id; $cwd):
+  ($ENV.STAFF_ID // "") as $id
+  | ($ARGS.named.machine // "") as $machine
+  | (if $id != "" then [$rows[] | select(.id == $id)]
+     else timer_owners($rows; $session_id; $machine) as $timers
+       | [$rows[] | select(.kind == "unit" and $cwd != "" and .worktree.state == "present"
+                          and .worktree.machine == $machine and .worktree.path == $cwd)] as $folders
+       | if ($timers | length) == 1 then $timers
+         elif ($folders | length) == 1 then $folders
+         else ($ENV.SHOWRUNNER_UNIT_ID // "" | if . == "" then $name // "" else . end
+                         | if test("^[A-Za-z0-9][A-Za-z0-9_-]*$")
+                         then sub("[-_]unit$"; "") else "" end) as $short
+       | [$rows[] | select((.kind == "unit" or .kind == "showrunner") and .name == $short)]
+         end
+     end)
+  | if length == 1 then .[0] else null end;
 
 def remaining($window):
   ($window.used_percentage? // null) as $used
@@ -145,14 +189,17 @@ def usage($config; $label; $window; $fmt):
      ($ARGS.named.home_config // "" | try (fromjson | .oauthAccount.emailAddress // "") catch "") as $login
      | if ($login | type) == "string" and $login != "" then ($ARGS.named.account // "") else "" end
    else ($ARGS.named.account // "") end) as $account
-| ($ARGS.named.showrunner // "" | try fromjson catch null
-   | if type == "object" then .name else null end
-   | if type == "string" and . != "" then . else null end) as $showrunner_name
 | (.session_id // "") as $session_id
 | ($ARGS.named.own // "" | try fromjson catch null
    | if type == "object" and $session_id != "" and .sessionId == $session_id then .name else null end
    | if type == "string" and . != "" then . else null end) as $session_name
+| (staff_rows // []) as $rows
 | ((.workspace.current_dir // .cwd // "") | if . == "" then $pwd else . end) as $d
+| assignment($rows; $session_name; $session_id; $d) as $assignment
+| (if $assignment.kind == "unit" then
+     [$rows[] | select(.id == $assignment.parent and .kind == "showrunner")]
+     | if length == 1 then .[0].name else null end
+   else null end) as $showrunner_name
 # Trailing slashes stripped first, so "/etc/nixos/" gives "/etc/nixos"; "/" stays "/".
 | ($d | sub("(?<=.)/+$"; "")) as $full
 | ($ENV.HOME // "" | sub("/+$"; "")) as $home
@@ -163,13 +210,14 @@ def usage($config; $label; $window; $fmt):
 | ((.model.display_name // "")
    + (if (.effort.level // "") == "" then "" else " " + .effort.level end)) as $m
 | ([
-     (role as $role
+     ((if $assignment.kind == "unit" then "unit director"
+        else $assignment.kind // "unassigned" end) as $role
       | (if $role == "unit director" then "unit" else $role end)
       | (if $role == "unit director" and ($showrunner_name | type) == "string"
             and $showrunner_name != ""
          then . + " for " + $showrunner_name else . end)
-      | if $session_name != null and ($role == "showrunner" or $role == "unit director")
-        then $session_name + " " + . else . end
+      | if $assignment != null and ($role == "showrunner" or $role == "unit director")
+        then $assignment.name + " " + . else . end
       # The session name takes the role's color.
       | color($colors; "role." + ($role | gsub(" "; "-")))),
      $path

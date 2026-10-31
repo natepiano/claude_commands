@@ -84,6 +84,14 @@ class QueueTests(unittest.TestCase):
     def snapshot_text(data: QueueLines) -> str:
         return "\n".join("".join(span["text"] for span in row) for row in data["lines"])
 
+    def test_head_line_uses_singular_for_one_recorded_bump(self) -> None:
+        write_bumps(NOW, [bump_line(NOW - 1)])
+        facts = head_facts.read_head_facts(head_reading(since=NOW - 600, now=NOW))
+        assert isinstance(facts, head_facts.HeadFacts)
+        text = head_facts.bump_text(facts, ZoneInfo("UTC"), short=True)
+        self.assertIn("1 bump since it joined, most: bumped check (1)", text)
+        self.assertNotIn("1 bumps", text)
+
 
     def test_older_fitting_step_reason_names_waiting_place_or_unmatched_fallback(self) -> None:
         older = memory_admit.WaitingStep(100, "older-id", "recorded-older", "check", "/tmp/older",
@@ -99,6 +107,26 @@ class QueueTests(unittest.TestCase):
                     line = queue_card.order_check(model, place)
                     self.assertIn(expected, plain([line]))
                     self.assertTrue(any(span.tone == "error" and "✗" in span.text for span in line))
+
+    def test_expired_head_json_paints_the_same_sixty_column_error_as_inline(self) -> None:
+        _ = self.fixture.waiter(500, "id-expired", "expired")
+        inputs = self.fixture.inputs()
+        path, row = inputs.ordered[0]
+        reading = memory_admit.queue_read_from(replace(inputs, pressure=memory_admit.NoPressureHold(),
+            ordered=[(path, {**row, "estimated_at": NOW - 600})]),
+            memory_admit.resolve_admission_limits(60 * GIB))
+        status, output, errors = self.invoke(reading, "--json", "--columns", "60")
+        self.assertEqual((status, errors), (0, ""))
+        data = cast(QueueLines, json.loads(output))
+        pane = self.snapshot_text(data)
+        status, inline, errors = self.invoke(reading, "--columns", "60")
+        self.assertEqual((status, errors), (0, ""))
+        self.assertIn("░" * 21, inline)
+        self.assertEqual(pane, inline.rstrip("\n").replace("░", "█"))
+        self.assertIn("estimate expired", pane)
+        self.assertTrue(all(terminal_width(line) <= 60 for line in pane.splitlines()))
+        self.assertTrue(any(span.get("tone") == "error" and "estimate expired" in span["text"]
+                            for line in data["lines"] for span in line))
 
     def test_busy_read_is_bounded_for_plain_card_and_pane_json(self) -> None:
         directory = self.fixture.directory

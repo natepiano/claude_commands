@@ -46,8 +46,8 @@ import unit_names  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
 from unit_move import PathMove, git  # noqa: E402
 from scripts.production import staff, staff_sources, staff_move
+from scripts.astra import design_roles
 
-POOL = Path(__file__).resolve().parent.parent / "direct" / "review_pool.py"
 
 
 @dataclass
@@ -369,12 +369,11 @@ def _commit_from(transfer: UnitTransfer, save: Callable[[], None]) -> None:
 
 
 def _move_state(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
-    """The stall-watch stretch moves to the receiving slug; the giving pool's reviewers retire, so
-    the receiving pool leases its own. The running pane keeps its launch record and identity.
+    """The stall-watch stretch moves to the receiving slug.
+    The running pane keeps its launch record and identity.
     The unit's held design roles name the receiving production as holder, so they resume under it.
     The phase note follows on the unit's next refresh, and the giving showrunner's report state
     keeps its rows as history."""
-    from scripts.astra import design_roles
     from scripts.direct import workers
     workers.move_unit(transfer.from_slug, transfer.to_slug, transfer.unit,
                       runs=tuple(retire_unit.runs_of(Path(transfer.worktree_dir))))
@@ -385,10 +384,6 @@ def _move_state(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
         raise RenameRefused(f"held roles: {error}") from error
     for path in (stall_watch.stretch_path, stall_watch.prompt_path):
         unit_move.move(PathMove(path(transfer.from_slug, transfer.unit), path(transfer.to_slug, transfer.unit)))
-    retired = subprocess.run([sys.executable, str(POOL), "retire", "--production", transfer.from_slug,
-                              "--unit", transfer.unit], capture_output=True, text=True, check=False)
-    if retired.returncode:
-        raise RenameRefused(f"review pool: {(retired.stderr or retired.stdout).strip()}")
 
 
 def _unit_address(from_slug: str, to_slug: str, unit: str, name: str) -> str:
@@ -438,15 +433,6 @@ def _showrunner_note(transfer: UnitTransfer) -> str:
             + f"Its Units row is now in {transfer.to_doc}; its session keeps running.")
 
 
-def _leased(slug: str, unit: str) -> list[str]:
-    """The reviewers of `slug`'s pool still leased to `unit`."""
-    listed = subprocess.run([sys.executable, str(POOL), "status", "--production", slug],
-                            capture_output=True, text=True, check=False)
-    if listed.returncode:
-        return [f"(the review pool is unreadable: {(listed.stderr or listed.stdout).strip()})"]
-    return [fields[0] for fields in (line.split("\t") for line in listed.stdout.splitlines())
-            if len(fields) >= 4 and fields[2] != "unleased"
-            and retire_unit.same_unit(fields[2].rsplit(":", 1)[0], unit)]
 
 
 def verify_failures(transfer: UnitTransfer) -> list[str]:
@@ -466,9 +452,6 @@ def verify_failures(transfer: UnitTransfer) -> list[str]:
     row = record.by_id(transfer.staff_id)
     if row is None or row.parent != transfer.parent_staff_id:
         failures.append(f"staff: {unit} is not under {transfer.to_slug}")
-    if leased := _leased(transfer.from_slug, unit):
-        failures.append(f"review pool {transfer.from_slug}: {', '.join(leased)} still leased to {unit}")
-    from scripts.astra import design_roles
     failures.extend(design_roles.holder_failures(design_roles.UnitHolder(transfer.from_slug, unit)))
     return failures
 
@@ -642,7 +625,7 @@ def plan(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer
 
 
 def apply(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer:
-    with staff.operation():
+    with staff.operation(), design_roles.record_operation():
         return _apply(from_slug, unit, to_doc, scratch)
 
 

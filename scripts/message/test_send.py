@@ -31,6 +31,7 @@ import send
 from scripts.lib import names
 from scripts.lib.test_names import fixture_names
 import rca
+
 import review
 import push_texts
 import postmaster
@@ -77,6 +78,8 @@ def interrupt_replacement(target: Path, *, after: bool = False, skip: int = 0) -
 
 INIT: dict[str, object] = {"type": "system", "subtype": "init", "permissionMode": "auto"}
 
+
+REAL_OPEN_CASE = rca.open_case
 
 class RelayAccountTests(unittest.TestCase):
     def test_relay_publishes_its_sender_before_exec_and_keeps_the_socket_owners_pid(self) -> None:
@@ -313,7 +316,8 @@ class SendTests(ShutdownTestCase):
             "pid": os.getpid(), "sessionId": session_id, "name": name, "formerNames": list(former),
             "messagingSocketPath": str(path), "updatedAt": 1}))
 
-    def open_case(self, report: rca.Report, at: object = None) -> str:
+    def open_case(self, report: rca.Report, at: object = None, *, defer_owner: bool = False) -> str:
+        self.assertTrue(defer_owner, "refusal delivery must not wait for the owner")
         del at
         self.cases.append(report)
         return "rca: opened 261023-1"
@@ -2424,6 +2428,20 @@ runpy.run_path(sys.argv[0], run_name="__main__")
             self.assertEqual(send.send(local_options(self.needs_go_arguments())).outcome, "sent")
         self.assertEqual(self.cases, [])
 
+    def test_a_refusal_finishes_with_its_case_retained_when_owner_delivery_is_unavailable(self) -> None:
+        self.writer_session()
+        options = local_options(self.auto_mode_arguments())
+        with (mock.patch.object(send, "run", return_value=(0, "pushover: sent\n", "")),
+              mock.patch.object(rca, "open_case", wraps=REAL_OPEN_CASE),
+              mock.patch.object(rca, "STATE", self.root / "rca"),
+              mock.patch.object(rca, "tell_owner", side_effect=AssertionError("owner unavailable")) as owner):
+            result = send.send(options)
+            self.assertEqual(result.outcome, "sent")
+            owner.assert_not_called()
+            cases = rca.cases()
+            self.assertEqual(len(cases), 1)
+            self.assertFalse(cases[0].get("owner_told", True))
+
     def test_the_rca_pushes_are_not_held_as_a_free_text_auto_mode_refusal(self) -> None:
         values = {"sender": "cargo-liner", "session": "handler", "time": "09:01 AST",
                   "stop": "auto mode refused a shell command", "cause": "a helper ran a build command that needs your permission",
@@ -3242,6 +3260,14 @@ class PeerSendTests(ShutdownTestCase):
         self.assertEqual(self.ssh_calls(), [])
         self.assertEqual(self.relayed + self.mesh_calls + self.daemon_calls, [])
 
+    def test_peer_durable_warnings_allow_a_clean_name_miss_and_print_once(self) -> None:
+        warning = 'durable role /fixture/design.json: missing or invalid repository'
+        os.environ['SSH_SNAPSHOT'] = roster.RosterSnapshot(roster.Roster([], [], [warning])).encode()
+        status, output, errors = self.run_main('bare missing')
+        self.assertEqual(status, 0, output + errors)
+        self.assertEqual(len(self.relayed), 1)
+        self.assertEqual(errors.splitlines(), [f'send.py: roster: warning: {roster.remote.other_machine()}: {warning}'])
+
     def test_an_address_can_resolve_on_peer_even_when_a_local_source_failed(self) -> None:
         self.local = roster.Roster([], ["worker source unreadable"])
         self.peer([self.row("peer", "codex:peer")])
@@ -3372,7 +3398,6 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             "ROSTER_RUN_ROOT": str(self.root / "runs"),
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership"),
-            "REVIEW_POOL_STATE": str(self.root / "review-pool"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
         }, clear=True)))
 

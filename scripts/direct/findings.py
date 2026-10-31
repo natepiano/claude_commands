@@ -65,7 +65,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib import unit_runs  # noqa: E402
+from scripts.lib import tunables, unit_runs  # noqa: E402
 from scripts.history.rounds import phase_rounds  # noqa: E402
 from scripts.usage.agents_log import LENSES as REVIEW_LENSES  # noqa: E402
 
@@ -120,20 +120,13 @@ def _config_path() -> Path:
 def _config_values() -> dict[str, str]:
     path = _config_path()
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as error:
+        return tunables.values(path)
+    except tunables.TunableUnusable as error:
         # Stop here: a file nobody can read would otherwise report every key as
         # unset, burying the one problem that matters.
-        _CONFIG_PROBLEMS.append(f"the file cannot be read ({error.strerror})")
+        _CONFIG_PROBLEMS.append(str(error))
         _require_usable_config()
         return {}
-    values: dict[str, str] = {}
-    for line in text.splitlines():
-        statement = line.split("#", 1)[0].strip()
-        key, separator, value = statement.partition("=")
-        if separator:
-            values[key.strip()] = value.strip()
-    return values
 
 
 def _configured_int(values: dict[str, str], key: str, minimum: int = 1) -> int:

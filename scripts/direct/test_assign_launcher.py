@@ -344,63 +344,38 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
             self.assertEqual(saved.workers[name].backend,
                              workers.CodexThread(str(thread), os.environ["CODEX_HOME"]))
 
-    def test_ignored_code_flags_reuse_the_units_own_reviewer_across_passes(self) -> None:
+    def test_unit_reviews_reuse_their_reviewer_across_passes(self) -> None:
         for arguments in (["init", "-q"], ["add", "plan.md"],
                           ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                            "commit", "-qm", "Initial fixture"]):
             _ = subprocess.run(["git", *arguments], cwd=self.project, check=True, capture_output=True)
-        archive = self.session_dir.parent / "review-pool"
-        with patch.dict(os.environ, {"REVIEW_POOL_STATE": str(archive)}):
-            for pass_number, flags in (("1", ["--pool", "code"]), ("2", ["--pool", "code", "--lease", "fixture-production/fixture-unit/7"])):
-                command = ["bash", str(ROOT / "scripts/direct/review.sh"), *flags, "--phase", "7",
-                           str(self.session_dir), str(self.project), str(self.prompt), "review", "Code review",
-                           "Reviewing assigned changes", pass_number, "contract"]
-                with subprocess.Popen(command, cwd=ROOT, env=os.environ.copy(), text=True,
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as child:
-                    output, errors = communicate_launcher(child)
-                    self.assertEqual(child.returncode, 0, output + errors)
-                if flags:
-                    self.assertEqual(errors, "review.sh: --pool code and --lease are ignored; using the unit reviewer.\n")
+        for pass_number in ("1", "2"):
+            worker_option = ["--slot", "review"] if pass_number == "1" else ["--to", "project-review"]
+            command = ["bash", str(ROOT / "scripts/direct/review.sh"), *worker_option, "--phase", "7",
+                       str(self.session_dir), str(self.project), str(self.prompt), "review", "Code review",
+                       "Reviewing assigned changes", pass_number, "contract"]
+            with subprocess.Popen(command, cwd=ROOT, env=os.environ.copy(), text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as child:
+                output, errors = communicate_launcher(child)
+                self.assertEqual(child.returncode, 0, output + errors)
+            turns_started = self.methods("turn/start")
+            self.assertEqual(len(turns_started), int(pass_number))
+            self.assertEqual(cast(dict[str, object], turns_started[-1]["params"])["sandboxPolicy"],
+                             {"type": "readOnly", "networkAccess": False})
         records = self.assignment_records()
         self.assertEqual(set(records), {"project-review"})
         self.assertEqual(records["project-review"]["thread_id"], mesh_fixture.THREAD_ID)
+        self.assertEqual(records["project-review"]["role"], "review")
         self.assertEqual(records["project-review"]["access_policy"], {"kind": "ReadOnlyReviewer"})
+        self.assertEqual(cast(dict[str, object], self.methods("thread/start")[0]["params"])["sandbox"],
+                         "read-only")
         self.assertEqual(len(self.methods("thread/start")), 1)
         self.assertEqual(self.methods("thread/fork"), [])
         self.assertEqual(len(self.methods("turn/start")), 2)
         turns = [read_object(path) for path in (self.history / "review_turns" / self.session_dir.name).glob("*.json")]
         self.assertEqual(len(turns), 2)
         self.assertTrue(all(turn["arm"] == "own" for turn in turns))
-        self.assertFalse(archive.exists(), "a review without an old lease must not create pool state")
 
-    def test_the_first_assigned_review_adopts_the_pool_thread_before_dispatch(self) -> None:
-        pool_root = self.session_dir.parent / "review-pool"
-        pool = pool_root / "fixture-production/pool.json"
-        source = pool.parent / "mesh/0"
-        source.mkdir(parents=True)
-        _ = (source / codex_mesh.SERVER_FILE).write_bytes((self.session_dir / codex_mesh.SERVER_FILE).read_bytes())
-        instructions = source / "code.md"
-        _ = instructions.write_text("Keep this reviewer's context.\n")
-        _ = (source / codex_mesh.ROSTER_FILE).write_text(json.dumps({"code6": {
-            "thread_id": mesh_fixture.THREAD_ID, "status": "done", "role": "review",
-            "model": "gpt-kept-sol", "effort": "high", "family": "codex", "port": self.server.port,
-            "codex_home": os.environ["CODEX_HOME"], "cwd": str(self.project),
-            "instructions_file": str(instructions), "access_policy": {"kind": "ReadOnlyReviewer"},
-        }}))
-        _ = pool.write_text(json.dumps({"generation": 0, "templates": {}, "reviewers": {
-            "code6": {"type": "code", "thread_id": mesh_fixture.THREAD_ID, "prime_hash": "saved-context",
-                      "lease": {"unit": "fixture-unit", "ordinal": 6}, "busy_pid": None, "reviews": 6},
-        }}))
-        with patch.dict(os.environ, {"REVIEW_POOL_STATE": str(pool_root)}):
-            _ = self.successful("review", "--lens", "contract", "--pass", "1")
-        name, record = next(iter(self.assignment_records().items()))
-        self.assertEqual(name, "project-review")
-        self.assertEqual(record["thread_id"], mesh_fixture.THREAD_ID)
-        self.assertEqual(record["role"], "review")
-        self.assertEqual(read_object(pool)["reviewers"], {})
-        self.assertEqual(self.methods("thread/start"), [])
-        self.assertEqual(self.methods("thread/fork"), [])
-        self.assertEqual(len(self.methods("turn/start")), 1)
 
     def test_a_review_worker_dispatched_for_implementation_keeps_one_durable_identity(self) -> None:
         _ = self.successful("review", "--lens", "contract", "--pass", "1")
@@ -1085,6 +1060,25 @@ class AssignLauncherTests(mesh_fixture.MeshCommandFixture):
         self.assertLess(methods.index("thread/compact/start"),
                         max(index for index, method in enumerate(methods) if method == "turn/start"))
         self.assertEqual(self.turn_starts, 2)
+
+    def test_changed_compaction_config_takes_effect_on_the_next_assignment(self) -> None:
+        config = self.session_dir.parent / "direct.conf"
+        _ = config.write_text("UNIT_COMPACT_ABOVE_TOKENS=300000 # keep this context\n")
+        with patch.dict(os.environ, {"UNIT_CONFIG": str(config)}):
+            _ = self.successful()
+            name, record = next(iter(self.assignment_records().items()))
+            thread = record["thread_id"]
+            record["context_tokens"] = 200_000
+            self.write_pool_roster({name: record})
+            self.context_sizes = [200_000, 200_000]
+            _ = self.successful("implement", "--to", name)
+            self.assertEqual(len(self.methods("thread/compact/start")), 0)
+            _ = config.write_text("UNIT_COMPACT_ABOVE_TOKENS=100000 # compact before the next turn\n")
+            _ = self.successful("implement", "--to", name)
+        self.assertEqual(len(self.methods("thread/compact/start")), 1)
+        self.assertEqual(self.assignment_records()[name]["thread_id"], thread)
+        self.assertEqual(len(self.methods("thread/start")), 1)
+        self.assertEqual(self.turn_starts, 3)
 
     def test_a_busy_named_worker_refuses_without_creating_another_dispatch_or_pass(self) -> None:
         _ = self.successful()

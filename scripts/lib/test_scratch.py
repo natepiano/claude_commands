@@ -40,7 +40,21 @@ class ScratchTests(unittest.TestCase):
         self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.enterContext(mock.patch.dict(os.environ, {
             scratch.ROOT_ENV: str(self.base / "scratch"), scratch.VISIBLE_ROOT_ENV: str(self.base / "repro"),
-            scratch.HOLDS_ENV: str(self.base / "holds.json"), "CLAUDE_CODE_SESSION_ID": "maker-session"}))
+            scratch.HOLDS_ENV: str(self.base / "holds.json"), scratch.COPIES_ENV: str(self.base / "copies"),
+            "CLAUDE_CODE_SESSION_ID": "maker-session"}))
+        def registered_plan(unit: str) -> Path:
+            return self.base / "registered-plans" / f"{unit}.md"
+
+        _ = self.enterContext(mock.patch.object(scratch, "registered_plan", side_effect=registered_plan))
+        _ = self.unit_plan("maker-unit", "### Phase 21 — Make a copy · status: todo\n")
+        _ = self.unit_plan("next-unit", "### Phase 22 — Use a copy · status: todo\n")
+        _ = self.unit_plan("builds-unit", "### Phase 7 — Check a build · status: todo\n")
+
+    def unit_plan(self, unit: str, text: str) -> Path:
+        plan = self.base / "registered-plans" / f"{unit}.md"
+        plan.parent.mkdir(exist_ok=True)
+        _ = plan.write_text(text)
+        return plan
 
     def git(self, repo: Path, *arguments: str) -> None:
         _ = subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *arguments],
@@ -145,6 +159,84 @@ class ScratchTests(unittest.TestCase):
         _ = progress.write_text(json.dumps({"phase": {"id": "21", "status": "finished"}}))
         self.assertIsInstance(scratch.lifetime(path), scratch.Ended)
         self.assertEqual(scratch.end("phase:maker-unit/21"), [path])
+
+    def test_an_existing_unknown_phase_task_can_update_and_end(self) -> None:
+        path = self.base / "scratch" / "legacy-phase"
+        path.mkdir(parents=True)
+        task = "phase:maker-unit/ci-icon"
+        scratch.write_record(path, task, 100.0)
+
+        scratch.renew(path, now=200.0)
+
+        record = scratch.task_of(path)
+        assert isinstance(record, scratch.Registered)
+        self.assertEqual(record.task, task)
+        self.assertEqual(record.fields["renewed"], 200.0)
+        self.assertEqual(scratch.end(task), [path])
+        self.assertFalse(path.exists())
+
+    def test_unknown_phase_is_refused_before_creation_or_hand_over(self) -> None:
+        path = self.copy()
+        before = (path / scratch.RECORD).read_bytes()
+        for operation in ("new", "adopt", "hand-over"):
+            with self.subTest(operation=operation):
+                loose = self.base / "loose"
+                loose.mkdir(exist_ok=True)
+                _ = (loose / "work").write_text("keep this work")
+                with self.assertRaises(scratch.ScratchError) as refusal:
+                    if operation == "new":
+                        _ = scratch.new("phase:maker-unit/ci-icon")
+                    elif operation == "adopt":
+                        _ = scratch.adopt(loose, "phase:maker-unit/ci-icon")
+                    else:
+                        scratch.hand_over(path, "maker-unit", "phase:maker-unit/ci-icon")
+                message = str(refusal.exception)
+                for form in ("ci-icon", "phase", "gate:<id>", "--until <when>"):
+                    self.assertIn(form, message)
+                self.assertEqual((path / scratch.RECORD).read_bytes(), before)
+                self.assertEqual((loose / "work").read_text(), "keep this work")
+                self.assertFalse((self.base / "scratch").exists())
+
+    def test_real_phase_ids_come_from_the_registered_plan(self) -> None:
+        _ = self.unit_plan("maker-unit", (
+            "### Phase 21 — Finished work (abcdef12)\n\n"
+            "### Phase 21 Review\n\n"
+            "### Phase 22a — Split work · status: todo\n"))
+        caller_plan = self.base / "checkout" / "docs" / "plans" / "maker-unit.md"
+        caller_plan.parent.mkdir(parents=True)
+        _ = caller_plan.write_text("### Phase 99 — Caller-only phase · status: todo\n")
+        old_cwd = Path.cwd()
+        os.chdir(caller_plan.parents[2])
+        self.addCleanup(os.chdir, old_cwd)
+        for phase in ("21", "22a"):
+            with self.subTest(phase=phase):
+                task = f"phase:maker-unit/{phase}"
+                path = scratch.new(task)
+                self.assertTrue(path.is_dir())
+                record = scratch.task_of(path)
+                assert isinstance(record, scratch.Registered)
+                self.assertEqual(record.task, task)
+                self.assertEqual(record.fields["phase_id"], phase)
+        with self.assertRaises(scratch.ScratchError):
+            _ = scratch.new("phase:maker-unit/99")
+
+    def test_phase_creation_without_a_readable_registered_plan_names_the_cause(self) -> None:
+        plan = self.unit_plan("maker-unit", "### Phase 21 — Work · status: todo\n")
+        for cause in ("unknown unit", "missing plan", "invalid encoding"):
+            with self.subTest(cause=cause):
+                unit = "unregistered-unit" if cause == "unknown unit" else "maker-unit"
+                if cause == "missing plan":
+                    plan.unlink()
+                elif cause == "invalid encoding":
+                    _ = plan.write_bytes(b"\xff")
+                with self.assertRaises(scratch.ScratchError) as refusal:
+                    _ = scratch.new(f"phase:{unit}/21")
+                message = str(refusal.exception)
+                self.assertIn(unit, message)
+                self.assertIn("plan", message.lower())
+                if cause != "unknown unit":
+                    self.assertIn(str(plan), message)
+                self.assertFalse((self.base / "scratch").exists())
 
     def test_hand_over_recovers_after_a_process_stops_before_record_replace(self) -> None:
         path = self.copy()

@@ -66,6 +66,57 @@ class WorkerName:
         raise StaffRefused(f"invalid worker name: {name!r}; expected launcher name characters")
 
 
+def _location(machine: str, path: Path) -> None:
+    if not machine or machine != machine.strip() or not path.is_absolute():
+        raise StaffRefused("a staff location requires a machine name and an absolute path")
+
+
+@dataclass(frozen=True)
+class PresentWorktree:
+    machine: str
+    path: Path
+
+    def __post_init__(self) -> None:
+        _location(self.machine, self.path)
+
+
+@dataclass(frozen=True)
+class RemovedWorktree:
+    machine: str
+    path: Path
+
+    def __post_init__(self) -> None:
+        _location(self.machine, self.path)
+
+
+@dataclass(frozen=True)
+class WorktreeUnfilled:
+    """The transitional record has no worktree fact yet."""
+
+
+@dataclass(frozen=True)
+class LiveDoc:
+    machine: str
+    path: Path
+
+    def __post_init__(self) -> None:
+        _location(self.machine, self.path)
+
+
+@dataclass(frozen=True)
+class WrappedDoc:
+    machine: str
+    path: Path
+
+    def __post_init__(self) -> None:
+        _location(self.machine, self.path)
+
+
+@dataclass(frozen=True)
+class DocUnfilled:
+    """The transitional record has no production document fact yet."""
+
+
 @dataclass(frozen=True)
 class StaffRow:
     id: StaffId
@@ -73,15 +124,25 @@ class StaffRow:
     name: str
     parent: StaffId | None
 
-    def to_json(self) -> dict[str, str | None]:
-        return {"id": self.id, "kind": self.kind, "name": self.name, "parent": self.parent}
+    worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = field(default_factory=WorktreeUnfilled)
+    doc: LiveDoc | WrappedDoc | DocUnfilled = field(default_factory=DocUnfilled)
+
+    def to_json(self) -> dict[str, object]:
+        value: dict[str, object] = {"id": self.id, "kind": self.kind, "name": self.name, "parent": self.parent}
+        if not isinstance(self.worktree, WorktreeUnfilled):
+            value["worktree"] = {"machine": self.worktree.machine, "path": str(self.worktree.path),
+                                 "state": "present" if isinstance(self.worktree, PresentWorktree) else "removed"}
+        if not isinstance(self.doc, DocUnfilled):
+            value["doc"] = {"machine": self.doc.machine, "path": str(self.doc.path),
+                            "state": "live" if isinstance(self.doc, LiveDoc) else "wrapped"}
+        return value
 
     @classmethod
     def from_json(cls, value: object) -> StaffRow:
         if not isinstance(value, dict):
             raise StaffUnreadable("staff row must be an object")
         fields = cast(dict[str, object], value)
-        if set(fields) != {"id", "kind", "name", "parent"}:
+        if not {"id", "kind", "name", "parent"} <= set(fields) or set(fields) - {"id", "kind", "name", "parent", "worktree", "doc"}:
             raise StaffUnreadable("staff row must contain id, kind, name and parent")
         staff_id, kind, name, parent = (fields[key] for key in ("id", "kind", "name", "parent"))
         if not isinstance(staff_id, str) or _ID.fullmatch(staff_id) is None:
@@ -92,8 +153,33 @@ class StaffRow:
             raise StaffUnreadable("staff name must be a string")
         if parent is not None and (not isinstance(parent, str) or _ID.fullmatch(parent) is None):
             raise StaffUnreadable("invalid staff parent id")
+        worktree: PresentWorktree | RemovedWorktree | WorktreeUnfilled = WorktreeUnfilled()
+        doc: LiveDoc | WrappedDoc | DocUnfilled = DocUnfilled()
+        for key in ("worktree", "doc"):
+            if key not in fields:
+                continue
+            if kind != ("unit" if key == "worktree" else "showrunner"):
+                raise StaffUnreadable(f"{kind} cannot hold {key}")
+            raw = fields[key]
+            if not isinstance(raw, dict):
+                raise StaffUnreadable(f"{key} must be an object")
+            location = cast(dict[str, object], raw)
+            if set(location) != {"machine", "path", "state"}:
+                raise StaffUnreadable(f"{key} requires machine, path and state")
+            machine, path, state = (location.get(item) for item in ("machine", "path", "state"))
+            if not isinstance(machine, str) or not isinstance(path, str):
+                raise StaffUnreadable(f"invalid {key} location")
+            try:
+                if key == "worktree" and state in ("present", "removed"):
+                    worktree = PresentWorktree(machine, Path(path)) if state == "present" else RemovedWorktree(machine, Path(path))
+                elif key == "doc" and state in ("live", "wrapped"):
+                    doc = LiveDoc(machine, Path(path)) if state == "live" else WrappedDoc(machine, Path(path))
+                else:
+                    raise StaffUnreadable(f"invalid {key} state: {state!r}")
+            except StaffRefused as error:
+                raise StaffUnreadable(str(error)) from error
         return cls(StaffId(staff_id), kind, name,
-                   StaffId(parent) if isinstance(parent, str) else None)
+                   StaffId(parent) if isinstance(parent, str) else None, worktree, doc)
 
 
 @dataclass(frozen=True)
@@ -101,12 +187,22 @@ class StaffSnapshot:
     rows: tuple[StaffRow, ...]
     pending_retire: tuple[StaffId, ...] = ()
     inputs: tuple[str, ...] = field(default=(), compare=False)
+    schema: int = field(default=2, compare=False)
 
     def by_id(self, staff_id: StaffId) -> StaffRow | None:
         return _row_by_id(self.rows, staff_id)
 
     def by_path(self, names: str) -> StaffRow | None:
         return _row_by_path(self.rows, names)
+
+    def by_worktree(self, machine: str, path: Path) -> StaffRow | None:
+        matches = [row for row in self.rows if isinstance(row.worktree, PresentWorktree)
+                   and row.worktree.machine == machine and path.is_relative_to(row.worktree.path)]
+        return max(matches, key=lambda row: len(cast(PresentWorktree, row.worktree).path.parts), default=None)
+
+    def by_doc(self, machine: str, path: Path) -> StaffRow | None:
+        return next((row for row in self.rows if isinstance(row.doc, (LiveDoc, WrappedDoc))
+                     and row.doc.machine == machine and row.doc.path == path), None)
 
     def find(self, *, kind: Kind | None = None, parent: StaffId | None = None) -> list[StaffRow]:
         """An omitted kind or parent leaves that field unrestricted."""
@@ -332,10 +428,20 @@ def _validate(rows: list[StaffRow]) -> None:
     """Check the complete proposed graph before any bytes are replaced."""
     indexed: dict[StaffId, StaffRow] = {}
     names: set[tuple[Kind, StaffId | None, str]] = set()
+    worktrees: set[tuple[str, Path]] = set()
     for row in rows:
         if row.id in indexed:
             raise StaffRefused(f"duplicate staff id: {row.id}")
         indexed[row.id] = row
+        if row.kind != "unit" and not isinstance(row.worktree, WorktreeUnfilled):
+            raise StaffRefused(f"{row.kind} cannot hold worktree")
+        if row.kind != "showrunner" and not isinstance(row.doc, DocUnfilled):
+            raise StaffRefused(f"{row.kind} cannot hold doc")
+        if isinstance(row.worktree, PresentWorktree):
+            location = (row.worktree.machine, row.worktree.path)
+            if location in worktrees:
+                raise StaffRefused(f"duplicate present worktree: {location[0]}:{location[1]}")
+            worktrees.add(location)
         if row.kind not in _KINDS:
             raise StaffRefused(f"invalid staff kind: {row.kind}")
         if not row.name or _ID.fullmatch(row.name) or row.name != row.name.strip() or "/" in row.name or any(
@@ -404,7 +510,7 @@ def _load(*, initial: bool = False) -> StaffSnapshot:
         raise StaffUnreadable("staff record must be an object")
     fields = cast(dict[str, object], value)
     schema = fields.get("schema")
-    if type(schema) is not int or schema != 1:
+    if type(schema) is not int or schema not in (1, 2):
         raise StaffUnreadable(f"unsupported staff schema: {schema!r}")
     return replace(_snapshot_value(fields), inputs=(str(_file().absolute()),))
 
@@ -420,7 +526,7 @@ def _snapshot_value(fields: dict[str, object]) -> StaffSnapshot:
         raise StaffUnreadable("invalid staff input paths")
     return StaffSnapshot(tuple(_rows(fields.get("rows"))),
                          tuple(sorted({StaffId(item) for item in cast(list[str], pending)})),
-                         tuple(cast(list[str], inputs)))
+                         tuple(cast(list[str], inputs)), cast(int, fields.get("schema", 2)))
 
 
 def _remote(arguments: list[str], *, input_text: str | None = None) -> object:
@@ -521,7 +627,7 @@ def find(*, kind: Kind | None = None, parent: StaffId | None = None) -> list[Sta
 
 
 def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
-    document: dict[str, object] = {"schema": 1, "rows": [row.to_json() for row in rows]}
+    document: dict[str, object] = {"schema": 2, "rows": [row.to_json() for row in rows]}
     if pending:
         document["pending_retire"] = sorted(pending)
     content = json.dumps(document,
@@ -543,7 +649,7 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
             result = edit(proposed, pending)
             _validate(proposed)
             proposed.sort(key=lambda row: row.id)
-            if proposed == list(original.rows) and pending == set(original.pending_retire):
+            if original.schema == 2 and proposed == list(original.rows) and pending == set(original.pending_retire):
                 # A prior replace may have succeeded before its folder sync failed.
                 atomic_file.sync_folder(path.parent)
                 print("unchanged", file=sys.stderr)
@@ -626,6 +732,40 @@ def move(staff_id: StaffId, new_parent: StaffId | None) -> StaffRow:
         moved = replace(row, parent=new_parent)
         rows[rows.index(row)] = moved
         return moved
+
+    return _transaction(edit)
+
+
+def set_worktree(unit: StaffId, worktree: PresentWorktree | RemovedWorktree) -> StaffRow:
+    """Set one unit's worktree through the existing owner transaction."""
+    if not _is_owner():
+        return _remote_row(["set-worktree", unit, "--machine", worktree.machine, "--path", str(worktree.path),
+                            "--state", "present" if isinstance(worktree, PresentWorktree) else "removed"])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, unit)
+        if row.kind != "unit":
+            raise StaffRefused("set-worktree requires a unit")
+        changed = replace(row, worktree=worktree)
+        rows[rows.index(row)] = changed
+        return changed
+
+    return _transaction(edit)
+
+
+def set_doc(showrunner: StaffId, doc: LiveDoc | WrappedDoc) -> StaffRow:
+    """Set one showrunner's document through the existing owner transaction."""
+    if not _is_owner():
+        return _remote_row(["set-doc", showrunner, "--machine", doc.machine, "--path", str(doc.path),
+                            "--state", "live" if isinstance(doc, LiveDoc) else "wrapped"])
+
+    def edit(rows: list[StaffRow]) -> StaffRow:
+        row = _required(rows, showrunner)
+        if row.kind != "showrunner":
+            raise StaffRefused("set-doc requires a showrunner")
+        changed = replace(row, doc=doc)
+        rows[rows.index(row)] = changed
+        return changed
 
     return _transaction(edit)
 
@@ -798,6 +938,9 @@ class _Arguments(argparse.Namespace):
     row_write: bool = False
     worker_row: bool = False
     ids: list[str] = []
+    machine: str = ""
+    path: str = ""
+    state: str = ""
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -805,7 +948,7 @@ def _parser() -> argparse.ArgumentParser:
     verbs = parser.add_subparsers(dest="verb", required=True)
     show = verbs.add_parser("show", help="show the production staff")
     _ = show.add_argument("--kind", choices=_KINDS)
-    _ = show.add_argument("--live", action="store_true", help="show live member identities and pool leases")
+    _ = show.add_argument("--live", action="store_true", help="show live member identities")
     _ = show.add_argument("--under", help="parent staff id or path")
     _ = show.add_argument("--snapshot", action="store_true", help=argparse.SUPPRESS)
     get = verbs.add_parser("get", help="find a member by id or path")
@@ -830,7 +973,15 @@ def _parser() -> argparse.ArgumentParser:
     defer_parser = verbs.add_parser("defer-retire", help=argparse.SUPPRESS)
     _ = defer_parser.add_argument("ids", nargs="*")
     pending_parser = verbs.add_parser("retire-pending", help=argparse.SUPPRESS)
-    for verb in (show, get, add, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
+    location_parsers: list[argparse.ArgumentParser] = []
+    for command, states in (("set-worktree", ("present", "removed")), ("set-doc", ("live", "wrapped"))):
+        location_parser = verbs.add_parser(command)
+        _ = location_parser.add_argument("target")
+        _ = location_parser.add_argument("--machine", required=True)
+        _ = location_parser.add_argument("--path", required=True)
+        _ = location_parser.add_argument("--state", required=True, choices=states)
+        location_parsers.append(location_parser)
+    for verb in (*location_parsers, show, get, add, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
         _ = verb.add_argument("--json", action="store_true")
     return parser
 
@@ -844,6 +995,14 @@ def _print_row(row: StaffRow, path: str) -> None:
 
 
 def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, ...] | None:
+    if arguments.verb == "set-worktree":
+        worktree = (PresentWorktree(arguments.machine, Path(arguments.path)) if arguments.state == "present"
+                    else RemovedWorktree(arguments.machine, Path(arguments.path)))
+        return set_worktree(StaffId(arguments.target), worktree)
+    if arguments.verb == "set-doc":
+        doc = (LiveDoc(arguments.machine, Path(arguments.path)) if arguments.state == "live"
+               else WrappedDoc(arguments.machine, Path(arguments.path)))
+        return set_doc(StaffId(arguments.target), doc)
     if arguments.verb == "defer-retire":
         return defer_retire(tuple(StaffId(value) for value in arguments.ids))
     if arguments.verb == "retire-pending":

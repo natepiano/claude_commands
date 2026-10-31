@@ -23,7 +23,8 @@ import showrunner_tree
 import unit_lookup
 from scripts.production import staff
 from production_units import Production, read_production
-from production_units import Refusal, cell_value, live_unit_table, production_field, unit_table
+from production_units import Refusal, cell_value, production_field, unit_table
+from unit_lookup import live_unit_table
 from ci_points import PointFailure, WatchFirstAlert, WatchRepeat, review_watch
 from dailies_counts import CountsFailure, production_counts
 from dailies_render import (LENGTHS, InputError, ReportsEvery, ReportsOnDemand, StateRefused, StyleSummary,

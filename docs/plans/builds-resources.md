@@ -1108,41 +1108,22 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** pruning `doc/` or `mend-wrapper/` inside a target that still has units; a path rule for session scratchpad clones (the order is by last use only); whole takes ahead of orphans (orphans also cost no rebuild).
 
-### Phase 38 — The floor_scan row shows takeable bytes and the reason for the rest  · status: todo
-**Depends on:** Phase 26 (`scripts/buildlog/record.py`, `scripts/buildlog/test_record.py`); Phase 37 (`scripts/lint/sweep.py`)
+### Phase 38 — The floor_scan row shows takeable bytes and the reason for the rest  · status: done
 
-**Approved:** builds showrunner 2026-10-31, part 4 of the floor pass-over work; it lands after Phase 26 because Phase 26 holds `record.py`.
+#### As-built
 
-#### Work Order
+- `IdleFloorTarget` retains `folder`, `last_use` and total `bytes` (`scan.target_bytes`), with optional `takeable_bytes` and `reason` when they differ; `record.floor_scan` persists them. `floor_scan_targets` uses `freed_by` with target-local candidate inode links and no shortfall limit, independently of take order; cross-target shared inodes free nothing from either target alone, and reasons distinguish `links outside the target`, `links outside the take candidates` within the target, and `output outside take candidates`. Busy and held targets are omitted.
+- `record_before_delete` saves `target-deletes.json` before normal or doc-budget deletion; a failed write keeps the folder, prints its cause, counts a failure and continues to later targets.
+- `DiscoveredTargetRoots` and `Scan` share one discovery inventory, including nested roots, without rediscovery in `walk`; `target_last_use` excludes entries containing a nested target from its no-stamp fallback.
+- `process_use` rechecks one target per take through `TargetOwnerIndex`, comparing `exe`/`cwd` prefixes and filtering raw `maps` bytes before decoding matching processes; `nextest_targets` and deepest-owner attribution protect nextest runs and nested targets. The initial full `process_uses` scan remains the inventory source.
+- Real `floor.lock` holders record pid and `started_at`; `floor_lock_holder` returns `KnownFloorLockHolder`, `UnreadableFloorLockHolder` or `NoFloorLockHolder`. A real sweep unable to acquire the lock alerts natedev only for a known overdue hold below the floor with pid, command and free space, using `[sweep]` `floor_lock_alert_minutes` from `config/lint.conf` at use (configured as 15); invalid configuration prints its cause and sends nothing.
+- `FloorRecord` represents receipts with `DeliveredFloorLockAlert(pid, started_at)` and `NoFloorLockAlert`; `locked_floor_record` holds the separate stable `floor-alert.lock` across receipt read/check/send/save and every measurement write, rereading inside the lock. Receipts persist only after `send_floor_alert` succeeds, so concurrent waiters deliver once per hold, failed sends retry, and another hold by the same pid can alert again.
 
-**Goal:** A `floor_scan` row tells what the floor could take from each idle target, so a reader does not take all bytes for takeable bytes (on 2026-10-31 the row showed 63.7 GiB "older" that the floor could not take).
+**Files:** `scripts/lint/sweep.py` — estimates, discovery, deletion, ownership and alert state; `scripts/lint/test_sweep.py` — filesystem, process and concurrency contracts; `scripts/buildlog/record.py` and `scripts/buildlog/test_record.py` — optional row fields and persistence; `config/lint.conf` — alert delay; `docs/as-built/build-targets.md` — behavior contracts.
 
-**Spec:**
+**Gotchas:** Target-local observed link counts distinguish internal links outside candidates from external links; the alert lock keeps a stable inode separate from the atomically replaced record, and both receipt and measurement writers reread under it to preserve newer state.
 
-1. **Row fields.** Each target in the `floor_scan` row keeps `bytes` (all bytes the walk saw, `scan.target_bytes`) and adds `takeable_bytes` and `reason` when the two differ (`links outside the target`, or another short reason the code already knows for an idle target). `sweep.py` computes them; `record.floor_scan` writes them.
-   - **What `takeable_bytes` means.** A scan-time estimate of what taking only this target's candidates (its orphans and groups, or Phase 37's whole take) would free, with no shortfall limit: the take lines already show the shortfall-limited take. Compute it with `freed_by` against link counts restricted to that target's candidate inodes (never a copy of all of `scan.links` per target: that is targets × inodes), so it does not depend on take order: a file with a link outside the target frees nothing from it (two targets that share one inode each show 0 for it).
-   - **Scope.** The row lists idle targets only, as now (`hold_floor` writes `idle`; a busy target prints a `left alone` line, and a held target is not walked). Busy and held targets stay out of the row.
-2. **Docs.** `docs/as-built/build-targets.md` names the new fields.
-3. **Three defects from Phase 37's review (routed here).**
-   - **The doc-budget sweep records its delete like `remove` does.** Phase 37 made `record_target_deletes` raise `OSError`. `remove` catches it, but the doc-budget path calls it in a `finally` with no handler, so a state-write failure stops the doc sweep and every later target. That path also records only after `rmtree`. Use one record-before-delete rule for both paths, in one place: the target root is in `target-deletes.json` before the doc folder goes. A record failure keeps that doc folder, prints one line, counts one failure, and the sweep goes on.
-   - **One target discovery per pass.** `walk` calls `target_dirs([directory])` for each target it scans, which walks each target's folders outside its build trees a second time, to depth 8. The scan takes the nested roots from the discovery result its caller already holds, so each folder is walked once per pass.
-   - **A whole take's last use ignores a nested target.** `target_last_use`'s no-stamp fallback reads the mtime of every top-level entry except the locks, so a nested target's folder (and its new output) counts as the outer target's use. Skip an entry that holds a nested target root; the nested target has its own last use.
-
-4. **natedev hears when the floor cannot run.** On 2026-10-31 a slow dry run held `floor.lock` from 02:55 to 06:46 EDT. Every real pass printed one "another sweep is holding it" line and stopped, and `/` fell from 297 GiB to 0.9 GiB free with no alert. Intended: when a real pass finds `floor.lock` held, free space is under the floor, and the lock has been held longer than the configured time (`floor_lock_alert_minutes=15` in `config/lint.conf` `[sweep]`, read at use; the user's rule 2026-10-31: no hard-coded tunables), it tells natedev once per hold (one message, through the existing send path), naming the holder's pid and command and the free space. A later pass under the same hold sends nothing more.
-   - **Hold identity.** A real pass that takes the lock writes its pid and its start time into the lock file. The hold's age comes from that start time, never from the lock file's mtime, and a hold is the pair (pid, start time), so two holds by one pid are two holds. The waiting pass reads the holder as named states: a known holder (pid, start time, command), a holder `lock_holder` sees with no readable record, or no holder (the lock is free again or could not be opened); only a known holder past the configured time sends. The pass records the hold it told about in the floor record only after `send_floor_alert` returns true, so a failed send is tried again on the next pass. (builds showrunner, 2026-10-31.)
-
-5. **A whole take's process recheck is cheap.** Phase 37's real-scale dry run (natedev, floor 400, 2026-10-31) made 221 takes, most of them small whole takes, and each take's recheck read every process's `maps` and parsed every line (`process_uses`, 25.6M lines, about 0.21 s a pass with 1830 pids). The dry run took 292 s; Phase 36's code took 44 s for 4 takes. The recheck before one take asks only whether a process uses that one target: compare `exe` and `cwd` by prefix, and search the raw `maps` bytes for the target's path prefix before any line is decoded; parse lines only in a process whose bytes match. The recheck keeps the cargo-nextest use (`nextest_targets`: a nextest run holds no path in the target between two test binaries) and deepest-owner attribution through `TargetOwnerIndex` (a process inside a nested target keeps only the nested one busy). Keep the first full `process_uses` pass as it is, and keep one recheck per take. Report the real-scale dry run's time before and after (floor 400, the same config file).
-
-Tests: `scripts/buildlog/test_record.py` (the row shape) and `scripts/lint/test_sweep.py` (the values for a whole-take target, a target with units, a file with a link outside the target, one inode shared by two targets, and the same values for a small and a large shortfall; a failed doc-budget record keeps the doc folder and the sweep continues; a successful doc removal records before `rmtree`; a scan of a target with a nested target does not call `target_dirs` again; a lock held past the configured time under the floor sends one message (the test sets its own value), and a second pass under the same hold sends none; a new hold by the same pid sends again; an old lock file with a new hold does not send early; a failed send is tried on the next pass; the one-target recheck still finds a nextest run whose workspace owns the target and keeps an outer target idle for a process inside its nested target; a no-stamp outer target's last use ignores its nested target's folder; a one-target recheck decodes no `maps` line of a process whose bytes do not name the target, and still finds a process that maps a file under the target, runs from it or works in it).
-
-**Acceptance:** the tests above; `test_record.py`, `test_sweep.py` and Phase 36's take-order regression pass from the worktree; `basedpyright` on the changed Python files.
-
-**Files:**
-- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`, `scripts/buildlog/record.py`, `scripts/buildlog/test_record.py`, `docs/as-built/build-targets.md`, `config/lint.conf` (the alert time) — items 1-5.
-
-**Workers:** `1 writer + 1 tester`
-- `impl` — `sweep.py`, `record.py` and the doc: the values and the row contract.
-- `test` — `test_sweep.py` and `test_record.py`: the values and the row shape.
+**Ruled out:** Treating all scanned bytes as independently takeable; copying all `scan.links` entries per target; using mtime or pid alone as hold identity; recording invalidation after deletion; saving delivery before a successful send.
 
 ### Phase 39 — A build's memory promise fits the build's size, so a big build does not wait for a promise it never uses  · status: todo
 **Depends on:** Phase 26 (`scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`). Runs before Phase 20 (same file; director's order 2026-10-31, a one-line revert), so Phase 20's replay calibrates against the adopted dev rule.
@@ -1177,28 +1158,153 @@ Tests: `scripts/lint/test_memory_admit.py`: a large dev build with 1 to 9 earlie
 - `impl` — `memory_admit.py`, `build_why.py`, the replay and the doc.
 - `test` — `test_memory_admit.py` and `test_build_why.py`, the budget-change decode and render cases included.
 
-### Phase 40 — A scratch folder's task always has an end, and only a running worker keeps a folder  · status: todo
-**Depends on:** Phase 37 (order set by the builds showrunner: after the dry-run lock and owner-index fixes)
+### Phase 40 — A scratch folder's task always has an end, and only a running worker keeps a folder  · status: done
 
-**Approved:** builds showrunner 2026-10-31: scratch.py and tmp_sweep.py are this unit's files; both fixes take a test each.
+#### As-built
+
+`scratch.registered_plan(unit)` is the single resolver, using `unit_lookup.unit_parent` with `staff.snapshot`, `phase_table.show_production` and `proposals_table.unit_plan_paths` to locate the registered plan.
+`target` and `hand_over` validate new phase tasks through `plan_history.plan_phases` before creation, adoption or record replacement; missing phases and unreadable plans raise cause-bearing refusals naming a real phase, `gate:<id>` or `--until <when>`.
+`checked_task` stays shape-only for legacy updates, holds and end, so existing invalid phase tasks remain cleanable.
+`tmp_sweep.worker_use` keeps a mesh record's cwd only while its status is `running`; other keeps and the 7-day fallback still apply.
+
+**Files:**
+- `scripts/lib/scratch.py`, `scripts/lib/test_scratch.py` — resolver, assignment guard and private-plan assignment/legacy-cleanup cases.
+- `scripts/lint/tmp_sweep.py`, `scripts/lint/test_tmp_sweep.py` — running-only cwd retention and lifecycle cases.
+- `scripts/production/test_merge_checkpoint.py` — private `registered_plan` fixture for phase-end cleanup.
+- `docs/as-built/build-memory-admission.md` — scratch task and retention rules.
+
+**Binds later work:** “Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor” uses the single resolver, real registered phase or gate/deadline tasks, shape-only legacy cleanup, private-plan tests and running-only mesh cwd keeps.
+
+**Gotchas:** Staff records carry no plan; resolution uses the registered production rather than the caller's checkout. Tests patch `registered_plan` and keep scratch/copy roots private. A paused roster worker or active unit run does not make a finished mesh record's cwd live.
+
+**Ruled out:** A second unit-plan registry; semantic validation on legacy update/end paths.
+
+### Phase 41 — A queue priority change reads only the new end of the build log, and a step waiting for the cargo token holds no place at the head  · status: todo
+**Depends on:** Phase 38 (`scripts/buildlog/record.py` is in Phase 38's files until its checkpoint); queue-unit Phase 4 (`origin/builds-queue` d309bbed, its one decision pass holds the head rule): merge it before any edit.
+
+**Approved:** item 7 of the production rules: defects in Phase 26's own change, found by its cold review after the merge. Builds showrunner 2026-10-31: land defects 1 and 2 first, as their own small checkpoint, not behind the smaller fixes (Phase 42); build defect 2 on queue's Phase 4 and tell queue-unit what changes there.
 
 #### Work Order
 
-**Goal:** A scratch folder made for a task goes away when that task ends. On 2026-10-31 lfo's `phase-lfo-unit-ci-icon-e0z61v` (58 GB) held a task `phase:lfo-unit/ci-icon` that nothing can end: `merge_checkpoint.py:1043` ends `phase:<unit>/<phase id>`, and `ci-icon` is no phase id. tmp_sweep also kept it as "a live worker uses it" from 31 finished `mesh_runs` records. Report: the director's lfo scratch diagnosis, 2026-10-31.
+**Goal:** Fix the two Phase 26 defects that stop builds on natedev today (director's read-only review of `ec3f2f0b..58391add`, 2026-10-31):
+
+- every `priority set`, replace or clear scans the whole natedev month log (496 MB on 2026-10-31, about 14 s) while it holds the admission lock and the build-log lock, so no step is admitted and no step row is written for those 14 s;
+- a step that waits for the cargo token keeps its queue row as a head candidate, so it can take the strict window and hold its memory while the step that holds the token waits behind it, up to `STRICT_SECONDS`.
 
 **Spec:**
 
-1. **A `phase:` task names a real phase.** `scripts/lib/scratch.py` refuses a `phase:<unit>/<id>` task when a folder is made for it (`target`, :489) or handed to it (`hand_over`, :356), when `<id>` is not a phase id in that unit's plan. `checked_task` (:475) stays the shape check only: it also runs from `end`, `hold` and `update_record`, and an existing task with a bad id must still end and clean up. Read the unit's plan from its registry record (`proposals_table.unit_plan_paths`, the record's `plan`), never from the caller's checkout, and list its phases with `plan_history.plan_phases`. With no readable plan the make refuses and names the cause. The refusal names the right forms: a phase id, `gate:<id>` or `--until <when>`. Find the flow that made `phase:lfo-unit/ci-icon` (a CI-fix flow); if it needs a scratch folder outside a phase, it uses `gate:` or `--until`, changed in that flow.
-2. **Only a running record keeps a folder.** `scripts/lint/tmp_sweep.py` `worker_use` (:753-769) counts the cwd of a `mesh_runs` record only while that record's status is `running`. A finished record no longer keeps a folder; the 7-day fallback and the other keeps stay.
-3. **Docs.** `docs/as-built/build-memory-admission.md`, where it describes scratch tasks and tmp_sweep's keeps, states both rules.
+1. **The priority row write reads only the new end of the log.** `record.queue_priority` (`scripts/buildlog/record.py:986`) takes the start offset and passes it to `append_row_once` (`:685`). `memory_admit.py` saves the log's end offset in the priority transition when it writes the transition (as `PendingStep.month_row_end` does) and passes it on every finish, the one in `check()` too. A rerun after a stop still finds the row by its fixed id, because the row can only be after the saved offset.
+2. **A step in token wait is no head.** A waiter row with `token_left_at` keeps its order place but is skipped as a head candidate and as a holder of room in the head rule (queue Phase 4's one decision pass) and the admission walk, until its token returns. Model the state as a named type, not as key presence (Type Design Contract): for example `QueuedWaiter | TokenWaitingWaiter`.
 
-Tests: `scripts/lib/test_scratch.py`: a `phase:` task with an unknown phase id is refused with the named forms; a real phase id is accepted; an existing folder whose task has an unknown id still ends (`end`) and its record still updates; a make for a unit with no readable plan refuses and names the cause. `scripts/lint/test_tmp_sweep.py`: a folder whose only `mesh_runs` records are finished is not kept for a worker; one with a running record is.
+Tests: `scripts/buildlog/test_record.py`: a `queue_priority` write with a start offset does not read rows before it, and a rerun after a stop adds the row once. `scripts/lint/test_memory_admit.py`: a priority set on a log whose part before the saved offset is not JSON finishes and adds its row once; the token-wait case from the review (X 12 GiB older, Y 11.5 GiB in token wait holding the token: Y is not held behind X, and X holds no room while it waits).
 
-**Acceptance:** the tests; `test_scratch.py`, `test_tmp_sweep.py`, `test_merge_checkpoint.py` and `basedpyright` on the changed Python files pass from the worktree.
+**Acceptance:** the tests; `test_memory_admit.py`, `test_record.py`, the `scripts/build_queue` suites and `basedpyright` on the changed Python files pass from the worktree. Live: one `priority set` on natedev's real month log answers in under 1 s (time it).
 
 **Files:**
-- `scripts/lib/scratch.py`, `scripts/lib/test_scratch.py`, `scripts/lint/tmp_sweep.py`, `scripts/lint/test_tmp_sweep.py`, `docs/as-built/build-memory-admission.md` — items 1-3. Director search 2026-10-31: no command, doc or script in this repo makes a `phase:` task whose id is not a phase; the scratch guard's hint names `phase:<unit>/<phase>`, so `phase:lfo-unit/ci-icon` was typed by hand. The refusal in item 1 is the fix; no flow file is added.
+- `scripts/lint/memory_admit.py`, `scripts/buildlog/record.py` — items 1-2.
+- `docs/as-built/build-memory-admission.md` — the token-wait rule.
+- `scripts/lint/test_memory_admit.py`, `scripts/buildlog/test_record.py` — tests.
 
 **Workers:** `1 writer + 1 tester`
-- `impl` — `scratch.py`, `tmp_sweep.py`, the flow and the doc.
-- `test` — `test_scratch.py` and `test_tmp_sweep.py`.
+- `impl` — the source and doc files.
+- `test` — the test files.
+
+### Phase 42 — Bump and token-wait edges: one bad intent, the pane's session, unit names, card text and type shapes  · status: todo
+**Depends on:** Phase 41
+
+**Approved:** item 7 of the production rules (Phase 26 cold review, 2026-10-31). Builds showrunner 2026-10-31: card text as recommended.
+
+#### Work Order
+
+**Goal:** Fix the smaller defects the Phase 26 cold review found.
+
+**Spec:**
+
+1. **One bad token-wait intent stops nothing else.** `check()` finishes each `*.token-wait` intent in its own guard (`memory_admit.py:2796`): an error is logged with the intent's path and the intent stays for the next poll; the other intents and the admission go on.
+2. **The pane's bump names the session itself.** `mods/unit-board/hooks/register.tsx:420` passes the session id from `$.session.id()` to the process explicitly (as `--you` does at :309), not by inheriting `CLAUDE_CODE_SESSION_ID`. Its test asserts the id reaches the process.
+3. **A unit name is checked.** `priority set <unit>` refuses a unit that is not in the roster's unit labels (one line naming the unit; the old priority stays), and the unit goes to argparse as `--unit=<unit>`, so a word that starts with `-` is a unit, not a flag.
+4. **Card text** (builds showrunner 2026-10-31, as recommended): the card names a unit-priority step as `N of <unit> (queue priority)`, not `moved up`, and shows no legacy per-row bump rows as its reason; the priority line shows once per card and renders the stored `why`, not a fixed "(the user's bump)".
+5. **Corrupt priority file.** `priority_clear` on an unreadable `queue_priority.json` removes it and says so; it does not print "cleared" and leave it.
+6. **Type design.** `Waiter.priority_rank` leaves the durable row type: the resolved order is its own type (for example `RankedWaiter` with `PriorityUnit | NormalOrder`). `QueuePriority.transition` becomes `SettledPriority | PendingPriorityTransition`. `resolve_queue_order` and `token_wait` take named types, not bare `None`. `priority_set` reports "no waiting step" as a named case, not `place = 0`. `BehindHead.head_since` gets a name that is not `head_since`.
+
+Tests: `scripts/lint/test_memory_admit.py`: one intent whose finish raises does not stop `check` for the others; an unknown unit is refused and the old priority stays; `--unit=-x` is a unit; a corrupt priority file is removed on clear. `mods/unit-board/tests/queue.test.ts`: the session id reaches the process. `scripts/build_queue/test_queue_card.py`, `test_head_facts.py` and the goldens: the item 4 text.
+
+The Phase 26 checkpoint did not name two narrowed assertions; this phase's checkpoint carries their lines: `Assertion-Change: scripts/lint/test_memory_admit.py::test_cleanup_added_floor_expires_the_old_estimate_without_losing_queue_place — bump_order and holds_younger left the waiter row in Phase 26` and the same for `test_estimate_expiry_after_lock_keeps_queue_and_recovery_for_next_poll`.
+
+**Acceptance:** the tests; `test_memory_admit.py`, the `scripts/build_queue` suites, `claude plugin test mods/unit-board` and `basedpyright` on the changed Python files pass from the worktree.
+
+**Files:**
+- `scripts/lint/memory_admit.py` — items 1, 3, 5, 6.
+- `mods/unit-board/hooks/register.tsx` — item 2.
+- `scripts/build_queue/queue_card.py`, `scripts/build_queue/head_facts.py`, `scripts/build_queue/build_queue.py`, `scripts/build_queue/golden/card_*.txt` — items 3, 4.
+- `docs/as-built/build-memory-admission.md`, `commands/build/queue.md`, `commands/showrunner/bump.md` — where they state the changed rules.
+- `scripts/lint/test_memory_admit.py`, `scripts/build_queue/test_queue_card.py`, `scripts/build_queue/test_head_facts.py`, `scripts/build_queue/test_build_queue.py`, `mods/unit-board/tests/queue.test.ts` — tests.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the source, doc and command files.
+- `test` — the test files and goldens.
+
+### Phase 43 — Every agent Hana carries its owner and purpose, and `hanas` lists, stops and sweeps test Hanas on both machines  · status: todo
+**Depends on:** none (runs beside Phase 41; no shared files).
+
+**Approved:** builds showrunner 2026-10-31, relaying a user request through hana: design `/home/natepiano/.local/state/showrunner/tool-based-ui/session/hana-test-window-design.md`, its phase 1. Outside paths approved under `--also`: `scripts/production/mac_run.sh`, `scripts/production/smoke_launch.sh`, `scripts/hana_shot/hana_shot.py`, `config/mac_test.conf`. `/etc/nixos` changes go to natedev as branch + hash. bevy_brp needs no change: its launch tool already takes `env` (`~/rust/bevy_brp/mcp/src/app_tools/launch_params.rs:49-52`). Trunk Phase 174 (the Hana side: refusal, title, idle exit) lands only after this phase is installed.
+
+#### Work Order
+
+**Goal:** The user wants each test Hana window to name the unit director and the feature under test, on the Mac and on natedev, and wants every test Hana to stop reliably, with no dependence on memories or announcements. This phase gives every agent launch path the two labels, refuses an agent Hana launch with no purpose, and adds one tool, `hanas`, that finds test Hanas from the process table on both machines, also when their owner session is gone, and stops the ones over their limits.
+
+**Spec:**
+
+1. **Config.** A new `config/hanas.conf` (documented in `config/README.md`) holds every limit, read at run time through `config_values`: `exempt_ports=15702,15761` (the user's own Hana and the demo), `test_max_hours=4`, `unlabelled_max_minutes=30`, `stop_grace_seconds`. Nothing hard-codes a limit or a port.
+2. **The labels.** Every agent launch path passes `HANA_TEST_PURPOSE` (the feature under test, required) and `HANA_TEST_OWNER` (the unit director's name; default `SHOWRUNNER_UNIT_ID` from the caller's env) in Hana's env:
+   - `scripts/hana_shot/hana_shot.py`: `launch()` (:2090, env built at :2113-2116) and every caller of it (`command_launch` :2747, `instance()` :2293) take a purpose; a launch without one refuses with one line naming the flag.
+   - `scripts/production/mac_run.sh`: the generated `.command` (:117-122) sets both; a run without a purpose refuses before any ssh.
+   - `scripts/production/smoke_launch.sh` (:73-74): the same.
+3. **The launch gate.** `scripts/hooks/pre-tool-use-brp-launch-gate.sh` reads `tool_input` and denies an `mcp__brp__brp_launch` of the Hana app whose `env` has no non-empty `HANA_TEST_PURPOSE`, with a reason that names the `env` key to add. Other apps pass as today. The deny uses the hook's existing deny form (:20-26) and runs before the memory wait.
+4. **`hanas`.** New `scripts/hanas/hanas.py` with `list`, `stop <machine>:<pid|port>` and `sweep [--dry-run]`. It reads the process table on natedev (`/proc`, the env through `shutdown/inventory.py` `_process_environment`) and on the Mac over ssh (`ps eww -axww`, ssh options from `mac_test/offload.py` `ssh_prefix`, host from `mac_test.conf`). A Hana is a process whose executable is a `target/<profile>/hana`. Each row: machine, pid, port (`BRP_EXTRAS_PORT`), owner, purpose, age, checkout. An unreachable Mac is one line, and natedev rows still print. A test Hana is a labelled Hana, or any Hana on a port outside `exempt_ports`, or a Hana on an exempt port whose env carries `CLAUDECODE`, `SSH_CONNECTION` or `SHOWRUNNER_UNIT_ID`. `sweep` stops a test Hana older than `test_max_hours` and an unlabelled test Hana older than `unlabelled_max_minutes`: TERM, then KILL after `stop_grace_seconds`. It never stops a user Hana (exempt port, no agent env). Every stop prints one line, and a rerun with nothing left to stop exits 0.
+5. **Install and timer (director, after the checkpoint).** A `/etc/nixos` branch adds a `hanas` wrapper beside `agents.nix:19-30` and a both-machine `nate.jobs` entry that runs `hanas sweep` (template `modules/common/folder-audit.nix`). Its interval is the only value set in nix. Sent to natedev as branch + hash.
+
+Tests: `scripts/hooks/test_brp_launch_gate.py`: a Hana launch with no purpose is denied with the named key; with a purpose it reaches the memory wait; another app is not checked. `scripts/hanas/test_hanas.py`: rows from a fake `/proc` and from fake `ps eww` output; the test-Hana rule for each exempt-port case; sweep picks only rows over their limit, from config values; a stop of a pid that is gone exits 0; an unreachable Mac still lists natedev. `scripts/hana_shot/test_hana_shot.py`: a launch without a purpose refuses; the started env carries both labels.
+
+**Acceptance:** the tests; `test_brp_launch_gate.py`, `test_hanas.py`, `test_hana_shot.py` and `basedpyright` on the changed Python files pass from the worktree. Live on natedev: `hanas list` shows each running Hana on both machines with owner and purpose, or `unlabelled`; `hanas sweep --dry-run` names exactly the ones over their limits.
+
+**Files:**
+- `config/hanas.conf`, `config/README.md` — item 1.
+- `scripts/hana_shot/hana_shot.py`, `scripts/production/mac_run.sh`, `scripts/production/smoke_launch.sh` — item 2 (approved outside paths).
+- `scripts/hooks/pre-tool-use-brp-launch-gate.sh` — item 3.
+- `scripts/hanas/hanas.py` — item 4.
+- `docs/as-built/hana-test-windows.md` — new: the labels, the gate, `hanas` and its config.
+- `scripts/hooks/test_brp_launch_gate.py`, `scripts/hanas/test_hanas.py`, `scripts/hana_shot/test_hana_shot.py` — tests.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the source, config and doc files.
+- `test` — the test files.
+
+### Phase 44 — Test Hana clones go through scratch, and the Mac keeps no idle clone below its floor  · status: todo
+**Depends on:** Phase 43
+
+**Approved:** builds showrunner 2026-10-31, the same design, its phase 3.
+
+#### Work Order
+
+**Goal:** No large copies stay on the Mac or natedev after tests (user request, 2026-10-31).
+
+**Spec:**
+
+1. **Clones through scratch.** Every test-Hana clone on both machines is made through `scripts/lib/scratch.py` with a task, so its end removes it; `mac_run.sh` and the Mac clone guidance use it.
+2. **Audit age.** `scripts/lint/folder_audit.py` (:68, `REMOVE_AFTER_SECONDS`) removes an idle clone after `clone_max_hours` (config, 4) instead of 7 days; other folders keep their limits.
+3. **Below the Mac floor.** When the Mac's free space is under `free_floor_gib` (`config/mac_test.conf:17`), the sweep removes idle clones, oldest first; a clone with unsaved work (a dirty git tree) loses only its `target`.
+
+Tests: `scripts/lint/test_folder_audit.py` and the Mac sweep's tests: a clone over the age is removed and a younger one stays; below the floor an idle clone goes, a dirty one keeps its source and loses `target`; a busy clone stays.
+
+**Acceptance:** the tests and `basedpyright` on the changed Python files pass from the worktree.
+
+**Files:**
+- `scripts/lib/scratch.py`, `scripts/lint/folder_audit.py`, `scripts/production/mac_run.sh`, `config/mac_test.conf`, `config/hanas.conf` — items 1-3.
+- `scripts/lib/test_scratch.py`, `scripts/lint/test_folder_audit.py` — tests.
+
+**Constraints from prior phases:** Phase 40 validates a new `phase:<unit>/<id>` assignment in `scratch.target` and `scratch.hand_over` through `scratch.registered_plan(unit) -> Path` and `plan_history.plan_phases`. The registered plan comes from the staff parent and production Units record, never the caller's checkout. Clone flows outside a real phase use `gate:<id>` or `--until <when>`. Keep `checked_task` as a shape check so old tasks can still update and end. Tests patch only `registered_plan` with a private plan and use private scratch and copy roots; keep `test_unknown_phase_is_refused_before_creation_or_hand_over` and `test_an_existing_unknown_phase_task_can_update_and_end` in `test_scratch.py`. A `mesh_runs` cwd keeps a folder only while its record says `running`; finished records do not remove the other keeps or the 7-day fallback.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — the source and config files.
+- `test` — the test files.
