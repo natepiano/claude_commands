@@ -373,7 +373,8 @@ Measured 2026-10-29 13:20 EDT (read-only survey of `/proc` and `~/.local/state/b
 
 **Ruled out:** tree equality as proof for a promote rerun (it does not show the commit is the gate's own).
 
-### Phase 15 — A nextest step's charge falls to its test-phase need when its tests start  · status: todo
+### Phase 15 — A nextest step's charge falls to its test-phase need when its tests start  · status: moved
+**Moved:** to queue-unit (builds showrunner 2026-10-31): one owner for queue Phase 5's hub file and a shorter path to the cutover. No new work on it here.
 **Depends on:** Phase 33 (its one anonymous-history reader feeds Spec 2, and its finalizer retry carries Spec 4's saved evidence; the reader moved from this phase to Phase 33) and Phase 26 (same file, `memory_admit.py`; 33 → 26 → 15 land one after another); report-unit's Phase 4c (the test-phase file `$BUILDLOG_PEAK.test-phase.json`, `test_phase_peak_bytes`, `record.read_test_phase`), merged on `origin/builds` (`f88d8012`) and in this branch at `31c3ee3e`. Merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24 and 32 are checkpointed; serial memory chain 31 → 33 → 26 → **15** → 27 → 20 → 11 → 17 → 18 → 19 → 8; 29 runs beside the chain, checkpoints after 33 (same file, `sweep.py`) and joins before 11.
 
 **Approved:** builds showrunner 2026-10-30, option A: the narrow key (repository + scope + package + filters), margin × 1.2, a test for each case, acceptance at most 2.3 % of test phases above their charge per repository on 4c data, and a 24 h check after the merge (steps above their charge, `mem_wait_s` against the 24 h before, earlyoom kills).
@@ -808,6 +809,12 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - `queue_decision` admits a younger step in a backfill window on its own budget and memory checks; nothing checks whether an older waiter that also fits is waiting.
 - `verify.sh` `buildlog_wait_for_memory` (:2630-2651 at `31c3ee3e`): when `try_token_now` fails, the step releases its memory reservation (`buildlog_release_memory 0`), waits in `acquire_token`, then waits for memory again with `BUILDLOG_MEM_WAIT_SINCE` from its first wait. Only the token wait seconds go to `TOKEN_WAIT_FILE`; no record holds the two times.
 
+**User amendment (2026-10-31, the user's words via the builds showrunner; it overrides the Specs below where they differ):**
+- Bump end time: "i never asked for a feature to have a bump until a period of time - it is non-sencial feature - if i want something else in front, i will bump it". So queue priority has no `until` and no expiry. It lasts until `priority clear`, or until a new `priority set` replaces it (a second `set` replaces the live record, and is not refused). Remove `--until`, the expiry pass and the expiry build-log row. Show `queue priority: <unit> (the user's bump)`.
+- head_since: "if it sat first for 158 minutes and it had already been in the queue for 200 does it matter? it is still too long - i don't understand this one". So drop `head_since` as a separate measure: no `HeadSince`/`NotHead`/`HeadTimeNotRecorded` state, no `head_state`/`head_since` row fields, and no "became first" text. The total wait (from the first queue time) is what every reader shows. Tell queue-unit at the checkpoint that `head_facts.read_head_facts` no longer gets `head_since`.
+- Give-back: "once it has both memory and tokens it just goes - if it doesn't have it, it stays in place until it has both- it should follow essentially the same rules - if it has been waiting for a short period, it lets things go through - otherwise it blocks until it gets what it needs". So a step that misses the CPU token keeps its queue place. It starts only when it holds both its memory and the token. While it waits, the same admission rules apply as for any waiter: inside the short (backfill) window, younger steps that fit may go; after it, the step blocks until it has what it needs (strict). No give-back that sends a step behind others. The token record (Spec 4) stays: it records `token_left_at` and `token_back_at`.
+- Also: merge `origin/builds` (`50c45192` or later: queue_view, queue Phases 1, 2, 3, 7) and port to it. Queue Phase 5 lands without these fields; whoever lands second carries this phase's state into the queue service, one copy of each field. `memory_gate.sh`'s wait loop is now queue-unit's.
+
 **Spec:**
 
 1. **Backfill in queue order: moved to Phase 30** (builds showrunner 2026-10-30). Phase 30 builds one admission walk for every window, with `BehindOlderFit`, its readers and the release search. This phase adds queue priority, `head_since` and the token record (Specs 2–6).
@@ -864,7 +871,8 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - Give-back interruption tests: a stop after the handoff is written and before finalization, and a stop after finalization and before the next check takes the handoff; each ends with one finalized reservation and the handoff's `HeadSince` and `token_left_at` kept.
 - Change-Review line: the user's bump walks one unit first until a set time | on natedev, from the builds showrunner session, run `~/.claude/scripts/lib/py ~/.claude/scripts/lint/memory_admit.py priority set --unit <a waiting unit> --until <HH:MM> --why "<what>"`, then type `/build:queue` | that unit's waiting steps are first, the queue shows `queue priority: <unit> until HH:MM (the user's bump)`, and each first row shows when it became first
 
-### Phase 27 — The merge gate holds its whole memory cap in the admission queue  · status: todo
+### Phase 27 — The merge gate holds its whole memory cap in the admission queue  · status: moved
+**Moved:** to queue-unit (builds showrunner 2026-10-31): one owner for queue Phase 5's hub file and a shorter path to the cutover. No new work on it here.
 **Depends on:** devtools-unit's merge-gate checkpoint that raises the gate memory cap to 6 GiB (`a70f99e6`), which is on `main`, `origin/builds` and this branch: `merge_gate.py` :72 has `DEFAULT_MEMORY_CAP_MIB = 6144`. Phase 15 (same files, `memory_admit.py` and `build_why.py`; 26 → 15 → 27 land one after another). Merge `origin/builds` first. Global order: Phases 21, 16, 25, 30, 28, 4, 24 and 32 are checkpointed; serial memory chain 31 → 33 → 26 → 15 → **27** → 20 → 11 → 17 → 18 → 19 → 8; 29 runs beside the chain, checkpoints after 33 (same file, `sweep.py`) and joins before 11.
 
 **Approved:** builds showrunner 2026-10-30 (natedev item: after devtools' 6 GiB cap lands on `main`, each gate holds its cap as one queue row from start to end, with a test).
@@ -1105,7 +1113,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** removing or loosening the installed-script guard (builds 2026-10-31: the guard stays); a skip in place of the error; wiring `test_invoke_scope.py` here (verify-unit owns it).
 
-### Phase 37 — The floor takes an idle target that holds no build unit whole, in last-use order  · status: todo
+### Phase 37 — The floor takes an idle target that holds no build unit whole, in last-use order  · status: done
 **Depends on:** Phase 36 (`scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`)
 
 **Approved:** builds showrunner 2026-10-31: the floor pass-over diagnosis is current work after Phase 36. "Whole take OK, test output included" (ci88 6.68 GiB in a 25.5 h idle clone; trace-targets `bins` 3.64 GiB). Keep the floor limits: never a held target, only the shortfall. Add the line "a target folder is disposable" to the as-built doc. Test: a held or newer target is never taken ahead of an idle empty one. The seed rule (touch `.lint-sweep-used`, copy files, not hard links) goes to verify through builds, not here.
@@ -1162,14 +1170,78 @@ Tests in `scripts/lint/test_sweep.py` (scratch targets, as the floor tests alrea
    - **What `takeable_bytes` means.** A scan-time estimate of what taking only this target's candidates (its orphans and groups, or Phase 37's whole take) would free, with no shortfall limit: the take lines already show the shortfall-limited take. Compute it with `freed_by` against a fresh copy of `scan.links` for each target, so it does not depend on take order: a file with a link outside the target frees nothing from it (two targets that share one inode each show 0 for it).
    - **Scope.** The row lists idle targets only, as now (`hold_floor` writes `idle`; a busy target prints a `left alone` line, and a held target is not walked). Busy and held targets stay out of the row.
 2. **Docs.** `docs/as-built/build-targets.md` names the new fields.
+3. **Three defects from Phase 37's review (routed here).**
+   - **The doc-budget sweep records its delete like `remove` does.** Phase 37 made `record_target_deletes` raise `OSError`. `remove` catches it, but the doc-budget path calls it in a `finally` with no handler, so a state-write failure stops the doc sweep and every later target. That path also records only after `rmtree`. Use one record-before-delete rule for both paths, in one place: the target root is in `target-deletes.json` before the doc folder goes. A record failure keeps that doc folder, prints one line, counts one failure, and the sweep goes on.
+   - **One target discovery per pass.** `walk` calls `target_dirs([directory])` for each target it scans, which walks each target's folders outside its build trees a second time, to depth 8. The scan takes the nested roots from the discovery result its caller already holds, so each folder is walked once per pass.
+   - **A whole take's last use ignores a nested target.** `target_last_use`'s no-stamp fallback reads the mtime of every top-level entry except the locks, so a nested target's folder (and its new output) counts as the outer target's use. Skip an entry that holds a nested target root; the nested target has its own last use.
 
-Tests: `scripts/buildlog/test_record.py` (the row shape) and `scripts/lint/test_sweep.py` (the values for a whole-take target, a target with units, a file with a link outside the target, one inode shared by two targets, and the same values for a small and a large shortfall).
+4. **natedev hears when the floor cannot run.** On 2026-10-31 a slow dry run held `floor.lock` from 02:55 to 06:46 EDT. Every real pass printed one "another sweep is holding it" line and stopped, and `/` fell from 297 GiB to 0.9 GiB free with no alert. Intended: when a real pass finds `floor.lock` held, free space is under the floor, and the lock has been held more than 15 minutes, it tells natedev once per hold (one message, through the existing send path), naming the holder's pid and command and the free space. A later pass under the same hold sends nothing more. (builds showrunner, 2026-10-31.)
+
+5. **A whole take's process recheck is cheap.** Phase 37's real-scale dry run (natedev, floor 400, 2026-10-31) made 221 takes, most of them small whole takes, and each take's recheck read every process's `maps` and parsed every line (`process_uses`, 25.6M lines, about 0.21 s a pass with 1830 pids). The dry run took 292 s; Phase 36's code took 44 s for 4 takes. The recheck before one take asks only whether a process uses that one target: compare `exe` and `cwd` by prefix, and search the raw `maps` bytes for the target's path prefix before any line is decoded; parse lines only in a process whose bytes match. Keep the first full `process_uses` pass as it is, and keep one recheck per take. Report the real-scale dry run's time before and after (floor 400, the same config file).
+
+Tests: `scripts/buildlog/test_record.py` (the row shape) and `scripts/lint/test_sweep.py` (the values for a whole-take target, a target with units, a file with a link outside the target, one inode shared by two targets, and the same values for a small and a large shortfall; a failed doc-budget record keeps the doc folder and the sweep continues; a successful doc removal records before `rmtree`; a scan of a target with a nested target does not call `target_dirs` again; a lock held past 15 minutes under the floor sends one message, and a second pass under the same hold sends none; a no-stamp outer target's last use ignores its nested target's folder; a one-target recheck decodes no `maps` line of a process whose bytes do not name the target, and still finds a process that maps a file under the target, runs from it or works in it).
 
 **Acceptance:** the tests above; `test_record.py`, `test_sweep.py` and Phase 36's take-order regression pass from the worktree; `basedpyright` on the changed Python files.
 
 **Files:**
-- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`, `scripts/buildlog/record.py`, `scripts/buildlog/test_record.py`, `docs/as-built/build-targets.md` — items 1-2.
+- `scripts/lint/sweep.py`, `scripts/lint/test_sweep.py`, `scripts/buildlog/record.py`, `scripts/buildlog/test_record.py`, `docs/as-built/build-targets.md` — items 1-5.
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `sweep.py`, `record.py` and the doc: the values and the row contract.
 - `test` — `test_sweep.py` and `test_record.py`: the values and the row shape.
+
+### Phase 39 — A build's memory promise fits the build's size, so a big build does not wait for a promise it never uses  · status: todo
+**Depends on:** Phase 26 (`scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`)
+
+**Approved:** builds showrunner GO 2026-10-31, after the head-memory-wait answer; the director's measurement is quoted below.
+
+#### Work Order
+
+**Goal:** A dev build with few earlier runs gets a promise near its real peak. On 2026-10-31 the S2 hana build (`verify.sh build hana`) waited 63 min at the head of the queue with 26 to 44 steps behind it. It was promised 21.0 GiB and peaked at 7.8 GiB.
+
+**Cause (measured by the director, 2026-10-31):** the `shape_largest` basis multiplies the largest earlier same-shape peak by `DEV_HEADROOM` (4.2). That one factor was fit so that the smallest dev build in the 126-build replay was covered: a cargo-berth build that used 1.41 GiB after a 0.34 GiB same-shape peak. Applied to a 6.3 GiB hana peak, it gives 26.4 GiB, which the 21 GiB budget then caps. A need equal to the whole budget fits only when no build runs. A cap on the result would only hide this; the cause is a multiplier fit to small builds and applied to large ones. In the 3 days to 2026-10-31 02:05, the 50 hana `build` steps on natedev peaked at p50 10.8, p90 13.4 and at most 15.3 GiB. Phase 31 does not cover this case: it changes only what younger steps may do while the head has priority.
+
+**Spec:**
+
+1. **The headroom fits the build's size.** Replace the single dev multiplier with a headroom rule that covers small builds without scaling their ratio onto large ones (for example a fixed margin plus a smaller factor, or a factor that falls with the peak). Fit the rule by replay on the same 126-build cohort that fit `DEV_HEADROOM`, plus every build in the last 3 days. Keep `RELEASE_HEADROOM` unless the replay shows the same defect for release builds; say so in the summary either way.
+2. **One source.** The rule and its fitted numbers live in one place in `memory_admit.py`, with a comment that names the replay (cohort, date, the build that limits each number). The need basis row records the rule so `need_basis` still reads back (`basis_from_row`). No second copy of the shape logic anywhere, tests included: tests import the constants.
+3. **The kill retry stays.** The existing retry after a memory kill stays the safety for a build that goes over its promise. Do not change it.
+4. **Replay report.** The phase ships a replay over the last 3 days of natedev step rows: for each build, the old promise, the new promise and the measured peak. The report gives how many builds would have gone over their new promise, and by how much (each one, and the largest).
+5. **Docs.** `docs/as-built/build-memory-admission.md` states the new rule and its source.
+
+Tests: `scripts/lint/test_memory_admit.py`: a large dev build with 1 to 9 earlier runs gets a need within the fitted margin of its earlier peak (the S2 case: 6.3 GiB earlier peak gives a need well under 21 GiB); a small build (0.34 GiB earlier peak) is still covered at 1.41 GiB; the basis row round-trips; a release build keeps its current need unless Spec 1 changes it.
+
+**Acceptance:** the tests; the replay report (Spec 4) in the checkpoint notice; `test_memory_admit.py`, the build queue tests and `basedpyright` on the changed Python files pass from the worktree. After the phase lands on main, the director sends builds the count of memory kills on natedev for one day, against the rate before the phase.
+
+**Files:**
+- `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `docs/as-built/build-memory-admission.md` — items 1-5.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `memory_admit.py`, the replay and the doc.
+- `test` — `test_memory_admit.py`.
+
+### Phase 40 — A scratch folder's task always has an end, and only a running worker keeps a folder  · status: todo
+**Depends on:** Phase 37 (order set by the builds showrunner: after the dry-run lock and owner-index fixes)
+
+**Approved:** builds showrunner 2026-10-31: scratch.py and tmp_sweep.py are this unit's files; both fixes take a test each.
+
+#### Work Order
+
+**Goal:** A scratch folder made for a task goes away when that task ends. On 2026-10-31 lfo's `phase-lfo-unit-ci-icon-e0z61v` (58 GB) held a task `phase:lfo-unit/ci-icon` that nothing can end: `merge_checkpoint.py:1043` ends `phase:<unit>/<phase id>`, and `ci-icon` is no phase id. tmp_sweep also kept it as "a live worker uses it" from 31 finished `mesh_runs` records. Report: the director's lfo scratch diagnosis, 2026-10-31.
+
+**Spec:**
+
+1. **A `phase:` task names a real phase.** `scripts/lib/scratch.py` refuses a `phase:<unit>/<id>` task, at the place the name is made (`checked_task`, :475), when `<id>` is not a phase id in that unit's plan. The refusal names the right forms: a phase id, `gate:<id>` or `--until <when>`. Find the flow that made `phase:lfo-unit/ci-icon` (a CI-fix flow); if it needs a scratch folder outside a phase, it uses `gate:` or `--until`, changed in that flow.
+2. **Only a running record keeps a folder.** `scripts/lint/tmp_sweep.py` `worker_use` (:753-769) counts the cwd of a `mesh_runs` record only while that record's status is `running`. A finished record no longer keeps a folder; the 7-day fallback and the other keeps stay.
+3. **Docs.** `docs/as-built/build-memory-admission.md`, where it describes scratch tasks and tmp_sweep's keeps, states both rules.
+
+Tests: `scripts/lib/test_scratch.py`: a `phase:` task with an unknown phase id is refused with the named forms; a real phase id is accepted. `scripts/lint/test_tmp_sweep.py`: a folder whose only `mesh_runs` records are finished is not kept for a worker; one with a running record is.
+
+**Acceptance:** the tests; `test_scratch.py`, `test_tmp_sweep.py`, `test_merge_checkpoint.py` and `basedpyright` on the changed Python files pass from the worktree.
+
+**Files:**
+- `scripts/lib/scratch.py`, `scripts/lib/test_scratch.py`, `scripts/lint/tmp_sweep.py`, `scripts/lint/test_tmp_sweep.py`, `docs/as-built/build-memory-admission.md` — items 1-3. The director adds the CI-fix flow's file here before dispatch once item 1 finds it.
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `scratch.py`, `tmp_sweep.py`, the flow and the doc.
+- `test` — `test_scratch.py` and `test_tmp_sweep.py`.

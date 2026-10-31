@@ -133,10 +133,40 @@ Each command shows its script's output unchanged; each script answers in about a
 ### Build output retained by the sweep
 
 `scripts/lint/sweep.py` keeps the configured free-space floor (300 GiB on natedev).
-When free space is below the floor, it takes only the shortfall. After orphaned
-copies, it takes output from idle targets in last-use order, oldest first,
-across all locations. `/tmp` targets have no special priority. A target's last
+When free space is below the floor, it takes only the shortfall. Orphaned
+copies go first from any idle target. Then whole takes and build-unit batches
+share target last-use order, oldest first, across all locations. A whole take
+has no special priority over a target with build units. `/tmp` targets have no
+special priority. A target's last
 use is the newer of its `.lint-sweep-used` stamp and its build units' last uses.
+A target folder is disposable; keep nothing you need in it. An idle target with
+no build-unit groups is a whole take: its contents go through the same
+write-ahead trim intent, confirmed deletion account and `sweep_trim` publication
+as build units. Orphaned copies keep their first place even when their target
+has no build units; a whole take covers the remaining contents. The target
+folder and its lock files stay. A held `doc/.lock`, Cargo lock or style sync lock
+keeps the target. Before the first unlink, the target root is saved durably in
+`target-deletes.json`, so memory admission refuses a warm promise even if the
+take stops. Cargo markers go last, after every payload delete succeeds. If a
+payload delete fails, the markers keep the target discoverable for the retry. Without a use stamp or build units, the newest mtime of
+the target's top-level entries supplies its last use.
+
+Nested Cargo targets outside Cargo's build trees are separate targets, with
+their own last use, locks and busy checks. The outer scan and whole take leave
+them alone. One owner index per floor pass resolves each target once. Paths from
+`/proc` are already resolved by the kernel and need no further resolution. The
+index rejects paths outside every target root before checking parent folders,
+and remembers each distinct path's deepest owner for the pass. Build-tree paths
+from other sources are resolved once. Process checks read each pid's mappings
+once per check and reuse the index for every batch recheck, tree mapping and
+trim intent. Each batch still checks live processes, so a use that starts during
+the scan keeps its target. Paths and
+processes belong to the deepest target, and the byte
+totals count nested output once. A Cargo target inside a build tree belongs to
+the build unit that holds it, including its bytes and change checks. Linker temporary files named
+`.<name>-<hash>.<pid>` in `deps/` go with the unit whose hash they carry;
+copied-up output still goes with its unit.
+
 Build locks, live processes and build holds still keep their targets out of the sweep.
 Candidate and size scans hold no cargo locks. Up to four target scans run
 together; combined inode accounting counts shared blocks once. The floor takes one target's locks
@@ -146,6 +176,8 @@ File identity, size and mtime are checked before deletion; changed output stays.
 Removing a hard link in another target does not change this check.
 The pass stops when successful deletions cover
 the shortfall.
+A dry run takes no `floor.lock`, so it can plan while a real floor pass holds
+that lock and cannot block a real pass. Real passes still take it without waiting.
 
 The floor takes the least recently used idle target first, then orders build
 units within that target by use. Recent targets are not held back. After each
