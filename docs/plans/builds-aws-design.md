@@ -35,7 +35,7 @@ Three results follow:
 
 ### Machine
 
-- **Type: m7a.8xlarge** to start. 32 vCPU (on 7a types each vCPU is a physical core), 128 GiB. That is natedev's CPU count with twice its memory, so it can run about as many steps as natedev at once with room for the large hana steps (hana nextest peaks at 11.6 GiB). Phase 0 replays the queue to confirm the size or move to m7a.12xlarge (48 vCPU, 192 GiB). x86_64 only: an arm64 machine would be a third platform, and its results would not stand for natedev's.
+- **Type: m7a.4xlarge** to start (Phase 0 result below; m7a.8xlarge was the first proposal). 16 vCPU (on 7a types each vCPU is a physical core), 64 GiB: about half of natedev's build throughput, enough for the large hana steps (hana nextest peaks at 11.6 GiB). m7a.8xlarge (32 vCPU, 128 GiB) is the next size. x86_64 only: an arm64 machine would be a third platform, and its results would not stand for natedev's.
 - **Market: Spot**, a persistent request with interruption behavior `stop`. The machine will run most hours, so the price gap matters more than the interruptions (estimates below). A capacity miss at start is recorded and retried after `capacity_backoff_s`; the steps stay in natedev's queue as today. If misses are frequent in the report, the instance is replaced with an on-demand one (one stack parameter; the data volume keeps the caches).
 - **Region:** us-east-1 or us-east-2 (the user's zone is America/New_York; both have the same list price). Day one runs `aws ec2 get-spot-placement-scores` for the type (free) and picks the better region. The region is a config value.
 - **Storage:** a separate 500 GiB gp3 data volume for `/home` (mirrors, build folders, sccache, rustup, cargo), 6,000 IOPS and 500 MB/s, encrypted, `DeleteOnTermination=false` and retained by the stack. The root volume holds only NixOS and the nix store. A stopped or replaced instance keeps every warm build folder. Size: hana slots at the Mac's 56 GiB budget, cargo-liner slots at 24 GiB, plus the nix store and sccache.
@@ -121,3 +121,31 @@ Go-live is the end of Phase 3, with test, check and doc: about 1,000 of last wee
 ## Open question for the user
 
 - **The monthly cap in dollars** (and a daily cap, default the monthly cap / 20). Phase 0's replay gives the expected cost and the expected saved wait hours before the user picks.
+
+## Phase 0 result — queue replay (2026-10-31)
+
+Script: `docs/plans/builds-aws/replay.py` (scratch analysis, reads the build log index read-only; rerun with `python3 -I docs/plans/builds-aws/replay.py`).
+
+**Data.** natedev steps from 2026-10-24T00:00Z to 2026-10-31T17:43Z (7.75 days): 12,983 steps, 2,316 waiting hours. Sweep steps (4,297) are left out: they are disk cleanup and never wait for memory. With them the count is 17,280. Mac steps are left out (they never enter natedev's queue).
+
+**Model.** natedev is a memory budget with first-fit admission in queue order; after 600 s the head reserves its need (the real head rule, simplified). Each step needs 0.65 of its recorded cgroup peak (admission's `ANON_SHARE`). Steps of one verify call run in order: the next step arrives at the previous step's end plus the recorded gap. The budget that reproduces the real wait is 32.5 GiB (simulated 2,308 h against 2,316 h). The box has 0.5 / 1.0 / 1.5 times that budget for m7a.4xlarge / 8xlarge / 12xlarge (natedev's Ryzen 9 9950X has about the build throughput of 32 Genoa cores). A box step runs the recorded natedev duration times f (1.0, and 1.3 for slower cores). A waiting `verify.sh` step leaves for the box when the box is up and has room. The box starts when 2 steps it can take have waited 120 s, is ready 120 s later, and stops after 15 idle minutes. Lint means clippy, mend and fmt steps (Phase 4, write-back).
+
+**Prices.** On-demand and Spot from instances.vantage.sh on 2026-10-31: m7a.4xlarge $0.927 / $0.483, m7a.8xlarge $1.855 / $0.893; m7a.12xlarge $2.782 / about $1.34 (estimated from the 8xlarge ratio). Plus $74 a month for the data volume and the IPv4 address.
+
+**Result, per 30 days, f = 1.0** (f = 1.3 changes saved hours by less than 1 % and adds 2 to 15 % to the cost):
+
+| Size | Lint | Saved wait | natedev wait left | Box up | Spot $/month | On-demand $/month | $ per saved hour, Spot / OD |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| no box | — | — | 8,939 h | — | — | — | — |
+| m7a.4xlarge | no | 8,211 h | 728 h | 12.1 h/day | 250 | 411 | 0.03 / 0.05 |
+| m7a.4xlarge | yes | 8,463 h | 477 h | 13.8 h/day | 274 | 457 | 0.03 / 0.05 |
+| m7a.8xlarge | no | 8,539 h | 401 h | 12.2 h/day | 400 | 752 | 0.05 / 0.09 |
+| m7a.8xlarge | yes | 8,711 h | 229 h | 13.3 h/day | 431 | 816 | 0.05 / 0.09 |
+| m7a.12xlarge | no | 8,567 h | 373 h | 12.1 h/day | 559 | 1,080 | 0.07 / 0.13 |
+| m7a.12xlarge | yes | 8,745 h | 194 h | 13.1 h/day | 599 | 1,164 | 0.07 / 0.15 |
+
+**Reading.** natedev's queue is at saturation: a small added capacity removes most of the wait. m7a.4xlarge with test, check and doc alone removes 92 % of it. 8xlarge saves 328 more hours a month for $150 more on Spot. Lint adds about 250 saved hours on the 4xlarge, because tests leaving natedev also shorten the lint queue.
+
+**Limits of the model.** New calls arrive at their recorded times; with shorter waits agents send work sooner, so real demand rises, and the box's up hours and cost with it. Routing is per step, not per call. Spot interruptions are not modelled. The need comes from each step's own peak, not admission's estimate. 7.75 days of data.
+
+**Decision.** Start with **m7a.4xlarge Spot**, test, check and doc (go-live at the end of Phase 3): about $250 to $275 a month expected. Lint (Phase 4) follows only when the live report shows lint waits still worth it. Move to m7a.8xlarge when the live report shows the box full (its slots busy while natedev still queues); the data volume keeps the caches through that change. The design's Machine section is updated to this choice.
