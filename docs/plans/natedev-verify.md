@@ -385,3 +385,40 @@ Checkpoint db889600 on `natedev-verify-base`, merged into builds as ee2f8c80.
 **Workers:** 1 writer + 1 tester.
 
 **Acceptance gate:** merge gate `--tests-only` green on a tree merged with origin/builds; basedpyright 0/0 on changed files and callers.
+
+### Phase 11 — Judge a merge commit against both of its parents, also when a base is given  · status: done
+
+**Origin:** builds showrunner, 2026-10-30 22:3x, wrong result, current; lfo is blocked on it. Branch `natedev-verify-base` (carries Phase 6c), worktree `/home/natepiano/worktrees/claude-build-followups-verify-base`, merged with origin/builds b56c91b0 at 88450f4d.
+
+**Depends on:** Phase 6, 6a, 6b, 6c (same file).
+
+#### Work Order
+
+**Source:** builds, 2026-10-30. `verify.sh lint` passes one `--base` from `VERIFY_ASSERTION_BASE` (`verify.sh`, lint verb). With any `--base`, `assertion_guard.py run` judges only against the given bases and skips the non-first parents of HEAD, which it adds only when no `--base` is given. Measured in `~/rust/hana` on lfo tip `f08af7de59` (trunk `1c396f1ecc` merged into its Phase 7 `f8b6c546ba`): a merge-base base gives 280 false blocks, a first-parent base gives 120, and both bases together give no removals.
+
+**Goal:** the guard settles a merge by itself, with no setting: an assertion counts as removed only when it is gone against the selected base and against each merged-in parent, whether the base comes from `--base`, `VERIFY_ASSERTION_BASE` or the default.
+
+**Spec:**
+
+1. Reproduce first: run the guard on `~/rust/hana` with `--head f08af7de59` and `--base` = `git merge-base 1c396f1ecc f8b6c546ba`, and with `--base f8b6c546ba`; record both block counts in the summary before the first edit.
+2. One function in `assertion_guard.py` gives the bases for a judged revision: the selected bases (explicit or default), plus each non-first parent of every merge commit in `<base>..<new side>` (the `--head` revision, else HEAD), plus `MERGE_HEAD` for `--staged` while a merge is in progress (today's `commit_bases`). A parent that is an ancestor of another chosen parent adds nothing and is dropped, so repeated merges of one trunk cost one extra base, not one per merge. `run` calls only this function; the no-`--base` special case goes away.
+3. A finding blocks only when it shows against every base (the existing intersection). Our own removal on a merge still blocks; the other parent's removals never do.
+4. No new setting, flag or skip. `verify.sh` keeps passing `VERIFY_ASSERTION_BASE` unchanged; the guard's own answer covers it.
+5. Fix the guard row in `docs/as-built/phase-checks.md` so it says how merge parents count.
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — the one bases function
+- `scripts/direct/test_assertion_guard.py` — merge cases
+- `docs/as-built/phase-checks.md` — guard row
+
+**Workers:** 1 writer (one owner for all three files).
+
+**State:** none.
+
+**Constraints from prior phases:** Phase 6a's base order (newer of upstream and production merge base; an explicit base still wins as the selected base). Phase 6b's constant pairing and Phase 6c's test naming stay as they are. Never change origin/HEAD in tests.
+
+**Acceptance gate:**
+- New tests in `test_assertion_guard.py`, each failing on 88450f4d: (a) a branch tip that merges a trunk which removed assertions, run with an explicit `--base` at the fork point, does not block; (b) the same with our own removal after the merge still blocks; (c) a branch that merged the trunk twice and then committed, with an explicit base, does not block on the trunk's removals; (d) `--head <merge>` takes that revision's parents, not HEAD's.
+- The real case: `assertion_guard.py --repo ~/rust/hana --head f08af7de59 --base f8b6c546ba` (the checkpoint before lfo's two trunk merges; f08af7de59's first parent is the earlier merge b997a8038a) prints no blocking line (was 120). Against the fork point it reports only lfo's own phase removals (58, was 403).
+- Ruling: the two `MergeAssertionTests` cases in `test_assertion_guard_revisions.py` that expect one explicit base to report the other parent's removal pinned the defect this phase removes; they change to expect no block, with an `Assertion-Change:` line each in the checkpoint.
+- basedpyright `0 errors, 0 warnings, 0 notes` on the two Python files; every `scripts/direct/test_assertion_guard*` and `scripts/hooks/test_change_review_gate.py` module passes; the merge gate passes.

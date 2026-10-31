@@ -1349,17 +1349,33 @@ def default_base(repo: Path, explicit_base: str = "") -> str:
     raise GuardError("cannot determine branch base; set VERIFY_ASSERTION_BASE (or --base)")
 
 
-def commit_bases(repo: Path) -> tuple[str, ...]:
-    """The parents of the commit being made, including all pending merge heads."""
-    bases = [git(repo, "rev-parse", "--verify", "HEAD^{commit}").strip()]
-    merge_head = repo / git(repo, "rev-parse", "--git-path", "MERGE_HEAD").strip()
-    try:
-        merging = merge_head.read_text(encoding="ascii").splitlines()
-    except FileNotFoundError:
-        merging = []
-    for revision in merging:
-        bases.append(git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}").strip())
-    return tuple(dict.fromkeys(bases))
+def commit_bases(repo: Path, selected_bases: tuple[str, ...] = ("HEAD",), *,
+                 head: str = "", staged: bool = True) -> tuple[str, ...]:
+    """Keep selected bases, adding independent merged-in parents of the judged side.
+
+    No arguments retains the commit hook's HEAD/index comparison. An empty
+    selection uses the branch default; an explicit selection keeps its order.
+    """
+    bases = list(dict.fromkeys(default_base(repo, base) for base in selected_bases))
+    if not bases:
+        bases = [default_base(repo)]
+    parents: dict[str, None] = {}
+    for base in bases:
+        for merge in git(repo, "rev-list", "--min-parents=2", "--parents",
+                         f"{base}..{head or 'HEAD'}").splitlines():
+            parents.update(dict.fromkeys(merge.split()[2:]))
+    if staged:
+        merge_head = repo / git(repo, "rev-parse", "--git-path", "MERGE_HEAD").strip()
+        try:
+            merging = merge_head.read_text(encoding="ascii").splitlines()
+        except FileNotFoundError:
+            merging = []
+        for revision in merging:
+            parents[git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}").strip()] = None
+    if parents:
+        independent = set(git(repo, "merge-base", "--independent", *dict.fromkeys([*bases, *parents])).split())
+        bases.extend(parent for parent in parents if parent in independent and parent not in bases)
+    return tuple(bases)
 
 
 @dataclass(frozen=True)
@@ -1520,12 +1536,7 @@ def run(arguments: list[str]) -> int:
     _ = parser.parse_args(arguments, namespace=args)
     repo = Path(args.repo).expanduser().resolve()
     repo = Path(git(repo, "rev-parse", "--show-toplevel").strip())
-    if args.bases:
-        bases = [default_base(repo, base) for base in args.bases]
-    else:
-        bases = [default_base(repo)]
-        bases.extend(git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()[2:])
-    bases = list(dict.fromkeys(bases))
+    bases = commit_bases(repo, tuple(args.bases), head=args.head, staged=args.staged)
     cache = RevisionSourceCache()
     findings = findings_against_base(repo, bases[0], args.head, args.staged, cache)
     common = Counter(finding_identity(finding) for finding in findings)

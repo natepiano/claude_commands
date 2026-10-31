@@ -847,10 +847,10 @@ class MergeAssertionTests(SeededMergeInProgressFixture):
                          (self.git("rev-parse", "HEAD"), self.git("rev-parse", "MERGE_HEAD")))
 
     def test_repeated_bases_exclude_the_other_parents_assertion_removal(self) -> None:
-        # A HEAD-only comparison really does see the imported removal.
+        # An explicit HEAD base still includes the pending merge parent.
         single = self.guard("--base", "HEAD", "--staged")
-        self.assertEqual(single.returncode, 1, single.stdout + single.stderr)
-        self.assertIn("test_incoming removed:", single.stdout)
+        self.assertEqual(single.returncode, 0, single.stdout + single.stderr)
+        self.assertNotIn("test_incoming removed:", single.stdout)
         for first, second in (("HEAD", "MERGE_HEAD"), ("MERGE_HEAD", "HEAD")):
             with self.subTest(first=first):
                 result = self.guard("--base", first, "--base", second, "--staged")
@@ -873,8 +873,8 @@ class MergeAssertionTests(SeededMergeInProgressFixture):
     def test_completed_merge_default_base_excludes_the_other_parents_removals(self) -> None:
         _ = self.git("commit", "-q", "-m", "merge incoming")
         explicit = self.guard("--base", "HEAD^1")
-        self.assertEqual(explicit.returncode, 1, explicit.stdout + explicit.stderr)
-        self.assertIn("test_incoming removed:", explicit.stdout)
+        self.assertEqual(explicit.returncode, 0, explicit.stdout + explicit.stderr)
+        self.assertNotIn("test_incoming removed:", explicit.stdout)
         result = self.guard()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.strip(), CLEAN)
