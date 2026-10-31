@@ -30,6 +30,7 @@ from add_style import NoStyleProduction, standing_style_production
 from production_units import Refusal
 from scripts.production import showrunners
 import style_ledger
+from process_failure import failure_detail
 import scratch
 
 PYTHON = SCRIPTS / "lib/py"
@@ -88,7 +89,7 @@ def notify(repo_dir: Path, branch: str, tip: str) -> None:
             "--timeout", str(SEND_SECONDS),
         ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
         if sent.returncode:
-            raise Refusal(sent.stderr.strip() or sent.stdout.strip() or f"send.py exited {sent.returncode}")
+            raise Refusal(f"send.py: {failure_detail(sent)}")
     except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
         detail = " ".join(str(error).splitlines()).removeprefix("style_sync: ")
         print("style_sync: notify: " + detail)
@@ -410,7 +411,7 @@ def handoff_notice(slug: str, parent: str, checkpoint: str) -> HandoffDelivery:
     if result.returncode == 1 and result.stdout.startswith("QUEUED:"):
         return "queued"
     if result.returncode:
-        raise Refusal(result.stderr.strip() or result.stdout.strip() or f"send.py exited {result.returncode}")
+        raise Refusal(f"send.py: {failure_detail(result)}")
     return "sent"
 
 
@@ -484,7 +485,7 @@ def wake_waiters(repo: Path, ticket_id: str) -> None:
                     "--timeout", str(SEND_SECONDS),
                 ], capture_output=True, text=True, check=False, timeout=SEND_RUN_SECONDS)
                 if result.returncode:
-                    raise Refusal(result.stderr.strip() or result.stdout.strip() or f"send.py exited {result.returncode}")
+                    raise Refusal(f"send.py: {failure_detail(result)}")
             except (Refusal, OSError, ValueError, subprocess.TimeoutExpired) as error:
                 print(f"style_ledger: wake {wait.unit}: " + " ".join(str(error).splitlines()))
                 continue

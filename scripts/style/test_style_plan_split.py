@@ -552,7 +552,7 @@ class RefillRecordingTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertEqual(completed, ["names-unit", "types-unit", "values-unit"])
             self.assertEqual(output.getvalue(), "names-unit: 1/2/3/4 in 0.25 min\n"
-                             + "types-unit: failed: cannot read tree\nvalues-unit: 1/2/3/4 in 0.25 min\n")
+                             + "types-unit: failed: stderr: split types-unit: cannot read tree\nvalues-unit: 1/2/3/4 in 0.25 min\n")
 
     def test_main_records_every_outcome_after_next_phase_returns(self) -> None:
         cases: tuple[tuple[object, str, int, str], ...] = (
