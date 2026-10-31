@@ -10,7 +10,6 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import style_plan
 import style_proposals
 
 import style_ledger
@@ -27,8 +26,7 @@ class StylePlanTests(StylePlanFixture):
             self.write(path, "fn work() -> u32 { 1 }\n")
         self.commit_to_every_checkout()
         issue = self.approved_decision(rule, files, "type")
-        expected = style_plan.read_slices(self.repo, self.tip, files, style_plan.BatchLimits(25, 5000, 10))
-        self.assertEqual(len(expected), 2)
+        expected = (files[:25], files[25:])
         ledger = self.ledger()
         tickets: list[list[str]] = []
         with mock.patch.object(style_proposals, "proposal_command"):
