@@ -103,3 +103,60 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 - `scripts/buildlog/test_report.py` — the Before and after section in the report
 
 **Ruled out:** a one-line moment heading — it would change 4 existing assertions.
+
+### Phase 2 — The build report shows memory figures before and after the build budget raise  · status: done
+**Depends on:** Phase 1
+
+#### Work Order
+
+**Goal:** the before-and-after report answers whether raising the build budget from 21 to 24 GiB (user approved, a one-day trial) changed memory pressure. It prints earlyoom kills (builds and others), the full memory stall, the memory wait p90 and memory-kill retries, before and after the moment the raise is live on main. The raise is a separate moment from Build rules 1 (06:50 EDT), which sits close to it, and the report names that overlap.
+
+**Spec:**
+- **A separate memory moment.** `moments.py` gets one more entry, `Build budget 21 → 24 GiB`, at the instant the showrunner sends. Until that time is known the entry is typed as not live: the report prints `Build budget 21 → 24 GiB: not live yet` in place of its table, and the director later swaps in the instant as a one-line change. Tests use their own fixture instants. It is on its own track: it does not cut the windows of the build moments, and the build moments do not cut its windows. Its before window is the 7 days before it, cut only at an earlier memory moment; its after window runs to the next memory moment or the report end. The type makes the track explicit (no flag a reader must remember); `comparison_windows` stays the one window rule, applied per track. Moment 1's after window is unchanged by this entry.
+- **The overlap, named.** Under the memory moment's table, print one line naming each build moment inside its before or after window, with its date and time, for example `Overlap: Build rules 1 (2026-10-31 06:50 EDT) is inside the before window, 2.2 h before this moment.`
+- **Memory rows.** The memory moment prints its own table (Before, After, Change) with these rows; the build-rate and p50 tables do not print for it:
+  1. earlyoom kills per day, builds: kills whose earlyoom line carries the build kill level, `build_oom_score_adj` in `config/lint.conf` (500 today; `invoke.sh` sets the build scope from the same key, with no new process on the hot path; build steps and sccache, per the kill order in `docs/as-built/build-memory-admission.md`), plus kills at any other adj whose cmdline program sits under a `/target/` folder (a build or test binary run outside the build gate, which gets the sessions' 200). Print `N (M outside the build gate)`;
+  2. earlyoom kills per day, others: every other kill (sessions' tools, CI at 100, the desktop);
+  3. full memory stall: % of sampled time, from the machine `stall_full_us` counter deltas over natedev's 60 s samples;
+  4. memory wait p90: the 90th percentile of `mem_wait_s` over natedev steps started in the window that have `mem_wait_s` recorded, zero waits included;
+  5. memory-kill retries per day: `sum(mem_kills) - sum(mem_kill_stopped)` over natedev calls started in the window, with the stopped calls (`mem_kill_stopped = 1`) in brackets.
+  When the journal cannot be read (the Mac, or journalctl fails), rows 1 and 2 print `unavailable`. A window shorter than 1 day prints `thin`, as the rate tables do.
+- **One reader each, no copies.**
+  - earlyoom: `memory.py` gets one function that returns the window's kills as a typed list (time, pid, command, `oom_score_adj` or none, cmdline or none) or the journal-unavailable value, built on `journal_messages` and the `EARLYOOM` pattern (extended to capture `oom_score_adj`). `window_report` uses it too, and its output stays the same.
+  - stall: reuse `report.sample_counter_deltas(..., window=UsageWindow(start, end), natedev_only=True)`; resets, boot changes and gaps stay unknown as they are today.
+  - The memory figures live where they can use these readers without an import cycle.
+- **Definitions.** Add each memory row's definition to the section's definitions, once.
+- **On demand.** `buildlog moments` and `buildlog report` both show the memory moment. No timer and no notifier.
+
+**Files:**
+- `scripts/buildlog/moments.py`
+- `scripts/buildlog/memory.py`
+- `scripts/buildlog/report.py`
+- `scripts/buildlog/test_moments.py`
+- `scripts/buildlog/test_report.py`
+- `scripts/buildlog/test_memory_window.py`
+- `config/lint.conf`
+- `scripts/lint/invoke.sh`
+- `scripts/lint/lint_config.sh`
+- `scripts/lint/config_values.py`
+- `scripts/lint/test_invoke_scope.py`
+
+**Workers:** impl3 writes `moments.py`, `memory.py`, `report.py`, `config/lint.conf`, `invoke.sh`, `lint_config.sh` and `config_values.py`. test2 writes the `test_moments.py`, `test_report.py`, `test_memory_window.py` and `test_invoke_scope.py` changes.
+
+**Acceptance gate:**
+- `basedpyright` on each slot's files reads 0 errors, 0 warnings, 0 notes.
+- `python3 -m unittest scripts.buildlog.test_moments scripts.buildlog.test_report scripts.buildlog.test_memory_window` passes, with a stubbed journal and fixture indexes that cover:
+  - the builds/others split (adj 500; adj 200 with a `/target/` program, counted as builds outside the gate; adj 200 without one; a line with no adj);
+  - journal unavailable;
+  - the stall share across a boot change;
+  - p90 with zero waits; retries with a stopped call;
+  - the memory moment's windows: not cut at Moment 1, and Moment 1's after window not cut at the memory moment;
+  - the overlap line;
+  - `window_report`'s earlyoom lines unchanged.
+- Live check by the director on natedev: for the week 2026-10-24 06:50 to 2026-10-31 06:50 EDT, the earlyoom reader returns 54 builds kills (9 outside the build gate) and 0 others (a manual journal count: 45 at adj 500; 9 at adj 200, all test binaries under `target/`); `buildlog moments` prints the memory table and the overlap line in under 5 s.
+
+**Constraints:**
+- Workers make no worktree commits.
+- Tests never read the live index, journal or progress history, and never write any of them.
+- Tests run with `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD`.
+- Build rules from 2026-10-31: fix every failure you can see before you rerun, and do not run a test after each small edit. After a pass, do not run again until your edits are done. Run basedpyright once, at the end.

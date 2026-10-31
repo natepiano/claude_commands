@@ -23,6 +23,7 @@ import disk
 import ci
 import index
 import mac_outcome
+import moments
 import report
 import holds
 import health
@@ -35,8 +36,15 @@ from record import TARGET_DIR_UNSET
 from test_holds import timed_hold_events, write_holder, write_mac_block
 from test_index import COORDINATION_VARIABLES, STAMP, Record, call, ci_job, ci_run, encode, local_day, point_root_at, sample, step
 from test_record_rerun import refresh_machine_health
+from test_memory_window import isolated_journal
 
 HISTORY_STAMP = "2026-09-30T12:00:00Z"
+
+
+def table_cells(heading: str, rows: list[str]) -> list[dict[str, str]]:
+    headers = [cell.strip() for cell in heading.strip("|").split("|")]
+    return [dict(zip(headers, [cell.strip() for cell in line.strip("|").split("|")], strict=True))
+            for line in rows]
 
 
 def cargo_build(record_id: str, **fields: object) -> Record:
@@ -128,6 +136,7 @@ def setUpModule() -> None:
 class ReportSpeedTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
+        _ = isolated_journal(self)
         temporary = Path(self.enterContext(tempfile.TemporaryDirectory()))
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {name: str(temporary / name) for name in COORDINATION_VARIABLES})))
 
@@ -2434,9 +2443,7 @@ class ReportTests(unittest.TestCase):
         return self.table_cells(table[0], table[2:])
 
     def table_cells(self, heading: str, rows: list[str]) -> list[dict[str, str]]:
-        headers = [cell.strip() for cell in heading.strip("|").split("|")]
-        return [dict(zip(headers, [cell.strip() for cell in line.strip("|").split("|")], strict=True))
-                for line in rows]
+        return table_cells(heading, rows)
 
     def usage_text(self, day: str) -> str:
         _ = index.update()
@@ -3221,6 +3228,10 @@ class PowerProfileTests(unittest.TestCase):
         point_root_at(self, self.root)
         self.addCleanup(time.tzset)
         _ = cast(object, self.enterContext(mock.patch.dict(os.environ, {"TZ": "UTC", "USER_ZONE": "UTC"})))
+        # These fixtures exercise build/profile comparisons. Memory moments
+        # have independent fixtures and must not change the profile assertions.
+        _ = cast(object, self.enterContext(mock.patch.object(moments, "MOMENTS", tuple(
+            event for event in moments.MOMENTS if isinstance(event, moments.BuildMoment)))))
         time.tzset()
 
     def write(self, *records: Record) -> None:

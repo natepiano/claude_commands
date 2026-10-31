@@ -32,9 +32,16 @@ if [[ -f "$LINT_CONFIG_READER" ]]; then
     # shellcheck source=/dev/null
     source "$LINT_CONFIG_READER"
 else
-    echo "invoke.sh: $LINT_CONFIG_READER not found — running every check" >&2
+    echo "invoke.sh: $LINT_CONFIG_READER not found — running every check; using build_oom_score_adj=500" >&2
     lint_config_enabled() { return 0; }
     lint_config_skip_notice() { :; }
+fi
+# Installed and stub readers may predate the numeric setting. Keep their
+# existing behavior quietly, with the same safe kill-order fallback.
+if declare -F lint_config_build_oom_score_adj >/dev/null; then
+    lint_config_build_oom_score_adj BUILD_OOM_SCORE_ADJ
+else
+    BUILD_OOM_SCORE_ADJ=500
 fi
 
 # natedev's machine-wide pool of build slots (/etc/nixos
@@ -82,10 +89,11 @@ fi
 # absence afterwards proves the scope never ran the step (no user manager, a
 # sandbox without its socket, a systemd older than 254 that rejects the
 # option), and run() runs it plainly.
-# The scope raises oom_score_adj to 500, so earlyoom kills build steps before
+# The scope sets oom_score_adj from lint.conf, so earlyoom kills build steps before
 # CI (100) and sessions (200), the largest first.
 BUILDLOG_RECORD="$HOME/.claude/scripts/buildlog/record.py"
-BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo 500 > /proc/self/oom_score_adj; } 2>/dev/null || true; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_SCOPE_SH='exec 2>&3 3>&-; { : > "$0"; } 2>/dev/null || exit 125; cgroup="/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)"; printf "%s\n" "$cgroup" > "$0.cgroup"; { echo @BUILD_OOM_SCORE_ADJ@ > /proc/self/oom_score_adj; } 2>/dev/null || true; "$@"; s=$?; cat "$cgroup/cpu.stat" > "$0.cpu.stat" 2>/dev/null || true; cat "$cgroup/io.stat" > "$0.io.stat" 2>/dev/null || true; cat "$cgroup/memory.peak" "$cgroup/memory.pressure" > "$0" 2>/dev/null; exit $s'
+BUILDLOG_SCOPE_SH="${BUILDLOG_SCOPE_SH//@BUILD_OOM_SCORE_ADJ@/$BUILD_OOM_SCORE_ADJ}"
 source "$(dirname "${BASH_SOURCE[0]}")/memory_gate.sh" || {
     printf 'invoke.sh: cannot load admission and hold checks; step refused\n' >&2
     return 2

@@ -14,7 +14,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from enum import Enum
-from typing import NamedTuple, cast
+from typing import Literal, NamedTuple, cast
 
 import ci
 import holds
@@ -74,6 +74,7 @@ CI_STALE_AFTER_S = 2 * 3600
 MAX_SAMPLE_GAP_S = 5 * 60
 GIB = 2**30
 MIN_PROFILE_RUNS = 10
+MIN_RATE_WINDOW_DAYS = 1
 # 2026-10-01–04 log: 1 edit 12.54 min, 2–3 16.09, 4–7 20.94, 8+ 31.28.
 # One test per two edits leaves headroom for most gaps to stay within 2–3;
 # the 4–7 bin is where recovery time starts to climb.
@@ -1326,8 +1327,8 @@ def moment_rate_table(before: moments.WindowRates, after: moments.WindowRates,
         lines.append("| " + " | ".join((row.label,
             rate_with_baseline(left, row, baseline, "before", before.days),
             rate_with_baseline(right, row, baseline, "after", after.days), change)) + " |")
-    before_thin = " (thin)" if before.days < 1 else ""
-    after_thin = " (thin)" if after.days < 1 else ""
+    before_thin = " (thin)" if before.days < MIN_RATE_WINDOW_DAYS else ""
+    after_thin = " (thin)" if after.days < MIN_RATE_WINDOW_DAYS else ""
     lines += [f"Before: {before.days:.3f} days{before_thin}; after: {after.days:.3f} days{after_thin}.", ""]
     return lines
 
@@ -1362,18 +1363,120 @@ def report_end(day: str, now: datetime) -> datetime:
     return min(now, day_end).astimezone(UTC)
 
 
+type MemoryMetricKey = Literal["builds", "others", "stall_full_pct", "wait_p90", "retries"]
+
+
+@dataclass(frozen=True)
+class MemoryRateRow:
+    key: MemoryMetricKey
+    label: str
+    value: float | moments.RateUnavailable
+    outside_build_gate: float = 0.0
+    stopped: float = 0.0
+
+
+def memory_window_rows(connection: sqlite3.Connection, start: datetime, end: datetime) -> tuple[MemoryRateRow, ...]:
+    """Memory pressure over an explicit window, using the shared journal and counter readers."""
+    days = (end - start).total_seconds() / 86400
+    if days <= 0:
+        raise ValueError("memory window must have positive duration")
+    kills = memory.earlyoom_kills(start, end)
+    outside = 0.0
+    if kills is memory.JournalUnavailable.VALUE:
+        builds: float | moments.RateUnavailable = moments.RateUnavailable("journal unavailable")
+        others: float | moments.RateUnavailable = moments.RateUnavailable("journal unavailable")
+    else:
+        builds = sum(kill.is_build for kill in kills) / days
+        others = sum(not kill.is_build for kill in kills) / days
+        outside = sum(kill.outside_build_gate for kill in kills) / days
+    intervals = sample_counter_deltas(connection, "", ("stall_full_us",),
+                                     window=UsageWindow(start, end), natedev_only=True)
+    stall_us = sampled_s = 0.0
+    for interval in intervals:
+        delta = interval.deltas["stall_full_us"]
+        if not isinstance(delta, int):
+            continue
+        covered = (min(end, interval.ended_at) - max(start, interval.started_at)).total_seconds()
+        stall_us += delta * covered / interval.elapsed_s
+        sampled_s += covered
+    stall = (100 * stall_us / (sampled_s * 1_000_000) if sampled_s
+             else moments.RateUnavailable("no known full-stall intervals"))
+    parameters = moments.window_parameters(start, end)
+    bounds = ("started_at >= :first_day AND started_at < :last_day"
+              + " AND julianday(started_at) >= julianday(:start) AND julianday(started_at) < julianday(:end)")
+    waits = cast(list[tuple[float]], connection.execute(
+        f"SELECT mem_wait_s FROM steps WHERE {bounds} AND {natedev_step_predicate()} AND mem_wait_s IS NOT NULL",
+        parameters).fetchall())
+    wait_p90 = (nearest_rank([row[0] for row in waits], 90) if waits
+                else moments.RateUnavailable("no recorded waits"))
+    retries, stopped = cast(tuple[int, int], connection.execute(
+        "SELECT coalesce(sum(mem_kills), 0) - coalesce(sum(mem_kill_stopped), 0),"
+        + f" coalesce(sum(mem_kill_stopped), 0) FROM calls WHERE {bounds} AND host = 'natedev'",
+        parameters).fetchone())
+    return (
+        MemoryRateRow("builds", "Earlyoom kills/day, builds", builds, outside_build_gate=outside),
+        MemoryRateRow("others", "Earlyoom kills/day, others", others),
+        MemoryRateRow("stall_full_pct", "Full memory stall", stall),
+        MemoryRateRow("wait_p90", "Memory wait p90", wait_p90),
+        MemoryRateRow("retries", "Memory-kill retries/day", retries / days, stopped=stopped / days),
+    )
+
+
+def memory_row_text(row: MemoryRateRow) -> str:
+    if isinstance(row.value, moments.RateUnavailable):
+        return "unavailable"
+    if row.key == "builds":
+        return f"{row.value:.1f} ({row.outside_build_gate:.1f} outside the build gate)"
+    if row.key == "stall_full_pct":
+        return f"{row.value:.1f}%"
+    if row.key == "wait_p90":
+        return seconds(row.value)
+    if row.key == "retries":
+        return f"{row.value:.1f} [{row.stopped:.1f} stopped]"
+    return f"{row.value:.1f}"
+
+
+def memory_moment_table(before: Sequence[MemoryRateRow], after: Sequence[MemoryRateRow],
+                        before_days: float, after_days: float) -> list[str]:
+    body: list[list[str]] = []
+    for left, right in zip(before, after, strict=True):
+        change = "—"
+        if isinstance(left.value, (int, float)) and isinstance(right.value, (int, float)) and left.value > 0:
+            change = f"{(right.value-left.value)/left.value:+.0%}".replace("-", "−")
+        body.append([left.label, memory_row_text(left), memory_row_text(right), change])
+    thin_before = " (thin)" if before_days < MIN_RATE_WINDOW_DAYS else ""
+    thin_after = " (thin)" if after_days < MIN_RATE_WINDOW_DAYS else ""
+    return [*table(["Memory", "Before", "After", "Change"], body),
+            f"Before: {before_days:.3f} days{thin_before}; after: {after_days:.3f} days{thin_after}.", ""]
+
+
+def memory_overlap_lines(window: moments.ComparisonWindow, events: Sequence[moments.Moment]) -> list[str]:
+    lines: list[str] = []
+    for event in sorted((event for event in events if isinstance(event, moments.BuildMoment)), key=lambda event: event.at):
+        if not window.before_start <= event.at < window.after_end:
+            continue
+        side = "before" if event.at < window.moment.at else "after"
+        distance = abs((event.at - window.moment.at).total_seconds()) / 3600
+        lines.append(f"Overlap: {event.name} ({memory.local_time(event.at, with_date=True)}) is inside the {side} window, "
+                     + f"{distance:.1f} h {side} this moment.")
+    return lines
+
+
 def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
     """One comparison window rule for build interventions and observed profiles."""
     end = report_end(day, datetime.now(UTC))
     profiles = [change for change in profile_changes(connection) if call_time(change.at) < end]
     events = (*moments.MOMENTS, *(moments.BuildMoment(call_time(change.at), change.profile, "all") for change in profiles))
     windows = moments.comparison_windows(events, end)
-    if not windows and not profiles:
+    pending = [event for event in events if isinstance(event, moments.PendingMemoryMoment)]
+    if not windows and not profiles and not pending:
         return []
     lines = ["### Before and after", ""]
     if profiles:
         latest = profiles[-1]
         lines += [f"Profile now: {latest.profile}, since {local_time(latest.at)}.", ""]
+    for event in pending:
+        lines += [f"{event.name}: not live yet", ""]
     if not windows:
         return lines
     lines += [
@@ -1385,10 +1488,17 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
         "Same-worker reruns: consecutive nextest steps in the same session, submit at most 60 min after the previous end, no lower bound; after a pass means both passed, fail then fail means both failed. Hours count the later step.",
         "Load ratios divide hana nextest or clippy counts by phase_finished events in natedev's progress history whose working_dir matches the hana name patterns; the Mac's phases are not counted. Repeated phase_instance_id counts once.",
         "Clone rebuilds: hana nextest with crates_compiled >= 300; clone repeats are the percentage whose previous nextest in the same session was also a clone rebuild ending at most 4 h before, no lower bound.",
-        "Per-day = total ÷ window days; percentages and /phase ratios are not divided by days. A window shorter than 1 day is thin; — means no denominator.",
-        "Windows: before covers 7 days cut at the previous moment; after ends at the next moment or report end. Pair histories and hana classification use each measured window.", "",
+        f"Per-day = total ÷ window days; percentages and /phase ratios are not divided by days. A window shorter than {MIN_RATE_WINDOW_DAYS} day is thin; — means no denominator.",
+        "Windows: before covers 7 days cut at the previous moment on the same track; after ends at the next moment on that track or report end. Build and memory moments do not cut each other's windows. Pair histories and hana classification use each measured window.", "",
     ]
-    phases = moments.phase_events()
+    if any(isinstance(window.moment, moments.MemoryMoment) for window in windows):
+        lines += [
+            f"Earlyoom kills/day, builds: oom_score_adj {memory.BUILD_OOM_SCORE_ADJ}, plus any other adjustment whose cmdline program is under /target/; the latter are outside the build gate. Others are every remaining kill; journal unavailable is not zero.",
+            "Full memory stall: stall_full_us deltas ÷ sampled elapsed microseconds, natedev's 60 s samples; resets, boot changes and gaps are unknown.",
+            "Memory wait p90: nearest-rank 90th percentile of recorded mem_wait_s on natedev steps started in the window, zero waits included.",
+            "Memory-kill retries/day: (sum(mem_kills) − sum(mem_kill_stopped)) ÷ window days on natedev calls started in the window; stopped calls are in brackets, per day.", "",
+        ]
+    phases = moments.phase_events() if any(isinstance(window.moment, moments.BuildMoment) for window in windows) else ()
     rates: dict[tuple[datetime, datetime], moments.WindowRates] = {}
     p50_groups: dict[tuple[datetime, datetime, bool], dict[tuple[str, str, str], list[float]]] = {}
 
@@ -1404,15 +1514,25 @@ def moments_section(connection: sqlite3.Connection, day: str) -> list[str]:
             p50_groups[key] = profile_step_durations(connection, start, finish, hana_only=hana_only)
         return p50_groups[key]
 
-    ascending = sorted((event for event in events if event.at < end), key=lambda event: event.at)
+    ascending = sorted((event for event in events if not isinstance(event, moments.PendingMemoryMoment)
+                        and event.at < end), key=lambda event: event.at)
     for window in windows:
         moment = window.moment
-        prior = [event for event in ascending if event.at < moment.at]
-        before_name = prior[-1].name if prior else "profile not recorded"
+        prior = [event for event in ascending if event.track == moment.track and event.at < moment.at]
+        before_name = (prior[-1].name if prior else
+                       "no earlier memory moment" if isinstance(moment, moments.MemoryMoment) else "profile not recorded")
         lines += [f"#### {moment.name}", "",
                   f"Before {local_time(moment.at.isoformat())} ({before_name}) vs after ({moment.name}):", "",
                   f"Windows: before {local_time(window.before_start.isoformat())} to {local_time(moment.at.isoformat())}; "
                   + f"after to {local_time(window.after_end.isoformat())}.", ""]
+        if isinstance(moment, moments.MemoryMoment):
+            before_rows = memory_window_rows(connection, window.before_start, moment.at)
+            after_rows = memory_window_rows(connection, moment.at, window.after_end)
+            lines += memory_moment_table(before_rows, after_rows,
+                                         (moment.at-window.before_start).total_seconds()/86400,
+                                         (window.after_end-moment.at).total_seconds()/86400)
+            lines += [*memory_overlap_lines(window, events), ""]
+            continue
         lines += moment_p50_table(grouped(window.before_start, moment.at, moment.scope == "hana"),
                                   grouped(moment.at, window.after_end, moment.scope == "hana"))
         before, after = measured(window.before_start, moment.at), measured(moment.at, window.after_end)

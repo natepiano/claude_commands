@@ -9,10 +9,11 @@ import sqlite3
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
 import index
 import cgroup_capture
@@ -21,9 +22,20 @@ import store
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from user_zone import user_zone  # noqa: E402
 
+if TYPE_CHECKING:
+    from ..lint.config_values import build_oom_score_adj
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
+    from config_values import build_oom_score_adj
+
+BUILD_OOM_SCORE_ADJ = build_oom_score_adj()
 GIB = 2**30
 SNAPSHOT_DISTANCE_S = 120
-EARLYOOM = re.compile(r'sending SIG(?:TERM|KILL) to process (\d+) uid \d+ "([^"]+)"')
+EARLYOOM = re.compile(
+    r'sending SIG(?:TERM|KILL) to process (?P<pid>\d+) uid \d+ "(?P<command>[^"]+)"'
+    + r'(?:[^\n]*?,\s*oom_score_adj (?P<adj>-?\d+))?'
+    + r'(?:[^\n]*?\bcmdline "(?P<cmdline>.*)")?[^\n]*$'
+)
 OOM_MEMCG = re.compile(r'oom_memcg=([^,\s]+)')
 
 
@@ -55,6 +67,38 @@ ServiceState = Literal["in_service", "outside", "unavailable"]
 
 class JournalUnavailable(Enum):
     VALUE = "journal unavailable"
+
+
+class OomScoreAdjUnavailable(Enum):
+    VALUE = "oom_score_adj not recorded"
+
+
+class CmdlineUnavailable(Enum):
+    VALUE = "cmdline not recorded"
+
+
+def cmdline_program(cmdline: str) -> str:
+    """earlyoom joins argv with spaces without shell quoting."""
+    return cmdline.partition(" ")[0]
+
+
+@dataclass(frozen=True)
+class EarlyoomKill:
+    at: datetime
+    pid: int
+    command: str
+    oom_score_adj: int | OomScoreAdjUnavailable = OomScoreAdjUnavailable.VALUE
+    cmdline: str | CmdlineUnavailable = CmdlineUnavailable.VALUE
+
+    @property
+    def outside_build_gate(self) -> bool:
+        if self.oom_score_adj == BUILD_OOM_SCORE_ADJ or not isinstance(self.cmdline, str):
+            return False
+        return "/target/" in cmdline_program(self.cmdline)
+
+    @property
+    def is_build(self) -> bool:
+        return self.oom_score_adj == BUILD_OOM_SCORE_ADJ or self.outside_build_gate
 
 
 def service_state(value: int | None) -> ServiceState:
@@ -206,6 +250,25 @@ def journal_messages(args: list[str], start: datetime, end: datetime) -> list[tu
     return messages
 
 
+def earlyoom_kills(start: datetime, end: datetime) -> list[EarlyoomKill] | JournalUnavailable:
+    """Read real kill lines once; startup threshold announcements are not kills."""
+    if store.host_name() != "natedev":
+        return JournalUnavailable.VALUE
+    messages = journal_messages(["-u", "earlyoom"], start, end)
+    if messages is JournalUnavailable.VALUE:
+        return messages
+    kills: list[EarlyoomKill] = []
+    for at, message in messages:
+        match = EARLYOOM.search(message)
+        if match is None or not start <= at < end:
+            continue
+        adj, cmdline = match.group("adj"), match.group("cmdline")
+        kills.append(EarlyoomKill(at, int(match.group("pid")), match.group("command"),
+                                 int(adj) if adj is not None else OomScoreAdjUnavailable.VALUE,
+                                 cmdline if cmdline is not None else CmdlineUnavailable.VALUE))
+    return kills
+
+
 def nearest_snapshot(connection: sqlite3.Connection, instant: datetime) -> SnapshotNearInstant:
     left = stored_bound(instant - timedelta(seconds=SNAPSHOT_DISTANCE_S))
     right = stored_bound(instant + timedelta(seconds=SNAPSHOT_DISTANCE_S))
@@ -265,14 +328,12 @@ def slice_line(name: Literal["builds", "ci"], start: SnapshotNearInstant, end: S
 
 def window_report(connection: sqlite3.Connection, start: datetime, end: datetime) -> str:
     lines = [f"Memory, {local_time(start, with_date=True)} to {local_time(end, with_date=True)}"]
-    early_messages = journal_messages(["-u", "earlyoom"], start, end)
-    if early_messages is JournalUnavailable.VALUE:
+    early = earlyoom_kills(start, end)
+    if early is JournalUnavailable.VALUE:
         lines.append("earlyoom kills: journal unavailable")
     else:
-        early = [(at, match.group(2), match.group(1)) for at, message in early_messages
-                 if (match := EARLYOOM.search(message))]
         lines.append(f"earlyoom kills: {len(early)}")
-        lines.extend(f"{local_time(at)} {comm} pid {pid}" for at, comm, pid in early)
+        lines.extend(f"{local_time(kill.at)} {kill.command} pid {kill.pid}" for kill in early)
     kernel_messages = journal_messages(["-k"], start, end)
     if kernel_messages is JournalUnavailable.VALUE:
         lines.append("kernel OOM kills: journal unavailable")

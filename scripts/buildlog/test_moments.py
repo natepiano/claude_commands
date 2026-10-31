@@ -16,11 +16,14 @@ from typing import cast, override
 from unittest import mock
 
 import index
+import memory
 import moments
 import report
 import store
 import test_report as report_fixtures
+import test_memory_window as memory_fixtures
 from test_index import Record, call, sample, step
+from test_memory_window import write_lint_config
 
 
 START = datetime(2026, 10, 10, tzinfo=UTC)
@@ -43,10 +46,14 @@ def build(record_id: str, seconds: float, **fields: object) -> Record:
 
 class MomentTests(unittest.TestCase):
     fixture: report_fixtures.PowerProfileTests  # pyright: ignore[reportUninitializedInstanceVariable]
+    journal: memory_fixtures.MemoryWindowTests  # pyright: ignore[reportUninitializedInstanceVariable]
+    configured_moments: tuple[moments.Moment, ...] = ()
 
     @override
     def setUp(self) -> None:
         # Reuse the p50 fixtures, including index, timezone and log isolation.
+        self.journal = memory_fixtures.isolated_journal(self)
+        self.configured_moments = moments.MOMENTS
         self.fixture = report_fixtures.PowerProfileTests(methodName="runTest")
         self.addCleanup(self.fixture.doCleanups)
         self.fixture.setUp()
@@ -410,7 +417,10 @@ class MomentTests(unittest.TestCase):
         self.assertIn("(sdlc 1", clippy)
 
     def test_moments_command_prints_the_same_section_from_fixture_index(self) -> None:
-        with closing(self.connection(build("measured", 3600, repo="hana"))) as connection:
+        with (
+            mock.patch.object(moments, "MOMENTS", self.configured_moments),
+            closing(self.connection(build("measured", 3600, repo="hana"))) as connection,
+        ):
             expected = report.moments_section(connection, "2026-10-30")
         database = self.fixture.root / "index.sqlite"
         before = database.read_bytes()
@@ -422,6 +432,230 @@ class MomentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), expected)
         self.assertEqual(database.read_bytes(), before)
+
+
+class MemoryMomentTests(unittest.TestCase):
+    fixture: MomentTests  # pyright: ignore[reportUninitializedInstanceVariable]
+    journal: memory_fixtures.MemoryWindowTests  # pyright: ignore[reportUninitializedInstanceVariable]
+
+    @override
+    def setUp(self) -> None:
+        self.fixture = MomentTests(methodName="runTest")
+        self.addCleanup(self.fixture.doCleanups)
+        self.fixture.setUp()
+        self.journal = self.fixture.journal
+        _ = cast(object, self.enterContext(mock.patch.object(store, "host_name", return_value="natedev")))
+
+    def memory_cells(self, lines: list[str]) -> dict[str, dict[str, str]]:
+        start = next(number for number, line in enumerate(lines) if line.startswith("| Memory "))
+        rows = [line for line in lines[start + 2:] if line.startswith("|")]
+        return {row["Memory"]: row for row in report_fixtures.table_cells(lines[start], rows)}
+
+    def memory_records(self, at: datetime) -> list[Record]:
+        records = [step(f"wait-before-{number}", started_at=(at - timedelta(minutes=10)).isoformat(),
+                        mem_wait_s=0 if number < 9 else 900) for number in range(10)]
+        records.extend(step(f"wait-after-{number}", started_at=(at + timedelta(minutes=10)).isoformat(),
+                            mem_wait_s=0 if number < 8 else 60 if number == 8 else 600)
+                       for number in range(10))
+        records.extend((
+            step("unknown-wait", started_at=(at - timedelta(minutes=10)).isoformat(), mem_wait_s=None),
+            step("mac-wait", host="macbook", started_at=(at + timedelta(minutes=10)).isoformat(), mem_wait_s=99999),
+            step("wait-at-end", started_at=END.isoformat(), mem_wait_s=99999),
+            call("before-retries", started_at=(at - timedelta(minutes=10)).isoformat(), mem_kills=3, mem_kill_stopped=False),
+            call("before-stopped", started_at=(at - timedelta(minutes=9)).isoformat(), mem_kills=2, mem_kill_stopped=True),
+            call("after-retries", started_at=(at + timedelta(minutes=10)).isoformat(), mem_kills=4, mem_kill_stopped=False),
+            call("after-stopped", started_at=(at + timedelta(minutes=11)).isoformat(), mem_kills=2, mem_kill_stopped=True),
+            call("mac-retries", host="macbook", started_at=(at + timedelta(minutes=10)).isoformat(), mem_kills=99),
+            call("retries-at-end", started_at=END.isoformat(), mem_kills=99),
+        ))
+        for seconds, boot, stall in (
+            (-180, "old", 0), (-120, "old", 6_000_000), (-60, "new", 100_000_000),
+            (0, "new", 106_000_000), (60, "new", 118_000_000),
+            (120, "newer", 0), (180, "newer", 12_000_000),
+        ):
+            records.append(sample((at + timedelta(seconds=seconds)).isoformat(), boot_id=boot, stall_full_us=stall))
+        records.extend((
+            sample(at.isoformat(), host="macbook", stall_full_us=0),
+            sample((at + timedelta(seconds=60)).isoformat(), host="macbook", stall_full_us=60_000_000),
+        ))
+        return records
+
+    def test_configured_kill_level_changes_the_python_split_and_definition(self) -> None:
+        at = START + timedelta(days=1)
+        self.journal.stub_journal(early=[
+            memory_fixtures.journal_entry(at + timedelta(minutes=1),
+                memory_fixtures.earlyoom_message(106, adj=650, cmdline="/usr/bin/rustc")),
+            memory_fixtures.journal_entry(at + timedelta(minutes=2),
+                memory_fixtures.earlyoom_message(107, adj=500, cmdline="/usr/bin/editor")),
+            memory_fixtures.journal_entry(at + timedelta(minutes=3),
+                memory_fixtures.earlyoom_message(108, adj=200, cmdline="/work/target/debug/test")),
+        ], kernel=[])
+        config = write_lint_config(self.journal.base, 650)
+        with closing(self.fixture.connection()):
+            pass
+        program = '''
+import json
+from datetime import datetime
+import index, memory, moments, report
+start = datetime.fromisoformat("2026-10-11T00:00:00+00:00")
+end = datetime.fromisoformat("2026-10-12T00:00:00+00:00")
+kills = memory.earlyoom_kills(start, end)
+assert isinstance(kills, list), kills
+print(json.dumps([(kill.is_build, kill.outside_build_gate) for kill in kills]))
+moments.MOMENTS = (moments.MemoryMoment(start, "fixture budget raise"),)
+with index.read_only() as connection:
+    print("\\n".join(report.moments_section(connection, "2026-10-11")))
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", program], capture_output=True, text=True, check=False,
+            timeout=60, env={**os.environ, "LINT_CONFIG_FILE": str(config),
+                             "PYTHONPATH": str(Path(report.__file__).parent)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], "[[true, false], [false, false], [true, true]]")
+        self.assertIn("oom_score_adj 650", result.stdout)
+        self.assertNotIn("oom_score_adj 500", result.stdout)
+
+    def test_first_memory_heading_names_the_absence_of_an_earlier_memory_moment(self) -> None:
+        moment = moments.MemoryMoment(START + timedelta(days=1), "fixture budget raise")
+        with mock.patch.object(moments, "MOMENTS", (moment,)):
+            lines = self.fixture.section(day="2026-10-11")
+        heading = next(line for line in lines if line.startswith("Before "))
+        self.assertIn("no earlier memory moment", heading)
+        self.assertNotIn("profile not recorded", heading)
+
+    def test_both_comparison_tables_and_definition_share_the_thin_window_threshold(self) -> None:
+        build_moment = moments.BuildMoment(START, "fixture build rule", "all")
+        memory_moment = moments.MemoryMoment(START + timedelta(hours=12), "fixture budget raise")
+        with (
+            mock.patch.object(report, "MIN_RATE_WINDOW_DAYS", 2),
+            mock.patch.object(moments, "MOMENTS", (memory_moment,)),
+            closing(self.fixture.connection()) as connection,
+        ):
+            before = moments.window_rates(connection, START, START + timedelta(days=1.5))
+            after = moments.window_rates(connection, START, END)
+            memory_rows = report.memory_window_rows(connection, START, END)
+            build_lines = report.moment_rate_table(before, after, build_moment)
+            memory_lines = report.memory_moment_table(memory_rows, memory_rows, before.days, after.days)
+            section = report.moments_section(connection, "2026-10-11")
+        expected = "Before: 1.500 days (thin); after: 2.000 days."
+        self.assertIn(expected, build_lines)
+        self.assertIn(expected, memory_lines)
+        self.assertEqual(sum("A window shorter than 2 day is thin" in line for line in section), 1)
+
+    def test_memory_table_counts_kills_stalls_zero_waits_and_stopped_retries(self) -> None:
+        at = START + timedelta(days=1)
+        moment = moments.MemoryMoment(at, "fixture budget raise")
+        before_messages = [memory_fixtures.earlyoom_message(number) for number in range(6)]
+        before_messages.append(memory_fixtures.earlyoom_message(10, adj=200, cmdline="/work/target/debug/test"))
+        before_messages.extend((memory_fixtures.earlyoom_message(11, adj=200, cmdline="/usr/bin/editor"),
+                                memory_fixtures.earlyoom_message(12, adj=None)))
+        after_messages = [memory_fixtures.earlyoom_message(20),
+                          memory_fixtures.earlyoom_message(21, adj=200, cmdline="/work/target/debug/test"),
+                          memory_fixtures.earlyoom_message(22, adj=100, cmdline="/work/target/release/test"),
+                          memory_fixtures.earlyoom_message(23, adj=None)]
+        self.journal.stub_journal(early=[
+            *(memory_fixtures.journal_entry(at - timedelta(minutes=10), message) for message in before_messages),
+            *(memory_fixtures.journal_entry(at + timedelta(minutes=10), message) for message in after_messages),
+        ], kernel=[])
+        with (
+            mock.patch.object(moments, "MOMENTS", (moment,)),
+            closing(self.fixture.connection(*self.memory_records(at))) as connection,
+            mock.patch.object(report, "sample_counter_deltas", wraps=report.sample_counter_deltas) as counters,
+        ):
+            before = {row.key: row for row in report.memory_window_rows(connection, at - timedelta(days=7), at)}
+            after = {row.key: row for row in report.memory_window_rows(connection, at, END)}
+            lines = report.moments_section(connection, "2026-10-11")
+        self.assertAlmostEqual(cast(float, before["builds"].value), 1)
+        self.assertAlmostEqual(before["builds"].outside_build_gate, 1 / 7)
+        self.assertAlmostEqual(cast(float, before["others"].value), 2 / 7)
+        self.assertEqual(after["builds"].value, 3)
+        self.assertEqual(after["builds"].outside_build_gate, 2)
+        self.assertEqual(after["others"].value, 1)
+        self.assertEqual(before["stall_full_pct"].value, 10)
+        self.assertEqual(after["stall_full_pct"].value, 20)
+        self.assertEqual(before["wait_p90"].value, 0)
+        self.assertEqual(after["wait_p90"].value, 60)
+        self.assertAlmostEqual(cast(float, before["retries"].value), 4 / 7)
+        self.assertAlmostEqual(before["retries"].stopped, 1 / 7)
+        self.assertEqual(after["retries"].value, 5)
+        self.assertEqual(after["retries"].stopped, 1)
+        for invocation in counters.call_args_list:
+            arguments = cast(dict[str, object], invocation.kwargs)
+            self.assertTrue(arguments["natedev_only"])
+            self.assertIsInstance(arguments["window"], report.UsageWindow)
+        cells = self.memory_cells(lines)
+        self.assertEqual(cells["Earlyoom kills/day, builds"]["Before"], "1.0 (0.1 outside the build gate)")
+        self.assertEqual(cells["Earlyoom kills/day, builds"]["After"], "3.0 (2.0 outside the build gate)")
+        self.assertEqual(cells["Earlyoom kills/day, others"]["Before"], "0.3")
+        self.assertEqual(cells["Earlyoom kills/day, others"]["After"], "1.0")
+        self.assertEqual(cells["Full memory stall"]["Change"], "+100%")
+        self.assertEqual(cells["Memory wait p90"]["Before"], "0.0 s")
+        self.assertEqual(cells["Memory wait p90"]["After"], "1.0 min")
+        self.assertEqual(cells["Memory-kill retries/day"]["After"], "5.0 [1.0 stopped]")
+        self.assertFalse(any(line.startswith(("| Rate |", "| Kind |")) for line in lines))
+        for definition in ("oom_score_adj 500", "stall_full_us", "zero waits included", "sum(mem_kills)"):
+            self.assertEqual(sum(definition in line for line in lines), 1)
+
+    def test_memory_and_build_windows_cut_only_at_their_own_track_and_name_overlaps(self) -> None:
+        previous = moments.MemoryMoment(START - timedelta(days=2), "earlier memory rule")
+        budget = moments.MemoryMoment(START + timedelta(days=1), "fixture budget raise")
+        next_memory = moments.MemoryMoment(START + timedelta(days=3), "later memory rule")
+        build_rule = moments.BuildMoment(START + timedelta(hours=12), "Build rules fixture", "all")
+        later_build = moments.BuildMoment(START + timedelta(days=1, hours=6), "Later build fixture", "all")
+        events = (previous, build_rule, budget, later_build, next_memory)
+        end = START + timedelta(days=4)
+        with mock.patch.object(moments, "MOMENTS", events):
+            windows = {window.moment.name: window for window in moments.comparison_windows(events, end)}
+            lines = self.fixture.section(day="2026-10-13")
+        self.assertEqual(windows[budget.name].before_start, previous.at)
+        self.assertEqual(windows[budget.name].after_end, next_memory.at)
+        self.assertEqual(windows[build_rule.name].before_start, build_rule.at - timedelta(days=7))
+        self.assertEqual(windows[build_rule.name].after_end, later_build.at)
+        self.assertEqual(windows[later_build.name].before_start, build_rule.at)
+        self.assertEqual(windows[later_build.name].after_end, end)
+        start = lines.index("#### fixture budget raise")
+        finish = next(number for number in range(start + 1, len(lines)) if lines[number].startswith("#### "))
+        block = lines[start:finish]
+        self.assertIn("Overlap: Build rules fixture (2026-10-10 12:00 UTC) is inside the before window, 12.0 h before this moment.", block)
+        self.assertIn("Overlap: Later build fixture (2026-10-11 06:00 UTC) is inside the after window, 6.0 h after this moment.", block)
+        self.assertTrue(any(line.startswith("| Memory ") for line in block))
+        self.assertFalse(any(line.startswith(("| Rate |", "| Kind |")) for line in block))
+
+    def test_unknown_journal_and_unknown_stall_intervals_never_print_zero(self) -> None:
+        at = START + timedelta(days=1)
+        moment = moments.MemoryMoment(at, "fixture budget raise")
+        self.journal.stub_journal(early=[], kernel=[], exit_code=1)
+        records = [sample((at + timedelta(seconds=seconds)).isoformat(), boot_id=boot, stall_full_us=stall)
+                   for seconds, boot, stall in ((0, "a", 100), (60, "b", 200), (120, "b", 0),
+                                                (600, "b", 900_000_000))]
+        with mock.patch.object(moments, "MOMENTS", (moment,)):
+            lines = self.fixture.section(*records, day="2026-10-11")
+        cells = self.memory_cells(lines)
+        for label in ("Earlyoom kills/day, builds", "Earlyoom kills/day, others", "Full memory stall", "Memory wait p90"):
+            self.assertEqual(cells[label]["After"], "unavailable")
+        self.assertEqual(cells["Memory-kill retries/day"]["After"], "0.0 [0.0 stopped]")
+
+    def test_short_memory_window_marks_thin_and_normalizes_kills_by_elapsed_days(self) -> None:
+        at = END - timedelta(hours=6)
+        moment = moments.MemoryMoment(at, "fixture short trial")
+        self.journal.stub_journal(early=[memory_fixtures.journal_entry(
+            at + timedelta(minutes=1), memory_fixtures.earlyoom_message(30))], kernel=[])
+        with mock.patch.object(moments, "MOMENTS", (moment,)):
+            lines = self.fixture.section(day="2026-10-11")
+        self.assertIn("Before: 7.000 days; after: 0.250 days (thin).", lines)
+        self.assertEqual(self.memory_cells(lines)["Earlyoom kills/day, builds"]["After"],
+                         "4.0 (0.0 outside the build gate)")
+
+    def test_budget_without_a_live_instant_prints_its_status_instead_of_a_table(self) -> None:
+        pending = moments.PendingMemoryMoment("Build budget 21 → 24 GiB")
+        with (
+            mock.patch.object(moments, "MOMENTS", (pending,)),
+            mock.patch.object(memory, "earlyoom_kills", side_effect=AssertionError("not-live moment queried journal")),
+            mock.patch.object(moments, "window_rates", side_effect=AssertionError("not-live moment measured rates")),
+        ):
+            lines = self.fixture.section()
+        self.assertEqual(lines, ["### Before and after", "", "Build budget 21 → 24 GiB: not live yet", ""])
 
 
 if __name__ == "__main__":

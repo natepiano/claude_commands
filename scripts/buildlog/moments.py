@@ -9,8 +9,9 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
-from typing import Literal, cast
+from typing import ClassVar, Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import unit_runs  # noqa: E402
@@ -51,15 +52,38 @@ class SdlcBaseline:
     window: Literal["adjacent", "week"] = "adjacent"
 
 
+class MomentTrack(Enum):
+    BUILD = "build"
+    MEMORY = "memory"
+
+
 @dataclass(frozen=True)
 class BuildMoment:
     at: datetime
     name: str
     scope: Literal["all", "hana"]
     baseline: SdlcBaseline | NoSdlcBaseline = NoSdlcBaseline()
+    track: ClassVar[MomentTrack] = MomentTrack.BUILD
 
 
-MOMENTS: tuple[BuildMoment, ...] = (
+@dataclass(frozen=True)
+class MemoryMoment:
+    at: datetime
+    name: str
+    track: ClassVar[MomentTrack] = MomentTrack.MEMORY
+
+
+@dataclass(frozen=True)
+class PendingMemoryMoment:
+    name: str
+    track: ClassVar[MomentTrack] = MomentTrack.MEMORY
+
+
+type LiveMoment = BuildMoment | MemoryMoment
+type Moment = LiveMoment | PendingMemoryMoment
+
+
+MOMENTS: tuple[Moment, ...] = (
     BuildMoment(datetime(2026, 10, 28, 13, 1, tzinfo=UTC), "herdr cgroup move", "all"),
     BuildMoment(datetime(2026, 10, 28, 13, 24, tzinfo=UTC), "baloo content indexing off", "all"),
     BuildMoment(datetime(2026, 10, 29, 6, 59, tzinfo=UTC), "hana opt-level 1", "hana"),
@@ -86,6 +110,7 @@ MOMENTS: tuple[BuildMoment, ...] = (
                     BaselineFigure("clone_hours", 231, basis="total"),
                 ), ("sdlc: clone rebuilds 805 runs, 231 of 327 hana nextest hours; 134 phases.",
                     "Fail then fail differs (ours about 80 h, sdlc 50–55 h); load ratios differ because sdlc's 134 phases include the Mac."), "week")),
+    MemoryMoment(datetime(2026, 10, 31, 13, 33, tzinfo=UTC), "Build budget 21 → 24 GiB (e791376e)"),
 )
 
 HANA_PATTERNS = ("hana", "tool-based-ui", "catalyst", "fairy_dust")
@@ -357,22 +382,27 @@ def window_rates(connection: sqlite3.Connection, start: datetime, end: datetime,
 
 @dataclass(frozen=True)
 class ComparisonWindow:
-    moment: BuildMoment
+    moment: LiveMoment
     before_start: datetime
     after_end: datetime
 
 
-def comparison_windows(moments: Sequence[BuildMoment], end: datetime) -> tuple[ComparisonWindow, ...]:
-    """Keep fixed interventions while their after window overlaps the last week.
+def comparison_windows(moments: Sequence[Moment], end: datetime) -> tuple[ComparisonWindow, ...]:
+    """Apply the before/after rule independently on each moment's track.
 
+    Keep fixed interventions while their after window overlaps the last week.
     Observed profile changes retain their original seven-day display horizon.
     Earlier events still bound the before window even when no longer shown.
     """
-    ordered = sorted((moment for moment in moments if moment.at < end), key=lambda moment: moment.at)
-    instants = sorted({moment.at for moment in ordered})
-    boundaries = {at: (instants[i-1] if i else at-timedelta(days=7),
-                       instants[i+1] if i+1 < len(instants) else end) for i, at in enumerate(instants)}
-    return tuple(ComparisonWindow(moment, max(moment.at-timedelta(days=7), boundaries[moment.at][0]),
-                                  boundaries[moment.at][1]) for moment in reversed(ordered)
-                 if (boundaries[moment.at][1] > end-timedelta(days=7) if moment in MOMENTS
-                     else moment.at >= end-timedelta(days=7)))
+    windows: list[ComparisonWindow] = []
+    for track in MomentTrack:
+        ordered = sorted((moment for moment in moments if not isinstance(moment, PendingMemoryMoment)
+                          and moment.track == track and moment.at < end), key=lambda moment: moment.at)
+        instants = sorted({moment.at for moment in ordered})
+        boundaries = {at: (instants[i-1] if i else at-timedelta(days=7),
+                           instants[i+1] if i+1 < len(instants) else end) for i, at in enumerate(instants)}
+        windows.extend(ComparisonWindow(moment, max(moment.at-timedelta(days=7), boundaries[moment.at][0]),
+                                        boundaries[moment.at][1]) for moment in ordered
+                       if (boundaries[moment.at][1] > end-timedelta(days=7) if moment in MOMENTS
+                           else moment.at >= end-timedelta(days=7)))
+    return tuple(sorted(windows, key=lambda window: window.moment.at, reverse=True))
