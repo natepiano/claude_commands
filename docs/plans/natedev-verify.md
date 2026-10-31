@@ -407,6 +407,50 @@ Checkpoints c0377368 and 4751eb55 on `natedev-verify-cancel`.
 
 **Ruled out:** a sweep that cleans up after a stop, or a second cancel path beside `verify_interrupted`.
 
+### Phase 11 — Judge a merge commit against both of its parents, also when a base is given  · status: done
+
+#### As-built
+
+Checkpoint 49a471ca on `natedev-verify-base`.
+
+- `assertion_guard.py` `commit_bases(repo, selected_bases=("HEAD",), *, head="", staged=True) -> tuple[str, ...]` is the one bases function. It keeps the selected bases in order (each through `default_base`; an empty selection uses the branch default), adds each non-first parent of every merge in `<base>..<head or HEAD>`, adds the `MERGE_HEAD` entries when `staged`, and keeps only the parents that `git merge-base --independent` lists, so repeated merges of one trunk add one base. With no arguments it is the commit hook's HEAD/index comparison.
+- `run` calls only `commit_bases(repo, tuple(args.bases), head=args.head, staged=args.staged)`. A finding blocks only when it shows against every base, so a merged-in trunk's removals never block and our own removal after a merge still does, with `--base`, `VERIFY_ASSERTION_BASE` or the default. `verify.sh` passes `VERIFY_ASSERTION_BASE` unchanged.
+- Real case: `assertion_guard.py --repo ~/rust/hana --head f08af7de59 --base f8b6c546ba` prints no blocking line (was 120); against fork 25d64d92 it reports 58, lfo's own removals (was 403).
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — `commit_bases`, `run`
+- `scripts/direct/test_assertion_guard.py` — `MergeBaseSelectionTests`: explicit fork base ignores trunk removals, still blocks our removal after a merge, two trunk merges then a commit, `--head` takes that revision's parents
+- `scripts/direct/test_assertion_guard_revisions.py` — the two `MergeAssertionTests` explicit-base cases expect exit 0 and no `test_incoming removed:` line
+- `docs/as-built/phase-checks.md` — guard row: explicit or default bases, merged-in parents, pending merge heads, findings against every base
+
+**Binds later work:** later guard changes reuse `commit_bases` unchanged and add no second bases path.
+
+**Gotchas:** f08af7de59's first parent is the earlier merge b997a8038a, not f8b6c546ba; a base at f8b6c546ba still crosses one trunk merge.
+
+**Ruled out:** a new setting, flag or skip for merges; parent discovery wider than the non-first parents of merges in the judged range.
+
+### Phase 12 — Pair an assertion whose local binding was renamed  · status: done
+
+#### As-built
+
+Checkpoint 48859c93 on `natedev-verify-base`.
+
+- `assertion_guard.py` pairs a Rust assertion whose only change is a renamed local `let` binding, also across a rustfmt rewrap. `touched_assertions` calls `binding_renames(sources, code, constants)` once. For each test that `enclosing_tests` finds once on each side, `prove_binding_rename(old_rows, new_rows, scope) -> BindingRename | NoBindingRename` compares the whole test token by token (`rust_tokens`, on the shared `lexical_spans` lexer). The proof holds only when every token difference is one bijection of plain `let` names, each bound once on its side and absent from the other side, so binding values must also be token-equal. `BindingRename.rewrite` maps the new names back to the old ones in each new-side assertion of that test before matching.
+- The proof reuses the Phase 6b census. `ConstantTable` adds `local_declarations` (plain `let [mut] name [: T] =`), `function_bodies` and `local_renames_refused`; `refuse_environment()` sets `refuse_all` and `local_renames_refused`. An untrusted macro inside another function does not refuse a local rename (`pairing_code_is_certain(code, function_bodies)`); constant pairing keeps its file-wide refusal.
+- These forms refuse the proof, and normal matching runs: shadowing; patterns; function and closure parameters; a generic signature, a nested function or any attribute inside the test; a literal on either side that holds `{name` for a mapped name; a mapped name inside a macro other than the assert family; member, path, field, label, type and `as` positions; a use before the binding's statement ends or inside a nested block; split or merged maps; the Phase 6b file refusals (`macro_rules`, a trusted-macro import, an unresolved glob, uncertain code); every Python file.
+- Real case: the staged `8dd754b1` diff from `~/rust/cargo-liner-style-names` at its parent, with no `Assertion-Change:` lines, prints `assertion guard: no removed or weaker assertions`.
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — `RustToken`, `rust_tokens`, `BindingRename`, `NoBindingRename`, `prove_binding_rename`, `rename_references_are_plain`, `binding_renames`; `ConstantTable.local_declarations`, `function_bodies`, `local_renames_refused`, `refuse_environment`
+- `scripts/direct/test_assertion_guard_revisions.py` — `BindingRenameTests`: the two real shapes, a rename plus another change, each refusal form, Python renames stay `removed`
+- `docs/as-built/phase-checks.md` — guard row: plain local `let` renames pair, and the forms that refuse
+
+**Binds later work:** a rename proof change goes in `prove_binding_rename` and reuses `rust_tokens` and the census; no second tokenizer or matcher.
+
+**Gotchas:** a refused proof does not block by itself: normal matching runs, so an in-place edit of one assertion stays a non-blocking `changed` note.
+
+**Ruled out:** pairing a renamed function parameter (a test attribute such as `#[rstest]` picks a fixture by parameter name); Python renames; a block for every refused proof.
+
 ### Phase 13 — Stop the Mac copy watcher when verify ends before the watcher starts  · status: done
 
 #### As-built

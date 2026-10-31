@@ -1,16 +1,14 @@
-/** Cells are formatted once by build_queue.py, including times in the user's zone. */
-export interface QueueSnapshot {
-  running_header: string[];
-  running: string[][];
-  waiting_header: string[];
-  waiting: string[][];
-  head: { text: string; tone: 'default' | 'error' };
-  totals: { promised: string; measured: string; free: string; reserve: string };
-  problems: string[];
+/** Already laid out in terminal cells by the queue reader. */
+export type Tone = 'default' | 'success' | 'error' | 'warning' | 'inactive' | 'suggestion';
+export interface QueueLines {
+  columns: number;
+  as_of: number;
+  lines: { text: string; tone?: Tone; bold?: boolean; background?: Tone; until?: number }[][];
 }
 
-export type QueuePaneState =
-  | { kind: 'loading' }
-  | { kind: 'queue'; data: QueueSnapshot }
-  | { kind: 'failed'; reason: string };
+export type QueueSelection = { kind: 'view' } | { kind: 'card'; selector: string };
 
+export type QueuePaneState =
+  | { kind: 'loading'; selection: QueueSelection }
+  | { kind: 'queue'; data: QueueLines; selection: QueueSelection }
+  | { kind: 'failed'; reason: string; selection: QueueSelection };

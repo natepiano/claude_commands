@@ -197,6 +197,15 @@ buildlog_memory_line() {
     buildlog_memory_line_inner "$@"
 }
 
+buildlog_memory_check_launch_limit() {
+    # An app launch (no argv) has no reservation and its hook a 960 s timeout: it alone keeps the limit.
+    if (( $1 == 0 && (( $2 != 0 && BUILDLOG_MEM_WAIT_S >= $3 ) || $3 == 0) )); then
+        buildlog_memory_refuse 'launch wait limit reached without admission'
+        return 2
+    fi
+    return 0
+}
+
 buildlog_wait_for_memory() {
     BUILDLOG_MEM_WAIT_S=0 BUILDLOG_MEM_OUTCOME=MeminfoUnavailable BUILDLOG_MEM_RESERVATION=""
     # This admission gate serves Linux. The Mac uses its claim admission.
@@ -206,10 +215,12 @@ buildlog_wait_for_memory() {
     fi
     local meminfo="${BUILDLOG_MEMINFO:-/proc/meminfo}" live_path line available_kb available result error_line
     local started=0 announced=0 next_notice=60 interval="${BUILDLOG_MEM_POLL_S:-5}" limit="${BUILDLOG_MEM_WAIT_LIMIT_S:-900}"
+    local failed_since=-1 retry_limit="${BUILDLOG_MEM_CHECK_RETRY_S:-60}"
     local state threshold need source count promised running reserve summary reservation repo step fresh reason worktree measured head_need head_label fields numeric noticed=0 caller_pid=$BASHPID
     local cached_repo="" cached_step="" cached_worktree="" cached_need=- cached_source="" cached_count=0
     [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || interval=5
     [[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 0 ]] || limit=900
+    [[ "$retry_limit" =~ ^[0-9]+$ ]] || retry_limit=60
     BUILDLOG_MEM_WAIT_FROM="${BUILDLOG_MEM_WAIT_SINCE:-${EPOCHSECONDS:-$(date +%s)}}"
     if [[ -n "${BUILDLOG_MEM_WAIT_FIRST_FILE:-}" && -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
         read -r BUILDLOG_MEM_WAIT_FROM < "$BUILDLOG_MEM_WAIT_FIRST_FILE"
@@ -250,9 +261,19 @@ buildlog_wait_for_memory() {
         fi
         if ! result="$(BUILDLOG_MEM_DETAIL=1 buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" check "$meminfo" "$caller_pid" "${BUILDLOG_PEAK:+$BUILDLOG_PEAK.cgroup}" "$BUILDLOG_MEM_WAIT_FROM" "$cached_repo" "$cached_step" "$cached_worktree" "$cached_need" "$cached_source" "$cached_count" "$@" 2>&1)"; then
             error_line=${result##*$'\n'}
+            if (( announced != 0 )); then
+                buildlog_memory_check_launch_limit "$#" "$announced" "$limit" || return 2
+                if (( failed_since < 0 )); then failed_since=$SECONDS; fi
+                if (( SECONDS - failed_since < 10#$retry_limit )); then
+                    printf 'memory admission check failed (%s); trying again, the step keeps its place\n' "${error_line:-checker returned an error}" >&2
+                    sleep "$interval"
+                    continue
+                fi
+            fi
             buildlog_memory_refuse "${error_line:-checker returned an error}"
             return 2
         fi
+        failed_since=-1
         fields=${result//[^|]/}
         if [[ "$result" == *$'\n'* || ( ${#fields} != 14 && ${#fields} != 17 ) ]]; then
             buildlog_memory_refuse 'invalid checker output'
@@ -263,10 +284,6 @@ buildlog_wait_for_memory() {
         case "$state:$reason" in
             admit:reserved|admit:launch|hold:held|hold:launch) ;;
             *) buildlog_memory_refuse "invalid admission answer $state:$reason"; return 2 ;;
-        esac
-        case "$source" in
-            measured|buildlog|pooled|fallback|shape) ;;
-            *) buildlog_memory_refuse 'invalid memory source'; return 2 ;;
         esac
         for numeric in "$threshold" "$need" "$count" "$promised" "$running" "$reserve" "$fresh" "$measured" "$head_need"; do
             if [[ ! "$numeric" =~ ^[0-9]+$ ]]; then
@@ -291,11 +308,7 @@ buildlog_wait_for_memory() {
             fi
             break
         fi
-        # An app launch (no argv) has no reservation and its hook a 960 s timeout: it alone keeps the limit.
-        if (( $# == 0 && announced != 0 && BUILDLOG_MEM_WAIT_S >= limit )) || (( $# == 0 && limit == 0 )); then
-            buildlog_memory_refuse 'launch wait limit reached without admission'
-            return 2
-        fi
+        buildlog_memory_check_launch_limit "$#" "$announced" "$limit" || return 2
         if (( announced == 0 )); then
             if [[ -n "${BUILDLOG_MEM_WAIT_FIRST_FILE:-}" && ! -s "$BUILDLOG_MEM_WAIT_FIRST_FILE" ]]; then
                 printf '%s\n' "$BUILDLOG_MEM_WAIT_FROM" > "$BUILDLOG_MEM_WAIT_FIRST_FILE"

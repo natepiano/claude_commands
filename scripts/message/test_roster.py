@@ -25,9 +25,12 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership, showrunner_relationship, showrunner_launch
+from scripts.production.staff_test_support import (
+    isolated_staff_file, production_membership, unit_membership, showrunner_relationship, showrunner_launch,
+)
 from scripts.astra import design_roles
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.message import unit_labels
 
 SCRIPTS = Path(__file__).parents[1]
 sys.path.insert(0, str(Path(__file__).parent))
@@ -37,7 +40,6 @@ sys.path.insert(0, str(SCRIPTS / "direct"))
 import codex_daemon
 from codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 import process_table
-import remove_workers
 import roster
 import send
 import broadcast
@@ -160,10 +162,6 @@ class RosterTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(showrunners, "SESSIONS_DIR", self.sessions))
         _ = self.enterContext(mock.patch.object(
             showrunners, "SESSIONS", Path(__file__).with_name("sessions.py"),
-        ))
-        _ = self.enterContext(mock.patch.object(
-            remove_workers, "shutdown_held_sessions",
-            return_value={"kind": "held sessions", "session_ids": set()},
         ))
         _ = self.enterContext(mock.patch.object(
             process_table, "PS", ["ps", "-eo", "pid=,ppid=,comm=,args="],
@@ -2331,6 +2329,12 @@ class CodexHolderLabelsTests(unittest.TestCase):
 
 
 class UnitLabelsTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
+        production_membership("cargo-liner-style", "cargo-liner-style-types-unit")
+
     def test_folder_name_joins_showrunner_and_unit(self) -> None:
         self.assertEqual(roster.UnitLabels("director", "hana", "lfo").folder_name(), "hana-lfo")
         self.assertEqual(roster.UnitLabels("director", "hana", "hanami").folder_name(), "hana-hanami")
@@ -2417,6 +2421,8 @@ class UnitLabelsTests(unittest.TestCase):
 
     def test_fast_lookup_uses_only_fixture_sessions_registry_and_unit_marks(self) -> None:
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
+        _ = unit_membership("cargo-liner-style", "cargo-liner-style-types-unit")
         doc = root / "production.md"
         _ = doc.write_text(
             "## Units\n| Unit | Plan | Worktree | Branch | Port | Owns |\n"
@@ -2446,10 +2452,10 @@ class UnitLabelsTests(unittest.TestCase):
         environment = {"HERDR_PROC": str(root / "proc"), "NOTIFIER_SESSIONS_DIR": str(root / "sessions")}
         notifier = root / "notifier"
         (notifier / "showrunner-cargo-liner-style").mkdir(parents=True)
-        with mock.patch.object(roster, "_newest_sessions", return_value=records), \
+        with mock.patch.object(unit_labels, "newest_sessions", return_value=records), \
              mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier), \
-             mock.patch.object(roster, "_registered_showrunners", return_value=registered), \
-             mock.patch.object(roster, "_live_runs", side_effect=AssertionError("no meshes")) as meshes, \
+             mock.patch.object(unit_labels, "registered_showrunners", return_value=registered), \
+             mock.patch.object(unit_labels, "live_runs", side_effect=AssertionError("no meshes")) as meshes, \
              mock.patch.object(unit_lookup, "every_marked_unit", side_effect=AssertionError("no mark scan")) as marks_read, \
              mock.patch.object(herdr, "herdr_places", side_effect=AssertionError("no process scan")) as places, \
              mock.patch.object(process_table, "snapshot", side_effect=AssertionError("no process table")) as processes, \
@@ -2478,8 +2484,10 @@ class UnitLabelsTests(unittest.TestCase):
              "updatedAt": 1, "tmux": "", "formerNames": []},
         ]
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        with mock.patch.object(roster, "_newest_sessions", return_value=records), \
-             mock.patch.object(roster, "_registered_showrunners", return_value=[]):
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
+        _ = showrunner_relationship("unrelated")
+        with mock.patch.object(unit_labels, "newest_sessions", return_value=records), \
+             mock.patch.object(unit_labels, "registered_showrunners", return_value=[]):
             labels = roster.unit_labels_for(["requested", "missing"], {"HERDR_PROC": str(root)})
         self.assertEqual(labels, {"requested": roster.UnitLabels("scratch", "—", "—")})
 

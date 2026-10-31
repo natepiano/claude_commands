@@ -1,6 +1,6 @@
 """Move a stopped showrunner's checkout, a linked git worktree, to a new path (`rename.py checkout`).
 
-The shutdown launch calls `move` between the showrunner's stop and its launch (restart.move_checkout).
+`checkout` calls the shared stop API, `move`, then the shared resume API.
 The git move comes first, so a refusal before it keeps the old checkout whole, and every later part is
 safe to repeat:
 
@@ -12,8 +12,7 @@ safe to repeat:
 - herdr pane records: a pane cwd under the old path.
 - the production doc: its Showrunner checkout line names the new path, committed on the merge branch.
 
-`checkout` is the verb: it stops the showrunner through the shutdown path with the move on its
-record, and a rerun after the restart pushes the doc commit.
+A rerun after the move pushes the doc commit.
 """
 from __future__ import annotations
 
@@ -65,7 +64,7 @@ def _move_git(old: Path, new: Path) -> None:
         raise RenameRefused(f"{new} already exists")
     if (old / ".git").is_dir():
         raise RenameRefused(f"{old} is a main worktree; git moves only a linked worktree")
-    if running := unit_move.processes_inside(old):
+    if running := [pid for pid in unit_move.processes_inside(old) if pid != os.getpid()]:
         raise RenameRefused(f"processes still work in {old}: {', '.join(map(str, running))}")
     _ = _git(old, "worktree", "move", str(old), str(new))
     _ = _git(new, "worktree", "repair")
@@ -211,8 +210,7 @@ def _push(production: Production) -> None:
 def checkout(slug: str, destination: str = "") -> None:
     """Move the showrunner's checkout to `destination`, by default its name with the production's new slug.
 
-    The first run stops the showrunner with the move on its shutdown record and returns; the conductor
-    moves the checkout and launches the showrunner in it. A run after the restart pushes the doc commit.
+    Stop and resume use the shared session API. A later run pushes the doc commit.
     """
     slug = showrunners.canonical_slug(slug)
     instance = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}"
@@ -233,9 +231,14 @@ def checkout(slug: str, destination: str = "") -> None:
     session_id = _showrunner_session(instance)
     if _session_records(session_id):
         raise RenameRefused(f"{slug}'s showrunner already has a shutdown in progress; let it settle first")
-    import rename_unit  # the shutdown conductor imports this module; only the verb needs the shutdown runner
-    rename_unit.run_shutdown("down", "--only", session_id, "--restart", "--checkout-move", str(old), str(new))
-    if not any("checkout_move" in saved for saved in _session_records(session_id)):
-        raise RenameRefused(f"{slug}'s shutdown record does not carry the checkout move")
-    print(f"{slug}: the showrunner stops, its checkout moves to {new}, and it restarts there; "
-          + f"then run rename.py checkout {slug} again to push the doc commit")
+    from scripts.shutdown import stop_resume
+    stopped = stop_resume.stop(session_id)
+    if not isinstance(stopped, (stop_resume.Stopped, stop_resume.NotRunning)):
+        reason = stopped.reason if isinstance(stopped, stop_resume.StopFailed) else "no local tab"
+        raise RenameRefused(f"{slug}: stop failed: {reason}")
+    move(old, new)
+    resumed = stop_resume.resume(session_id, why="showrunner checkout moved")
+    if not isinstance(resumed, stop_resume.ClaudeUp):
+        reason = resumed.reason if isinstance(resumed, stop_resume.ResumeFailed) else "no local tab"
+        raise RenameRefused(f"{slug}: resume failed: {reason}")
+    print(f"{slug}: checkout moved to {new}; run rename.py checkout {slug} again to push the doc commit")

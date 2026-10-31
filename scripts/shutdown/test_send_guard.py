@@ -18,7 +18,7 @@ import shutdown_record
 import remote
 import remote_control
 import restart
-import settle
+import restart_support
 import shutdown
 from test_support import ShutdownSendLeaf, ShutdownTestCase
 from push_texts import render, user_send_argv
@@ -101,7 +101,7 @@ class SendGuardTests(ShutdownTestCase):
     def test_account_alert_without_a_fake_fails(self) -> None:
         class UnfakedAlert(ShutdownTestCase):
             def test_alert(self) -> None:
-                _ = settle.alert_user(
+                _ = restart_support.alert_user(
                     render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                 )
 
@@ -113,7 +113,7 @@ class SendGuardTests(ShutdownTestCase):
         class SwallowedAlert(ShutdownTestCase):
             def test_alert(self) -> None:
                 try:
-                    _ = settle.alert_user(
+                    _ = restart_support.alert_user(
                             render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                     )
                 except Exception:
@@ -128,7 +128,7 @@ class SendGuardTests(ShutdownTestCase):
             with self.subTest(machine=machine):
                 class UnfakedSessionMessage(ShutdownTestCase):
                     def test_message(self) -> None:
-                        _ = settle.send_message(
+                        _ = restart_support.send_message(
                             "session:x", "summary", "text", machine=machine
                         )
 
@@ -143,7 +143,7 @@ class SendGuardTests(ShutdownTestCase):
             def test_retire(self) -> None:
                 retire = cast(
                     Callable[[str, str], None],
-                    getattr(settle, "_retire_shutdown_messages"),
+                    getattr(restart_support, "retire_shutdown_messages"),
                 )
                 retire(LOGIN, "x")
 
@@ -154,7 +154,7 @@ class SendGuardTests(ShutdownTestCase):
         )
 
     def test_all_four_remote_bindings_fail_before_ssh(self) -> None:
-        for module in (remote, settle, restart, shutdown):
+        for module in (remote, restart_support, restart, shutdown):
             with self.subTest(binding=f"{module.__name__}.run_remote"):
                 class UnfakedRemote(ShutdownTestCase):
                     def test_remote(self) -> None:
@@ -170,27 +170,13 @@ class SendGuardTests(ShutdownTestCase):
                     f"{remote.other_machine()}: shutdown.py status {LOGIN}",
                 )
 
-    def test_launching_a_conductor_fails(self) -> None:
-        class UnfakedConductor(ShutdownTestCase):
-            def test_launch(self) -> None:
-                launch = cast(
-                    Callable[[str, str, bool], None],
-                    getattr(settle, "_launch_conductor"),
-                )
-                launch(LOGIN, LABEL, True)
-
-        self.assert_blocked(
-            UnfakedConductor("test_launch"),
-            ShutdownSendLeaf.LAUNCH_CONDUCTOR,
-            f"conductor for {LOGIN}",
-        )
 
     def test_notifier_start_and_stop_fail(self) -> None:
         for verb in ("start", "stop"):
             with self.subTest(verb=verb):
                 class UnfakedNotifier(ShutdownTestCase):
                     def test_notifier(self) -> None:
-                        settle.run_notifier(verb, "x")
+                        restart_support.run_notifier(verb, "x")
 
                 self.assert_blocked(
                     UnfakedNotifier("test_notifier"),
@@ -234,7 +220,7 @@ class SendGuardTests(ShutdownTestCase):
         class AllowedDelivery(ShutdownTestCase):
             def test_alert(self) -> None:
                 self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
-                _ = settle.alert_user(
+                _ = restart_support.alert_user(
                     render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                 )
 
@@ -254,7 +240,7 @@ class SendGuardTests(ShutdownTestCase):
                 self.allow_leaf(ShutdownSendLeaf.DELIVER_MESSAGE)
 
             def test_alert(self) -> None:
-                _ = settle.alert_user(
+                _ = restart_support.alert_user(
                     render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                 )
 
@@ -269,14 +255,14 @@ class SendGuardTests(ShutdownTestCase):
 
         def fake_delivery(
             command: list[str], recipient: str, text: str
-        ) -> settle.MessageDelivery:
+        ) -> restart_support.MessageDelivery:
             calls.append((command, recipient, text))
-            return settle.MessageSent(kind="sent")
+            return restart_support.MessageSent(kind="sent")
 
         class PatchedDelivery(ShutdownTestCase):
             def test_alert(self) -> None:
-                with patch.object(settle, "_deliver_message", new=fake_delivery):
-                    _ = settle.alert_user(
+                with patch.object(restart_support, "_deliver_message", new=fake_delivery):
+                    _ = restart_support.alert_user(
                             render("shutdown.restart_incomplete", account='"claude2"', machine="Mac"),
                     )
 
@@ -298,7 +284,7 @@ class SendGuardTests(ShutdownTestCase):
             def test_remote(self) -> None:
                 self.allow_leaf(ShutdownSendLeaf.RUN_REMOTE)
                 with patch.object(subprocess, "run", new=fake_ssh):
-                    for module in (remote, settle, restart, shutdown):
+                    for module in (remote, restart_support, restart, shutdown):
                         run_remote = cast(
                             Callable[[list[str]], tuple[int, str]],
                             getattr(module, "run_remote"),
@@ -327,14 +313,13 @@ class SendGuardTests(ShutdownTestCase):
                 self.assertEqual(
                     {leaf.name: leaf.value for leaf in ShutdownSendLeaf},
                     {
-                        "DELIVER_MESSAGE": "settle._deliver_message",
-                        "RETIRE_SHUTDOWN_MESSAGES": "settle._retire_shutdown_messages",
+                        "DELIVER_MESSAGE": "restart_support._deliver_message",
+                        "RETIRE_SHUTDOWN_MESSAGES": "restart_support.retire_shutdown_messages",
                         "RESTART_RETIRE": "restart._retire",
                         "RESUME_CODEX_WORKERS": "restart._send_worker_resume",
                         "RUN_REMOTE": "remote.run_remote",
-                        "LAUNCH_CONDUCTOR": "settle._launch_conductor",
                         "LAUNCH_REMOTE_CONTROL_FIXER": "remote_control.launch_fixer",
-                        "RUN_NOTIFIER": "settle.run_notifier",
+                        "RUN_NOTIFIER": "restart_support.run_notifier",
                     },
                 )
 
