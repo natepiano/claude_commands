@@ -377,6 +377,39 @@ class ReviewLinkTests(unittest.TestCase):
         self.assertIn("marked.use({renderer: {html(text)", document)
         self.assertIn("text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')", document)
 
+    def test_table_cells_keep_prices_and_short_headers_unbroken(self) -> None:
+        document = review_link.render_markdown("| $/GB |\n| --- |\n| $14.32 |\n", "prices.md")
+        cell_style = document.split("td, th {", 1)[1].split("}", 1)[0]
+        self.assertIn("overflow-wrap: normal;", cell_style)
+        self.assertIn("word-break: normal;", cell_style)
+
+    def test_text_and_source_keep_a_centered_column_without_limiting_tables(self) -> None:
+        document = review_link.render_markdown("# Review\n\nhttps://example.com/" + "a" * 100, "review.md")
+        body_style = document.split("body {", 1)[1].split("}", 1)[0]
+        text_style = document.split(", #markdown-source {", 1)[1].split("}", 1)[0]
+        table_style = document.split("table {", 1)[1].split("}", 1)[0]
+        self.assertNotIn("max-width:", body_style)
+        self.assertIn("overflow-wrap: anywhere;", body_style)
+        self.assertIn("max-width: 48rem;", text_style)
+        self.assertIn("margin-left: auto;", text_style)
+        self.assertIn("margin-right: auto;", text_style)
+        self.assertNotIn("48rem", table_style)
+
+    def test_blocks_containing_tables_are_excluded_from_the_text_width_limit(self) -> None:
+        document = review_link.render_markdown("> | Product | Price |\n> | --- | --- |\n> | Disk | $14.32 |", "quote.md")
+        text_rule = document.split("<style>", 1)[1].split("max-width: 48rem;", 1)[0].rsplit("\n", 1)[1]
+        self.assertEqual(text_rule, "main > :not(table):not(:has(table)), #markdown-source { ")
+
+    def test_tables_use_the_available_width_and_scroll_inside_the_page(self) -> None:
+        document = review_link.render_markdown("| Product | Price |\n| --- | --- |\n| Disk | $14.32 |", "prices.md")
+        table_style = document.split("table {", 1)[1].split("}", 1)[0]
+        self.assertIn("display: block;", table_style)
+        self.assertIn("width: max-content;", table_style)
+        self.assertIn("max-width: 100%;", table_style)
+        self.assertIn("margin-left: auto;", table_style)
+        self.assertIn("margin-right: auto;", table_style)
+        self.assertIn("overflow-x: auto;", table_style)
+
     def test_multiple_files_share_one_snapshot_and_preserve_html_image_and_text_bytes(self) -> None:
         page = self.source("page.html", "<!doctype html><title>Existing</title><p>café</p>")
         text = self.source("notes.txt", "review text — unchanged\n")

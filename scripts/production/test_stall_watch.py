@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
-
 import fcntl
 import hashlib
 import json
@@ -19,8 +17,12 @@ from types import ModuleType
 from unittest import mock
 from datetime import datetime
 from pathlib import Path
+
 from typing import cast, override
 from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.test_agents_registry import write_registry
 
 # load 136 on natedev, 2026-10-29
 TEST_HANG_GUARD_SECS = 300
@@ -29,6 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 import fake_unit_host
 from fake_unit_host import HostedUnit
 import fake_herdr
@@ -116,6 +120,7 @@ class StallWatchTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(short_socket_directory()))
+        self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.notifier = self.root / "notifier"
@@ -238,6 +243,12 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             "faults_to": "natedev", "always": ["natedev"],
         }))
         for session, units in runners.items():
+            parent = showrunner_relationship(session)
+            live_units = [unit for unit in units if "retired" not in self.plans.get(unit, "").lower()]
+            intended = {unit_membership(session, unit).id for unit in live_units}
+            for row in staff.snapshot().find(kind="unit", parent=parent.id):
+                if row.id not in intended:
+                    _ = staff.retire(row.id)
             # A showrunner is recorded by its update timer alone, addressed to its Claude session id.
             self.production(session, tuple(units), doc=self.root / f"{session}-production.md")
             rows = [f"| {unit} | {self.plans.get(unit, '`docs/plan.md`')} | /tmp/no-worktree-of-{unit} | {unit} | — | — |"
@@ -391,7 +402,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
 
     def test_one_tick_reads_run_records_once_across_productions_and_units(self) -> None:
         import stall_watch
-        import showrunners
+        from scripts.production import showrunners
         import unit_lookup as lookup
         runners: list[showrunners.Showrunner] = []
         for slug in ("first", "second"):
@@ -402,6 +413,8 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
                                f"| beta | docs/beta.md | {self.root / 'beta'} |", "")))
             runners.append(showrunners.Showrunner(session=slug, socket="/fixture.sock",
                             slug=slug, zone="UTC", doc=str(doc)))
+            for unit in ("alpha", "beta"):
+                _ = unit_membership(slug, unit)
         marked = {name: lookup.MarkedUnit(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name))
                   for name in ("alpha", "beta")}
         with (mock.patch.dict(os.environ, self.environment),
@@ -1197,7 +1210,7 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
 
     def test_detached_processes_share_one_slug_resolution_per_work_check(self) -> None:
         import stall_watch
-        import showrunners
+        from scripts.production import showrunners
 
         doc = self.root / "showrunner-production.md"
         _ = doc.write_text("## Production Context\n\n- **Formerly:** `old-showrunner`\n\n" + doc.read_text())

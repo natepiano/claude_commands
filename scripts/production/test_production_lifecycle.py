@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import fake_unit_host
 import production_lifecycle
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 import showrunner_parent
 from production_units import read_production
@@ -23,6 +25,7 @@ from fake_unit_host import HostedUnit
 
 
 from scripts.production import production_doc, staff
+from scripts.production.staff_test_support import unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture, SCRIPT
 
 
@@ -313,6 +316,9 @@ class LifecycleTests(LifecycleFixture):
 
     def test_load_finds_each_unit_session_by_its_mark_whatever_it_is_called(self) -> None:
         self.running()
+        with mock.patch.dict(os.environ, self.env):
+            self.staff.register_production("example", self.doc)
+        _ = unit_membership("old-showrunner", "beta-unit")
         fake_unit_host.write(self.env, [
             HostedUnit("alpha", "w1:p1", {}),
             HostedUnit("renamed-since-launch", "w2:p1", {

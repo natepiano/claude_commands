@@ -19,9 +19,13 @@ from collections.abc import Mapping
 from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, unit_membership, showrunner_relationship, showrunner_launch
 from scripts.astra import design_roles
 from scripts.lib.socket_test_support import short_socket_directory
 
@@ -42,7 +46,7 @@ import unit_runs
 import herdr
 from fake_herdr import CommandResponse, herdr_listener
 import sessions
-import showrunners
+from scripts.production import showrunners
 if TYPE_CHECKING:
     from ..whoami import account, agent_accounts
 else:
@@ -139,6 +143,7 @@ class RosterTests(unittest.TestCase):
             "UNIT_HISTORY_DIR": str(self.root / "history"),
             "ROSTER_RUN_ROOT": str(self.runs),
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
+            "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"),
             "ROSTER_PS_FIXTURE": str(self.ps_state),
             "PROCESS_TABLE_PS": f"cat {self.ps_state}",
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
@@ -170,6 +175,8 @@ class RosterTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(sessions, "running_session", side_effect=fixture_running))
         self.environment["HERDR_PROC"] = str(self.root / "herdr-proc")
         os.environ["HERDR_PROC"] = self.environment["HERDR_PROC"]
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = unit_membership("alpha", "unit-one")
         self._build_complete_roster()
         self._herdr_process(991099, 0, ["herdr", "--session", "native", "server"])
         self._herdr_process(991100, 991099, ["claude"], HERDR_PANE_ID="w1:p1", SHOWRUNNER_UNIT="alpha", SHOWRUNNER_UNIT_ID="unit-one")
@@ -385,7 +392,40 @@ class RosterTests(unittest.TestCase):
         daemon.assert_not_called()
         accounts.assert_not_called()
 
+    def test_transferred_director_keeps_its_new_production_without_a_new_document_row(self) -> None:
+        receiving = showrunner_relationship("receiving")
+        row = next(row for row in staff.find(kind="unit") if row.name == "unit-one")
+        _ = staff.move(row.id, receiving.id)
+        env_file = self.root / "herdr-proc/991100/environ"
+        _ = env_file.write_bytes(env_file.read_bytes() + f"\0STAFF_ID={row.id}".encode())
+        doc = self.root / "receiving-production.md"
+        _ = doc.write_text("# Receiving\n\n## Units\n| Unit | Worktree | Plan |\n| --- | --- | --- |\n")
+        timer = self.notifier / "showrunner-receiving"
+        timer.mkdir()
+        _ = (timer / "conf").write_text(f"TARGET=session:sid-receiving\nCHECK=zsh /scripts/production_check.sh {doc}\n")
+        self._write_session(str(os.getppid()), "receiving-runner", "sid-receiving", self.home / "receiving",
+                            pid=os.getppid())
+        director = self._entries()["director"]
+        self.assertEqual(director.role, "unit director")
+        self.assertEqual(director.director, roster.DirectsUnit("unit-one"))
+        self.assertEqual(director.showrunner,
+                         roster.UnderShowrunner("receiving", "receiving-runner", "session:sid-receiving"))
+        self.assertNotIn("unit-one", doc.read_text())
+
+    def test_full_roster_reads_the_staff_owner_once(self) -> None:
+        with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+            entries = self._entries()
+        self.assertEqual(entries["director"].director, roster.DirectsUnit("unit-one"))
+        self.assertEqual(reads.call_count, 1)
+
+    def test_session_labels_read_the_staff_owner_once(self) -> None:
+        with mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads:
+            labels = roster.unit_labels_for(["sid-director", "sid-runner"], self.environment)
+        self.assertEqual(labels["sid-director"], roster.UnitLabels("director", "alpha", "unit-one"))
+        self.assertEqual(reads.call_count, 1)
+
     def test_renamed_production_has_the_same_full_and_fast_labels(self) -> None:
+        showrunner_launch(showrunner_relationship("alpha"), "sid-runner", self.environment)
         _ = (self.notifier / "showrunner-alpha").rename(self.notifier / "showrunner-builds")
         _ = self.production_doc.write_text(
             "## Production Context\n\n- **Formerly:** `alpha`\n\n" + self.production_doc.read_text(),
@@ -1628,8 +1668,8 @@ class RosterTests(unittest.TestCase):
     def test_a_duplicate_mark_on_another_unit_keeps_this_units_director(self) -> None:
         read = unit_lookup.every_marked_unit
 
-        def with_duplicate() -> unit_lookup.MarkedProductions:
-            found = read()
+        def with_duplicate(*, record: staff.StaffSnapshot | None = None) -> unit_lookup.MarkedProductions:
+            found = read(record=record)
             return unit_lookup.MarkedProductions(
                 found.units, {"alpha": {"unit-two": "unit-two: its mark is on herdr sessions copy and first"}})
 
@@ -1684,6 +1724,7 @@ class RosterTests(unittest.TestCase):
             "sessions": [{"name": "native", "running": True, "default": False,
                           "session_dir": "/fixture", "socket_path": "/fixture/socket"}]
         })}, "--session native agent list": {"code": 0, "stdout": '{"ok": true, "result": {"agents": []}}'}}
+
 
     def test_socketless_herdr_director_is_placed_by_pid(self) -> None:
         # A socketless live record is deliberately excluded from _claudes; the
@@ -2160,7 +2201,9 @@ class RosterTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_mac_without_hosts_keeps_worktree_directors(self) -> None:
-        with (mock.patch.object(sys, "platform", "darwin"),
+        record = staff.snapshot()
+        with (mock.patch.object(staff, "snapshot", return_value=record),
+              mock.patch.object(sys, "platform", "darwin"),
               mock.patch.object(herdr, "herdr_binary", side_effect=herdr.HerdrMissing("herdr is not installed")),
               mock.patch.object(codex_daemon, "loaded_sessions", return_value=[])):
             result = roster.roster(os.environ, roster.ThisMachine())
@@ -2191,6 +2234,7 @@ class CodexHolderLabelsTests(unittest.TestCase):
             "ROSTER_RUN_ROOT": str(self.runs), "HERDR_PROC": str(self.root / "proc"),
             "HERDR_BIN": str(SCRIPTS / "herdr/fake_herdr.py"),
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
+            "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"),
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
             "REVIEW_POOL_STATE": str(self.root / "review-pool"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr.json"),
@@ -2199,6 +2243,8 @@ class CodexHolderLabelsTests(unittest.TestCase):
         environment_patch = cast(AbstractContextManager[object], mock.patch.dict(os.environ, self.environment, clear=True))
         _ = self.enterContext(environment_patch)
         _ = self.enterContext(mock.patch.object(showrunners, "NOTIFIER_STATE_DIR", notifier))
+        _ = self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
+        _ = unit_membership("builds", "report-unit")
         # Both registry records are live processes, with real start identities.
         # Only their declared unit marks and run metadata come from fixture files.
         for pid, sid, name in ((os.getppid(), "holder-director", "report-director"),

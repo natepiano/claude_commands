@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import staff, staff_sources
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -29,7 +30,7 @@ sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
 import autocompact
 import rename_state
-import showrunners
+from scripts.production import showrunners
 import sessions
 import unit_lookup
 import unit_names
@@ -38,6 +39,7 @@ from production_units import Production, Refusal, cell_value, plan_cell_is_retir
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from probe_session import PROBE_ENV  # noqa: E402
 from atomic_file import write_text_atomic
+from process_failure import failure_detail
 
 if TYPE_CHECKING:
     import herdr
@@ -697,11 +699,11 @@ def stop_for_attach(handoff: RunningSessionHandoff) -> SessionShutdown:
         down = run_attach_shutdown(["down", handoff.login, "--here", "--only", handoff.session_id,
                                     "--request-id", identity], restart.SESSION_WAIT_SECONDS)
         if down.returncode != 0:
-            raise Refusal(down.stderr.strip() or down.stdout.strip() or "shutdown down failed")
+            raise Refusal(f"shutdown down failed: {failure_detail(down)}")
         followed = run_attach_shutdown(["follow", handoff.login, "--request", identity],
                                       settle.NOT_ANSWERING_AFTER.total_seconds() + settle.SETTLE_INTERVAL_SECONDS)
         if followed.returncode != 0:
-            raise Refusal(followed.stderr.strip() or followed.stdout.strip() or "shutdown follow failed")
+            raise Refusal(f"shutdown follow failed: {failure_detail(followed)}")
         records = [saved for saved in session_records(handoff.login)
                    if saved["session"]["session_id"] == handoff.session_id and saved["request_id"] == identity]
         if (len(records) != 1 or records[0]["progress"]["kind"] not in {"stopped", "already gone"}
@@ -922,13 +924,15 @@ def launch_session(
     target: str = "",
     model: str = "",
     autocompact_window: str = "",
+    staff_id: str = "",
 ) -> herdr.PromptSubmitOutcome:
     """Start Claude in a tab of the shared herdr session, carrying this unit's marks."""
     import herdr
     from scripts.accounts import accounts
     from scripts.whoami.account import named_account_environment
 
-    environment = {unit_lookup.PRODUCTION_MARK: request.production.slug,
+    row_id = staff_id or ensure_staff_unit(request.production, request.unit_id).id
+    environment = {"STAFF_ID": row_id, unit_lookup.PRODUCTION_MARK: request.production.slug,
                    unit_lookup.UNIT_MARK: request.identity.unit, "ENABLE_TOOL_SEARCH": "true"}
     if target:
         if target != selected.label:
@@ -1405,7 +1409,7 @@ def _main(argv: list[str]) -> int:
                 if isinstance(ready.plan_transition, BriefToPlanTransition):
                     raise Refusal(f"unit {request.identity.unit} runs its brief in session {marked_unit.unit.place.session}; "
                                   + f"end that session, then run {retry}")
-            _ = ensure_staff_unit(request.production, request.unit_id)
+            staff_row = ensure_staff_unit(request.production, request.unit_id)
             if isinstance(stopped_tab, MarkedUnitFound):
                 place = stopped_tab.unit.place
                 try:
@@ -1429,7 +1433,7 @@ def _main(argv: list[str]) -> int:
                     )
                 outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
                                if isinstance(request.session, ResumedSession) else "", model=resume_model,
-                               autocompact_window=resume_autocompact)
+                               autocompact_window=resume_autocompact, staff_id=staff_row.id)
             elif opening_record(request.production, request.unit_id).exists():
                 recovered = finish_opening(request, marked_unit)
                 if not isinstance(recovered, NoPendingOpening):

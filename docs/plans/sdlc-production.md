@@ -29,6 +29,8 @@
 | hierarchies-unit | `docs/plans/build-followups-hierarchies.md` | `/home/natepiano/worktrees/claude-build-followups-hierarchies` | `build-followups-hierarchies` | — | `docs/plans/build-followups-hierarchies.md`; `docs/plans/build-followups-hierarchies-next.md`; `docs/plans/build-followups-hierarchies-design.md`; `scripts/hierarchies/` |
 | models-unit | `docs/as-built/usage-ledger.md` (run done; the user 2026-10-11 10:02 PDT via hana, start confirmed 10:21 PDT; follow-ups: `docs/plans/build-followups-usage-ledger-next.md`; earlier runs: `docs/as-built/long-lived-workers.md`, `docs/as-built/director-model-study.md`) | `/home/natepiano/worktrees/claude-natedev-models` | `natedev-models` | — | `docs/plans/build-followups-model-study.md`; `docs/as-built/long-lived-workers.md`; `scripts/model_study/`; `docs/as-built/director-model-study-results.md`; `scripts/delegate/` (seat launcher); `scripts/agents/codex_mesh.py`; `commands/unit/direct.md`; `commands/unit/delegate.md`; `docs/production_format.md`; `docs/as-built/usage-ledger.md`; `scripts/usage/`; also touches `review.sh`, `commands/showrunner/produce.md` (hub; the showrunner-start call) and `settings.json` (SessionStart hook; the user's go before main) |
 | devtools-unit | `docs/plans/sdlc-devtools-tests.md` | /home/natepiano/worktrees/claude-build-followups-sdlc-devtools | sdlc-devtools | — | idempotency (rerun safety) of tools that change shared state in steps |
+| qprobe2-unit | standby | /home/natepiano/worktrees/claude-build-followups-sdlc-qprobe2 | sdlc-qprobe2 | — | — |
+| renamecheck-unit | standby | /home/natepiano/worktrees/renamecheck | renamecheck | — | — |
 
 Scope of each unit:
 

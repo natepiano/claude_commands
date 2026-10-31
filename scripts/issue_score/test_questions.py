@@ -37,14 +37,14 @@ class QuestionTests(unittest.TestCase):
     def test_jev_proposes_exactly_the_fields_approved_by_the_user(self) -> None:
         self.assertEqual(
             questions.JEV_FIELDS,
-            {"backlog_goal", "backlog_impact", "backlog_alignment"},
+            {"backlog_goal", "backlog_impact", "backlog_alignment", "area"},
         )
 
     def test_every_jev_proposed_field_has_a_supported_threshold_policy(self) -> None:
         for field in questions.JEV_FIELDS:
             with self.subTest(field=field):
                 self.assertIn(field, questions.THRESHOLDS)
-                self.assertIsInstance(questions.THRESHOLDS[field], questions.Supported)
+                self.assertIsInstance(questions.THRESHOLDS[field], (questions.Supported, questions.MinimumGap))
 
     def test_effort_example_stems_resolve_only_the_exact_open_example_files(self) -> None:
         examples = {

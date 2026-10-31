@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-import showrunners
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff, staff_sources
 from scripts.lib.atomic_file import write_text_atomic
