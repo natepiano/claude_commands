@@ -24,7 +24,7 @@ from scripts.whoami import account
 from scripts.shutdown import stop_results
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for directory in ("production", "shutdown"):
+for directory in ("production", "shutdown", "herdr", "message", "whoami"):
     sys.path.insert(0, str(SCRIPTS / directory))
 
 if TYPE_CHECKING:

@@ -7,6 +7,7 @@ import os
 import runpy
 import signal
 import subprocess
+import tempfile
 import time
 import unittest
 from datetime import timedelta
@@ -47,6 +48,22 @@ else:
 import quota_alert
 from scripts.whoami import agent_accounts
 NOW = fixtures.NOW
+
+
+class RecoveryChildImportTests(unittest.TestCase):
+    def test_recovery_child_imports_with_only_home_and_path(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            child = subprocess.run(
+                [sys.executable, "-m", "scripts.accounts.unit_watchdog", "--recover"],
+                cwd=Path(__file__).resolve().parents[2],
+                env={"HOME": home, "PATH": os.environ["PATH"]},
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        self.assertEqual(child.returncode, 1, child.stdout + child.stderr)
+        self.assertEqual(child.stdout, "")
+        self.assertNotIn("ModuleNotFoundError", child.stderr)
+        self.assertNotIn("Traceback", child.stderr)
+        self.assertEqual(child.stderr, "usage: unit_watchdog --recover <account> <session> <result> <source>\n")
 
 
 @final
