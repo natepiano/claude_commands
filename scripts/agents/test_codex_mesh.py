@@ -427,6 +427,7 @@ def setUpModule() -> None:
     usage = tempfile.TemporaryDirectory()
     restore_usage = set_environment("USAGE_STATE_DIR", usage.name)
     restore_home = set_environment("HOME", home.name)
+    unittest.addModuleCleanup(set_environment("XDG_STATE_HOME", str(Path(home.name) / "state")))
     restore_notes = set_environment("AGENT_NOTES_DIR", home.name)
     unittest.addModuleCleanup(set_environment("AGENTS_CONFIG_PUBLISH", "0"))
     # Tier tests never read the caller's registry, config, or pacer choice.
@@ -867,6 +868,7 @@ class MeshCommandFixture(unittest.TestCase):
             clock.registry_resolution(codex_mesh._turn_service_tier)))  # pyright: ignore[reportPrivateUsage]
         _ = cast(object, self.patches.enter_context(patch.dict(os.environ, {
             "HOME": str(self.home), "CODEX_HOME": str(self.home / ".codex"),
+            "XDG_STATE_HOME": str(self.home / ".local/state"),
             "AGENT_NOTES_DIR": str(self.home),
         })))
         # resolve(): macOS /tmp is a link to /private/tmp, and the mesh records resolved paths.
@@ -1478,9 +1480,14 @@ class MeshCommandFixture(unittest.TestCase):
         return code, output.getvalue(), errors.getvalue()
 
     def write_pool_roster(self, entries: dict[str, object]) -> None:
-        _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(
-            json.dumps(entries), encoding="utf-8"
-        )
+        # Follow reads this file concurrently. Match production's lock before
+        # truncating, so a terminal marker cannot look like lost ownership.
+        with (self.session_dir / codex_mesh.ROSTER_FILE).open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            _ = handle.seek(0)
+            _ = handle.truncate()
+            _ = handle.write(json.dumps(entries))
+            handle.flush()
 
     def prime_cli(self, *options: str) -> list[str]:
         instructions_file = self.session_dir / "review-instructions.txt"
@@ -6993,6 +7000,75 @@ class MeshCommandTests(MeshCommandFixture):
                 waiting.assert_called_once()
                 self.assertIs(client.wake, codex_mesh.SOCKET_ONLY_WAIT)
 
+    def test_direct_mesh_sends_hold_the_third_repeat_and_allow_a_human_relay(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "running",
+                                           "launcher_pid": os.getpid(), "port": self.server.port}})
+        codes: list[int] = []
+        for index in range(3):
+            code, output, errors = self.run_mesh(["send", "--to", "worker", "--from", "fixture-watchdog",
+                                                 "--message", "Morty stopped pid 100"])
+            codes.append(code)
+            if index == 2:
+                self.assertIn("HELD: repeat guard", output)
+                self.assertEqual(errors, "")
+        self.assertEqual(codes, [0, 0, 4])
+        pending = self.session_dir / "worker.pending.json"
+        before = pending.read_text()
+        self.assertIn("pid 100", before)
+        self.assertEqual(len(cast(list[str], cast(dict[str, object], json.loads(before))["messages"])), 2)
+        code, output, errors = self.run_mesh(["send", "--to", "worker", "--from", "fixture-watchdog",
+                                             "--human", "--message", "Morty stopped pid 100"])
+        self.assertEqual(code, 0, (output, errors))
+        self.assertEqual(len(cast(list[str], cast(dict[str, object], json.loads(pending.read_text()))["messages"])), 3)
+
+    def test_send_py_and_direct_mesh_share_one_recipient_counter(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "launcher_pid": 0}})
+        self.assertEqual(self.run_mesh(["send", "--to", "worker", "--from", "same-source",
+                                       "--message", "same notice"])[0], 0)
+        result = subprocess.run([sys.executable, str(Path(codex_mesh.__file__).parents[1] / "message/send.py"),
+            "--to", "worker", "--codex", "--session-dir", str(self.session_dir), "--from", "same-source",
+            "--here", "--forwarded-shown-sender", "same-source", "--text", "same notice"],
+            capture_output=True, text=True, check=False, timeout=TEST_HANG_GUARD_SECS)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertIn("SENT:", result.stdout)
+        code, output, errors = self.run_mesh(["send", "--to", "worker", "--from", "same-source",
+                                             "--message", "same notice"])
+        self.assertEqual(code, 4, (output, errors))
+        log_root = Path(os.environ["XDG_STATE_HOME"]) / "message"
+        direct = [cast(dict[str, object], json.loads(line)) for line in (log_root / "transports.jsonl").read_text().splitlines()]
+        self.assertEqual([item["to"] for item in direct], ["codex:" + THREAD_ID] * 2)
+        wrapper = [cast(dict[str, object], json.loads(line)) for line in (log_root / "log.jsonl").read_text().splitlines()]
+        self.assertEqual(wrapper[-1]["to"], "codex:" + THREAD_ID)
+        self.assertEqual(len(direct) + len(wrapper), 3)
+
+    def test_human_interrupt_messages_bypass_an_active_repeat_hold(self) -> None:
+        self.write_pool_roster({"worker": {"thread_id": THREAD_ID, "status": "done", "launcher_pid": 0}})
+        results = [self.run_mesh(["send", "--to", "worker", "--from", "human-source",
+                                  "--message", text]) for text in ["Please inspect again"] * 3]
+        code, output, errors = results[-1]
+        self.assertEqual(code, 4, (output, errors))
+        with patch.object(codex_mesh, "_server_availability", return_value=codex_mesh.ServerRestartRequired()):
+            code, output, errors = self.run_mesh(["interrupt", "--to", "worker", "--from", "human-source",
+                                                 "--human", "--message", "Please inspect again"])
+        self.assertEqual(code, 0, (output, errors))
+        messages = cast(dict[str, object], json.loads((self.session_dir / "worker.pending.json").read_text()))
+        self.assertEqual(len(cast(list[str], messages["messages"])), 3)
+        self.assertTrue(str(self.home) in os.environ["XDG_STATE_HOME"])
+
+    def test_adopted_and_current_mesh_routes_share_the_resolved_thread_counter(self) -> None:
+        destination = self.session_dir.parent / "adopted"
+        destination.mkdir()
+        entry = {"thread_id": THREAD_ID, "status": "done", "launcher_pid": 0}
+        _ = (destination / codex_mesh.ROSTER_FILE).write_text(json.dumps({"worker": entry}))
+        self.write_pool_roster({"worker": {**entry, "adopted_to": str(destination)}})
+        outcomes = [codex_mesh.hold_message(str(folder), "worker", "same notice", without_launcher=True,
+                                          sender="same-source")
+                    for folder in (self.session_dir, destination, self.session_dir)]
+        self.assertIsInstance(outcomes[0], codex_mesh.HeldForNextDispatch)
+        self.assertIsInstance(outcomes[1], codex_mesh.HeldForNextDispatch)
+        self.assertIsInstance(outcomes[2], codex_mesh.RepeatHeld)
+        self.assertFalse((self.session_dir / "worker.pending.json").exists())
+
     def test_message_for_retired_live_server_is_held_and_steer_stays_on_live_turn(self) -> None:
         _, new = self.prepare_workers_move()
         _ = (self.session_dir / codex_mesh.ROSTER_FILE).write_text(json.dumps({"worker": {
@@ -8364,7 +8440,8 @@ class MeshCommandTests(MeshCommandFixture):
                     }})
                     for message in held:
                         code, _output, errors = self.run_mesh([
-                            "send", "--to", "worker", "--message", message])
+                            "send", "--to", "worker", "--from", f"fixture-{preserved}-{continuation}",
+                            "--message", message])
                         self.assertEqual((code, errors), (0, ""))
                     self.server.requests.clear()
                     with patch.object(refusals, "stored_reading", return_value=refusals.FreshReading(
@@ -14241,7 +14318,8 @@ class SweepTests(unittest.TestCase):
 
     def test_message_without_live_launcher_is_held_without_contacting_a_server(self) -> None:
         for launcher in (0, 99999999, None):
-            with self.subTest(launcher=launcher), tempfile.TemporaryDirectory() as directory:
+            with (self.subTest(launcher=launcher), tempfile.TemporaryDirectory() as directory,
+                  patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(directory) / "state")})):
                 record: dict[str, object] = {"thread_id": "thread-1", "status": "running"}
                 if launcher is not None:
                     record["launcher_pid"] = launcher
