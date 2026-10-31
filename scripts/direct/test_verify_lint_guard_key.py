@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import cast, override
 
 from scripts.direct import verify_lint_scope_test_support as support
+from scripts.direct import assertion_guard_test_support as guard_support
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -338,6 +339,40 @@ run_once cargo nextest run -E "package(sample) & test(native_rate)"
                                "-m", "merge removes assertion against both parents")
         _ = self.git("reset", "--hard", own_removal)
         self.assertEqual(self.git("rev-parse", "HEAD^{tree}"), tree)
+        self.assert_guard_reruns_and_blocks()
+
+    def test_fetching_a_contained_production_base_invalidates_cached_green_lint(self) -> None:
+        strong_tree = self.git("rev-parse", self.strong + "^{tree}")
+        weak_tree = self.git("rev-parse", self.weak + "^{tree}")
+        incoming = self.git("commit-tree", strong_tree, "-p", self.strong,
+                            "-m", "independent production work keeps strong assertion")
+        merged = self.git("commit-tree", strong_tree, "-p", self.strong, "-p", incoming,
+                          "-m", "merge production without changing assertions")
+        previous_production = self.git("commit-tree", weak_tree, "-p", merged,
+                                       "-m", "production accepts weaker assertion")
+        production = self.git("commit-tree", strong_tree, "-p", previous_production,
+                              "-m", "production restores strong assertion")
+        head = self.git("commit-tree", weak_tree, "-p", production,
+                        "-m", "unit weakens assertion after production")
+        _ = self.git("reset", "--hard", head)
+        _ = self.git("push", "-q", "origin", previous_production + ":refs/heads/builds")
+        _ = self.git("push", "-q", "origin", production + ":refs/heads/incoming")
+        _ = self.git("branch", "--set-upstream-to=origin/strict")
+        registry = guard_support.GitRepositoryFixture()
+        registry.root = self.root
+        registry.repo = self.root
+        registry.notifier_dir = self.root / "notifier"
+        registry.notifier_dir.mkdir()
+        _ = registry.register_production("builds", branch="feature")
+        self.environment["NOTIFIER_STATE_DIR"] = str(registry.notifier_dir)
+        self.cache_passing_lint()
+
+        _ = self.git("--git-dir", str(self.root / "remote.git"),
+                     "update-ref", "refs/heads/builds", production)
+        _ = self.git("fetch", "-q", "origin")
+
+        self.assertEqual(self.git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.git("rev-parse", "HEAD^{tree}"), weak_tree)
         self.assert_guard_reruns_and_blocks()
 
     def test_guard_script_change_invalidates_lint(self) -> None:

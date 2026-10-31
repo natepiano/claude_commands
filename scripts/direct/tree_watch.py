@@ -46,7 +46,8 @@ class AssertionGuard(Protocol):
 
     GuardError: type[Exception]
 
-    def default_base(self, repo: Path, explicit_base: str = "") -> str: ...
+    def commit_bases(self, repo: Path, selected_bases: tuple[str, ...] = ("HEAD",), *,
+                     head: str = "", staged: bool = True) -> tuple[str, ...]: ...
     def git(self, repo: Path, *arguments: str) -> str: ...
     def read_rulings(self, sources: list[str], messages: str) -> dict[tuple[str, str], str]: ...
 
@@ -187,17 +188,14 @@ class TreeInputs:
             for path in changed:
                 key.update(path + b"\0" + content(os.path.join(self.top, path)))
         if self.guard_files:
-            # Use the invoked guard's own readers, including completed merge
-            # parents. An unresolved base leaves no reusable cache key.
+            # Use the invoked guard's selector for both comparison trees and
+            # ruling ranges. An unresolved base leaves no reusable cache key.
             assertion_guard = cast(AssertionGuard, cast(object, SimpleNamespace(
                 **runpy.run_path(self.guard_files[0]))))
             repo = Path(os.fsdecode(self.top))
             explicit = os.environ.get("VERIFY_ASSERTION_BASE", "")
             try:
-                bases = [assertion_guard.default_base(repo, explicit)]
-                if not explicit:
-                    bases.extend(assertion_guard.git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split()[2:])
-                for base in dict.fromkeys(bases):
+                for base in assertion_guard.commit_bases(repo, (explicit,) if explicit else (), staged=False):
                     key.update(b"\0guard-base=" + base.encode())
                     key.update(assertion_guard.git(repo, "log", "--format=%B", base + "..HEAD", "--").encode())
                 key.update(assertion_guard.git(repo, "rev-parse", "HEAD").encode())

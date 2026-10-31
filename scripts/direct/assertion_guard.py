@@ -8,6 +8,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -349,9 +350,16 @@ class SourceRevision:
 class RevisionSourceCache:
     """Read each changed file and build its census once per revision."""
     sources: dict[tuple[SourceRevision, str], list[str]] = field(default_factory=dict)
+    code: dict[tuple[SourceRevision, str], list[str]] = field(default_factory=dict)
     tables: dict[tuple[SourceRevision, str], ConstantTable] = field(default_factory=dict)
     files: dict[SourceRevision, set[str]] = field(default_factory=dict)
     unreadable: set[tuple[SourceRevision, str]] = field(default_factory=set)
+
+    def code_rows(self, revision: SourceRevision, path: str, rows: list[str]) -> list[str]:
+        key = revision, path
+        if key not in self.code:
+            self.code[key] = code_lines(rows, path.endswith(".rs"))
+        return self.code[key]
 
 
 def source_revision(base: str, head: str, staged: bool, side: Side) -> SourceRevision:
@@ -732,7 +740,7 @@ def inspect_globs(repo: Path, base: str, head: str, staged: bool, path: str, sid
             if key not in cache.tables:
                 rows = read_sources(repo, base, head, staged, [], cache,
                                     (SourceFile(candidates[0], side),))[candidates[0], side]
-                cache.tables[key] = constant_table(rows, code_lines(rows, True))
+                cache.tables[key] = constant_table(rows, cache.code_rows(revision, candidates[0], rows))
             imported = cache.tables[key]
             if imported.refuse_all or imported.globs or imported.block.uncertain:
                 table.refuse_all = True
@@ -1343,32 +1351,18 @@ def production_base(repo: Path) -> ProductionBase | NoProductionBase:
     return NoProductionBase()
 
 
-def default_base(repo: Path, explicit_base: str = "") -> str:
-    """Take the newer upstream/production base, or the nearest remote base."""
-    if explicit_base:
-        return git(repo, "rev-parse", "--verify", f"{explicit_base}^{{commit}}").strip()
-    production = production_base(repo)
-    try:
-        upstream = git(repo, "merge-base", "HEAD", "@{upstream}").strip()
-    except GuardError:
-        pass
-    else:
-        if isinstance(production, ProductionBase) and production.commit != upstream:
-            # A descendant always has fewer base..HEAD commits. For diverged bases,
-            # the same count selects the nearer one; ties keep the upstream base.
-            upstream_count = int(git(repo, "rev-list", "--count", f"{upstream}..HEAD").strip())
-            production_count = int(git(repo, "rev-list", "--count", f"{production.commit}..HEAD").strip())
-            if production_count < upstream_count:
-                return production.commit
-        return upstream
+def _explicit_base(repo: Path, revision: str) -> str:
+    return git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}").strip()
+
+
+def _nearest_remote_base(repo: Path) -> str:
+    """Require a unique nearest remote base when no configured base is usable."""
     default_remote = ""
     try:
         default_remote = git(repo, "symbolic-ref", "refs/remotes/origin/HEAD").strip()
     except GuardError:
         pass
     nearest: dict[str, int] = {}
-    if isinstance(production, ProductionBase):
-        nearest[production.commit] = int(git(repo, "rev-list", "--count", f"{production.commit}..HEAD").strip())
     for reference in git(repo, "for-each-ref", "--format=%(refname)", "refs/remotes/").splitlines():
         if reference.endswith("/HEAD") or reference == default_remote:
             continue
@@ -1385,32 +1379,47 @@ def default_base(repo: Path, explicit_base: str = "") -> str:
     raise GuardError("cannot determine branch base; set VERIFY_ASSERTION_BASE (or --base)")
 
 
+def _pending_merge_bases(repo: Path) -> tuple[str, ...]:
+    merge_head = repo / git(repo, "rev-parse", "--git-path", "MERGE_HEAD").strip()
+    try:
+        merging = merge_head.read_text(encoding="ascii").splitlines()
+    except FileNotFoundError:
+        return ()
+    return tuple(_explicit_base(repo, revision) for revision in merging)
+
+
 def commit_bases(repo: Path, selected_bases: tuple[str, ...] = ("HEAD",), *,
                  head: str = "", staged: bool = True) -> tuple[str, ...]:
     """Keep selected bases, adding independent merged-in parents of the judged side.
 
     No arguments retains the commit hook's HEAD/index comparison. An empty
-    selection uses the branch default; an explicit selection keeps its order.
+    selection covers upstream and production history; an explicit selection
+    keeps its order. Only automatic selection prunes covered starting bases.
     """
-    bases = list(dict.fromkeys(default_base(repo, base) for base in selected_bases))
+    bases = list(dict.fromkeys(_explicit_base(repo, base) for base in selected_bases))
     if not bases:
-        bases = [default_base(repo)]
+        try:
+            bases.append(git(repo, "merge-base", "HEAD", "@{upstream}").strip())
+        except GuardError:
+            pass
+        production = production_base(repo)
+        if isinstance(production, ProductionBase) and production.commit not in bases:
+            bases.append(production.commit)
+        if not bases:
+            bases.append(_nearest_remote_base(repo))
     parents: dict[str, None] = {}
     for base in bases:
         for merge in git(repo, "rev-list", "--min-parents=2", "--parents",
                          f"{base}..{head or 'HEAD'}").splitlines():
             parents.update(dict.fromkeys(merge.split()[2:]))
     if staged:
-        merge_head = repo / git(repo, "rev-parse", "--git-path", "MERGE_HEAD").strip()
-        try:
-            merging = merge_head.read_text(encoding="ascii").splitlines()
-        except FileNotFoundError:
-            merging = []
-        for revision in merging:
-            parents[git(repo, "rev-parse", "--verify", f"{revision}^{{commit}}").strip()] = None
-    if parents:
-        independent = set(git(repo, "merge-base", "--independent", *dict.fromkeys([*bases, *parents])).split())
+        parents.update(dict.fromkeys(_pending_merge_bases(repo)))
+    candidates = list(dict.fromkeys([*bases, *parents]))
+    independent = set(git(repo, "merge-base", "--independent", *candidates).split())
+    if selected_bases:
         bases.extend(parent for parent in parents if parent in independent and parent not in bases)
+    else:
+        bases = [base for base in candidates if base in independent]
     return tuple(bases)
 
 
@@ -1711,7 +1720,9 @@ def findings_against_base(repo: Path, base: str, head: str, staged: bool,
     diff = git(repo, *diff_args)
     lines = parse_diff(diff)
     sources = read_sources(repo, base, head, staged, lines, cache)
-    code = {key: code_lines(rows, key[0].endswith(".rs")) for key, rows in sources.items()}
+    code: dict[tuple[str, Side], list[str]] = {
+        (path, side): cache.code_rows(source_revision(base, head, staged, side), path, rows)
+        for (path, side), rows in sources.items()}
     constants: dict[tuple[str, Side], ConstantTable] = {}
     for (path, side), rows in sources.items():
         if path.endswith(".rs"):
@@ -1730,6 +1741,20 @@ def finding_identity(finding: Finding) -> tuple[str, Kind, str, str]:
     return (finding.source.path, finding.kind, normalized(finding.old, rust), normalized(finding.new, rust))
 
 
+def intersect_findings(comparisons: list[list[Finding]]) -> list[Finding]:
+    """Keep the first base's occurrences that every comparison reports."""
+    common = Counter(finding_identity(finding) for finding in comparisons[0])
+    for findings in comparisons[1:]:
+        common &= Counter(finding_identity(finding) for finding in findings)
+    shared: list[Finding] = []
+    for finding in comparisons[0]:
+        identity = finding_identity(finding)
+        if common[identity]:
+            shared.append(finding)
+            common[identity] -= 1
+    return shared
+
+
 def run(arguments: list[str]) -> int:
     parser = GuardParser(description=__doc__)
     _ = parser.add_argument("--repo", default=".")
@@ -1742,19 +1767,12 @@ def run(arguments: list[str]) -> int:
     _ = parser.parse_args(arguments, namespace=args)
     repo = Path(args.repo).expanduser().resolve()
     repo = Path(git(repo, "rev-parse", "--show-toplevel").strip())
-    bases = commit_bases(repo, tuple(args.bases), head=args.head, staged=args.staged)
+    explicit = os.environ.get("VERIFY_ASSERTION_BASE", "")
+    selected = tuple(args.bases) or ((explicit,) if explicit else ())
+    bases = commit_bases(repo, selected, head=args.head, staged=args.staged)
     cache = RevisionSourceCache()
-    findings = findings_against_base(repo, bases[0], args.head, args.staged, cache)
-    common = Counter(finding_identity(finding) for finding in findings)
-    for base in bases[1:]:
-        common &= Counter(finding_identity(finding)
-                          for finding in findings_against_base(repo, base, args.head, args.staged, cache))
-    shared: list[Finding] = []
-    for finding in findings:
-        identity = finding_identity(finding)
-        if common[identity]:
-            shared.append(finding)
-            common[identity] -= 1
+    shared = intersect_findings([findings_against_base(repo, base, args.head, args.staged, cache)
+                                 for base in bases])
     messages = "\n".join(git(repo, "log", "--format=%B", f"{base}..{args.head or 'HEAD'}", "--")
                          for base in bases)
     rulings = read_rulings(args.rulings, messages)

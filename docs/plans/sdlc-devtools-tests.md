@@ -195,3 +195,41 @@ Dropped 2026-10-30 by its own rule: no module that natedev's condition allows to
 Source: devtools-unit diagnosis, 2026-10-30; models-unit's go, 2026-10-30. `QUEUE_GRACE_SECS = 3.0` (`scripts/agents/codex_mesh.py:306`, used at about line 2978) makes `follow` wait 3 s after each turn. `MeshCommandFixture` patches it to 0.0 in the test process (`scripts/agents/test_codex_mesh.py:831`), but `direct/test_assign_launcher.py` runs codex_mesh as a child process, so the child still waits: 3 s per dispatch. Goal: codex_mesh reads the grace from one env var at use (default 3.0), and `MeshCommandFixture` sets that env var where it patches the constant now. Build on models' checkpoint, which rewrites much of both files; send models the diff for those two files before the merge. The Work Order is written when the hash arrives.
 
 From Phase 6: the agents.conf parse fix took `direct/test_assign_launcher.py` from 545 s to 300 s (42 tests, natedev, 2026-10-30). 300 s is the before figure for this phase's timing.
+
+### Phase 7 — The assertion guard keeps the branch's own base after a merge of the merge branch  · status: done
+**Depends on:** none
+
+Source: the sdlc showrunner, 2026-10-31, from inspectors-unit (tool-based-ui) lint run 20261031T054106. Analysis: `/tmp/claude/delegate/8777d55e-0ac2-4586-94c5-c7c309274d22/phases/14/fix3_summary.txt`, section "Guard 26". Their workaround is `VERIFY_ASSERTION_BASE=<phase HEAD>`.
+
+#### Work Order
+
+**Goal:** after a unit merges its merge branch, `assertion_guard.py` with no `--base` reports only the assertion changes of the branch's own work, the same as before the merge, and it never drops a change in the working diff.
+
+**Spec:**
+- Cause (measured, inspectors, HEAD 03fafc1d6c): `default_base` (`scripts/direct/assertion_guard.py` about line 1319) takes the production merge-base or the upstream merge-base, whichever has fewer `base..HEAD` commits. Before the merge the upstream base b45c99b672 won (10 against 26), and `run` (about line 1447) added HEAD's second parent 86276e88d9, so findings were the intersection of two bases. After the merge the upstream count is 73, because the count includes the trunk commits the merge brought in, so the production merge-base 489bcff1a5 won (27). It is also HEAD's second parent, so the dedup left one base and no intersection. Lint then blocked on 24 old branch-against-trunk differences that are not in the working diff and are already absent at the upstream base.
+- After a merge of the merge branch, the base choice gives the same comparison as before the merge: the merge's trunk commits do not count against the upstream base. Old committed branch-against-trunk differences that are already absent at the upstream base are no findings.
+- A change in the working diff (uncommitted, or staged with `--staged`) is never dropped by the parent intersection. Measured case: inspectors entries 13 and 14 are real working-diff assertion changes. The intersection hid them before the merge, because their old test name (and for 14 the finding kind) differs between the upstream base and the trunk base.
+- An explicit `--base` (and `VERIFY_ASSERTION_BASE`) keeps its current meaning. Every existing test in `test_assertion_guard*.py` and `test_verify_assertion_guard.py` keeps its result, among them the completed-merge, ticket-108, upstream-against-production and diverged-base tests.
+- One base choice and one intersection: fix them where they are, with no second selector and no per-caller patch.
+
+**Files:**
+- `scripts/direct/assertion_guard.py` — the base choice in `default_base` and the parent intersection in `run`
+- `scripts/direct/test_assertion_guard_revisions.py` — tests for the merge of the merge branch and for the working-diff changes
+- `scripts/direct/assertion_guard_test_support.py` — a shared fixture step for "merge the production branch into the unit branch", when the tests need one
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `scripts/direct/assertion_guard.py`
+- `test` — `scripts/direct/test_assertion_guard_revisions.py` and `scripts/direct/assertion_guard_test_support.py`, from this Spec alone: (a) a unit branch pushed with an assertion removed that trunk still has, trunk then advanced and merged into the branch, gives no finding with no `--base`; (b) the same shape plus a new working-tree removal reports that removal; (c) a working-tree change to an assertion in a test that the branch renamed against trunk is reported. Each new test fails on the old code.
+
+**State:** none
+
+**Constraints from prior phases:** the `rust` flag of `normalized` and `finding_identity` is `path.endswith(".rs")` (Phase 2c). In `~/rust/cargo-liner`, `assertion_guard.py --base e21d5b93^ --head e21d5b93` prints `assertion guard: 73 blocking` (change-review row C437); an explicit base must still give that.
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/direct -p 'test_assertion_guard*.py'` and `-p 'test_verify_assertion_guard.py'` green, with the new tests failing on the old code; `basedpyright` on each slot's files `0 errors, 0 warnings, 0 notes`; live check, read only: in `/home/natepiano/rust/hana_catalyst-inspectors`, `python3 <worktree>/scripts/direct/assertion_guard.py --repo .` gives the same findings as `--base HEAD` on the same tree, and none of the 24 old items; the cargo-liner C437 line still prints 73.
+
+**Repair round 4 rule (after the merge of sdlc aed34e81, which brought natedev-verify's `commit_bases` and owner-free `finding_identity`; showrunner ruling 2026-10-31: one rule for base and merge parents, no second path; Astra review `/tmp/claude/astra/20261031T113652Z-318765/review.md`):** `commit_bases` is the one selector. With no `--base`, its starting bases are every distinct one of the upstream merge-base and the production merge-base (the nearest-remote fallback and its ambiguity refusal stay); then it adds merge parents in `base..target` and `MERGE_HEAD` as now, and drops every base another base descends from (`git merge-base --independent`). An explicit `--base` keeps its list and order. `default_base` goes. The comparison stays the per-base intersection by owner-free identity. There is no second comparison path: round 4's HEAD-to-tree supplement counted one removal twice after a production rename merge (closure pass 4), and Astra review `/tmp/claude/astra/20261031T121403Z-1704209/review.md` found each repair of its reconciliation opens a new owner or grouping edge, so repair round 5 removes it. `tree_watch.py` keys the lint cache on the bases `commit_bases` returns. Second live check (showrunner): inspectors HEAD 03fafc1d6c (merge of 489bcff1a5 into 6236e6f419) with no `--base`: before and after counts go in the notice.
+
+### Phase 7b — The assertion guard compares against the combined history of its bases  · status: todo
+**Depends on:** Phase 7
+
+Source: Phase 7 repair round 4 (landing rule; showrunner ruling 2026-10-31). Astra review `/tmp/claude/astra/20261031T113652Z-318765/review.md` items 1-3. Phase 7's per-base intersection hides a branch-made removal of an assertion whose text differs per base. Distinguishing test (clean tree, no conflicts, one test name): fork with `self.assertEqual(value, 1)`; pushed U changes it to `2`; P changes another file; merge U and P and replace the assertion with `pass`; add an unrelated commit. With no `--base` and `--head HEAD`, the guard must give exactly one blocking removal of `self.assertEqual(value, 2)`. The same hole covers a working-tree or index removal of an assertion whose text the merge changed (Phase 7 round 4 tried a HEAD-to-tree supplement; it double-counted after a rename merge, and Astra review `/tmp/claude/astra/20261031T121403Z-1704209/review.md` lists the owner, replacement and grouping edges a fix must handle): the guard must give exactly one blocking removal with HEAD's spelling, and its count on the tree or index must never exceed the `--base HEAD` count for local changes. Design inputs: Phase 7 round 3's merge-tree fold (saved in the Phase 7 run folder as `round3_wip/assertion_guard.py`), and that its whole-path conflict fallback reports imported removals. natedev-verify's explicit multi-`--base` tests require intersection semantics: the Work Order must name each one it changes. The Work Order is written when the phase starts.

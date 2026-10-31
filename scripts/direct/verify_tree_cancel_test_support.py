@@ -12,6 +12,7 @@ from typing import cast, override
 from scripts.direct.test_tree_watch import write_workspace
 from scripts.direct.verify_token_ownership_test_support import VerifyTokenOwnershipFixture
 from scripts.direct.verify_token_wait_test_support import VERIFY
+from scripts.direct.verify_assertion_guard_test_support import write_guard
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -120,22 +121,7 @@ class VerifyTreeCancelFixture(VerifyTokenOwnershipFixture):
         self.write_tool(stubs / "cargo", CARGO)
         self.write_shell_tool(stubs / "taplo", "exit 0\n")
         self.write_shell_tool(stubs / "rustc", "printf 'rustc fixture\\n'\n")
-        self.write_tool(stubs / "assertion-guard", """
-class GuardError(Exception):
-    pass
-
-def default_base(repo, explicit_base=""):
-    return "fixture-base"
-
-def git(repo, *arguments):
-    return "fixture-head" if arguments[0] == "rev-parse" else ""
-
-def read_rulings(sources, messages):
-    return {}
-
-if __name__ == "__main__":
-    raise SystemExit(0)
-""")
+        write_guard(stubs / "assertion-guard")
         # Keep real heartbeat/board sleeps; only controlled memory transitions
         # use already-published routing readiness or the meminfo change event.
         sleep = shutil.which("sleep")
