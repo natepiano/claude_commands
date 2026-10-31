@@ -117,14 +117,15 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
         step.promise, step.measured.bytes if isinstance(step.measured, gate.MeasuredMemory) else 0,
         gate.build_charge(step.measured), gate.charge_basis(step.measured)) for step in view.running if not isinstance(step.measured, gate.GoneMemory))
     first: gate.HeadExplanation | gate.NoWaiter = gate.NoWaiter()
+    budget = gate.build_budget_bytes()
     host: gate.HostAvailable | gate.ReadingUnavailable = gate.HostAvailable(
-        view.available, gate.UnknownHostTotal(), view.reserve, 21 * gate.GIB, gate.NoPressureHold())
+        view.available, gate.UnknownHostTotal(), view.reserve, budget, gate.NoPressureHold())
     if view.waiting:
         step = view.waiting[0]
         reason = step.reason
         row: gate.Waiter = {"pid": step.pid, "start_time": "", "need": step.need, "since": step.since}
         order = gate.head_window(row, view.now)
-        decision = gate.AdmissionDecision("admit", step.need + view.reserve, view.promised, view.reserve, 0)
+        decision = gate.AdmissionDecision("admit", step.need + view.reserve, view.promised, view.reserve, 0, budget=budget)
         if isinstance(reason, gate.HeadAdmissionStatus):
             decision, order = reason.decision, reason.backfill
         elif isinstance(reason, gate.NeedsBuildBudget):
@@ -132,10 +133,10 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
                 0, charged=reason.charged, budget=reason.budget, budget_passes=False)
         elif isinstance(reason, gate.NeedsMemory):
             decision = gate.AdmissionDecision("hold", reason.threshold, reason.growth, reason.reserve,
-                0, free_passes=False)
+                0, budget=budget, free_passes=False)
         elif isinstance(reason, gate.MemoryPressure):
             decision = gate.AdmissionDecision("hold", step.need + view.reserve, view.promised,
-                                                      view.reserve, 0, pressure=reason)
+                                                      view.reserve, 0, pressure=reason, budget=budget)
         elif isinstance(reason, gate.ReadingUnavailable):
             host = reason
         first = gate.HeadExplanation(step, gate.NeedSourceNotRecorded(), decision,
@@ -144,7 +145,7 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
     followers: list[gate.LineWaiter] = []
     for step in view.waiting[1:]:
         own = gate.decide(view.available, gate.UnknownHostTotal(), step.need, [],
-                          limits=gate.AdmissionLimits(21 * gate.GIB, view.reserve))
+                          limits=gate.AdmissionLimits(budget, view.reserve))
         followers.append(gate.LineWaiter(step, own.state == "admit", own,
                                          *gate.decision_checks(own, step.need, view.available)))
     explanation = gate.QueueExplanation(view.now, host, running,
@@ -319,4 +320,4 @@ class AdmissionLogTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root)}))
+        self.enterContext(mock.patch.dict(os.environ, {"BUILDLOG_DIR": str(self.root), "BUILDLOG_BUILD_BUDGET_GIB": "21"}))

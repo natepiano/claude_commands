@@ -19,7 +19,7 @@ import time
 import uuid
 from collections.abc import Generator, Iterator, Mapping
 from contextlib import redirect_stderr
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from build_shape import BuildShape, NoBuildShape, build_shape, index_shapes, recorded_build_shape
 from user_zone import user_zone
 from atomic_file import write_text_atomic
+from config_values import config_values
 
 
 class GitFacts(TypedDict):
@@ -89,8 +90,8 @@ FILTERED_FLOOR = GIB
 # clippy had 65%, so 0.65 covers the measured p90 process-memory share.
 ANON_SHARE = 0.65
 HISTORY_DAYS = 14
-# Build anon at 16–20 GiB averaged 10.4% full PSI; at 20–24 GiB it averaged 16.4%.
-BUILD_BUDGET_BYTES = 21 * GIB
+# Used only when neither the environment nor lint.conf supplies a valid budget.
+FALLBACK_BUILD_BUDGET_BYTES = 21 * GIB
 # Option C, 126 builds over 14 days to 2026-10-30: 1.314 covered every
 # replayed release step (including the 15.76 GiB incident).
 RELEASE_HEADROOM = 1.314
@@ -625,7 +626,8 @@ class AdmissionDecision:
     measured: int
     pressure: Pressure = NO_PRESSURE_HOLD
     charged: int = 0
-    budget: int = BUILD_BUDGET_BYTES
+    # The lambda resolves build_budget_bytes after its definition below.
+    budget: int = field(default_factory=lambda: build_budget_bytes())
     budget_passes: bool = True
     free_passes: bool = True
     head_room: HeadRoom | NoHeadRoom = NoHeadRoom()
@@ -1162,14 +1164,29 @@ class CheckResult:
     blocker: Blocker = NoSingleBlocker()
 
 
-def build_budget_bytes() -> int:
+def _positive_gib_bytes(raw: str) -> int | None:
     try:
-        value = float(os.environ["BUILDLOG_BUILD_BUDGET_GIB"]) * GIB
+        value = float(raw) * GIB
         if math.isfinite(value) and value > 0:
             return max(1, int(value))
-    except (KeyError, ValueError):
+    except ValueError:
         pass
-    return BUILD_BUDGET_BYTES
+    return None
+
+
+def _lint_config_path() -> str:
+    return os.path.expanduser(os.environ.get("LINT_CONFIG_FILE") or "~/.claude/config/lint.conf")
+
+
+def build_budget_bytes() -> int:
+    """Resolve the live budget: environment, lint.conf, then the fallback."""
+    environment_budget = _positive_gib_bytes(os.environ.get("BUILDLOG_BUILD_BUDGET_GIB", ""))
+    if environment_budget is not None:
+        return environment_budget
+    config_budget = _positive_gib_bytes(config_values(_lint_config_path()).get("build_budget_gib", ""))
+    if config_budget is not None:
+        return config_budget
+    return FALLBACK_BUILD_BUDGET_BYTES
 
 
 def resolve_admission_limits(total: int | UnknownHostTotal) -> AdmissionLimits:
@@ -1443,10 +1460,11 @@ def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape
         basis = replace(basis, floor=floor, factor=factor)
     else:
         uncapped = base
+    budget = build_budget_bytes()
     cap: CappedAtBudget | UnderBudget = (CappedAtBudget(uncapped)
-                                       if uncapped > BUILD_BUDGET_BYTES else UnderBudget())
+                                       if uncapped > budget else UnderBudget())
     basis = replace(basis, cap=cap)
-    return ExpectedPeak(min(uncapped, BUILD_BUDGET_BYTES), "shape", count, basis)
+    return ExpectedPeak(min(uncapped, budget), "shape", count, basis)
 
 
 def need_basis_record(basis: NeedBasis | BasisNotRecorded) -> dict[str, object]:
@@ -1482,7 +1500,7 @@ def read_need_basis(raw: object) -> NeedBasis | BasisNotRecorded:
         cap: CappedAtBudget | UnderBudget = UnderBudget()
         if cap_row["kind"] == "budget":
             uncapped = cap_row["uncapped"]
-            if not isinstance(uncapped, int) or uncapped <= BUILD_BUDGET_BYTES:
+            if not isinstance(uncapped, int) or uncapped <= build_budget_bytes():
                 return BasisNotRecorded()
             cap = CappedAtBudget(uncapped)
         elif cap_row["kind"] != "none":
