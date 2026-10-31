@@ -54,11 +54,11 @@ class PaneRecordTests(unittest.TestCase):
             "CLAUDE_CODE_OAUTH_TOKEN": "secret", "UNRELATED": "x",
         }
 
-    def start(self, pane: str, session_id: str, *flags: str) -> subprocess.CompletedProcess[str]:
+    def start(self, pane: str, session_id: str, *flags: str, source: str = "startup") -> subprocess.CompletedProcess[str]:
         """The hook under a process whose argv is `claude <flags>`, as a pane's Claude runs it."""
         command = [BASH, "-c", 'exec -a claude "$0" "$@"', sys.executable, str(self.root / "runner.py"),
                    sys.executable, str(HOOK), *flags]
-        payload = json.dumps({"session_id": session_id, "cwd": "/work/alpha", "source": "startup"})
+        payload = json.dumps({"session_id": session_id, "cwd": "/work/alpha", "source": source})
         return subprocess.run(command, input=payload, env={**self.env, "HERDR_PANE_ID": pane},
                               capture_output=True, text=True, check=False, timeout=60)
 
@@ -141,6 +141,162 @@ class PaneRecordTests(unittest.TestCase):
         self.assertEqual({pane: entry["session_id"] for pane, entry in entries.items()},
                          {"w1:p2": "sid-alpha-2", "w2:p1": "sid-ups"})
         self.assertEqual((entries["w2:p1"]["name"], entries["w2:p1"]["remote_control"]), ("", False))
+
+    def test_explicit_record_directory_keeps_identity_sources_separate(self) -> None:
+        source = self.root / "staff-source"
+        source.mkdir()
+        entry = pane_record.launch("w1:p2", "sid-alpha", "/fixture", {
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit",
+            "STAFF_ID": "s123456789ab"}, ["claude"])
+        evidence = source / "agents.json"
+        _ = evidence.write_text(json.dumps({"w1:p2": entry}))
+        before = evidence.read_bytes()
+        with (mock.patch.dict(os.environ, {"HERDR_PANE_RECORD_DIR": str(source)}),
+              mock.patch.object(pane_record, "RECORD_DIR", self.records)):
+            pane_record.write("agents", entry)
+            self.assertEqual(pane_record.read("agents"), {"w1:p2": entry})
+            self.assertEqual(pane_record.forget_unit("alpha-unit"), ["agents:w1:p2"])
+            self.assertEqual(pane_record.read("agents"), {})
+        self.assertEqual(evidence.read_bytes(), before)
+        self.assertEqual(json.loads((self.records / "agents.json").read_text()), {})
+
+    def test_markless_hook_preserves_only_the_same_conversations_identity(self) -> None:
+        self.env["STAFF_ID"] = "s123456789ab"
+        self.assertEqual(self.start("w1:p2", "sid-alpha").returncode, 0)
+        for key in ("STAFF_ID", "SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID"):
+            del self.env[key]
+        self.assertEqual(self.start("w1:p2", "sid-alpha").returncode, 0)
+        environment = cast(dict[str, str], self.entries()["w1:p2"]["environment"])
+        self.assertEqual(environment, {"ENABLE_TOOL_SEARCH": "true", "STAFF_ID": "s123456789ab",
+                                      "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+        self.assertEqual(self.start("w1:p2", "different-conversation").returncode, 0)
+        self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
+
+    def test_repair_recovers_history_and_staff_identity_without_changing_conversations(self) -> None:
+        from scripts.production import staff, session_staff
+        from scripts.shutdown import pane_record
+        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+        import sessions
+
+        environment = {"HERDR_PANE_RECORD_DIR": str(self.records)}
+        with (mock.patch.dict(os.environ, environment),
+              isolated_staff_file(self.root / "staff.json", environment)):
+            owner = unit_membership("demo", "alpha-unit")
+            old = pane_record.launch("old", "sid-alpha", "/old", {
+                "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude"])
+            old["written_at"] = "2026-10-30T00:00:00+00:00"
+            new = pane_record.launch("new", "sid-alpha", "/new", {"ENABLE_TOOL_SEARCH": "true"}, ["claude"])
+            # Reproduce the damaged store without passing through the now-preserving writer.
+            self.records.mkdir(parents=True, exist_ok=True)
+            path = self.records / "agents.json"
+            _ = path.write_text(json.dumps({"old": old, "new": new}))
+            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, (old, new)))
+            with (mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership),
+                  mock.patch.object(sessions, "running_sessions", return_value=[])):
+                self.assertEqual(len(session_staff.repair_marks()), 1)
+                repaired = pane_record.read_strict("agents")
+                expected = {**new, "environment": {**old["environment"], **new["environment"], "STAFF_ID": owner.id}}
+                self.assertEqual(repaired["new"], expected)
+                self.assertEqual(repaired["old"], old)
+                before = (path.read_bytes(), path.stat().st_mtime_ns)
+                self.assertEqual(session_staff.repair_marks(), [])
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_repair_command_reports_each_record_then_is_idle_on_rerun(self) -> None:
+        from scripts.production.staff_test_support import isolated_staff_file, source_environment, unit_membership
+
+        environment = {"PATH": os.defpath, **source_environment(self.root / "sources"),
+                       "HERDR_PANE_RECORD_DIR": str(self.records), "HOME": str(self.root), "HERDR_SESSION": "agents"}
+        with isolated_staff_file(self.root / "staff.json", environment):
+            owner = unit_membership("demo", "alpha-unit")
+        old = pane_record.launch("old", "same-session", "/fixture", {
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude"])
+        old["written_at"] = "2026-10-30T00:00:00+00:00"
+        new = pane_record.launch("new", "same-session", "/fixture", {}, ["claude"])
+        self.records.mkdir(parents=True)
+        path = self.records / "agents.json"
+        _ = path.write_text(json.dumps({"old": old, "new": new}))
+        command = [sys.executable, "-m", "scripts.production.session_staff", "repair"]
+        first = subprocess.run(command, cwd=HOOK.parents[2], env=environment,
+                               capture_output=True, text=True, timeout=60)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(first.stdout.splitlines(), [
+            "agents:new:same-session: set SHOWRUNNER_UNIT=demo; set SHOWRUNNER_UNIT_ID=alpha-unit; "
+            + f"set STAFF_ID={owner.id}"])
+        self.assertEqual(self.entries()["new"]["environment"], {**old["environment"], "STAFF_ID": owner.id})
+        before = path.read_bytes(), path.stat().st_mtime_ns
+        second = subprocess.run(command, cwd=HOOK.parents[2], env=environment,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stdout, "nothing to repair\n")
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_unmarked_compaction_keeps_repaired_labels_only_for_the_same_conversation(self) -> None:
+        from scripts.production import staff, session_staff
+        from scripts.shutdown import pane_record
+        from scripts.production.staff_test_support import isolated_staff_file, unit_membership
+        import sessions
+
+        environment = {"HERDR_PANE_RECORD_DIR": str(self.records)}
+        with (mock.patch.dict(os.environ, environment),
+              isolated_staff_file(self.root / "staff.json", environment)):
+            owner = unit_membership("demo", "alpha-unit")
+            old = pane_record.launch("old", "sid-alpha", "/work/alpha", {
+                "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude"])
+            old["written_at"] = "2026-10-30T00:00:00+00:00"
+            damaged = pane_record.launch("w1:p2", "sid-alpha", "/work/alpha", {}, ["claude"])
+            self.records.mkdir(parents=True)
+            _ = (self.records / "agents.json").write_text(json.dumps({"old": old, "w1:p2": damaged}))
+            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, (old, damaged)))
+            with (mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership),
+                  mock.patch.object(sessions, "running_sessions", return_value=[])):
+                self.assertEqual(len(session_staff.repair_marks()), 1)
+            for key in ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID"):
+                del self.env[key]
+            for _compaction in range(2):
+                hook = self.start("w1:p2", "sid-alpha", source="compact")
+                self.assertEqual(hook.returncode, 0, hook.stderr)
+                self.assertEqual(self.entries()["w1:p2"]["environment"], {
+                    "ENABLE_TOOL_SEARCH": "true", "SHOWRUNNER_UNIT": "demo",
+                    "SHOWRUNNER_UNIT_ID": "alpha-unit", "STAFF_ID": owner.id})
+            hook = self.start("w1:p2", "different-conversation")
+            self.assertEqual(hook.returncode, 0, hook.stderr)
+            self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
+
+    def test_restored_unit_id_comes_from_the_productions_units_table(self) -> None:
+        from scripts.production import staff, session_staff, showrunners
+
+        parent = staff.StaffRow(staff.StaffId("s123456789aa"), "showrunner", "demo", None)
+        owner = staff.StaffRow(staff.StaffId("s123456789ab"), "unit", "alpha", parent.id)
+        document = "# Production — demo\n\n## Units\n\n| Unit | Plan |\n| --- | --- |\n| `alpha` | standby |\n"
+        source = showrunners.ShowrunnerSource(
+            showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), document)
+        entry = pane_record.launch("new", "sid-alpha", "/fixture", {"STAFF_ID": owner.id}, ["claude"])
+        membership = session_staff.LaunchMembership(staff.StaffSnapshot((parent, owner)),
+            session_staff.MemberSources({"demo": source}, ()))
+        self.assertEqual(membership.environment(entry), {"STAFF_ID": owner.id,
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha"})
+
+    def test_staff_owner_supersedes_a_promoted_showrunners_old_session_staff(self) -> None:
+        from scripts.production import staff, session_staff, showrunners
+
+        owner = staff.StaffRow(staff.StaffId("s123456789ab"), "showrunner", "demo", None)
+        source = showrunners.ShowrunnerSource(
+            showrunners.Timer("demo", "session:sid-alpha", self.root / "demo.md", "UTC"), "# demo\n")
+        entry = pane_record.launch("new", "sid-alpha", "/fixture", {
+            "SHOWRUNNER_UNIT": "former", "SHOWRUNNER_UNIT_ID": "demo-unit"}, ["claude"])
+        membership = session_staff.LaunchMembership(staff.StaffSnapshot((owner,)),
+            session_staff.MemberSources({"demo": source}, ()))
+        repaired = membership.environment(entry)
+        self.assertEqual(repaired, {"STAFF_ID": owner.id})
+        entry["environment"] = {**entry["environment"], **repaired}
+        self.assertEqual(membership.environment(entry), repaired)
+        with mock.patch.object(pane_record, "RECORD_DIR", self.records):
+            pane_record.write("agents", entry)
+            canonical = entry.copy()
+            canonical["environment"] = repaired
+            pane_record.write("agents", canonical)
+            self.assertEqual(pane_record.read("agents")["new"]["environment"], repaired)
 
     def test_a_session_outside_herdr_writes_nothing(self) -> None:
         self.env["HERDR_ENV"] = ""

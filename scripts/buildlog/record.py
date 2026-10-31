@@ -68,7 +68,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from test_phase import (
@@ -989,6 +989,8 @@ class IdleFloorTarget(TypedDict):
     folder: str
     last_use: float
     bytes: int
+    takeable_bytes: NotRequired[int]
+    reason: NotRequired[str]
 
 
 def floor_scan(free_after_scan: int, floor: int, idle_targets: list[IdleFloorTarget], at: float) -> None:

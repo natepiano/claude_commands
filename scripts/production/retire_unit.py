@@ -13,7 +13,6 @@ uncommitted work: no person wrote it. Then it stops what the unit owns. It finds
   pane launch is then forgotten, so pane restore does not bring it back;
 - each run of the worktree that has an app-server stops it and ends its Codex workers
   (`codex_mesh.py stop`);
-- the unit's review-pool reviewers retire (`review_pool.py retire`); one still reviewing stays;
 - the build holds of the unit's sessions release, its berth reservations release, and the
   process of each Mac claim on the worktree stops;
 - unowned processes inside the worktree block retirement; cwd never grants stop authority.
@@ -77,7 +76,6 @@ else:
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 MESH = SCRIPTS / "agents" / "codex_mesh.py"
-POOL = SCRIPTS / "direct" / "review_pool.py"
 BUILD_HOLD = SCRIPTS / "build_hold" / "build_hold.py"
 MAC_CLAIMS = Path.home() / ".local/state/mac-test/claims"
 WAIT_MINUTES = 20.0
@@ -121,11 +119,6 @@ class MeshRun(NamedTuple):
     seats: tuple[str, ...]
 
 
-class Reviewer(NamedTuple):
-    name: str
-    busy: bool
-
-
 class MacClaim(NamedTuple):
     path: Path
     what: str
@@ -136,7 +129,6 @@ class MacClaim(NamedTuple):
 class Found(NamedTuple):
     claude: tuple[SessionRecord, ...]
     runs: tuple[MeshRun, ...]
-    reviewers: tuple[Reviewer, ...]
     holds: tuple[str, ...]
     reservations: tuple[str, ...]
     claims: tuple[MacClaim, ...]
@@ -360,23 +352,6 @@ def run_processes(worktree: Path, inside: list[int]) -> dict[int, str]:
             for pid in inside if (leader := _session_of(pid)) in leaders}
 
 
-def same_unit(lease: str, unit: str) -> bool:
-    # review_pool's own rule: some leases name `trunk`, others `trunk-unit`.
-    return lease.removesuffix("-unit") == unit.removesuffix("-unit")
-
-
-def reviewers(unit: Unit) -> tuple[Reviewer, ...]:
-    listed = run([sys.executable, str(POOL), "status", "--production", unit.production.slug])
-    if listed.returncode:
-        raise Refused(f"cannot read the review pool: {failure(listed)}")
-    found: list[Reviewer] = []
-    for line in listed.stdout.splitlines():
-        fields = line.split("\t")
-        if len(fields) >= 4 and fields[2] != "unleased" and same_unit(fields[2].rsplit(":", 1)[0], unit.name):
-            found.append(Reviewer(fields[0], fields[3] == "busy"))
-    return tuple(found)
-
-
 def hold_directory() -> Path:
     return Path(os.environ.get("BUILD_HOLD_DIR", str(Path.home() / ".local/state/build-hold")))
 
@@ -419,7 +394,7 @@ def gather(unit: Unit) -> Found:
     ids = {item["sessionId"] for item in claude} | directors
     known = {item["pid"] for item in claude} | {claim.pid for claim in claims}
     inside = unit_move.processes_inside(unit.worktree) if unit_move.exists(unit.worktree) else []
-    return Found(claude, mesh_runs(runs), reviewers(unit), holds(ids), reservations(unit.worktree), claims,
+    return Found(claude, mesh_runs(runs), holds(ids), reservations(unit.worktree), claims,
                  tuple(pid for pid in inside if pid not in known and pid != os.getpid()))
 
 
@@ -543,8 +518,6 @@ def dry_run(unit: Unit) -> int:
     found = gather(unit)
     lines = ([f"would stop: {describe_session(item)}, through stop_resume.stop" for item in found.claude]
              + [f"would stop: {describe_run(item)}" for item in found.runs]
-             + [f"would leave running: reviewer {item.name}: it is reviewing" if item.busy
-                else f"would retire: reviewer {item.name}" for item in found.reviewers]
              + [f"would release: build hold of {key}" for key in found.holds]
              + [f"would release: berth reservation {key}" for key in found.reservations]
              + [f"would stop: Mac claim {item.what} (pid {item.pid})" for item in found.claims]
@@ -613,15 +586,6 @@ def stop_rest(unit: Unit, found: Found) -> list[str]:
             left.append(f"{describe_run(item)}: {failure(result)}")
         else:
             print(f"stopped: {describe_run(item)}")
-    if found.reviewers:
-        result = run([sys.executable, str(POOL), "retire", "--production", unit.production.slug, "--unit", unit.name])
-        retired = set(result.stdout.split())
-        for item in found.reviewers:
-            if item.name in retired:
-                print(f"stopped: reviewer {item.name}")
-            else:
-                left.append(f"reviewer {item.name}: " + ("it is reviewing" if item.busy or not result.returncode
-                                                           else failure(result)))
     for key in found.holds:
         result = run([sys.executable, str(BUILD_HOLD), "release", "--holder", key])
         if result.returncode:

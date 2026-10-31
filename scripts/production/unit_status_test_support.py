@@ -88,14 +88,16 @@ class UnitStatusFixture(unittest.TestCase):
         message = root / "scripts/message"
         message.mkdir()
         _ = shutil.copy2(SCRIPT.parents[1] / "message/sessions.py", message / "sessions.py")
+        (root / "config").mkdir()
+        _ = shutil.copy2(SCRIPT.parents[2] / "config/session_retries.toml", root / "config/session_retries.toml")
         _write_executable(message / "notifier.sh", 'print -r -- "$*" >> "$NOTIFIER_CALL_LOG"\nprint -r -- "$NOTIFIER_HEALTH_TEXT"\nexit "$NOTIFIER_HEALTH_EXIT"\n')
         hooks = root / "scripts/hooks"
         hooks.mkdir()
         _ = (hooks / "direct_run.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
-        for name in ("production_units.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_staff.py", "unit_names.py", "staff.py", "session_pane.py"):
+        for name in ("production_units.py", "unit_table.py", "live_units.py", "showrunners.py", "unit_lookup.py", "session_staff.py", "session_labels.py", "unit_names.py", "staff.py", "session_pane.py"):
             _ = shutil.copy2(SCRIPT.with_name(name), script.with_name(name))
         (root / "scripts/herdr").mkdir()
-        for name in ("herdr.py", "place.py"):
+        for name in ("herdr.py", "place.py", "pane_launch.py"):
             _ = shutil.copy2(SCRIPT.parents[1] / "herdr" / name, root / "scripts/herdr" / name)
         (root / "scripts/shutdown").mkdir()
         for name in ("pane_record.py", "remote.py"):

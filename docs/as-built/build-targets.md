@@ -147,9 +147,12 @@ has no build units; a whole take covers the remaining contents. The target
 folder and its lock files stay. A held `doc/.lock`, Cargo lock or style sync lock
 keeps the target. Before the first unlink, the target root is saved durably in
 `target-deletes.json`, so memory admission refuses a warm promise even if the
-take stops. Cargo markers go last, after every payload delete succeeds. If a
+take stops. The doc-budget sweep uses this same record-before-delete rule: a
+record failure keeps that doc folder, reports a failure and continues with the
+next target. Cargo markers go last, after every payload delete succeeds. If a
 payload delete fails, the markers keep the target discoverable for the retry. Without a use stamp or build units, the newest mtime of
-the target's top-level entries supplies its last use.
+the target's top-level entries supplies its last use. An entry that holds a
+nested target does not count as the outer target's use.
 
 Nested Cargo targets outside Cargo's build trees are separate targets, with
 their own last use, locks and busy checks. The outer scan and whole take leave
@@ -157,10 +160,13 @@ them alone. One owner index per floor pass resolves each target once. Paths from
 `/proc` are already resolved by the kernel and need no further resolution. The
 index rejects paths outside every target root before checking parent folders,
 and remembers each distinct path's deepest owner for the pass. Build-tree paths
-from other sources are resolved once. Process checks read each pid's mappings
-once per check and reuse the index for every batch recheck, tree mapping and
-trim intent. Each batch still checks live processes, so a use that starts during
-the scan keeps its target. Paths and
+from other sources are resolved once. The first process check reads each pid's mappings once. Before each take,
+its live recheck tests only that target: executable and working-directory paths
+are checked by prefix, and mappings are searched as bytes before any matching
+process's lines are decoded. Cargo-nextest still keeps its workspace's target
+between test binaries. Every check uses the same deepest-owner index. Each batch
+still checks live processes, so a use that starts during the scan keeps its target.
+The scan reuses the nested roots from the pass's one target discovery. Paths and
 processes belong to the deepest target, and the byte
 totals count nested output once. A Cargo target inside a build tree belongs to
 the build unit that holds it, including its bytes and change checks. Linker temporary files named
@@ -177,7 +183,16 @@ Removing a hard link in another target does not change this check.
 The pass stops when successful deletions cover
 the shortfall.
 A dry run takes no `floor.lock`, so it can plan while a real floor pass holds
-that lock and cannot block a real pass. Real passes still take it without waiting.
+that lock and cannot block a real pass. Real passes still take it without waiting and save their pid and hold start
+in the lock file. If a known holder keeps a real pass below the floor from
+running longer than `floor_lock_alert_minutes=15` in `[sweep]`, the waiting pass
+tells natedev its pid, command and the free space. The start time, rather than
+the file's mtime, sets the age. A successful send is saved in the floor record
+once per pid and start time; failed sends are tried on the next pass. A hold
+with no readable identity sends no alert. Waiting passes serialize the receipt
+check, send and success record under a separate stable `floor-alert.lock`.
+The active pass updates its measurement under that same lock, reading the
+latest receipts before it writes, so neither pass can restore an older record.
 
 The floor takes the least recently used idle target first, then orders build
 units within that target by use. Recent targets are not held back. After each
@@ -185,8 +200,13 @@ scan that finds free space under the floor, it writes one `floor_scan`
 build-log row; a dry run writes none. The row records `at`, `free_after_scan` (bytes),
 `floor` (bytes), `shortfall` (bytes), and `idle_targets` in oldest-first order.
 Each idle target has `folder`, `last_use` (epoch seconds), and `bytes` (allocated
-file bytes measured in the scan). These rows keep the scan's capacity and use
-evidence for later replay.
+file bytes measured in the scan). When this differs from what that target's
+candidates could free, `takeable_bytes` gives that estimate and `reason` names
+why: `links outside the target`, `links outside the take candidates` for links
+to unclaimed output inside the target, or `output outside take candidates`.
+Each estimate takes that target alone with no shortfall limit, so links shared
+by two targets are takeable from neither alone. Busy and held targets stay out
+of the row. These rows keep the scan's capacity and use evidence for later replay.
 
 `recent_minutes=60` orders only build units inside one target under its budget:
 older units first, then recent units. Within each group, whole days since last

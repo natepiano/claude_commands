@@ -363,8 +363,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(len(self.log.read_text().splitlines()), 1)
         self.assertIn("alpha-unit started: herdr session attach agents, workspace director, tab alpha", result.stdout)
 
-    def test_a_review_named_unit_opens_unit_direct_beside_a_review_pool(self) -> None:
-        _ = self.doc.write_text(self.doc.read_text().replace("## Units", "- **Review pool:** code\n\n## Units"))
+    def test_a_review_named_unit_opens_unit_direct(self) -> None:
         _ = self.successful("review", "--plan", "docs/plans/given.md")
         self.assertIn(shlex.quote("/unit:direct docs/plans/given.md"), self.launch_command())
         self.assertNotIn("/review:direct", self.launch_command())
