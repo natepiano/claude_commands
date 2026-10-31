@@ -2087,8 +2087,10 @@ def build_paths_label(paths: list[str]) -> str:
     return label + (f", and {len(paths) - 10} more" if len(paths) > 10 else "")
 
 
-def launch(port: int, worktree: str | None, binary: str | None) -> tuple[LaunchState, subprocess.Popen[bytes]]:
+def launch(port: int, worktree: str | None, binary: str | None, purpose: str = "", owner: str = "") -> tuple[LaunchState, subprocess.Popen[bytes]]:
     """Start a Hana build on a test port with scratch config and wait until the scene shows."""
+    if not purpose.strip():
+        raise Refused("a test Hana launch needs --purpose <feature under test>")
     check_port(port)
     if port_answers(port):
         raise Refused(f"something already listens on port {port}; shut it down or pick another port")
@@ -2112,6 +2114,7 @@ def launch(port: int, worktree: str | None, binary: str | None) -> tuple[LaunchS
     log = scratch / "hana.log"
     command = [
         "env", f"XDG_CONFIG_HOME={config}", f"BRP_EXTRAS_PORT={port}",
+        f"HANA_TEST_PURPOSE={purpose.strip()}", f"HANA_TEST_OWNER={owner.strip() or os.environ.get('SHOWRUNNER_UNIT_ID', '')}",
         f"BEVY_ASSET_ROOT={root / 'crates' / 'hana'}", str(executable),
     ]
     direnv = shutil.which("direnv")
@@ -2286,11 +2289,11 @@ def shutdown(port: int, process: subprocess.Popen[bytes] | None = None) -> None:
 
 
 @contextmanager
-def instance(port: int, launch_first: bool, shutdown_after: bool, worktree: str | None, binary: str | None) -> Generator[Brp]:
+def instance(port: int, launch_first: bool, shutdown_after: bool, worktree: str | None, binary: str | None, purpose: str = "", owner: str = "") -> Generator[Brp]:
     check_port(port)
     process: subprocess.Popen[bytes] | None = None
     if launch_first:
-        _, process = launch(port, worktree, binary)
+        _, process = launch(port, worktree, binary, purpose, owner)
     try:
         yield Brp(port)
     finally:
@@ -2329,6 +2332,8 @@ class Arguments(argparse.Namespace):
     remote: str | None = None
     worktree: str | None = None
     binary: str | None = None
+    purpose: str = ""
+    owner: str = ""
     from_current: bool = False
     replace: bool = False
     since: str | None = None
@@ -2435,7 +2440,7 @@ def command_shot(args: Arguments, invocation: InProgressCaptureInvocation) -> in
         shots = [shot_from_arguments(args)]
     invocation.orientation = shots[0].orientation
     invocation.shot = shots[0]
-    with instance(args.port, args.launch, args.shutdown, args.worktree, args.binary) as brp:
+    with instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner) as brp:
         _ = run_shots(brp, shots, args.out, args.remote, report, invocation)
     return 0
 
@@ -2684,7 +2689,7 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
     failures: list[str] = []
     passed: list[str] = []
     with (
-        instance(args.port, args.launch, args.shutdown, args.worktree, args.binary) as brp,
+        instance(args.port, args.launch, args.shutdown, args.worktree, args.binary, args.purpose, args.owner) as brp,
         closing(Session(brp, args.remote)) as session,
     ):
         _ = session.start()
@@ -2745,7 +2750,7 @@ def views_check(args: Arguments, path: Path, invocation: InProgressCaptureInvoca
 
 
 def command_launch(args: Arguments) -> int:
-    state, _ = launch(args.port, args.worktree, args.binary)
+    state, _ = launch(args.port, args.worktree, args.binary, args.purpose, args.owner)
     print(json.dumps(state))
     return 0
 
@@ -2784,6 +2789,8 @@ def add_run_flags(parser: argparse.ArgumentParser, port_required: bool = True) -
     _ = parser.add_argument("--remote", help="ssh host of a Hana whose --port is tunnelled here, such as natemccoy@mac")
     _ = parser.add_argument("--worktree")
     _ = parser.add_argument("--binary")
+    _ = parser.add_argument("--purpose", default="", help="feature under test; required when launching Hana")
+    _ = parser.add_argument("--owner", default="", help="unit director; defaults to SHOWRUNNER_UNIT_ID")
 
 
 class ArgumentExit(SystemExit):
@@ -2838,6 +2845,8 @@ def arguments(argv: list[str]) -> Arguments:
     _ = launch_parser.add_argument("--port", type=int, required=True)
     _ = launch_parser.add_argument("--worktree")
     _ = launch_parser.add_argument("--binary")
+    _ = launch_parser.add_argument("--purpose", default="", help="feature under test (required)")
+    _ = launch_parser.add_argument("--owner", default="", help="unit director; defaults to SHOWRUNNER_UNIT_ID")
 
     shutdown_parser = commands.add_parser("shutdown", help="stop a launched Hana and remove its scratch")
     _ = shutdown_parser.add_argument("--port", type=int, required=True)

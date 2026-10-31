@@ -11,6 +11,11 @@
 # OIT crash. Linux only: on macOS Hana's config path ignores XDG_CONFIG_HOME.
 set -euo pipefail
 
+HANA_TEST_PURPOSE="${HANA_TEST_PURPOSE:-}"
+HANA_TEST_OWNER="${HANA_TEST_OWNER:-${SHOWRUNNER_UNIT_ID:-}}"
+[[ -n "${HANA_TEST_PURPOSE//[[:space:]]/}" ]] || { printf '%s\n' 'smoke_launch: set HANA_TEST_PURPOSE to the feature under test' >&2; exit 2; }
+export HANA_TEST_PURPOSE HANA_TEST_OWNER
+
 CHECKOUT="${1:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 SHA="${2:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
 LOG="${3:?Usage: smoke_launch.sh <checkout> <sha> <log> [port]}"
@@ -72,6 +77,7 @@ trap cleanup EXIT
 # CARGO_MANIFEST_DIR for asset lookup.
 log "launch: port $PORT, config $SCRATCH/xdg"
 setsid direnv exec "$CHECKOUT" env XDG_CONFIG_HOME="$SCRATCH/xdg" BRP_EXTRAS_PORT="$PORT" \
+    HANA_TEST_PURPOSE="$HANA_TEST_PURPOSE" HANA_TEST_OWNER="$HANA_TEST_OWNER" \
     BEVY_ASSET_ROOT="$CHECKOUT/crates/hana" RUST_BACKTRACE=1 "$BIN" >>"$LOG" 2>&1 &
 HANA_PID=$!
 

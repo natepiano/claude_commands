@@ -1244,7 +1244,7 @@ The Phase 26 checkpoint did not name two narrowed assertions; this phase's check
 - `impl` — the source, doc and command files.
 - `test` — the test files and goldens.
 
-### Phase 43 — Every agent Hana carries its owner and purpose, and `hanas` lists, stops and sweeps test Hanas on both machines  · status: todo
+### Phase 43 — Every agent Hana carries its owner and purpose, and `hanas` lists, stops and sweeps test Hanas on both machines  · status: done
 **Depends on:** none (runs beside Phase 41; no shared files).
 
 **Approved:** builds showrunner 2026-10-31, relaying a user request through hana: design `/home/natepiano/.local/state/showrunner/tool-based-ui/session/hana-test-window-design.md`, its phase 1. Outside paths approved under `--also`: `scripts/production/mac_run.sh`, `scripts/production/smoke_launch.sh`, `scripts/hana_shot/hana_shot.py`, `config/mac_test.conf`. `/etc/nixos` changes go to natedev as branch + hash. bevy_brp needs no change: its launch tool already takes `env` (`~/rust/bevy_brp/mcp/src/app_tools/launch_params.rs:49-52`). Trunk Phase 174 (the Hana side: refusal, title, idle exit) lands only after this phase is installed.

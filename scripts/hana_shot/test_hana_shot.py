@@ -30,6 +30,7 @@ from scripts.hana_shot import hana_shot
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
 TEST_HANG_GUARD_SECS = 300
+LAUNCH_RECORDING_PURPOSE = "launch recovery"
 
 SCRIPT = Path(__file__).with_name("hana_shot.py")
 CAMERA_ENTITY = 5
@@ -774,6 +775,18 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
         _ = self.source.write_text("uncommitted source\n")
         os.utime(self.source, ns=(mtime_ns, mtime_ns))
 
+    def test_launch_without_a_purpose_refuses_before_starting_a_process(self) -> None:
+        for purpose in ("", "   "):
+            with (
+                self.subTest(purpose=purpose),
+                mock.patch.object(subprocess, "Popen") as start,
+                self.assertRaises(hana_shot.Refused) as refused,
+            ):
+                _ = hana_shot.launch(15797, str(self.root), str(self.executable), purpose=purpose)
+            self.assertIn("--purpose", str(refused.exception))
+            self.assertEqual(len(str(refused.exception).splitlines()), 1)
+            start.assert_not_called()
+
     def test_clean_crates_do_not_warn_about_binary(self) -> None:
         self.assertEqual(hana_shot.uncommitted_build_paths(self.root, self.executable), [])
 
@@ -859,7 +872,7 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
         self.modify_source(3_000_000_000)
         self.executable.unlink()
         with mock.patch.object(hana_shot, "port_answers", return_value=False), self.assertRaises(hana_shot.Refused) as refused:
-            _ = hana_shot.launch(15797, str(self.root), str(self.executable))
+            _ = hana_shot.launch(15797, str(self.root), str(self.executable), purpose="launch warning")
         self.assertIn(f"no Hana binary at {self.executable}; build it first (cargo build -p hana)", str(refused.exception))
         self.assertIn("uncommitted edits in crates/ or the root Cargo files will be included by a build: crates/hana/main.rs", str(refused.exception))
 
@@ -876,6 +889,8 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
         def start_stub(command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
             self.assertEqual(command[-1], str(self.executable))
             self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+            self.assertIn("HANA_TEST_PURPOSE=launch warning", command)
+            self.assertIn("HANA_TEST_OWNER=window-unit", command)
             self.assertIn("so this Hana runs that code:", diagnostics.getvalue())
             return cast(subprocess.Popen[bytes], process)
 
@@ -889,12 +904,13 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
 
         with (
             redirect_stderr(diagnostics),
+            mock.patch.dict(os.environ, {"SHOWRUNNER_UNIT_ID": "window-unit", "HANA_TEST_OWNER": ""}),
             mock.patch.object(hana_shot, "port_answers", return_value=False),
             mock.patch.object(hana_shot, "wait_ready"),
             mock.patch.object(hana_shot, "launch_state_path", return_value=self.root / "launch.json"),
             mock.patch.object(tempfile, "mkdtemp", side_effect=make_scratch),
         ):
-            state, _ = hana_shot.launch(15797, str(self.root), str(self.executable))
+            state, _ = hana_shot.launch(15797, str(self.root), str(self.executable), purpose="launch warning")
         warning = next(line for line in diagnostics.getvalue().splitlines() if line.startswith("hana_shot: warning:"))
         self.assertIn(f"{self.executable} was built after uncommitted edits in crates/ or the root Cargo files,", warning)
         for path in paths[:10]:
@@ -908,6 +924,7 @@ class LaunchBuildWarningTests(BuildLogIsolatedTest):
 
 
 class LaunchRecordRecoveryTests(HanaShotTest):
+    launch_command: list[str] = []
     state_path: Path = Path()
     root: Path = Path()
     executable: Path = Path()
@@ -924,19 +941,34 @@ class LaunchRecordRecoveryTests(HanaShotTest):
         self.executable = self.root / "hana"
         _ = self.executable.write_bytes(b"fixture binary; never execute")
 
-    def launch_without_starting_hana(self) -> hana_shot.LaunchState:
+    def launch_without_starting_hana(self, *, owner: str = "") -> hana_shot.LaunchState:
         launch_scratch = self.scratch / "new-launch-scratch"
         launch_scratch.mkdir()
         process = cast(subprocess.Popen[bytes], mock.Mock(pid=424242))
+
+        def start(command: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+            if command[-1] == str(self.executable):
+                self.launch_command = command
+            self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+            return process
+
         with (
             mock.patch.object(hana_shot, "uncommitted_build_paths", return_value=[]),
             mock.patch.object(tempfile, "mkdtemp", return_value=str(launch_scratch)),
-            mock.patch.object(subprocess, "Popen", return_value=process),
+            mock.patch.object(subprocess, "Popen", side_effect=start),
             mock.patch.object(hana_shot, "wait_ready"),
             redirect_stderr(io.StringIO()),
         ):
-            state, _ = hana_shot.launch(self.port, str(self.root), str(self.executable))
+            state, _ = hana_shot.launch(self.port, str(self.root), str(self.executable), purpose=LAUNCH_RECORDING_PURPOSE, owner=owner)
         return state
+
+    def test_explicit_launch_owner_takes_precedence_over_the_callers_unit(self) -> None:
+        self.stop_fake_listener()
+        with mock.patch.dict(os.environ, {"SHOWRUNNER_UNIT_ID": "caller-unit"}):
+            _ = self.launch_without_starting_hana(owner="feature-unit")
+        self.assertIn("HANA_TEST_OWNER=feature-unit", self.launch_command)
+        self.assertIn(f"HANA_TEST_PURPOSE={LAUNCH_RECORDING_PURPOSE}", self.launch_command)
+        self.assertNotIn("HANA_TEST_OWNER=caller-unit", self.launch_command)
 
     def stop_fake_listener(self) -> None:
         server = self.fake_listeners[-1]
@@ -1213,12 +1245,19 @@ class LaunchRecordRecoveryTests(HanaShotTest):
 
 
 class PortGuardTests(HanaShotTest):
+    def test_launch_command_without_purpose_names_the_required_flag(self) -> None:
+        result = self.run_script("launch", "--port", "15797")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--purpose", result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertEqual(self.fake.calls, [])
+
     def test_user_port_is_refused_by_every_command(self) -> None:
         for argv in (
             ["shot", "--port", "15702", "--mode", "home"],
             ["pose", "get", "--port", "15702"],
             ["targets", "--port", "15702"],
-            ["launch", "--port", "15702"],
+            ["launch", "--port", "15702", "--purpose", "port guard"],
             ["shutdown", "--port", "15702"],
             ["views", "check", "--port", "15702", "--views-file", str(self.scratch / "views.toml")],
         ):

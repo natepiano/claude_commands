@@ -191,6 +191,7 @@ class MacRunTests(unittest.TestCase):
             "MAC_TEST_CONFIG": str(self.config_path),
             "MAC_RUN_STUB_STATE": str(self.stub_state),
             "MAC_RUN_SHA": SHA,
+            "HANA_TEST_PURPOSE": "Mac launch coordination",
             "TMPDIR": str(self.temp_directory),
         }
 
@@ -424,6 +425,11 @@ class MacRunTests(unittest.TestCase):
         result = self.mac_run(extra={"MAC_RUN_GIT_RESOLVE_STATUS": "2"})
 
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertTrue(any(
+            event["command"] == "git" and "rev-parse" in event["args"]
+            for event in self.events()
+        ), self.events())
+        self.assertNotIn("HANA_TEST_PURPOSE", result.stdout + result.stderr)
         self.assert_claim_released()
         self.assert_no_build_started()
 

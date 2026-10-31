@@ -12,6 +12,12 @@
 # 7 hana exited early; 8 hana stayed up but an example failed; 9 Mac blocked,
 # busy with a test, or coordination state unreadable.
 set -o pipefail
+purpose=${HANA_TEST_PURPOSE:-}
+owner=${HANA_TEST_OWNER:-${SHOWRUNNER_UNIT_ID:-}}
+[[ -n ${purpose//[[:space:]]/} ]] || { print -u2 'mac_run: set HANA_TEST_PURPOSE to the feature under test'; exit 2 }
+# zsh's q flag quotes labels for the generated command without evaluating them.
+purpose_arg=${(q)purpose}
+owner_arg=${(q)owner}
 repo=$1 sha=$2 hold=${3:-60}
 host=natemccoy@mac
 # A standing clone, so builds are incremental. Never ~/rust/hana, the user's.
@@ -114,7 +120,7 @@ on_mac "cd $clone && MACOSX_DEPLOYMENT_TARGET=14.0 ~/.cargo/bin/cargo build -q -
 ssh $host "rm -f $status_file; cat > $launch; chmod +x $launch" <<EOF
 #!/bin/zsh
 cd ~/$clone
-BEVY_ASSET_ROOT=\$HOME/$clone/crates/hana BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $hold \$HOME/$clone/target/debug/hana > $log 2>&1
+HANA_TEST_PURPOSE=$purpose_arg HANA_TEST_OWNER=$owner_arg BEVY_ASSET_ROOT=\$HOME/$clone/crates/hana BRP_EXTRAS_PORT=$port perl -e 'alarm shift; exec @ARGV' $hold \$HOME/$clone/target/debug/hana > $log 2>&1
 echo \$? > $status_file
 exit 0
 EOF

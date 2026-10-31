@@ -63,6 +63,15 @@ config decides whether a check runs, never with what flags.
 call `lint_config_enabled <op>` (plus `lint_config_skip_notice <op> <what>` for
 the SKIPPED line), or run it as the `/lint_config` CLI.
 
+## hanas.conf
+
+`scripts/hanas/hanas.py` reads this file on each run. `exempt_ports` names the
+user and demo Hana ports. An exempt port is still a test Hana when the process
+has test labels or agent environment. `test_max_hours` bounds labelled test
+Hanas; `unlabelled_max_minutes` bounds test Hanas with neither label.
+`stop_grace_seconds` is the time between TERM and KILL. `HANAS_CONFIG` selects
+another file for private tests. Mac host and SSH settings stay in `mac_test.conf`.
+
 ## mac_test.conf
 
 Controls Mac test offload and the `/build:mac` block command. It names the CI

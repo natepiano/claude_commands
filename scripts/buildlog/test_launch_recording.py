@@ -29,8 +29,10 @@ from test_launches import CLI, result_line
 
 if TYPE_CHECKING:
     from ..hana_shot import hana_shot
+    from ..hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
 else:
     from scripts.hana_shot import hana_shot
+    from scripts.hana_shot.test_hana_shot import LAUNCH_RECORDING_PURPOSE
 
 
 class RecordingStopped(BaseException):
@@ -139,7 +141,7 @@ class LaunchRecordingTests(unittest.TestCase):
 
     def launch_without_process(self, port: int) -> hana_shot.LaunchState:
         with self.fake_launch_process(port):
-            launched = hana_shot.launch(port, str(self.worktree), str(self.binary))
+            launched = hana_shot.launch(port, str(self.worktree), str(self.binary), purpose=LAUNCH_RECORDING_PURPOSE)
         return launched[0]
 
     def test_hana_launch_records_one_start_with_no_admission(self) -> None:
@@ -299,7 +301,7 @@ class LaunchRecordingTests(unittest.TestCase):
             try:
                 sys.setprofile(interrupt_recording)
                 with self.assertRaises(hana_shot.ExitSignal) as caught:
-                    _ = hana_shot.launch(port, str(self.worktree), str(self.binary))
+                    _ = hana_shot.launch(port, str(self.worktree), str(self.binary), purpose=LAUNCH_RECORDING_PURPOSE)
             finally:
                 sys.setprofile(previous_profile)
 
@@ -401,7 +403,7 @@ class LaunchRecordingTests(unittest.TestCase):
         with mock.patch.object(record, "write_launch_line", side_effect=fail_first_publication):
             for port in (15816, 15817):
                 with self.fake_launch_process(port) as process:
-                    _ = hana_shot.launch(port, str(self.worktree), str(self.binary))
+                    _ = hana_shot.launch(port, str(self.worktree), str(self.binary), purpose=LAUNCH_RECORDING_PURPOSE)
                     self.assertTrue(hana_shot.launch_state_path(port).exists())
                     hana_shot.shutdown(port, process)
                     self.assertEqual(process.poll(), 0)

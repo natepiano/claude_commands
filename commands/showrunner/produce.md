@@ -784,7 +784,7 @@ files for a small fix checkpoint. Log each point and its result. Pass
 `--no-ci` to both calls when the production rules say CI does not apply.
 
 **Mac run.** After every green CI on the merge branch, run its sha on the Mac
-in the background: `zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
+in the background: `HANA_TEST_PURPOSE="CI promotion smoke" zsh ~/.claude/scripts/production/mac_run.sh <CHECKOUT> <sha> 60`.
 It builds, checks hana stays up 60 s, and stops it, then builds and runs each
 demo example (list in the script) for 20 s with the command you would type, so
 each starts at once from the clone `~/rust/hana_catalyst_mac`. Exit 3 means the
@@ -805,7 +805,7 @@ Promote the exact sha pushed by <CIPoint/> after these checks:
    background with `dangerouslyDisableSandbox: true`:
 
    ```sh
-   bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
+   HANA_TEST_PURPOSE="promotion smoke" bash ~/.claude/scripts/production/smoke_launch.sh CHECKOUT <sha> <SCRATCH>/smoke_<short sha>.log
    ```
 
    It builds `hana`, starts it on port 15790 with an empty config directory,
