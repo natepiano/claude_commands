@@ -19,6 +19,9 @@ from unittest import mock
 from pathlib import Path
 from typing import ClassVar, NamedTuple, cast, override
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import process_group
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import merge_checkpoint
 import change_review
@@ -502,7 +505,7 @@ class MergeCheckpointFixture(unittest.TestCase):
 
         def cleanup() -> None:
             if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
+                process_group.send_process_group(process.pid, signal.SIGKILL)
             _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
 
         self.addCleanup(cleanup)
@@ -570,7 +573,7 @@ class MergeCheckpointFixture(unittest.TestCase):
             return
         if isinstance(sessions.process_liveness(run.gate_pid, run.gate_start), sessions.LiveSessionProcess):
             self.assertEqual(os.getsid(run.gate_pid), run.gate_pid, "fixture gate must own its session")
-            os.killpg(run.gate_pid, signal.SIGKILL)
+            process_group.send_process_group(run.gate_pid, signal.SIGKILL)
             try:
                 _ = os.waitpid(run.gate_pid, 0)
             except ChildProcessError:
