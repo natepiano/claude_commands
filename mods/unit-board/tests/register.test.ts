@@ -91,7 +91,7 @@ describe("unit board commands and lifetime", () => {
       const result = await $.command.run(command());
       expect(result.text).toBe("Unit board opened.");
       expect(fake.processes).toEqual([["/test-home/.claude/scripts/lib/py",
-        "/test-home/.claude/scripts/direct/board_json.py", "--cwd", CWD, "--session", SESSION]]);
+        "/test-home/.claude/scripts/direct/board_json.py", "--session", SESSION]]);
       expect(fake.opened).toEqual(["unit-board"]);
       const ui = await mount($, surface);
       let text = drawnText(await ui.drawn());
@@ -206,7 +206,7 @@ describe("unit board commands and lifetime", () => {
     expect(fake.processes).toEqual([]);
   });
 
-  test("opening the board passes the current session id to the generator", async ($, on) => {
+  test("opening the board passes only the current session to the generator", async ($, on) => {
     const fake = engineFiles(on);
     fake.setSession("command-showrunner-id");
 
@@ -214,8 +214,7 @@ describe("unit board commands and lifetime", () => {
 
     expect(fake.processes.length).toBe(1);
     const argv = fake.processes[0]!;
-    expect(argv).toContain("--cwd");
-    expect(argv[argv.indexOf("--cwd") + 1]).toBe(CWD);
+    expect(argv).not.toContain("--cwd");
     expect(argv).toContain("--session");
     expect(argv[argv.indexOf("--session") + 1]).toBe("command-showrunner-id");
   });
@@ -234,8 +233,7 @@ describe("unit board commands and lifetime", () => {
 
     expect(fake.processes.length).toBe(1);
     const refreshed = fake.processes[0]!;
-    expect(refreshed).toContain("--cwd");
-    expect(refreshed[refreshed.indexOf("--cwd") + 1]).toBe(CWD);
+    expect(refreshed).not.toContain("--cwd");
     expect(refreshed).toContain("--session");
     expect(refreshed[refreshed.indexOf("--session") + 1]).toBe("resumed-showrunner-id");
     expect(fake.reads).toEqual([BOARD]);
@@ -479,7 +477,7 @@ describe("unit board commands and lifetime", () => {
     fake.replaceBoards([]);
     await $.command.run(command());
     const ui = await mount($, "terminal");
-    expect(drawnText(await ui.drawn())).toContain("Run /showrunner:unit_board in a showrunner session.");
+    expect(drawnText(await ui.drawn())).toContain("This session is not on the staff list.");
     fake.clear();
     await fake.clock.advance(10_000);
     expect(fake.processes).toEqual([]);

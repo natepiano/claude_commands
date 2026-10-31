@@ -86,6 +86,26 @@ def row_production(row: staff.StaffRow, record: staff.StaffSnapshot,
     return UnitProduction(slug, str(sources.productions[slug].timer.doc))
 
 
+@dataclass(frozen=True)
+class NoSessionShowrunner:
+    """The session has no staff row with a showrunner at or above it."""
+
+
+def session_showrunner(session_id: str, *, record: staff.StaffSnapshot,
+                       sources: MemberSources) -> MemberFound | NoSessionShowrunner:
+    """Follow the newest launch's staff id to its first showrunner."""
+    launches = [launch for launch in sources.launches if launch["session_id"] == session_id]
+    if not launches:
+        return NoSessionShowrunner()
+    environment = max(launches, key=lambda launch: launch["written_at"])["environment"]
+    row = record.by_id(staff.StaffId(environment.get("STAFF_ID", "")))
+    while row is not None:
+        if row.kind == "showrunner":
+            return MemberFound(row)
+        row = record.by_id(row.parent) if row.parent is not None else None
+    return NoSessionShowrunner()
+
+
 def unit_parent(unit: str, session_id: str = "", *, record: staff.StaffSnapshot,
                 sources: MemberSources | None = None) -> UnitProduction:
     """Resolve identity and its current parent without another owner read."""
