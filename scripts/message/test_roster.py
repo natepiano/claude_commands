@@ -41,8 +41,6 @@ import codex_daemon
 from codex_test_support import FakeDaemon, receive_frame, reply, write_codex_account
 import process_table
 import roster
-import send
-import broadcast
 import unit_lookup
 import unit_runs
 import herdr
@@ -150,7 +148,6 @@ class RosterTests(unittest.TestCase):
             "PROCESS_TABLE_PS": f"cat {self.ps_state}",
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership"),
-            "REVIEW_POOL_STATE": str(self.root / "review-pool"),
         }
         environment_patch = cast(
             AbstractContextManager[object],
@@ -370,6 +367,13 @@ class RosterTests(unittest.TestCase):
                 "thread-window", "Codex window", str(self.home / "projects" / "codex"), "idle",
             ),
         ]
+
+    def test_unit_worker_keeps_its_director_run_messaging_address(self) -> None:
+        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
+            result = roster.roster(os.environ, roster.ThisMachine())
+        self.assertEqual(result.problems, [])
+        unit_worker = next(entry for entry in result.entries if entry.name == "alpha-impl")
+        self.assertEqual(unit_worker.reach, roster.Messageable("worker:director-run/alpha-impl"))
 
     def _entries(self) -> dict[str, roster.RosterEntry]:
         with mock.patch.object(codex_daemon, "loaded_sessions", return_value=self._daemon_sessions()):
@@ -857,8 +861,8 @@ class RosterTests(unittest.TestCase):
                        showrunner=roster.UnderShowrunner("sdlc", "runner", "session:runner"),
                        director=roster.UnderDirector("roles-unit", "director", "session:director"))
         for role, slot, expected in (("impl", "impl", "worker impl"), ("test", "test", "worker test"),
-                                     ("review", "code6", "code reviewer 6"),
-                                     ("review", "code7", "code reviewer 7")):
+                                     ("review", "review", "code reviewer review"),
+                                     ("review", "review2", "code reviewer review2")):
             with self.subTest(slot=slot):
                 entry = replace(base, assignment=roster.WorkerAssignment(
                     role, "/run", roster.worker_role({"role": role}), slot))
@@ -902,26 +906,6 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(decoded.thread, roster.CodexThread("fixed-thread"))
                 self.assertEqual(decoded.reach, roster.Messageable("worker:run/fixed-address"))
 
-    def test_pool_titles_follow_each_number_and_current_lease(self) -> None:
-        pool = self.root / "review-pool"
-        state = pool / "sdlc" / "pool.json"
-        state.parent.mkdir(parents=True)
-        reviewers: dict[str, object] = {
-            name: {"type": "code", "lease": {"unit": "roles-unit", "ordinal": number}}
-            for number, name in ((6, "code6"), (7, "code7"))
-        }
-        _ = state.write_text(json.dumps({"reviewers": reviewers}))
-        with mock.patch.dict(os.environ, {"REVIEW_POOL_STATE": str(pool)}):
-            for number, name in ((6, "code6"), (7, "code7")):
-                with self.subTest(name=name):
-                    shown = roster.mesh_shown_name(str(pool / "sdlc" / "mesh" / name), name, {"role": "review"})
-                    self.assertEqual(shown.render(), f"sdlc · roles · code reviewer {number}")
-                    self.assertEqual(shown.address, name)
-            reviewers["code6"] = {"type": "code", "lease": {"unit": "other-unit", "ordinal": 1}}
-            _ = state.write_text(json.dumps({"reviewers": reviewers}))
-            moved = roster.mesh_shown_name(str(pool / "sdlc" / "mesh" / "code6"), "code6", {"role": "review"})
-            self.assertEqual(moved.render(), "sdlc · other · code reviewer 6")
-            self.assertEqual(moved.address, "code6")
 
     def test_mesh_titles_use_held_design_holder_and_fall_back_when_it_is_unreadable(self) -> None:
         design_id = "00000000-0000-4000-8000-000000000099"
@@ -969,41 +953,6 @@ class RosterTests(unittest.TestCase):
                 self.assertEqual(title.render(), f"alpha · unit-one · worker {slot}")
                 self.assertEqual(title.address, name)
 
-    def test_roster_discovers_pool_reviewers_and_tracks_lease_changes_without_duplicate_daemon_rows(self) -> None:
-        pool = self.root / "review-pool" / "sdlc"
-        pool.mkdir(parents=True)
-        state = pool / "pool.json"
-        reviewers: dict[str, object] = {
-            "code6": {"type": "code", "lease": {"unit": "roles-unit"}},
-            "ui2": {"type": "ui", "lease": None},
-            "code7": {"type": "code", "lease": {"unit": "roles-unit"}},
-        }
-        _ = state.write_text(json.dumps({"reviewers": reviewers}))
-        mesh = pool / "mesh" / "3"
-        self._write_mesh(mesh, {
-            "code6": {"thread_id": "pool-code", "status": "running", "role": "review"},
-            "ui2": {"thread_id": "pool-ui", "status": "done", "role": "review"},
-            "code7": {"thread_id": "pool-ended", "status": "ended", "role": "review"},
-        })
-        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[
-            codex_daemon.DaemonSession("pool-code", "daemon-alias", str(self.root), "idle")]):
-            result = roster.roster(os.environ, roster.ThisMachine())
-        entries = {entry.name: entry for entry in result.entries}
-        self.assertNotIn("daemon-alias", entries)
-        self.assertNotIn("code7", entries)
-        code, ui = entries["code6"], entries["ui2"]
-        self.assertEqual(code.role, "worker")
-        self.assertEqual(code.assignment, roster.WorkerAssignment("review", str(mesh), "review", "code6", "code"))
-        self.assertEqual(code.reach, roster.Messageable("worker:review-pool/sdlc/3/code6"))
-        self.assertEqual(code.thread, roster.CodexThread("pool-code"))
-        self.assertEqual(roster.shown_name(code).render(), "sdlc · roles · code reviewer 6")
-        self.assertEqual(roster.shown_name(ui).render(), "sdlc · UI reviewer 2")
-        self.assertIsInstance(roster.shown_name(ui).unit, roster.NoUnit)
-        reviewers["code6"] = {"type": "code", "lease": {"unit": "next-unit"}}
-        _ = state.write_text(json.dumps({"reviewers": reviewers}))
-        moved = self._entries()["code6"]
-        self.assertEqual(roster.shown_name(moved).render(), "sdlc · next · code reviewer 6")
-        self.assertEqual((moved.thread, moved.reach, moved.assignment), (code.thread, code.reach, code.assignment))
 
     def test_named_launch_record_wins_over_another_workers_matching_suffix(self) -> None:
         _ = (self.director_run / unit_runs.DIRECTOR_FILE).write_text("sid-director\n")
@@ -1020,81 +969,8 @@ class RosterTests(unittest.TestCase):
         title = roster.mesh_shown_name(str(self.director_run), "arbitrary-impl", {"role": "test"})
         self.assertEqual(title.render(), "alpha · unit-one · worker test")
 
-    def test_pool_addresses_resolve_separately_across_productions_with_the_same_run_and_name(self) -> None:
-        meshes: dict[str, Path] = {}
-        for slug in ("sdlc", "hana"):
-            pool = self.root / "review-pool" / slug
-            pool.mkdir(parents=True)
-            _ = (pool / "pool.json").write_text(json.dumps({"reviewers": {
-                "code6": {"type": "code", "lease": None}}}))
-            meshes[slug] = pool / "mesh" / "3"
-            self._write_mesh(meshes[slug], {
-                "code6": {"thread_id": f"{slug}-thread", "status": "running", "role": "review"}})
-        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            result = roster.roster(os.environ, roster.ThisMachine())
-        self.assertEqual(result.problems, [])
-        reviewers = [entry for entry in result.entries if entry.name == "code6"]
-        self.assertEqual(len(reviewers), 2)
-        addresses: set[str] = set()
-        for entry in reviewers:
-            assert isinstance(entry.reach, roster.Messageable)
-            assert isinstance(entry.showrunner, roster.ProductionWithoutRunningShowrunner)
-            addresses.add(entry.reach.address)
-            recipient = send.resolve_recipient(entry.reach.address, send.LocalOnly(), result)
-            self.assertEqual(recipient, send.CodexWorkerRecipient(
-                entry.reach.address, "code6", str(meshes[entry.showrunner.production])))
-        self.assertEqual(len(addresses), 2)
-        unit_worker = next(entry for entry in result.entries if entry.name == "alpha-impl")
-        self.assertEqual(unit_worker.reach, roster.Messageable("worker:director-run/alpha-impl"))
 
-    def test_leased_pool_reviewers_join_only_their_productions_unit_broadcast(self) -> None:
-        for slug in ("alpha", "other"):
-            pool = self.root / "review-pool" / slug
-            pool.mkdir(parents=True)
-            _ = (pool / "pool.json").write_text(json.dumps({"reviewers": {
-                "code6": {"type": "code", "lease": {"unit": "unit-one"}}}}))
-            self._write_mesh(pool / "mesh" / "3", {
-                "code6": {"thread_id": f"{slug}-thread", "status": "running", "role": "review"}})
-        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            result = roster.roster(os.environ, roster.ThisMachine())
-        self.assertEqual(result.problems, [])
-        director = next(entry for entry in result.entries if entry.name == "director")
-        audience = broadcast.WorkersOfUnit("session:sid-director", "unit-one", director.machine)
-        reviewers = [entry for entry in result.entries if entry.name == "code6"]
-        self.assertEqual(len(reviewers), 2)
-        for entry in reviewers:
-            assert isinstance(entry.showrunner, roster.ProductionWithoutRunningShowrunner)
-            if entry.showrunner.production == "alpha":
-                self.assertEqual(entry.director, roster.UnderDirector("unit-one", "director", "session:sid-director"))
-                self.assertTrue(broadcast.selects(audience, entry))
-            else:
-                self.assertEqual(entry.director, roster.UnderDirector("unit-one", "", ""))
-                self.assertFalse(broadcast.selects(audience, entry))
 
-        # A lease survives the director going away; its address does not.
-        (self.sessions / "director.json").unlink()
-        with mock.patch.object(codex_daemon, "loaded_sessions", return_value=[]):
-            offline = roster.roster(os.environ, roster.ThisMachine())
-        leased = next(entry for entry in offline.entries if entry.name == "code6"
-                      and isinstance(entry.showrunner, roster.ProductionWithoutRunningShowrunner)
-                      and entry.showrunner.production == "alpha")
-        self.assertEqual(leased.director, roster.UnderDirector("unit-one", "", ""))
-        self.assertFalse(broadcast.selects(audience, leased))
-
-    def test_unreadable_pool_reports_one_problem_without_listing_partial_reviewers(self) -> None:
-        pool = self.root / "review-pool" / "sdlc"
-        pool.mkdir(parents=True)
-        self._write_mesh(pool / "mesh" / "1", {
-            "code6": {"thread_id": "pool-code", "status": "running", "role": "review"}})
-        for text in ("broken JSON", json.dumps({"reviewers": {
-                "code6": {"type": "code", "lease": None}, "ui2": {"type": "unknown"}}})):
-            with self.subTest(text=text):
-                _ = (pool / "pool.json").write_text(text)
-                result = roster.roster(os.environ, roster.ThisMachine())
-                self.assertFalse(any(entry.name == "code6" for entry in result.entries))
-                problems = [problem for problem in result.problems if "review pool" in problem]
-                self.assertEqual(len(problems), 1, result.problems)
-                self.assertIn(str(pool / "pool.json"), problems[0])
 
     def test_legacy_snapshot_assignment_is_unrecorded_and_unknown_organization_is_rejected(self) -> None:
         entry = self._entry("old-impl", "worker", "worker:old/old-impl")
@@ -2234,7 +2110,6 @@ class CodexHolderLabelsTests(unittest.TestCase):
             "ROSTER_CODEX_SOCKET": str(self.root / "no-daemon.sock"),
             "HERDR_PANE_RECORD_DIR": str(self.root / "pane-records"),
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
-            "REVIEW_POOL_STATE": str(self.root / "review-pool"),
             "FAKE_HERDR_RESPONSES": str(self.root / "herdr.json"),
             "FAKE_HERDR_LOG": str(self.root / "herdr.log"),
         }

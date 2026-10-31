@@ -528,14 +528,15 @@ def _resumed_launcher_command(command: list[str], seat: str, prompt: str) -> str
     index = next((i for i, arg in enumerate(command) if Path(arg).name in {"implement.sh", "review.sh"}), -1)
     if index < 0:
         return None
-    # Launchers accept option/value pairs followed by session_dir, cwd, prompt_file.
+    # Retain supported task options; saved commands may predate the current launcher.
+    supported = {"--phase", "--lens"} if Path(command[index]).name == "review.sh" else {"--phase", "--fix-cause"}
     position = index + 1
     options: list[str] = []
     while position < len(command) and command[position].startswith("--"):
         if position + 1 >= len(command):
             return None
         option, value = command[position], command[position + 1]
-        if option not in {"--slot", "--pool", "--lease", "--to"}:
+        if option in supported:
             options.extend((option, value))
         position += 2
     arguments = command[position:]

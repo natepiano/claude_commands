@@ -45,7 +45,7 @@ class SendMessageMissTests(unittest.TestCase):
             "PROCESS_TABLE_PS": str(binaries / "ps"), "XDG_STATE_HOME": str(self.root / "state"),
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"), "ROSTER_RUN_ROOT": str(self.root / "runs"),
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"), "DESIGN_ROLES_STATE": str(self.root / "roles"),
-            "DESIGN_OWNERSHIP_STATE": str(self.root / "ownership"), "REVIEW_POOL_STATE": str(self.root / "pool"),
+            "DESIGN_OWNERSHIP_STATE": str(self.root / "ownership"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
         }
         self.peer_snapshot()
