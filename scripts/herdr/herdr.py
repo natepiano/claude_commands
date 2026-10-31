@@ -38,9 +38,11 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, TypeVar, c
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from process_failure import failure_detail
 import nix_env as nix_env
+from place import HerdrPlace as HerdrPlace
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -569,12 +571,6 @@ class ObservedAgentState:
 @dataclass(frozen=True)
 class WaitTimedOut:
     """The CLI or its subprocess exhausted the wait deadline."""
-
-
-@dataclass(frozen=True)
-class HerdrPlace:
-    session: str
-    pane: str
 
 
 @dataclass(frozen=True)

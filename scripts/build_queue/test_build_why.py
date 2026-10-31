@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 import io
+import fcntl
 import json
 import os
 import re
@@ -15,11 +16,12 @@ import unittest
 from typing import cast, override
 from unittest import mock
 
-from scripts.build_queue import build_queue, build_why, head_facts
+from scripts.build_queue import build_why, head_facts
+from scripts.build_queue.queue_fixture import write_process
 from scripts.build_queue.test_head_facts import bump_line, queue_time_line, token_gap_line, write_bumps, write_token_gaps
 from scripts.lint import memory_admit as gate
 from scripts.lib.user_zone import user_zone
-from scripts.message import roster
+from scripts.message import roster, unit_labels
 
 GIB = gate.GIB
 NOW = datetime(2026, 10, 30, 1, 51, tzinfo=UTC).timestamp()
@@ -77,9 +79,10 @@ class BuildWhyTests(unittest.TestCase):
         for number in range(16):
             _ = self.waiter(600 + number, f"younger-{number}", number + 1, 20 - number)
         entries = [self.entry(name) for name in ("widget", "demo", "organon", "frame-cost", "inspectors-fix")]
-        _ = self.enterContext(mock.patch.object(build_queue, "read_roster", return_value=roster.Roster(entries, [])))
+        labels = roster.unit_labels(entries)
+        _ = self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value=labels))
         _ = self.enterContext(mock.patch.object(roster, "roster", return_value=roster.Roster(entries, [])))
-        _ = self.enterContext(mock.patch.object(roster, "unit_labels_for", return_value=roster.unit_labels(entries)))
+        _ = self.enterContext(mock.patch.object(roster, "unit_labels_for", return_value=labels))
 
     def entry(self, name: str) -> roster.RosterEntry:
         return roster.RosterEntry(
@@ -91,16 +94,9 @@ class BuildWhyTests(unittest.TestCase):
             session=roster.NoClaudeSession(),
         )
 
-    def process(self, pid: int, used: float = 0) -> None:
-        directory = self.proc / str(pid)
-        directory.mkdir()
-        fields = ["S", "1", *(["0"] * 17), str(pid)]
-        _ = (directory / "stat").write_text(f"{pid} (verify) {' '.join(fields)}\n")
-        _ = (directory / "status").write_text(f"VmRSS: {gib(used) // 1024} kB\nVmSwap: 0 kB\n")
-
     def running(self, pid: int, name: str, step: str, need: float, used: float,
                 age: int, *, peak: float = 0) -> Path:
-        self.process(pid, used)
+        write_process(self.proc, pid, gib(used))
         folder = "/tmp/p34-merge" if name == "widget" else f"/tmp/{name}"
         row: dict[str, object] = {
             "pid": pid, "start_time": str(pid), "need": gib(need), "repo": "hana", "step": step,
@@ -116,7 +112,7 @@ class BuildWhyTests(unittest.TestCase):
         return path
 
     def waiter(self, pid: int, name: str, need: float, minutes: int) -> Path:
-        self.process(pid)
+        write_process(self.proc, pid)
         row: dict[str, object] = {
             "pid": pid, "start_time": str(pid), "need": gib(need), "since": NOW - minutes * 60,
             "session_id": f"id-{name}", "session_name": name, "step": "nextest", "folder": f"/tmp/{name}",
@@ -558,7 +554,7 @@ class BuildWhyTests(unittest.TestCase):
                           bump_line(NOW - 2, actor="actor-two", session="bumped-two")])
         with mock.patch.object(roster, "unit_labels_for", return_value={}) as labels, \
              mock.patch.object(roster, "roster", side_effect=AssertionError("no full roster")), \
-             mock.patch.object(gate, "locked_queue_read", wraps=gate.locked_queue_read) as reading, \
+             mock.patch.object(gate, "queue_read", wraps=gate.queue_read) as reading, \
              mock.patch.object(head_facts, "read_head_facts", wraps=head_facts.read_head_facts) as facts:
             output = self.output()
         labels.assert_called_once()
@@ -605,11 +601,30 @@ class BuildWhyTests(unittest.TestCase):
         self.assertIn("recovery", recovery)
         self.assertIn("21:51", recovery)
 
+    def test_missing_or_corrupt_snapshot_with_held_lock_answers_busy_in_under_a_second(self) -> None:
+        for content in (None, "{"):
+            with self.subTest(content=content):
+                path = self.directory / "queue.json"
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _ = path.write_text(content)
+                output, errors = io.StringIO(), io.StringIO()
+                with (self.directory / "lock").open("a+") as lock, \
+                     redirect_stdout(output), redirect_stderr(errors), mock.patch("sys.argv", ["build_why.py"]):
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    started = time.perf_counter()
+                    status = build_why.main()
+                    elapsed = time.perf_counter() - started
+                self.assertLess(elapsed, 1.0)
+                self.assertEqual((status, output.getvalue(), errors.getvalue()),
+                                 (0, "queue busy; try again\n", ""))
+
     def test_read_failure_is_one_fixed_line_with_exit_two(self) -> None:
         for error in (OSError("cannot read ledger"), ValueError("invalid ledger"), TimeoutError("lock busy")):
             with self.subTest(error=type(error).__name__):
                 output, errors = io.StringIO(), io.StringIO()
-                with mock.patch.object(gate, "locked_queue_read", side_effect=error), \
+                with mock.patch.object(gate, "queue_read", side_effect=error), \
                      redirect_stdout(output), redirect_stderr(errors), mock.patch("sys.argv", ["build_why.py"]):
                     result = build_why.main()
                 self.assertEqual(result, 2)
