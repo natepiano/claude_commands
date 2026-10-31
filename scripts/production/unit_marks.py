@@ -12,9 +12,9 @@ for directory in (SCRIPTS / "message", SCRIPTS / "production", SCRIPTS / "herdr"
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 
-import showrunners
+from scripts.production import showrunners
 from sessions import SessionRecord
-from showrunners import canonical_slug
+from scripts.production.showrunners import canonical_slug
 from place import HerdrPlace
 
 PRODUCTION_MARK = "SHOWRUNNER_UNIT"

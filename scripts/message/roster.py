@@ -26,7 +26,7 @@ for _directory in (SCRIPTS / "production", SCRIPTS / "direct", SCRIPTS / "herdr"
 
 import remove_workers  # noqa: E402
 from worker_state import worker_ledger  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
 import unit_runs  # noqa: E402
 import herdr  # noqa: E402

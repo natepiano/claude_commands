@@ -1,6 +1,7 @@
 """Read typed log fields and format measurement rows for hierarchy reports."""
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -236,18 +237,20 @@ def blocks(title: str, rows: Sequence[MeasureRow]) -> str:
     heading = [wrap_text(title)]
     if not rows:
         return "\n".join([*heading, "none"])
-    shared_window = all(row.window == rows[0].window for row in rows)
-    shared_source = all(row.source == rows[0].source for row in rows)
+    window, window_n = Counter(row.window for row in rows).most_common(1)[0]
+    source, source_n = Counter(row.source for row in rows).most_common(1)[0]
+    shared_window = window_n > 1
+    shared_source = source_n > 1
     if shared_window:
-        heading.append(wrap_text("Window: " + rows[0].window, subsequent_indent="    "))
+        heading.append(wrap_text("Window: " + window, subsequent_indent="    "))
     if shared_source:
-        heading.append(wrap_text("Source: " + rows[0].source, subsequent_indent="    "))
+        heading.append(wrap_text("Source: " + source, subsequent_indent="    "))
     output = ["\n".join(heading)]
     for row in rows:
         fields = [("value", row.value), ("n", str(row.n))]
-        if not shared_window:
+        if not shared_window or row.window != window:
             fields.append(("window", row.window))
-        if not shared_source:
+        if not shared_source or row.source != source:
             fields.append(("source", row.source))
         output.append("\n".join([
             wrap_text(row.measure),
