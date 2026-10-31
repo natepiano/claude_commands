@@ -486,10 +486,12 @@ Moved from builds-resources Phase 27 (builds showrunner, 2026-10-31): one owner 
 - `scripts/build_queue/test_build_why.py` — Spec 4 (owner queue-unit).
 - `docs/as-built/build-memory-admission.md` — Spec 5.
 - `docs/as-built/merge-gate-and-test-speed.md` — Spec 5, the Shared admission bullet (owner natedev showrunner; trial-merge against `origin/natedev`).
+- `scripts/lint/memory_gate.sh` — the shell wait line: `buildlog_memory_line_inner` (its `*)` arm) reads any unknown need source as "no history, so the fallback", the new `cap` source included. It says the cap as build-why does (resources-unit architect finding, 2026-10-31).
+- `scripts/lint/test_memory_gate_wait.py` — a wait-line regression for the `cap` source.
 
 **Workers:** `1 writer + 1 tester`
-- `impl` — gate sizing (`merge_gate.py`), the admission charge and the gate-cap basis (`memory_admit.py`), the explanation (`build_why.py`) and both docs.
-- `test` — `test_memory_admit.py`, `test_merge_gate_suites_admission.py` and `test_build_why.py`.
+- `impl` — gate sizing (`merge_gate.py`), the admission charge and the gate-cap basis (`memory_admit.py`), the explanation (`build_why.py`), the shell wait line (`memory_gate.sh`) and both docs.
+- `test` — `test_memory_admit.py`, `test_merge_gate_suites_admission.py`, `test_build_why.py` and the `cap` wait-line regression in `test_memory_gate_wait.py`.
 
 **Acceptance gate:**
 - The memory admission, gate admission and build-why tests pass; `basedpyright` over the six Python files reports `0 errors, 0 warnings, 0 notes`; the merge gate is green.
