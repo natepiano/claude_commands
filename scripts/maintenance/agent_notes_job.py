@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, cast
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from scripts.lib import process_group
 from scripts.maintenance.settings import Part, Schedule, settings
 
 
@@ -51,7 +52,7 @@ def run_part(part: Part, cadence: Schedule, deadline: float) -> PartResult:
                 output, _ = child.communicate(timeout=remaining)
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(child.pid, signal.SIGKILL)
+                    process_group.send_process_group(child.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 output, _ = child.communicate()

@@ -330,7 +330,7 @@ class StaffTestCase(unittest.TestCase):
         self.assertTrue(folder.is_relative_to(self.root))
         result = subprocess.run(
             ["git", "-C", str(folder), *arguments], capture_output=True, text=True,
-            check=True, timeout=PROCESS_TIMEOUT,
+            check=True, timeout=TEST_HANG_GUARD_SECS,
         )
         return result.stdout.strip()
 
