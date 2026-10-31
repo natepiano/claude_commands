@@ -59,8 +59,8 @@ from unittest.mock import MagicMock, patch
 from scripts.agents import codex_mesh, worker_lifecycle
 from scripts.direct import plan_history, workers as unit_workers
 from scripts.direct.recorder_fixture import invoke_recorder
-from scripts.lib import nix_env
-from scripts.message import process_table, sessions, roster as message_roster
+from scripts.lib import nix_env, unit_runs
+from scripts.message import process_table, sessions, unit_labels, roster as message_roster
 from scripts.usage import agents_log
 from scripts.accounts import accounts, moves, refusals, role_map
 from scripts.astra import astra_work, design_roles
@@ -1634,6 +1634,21 @@ class MeshCommandFixture(unittest.TestCase):
         _ = (self.session_dir / "progress_history_state.json").write_text(json.dumps({
             "production": "natedev", "unit": "models-unit", "working_dir": str(self.session_dir),
         }))
+
+    @contextlib.contextmanager
+    def thread_title_context(self) -> Generator[None, None, None]:
+        from scripts.production.staff_test_support import isolated_staff_file, production_membership
+
+        _ = (self.session_dir / unit_runs.DIRECTOR_FILE).write_text("title-director", encoding="utf-8")
+        place = unit_labels.ProductionPlace(unit_labels.ProductionWithoutRunningShowrunner("sdlc"),
+                                            unit_labels.DirectsUnit("roles-unit"))
+        runner = {"session": "", "socket": "", "slug": "sdlc", "zone": "UTC",
+                  "doc": str(self.session_dir / "production.md")}
+        with isolated_staff_file(self.session_dir / "staff.json", {}), \
+                patch.object(message_roster, "_registered_showrunners", return_value=[runner]), \
+                patch.object(message_roster, "_production_places", return_value={"title-director": place}):
+            production_membership("sdlc", "roles-unit")
+            yield
 
 
 @final
@@ -4118,10 +4133,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(self.worker_record()["role"], "impl")
 
     def test_thread_titles_follow_assignment_at_each_turn_without_renaming_the_worker(self) -> None:
-        roster = message_roster
-        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
-                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
-        with patch.object(roster, "_pool_context", return_value=place):
+        with self.thread_title_context():
             self.assertEqual(self.run_start(), (0, ""))
             self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
                 "threadId": THREAD_ID, "name": "sdlc · roles · worker worker"})
@@ -4136,10 +4148,7 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                           for request in self.methods("turn/start")], [THREAD_ID])
 
     def test_display_rename_reaches_the_next_thread_title_without_changing_record_identity(self) -> None:
-        roster = message_roster
-        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
-                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
-        with patch.object(roster, "_pool_context", return_value=place):
+        with self.thread_title_context():
             self.assertEqual(self.run_start(), (0, ""))
             before = dict(self.worker_record())
             with patch.object(names, "runtime_names", return_value=fixture_names(worker="builder")):
@@ -4151,18 +4160,13 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
         self.assertEqual(set(self.roster()), {"worker"})
 
     def test_unplaced_thread_keeps_its_address_as_title(self) -> None:
-        roster = message_roster
-        with patch.object(roster, "_pool_context", return_value=(roster.NoShowrunner(), roster.NoDirector(), "")):
-            self.assertEqual(self.run_start(), (0, ""))
+        self.assertEqual(self.run_start(), (0, ""))
         self.assertEqual(self.methods("thread/name/set")[-1]["params"], {"threadId": THREAD_ID, "name": "worker"})
         self.assertEqual(self.worker_record()["role"], "impl")
         self.assertEqual(self.worker_record()["thread_id"], THREAD_ID)
 
     def test_prime_and_fork_send_shown_titles_and_keep_mesh_addresses(self) -> None:
-        roster = message_roster
-        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
-                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
-        with patch.object(roster, "_pool_context", return_value=place):
+        with self.thread_title_context():
             result, output, errors = self.run_mesh(self.prime_cli())
             self.assertEqual((result, output, errors), (0, f"{THREAD_ID}\n", ""))
             self.assertEqual(self.methods("thread/name/set")[-1]["params"], {
@@ -4207,12 +4211,9 @@ with contextlib.closing(codex_mesh.Client(int(sys.argv[1]), "grace-child")) as c
                                      (design_id, role, THREAD_ID))
 
     def test_resume_fallback_sets_shown_title_and_retains_assignment(self) -> None:
-        roster = message_roster
         self.write_pool_roster({"worker": {"thread_id": "old-thread", "status": "done", "role": "impl"}})
         self.failing_method = "thread/resume"
-        place = (roster.ProductionWithoutRunningShowrunner("sdlc"),
-                 roster.UnderDirector("roles-unit", "director", "session:director"), "")
-        with patch.object(roster, "_pool_context", return_value=place):
+        with self.thread_title_context():
             self.assertEqual(self.run_follow(), (0, ""))
         titles = self.methods("thread/name/set")
         self.assertTrue(titles)

@@ -25,7 +25,8 @@ import herdr
 from inventory import Session, inventory
 import shutdown_record as store
 from shutdown_record import SessionShutdown, SessionStopIssue
-from remote import local_machine, other_machine, run_remote
+import remote
+from remote import other_machine, run_remote
 from scripts.production import staff_sources
 from scripts.production import showrunners
 import sessions
@@ -435,7 +436,7 @@ def report_stop(records: list[SessionShutdown]) -> None:
             lines.append(f"  {saved['session']['name']}: {progress['reason']}")
         elif progress["kind"] == "manual restart":
             lines.append(f"  {saved['session']['name']}: in a terminal on {saved['machine']}: {progress['command']}")
-        if saved["machine"].casefold() == local_machine().casefold():
+        if saved["machine"].casefold() == remote.local_machine().casefold():
             lines.extend(failed_prompt_screen_lines(saved))
     failed = [saved for saved in records if saved["session"]["session_id"] not in running and store.stop_incomplete(saved)]
     restore_failed = [saved for saved in records
@@ -456,11 +457,11 @@ def report_stop(records: list[SessionShutdown]) -> None:
         for saved in records:
             if saved["session"]["session_id"] not in running:
                 lines.append(restart_line(saved))
-    tell_showrunners_outcome([saved for saved in records if saved["machine"] == local_machine()],
+    tell_showrunners_outcome([saved for saved in records if saved["machine"] == remote.local_machine()],
                             restart_observations=tuple(restart_liveness.items()))
     text = "\n".join(lines)
     origins = {saved["requested_by"]["session_id"] for saved in records if saved["requested_by"]["kind"] == "session"}
-    route = "natedev" if local_machine().casefold() == "mac" else ""
+    route = "natedev" if remote.local_machine().casefold() == "mac" else ""
     unpushed = [saved for saved in restore_failed
                 if saved["progress"]["kind"] != "timers pending" and saved["alerts"] == "user"
                 and saved.get("restore_alerted") != not_back_text(saved)]

@@ -46,7 +46,7 @@ from scripts.whoami.account import (  # noqa: E402
 from scripts.shutdown import folder_trust, stop_resume  # noqa: E402
 import pane_record  # noqa: E402
 import production_units  # noqa: E402
-from scripts.production import staff, staff_sources  # noqa: E402
+from scripts.production import staff, staff_sources, unit_marks  # noqa: E402
 import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import inventory as inventory_work  # noqa: E402
@@ -99,6 +99,7 @@ from shutdown_record import (  # noqa: E402
 )
 import shutdown_record as recovery_store  # noqa: E402
 import launch_permission as restore_permission  # noqa: E402
+import remote  # noqa: E402
 from remote import other_machine, run_remote  # noqa: E402
 import sessions  # noqa: E402
 from sessions import (  # noqa: E402
@@ -120,7 +121,6 @@ class ShutdownServices(Protocol):
                             summary: str, text: str) -> SessionShutdown: ...
 
     def record_time(self) -> str: ...
-    def local_machine(self) -> str: ...
     def elapsed_text(self, seconds: int) -> str: ...
     def stopped_sessions_text(self, count: int) -> str: ...
     def shutdown_command(self, *arguments: str) -> str: ...
@@ -771,6 +771,7 @@ def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str
     entry = pane_record.PaneLaunch(pane_id="", session_id=session["session_id"], config_dir=str(config_dir),
         cwd=session["cwd"], name=session["name"], model=model["name"] if model["kind"] == "model" else "",
         remote_control=True, environment=environment, flags_read=True, ended=False, written_at=at)
+    environment = unit_marks.record_membership(entry)["environment"]
     argv = stop_resume.resume_arguments(entry)
     if isinstance(conversation, StartFreshConversation):
         argv[0] = "--session-id"
@@ -1681,7 +1682,7 @@ def clear_running_on_target(records: list[SessionShutdown]) -> TargetCheck:
     for record in records:
         if (recovery_store.legacy_tmux_leftovers(record)
                 or record["progress"]["kind"] not in NOT_BACK_PROGRESS
-                or record["machine"].casefold() != restart_support.local_machine().casefold()):
+                or record["machine"].casefold() != remote.local_machine().casefold()):
             remaining.append(record)
             continue
         observed_at = time.time()
@@ -3288,7 +3289,7 @@ def _up(login: str, dry_run: bool, only: Iterable[str] = (), *,
         eligible = [record for record in eligible if record["session"]["session_id"] not in dropped]
         records = [record for record in records if record["session"]["session_id"] not in dropped]
     label = eligible[0]["label"] if eligible else hold_outcome.hold["label"] if isinstance(hold_outcome, AccountHeld) else "all accounts" if all_accounts else login
-    machine = eligible[0]["machine"] if eligible else hold_outcome.hold["machine"] if isinstance(hold_outcome, AccountHeld) else restart_support.local_machine()
+    machine = eligible[0]["machine"] if eligible else hold_outcome.hold["machine"] if isinstance(hold_outcome, AccountHeld) else remote.local_machine()
     if not eligible and not codex_entries:
         if not ids and not dry_run and isinstance(hold_outcome, AccountHeld) and not any(
             item["request_id"] == hold_outcome.hold["request_id"] for item in all_records
@@ -3390,8 +3391,8 @@ def up_result(login: str, dry_run: bool = False, only: Iterable[str] = (), *,
             if notify and result.status == "partial":
                 _notify_local_restart(login, result, ids, identities)
         except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-            print(f"{restart_support.local_machine()}: restart failed: {error}")
-            result = MachineRestartResult(restart_support.local_machine(), login, "partial", failed=1)
+            print(f"{remote.local_machine()}: restart failed: {error}")
+            result = MachineRestartResult(remote.local_machine(), login, "partial", failed=1)
     return PeerRestartResult(machine=result.machine, label=result.label,
         outcome="partial" if result.failed else result.status,
         lines=output.getvalue().splitlines(), no_remote_control=[], refused=list(result.refused))
@@ -3441,7 +3442,7 @@ def up(login: str, dry_run: bool = False, only: Iterable[str] = ()) -> int:
         result = _up(login, dry_run, only)
         return result.exit_status
     except (InvalidRecord, OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-        print(f"{restart_support.local_machine()}: restart failed: {error}")
+        print(f"{remote.local_machine()}: restart failed: {error}")
         return 1
 
 
@@ -3563,7 +3564,7 @@ def _not_back_records(login: str, ids: tuple[str, ...]) -> list[SessionShutdown]
     except (InvalidRecord, OSError, ValueError):
         return []
     return [saved for saved in records
-            if saved["machine"] == restart_support.local_machine()
+            if saved["machine"] == remote.local_machine()
             and saved["progress"]["kind"] in {"restart failed", "manual restart"}
             and (not ids or saved["session"]["session_id"] in ids)
             and not restart_failed_session_running(saved)]
@@ -3714,9 +3715,9 @@ def send_failure_pushes(
 
 def _local_alert_sources(login: str) -> dict[str, str]:
     identities = {saved["session"]["name"]: saved["session"]["session_id"] for saved in session_records(login)
-                  if saved["machine"].casefold() == restart_support.local_machine().casefold()}
+                  if saved["machine"].casefold() == remote.local_machine().casefold()}
     for snapshot in all_snapshots():
-        if snapshot["login"].casefold() == login.casefold() and snapshot["machine"].casefold() == restart_support.local_machine().casefold():
+        if snapshot["login"].casefold() == login.casefold() and snapshot["machine"].casefold() == remote.local_machine().casefold():
             identities.update({entry["session"]["name"]: entry["session"]["session_id"]
                                for entry in snapshot["sessions"] if entry["agent"] == "claude"})
     return identities
@@ -3798,7 +3799,7 @@ def restart(
     ) as error:
         print(f"shutdown: restart failed: {error}", file=sys.stderr)
         local = MachineRestartResult(
-            restart_support.local_machine(),
+            remote.local_machine(),
             selected.label,
             "partial",
             failed=1,

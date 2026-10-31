@@ -527,8 +527,10 @@ PY
         self.assert_step(result, "validation", False)
         self.assertEqual(
             result.stdout,
-            "validation: failed — stdout: === STEP: validation ===; FAILED: fixed-commit validation\n",
+            f"validation: failed — exit 7, no step named; log {self.state / 'ci_validation.log'}\n",
         )
+        self.assertEqual((self.state / "ci_validation.log").read_text(),
+                         "=== STEP: validation ===\nFAILED: fixed-commit validation\n")
         observed = self.validation_observation()
         self.assertFalse(Path(observed["directory"]).exists())
         self.assertEqual(self.git("rev-parse", "production", cwd=self.origin), initial)
@@ -637,8 +639,13 @@ PY
         validate = self.bin / "validate_and_push.sh"
         self.write(validate, "\n".join((
             "#!/bin/sh",
-            "printf 'waiting for memory: 2 GiB available\\nwaiting for memory: 3 GiB available\\n' >&2",
-            "printf 'FAILED: quota formatter check\\n'",
+            "printf '!!! VALIDATION FAILED at step: earlier attempt !!!\\n'",
+            "i=1",
+            'while [ "$i" -le 25 ]; do',
+            '    printf "waiting for memory: %s GiB available\\n" "$i" >&2',
+            "    i=$((i+1))",
+            "done",
+            "printf 'Killed: cargo nextest\\n!!! VALIDATION FAILED at step: nextest !!!\\n'",
             "exit 7",
             "",
         )))
@@ -647,12 +654,83 @@ PY
         result = self.run_ci("ci", "start", "--state-dir", str(self.state))
 
         self.assert_step(result, "validation", False)
-        self.assertEqual(result.stdout.strip(), (
-            "validation: failed — stderr: waiting for memory: 2 GiB available; "
-            + "waiting for memory: 3 GiB available; stdout: FAILED: quota formatter check"
-        ))
+        validation_log = self.state / "ci_validation.log"
+        self.assertEqual(result.stdout.strip(),
+                         f"validation: failed — step nextest failed; log {validation_log}")
+        self.assertNotIn("waiting for memory", result.stdout)
+        self.assertEqual(validation_log.read_text().splitlines(), [
+            "!!! VALIDATION FAILED at step: earlier attempt !!!",
+            *(f"waiting for memory: {available} GiB available" for available in range(1, 26)),
+            "Killed: cargo nextest",
+            "!!! VALIDATION FAILED at step: nextest !!!",
+        ])
         self.assertEqual(result.stderr, "")
         self.assertFalse((self.state / "ci_run.json").exists())
+        self.assertEqual(list(self.state.glob("ci-point-*")), [])
+
+    def test_validation_failure_with_invalid_bytes_still_names_step_and_log(self) -> None:
+        validate = self.bin / "validate_and_push.sh"
+        self.write(validate, "\n".join((
+            "#!/bin/sh",
+            "printf '\\377\\n' >&2",
+            "printf '!!! VALIDATION FAILED at step: nextest !!!\\n'",
+            "printf '\\377\\n'",
+            "exit 7",
+            "",
+        )))
+        self.env["CI_POINTS_VALIDATE_SCRIPT"] = str(validate)
+
+        result = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+        self.assert_step(result, "validation", False)
+        validation_log = self.state / "ci_validation.log"
+        self.assertEqual(result.stdout.strip(),
+                         f"validation: failed — step nextest failed; log {validation_log}")
+        self.assertEqual(validation_log.read_bytes(),
+                         b"\xff\n!!! VALIDATION FAILED at step: nextest !!!\n\xff\n")
+        self.assertEqual(result.stderr, "")
+        self.assertFalse((self.state / "ci_run.json").exists())
+        self.assertEqual(list(self.state.glob("ci-point-*")), [])
+
+    def test_validation_failure_without_a_marker_names_exit_and_log(self) -> None:
+        validate = self.bin / "validate_and_push.sh"
+        self.write(validate, "#!/bin/sh\nexit 9\n")
+        self.env["CI_POINTS_VALIDATE_SCRIPT"] = str(validate)
+
+        result = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+        self.assert_step(result, "validation", False)
+        validation_log = self.state / "ci_validation.log"
+        self.assertEqual(result.stdout.strip(),
+                         f"validation: failed — exit 9, no step named; log {validation_log}")
+        self.assertEqual(validation_log.read_bytes(), b"")
+        self.assertFalse((self.state / "ci_run.json").exists())
+        self.assertEqual(list(self.state.glob("ci-point-*")), [])
+
+    def test_passing_validation_replaces_and_keeps_its_log_after_copy_removal(self) -> None:
+        validation_log = self.state / "ci_validation.log"
+        self.write(validation_log, "previous failure\n")
+        validate = self.bin / "validate_and_push.sh"
+        self.write(validate, "#!/bin/sh\nprintf 'check started\\n' >&2\nprintf 'check passed\\n'\n")
+        self.env["CI_POINTS_VALIDATE_SCRIPT"] = str(validate)
+
+        _ = self.start_point()
+
+        self.assertEqual(validation_log.read_text(), "check started\ncheck passed\n")
+        self.assertEqual(list(self.state.glob("ci-point-*")), [])
+        self.assertEqual(ci_points.read_run(self.state).tip, self.git("rev-parse", "HEAD"))
+
+    def test_validation_log_open_failure_is_reported_as_validation(self) -> None:
+        validation_log = self.state / "ci_validation.log"
+        validation_log.mkdir()
+
+        result = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+        self.assert_step(result, "validation", False)
+        self.assertIn(str(validation_log), result.stdout)
+        self.assertFalse((self.stub_state / "validate-calls").exists())
+        self.assertFalse((self.state / "ci_run.json").exists())
+        self.assertEqual(list(self.state.glob("ci-point-*")), [])
 
     def test_collect_records_green_tip_and_resets_five_merge_interval(self) -> None:
         for number in range(1, 5):

@@ -105,7 +105,7 @@ class Delivery(NamedTuple):
 def recipients() -> list[roster.RosterEntry]:
     """Read the roster once, retaining readable rows when a source fails."""
     result = roster.roster(os.environ, roster.ThisMachine())
-    for problem in result.problems:
+    for problem in result.diagnostics:
         print(f"broadcast: roster: {problem}", file=sys.stderr)
     return result.entries
 
@@ -363,7 +363,7 @@ def main(arguments: list[str]) -> int:
     identity = roster.sender_identity(os.environ)
     if any(flag == "--of" for flag, _ in pairs):
         result = roster.roster(os.environ, scope)
-        for problem in result.problems:
+        for problem in result.diagnostics:
             print(f"broadcast: roster: {problem}", file=sys.stderr)
         host = roster.remote.other_machine()
         failures = [problem for problem in result.problems if problem.startswith(f"{host}: not reached:")]

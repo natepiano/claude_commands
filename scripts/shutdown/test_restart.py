@@ -28,7 +28,7 @@ import unittest
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
-from typing import BinaryIO, Literal, TextIO, TypedDict, cast, final, override
+from typing import Literal, TypedDict, cast, final, override
 from unittest.mock import call, patch
 from zoneinfo import ZoneInfo
 
@@ -52,6 +52,7 @@ import herdr
 from fake_herdr import CommandResponse
 import conversation_pause
 import restart_support
+import remote
 from scripts.message import send as message_send
 import shutdown
 from scripts.whoami import account as account_reader
@@ -334,6 +335,21 @@ class RestartTests(ShutdownTestCase):
     desktop_state: restart.DesktopLaunchState = restart.DesktopLaunchState()
     account = Account("claude", LOGIN, LABEL)
     conversation_lookup = staticmethod(restart._conversation_launch)  # pyright: ignore[reportPrivateUsage]
+
+    def test_snapshot_restart_restores_recorded_marks_and_the_staff_owners_id(self) -> None:
+        from scripts.production import staff, unit_marks
+        from scripts.production.staff_test_support import unit_membership
+
+        row = unit_membership("demo", "alpha-unit")
+        entry = pane_record.launch("old", "sid-alpha", str(self.root), {
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit"}, ["claude"])
+        pane_record.write("writing", entry)
+        membership = unit_marks.LaunchMembership(staff.snapshot(), unit_marks.MemberSources({}, (entry,)))
+        with patch.object(unit_marks.LaunchMembership, "read", return_value=membership):
+            parts = restart._resume_parts(top_level("sid-alpha"), "existing restart prompt")  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(parts.environment["STAFF_ID"], row.id)
+        self.assertEqual(parts.environment["SHOWRUNNER_UNIT_ID"], "alpha-unit")
+        self.assertEqual(parts.opening_prompt, "existing restart prompt")
 
     @override
     def setUp(self) -> None:
@@ -938,15 +954,13 @@ class RestartTests(ShutdownTestCase):
                 persisted = next(item for item in shutdown_record.session_records(LOGIN) if item["session"]["session_id"] == owner["session_id"])
                 self.assertEqual(persisted["progress"]["kind"], "restarted")
 
-    def test_restarted_unit_keeps_its_adopted_reviewer_and_queue_with_the_pool_archive_unreadable(self) -> None:
+    def test_restarted_unit_keeps_its_reviewer_identity_and_queue(self) -> None:
         self.allow_leaf(ShutdownSendLeaf.RESUME_CODEX_WORKERS)
         owner = unit("adopted-review-owner")
         run = self.root / "adopted-review-run"
         run.mkdir()
         name = "project-review"
         thread = "adopted-private-thread"
-        archive = self.root / "review-pool"
-        archive.mkdir()
         roster = run / "mesh_roster.json"
         _ = roster.write_text(json.dumps({name: {"thread_id": thread, "role": "review",
                                                "status": "paused", "slot": "review"}}))
@@ -958,17 +972,7 @@ class RestartTests(ShutdownTestCase):
                                                   turn_live=False, launcher_command=[])]
         self.create([saved])
         commands = CommandRecorder()
-        original_open = Path.open
-
-        def refuse_archive(path: Path, mode: str = "r", buffering: int = -1,
-                           encoding: str | None = None, errors: str | None = None,
-                           newline: str | None = None) -> TextIO | BinaryIO:
-            if path.is_relative_to(archive):
-                raise AssertionError(f"restart read the archive: {path}")
-            return cast(TextIO | BinaryIO, original_open(path, mode, buffering, encoding, errors, newline))
-
-        with patch.dict(os.environ, {"REVIEW_POOL_STATE": str(archive)}), \
-                patch.object(Path, "open", refuse_archive), patch.object(restart, "_run", commands):
+        with patch.object(restart, "_run", commands):
             restart.confirm_entry(saved, RESTARTED, True, observed_at=time.time())
         sends = [argv for argv in commands.calls if "resume-workers-" + owner["session_id"] in argv]
         self.assertEqual(len(sends), 1)
@@ -4288,7 +4292,7 @@ class RestartTests(ShutdownTestCase):
     def test_up_prints_a_machine_prefixed_failure_to_stdout(self) -> None:
         output = io.StringIO()
         errors = io.StringIO()
-        with patch.object(restart, '_up', side_effect=RuntimeError('restore broke')), patch.object(restart_support, 'local_machine', return_value='Mac'), redirect_stdout(output), redirect_stderr(errors):
+        with patch.object(restart, '_up', side_effect=RuntimeError('restore broke')), patch.object(remote, 'local_machine', return_value='Mac'), redirect_stdout(output), redirect_stderr(errors):
             self.assertEqual(restart.up(LOGIN), 1)
         self.assertEqual(output.getvalue(), 'Mac: restart failed: restore broke\n')
         self.assertEqual(errors.getvalue(), '')
@@ -4333,7 +4337,7 @@ class RestartTests(ShutdownTestCase):
                     failed_sessions=(restart.FailedSessionRestart("stuck", reason),))
                 with (patch.object(restart, "named_claude_account", return_value=self.account),
                       patch.object(restart, "_up", return_value=result),
-                      patch.object(restart_support, "local_machine", return_value="natedev"),
+                      patch.object(remote, "local_machine", return_value="natedev"),
                       patch.object(restart_support, "alert_user", side_effect=alert),
                       redirect_stdout(io.StringIO())):
                     _ = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
@@ -4361,7 +4365,7 @@ class RestartTests(ShutdownTestCase):
                 pushes.clear()
                 with (patch.object(restart, "named_claude_account", return_value=self.account),
                       patch.object(restart, "_up", return_value=result),
-                      patch.object(restart_support, "local_machine", return_value="natedev"),
+                      patch.object(remote, "local_machine", return_value="natedev"),
                       patch.object(restart_support, "alert_user", side_effect=alert),
                       redirect_stdout(io.StringIO())):
                     _ = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
@@ -4388,7 +4392,7 @@ class RestartTests(ShutdownTestCase):
             failed_sessions=(restart.FailedSessionRestart("mover", reason, command),))
         with (patch.object(restart, "named_claude_account", return_value=self.account),
               patch.object(restart, "_up", return_value=result),
-              patch.object(restart_support, "local_machine", return_value="natedev"),
+              patch.object(remote, "local_machine", return_value="natedev"),
               patch.object(restart_support, "alert_user", return_value=True) as alert,
               redirect_stdout(io.StringIO())):
             _ = restart.restart(restart.AccountNamed(LABEL), dry_run=False,

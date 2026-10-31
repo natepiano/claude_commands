@@ -28,6 +28,9 @@ from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Concatenate, Literal, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
+from issues import Issue, frontmatter
+
 from git_process import (CheckCouldNotRun as CheckCouldNotRun, GitReadFailed as GitReadFailed,
                          LedgerError as LedgerError, GitExitAnswers, SUCCESS_ONLY, run_git)
 
@@ -690,16 +693,16 @@ class WithdrawnFinding:
 
 @dataclass(frozen=True)
 class KeptForBuild:
-    """A finding the newer verdict would withdraw, kept because a ticket that is not final builds it."""
+    """A superseded finding retained by its build, including accepted checkpoints and merged work."""
 
     finding: HeldFinding
-    verdict: SupersedingJudgment
+    verdict: SupersedingJudgment | RuleBodyChanged
     ticket: str
 
 
 @dataclass(frozen=True)
 class Withdrawal:
-    """Findings withdrawn by changed rule bodies or newer judgments, and those an open build keeps."""
+    """Findings withdrawn by changed rule bodies or newer judgments, and those retained by their builds."""
 
     withdrawn: tuple[WithdrawnFinding, ...]
     kept: tuple[KeptForBuild, ...]
@@ -1750,10 +1753,9 @@ def _is_ignored(path: str, patterns: tuple[str, ...]) -> bool:
     )
 
 
-def _tip(repo: Path, commit: str) -> RepositoryTip:
-    commit = _git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
-    tree = _git(repo, "rev-parse", f"{commit}^{{tree}}")
-    listing = _git(repo, "ls-tree", "-rz", "--full-tree", commit)
+def tree_entries(repo: Path, revision: str) -> dict[str, TreeEntry]:
+    """Read the complete inventory of a commit or bare tree, retaining modes and object kinds."""
+    listing = _git(repo, "ls-tree", "-rz", "--full-tree", revision)
     entries: dict[str, TreeEntry] = {}
     for entry in listing.split("\0"):
         if not entry:
@@ -1761,6 +1763,13 @@ def _tip(repo: Path, commit: str) -> RepositoryTip:
         metadata, path = entry.split("\t", 1)
         mode, kind, name = metadata.split()
         entries[path] = TreeEntry(mode, kind, name)
+    return entries
+
+
+def _tip(repo: Path, commit: str) -> RepositoryTip:
+    commit = _git(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+    tree = _git(repo, "rev-parse", f"{commit}^{{tree}}")
+    entries = tree_entries(repo, commit)
     blobs = {path: entry.object for path, entry in entries.items() if entry.kind == "blob"}
     configs = (".claude/config/berth.toml", "rustfmt.toml", ".rustfmt.toml")
     inputs = {path: blob for path, blob in blobs.items() if PurePosixPath(path).name == "Cargo.toml" or path in configs}
@@ -2769,17 +2778,28 @@ class Ledger:
         return tuple(pair for kind, before, after, line, text in rows
                      if isinstance(pair := binding_rename(kind, before, after, line, text), BindingRename))
 
-    def bulk_release(self, id: str, reasons: Mapping[str, str]) -> tuple[BulkRefusal, ...]:
+    def ticket_refuse(self, id: str, findings: Sequence[str], by: str, reason: str) -> tuple[BulkRefusal, ...]:
+        """Release a person's named findings while keeping every contributing decision buildable."""
+        if not by.strip() or not reason.strip():
+            raise LedgerError("ticket refuse requires a non-empty --by and --reason")
+        if not findings:
+            raise LedgerError("ticket refuse requires at least one finding")
+        return self.bulk_release(id, dict.fromkeys(findings, reason), keep_decisions=True)
+
+    def bulk_release(self, id: str, reasons: Mapping[str, str], *, keep_decisions: bool = False) -> tuple[BulkRefusal, ...]:
         """Record refusals and release only those findings, atomically; repeated refusals change nothing.
 
-        Each finding stays filed under its decision. Removing ticket membership prevents merge-time checks from
-        counting it as part of this batch, and clearing build_ticket makes it available to an ordinary ticket.
+        Each finding keeps its filed or waived state. Removing ticket membership prevents merge-time checks from
+        counting it as part of this batch, and clearing build_ticket makes filed findings available to an ordinary
+        ticket. A person's refusal must leave a filed finding of each decision's rule in the ticket.
         """
         if any(not reason.strip() for reason in reasons.values()):
             raise LedgerError("bulk refusal requires a reason")
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
-            ticket = self.bulk_ticket(id)
+            ticket = self._ticket(id)
+            if ticket["kind"] != "proposal" or ticket["state"] not in ("assigned", "checkpointed"):
+                raise LedgerError(f"{id}: refusal requires an assigned or checkpointed proposal ticket")
             recorded = self.bulk_refusals(id)
             known = {row.finding_id for row in recorded}
             pending = {identity: reason for identity, reason in reasons.items() if identity not in known}
@@ -2788,8 +2808,15 @@ class Ledger:
             for identity in pending:
                 finding = self._held(identity)
                 if (identity not in ticket["finding_ids"] or finding.build_ticket != BuildTicket(id)
-                        or not isinstance(finding.state, Filed)):
-                    raise LedgerError(f"{identity}: finding is not filed under bulk ticket {id}")
+                        or not isinstance(finding.state, Filed | Waived)):
+                    raise LedgerError(f"{identity}: finding does not belong to ticket {id}")
+            if keep_decisions:
+                remaining = self.named_held(tuple(identity for identity in ticket["finding_ids"] if identity not in pending))
+                for issue in self.ticket_proposals(id):
+                    rule = Issue(issue, frontmatter(issue)).value("style_rule")
+                    if not any(isinstance(finding.state, Filed) and finding.state.proposal == issue
+                               and base_rule(finding.rule) == rule for finding in remaining):
+                        raise LedgerError(f"{id}: refusal leaves issue {issue} without a finding of its rule {rule}")
             now = _now()
             for identity, reason in pending.items():
                 _ = self._connection.execute("INSERT INTO bulk_refusals VALUES (?,?,?,?)", (identity, id, reason, now))
@@ -3031,6 +3058,22 @@ class Ledger:
             raise LedgerError(f"{ticket['id']}: empty pipeline footprint")
         return frozenset(files)
 
+    def ticket_changed_paths(self, ticket: TicketRecord, end: str) -> frozenset[str]:
+        """Paths touched by this ticket's own non-merge commits, excluding imported style work.
+
+        End may be a worktree snapshot, so uncommitted ticket edits count as well. Keep reverted paths:
+        they were touched by the ticket even when its endpoint trees happen to match.
+        """
+        if not ticket["base"]:
+            raise LedgerError(f"{ticket['id']}: changed paths require a ticket base")
+        style_tip = self._style_branch_tip()[1]
+        revisions = (end, f"^{ticket['base']}", *((f"^{style_tip}",) if style_tip else ()))
+        paths = _git_bytes(self.repo, "log", "--no-merges", "--name-only", "--no-renames", "-z",
+                           "--format=", *revisions, "--").stdout
+        if paths and not paths.endswith(b"\0"):
+            raise LedgerError("unreadable changed paths")
+        return frozenset(os.fsdecode(path) for path in paths.split(b"\0") if path)
+
     def _check_ticket_pair(self, predecessor: TicketRecord, successor: TicketRecord) -> None:
         """Reprove disjointness from fresh rows and resolved tips; any uncertainty refuses the transaction."""
         try:
@@ -3052,13 +3095,7 @@ class Ledger:
             footprints: list[frozenset[str]] = []
             for ticket in (predecessor, successor):
                 end = ticket["checkpoint"] or live[successor["branch"]]
-                # Neither inherited predecessor work nor imported style work belongs to this ticket.
-                revisions = (end, f"^{ticket['base']}", *((f"^{style_tip}",) if style_tip else ()))
-                paths = _git_bytes(self.repo, "log", "--no-merges", "--name-only", "--no-renames", "-z",
-                                   "--format=", *revisions, "--").stdout
-                if paths and not paths.endswith(b"\0"):
-                    raise LedgerError("unreadable changed paths")
-                actual = frozenset(os.fsdecode(path) for path in paths.split(b"\0") if path)
+                actual = self.ticket_changed_paths(ticket, end)
                 footprints.append(self._pipeline_footprint(ticket, trees) | actual)
             waiting, selected = footprints
             overlap = ((waiting & protected_ticket_files(selected, crates))
@@ -3485,6 +3522,56 @@ class Ledger:
             # Merge clears the build ticket of a rename that is not applied, so a finding that keeps it has no check.
             return tuple(FindingNotBuilt(finding.finding_id, NoAppliedCheck(finding.kind)) for finding in self.filed_build_findings(id))
         return self._ticket_transition(id, "merged")
+
+    @_ticket_operation("restore-checkpoint")
+    def ticket_restore_checkpoint(self, id: str) -> None:
+        """Restore a checkpoint and its proposal findings cancelled together by rule-body withdrawal.
+
+        The retained checkpoint proves the ticket reached checkpointed before dropped. Immutable finding
+        membership and matching transaction timestamps prove the findings were released by that cancellation.
+        Rule-body withdrawal rows distinguish withdrawn findings from other reasons for leaving a decision.
+        No coverage judgment or rule generation is restored; merge still owns the applied checks.
+        """
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            ticket = self._ticket(id)
+            if ticket["state"] != "dropped":
+                raise LedgerError(f"{id}: restore requires a dropped ticket")
+            if not ticket["checkpoint"]:
+                raise LedgerError(f"{id}: no recorded checkpoint to restore")
+            if ticket["kind"] != "proposal" or not ticket["finding_ids"]:
+                raise LedgerError(f"{id}: restore requires proposal findings")
+            if self._connection.execute("SELECT 1 FROM tickets WHERE unit=? AND state IN ('queued','assigned','checkpointed') LIMIT 1",
+                                        (ticket["unit"],)).fetchone():
+                raise LedgerError(f"{id}: cannot restore while its unit has open tickets")
+            decisions = self.ticket_proposals(id)
+            withdrawn = False
+            for finding_id in ticket["finding_ids"]:
+                finding = self._held(finding_id)
+                if finding.rule not in ticket["rules"] or finding.path not in ticket["files"]:
+                    raise LedgerError(f"{finding.finding_id}: not in the ticket's recorded files and rules")
+                if (not isinstance(finding.state, Filed | Withdrawn)
+                        or isinstance(finding.build_ticket, BuildTicket)):
+                    raise LedgerError(f"{finding.finding_id}: not released by the ticket's withdrawal")
+                if finding.state.proposal not in decisions:
+                    raise LedgerError(f"{finding.finding_id}: not in the ticket's recorded decisions")
+                stamp, judgment, duplicate, gone, built = cast(tuple[str, int, str, str, str], self._connection.execute(
+                    "SELECT updated_at,withdrawn_by,duplicate_of,declaration_gone_at,built_at FROM held_findings WHERE finding_id=?",
+                    (finding.finding_id,)).fetchone())
+                if stamp != ticket["updated_at"] or judgment or duplicate or gone or built:
+                    raise LedgerError(f"{finding.finding_id}: withdrawal does not match the ticket's cancellation")
+                if isinstance(finding.state, Withdrawn):
+                    if not isinstance(finding.state.by, RuleBodyChanged):
+                        raise LedgerError(f"{finding.finding_id}: no rule-body withdrawal proof")
+                    withdrawn = True
+            if not withdrawn:
+                raise LedgerError(f"{id}: no findings prove rule-body withdrawal")
+            now = _now()
+            _ = self._connection.executemany(
+                "UPDATE held_findings SET state='filed',build_ticket=?,updated_at=? WHERE finding_id=?",
+                [(id, now, finding_id) for finding_id in ticket["finding_ids"]])
+            _ = self._connection.execute("UPDATE tickets SET state='checkpointed',updated_at=? WHERE id=?", (now, id))
+            self._check_ticket_pipelines(ticket["unit"])
 
     def _style_branch_tip(self) -> tuple[str, str]:
         """The style branch the ledger syncs with and the full id of its tip; both empty when it names none."""
@@ -4183,7 +4270,12 @@ class Ledger:
         kept: list[KeptForBuild] = []
         for finding, definition in self._withdrawal_candidates(definitions):
             if not rule_catalog.judged_text_unchanged(finding.rule_blob, definition):
-                withdrawn.append(WithdrawnFinding(finding, RuleBodyChanged(definition.blob)))
+                reason = RuleBodyChanged(definition.blob)
+                if (isinstance(finding.build_ticket, BuildTicket)
+                        and self._ticket(finding.build_ticket.ticket)["state"] in ("checkpointed", "merged")):
+                    kept.append(KeptForBuild(finding, reason, finding.build_ticket.ticket))
+                else:
+                    withdrawn.append(WithdrawnFinding(finding, reason))
                 continue
             if not self._connection.execute("SELECT 1 FROM sync WHERE id=1").fetchone():
                 continue
@@ -4192,7 +4284,7 @@ class Ledger:
                 continue
             if isinstance(finding.build_ticket, BuildTicket):
                 ticket = self._ticket(finding.build_ticket.ticket)
-                if ticket["state"] not in FINAL_TICKET_STATES:
+                if ticket["state"] != "dropped":
                     kept.append(KeptForBuild(finding, verdict, ticket["id"]))
                     continue
             withdrawn.append(WithdrawnFinding(finding, verdict))
@@ -4209,19 +4301,22 @@ class Ledger:
         return self._superseded(definitions)
 
     def _obsolete_tickets(self, definitions: Mapping[str, Rule], withdrawal: Withdrawal) -> tuple[TicketRecord, ...]:
-        """Cancel stale pins and dependent successors, including a build holding a withdrawn finding."""
+        """Cancel unfinished stale pins and dependent successors; accepted checkpoints stop cancellation."""
         rows = cast(list[tuple[str]], self._connection.execute(
-            "SELECT id FROM tickets WHERE state NOT IN ('merged','dropped') ORDER BY id").fetchall())
+            "SELECT id FROM tickets WHERE state IN ('queued','assigned') ORDER BY id").fetchall())
         tickets = tuple(self._ticket(row[0]) for row in rows)
+        cancellable = {ticket["id"] for ticket in tickets}
         obsolete = {ticket["id"] for ticket in tickets if any(
             (definition := definitions.get(base_rule(rule))) is not None
             and not rule_catalog.judged_text_unchanged(blob, definition)
             for rule, blob in ticket["rule_blobs"].items())}
         obsolete.update(item.finding.build_ticket.ticket for item in withdrawal.withdrawn
-                        if isinstance(item.verdict, RuleBodyChanged) and isinstance(item.finding.build_ticket, BuildTicket))
+                        if isinstance(item.verdict, RuleBodyChanged) and isinstance(item.finding.build_ticket, BuildTicket)
+                        and item.finding.build_ticket.ticket in cancellable)
         dependencies = cast(list[tuple[str, str]], self._connection.execute(
             "SELECT ticket,predecessor FROM ticket_predecessors").fetchall())
-        while successors := {ticket for ticket, predecessor in dependencies if predecessor in obsolete} - obsolete:
+        while successors := {ticket for ticket, predecessor in dependencies
+                             if predecessor in obsolete and ticket in cancellable} - obsolete:
             obsolete.update(successors)
         return tuple(ticket for ticket in tickets if ticket["id"] in obsolete)
 
@@ -4246,8 +4341,9 @@ class Ledger:
         return tuple(changes)
 
     def withdraw_superseded(self, definitions: Mapping[str, Rule]) -> Withdrawal:
-        """Withdraw all open old-body findings and cancel obsolete tickets in one transaction.
+        """Withdraw unfinished old-body findings and cancel obsolete tickets in one transaction.
 
+        Checkpointed tickets and their findings keep their accepted build despite later rule changes.
         Same-body findings retain the existing newer-judgment policy, including open-build protection.
         Source proofs run before the write lock; the transaction rechecks the plan before changing rows.
         Workers judge outside this transaction. Their hold/record writes check pins and ticket state under
@@ -6808,6 +6904,8 @@ class LedgerArguments(argparse.Namespace):
     proposal: str = ""
     state: HeldStateName | None = None
     finding_ids: str = "[]"
+    finding: list[str] = []
+    reason: str = ""
     site: str = ""
     idea: str = ""
     # `held built` takes more than one --id only with --commit.
@@ -6922,7 +7020,7 @@ def main() -> None:
         _ = command.add_argument("--repo", required=True)
     for name, actions in (
         ("unit", ("rename",)),
-        ("ticket", ("add", "assign", "checkpoint", "merge", "drop", "open", "yield")),
+        ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield", "refuse")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
         ("held", ("add", "replace", "file", "waive", "built", "list")),
@@ -6958,6 +7056,10 @@ def main() -> None:
                     _ = command.add_argument("--phase", default="")
                 elif action == "yield":
                     _ = command.add_argument("--path", required=True)
+                elif action == "refuse":
+                    _ = command.add_argument("--finding", action="append", required=True)
+                    _ = command.add_argument("--by", required=True)
+                    _ = command.add_argument("--reason", required=True)
             elif name == "handoff":
                 if action != "pending":
                     _ = command.add_argument("--checkpoint", required=True)
@@ -7052,6 +7154,8 @@ def main() -> None:
                     ledger.ticket_assign(args.id, args.branch)
                 elif args.action == "checkpoint":
                     ledger.ticket_checkpoint(args.id, args.commit, args.session_dir, args.phase)
+                elif args.action == "restore-checkpoint":
+                    ledger.ticket_restore_checkpoint(args.id)
                 elif args.action == "merge":
                     for item in ledger.ticket_merge(args.id):
                         print(not_built_line(ledger.repo, item))
@@ -7067,6 +7171,9 @@ def main() -> None:
                 elif args.action == "yield":
                     for finding_id in ledger.ticket_yield(args.id, args.path):
                         print(f"yielded {finding_id}: it stays filed for a later ticket")
+                elif args.action == "refuse":
+                    _ = ledger.ticket_refuse(args.id, args.finding, args.by or "", args.reason)
+                    print(f"{args.id}: named findings refused; remaining findings kept")
                 else:
                     for ticket in ledger.ticket_open(args.unit):
                         print(json.dumps(ticket, sort_keys=True))

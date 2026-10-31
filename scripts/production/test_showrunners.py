@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from time import monotonic
 from dataclasses import FrozenInstanceError
 import os
 import re
@@ -35,6 +36,13 @@ from scripts.production.rename_test_support import bind_staff_fixture
 
 SCRIPT = Path(__file__).with_name("showrunners.py")
 LOS_ANGELES = "America/Los_Angeles"
+
+
+def stalled_session_reader(root: Path) -> Path:
+    """An isolated sessions command that never answers; callers must bound its lifetime."""
+    reader = root / "stalled-sessions.py"
+    _ = reader.write_text("import threading\nthreading.Event().wait()\n")
+    return reader
 
 
 def setUpModule() -> None:
@@ -242,6 +250,16 @@ class ShowrunnerRegistryTests(ShowrunnerFixture):
         check = shlex.join(["zsh", "/opt/tools/production_check.sh", str(doc), "extra"])
         _ = (directory / "conf").write_text(f"TARGET=session:abc\nCHECK={check}\n", encoding="utf-8")
         self.assertEqual(showrunners.checked_doc(directory), showrunners.CheckedDoc(doc))
+
+    def test_stalled_session_discovery_obeys_the_callers_deadline(self) -> None:
+        reader = stalled_session_reader(self.root)
+        self.instance("showrunner-builds", target="session:builds-id", doc=self.doc)
+        began = monotonic()
+        with mock.patch.object(showrunners, "SESSIONS", reader):
+            with self.assertRaisesRegex(OSError, "lookup timed out; retained"):
+                _ = showrunners.registered_showrunners(self.notifier, deadline=began + 0.15)
+        self.assertLess(monotonic() - began, 1.5)
+        self.assertTrue((self.notifier / "showrunner-builds" / "conf").exists())
 
     def test_registered_showrunners_uses_supplied_records_without_session_discovery(self) -> None:
         self.instance("showrunner-builds", target="session:builds-id", doc=self.doc)

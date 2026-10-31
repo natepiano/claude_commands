@@ -384,7 +384,8 @@ def bump_text(facts: HeadFacts, zone: ZoneInfo, *, short: bool = False) -> str:
             return "no bumps since it joined"
         most = bumps.groups[0]
         folder = Path(most.folder).name or "unknown"
-        return f"{bumps.total} bumps since it joined, most: {folder} {most.step} ({most.count})"
+        noun = "bump" if bumps.total == 1 else "bumps"
+        return f"{bumps.total} {noun} since it joined, most: {folder} {most.step} ({most.count})"
     count = str(bumps.total) if bumps.groups else "none"
     return f"Bumps since it joined at {clock(facts.joined_at, zone)}: {count}"
 
@@ -407,7 +408,9 @@ def bump_remainder(facts: HeadFacts) -> str:
     remaining = facts.bumps.groups[BUMP_TABLE_ROWS:]
     if not remaining:
         return ""
-    return f"and {len(remaining)} more steps with {sum(group.count for group in remaining)} bumps"
+    count = sum(group.count for group in remaining)
+    noun = "bump" if count == 1 else "bumps"
+    return f"and {len(remaining)} more steps with {count} {noun}"
 
 
 def priority_text(priority: gate.QueuePriority | gate.NoQueuePriority) -> str:

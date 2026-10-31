@@ -592,7 +592,7 @@ describe("phase 17 board", () => {
 
 describe("unit detail layout", () => {
   for (const surface of ["terminal", "desktop"] as const) {
-    test(`${surface}: an empty board gives only the showrunner command instruction`, async ($, on) => {
+    test(`${surface}: an empty board explains that the session is not on staff`, async ($, on) => {
       on("ui.render", { component: "Pane", requestId: "empty-board" }, ($, event) =>
         BoardView($.ui.resolve(event), 170, 50,
           { files: [], watch: [], loadedAt: NOW / 1000, boards: [] }, NOW / 1000, () => {}));
@@ -600,7 +600,7 @@ describe("unit detail layout", () => {
         surface, props });
 
       expect(lines(await ui.drawn()).filter(line => line.trim()))
-        .toEqual(["Run /showrunner:unit_board in a showrunner session."]);
+        .toEqual(["This session is not on the staff list."]);
       expect(await ui.findAll({ type: "Button" })).toEqual([]);
     });
 

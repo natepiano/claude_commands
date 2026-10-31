@@ -19,6 +19,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -216,7 +217,7 @@ class DamagedDesignRecord(RoleRefused):
         self.path = path
         self.field = field
         self.holder = holder
-        super().__init__(f'{path}: missing or invalid {field}')
+        super().__init__('missing or invalid ' + field.rsplit('.', 1)[-1])
 
 
 def state_root() -> Path:
@@ -307,12 +308,6 @@ def _binding(fields: dict[str, object]) -> Binding:
                               _text(fields, 'repository'), tuple(cast(list[str], paths)))
 
 
-def _binding_in_repository(binding: Binding, repository: str) -> Binding:
-    if isinstance(binding, DesignBoundToPhase) and not binding.repository:
-        return replace(binding, repository=repository)
-    return binding
-
-
 def _lifecycle(fields: dict[str, object]) -> Lifecycle:
     kind = fields.get('kind')
     if kind == 'RoleNotOpened':
@@ -339,11 +334,11 @@ def read_design(design_id: str) -> HeldDesign:
 
 
 def _load_design(design_id: str, *, repair_empty_repository: bool) -> HeldDesign:
-    return _design_from_fields(design_id, _read(design_directory(design_id) / 'design.json'),
+    return _decode_design(design_id, _read(design_directory(design_id) / 'design.json'),
                                repair_empty_repository=repair_empty_repository)
 
 
-def _design_from_fields(design_id: str, fields: dict[str, object], *,
+def _decode_design(design_id: str, fields: dict[str, object], *,
                         repair_empty_repository: bool = False) -> HeldDesign:
     path = design_directory(design_id) / 'design.json'
     if fields.get('schema') != 1:
@@ -399,7 +394,7 @@ def _design_fields(design: HeldDesign) -> dict[str, object]:
 
 def _save(design: HeldDesign) -> None:
     fields = _design_fields(design)
-    _ = _design_from_fields(design.placement.design_id, fields)
+    _ = _decode_design(design.placement.design_id, fields)
     _atomic(design_directory(design.placement.design_id) / 'design.json', fields)
 
 
@@ -770,6 +765,7 @@ def open_role(repository: str, document: str, role: Role, holder: Holder, area: 
     placement = authority_request('reserve', {'repository_id': repository, 'document': document,
                                              'host': host, 'request_id': request_id or str(uuid4())})
     design_id = _text(placement, 'design_id')
+    binding = _resolved_binding(binding, _text(placement, 'checkout'))
     if placement.get('adoption_state') == 'AdoptionReserved':
         raise RoleRefused('AdoptionReserved: complete the reserved transfer before opening')
     if placement.get('adoption_required'):
@@ -782,7 +778,6 @@ def open_role(repository: str, document: str, role: Role, holder: Holder, area: 
                 raise RoleRefused('design has another holder; rebind explicitly while idle')
         else:
             checkout = _text(placement, 'checkout')
-            binding = _binding_in_repository(binding, checkout)
             document_path = str((Path(checkout) / _text(placement, 'document')).resolve())
             design = HeldDesign(DesignPlacement(design_id, host, _integer(placement, 'generation')),
                                 repository, checkout, document_path, area, datetime.now(UTC).isoformat(), holder,
@@ -968,13 +963,13 @@ def rebind(design_id: str, *, expected_generation: int, reason: str,
     transition = directory / 'transition.json'
     with _lock(directory):
         fields = _read(directory / 'design.json')
-        design = _design_from_fields(design_id, fields, repair_empty_repository=binding is not None)
+        design = _decode_design(design_id, fields, repair_empty_repository=binding is not None)
         damaged_binding = _object(fields.get('binding')).get('repository') == ''
         target = replace(design, holder=holder or design.holder,
                          binding=binding if binding is not None else design.binding,
                          repository=repository or design.repository, document=document or design.document)
         # A target must pass the same rules as a saved record before lifecycle effects.
-        _ = _design_from_fields(design_id, _design_fields(target))
+        _ = _decode_design(design_id, _design_fields(target))
         updated = replace(target, placement=replace(target.placement, generation=expected_generation + 1))
         pending = _read(transition) if transition.exists() else {}
         if pending and (pending.get('reason') != reason or pending.get('generation') != expected_generation):
@@ -1233,7 +1228,7 @@ def adopt(repository: str, document: str, role: Role, holder: Holder, area: str,
             or _holder(_object(recorded_source.get('holder'))) != holder):
         raise RoleRefused('AdoptionRequired: source thread, mesh, name or holder differs from the authority record')
     checkout = _text(placement, 'checkout')
-    binding = _binding_in_repository(binding, checkout)
+    binding = _resolved_binding(binding, checkout)
     candidate = HeldDesign(DesignPlacement(design_id, host, _integer(placement, 'generation')), repository,
                            checkout, str((Path(checkout) / _text(placement, 'document')).resolve()), area,
                            datetime.now(UTC).isoformat(), holder, binding,
@@ -1412,25 +1407,107 @@ def render_roles(report: dict[str, object]) -> str:
     return '\n'.join(lines)
 
 
+def _resolved_binding(binding: Binding, repository: str) -> Binding:
+    if isinstance(binding, DesignBoundToPhase) and not binding.repository:
+        return replace(binding, repository=repository)
+    return binding
+
+
+def _has_live_roles(fields: dict[str, object]) -> bool:
+    roles = fields.get('roles')
+    if not isinstance(roles, list):
+        return False
+    for value in cast(list[object], roles):
+        if not isinstance(value, dict):
+            continue
+        lifecycle = cast(dict[str, object], value).get('lifecycle')
+        if isinstance(lifecycle, dict) and cast(dict[str, object], lifecycle).get('kind') in (
+                'RoleOpen', 'RolePausedForMove', 'RoleNeedsRecovery'):
+            return True
+    return False
+
+
+def _held_by(fields: dict[str, object], *holders: Holder) -> bool:
+    value = fields.get('holder')
+    if not isinstance(value, dict):
+        return False
+    holder_fields = cast(dict[str, object], value)
+    return any(all(holder_fields.get(key) == value for key, value in _tag(holder).items()) for holder in holders)
+
+
+@dataclass
+class _RecordWarnings:
+    paths: set[Path]
+
+
+_record_warnings: ContextVar[_RecordWarnings] = ContextVar('design_role_record_warnings')
+
+
+@contextmanager
+def record_operation() -> Generator[None]:
+    """Report each bad record once across this operation's nested sweeps."""
+    try:
+        _ = _record_warnings.get()
+    except LookupError:
+        token = _record_warnings.set(_RecordWarnings(set()))
+        try:
+            yield
+        finally:
+            _record_warnings.reset(token)
+    else:
+        yield
+
+
+def _read_designs(relevant: Callable[[dict[str, object]], bool], *,
+                  refuse_matching_damage: bool = False) -> Generator[HeldDesign]:
+    """Skip broken records, but preserve a caller's matching live role for recovery."""
+    with record_operation():
+        warned = _record_warnings.get().paths
+        for path in sorted(state_root().glob('*/design.json')):
+            fields: dict[str, object] = {}
+            try:
+                fields = _read(path)
+                design = _decode_design(path.parent.name, fields)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                reason = ' '.join(str(error).splitlines())
+                live_roles = _has_live_roles(fields)
+                if relevant(fields) and (refuse_matching_damage or live_roles):
+                    recovery = '; live held role needs recovery' if live_roles else ''
+                    raise RoleRefused(f'{path}: {reason}{recovery}') from error
+                if path not in warned:
+                    print(f'warning: {path}: {reason}', file=sys.stderr)
+                    warned.add(path)
+                continue
+            yield design
+
+
 def held_document(document: Path) -> HeldDesign | None:
-    found = [read_design(path.parent.name) for path in state_root().glob('*/design.json')
-             if _read(path).get('document') == str(document.resolve())]
+    target = str(document.resolve())
+    found = [design for design in _read_designs(lambda fields: fields.get('document') == target)
+             if design.document == target]
     if len(found) > 1:
         raise RoleRefused('document has more than one held identity; recovery required')
     return found[0] if found else None
 
 
 def unbind_run(run_directory: str) -> None:
-    for path in state_root().glob('*/design.json'):
-        design = read_design(path.parent.name)
+    def relevant(fields: dict[str, object]) -> bool:
+        binding = fields.get('binding')
+        if not isinstance(binding, dict):
+            return False
+        directory = cast(dict[str, object], binding).get('run_directory')
+        return isinstance(directory, str) and Path(directory) == Path(run_directory)
+
+    for design in _read_designs(relevant):
         if isinstance(design.binding, DesignBoundToPhase) and Path(design.binding.run_directory) == Path(run_directory):
             _ = rebind(design.placement.design_id, expected_generation=design.placement.generation,
                        reason='run ended after reservation release', binding=DesignUnbound())
 
 
 def end_holder(production: str, unit: str) -> None:
-    for design in _holder_scan(UnitHolder(production, unit)):
-        if design.holder == UnitHolder(production, unit):
+    holder = UnitHolder(production, unit)
+    for design in _read_designs(lambda fields: _held_by(fields, holder), refuse_matching_damage=True):
+        if design.holder == holder:
             reach = resolve_holder(ShowrunnerHolder(production))
             if not isinstance(reach, HolderReach) or reach.session_id != os.environ.get('CLAUDE_CODE_SESSION_ID'):
                 raise RoleRefused('only the production showrunner may retire held roles')
@@ -1495,7 +1572,7 @@ def move_holder(old_holder: Holder, new_holder: Holder, old_checkout: str = '', 
     `new_checkout` when both are given. A unit transfer or a production rename changes the holder only;
     a unit rename changes both. Role names, saved prompt/reply paths and aliases retain their history."""
     moves_checkout = bool(old_checkout) and old_checkout != new_checkout
-    for design in _holder_scan(old_holder):
+    for design in _read_designs(lambda fields: _held_by(fields, old_holder, new_holder), refuse_matching_damage=True):
         path = design_directory(design.placement.design_id) / 'design.json'
         if design.holder not in (old_holder, new_holder):
             continue
@@ -1554,48 +1631,36 @@ def rename_failures(production: str, old_unit: str, old_checkout: str) -> list[s
 def holder_failures(old_holder: Holder, old_checkout: str = '') -> list[str]:
     """Each place a design still names `old_holder`, or `old_checkout` when one is given."""
     failures: list[str] = []
-    for path in state_root().glob('*/design.json'):
-        try:
-            design = read_design(path.parent.name)
-            if design.holder.production_slug != old_holder.production_slug:
-                continue
-            if design.holder == old_holder:
-                failures.append(str(path) + ': holder still names ' + _holder_name(old_holder))
-            if old_checkout:
-                values = [design.repository, design.document]
-                if isinstance(design.binding, DesignBoundToPhase):
-                    values.extend((design.binding.repository, design.binding.run_directory,
-                                   *design.binding.output_paths))
-                if any(value == old_checkout or value.startswith(old_checkout + '/') for value in values):
-                    failures.append(str(path) + ': live binding still names old checkout')
-                for value in _roster(design).values():
-                    entry = _object(value)
-                    if entry.get('cwd') == old_checkout:
-                        failures.append(str(path) + ': launch cwd still names old checkout')
-            context_path = mesh_directory(design.placement.design_id) / 'design_context.json'
-            if context_path.exists():
-                context = _read(context_path)
-                if (old_checkout and context.get('cwd') == old_checkout) or (
-                        context.get('generation') != design.placement.generation):
-                    failures.append(str(context_path) + ': stale launch context')
-        except DamagedDesignRecord as error:
-            if error.holder == old_holder:
-                failures.append(str(error))
-            else:
-                print('design_roles: ' + str(error), file=sys.stderr)
-        except (OSError, ValueError) as error:
-            failures.append(str(path) + ': ' + str(error))
+    try:
+        for design in _read_designs(lambda fields: _held_by(fields, old_holder)):
+            path = design_directory(design.placement.design_id) / 'design.json'
+            try:
+                if design.holder.production_slug != old_holder.production_slug:
+                    continue
+                if design.holder == old_holder:
+                    failures.append(str(path) + ': holder still names ' + _holder_name(old_holder))
+                if old_checkout:
+                    values = [design.repository, design.document]
+                    if isinstance(design.binding, DesignBoundToPhase):
+                        values.extend((design.binding.repository, design.binding.run_directory,
+                                       *design.binding.output_paths))
+                    if any(value == old_checkout or value.startswith(old_checkout + '/') for value in values):
+                        failures.append(str(path) + ': live binding still names old checkout')
+                    for value in _roster(design).values():
+                        entry = _object(value)
+                        if entry.get('cwd') == old_checkout:
+                            failures.append(str(path) + ': launch cwd still names old checkout')
+                context_path = mesh_directory(design.placement.design_id) / 'design_context.json'
+                if context_path.exists():
+                    context = _read(context_path)
+                    if (old_checkout and context.get('cwd') == old_checkout) or (
+                            context.get('generation') != design.placement.generation):
+                        failures.append(str(context_path) + ': stale launch context')
+            except (OSError, ValueError) as error:
+                failures.append(str(path) + ': ' + str(error))
+    except RoleRefused as error:
+        failures.append(str(error))
     return failures
-
-
-def _holder_scan(holder: Holder) -> Generator[HeldDesign]:
-    for path in state_root().glob('*/design.json'):
-        try:
-            yield read_design(path.parent.name)
-        except DamagedDesignRecord as error:
-            if error.holder == holder:
-                raise
-            print('design_roles: ' + str(error), file=sys.stderr)
 
 
 def _holder_name(holder: Holder) -> str:
@@ -1710,7 +1775,9 @@ def main(argv: list[str]) -> int:
             report = list_roles()
             print(json.dumps(report) if args.get('json') else render_roles(report))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, configparser.Error) as error:
-        print('design_roles: ' + str(error).replace('\n', ' '), file=sys.stderr)
+        detail = (f'{error.path}: missing or invalid {error.field}'
+                  if isinstance(error, DamagedDesignRecord) else str(error))
+        print('design_roles: ' + detail.replace('\n', ' '), file=sys.stderr)
         return 2
     return 0
 

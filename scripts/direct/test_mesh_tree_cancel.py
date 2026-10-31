@@ -26,8 +26,7 @@ class MeshTreeCancelTests(VerifyTreeCancelFixture):
             "turn_id": identity + "-turn", "port": 4100,
         }}))
         environment = {**fixture.environment, "CODEX_THREAD_ID": identity + "-thread",
-                       "TEST_FINISH": "1", "GUILD_ROLES_STATE": str(fixture.root / "roles"),
-                       "REVIEW_POOL_STATE": str(fixture.root / "review-pool")}
+                       "TEST_FINISH": "1", "GUILD_ROLES_STATE": str(fixture.root / "roles")}
         done_flags: list[str] = []
         if done_message:
             done = fixture.root / "done-message.txt"

@@ -1117,12 +1117,12 @@ class WorkerAndGitTests(TmpSweepCase):
         self.now: float = time.time() + 5 * 3600
         return destination
 
-    def live_worker(self, cwd: Path, status: str = "paused") -> Path:
+    def live_worker(self, cwd: Path, status: str = "paused", *, run_status: str = "running") -> Path:
         run = self.unit / "worker-run"
         _ = write(run / "mesh_roster.json", json.dumps({
             "impl": {"status": status, "thread_id": "worker-thread"},
         }))
-        _ = write(run / "mesh_runs" / "run.json", json.dumps({"cwd": str(cwd)}))
+        _ = write(run / "mesh_runs" / "run.json", json.dumps({"cwd": str(cwd), "status": run_status}))
         return run
 
     def test_dirty_clone_without_worker_stays_and_plan_names_unsaved_work(self) -> None:
@@ -1225,10 +1225,46 @@ class WorkerAndGitTests(TmpSweepCase):
         _ = self.sweep()
         self.assertFalse(folder.exists())
 
+    def test_finished_mesh_records_do_not_keep_a_folder_for_a_worker(self) -> None:
+        self.now = time.time() + 8 * DAY
+        for guard in ("paused worker", "active run"):
+            with self.subTest(guard=guard):
+                folder = write(self.tmp / "scratch" / guard.replace(" ", "-") / "repo" / "file").parents[1]
+                run = self.live_worker(folder / "repo", run_status="finished")
+                if guard == "active run":
+                    _ = write(run / "mesh_roster.json", json.dumps({"impl": {"status": "ended"}}))
+                    _ = write(self.unit / "active" / LIVE_SESSION, str(run))
+                for exit_code in (0, 1, 143):
+                    _ = write(run / "mesh_runs" / f"finished-{exit_code}.json", json.dumps({
+                        "cwd": str(folder / "repo"), "status": "finished", "exit_code": exit_code,
+                    }))
+                result = self.sweep()
+                self.assertNotIn(str(folder), result.kept.get(tmp_sweep.WORKER_USES, []))
+                self.assertIn(str(folder), [entry["path"] for entry in result.deleted])
+                self.assertFalse(folder.exists())
+
+    def test_a_running_mesh_record_keeps_a_folder_among_finished_records(self) -> None:
+        self.now = time.time() + 8 * DAY
+        folder = write(self.tmp / "scratch" / "running-worker" / "repo" / "file").parents[1]
+        run = self.live_worker(folder / "repo")
+        for exit_code in (0, 1):
+            _ = write(run / "mesh_runs" / f"finished-{exit_code}.json", json.dumps({
+                "cwd": str(folder / "repo"), "status": "finished", "exit_code": exit_code,
+            }))
+        result = self.sweep()
+        self.assertTrue(folder.exists())
+        self.assertIn(str(folder), result.kept[tmp_sweep.WORKER_USES])
+        _ = write(run / "mesh_runs" / "run.json", json.dumps({
+            "cwd": str(folder / "repo"), "status": "finished", "exit_code": 0,
+        }))
+        result = self.sweep()
+        self.assertFalse(folder.exists())
+        self.assertIn(str(folder), [entry["path"] for entry in result.deleted])
+
     def test_active_run_mesh_record_keeps_its_working_folder_under_any_root(self) -> None:
         folder = write(self.tmp / "copy" / "repo" / "file").parents[1]
         run = self.unit / "marked-run"
-        _ = write(run / "mesh_runs" / "run.json", json.dumps({"cwd": str(folder / "repo")}))
+        _ = write(run / "mesh_runs" / "run.json", json.dumps({"cwd": str(folder / "repo"), "status": "running"}))
         _ = write(self.unit / "active" / LIVE_SESSION, str(run))
         result = self.sweep()
         self.assertTrue(folder.exists())
@@ -1285,7 +1321,7 @@ class WorkerAndGitTests(TmpSweepCase):
         _ = write(run / "impl.pending.json", json.dumps({"working_dir": str(unrelated)}))
         _ = write(run / "mesh_runs" / "results.json", json.dumps(["pass", {"cwd": str(unrelated)}]))
         _ = write(run / "mesh_runs" / "run.json", json.dumps({
-            "cwd": str(folder), "metadata": {"cwd": str(unrelated)},
+            "cwd": str(folder), "status": "running", "metadata": {"cwd": str(unrelated)},
         }))
         result = self.sweep()
         self.assertTrue(folder.exists())
