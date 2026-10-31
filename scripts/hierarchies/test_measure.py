@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import closing, redirect_stdout
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
@@ -12,12 +13,15 @@ import json
 import io
 import os
 import subprocess
+from typing import cast
 from unittest.mock import patch
 
 from scripts.hierarchies import measure as m, log_records, push_audit as audit
 from scripts.hierarchies.test_log_records import phone_overflow_lines, read_report_blocks, summary_lines
 from scripts.lib.user_zone import user_zone
+from scripts.lib import unit_runs
 from scripts.production.issues import Issue
+from scripts.usage import collect
 
 
 def row_cells(output: str) -> dict[str, list[str]]:
@@ -115,6 +119,22 @@ def receipt_fixture(commit: str, at: datetime) -> log_records.JsonObject:
         "source_checkpoint": "b" * 40, "target_branch": "init/catalyst",
         "merged_at": at.isoformat(), "timestamp_epoch": at.timestamp(),
     }
+
+
+def write_token_ledger(
+    path: Path, folders: Sequence[tuple[str, str]], changes: Sequence[tuple[str, str, str]],
+    turns: Sequence[tuple[str, str, str, str | None, int]],
+) -> None:
+    with closing(sqlite3.connect(path)) as db:
+        _ = db.executescript(
+            "CREATE TABLE turns(machine,family,parent_id,agent_id,at,role,input,cache_write_5m,cache_write_1h,cache_read,output); "
+            + "CREATE TABLE folders(machine,family,parent_id,agent_id,folder); "
+            + "CREATE TABLE account_role_changes(machine,at,role,label);"
+        )
+        _ = db.executemany("INSERT INTO folders VALUES ('natedev','codex','',?,?)", folders)
+        _ = db.executemany("INSERT INTO account_role_changes VALUES ('natedev',?,?,?)", changes)
+        _ = db.executemany("INSERT INTO turns VALUES (?,'codex','',?,?,?,?,0,0,0,0)", turns)
+        db.commit()
 
 
 class MeasuresTest(unittest.TestCase):
@@ -886,10 +906,10 @@ class WaitRecordsTest(unittest.TestCase):
     def test_candidate_cells_count_distinct_notes_in_first_seen_order(self) -> None:
         first: log_records.JsonObject = {"run_id": "hana-run", "phase_id": "4", "phase_instance_id": "hana-phase"}
         second: log_records.JsonObject = {"run_id": "hana-run", "phase_id": "5", "phase_instance_id": "hana-next"}
-        first_label = "run=hana-run; phase=4; instance=hana-phase; cwd="
-        second_label = "run=hana-run; phase=5; instance=hana-next; cwd="
-        for candidates, expected in (([first] * 6, first_label + " (6 times)"),
-                                     ([first, second, first], first_label + " (2 times) | " + second_label)):
+        first_label = "run=hana-run; phase=4; instance=hana-phase; cwd=not recorded"
+        second_label = "run=hana-run; phase=5; instance=hana-next; cwd=not recorded"
+        for candidates, expected in (([first] * 6, first_label),
+                                     ([first, second, first], first_label + " | " + second_label)):
             with self.subTest(expected=expected):
                 phase = wait_phase_fixture("UncertainCoverage")
                 phase.update(reason="ambiguous coverage", candidates=candidates, recorded_wait_n=0)
@@ -897,12 +917,129 @@ class WaitRecordsTest(unittest.TestCase):
                 missing["wait_attribution"] = {"state": "UnresolvedAttribution", "reason": "ambiguous attribution",
                                                 "candidates": candidates}
                 history = m.parse_wait_report(wait_report_fixture(self.window, [missing], [phase]))
-                rows = m.hana_wait_rows(history, self.window, ())
+                output = log_records.blocks("Waits", m.hana_wait_rows(history, self.window, ()))
+                rows = read_report_blocks(output)
                 for label, reason in (("Hana wait coverage / UncertainCoverage", "ambiguous coverage"),
                                       ("Hana wait attribution / Unresolved", "ambiguous attribution")):
                     cells = [row for row in rows if row.measure == label]
                     self.assertEqual([(row.value, row.n) for row in cells],
                                      [(reason + "; candidates: " + expected, 1)])
+
+    def test_full_wait_report_collapses_twenty_six_phases_and_three_waits_without_merging_other_reasons(self) -> None:
+        candidates: list[log_records.JsonObject] = [
+            {"run_id": "hana-run", "phase_id": str(index), "phase_instance_id": f"candidate-{index}",
+             "working_dir": "" if index == 0 else f"/archive/hana-{index}"}
+            for index in range(6)
+        ]
+        phases: list[log_records.JsonObject] = []
+        for index in range(26):
+            phase = wait_phase_fixture("UncertainCoverage")
+            phase.update(phase_instance_id=f"phase-{index}", reason="overlapping phase records",
+                         candidates=candidates * 26)
+            phases.append(phase)
+        different = wait_phase_fixture("UncertainCoverage")
+        different.update(phase_instance_id="different-phase", reason="another coverage reason", candidates=candidates)
+        phases.append(different)
+        waits: list[log_records.JsonObject] = []
+        for index in range(4):
+            wait = wait_fixture(f"miss-{index}", "WaitingForUser", self.start)
+            wait["wait_attribution"] = {
+                "state": "UnresolvedAttribution", "reason": "ambiguous owner" if index < 3 else "different owner",
+                "candidates": candidates * 26,
+            }
+            waits.append(wait)
+        history = m.parse_wait_report(wait_report_fixture(self.window, waits, phases))
+        rows = m.hana_wait_rows(history, self.window, ())
+        sources = m.BaselineSources([], [], [], [], [], notification_report([], [], self.window),
+                                    [], [], [], [], [], [], history)
+        output = m.render(sources, self.window, self.window.until, full=True)
+        parsed = read_report_blocks(output)
+        shared_source = "progress_history.py waits; phase starts and wait starts in window; completed durations only"
+        labels = [f"run=hana-run; phase={index}; instance=candidate-{index}; cwd="
+                  + ("not recorded" if index == 0 else f"/archive/hana-{index}") for index in range(6)]
+        detail = " | ".join(labels)
+        grouped_phases = [row for row in parsed if row.measure == "Hana wait coverage / UncertainCoverage"]
+        self.assertEqual(grouped_phases, [
+            log_records.MeasureRow("Hana wait coverage / UncertainCoverage",
+                                   "overlapping phase records; candidates: " + detail, 26, self.window.label,
+                                   shared_source + "; phases: "
+                                   + ", ".join(f"hana-run/phase-{index}" for index in range(26))),
+            log_records.MeasureRow("Hana wait coverage / UncertainCoverage",
+                                   "another coverage reason; candidates: " + detail, 1, self.window.label,
+                                   shared_source + "; phases: hana-run/different-phase"),
+        ])
+        attribution = [row for row in parsed if row.measure == "Hana wait attribution / Unresolved"]
+        self.assertEqual(attribution, [
+            log_records.MeasureRow("Hana wait attribution / Unresolved", "ambiguous owner; candidates: " + detail,
+                                   3, self.window.label, shared_source + "; waits: miss-0, miss-1, miss-2"),
+            log_records.MeasureRow("Hana wait attribution / Unresolved", "different owner; candidates: " + detail,
+                                   1, self.window.label, shared_source + "; waits: miss-3"),
+        ])
+        original = next(row for row in rows if row.measure == "Hana wait coverage / UncertainCoverage")
+        for measure, quantities in (
+            ("Hana wait coverage / UncertainCoverage", [
+                log_records.Diagnostic(26, "overlapping phase records; candidates: " + detail),
+                log_records.Diagnostic(1, "another coverage reason; candidates: " + detail),
+            ]),
+            ("Hana wait attribution / Unresolved", [
+                log_records.Diagnostic(3, "ambiguous owner; candidates: " + detail),
+                log_records.Diagnostic(1, "different owner; candidates: " + detail),
+            ]),
+        ):
+            with self.subTest(measure=measure):
+                self.assertEqual([row.quantity for row in rows if row.measure == measure], quantities)
+        self.assertEqual(original.source, shared_source + "; phases: "
+                         + ", ".join(f"hana-run/phase-{index}" for index in range(26)))
+        self.assertEqual(len(history.phases), 27)
+        self.assertEqual(len(history.attribution_misses), 4)
+        self.assertNotRegex(output, r"\(\d+ times\)")
+        self.assertNotRegex(output, r"cwd=(?:\s*\||\s*$)")
+        self.assertEqual(phone_overflow_lines(output), [])
+
+    def test_unresolved_origins_and_source_problems_group_only_equal_reasons(self) -> None:
+        phases: list[log_records.JsonObject] = []
+        waits: list[log_records.JsonObject] = []
+        for index in range(4):
+            phase = wait_phase_fixture()
+            phase.update(run_id="unknown-run", phase_instance_id=f"unknown-{index}", unit="unknown-unit")
+            for field in ("plan_doc", "production", "repository"):
+                phase[field] = {"state": "NotRecorded", "reason": "origin absent" if index < 3 else "older origin absent"}
+            phases.append(phase)
+            wait = wait_fixture(f"bad-{index}", "invalid-kind" if index < 3 else "other-invalid-kind", self.start)
+            waits.append(wait)
+        history = m.parse_wait_report(wait_report_fixture(self.window, waits, phases))
+        diagnostics = m.hana_wait_rows(history, self.window, ())
+        output = log_records.blocks("Wait diagnostics", diagnostics)
+        rows = read_report_blocks(output)
+        source = "progress_history.py waits; phase starts and wait starts in window; completed durations only"
+        origins = [row for row in rows if row.measure == "Hana wait origin / UnresolvedPhaseOrigin"]
+        self.assertEqual(origins, [
+            log_records.MeasureRow("Hana wait origin / UnresolvedPhaseOrigin", "; ".join(["origin absent"] * 3),
+                                   3, self.window.label,
+                                   source + "; phases: unknown-run/unknown-0, unknown-run/unknown-1, unknown-run/unknown-2"),
+            log_records.MeasureRow("Hana wait origin / UnresolvedPhaseOrigin", "; ".join(["older origin absent"] * 3),
+                                   1, self.window.label, source + "; phases: unknown-run/unknown-3"),
+        ])
+        problems = [row for row in rows if row.measure == "Hana wait / source problem"]
+        self.assertEqual(problems, [
+            log_records.MeasureRow("Hana wait / source problem", "unknown wait kind: invalid-kind", 3,
+                                   self.window.label, source + "; waits: wait bad-0, wait bad-1, wait bad-2"),
+            log_records.MeasureRow("Hana wait / source problem", "unknown wait kind: other-invalid-kind", 1,
+                                   self.window.label, source + "; waits: wait bad-3"),
+        ])
+        for measure, quantities in (
+            ("Hana wait origin / UnresolvedPhaseOrigin", [
+                log_records.Diagnostic(3, "; ".join(["origin absent"] * 3)),
+                log_records.Diagnostic(1, "; ".join(["older origin absent"] * 3)),
+            ]),
+            ("Hana wait / source problem", [
+                log_records.Diagnostic(3, "unknown wait kind: invalid-kind"),
+                log_records.Diagnostic(1, "unknown wait kind: other-invalid-kind"),
+            ]),
+        ):
+            with self.subTest(measure=measure):
+                self.assertEqual([row.quantity for row in diagnostics if row.measure == measure], quantities)
+        self.assertEqual(phone_overflow_lines(output), [])
 
     def test_completed_wait_with_unresolved_supplier_adds_no_hana_minutes(self) -> None:
         reason = "supplier address is not recorded"
@@ -1908,6 +2045,1049 @@ class BaselineOutputTest(unittest.TestCase):
         self.assertEqual([row.value for row in problems], ["missing review file", "cannot read build file"])
 
 
+class ComparisonTest(unittest.TestCase):
+    before_window: log_records.Window = log_records.Window(
+        log_records.required_time("2026-10-13T17:24:00-04:00"),
+        log_records.required_time("2026-10-20T17:24:00-04:00"),
+    )
+    after_window: log_records.Window = log_records.Window(
+        before_window.until, before_window.until + timedelta(days=28),
+    )
+    covered_before_window: log_records.Window = log_records.Window(
+        before_window.since - timedelta(days=35), before_window.until - timedelta(days=35),
+    )
+    covered_after_window: log_records.Window = log_records.Window(
+        covered_before_window.until, covered_before_window.until + timedelta(days=28),
+    )
+
+    def part(self, window: log_records.Window, count: int, failed: int = 0) -> m.ComparisonWindow:
+        at = window.since + timedelta(hours=1)
+        pushes = [push_fixture(at, f"push-{index}") for index in range(count)]
+        reviews: list[log_records.JsonObject] = [
+            {"time": at.isoformat(), "source": "fixture-unit", "verdict": "failed",
+             "sent": {"title": f"push-{index}", "body": f"push-{index}"}}
+            for index in range(failed)
+        ]
+        found = [Issue(Path(f"closed-{index}.md"), {
+            "status": ["closed"], "backlog_goal": ["1 - Ship Hana"], "project": ["hana"],
+            "date_active": [window.since.isoformat()], "date_closed": [at.isoformat()],
+        }) for index in range(count)]
+        waits = [wait_fixture(f"wait-{index}", "WaitingForQuotaRefusal", at + timedelta(minutes=index), 1)
+                 for index in range(count)]
+        history = m.parse_wait_report(wait_report_fixture(window, waits, [wait_phase_fixture(wait_n=count)]))
+        phases = [m.PhaseCompletion("finish", at + timedelta(hours=1), True, 7200,
+                                    m.WaitPhaseInstance("hana-run", "hana-phase"), window.since)]
+        sources = m.BaselineSources(
+            [m.Unit("hana", "current-unit", "hana", "/current", True, "")], [], [], [], phases,
+            notification_report(pushes, reviews, window), [], found, [],
+            [m.WaitingItem("changes", at)], [], [m.HanaMerge(f"merge-{index}", at) for index in range(count)],
+            history,
+        )
+        return m.ComparisonWindow(window, sources, {source: m.RecordedCoverage((window,)) for source in m.EventSource},
+                                  (), (), (), m.MemoryNotRecorded("fixture has no memory samples"))
+
+    def rows(self, before: m.ComparisonWindow, after: m.ComparisonWindow) -> dict[str, log_records.MeasureRow]:
+        return {row.measure: row for row in m.comparison_rows(before, after, self.after_window.until)}
+
+    def load_fixture_home(
+        self, home: Path, windows: tuple[log_records.Window, log_records.Window],
+    ) -> tuple[m.ComparisonWindow, m.ComparisonWindow]:
+        with patch.object(Path, "home", return_value=home), \
+                patch.object(audit, "SESSION_CONFIG", home / "config/hierarchies/sessions.toml"), \
+                patch.object(m, "COVERAGE_CONFIG", home / "config/hierarchies/coverage.toml"), \
+                patch.object(audit, "read_owners", return_value=audit.ProductionOwnership({}, {})), \
+                patch.object(m, "read_units", return_value=[]), \
+                patch.object(m, "read_workers", return_value=([], [])), \
+                patch.object(collect, "store_path", return_value=home / "usage.sqlite"), \
+                patch.object(unit_runs, "history_root", return_value=home / "history"):
+            return m.load_comparison(*windows)
+
+    def test_coverage_file_drives_live_loader_rates_and_leaves_unclaimed_sources_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            before_window, after_window = self.covered_before_window, self.covered_after_window
+            notify = home / ".local/state/notify"
+            notify.mkdir(parents=True)
+            config = home / "config/hierarchies/coverage.toml"
+            config.parent.mkdir(parents=True)
+            _ = config.with_name("sessions.toml").write_text('[fixture-unit]\ndisplay_name="Fixture"\n')
+            pushes = [push_fixture(window.since + timedelta(hours=1), f"{label}-{index}")
+                      for label, window, n in (("before", before_window, 2), ("after", after_window, 8))
+                      for index in range(n)]
+            _ = (notify / "pushover.jsonl").write_text("".join(json.dumps(row) + "\n" for row in pushes))
+            _ = (notify / "review.jsonl").write_text("")
+            messages = home / ".local/state/message/log.jsonl"
+            messages.parent.mkdir(parents=True)
+            _ = messages.write_text("")
+            _ = config.write_text('["notification history"]\nsince="' + before_window.since.isoformat()
+                                  + '"\nevidence="fixture commit starts continuous delivery logging"\n'
+                                  + '[["notification history".gaps]]\nfrom="' + after_window.since.isoformat()
+                                  + '"\nto="' + (after_window.since + timedelta(days=14)).isoformat()
+                                  + '"\nreason="logging paused"\n')
+            original = {path: path.read_bytes() for path in (config, notify / "pushover.jsonl", messages)}
+            before, after = self.load_fixture_home(home, (before_window, after_window))
+            rows = self.rows(before, after)
+            pushes_row = rows["phone pushes sent"]
+            self.assertEqual(pushes_row.value,
+                             "before: 2.0/week; 7 covered days; after: 0.0/week; 14 covered days (partial); "
+                             + "change: -2.0/week; n before=2; after=0")
+            self.assertEqual(pushes_row.n, 0)
+            self.assertIsInstance(after.coverage[m.EventSource.MESSAGES], m.CoverageUnknown)
+            self.assertTrue(all(isinstance(part.coverage[m.EventSource.PUSHES], m.RecordedCoverage)
+                                for part in (before, after)))
+            self.assertEqual({path: path.read_bytes() for path in original}, original)
+            _ = config.write_bytes(original[config] + b'\n["merge history"]\nsince="no time"\nevidence="invalid entry"\n')
+            before, after = self.load_fixture_home(home, (before_window, after_window))
+            self.assertEqual(self.rows(before, after)["phone pushes sent"], pushes_row)
+            for part in (before, after):
+                errors = [problem for problem in part.sources.problems if problem.source == str(config)]
+                self.assertEqual(len(errors), 1)
+                self.assertIn("merge history", errors[0].reason)
+            _ = config.write_text("")
+            before, after = self.load_fixture_home(home, (before_window, after_window))
+            self.assertIsInstance(after.coverage[m.EventSource.PUSHES], m.CoverageUnknown)
+            unclaimed = self.rows(before, after)["phone pushes sent"]
+            self.assertIn("coverage unknown", unclaimed.value)
+            self.assertIn("n before=2; after=8", unclaimed.value)
+            self.assertEqual(unclaimed.n, 8)
+            _ = config.write_text("[")
+            before, after = self.load_fixture_home(home, (before_window, after_window))
+            malformed = self.rows(before, after)["phone pushes sent"]
+            self.assertEqual(malformed, unclaimed)
+            output = m.render_compare(before, after, self.after_window.until, full=True)
+            self.assertIn(str(config), output)
+            self.assertIn("coverage config", " ".join(output.split()))
+            self.assertEqual(phone_overflow_lines(output), [])
+
+    def test_wait_rates_exclude_gap_and_pre_window_starts_without_losing_cause_minutes(self) -> None:
+        part = self.part(self.after_window, 0)
+        at = part.window.since
+        records: list[log_records.JsonObject] = []
+        starts = [(f"gap-{index}", at + timedelta(days=2, minutes=index * 3)) for index in range(8)]
+        starts.extend((("crossing", at - timedelta(minutes=1)), ("covered", at + timedelta(days=16))))
+        for identity, started in starts:
+            record = wait_fixture(identity, "WaitingForQuotaRefusal", started, 2)
+            record["holders"] = [
+                holder_observation(started, named_holder_fixture("account", "worker/account-a")),
+                holder_observation(started + timedelta(minutes=1), {
+                    "state": "HolderNotNamed", "reason": "account holder not recorded",
+                }),
+            ]
+            records.append(record)
+        part = self.with_waits(part, records, (
+            m.CauseProject("session:other-project-director", m.NonHanaProject("build-tools")),
+        ))
+        part.coverage[m.EventSource.WAITS] = m.RecordedCoverage((
+            log_records.Window(at, at + timedelta(days=1)),
+            log_records.Window(at + timedelta(days=15), part.window.until),
+        ))
+        total = self.rows(part, part)["Hana wait / WaitingForQuotaRefusal"]
+        self.assertEqual(total.n, 1)
+        self.assertIn("before: 1.0 min/week; 14 covered days (partial); waits 0.5/week", total.value)
+        self.assertIn("after: 1.0 min/week; 14 covered days (partial); waits 0.5/week", total.value)
+        detailed = m.wait_cause_rows(part)
+        for identity, _ in starts:
+            with self.subTest(wait=identity):
+                causes = [row for row in detailed if row.measure == "Hana wait cause / " + identity]
+                self.assertEqual(len(causes), 1 if identity == "crossing" else 2)
+                self.assertTrue(all(row.n == 1 for row in causes))
+                expected_rate = "0.5/week" if identity == "covered" else "0.0/week"
+                self.assertTrue(all("1.0 min; " + expected_rate + "; 14 covered days (partial)" in row.value
+                                    for row in causes))
+        output = m.render_compare(part, part, self.after_window.until, full=True)
+        displayed = read_report_blocks(output)
+        for identity, _ in starts:
+            named = [row for row in displayed if row.measure == "Hana wait cause / " + identity]
+            if identity == "crossing":
+                self.assertEqual(named, [])
+                continue
+            self.assertEqual(len(named), 2)
+            self.assertEqual([row.n for row in named], [1, 1])
+            expected_rate = "0.5/week" if identity == "covered" else "0.0/week"
+            self.assertTrue(all(row.value == "non-Hana cause session:other-project-director; project build-tools; "
+                                + "1.0 min; " + expected_rate + "; 14 covered days (partial)" for row in named))
+        for label, minutes, wait_n in (("holder named", 9, 9), ("holder not named", 10, 10), ("cause not recorded", 10, 10)):
+            grouped = [row for row in displayed if row.measure == "Hana wait causes / WaitingForQuotaRefusal / " + label]
+            self.assertEqual(len(grouped), 2)
+            self.assertEqual([row.n for row in grouped], [wait_n, wait_n])
+            self.assertTrue(all(row.value == f"{label}; {minutes:.1f} min; waits 0.5/week; 14 covered days (partial)"
+                                for row in grouped))
+        self.assertEqual(phone_overflow_lines(output), [])
+
+    def test_full_comparison_keeps_one_block_per_measure_as_event_counts_grow(self) -> None:
+        reports: list[list[log_records.MeasureRow]] = []
+        for before_n, after_n in ((2, 8), (60, 240)):
+            before, after = self.part(self.before_window, before_n), self.part(self.after_window, after_n)
+            for part in (before, after):
+                history = part.sources.wait_history
+                if not isinstance(history, m.HanaWaitHistory):
+                    self.fail("comparison fixture lost its waits")
+                first = replace(history.waits[0], kind=m.WaitKind.SUPPLIER,
+                                expected_supplier=m.NamedSupplier("unit:build-tools"))
+                memory = replace(history.waits[0], identity="two-holders", kind=m.WaitKind.CAPACITY,
+                                 holders=m.HolderHistory((
+                                     m.HolderObservation(first.started, m.NamedHolder(
+                                         m.HolderResourceKind.MEMORY, "natedev", m.SessionHolder("first-builder"))),
+                                     m.HolderObservation(first.started + timedelta(seconds=30), m.NamedHolder(
+                                         m.HolderResourceKind.MEMORY, "natedev", m.SessionHolder("second-builder"))),
+                                 )))
+                part.sources.wait_history = replace(history, waits=(first, *history.waits[1:], memory))
+            projects = (
+                m.CauseProject("unit:build-tools", m.NonHanaProject("build-tools")),
+                m.CauseProject("session:first-builder", m.NonHanaProject("first-tools")),
+                m.CauseProject("session:second-builder", m.NonHanaProject("second-tools")),
+            )
+            before, after = replace(before, projects=projects), replace(after, projects=projects)
+            with patch.object(m, "load_comparison", return_value=(before, after)), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(m.main([
+                    "compare", "--before", before.window.since.isoformat() + ".." + before.window.until.isoformat(),
+                    "--after", after.window.since.isoformat() + ".." + after.window.until.isoformat(), "--full",
+                ]), 0)
+            text = output.getvalue()
+            rows = read_report_blocks(text)
+            reports.append(rows)
+            self.assertEqual(phone_overflow_lines(text), [])
+            self.assertEqual(len({(row.measure, row.window) for row in rows}), len(rows))
+            total = next(row for row in rows if row.measure == "Hana wait / WaitingForQuotaRefusal")
+            self.assertIn(f"n before={before_n - 1}; after={after_n - 1}", total.value)
+            self.assertEqual(total.n, after_n - 1)
+            causes = [row for row in rows if "non-Hana cause unit:build-tools" in row.value]
+            self.assertEqual([(row.n, "1.0 min" in row.value) for row in causes], [(1, True), (1, True)])
+            self.assertTrue(all("wait-0" in row.measure for row in causes))
+            for part, wait_n, covered_days in ((before, before_n - 1, 7), (after, after_n - 1, 28)):
+                memory_causes = [row for row in rows if row.measure == "Hana wait cause / two-holders"
+                                 and row.window == part.window.label]
+                self.assertEqual(len(memory_causes), 1)
+                memory_cause = memory_causes[0]
+                self.assertEqual((memory_cause.value, memory_cause.n), (
+                    "non-Hana cause session:first-builder; project first-tools; 0.5 min; "
+                    + f"{7 / covered_days:.1f}/week; {covered_days} covered days; "
+                    + "non-Hana cause session:second-builder; project second-tools; 0.5 min; "
+                    + f"{7 / covered_days:.1f}/week; {covered_days} covered days", 1,
+                ))
+                grouped = next(row for row in rows if row.measure ==
+                               "Hana wait causes / WaitingForQuotaRefusal / cause not recorded"
+                               and row.window == part.window.label)
+                self.assertEqual((grouped.value, grouped.n), (
+                    f"cause not recorded; {wait_n:.1f} min; waits {wait_n * 7 / covered_days:.1f}/week; "
+                    + f"{covered_days} covered days", wait_n,
+                ))
+                holder = next(row for row in rows if row.measure ==
+                              "Hana wait causes / WaitingForQuotaRefusal / holder not named"
+                              and row.window == part.window.label)
+                self.assertEqual((holder.value, holder.n), (
+                    f"holder not named; {wait_n:.1f} min; waits {wait_n * 7 / covered_days:.1f}/week; "
+                    + f"{covered_days} covered days", wait_n,
+                ))
+            self.assertNotIn("wait-1", text)
+        self.assertEqual([(row.measure, row.window) for row in reports[0]],
+                         [(row.measure, row.window) for row in reports[1]])
+
+    def test_bad_build_rows_keep_good_minutes_and_one_diagnostic_in_baseline_and_compare(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            before_window, after_window = self.covered_before_window, self.covered_after_window
+            path = home / ".local/state/buildlog/index.sqlite"
+            path.parent.mkdir(parents=True)
+            with closing(sqlite3.connect(path)) as db:
+                _ = db.execute("CREATE TABLE steps(repo,step,started_at,duration_s,host)")
+                _ = db.executemany("INSERT INTO steps VALUES ('hana','check',?,?,?)", [
+                    (before_window.since.isoformat(), 120, "natedev"),
+                    (before_window.since.isoformat(), float("inf"), "natedev"),
+                    (after_window.since.isoformat(), 240, "natedev"),
+                    (after_window.since.isoformat(), "bad seconds", "natedev"),
+                    (after_window.since.isoformat(), "ignored machine", "mac"),
+                ])
+                db.commit()
+            original = path.read_bytes()
+            config = home / "config/hierarchies/coverage.toml"
+            config.parent.mkdir(parents=True)
+            _ = config.write_text('[buildlog]\nsince="' + before_window.since.isoformat()
+                                  + '"\nevidence="fixture writer enabled"\n')
+            before, after = self.load_fixture_home(home, (before_window, after_window))
+            for part, minutes in ((before, "2.0"), (after, "4.0")):
+                problems = [problem for problem in part.sources.problems if problem.source == str(path)]
+                self.assertEqual(len(problems), 1)
+                self.assertIn("invalid build rows skipped: 2", problems[0].reason)
+                self.assertIn("seconds: expected a finite number", problems[0].reason)
+                self.assertIs(problems[0].event_source, m.EventSource.BUILDS)
+                self.assertEqual(problems[0].kind, log_records.RowsSkipped(2))
+                self.assertIsInstance(part.coverage[m.EventSource.BUILDS], m.RecordedCoverage)
+                self.assertEqual([step.seconds for step in part.sources.builds], [120, 240])
+                baseline = read_report_blocks(m.render(part.sources, part.window, self.after_window.until, full=True))
+                total = next(row for row in baseline if row.measure == "build/check minutes / hana")
+                self.assertEqual((total.value, total.n), (minutes, 1))
+                diagnostic = [row for row in baseline if row.measure == "source unavailable" and row.source == str(path)]
+                self.assertEqual(len(diagnostic), 1)
+                self.assertEqual(diagnostic[0].value, problems[0].reason)
+            compared = self.rows(before, after)["build/check minutes / hana"]
+            self.assertEqual(compared.value,
+                             "before: 2.0 min/week; 7 covered days; incomplete: 2 rows skipped; "
+                             + "after: 1.0 min/week; 28 covered days; incomplete: 2 rows skipped; "
+                             + "change: -1.0/week; n before=1; after=1")
+            self.assertEqual(compared.n, 1)
+            output = m.render_compare(before, after, self.after_window.until, full=True)
+            diagnostic = [row for row in read_report_blocks(output)
+                          if row.measure == "source unavailable" and row.source == str(path)]
+            self.assertEqual(len(diagnostic), 1)
+            self.assertIn("invalid build rows skipped: 2", diagnostic[0].value)
+            self.assertEqual(phone_overflow_lines(output), [])
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_comparison_normalizes_event_counts_and_changes_over_unequal_windows(self) -> None:
+        before, after = self.part(self.before_window, 2, 1), self.part(self.after_window, 12, 2)
+        rows = self.rows(before, after)
+        for name in ("Hana merges / origin/init/catalyst", "goal 1 issues closed", "phone pushes sent"):
+            with self.subTest(measure=name):
+                self.assertEqual(rows[name].value,
+                                 "before: 2.0/week; 7 covered days; after: 3.0/week; 28 covered days; "
+                                 + "change: +1.0/week; n before=2; after=12")
+                self.assertEqual(rows[name].n, 12)
+                self.assertIn(before.window.label, rows[name].window)
+                self.assertIn(after.window.label, rows[name].window)
+        failed = rows["phone pushes after failed review"]
+        self.assertEqual(failed.value, "before: 1.0/week; 7 covered days; after: 0.5/week; 28 covered days; "
+                                      + "change: -0.5/week; n before=2; after=12")
+        self.assertEqual(failed.n, 12)
+        wait = rows["Hana wait / WaitingForQuotaRefusal"]
+        self.assertIn("before: 2.0 min/week; 7 covered days; waits 2.0/week", wait.value)
+        self.assertIn("after: 3.0 min/week; 28 covered days; waits 3.0/week", wait.value)
+        self.assertIn("change: +1.0/week", wait.value)
+        self.assertIn("progress_history.py waits", wait.source)
+        missing = rows["question answer time"]
+        self.assertIn("before: not recorded; after: not recorded; change: not recorded", missing.value)
+        self.assertIn("48-hour", missing.source)
+
+    def test_comparison_keeps_every_baseline_row_including_one_sided_rows(self) -> None:
+        before, after = self.part(self.before_window, 2), self.part(self.after_window, 4)
+        before.sources.builds = [m.BuildStep("before-only-repo", "check", self.before_window.since, 60)]
+        after.sources.builds = [m.BuildStep("after-only-repo", "check", self.after_window.since, 120)]
+        rows = m.comparison_rows(before, after, self.after_window.until)
+        expected = {row.measure for part in (before, after)
+                    for row in read_report_blocks(m.render(part.sources, part.window, self.after_window.until, full=True))}
+        daily_merges = {"Hana merges / " + (part.window.since + timedelta(days=day)).date().isoformat()
+                        for part in (before, after) for day in range((part.window.until - part.window.since).days + 1)}
+        event_details = daily_merges | {name for name in expected if name.startswith((
+            "Hana wait holder /", "Hana closure merge commit /", "phone pushes /", "messages /",
+        ))}
+        self.assertTrue((expected - event_details).issubset({row.measure for row in rows}),
+                        sorted(expected - event_details - {row.measure for row in rows}))
+        self.assertTrue(event_details.isdisjoint(row.measure for row in rows))
+        values = {row.measure: row.value for row in rows}
+        self.assertIn("comparison unavailable (no recorded after row)", values["build/check minutes / before-only-repo"])
+        self.assertIn("comparison unavailable (no recorded before row)", values["build/check minutes / after-only-repo"])
+        for name in ("Hana merges / origin/init/catalyst", "goal 1 issues closed", "phone pushes sent"):
+            with self.subTest(aggregate=name):
+                row = next(row for row in rows if row.measure == name)
+                self.assertEqual((row.value, row.n), (
+                    "before: 2.0/week; 7 covered days; after: 1.0/week; 28 covered days; "
+                    + "change: -1.0/week; n before=2; after=4", 4,
+                ))
+        for kind in m.SenderKind:
+            with self.subTest(message_kind=kind.value):
+                row = next(row for row in rows if row.measure == "messages / " + kind.value)
+                self.assertEqual((row.value, row.n), (
+                    "before: 0.0/week; 7 covered days; after: 0.0/week; 28 covered days; "
+                    + "change: +0.0/week; n before=0; after=0", 0,
+                ))
+
+    def test_receipt_rates_use_receipt_coverage_and_keep_digit_leading_missing_hashes(self) -> None:
+        before, after = self.part(self.before_window, 2), self.part(self.after_window, 2)
+        missing_hash = "1234567890" + "a" * 30
+        for part, commits in ((before, ("b" * 40, missing_hash)), (after, ("c" * 40, "d" * 40))):
+            at = part.window.since + timedelta(hours=1)
+            part.sources.merges = [m.HanaMerge(commit, at) for commit in commits]
+            part.sources.receipts = tuple(m.parse_receipt(receipt_fixture(commit, at))
+                                          for commit in commits if commit != missing_hash)
+        before.coverage[m.EventSource.PHASES] = m.SourceUnavailable("phase history unavailable")
+        before.coverage[m.EventSource.RECEIPTS] = m.RecordedCoverage((log_records.Window(
+            before.window.since, before.window.since + timedelta(days=3.5)),))
+        after.coverage[m.EventSource.PHASES] = m.RecordedCoverage((after.window,))
+        after.coverage[m.EventSource.RECEIPTS] = m.RecordedCoverage((log_records.Window(
+            after.window.since, after.window.since + timedelta(days=14)),))
+        rows = self.rows(before, after)
+        total = rows["merge receipts / all projects"]
+        self.assertEqual(total.value,
+                         "before: 2.0/week; 3.5 covered days (partial); after: 1.0/week; 14 covered days (partial); "
+                         + "change: -1.0/week; n before=1; after=2")
+        self.assertEqual(total.n, 2)
+        self.assertIn("merge_receipts.jsonl", total.source)
+        baseline = read_report_blocks(m.render(before.sources, before.window, self.after_window.until, full=True))
+        missing_baseline = [row for row in baseline if row.measure == "Hana merge / ReceiptMissing"]
+        self.assertEqual([(row.value, row.n) for row in missing_baseline], [(missing_hash, 1)])
+        missing = rows["Hana merge / ReceiptMissing"]
+        self.assertEqual(missing.value, "before: 2.0/week; 3.5 covered days (partial); "
+                         + "after: comparison unavailable (no recorded after row); change: not recorded; n before=1; after=0")
+        self.assertEqual(missing.n, 0)
+        output = m.render_compare(before, after, self.after_window.until, full=True)
+        displayed = {row.measure: row for row in read_report_blocks(output)}
+        self.assertEqual(displayed[missing.measure], missing)
+        self.assertEqual(displayed[total.measure], total)
+        self.assertEqual(phone_overflow_lines(output), [])
+
+    def test_empty_partial_missing_and_unknown_coverage_have_distinct_rate_results(self) -> None:
+        before, after = self.part(self.before_window, 0), self.part(self.after_window, 4)
+        before.coverage[m.EventSource.MERGES] = m.RecordedCoverage((self.before_window,))
+        partial = log_records.Window(after.window.since, after.window.since + timedelta(days=14))
+        after.coverage[m.EventSource.MERGES] = m.RecordedCoverage((partial, partial))
+        value = self.rows(before, after)["Hana merges / origin/init/catalyst"].value
+        self.assertEqual(value, "before: 0.0/week; 7 covered days; after: 2.0/week; 14 covered days (partial); "
+                                + "change: +2.0/week; n before=0; after=4")
+        for coverage, reason in ((m.SourceUnavailable("file missing"), "source unavailable: file missing"),
+                                 (m.CoverageUnknown("coverage stamp absent"), "coverage unknown: coverage stamp absent")):
+            with self.subTest(coverage=coverage):
+                after.coverage[m.EventSource.MERGES] = coverage
+                row = self.rows(before, after)["Hana merges / origin/init/catalyst"]
+                self.assertIn("after: not recorded (" + reason + ")", row.value)
+                self.assertIn("change: not recorded", row.value)
+                self.assertEqual(row.n, 4)
+
+    def test_before_snapshots_use_the_recorded_rows_and_explain_list_visibility(self) -> None:
+        before, after = self.part(self.before_window, 1), self.part(self.after_window, 1)
+        current = m.capacity(before.sources.units, [], "snapshot now")[0]
+        saved = log_records.MeasureRow(current.measure, "11", 11, "snapshot 2026-10-20 17:24 EDT", "saved Baseline",
+                                       quantity=log_records.Snapshot(11))
+        waiting = log_records.MeasureRow("waiting / changes", "315; oldest not recorded", 315, saved.window, "saved Baseline",
+                                         quantity=log_records.Snapshot(315, visibility_changed=True))
+        before = replace(before, snapshot_rows=(saved, waiting))
+        rows = self.rows(before, after)
+        self.assertIn("before: 11; after: 1; change: -10.0", rows[current.measure].value)
+        self.assertIn(saved.window, rows[current.measure].window)
+        self.assertIn("before: 315; oldest not recorded", rows["waiting / changes"].value)
+        self.assertIn("visibility changed", rows["waiting / changes"].value)
+        self.assertIn("not backlog growth", rows["waiting / changes"].value)
+        self.assertNotIn("/week", rows["waiting / changes"].value)
+        without_snapshot = self.rows(self.part(self.before_window, 1), after)[current.measure]
+        self.assertIn("before: comparison unavailable", without_snapshot.value)
+        self.assertIn("change: not recorded", without_snapshot.value)
+        output = log_records.blocks("Comparison", list(rows.values()))
+        self.assertEqual(phone_overflow_lines(output), [])
+        self.assertEqual({row.measure: row for row in read_report_blocks(output)}, rows)
+
+    def test_compare_cli_uses_explicit_windows_and_keeps_full_rows_below_the_summary(self) -> None:
+        before, after = self.part(self.before_window, 2, 1), self.part(self.after_window, 12, 2)
+        arguments = ["compare", "--before", before.window.since.isoformat() + ".." + before.window.until.isoformat(),
+                     "--after", after.window.since.isoformat() + ".." + after.window.until.isoformat()]
+        outputs: list[str] = []
+        render_times: list[datetime] = []
+        for full in (False, True):
+            with patch.object(m, "load_comparison", return_value=(before, after)) as load, \
+                    patch.object(m, "render_compare", wraps=m.render_compare) as render, \
+                    redirect_stdout(io.StringIO()) as captured:
+                self.assertEqual(m.main([*arguments, *(["--full"] if full else [])]), 0)
+            load.assert_called_once_with(before.window, after.window)
+            render_times.append(cast(datetime, render.call_args.args[2]))
+            outputs.append(captured.getvalue())
+        summary, full_output = outputs
+        self.assertEqual(read_report_blocks(summary), [])
+        self.assertIn("Use --full to print the tables.", " ".join(summary.split()))
+        self.assertNotIn("Use --full", full_output)
+        self.assertEqual(phone_overflow_lines(summary), [])
+        self.assertEqual(phone_overflow_lines(full_output), [])
+        expected = m.comparison_rows(before, after, render_times[1])
+        rows = read_report_blocks(full_output)
+        displayed = [row for row in rows if "; n before=" in row.value]
+        self.assertEqual(displayed, expected)
+        self.assertTrue(all(before.window.label in row.window and after.window.label in row.window for row in displayed))
+
+    def test_compare_date_only_end_includes_the_same_final_day_as_baseline(self) -> None:
+        before, after = self.part(self.before_window, 0), self.part(self.after_window, 0)
+        with patch.object(m, "load_comparison", return_value=(before, after)) as load, redirect_stdout(io.StringIO()):
+            self.assertEqual(m.main([
+                "compare", "--before", "2026-10-13..2026-10-19", "--after", "2026-10-23..2026-10-30",
+            ]), 0)
+        load.assert_called_once_with(
+            log_records.Window(log_records.required_time("2026-10-13"), log_records.required_time("2026-10-20")),
+            log_records.Window(log_records.required_time("2026-10-23"), log_records.required_time("2026-10-31")),
+        )
+
+    def test_comparison_loads_notifications_once_without_turning_attribution_failures_into_zero_deliveries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            notify = home / ".local/state/notify"
+            notify.mkdir(parents=True)
+            config = home / "config/hierarchies/sessions.toml"
+            config.parent.mkdir(parents=True)
+            pushes = [push_fixture(self.before_window.since, "Before"),
+                      push_fixture(self.after_window.since, "After")]
+            reviews: list[log_records.JsonObject] = [
+                {"time": (self.after_window.since - timedelta(seconds=1)).isoformat(), "source": "fixture-unit",
+                 "verdict": "failed", "sent": {"title": "After", "body": "After"}},
+            ]
+            push_path, review_path = notify / "pushover.jsonl", notify / "review.jsonl"
+            _ = push_path.write_text("".join(json.dumps(record) + "\n" for record in pushes))
+            _ = review_path.write_text("".join(json.dumps(record) + "\n" for record in reviews))
+            for state in ("missing", "malformed"):
+                with self.subTest(session_config=state):
+                    if state == "malformed":
+                        _ = config.write_text("[")
+                    original = {path: path.read_bytes() for path in (push_path, review_path)}
+                    with patch.object(audit, "load_sources", wraps=audit.load_sources) as load, \
+                            patch.object(audit, "audit", wraps=audit.audit) as run_audit:
+                        before, after = self.load_fixture_home(home, (self.before_window, self.after_window))
+                    self.assertEqual(load.call_count, 1)
+                    self.assertEqual([call.args[1] for call in run_audit.call_args_list], [self.before_window, self.after_window])
+                    self.assertEqual([len(part.sources.push_report.delivered_pushes) for part in (before, after)], [1, 1])
+                    self.assertEqual([len(part.sources.push_report.entries) for part in (before, after)], [0, 1])
+                    self.assertTrue(all(isinstance(part.coverage[m.EventSource.PUSHES], m.CoverageUnknown)
+                                        for part in (before, after)))
+                    row = self.rows(before, after)["phone pushes after failed review"]
+                    self.assertEqual(row.n, 1)
+                    self.assertIn("n before=1; after=1", row.value)
+                    output = m.render_compare(before, after, self.after_window.until, full=True)
+                    self.assertIn(str(config), output)
+                    self.assertIn("unreadable session config", " ".join(output.split()))
+                    self.assertNotIn("missing delivery history", output)
+                    self.assertEqual(phone_overflow_lines(output), [])
+                    self.assertEqual({path: path.read_bytes() for path in original}, original)
+
+    def test_event_timestamps_do_not_claim_coverage_and_corrupt_sources_keep_their_reason(self) -> None:
+        before, after = self.part(self.before_window, 2), self.part(self.after_window, 4)
+        after = replace(after, coverage=m.comparison_coverage(after.sources))
+        row = self.rows(before, after)["Hana merges / origin/init/catalyst"]
+        self.assertIn("after: not recorded (coverage unknown:", row.value)
+        self.assertEqual(row.n, 4)
+
+        after.sources.problems.append(log_records.SourceProblem("Hana origin/init/catalyst merge log", "unreadable: invalid commit date",
+                                                                 m.EventSource.MERGES, log_records.SourceUnreadable()))
+        after = replace(after, coverage=m.comparison_coverage(after.sources))
+        row = self.rows(before, after)["Hana merges / origin/init/catalyst"]
+        self.assertIn("source unavailable: unreadable: invalid commit date", row.value)
+        self.assertNotIn("after: 0.0/week", row.value)
+        self.assertEqual(row.n, 4)
+
+    def test_a_corrupt_only_run_keeps_coverage_and_marks_the_phase_rate_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "unrecognized-run-label.jsonl"
+            _ = path.write_text("not json\n")
+            original = path.read_bytes()
+            before, after = self.part(self.before_window, 0), self.part(self.after_window, 0)
+            after.sources.phases = m.read_phases(root, after.sources.problems)
+            self.assertEqual(after.sources.phases, [])
+            self.assertEqual(len(after.sources.problems), 1)
+            self.assertEqual(after.sources.problems[0].source, str(path))
+            self.assertIs(after.sources.problems[0].event_source, m.EventSource.PHASES)
+            self.assertEqual(after.sources.problems[0].kind, log_records.RowsSkipped(1))
+            row = self.rows(before, after)["Hana phases done"]
+            self.assertIn("after: 0.0/week; 28 covered days", row.value)
+            self.assertIn("incomplete: 1 rows skipped", row.value)
+            self.assertIsInstance(after.coverage[m.EventSource.PHASES], m.RecordedCoverage)
+            output = m.render_compare(before, after, self.after_window.until, full=True)
+            self.assertIn(str(path), output)
+            self.assertEqual(phone_overflow_lines(output), [])
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_phase_read_failure_keeps_its_identity_when_a_state_read_has_the_same_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            root = home / "runs"
+            root.mkdir()
+            path = root / "run.jsonl"
+            _ = path.write_text("{}\n")
+            problems: list[log_records.SourceProblem] = []
+            with patch.object(Path, "open", side_effect=PermissionError("access denied")):
+                self.assertEqual(m.read_source(str(path), path.read_text, "", problems,
+                                              log_records.SourceNotApplicable.STATE), "")
+                phases = m.read_phases(root, problems)
+            self.assertEqual(phases, [])
+            self.assertEqual([(problem.source, problem.reason) for problem in problems],
+                             [(str(path), "unreadable: access denied")] * 2)
+            source = self.part(self.covered_before_window, 0).sources
+            source.phases = phases
+            source.problems = problems
+            config = home / "config/hierarchies/coverage.toml"
+            config.parent.mkdir(parents=True)
+            _ = config.write_text('["phase history"]\nsince="' + self.covered_before_window.since.isoformat()
+                                  + '"\nevidence="fixture phase writer"\n')
+            with patch.object(m, "load_window_sources", return_value=source):
+                before, after = self.load_fixture_home(home, (self.covered_before_window, self.covered_after_window))
+            for part in (before, after):
+                self.assertIsInstance(part.coverage[m.EventSource.PHASES], m.SourceUnavailable)
+            row = self.rows(before, after)["Hana phases done"]
+            self.assertIn("source unavailable: unreadable: access denied", row.value)
+            self.assertNotIn("0.0/week", row.value)
+            output = m.render_compare(before, after, self.after_window.until, full=True)
+            errors = [row for row in read_report_blocks(output) if row.measure == "source unavailable"
+                      and row.source == str(path)]
+            self.assertEqual(len(errors), 2)
+            self.assertEqual([row.value for row in errors], ["unreadable: access denied"] * 2)
+            self.assertEqual(phone_overflow_lines(output), [])
+
+    def test_comparison_uses_the_row_data_when_all_display_labels_are_unrecognized(self) -> None:
+        before, after = self.part(self.before_window, 0), self.part(self.after_window, 0)
+        before.coverage[m.EventSource.PUSHES] = m.SourceUnavailable("delivery history unavailable")
+        after.coverage[m.EventSource.PUSHES] = m.SourceUnavailable("delivery history unavailable")
+        groups: list[list[tuple[str, list[log_records.MeasureRow]]]] = []
+        for part in (before, after):
+            row = next(row for row in m.phase_flow(part.sources.phases, part.window) if row.measure == "Hana phases done")
+            groups.append([("opaque group", [replace(row, measure="opaque measure", source="opaque source", value="opaque value")])])
+        with patch.object(m, "baseline_groups", side_effect=groups):
+            row = self.rows(before, after)["opaque measure"]
+        self.assertEqual((row.value, row.n, row.source), (
+            "before: 1.0/week; 7 covered days; after: 0.2/week; 28 covered days; "
+            + "change: -0.8/week; n before=1; after=1", 1, "opaque source",
+        ))
+
+    def test_recorded_baseline_snapshot_reads_saved_values_instead_of_current_state(self) -> None:
+        rows = m.recorded_baseline_rows()
+        units = [row for row in rows if row.measure.startswith("units / tool-based-ui /")]
+        self.assertEqual([(row.value, row.n, row.window) for row in units],
+                         [("11", 11, "snapshot 2026-10-20 17:24 EDT")])
+        waiting = next(row for row in rows if row.measure == "waiting / changes")
+        self.assertTrue(waiting.value.startswith("315;"))
+        self.assertEqual(waiting.n, 315)
+        self.assertTrue(all("snapshot" in row.window for row in units))
+
+    def test_saved_baseline_capacity_count_drives_the_change_to_current_capacity(self) -> None:
+        before, after = self.part(self.before_window, 0), self.part(self.after_window, 0)
+        saved = m.recorded_baseline_rows()
+        before = replace(before, snapshot_rows=saved)
+        after.sources.units = [m.Unit("tool-based-ui", "current-hana", "/home/natepiano/rust/hana",
+                                     "/current/hana", True, "")]
+        measure = "units / tool-based-ui / /home/natepiano/rust/hana / Hana"
+        row = self.rows(before, after)[measure]
+        self.assertEqual(row.value, "before: 11; after: 1; change: -10.0; n before=11; after=1")
+        self.assertIn("before snapshot 2026-10-20 17:24 EDT", row.window)
+        self.assertNotIn("/week", row.value)
+
+    def test_saved_baseline_fractions_suffixes_and_unknown_values_keep_their_meaning(self) -> None:
+        rows = {row.measure: row for row in m.recorded_baseline_rows()}
+        expected = {
+            "waiting / changes": ("315; oldest 11.7 days", 315),
+            "top 20 goal 1 open issues with a unit": ("2/20", log_records.Fraction(2, 20)),
+            "top 20 goal 1 open issues covered score": ("140/604 (23.2%)", log_records.Fraction(140, 604, percent=True)),
+        }
+        for measure, (text, amount) in expected.items():
+            with self.subTest(measure=measure):
+                row = rows[measure]
+                self.assertEqual(row.value, text)
+                if not isinstance(row.quantity, log_records.Snapshot):
+                    self.fail("saved state lost its snapshot type")
+                self.assertEqual(row.quantity.amount, amount)
+                self.assertTrue(row.window.startswith("snapshot 2026-10-20"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "saved.md"
+            _ = path.write_text("## Baseline\n\nunknown state  value not understood  17  "
+                                + "snapshot 2026-10-20 17:24 EDT  saved fixture\n### Prior-week Hana merges\n")
+            unknown, = m.recorded_baseline_rows(path)
+            self.assertEqual((unknown.value, unknown.n, unknown.window),
+                             ("value not understood", 17, "snapshot 2026-10-20 17:24 EDT"))
+            if not isinstance(unknown.quantity, log_records.Snapshot):
+                self.fail("saved state lost its snapshot type")
+            self.assertEqual(unknown.quantity.amount, log_records.NotRecorded("value not understood"))
+
+    def with_waits(
+        self, part: m.ComparisonWindow, records: Sequence[log_records.JsonObject],
+        projects: tuple[m.CauseProject, ...] = (),
+    ) -> m.ComparisonWindow:
+        history = m.parse_wait_report(wait_report_fixture(part.window, records, [wait_phase_fixture(wait_n=len(records))]))
+        return replace(part, sources=replace(part.sources, wait_history=history), projects=projects)
+
+    def projects_from_history(
+        self, records: Sequence[log_records.JsonObject], units: Sequence[m.Unit] = (),
+    ) -> tuple[m.CauseProject, ...]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "retired.jsonl"
+            _ = path.write_text("".join(json.dumps(record) + "\n" for record in records))
+            original = path.read_bytes()
+            problems: list[log_records.SourceProblem] = []
+            projects = m.read_cause_projects(root, units, problems)
+            self.assertEqual(problems, [])
+            self.assertEqual(path.read_bytes(), original)
+            return projects
+
+    def test_two_unavailable_wait_histories_keep_each_reason_and_no_numeric_change(self) -> None:
+        before, after = self.part(self.before_window, 0), self.part(self.after_window, 0)
+        before.sources.wait_history = m.HistoryNotRecorded("before wait ledger absent")
+        after.sources.wait_history = m.HistoryNotRecorded("after wait ledger absent")
+        row = self.rows(before, after)["Hana wait coverage / HistoryNotRecorded"]
+        self.assertIn("before: not recorded", row.value)
+        self.assertIn("before wait ledger absent", row.value)
+        self.assertIn("after: not recorded", row.value)
+        self.assertIn("after wait ledger absent", row.value)
+        self.assertIn("change: not recorded", row.value)
+        self.assertEqual(row.n, 0)
+
+    def test_retired_hana_production_keeps_its_classification_with_a_tools_repository(self) -> None:
+        projects = self.projects_from_history([{
+            "event_type": "phase_started", "unit": {"state": "Recorded", "value": "retired-ui"},
+            "main_agent": {"session_id": "retired-ui-director"},
+            "production": {"state": "Recorded", "value": "tool-based-ui"},
+            "repository": {"state": "Recorded", "value": "claude"},
+        }])
+        part = self.part(self.before_window, 0)
+        record = wait_fixture("ui-holder", "WaitingForMemoryOrSlot", part.window.since, 3)
+        holder = named_holder_fixture("memory", "natedev")
+        holder["holder"] = {"state": "SessionHolder", "session_id": "retired-ui-director"}
+        record["holders"] = [holder_observation(part.window.since, holder)]
+        part = self.with_waits(part, [record], projects)
+        history = part.sources.wait_history
+        if not isinstance(history, m.HanaWaitHistory):
+            self.fail("recorded wait was lost")
+        intervals = m.wait_causes(history.waits[0], projects, part.window)
+        self.assertEqual(len(intervals), 1)
+        self.assertIsInstance(intervals[0].cause, m.HanaCause)
+        output = " ".join(m.render_compare(part, part, self.after_window.until, full=True).split())
+        self.assertIn("0 named wait causes", output)
+        self.assertNotIn("HI10 proposal evidence recorded", output)
+
+    def test_active_unit_and_its_repository_history_have_one_project_identity(self) -> None:
+        unit = m.Unit("builds", "active-builds", "build-tools", "/active/build-tools", False, "")
+        projects = self.projects_from_history([{
+            "event_type": "phase_started", "unit": {"state": "Recorded", "value": unit.name},
+            "main_agent": {"session_id": "builds-director"},
+            "production": {"state": "Recorded", "value": "builds"},
+            "repository": {"state": "Recorded", "value": "build-tools"},
+        }], [unit])
+        part = self.part(self.before_window, 0)
+        record = wait_fixture("active-holder", "WaitingForMemoryOrSlot", part.window.since, 3)
+        record["holders"] = [holder_observation(part.window.since, {
+            "state": "NamedHolder", "resource_kind": "memory", "resource": "natedev",
+            "holder": {"state": "UnitHolder", "unit": unit.name},
+        })]
+        part = self.with_waits(part, [record], projects)
+        history = part.sources.wait_history
+        if not isinstance(history, m.HanaWaitHistory):
+            self.fail("recorded wait was lost")
+        causes = m.wait_causes(history.waits[0], projects, part.window)
+        self.assertEqual(len(causes), 1)
+        self.assertIsInstance(causes[0].cause, m.NonHanaCause)
+        self.assertEqual((causes[0].until - causes[0].started).total_seconds(), 180)
+        self.assertEqual(len({project.project for project in projects if project.subject == "unit:" + unit.name}), 1)
+        self.assertIn("HI10 proposal evidence recorded", " ".join(m.render_compare(part, part, self.after_window.until).split()))
+
+    def test_recorded_hana_project_precedes_reused_unit_and_session_names_and_conflicts_stay_unknown(self) -> None:
+        unit = m.Unit("builds", "reused-unit", "build-tools", "/current/build-tools", False, "")
+        recorded: log_records.JsonObject = {
+            "event_type": "phase_started", "unit": {"state": "Recorded", "value": unit.name},
+            "main_agent": {"session_id": unit.name},
+            "production": {"state": "Recorded", "value": "tool-based-ui"},
+            "repository": {"state": "Recorded", "value": "claude"},
+        }
+        conflicting = {**recorded, "production": {"state": "Recorded", "value": "builds"},
+                       "repository": {"state": "Recorded", "value": "build-tools"}}
+        for history, cause_type in (([recorded], m.HanaCause), ([recorded, conflicting], m.CauseNotRecorded)):
+            with self.subTest(records=len(history)):
+                projects = self.projects_from_history(history, [unit])
+                for subject in ("unit:" + unit.name, "session:" + unit.name, unit.name):
+                    self.assertIsInstance(m.project_cause(subject, projects), cause_type)
+                part = self.part(self.before_window, 0)
+                records: list[log_records.JsonObject] = []
+                for holder in ({"state": "UnitHolder", "unit": unit.name},
+                               {"state": "SessionHolder", "session_id": unit.name}):
+                    record = wait_fixture(str(holder["state"]), "WaitingForMemoryOrSlot", part.window.since, 3)
+                    record["holders"] = [holder_observation(part.window.since, {
+                        "state": "NamedHolder", "resource_kind": "memory", "resource": "natedev", "holder": holder,
+                    })]
+                    records.append(record)
+                part = self.with_waits(part, records, projects)
+                evidence = m.wait_evidence(part)
+                self.assertEqual(len(evidence), 2)
+                for wait in evidence:
+                    self.assertEqual(len(wait.causes), 1)
+                    self.assertIsInstance(wait.causes[0].cause, cause_type)
+                    self.assertEqual(wait.causes[0].minutes, 3)
+                output = " ".join(m.render_compare(part, part, self.after_window.until, full=True).split())
+                self.assertIn("0 named wait causes", output)
+                self.assertNotIn("HI10 proposal evidence recorded", output)
+
+    def test_a_malformed_holder_reason_cannot_create_named_cause_evidence(self) -> None:
+        part = self.part(self.before_window, 0)
+        record = wait_fixture("misleading-reason", "WaitingForMemoryOrSlot", part.window.since, 10)
+        record["holders"] = [holder_observation(part.window.since, {
+            "state": "MalformedHolder", "reason": "invalid holder mentions non-Hana cause session:tools",
+        })]
+        part = self.with_waits(part, [record])
+        history = part.sources.wait_history
+        if not isinstance(history, m.HanaWaitHistory):
+            self.fail("malformed holder removed its wait")
+        self.assertTrue(all(isinstance(interval.cause, m.CauseNotRecorded)
+                            for interval in m.wait_causes(history.waits[0], (), part.window)))
+        output = m.render_compare(part, part, self.after_window.until, full=True)
+        summary = " ".join(output.split("\n\n", 1)[0].split())
+        self.assertIn("Non-Hana causes: 0 named wait causes", summary)
+        self.assertNotIn("HI10 proposal evidence recorded", summary)
+        evidence = [row for row in read_report_blocks(output) if row.measure == "Hana wait cause / misleading-reason"]
+        self.assertEqual(evidence, [])
+        self.assertEqual(self.rows(part, part)["Hana wait / WaitingForMemoryOrSlot"].n, 1)
+
+    def test_holder_minutes_and_wait_counts_use_equal_weekly_rates_for_unequal_windows(self) -> None:
+        parts: list[m.ComparisonWindow] = []
+        for window, minutes in ((self.before_window, 2), (self.after_window, 8)):
+            part = self.part(window, 0)
+            records = [wait_fixture("unnamed-" + str(index), "WaitingForQuotaRefusal", window.since, 1)
+                       for index in range(minutes)]
+            parts.append(self.with_waits(part, records))
+        row = self.rows(parts[0], parts[1])["Hana wait holders / WaitingForQuotaRefusal / HolderNotNamed"]
+        self.assertIn("before: 2.0 min/week; 7 covered days", row.value)
+        self.assertIn("after: 2.0 min/week; 28 covered days", row.value)
+        self.assertIn("waits 2.0/week; 7 covered days", row.value)
+        self.assertIn("waits 2.0/week; 28 covered days", row.value)
+        self.assertIn("change: +0.0/week", row.value)
+        self.assertEqual(row.n, 8)
+
+    def test_receipt_coverage_compares_fractions_without_turning_them_into_rates(self) -> None:
+        parts: list[m.ComparisonWindow] = []
+        for window in (self.before_window, self.after_window):
+            part = self.part(window, 0)
+            at = window.since + timedelta(hours=1)
+            part.sources.merges = [m.HanaMerge(commit, at) for commit in ("b" * 40, "c" * 40)]
+            part.sources.receipts = (m.parse_receipt(receipt_fixture("b" * 40, at)),)
+            parts.append(part)
+        row = self.rows(parts[0], parts[1])["Hana merge receipts / origin/init/catalyst"]
+        self.assertIn("before: 1/2", row.value)
+        self.assertIn("after: 1/2", row.value)
+        self.assertIn("change: unchanged", row.value)
+        self.assertNotIn("/week", row.value)
+        self.assertEqual(row.n, 2)
+
+    def test_malformed_holder_minutes_keep_waits_without_claiming_a_non_hana_cause(self) -> None:
+        part = self.part(self.before_window, 0)
+        start = part.window.since
+        whole = wait_fixture("all-malformed", "WaitingForMemoryOrSlot", start, 10)
+        partial = wait_fixture("part-malformed", "WaitingForMemoryOrSlot", start, 10)
+        malformed: log_records.JsonObject = {"state": "MalformedHolder", "reason": "holder invalid",
+                                             "raw_value": "private-holder-value"}
+        whole["holders"] = [holder_observation(start, malformed)]
+        partial["holders"] = [holder_observation(start, named_holder_fixture()),
+                              holder_observation(start + timedelta(minutes=4), malformed)]
+        part = self.with_waits(part, [whole, partial], (
+            m.CauseProject("session:other-project-director", m.NonHanaProject("build-tools")),
+        ))
+        rows = m.wait_cause_rows(part)
+        named = {row.measure: row for row in rows if row.measure.startswith("Hana wait holder minutes /")}
+        self.assertEqual([(named["Hana wait holder minutes / " + name].value, named["Hana wait holder minutes / " + name].n)
+                          for name in ("all-malformed", "part-malformed")],
+                         [("named 0.0 min; not named 10.0 min", 1), ("named 4.0 min; not named 6.0 min", 1)])
+        causes = [row for row in rows if row.measure.startswith("Hana wait cause /")]
+        proven = [row for row in causes if "non-Hana cause" in row.value]
+        self.assertEqual(len(proven), 1)
+        self.assertEqual((proven[0].measure, proven[0].n), ("Hana wait cause / part-malformed", 1))
+        self.assertIn("project build-tools; 4.0 min", proven[0].value)
+        unknown = [row for row in causes if "cause not recorded: MalformedHolder" in row.value]
+        self.assertEqual(len(unknown), 2)
+        self.assertTrue(any("10.0 min" in row.value for row in unknown))
+        self.assertTrue(any("6.0 min" in row.value for row in unknown))
+        total = self.rows(part, part)["Hana wait / WaitingForMemoryOrSlot"]
+        self.assertEqual(total.n, 2)
+        self.assertIn("20.0 min/week", total.value)
+        output = m.render_compare(part, part, self.after_window.until, full=True)
+        displayed = read_report_blocks(output)
+        for identity, expected in (("all-malformed", "named 0.0 min; not named 10.0 min"),
+                                   ("part-malformed", "named 4.0 min; not named 6.0 min")):
+            with self.subTest(wait=identity):
+                breakdowns = [row for row in displayed if row.measure == "Hana wait holder minutes / " + identity]
+                self.assertEqual([(row.value, row.n) for row in breakdowns], [(expected, 1)] * 2)
+        self.assertNotIn("private-holder-value", output)
+        self.assertEqual(phone_overflow_lines(output), [])
+        self.assertIn("HI10 proposal evidence recorded.", " ".join(output.split()))
+
+    def test_a_known_quota_kind_and_named_unattributed_supplier_are_not_proven_causes(self) -> None:
+        part = self.part(self.before_window, 0)
+        quota = wait_fixture("known-quota", "WaitingForQuotaRefusal", part.window.since, 5)
+        supplier = wait_fixture("unknown-supplier-project", "WaitingForSupplier", part.window.since, 7)
+        supplier["expected_supplier"] = {"state": "NamedSupplier", "address": "worker:old-run/peer"}
+        part = self.with_waits(part, [quota, supplier])
+        history = part.sources.wait_history
+        self.assertIsInstance(history, m.HanaWaitHistory)
+        if not isinstance(history, m.HanaWaitHistory):
+            self.fail("recorded wait fixture was lost")
+        self.assertIs(history.waits[0].kind, m.WaitKind.QUOTA)
+        self.assertEqual(history.waits[1].expected_supplier, m.NamedSupplier("worker:old-run/peer"))
+        self.assertTrue(all(isinstance(interval.cause, m.CauseNotRecorded)
+                            for wait in history.waits for interval in m.wait_causes(wait, part.projects, part.window)))
+        causes = [row for row in m.wait_cause_rows(part) if row.measure.startswith("Hana wait cause /")]
+        self.assertEqual([row.n for row in causes], [1, 1])
+        self.assertIn("5.0 min", causes[0].value)
+        self.assertIn("7.0 min", causes[1].value)
+        self.assertIn("worker:old-run/peer", causes[1].value)
+        self.assertTrue(all("cause not recorded" in row.value for row in causes))
+        self.assertNotIn("HI10 proposal evidence recorded", " ".join(m.render_compare(part, part, self.after_window.until).split()))
+
+    def test_named_supplier_evidence_and_holder_resource_kind_control_non_hana_proof(self) -> None:
+        part = self.part(self.before_window, 0)
+        at = part.window.since
+        supplier = wait_fixture("supplier", "WaitingForSupplier", at, 0.5)
+        supplier["expected_supplier"] = {"state": "NamedSupplier", "address": "unit:builds"}
+        wrong = wait_fixture("wrong-resource", "WaitingForQuotaRefusal", at, 5)
+        wrong["holders"] = [holder_observation(at, named_holder_fixture("slot"))]
+        part = self.with_waits(part, [supplier, wrong], (
+            m.CauseProject("unit:builds", m.NonHanaProject("build-tools")),
+            m.CauseProject("session:other-project-director", m.NonHanaProject("build-tools")),
+        ))
+        proven = [row for row in m.wait_cause_rows(part) if "non-Hana cause" in row.value]
+        self.assertEqual([(row.measure, row.n) for row in proven], [("Hana wait cause / supplier", 1)])
+        self.assertIn("0.5 min", proven[0].value)
+        self.assertIn("HI10 proposal evidence recorded", " ".join(m.render_compare(part, part, self.after_window.until).split()))
+        self.assertTrue(any("holder resource does not match wait kind" in row.value
+                            for row in m.wait_cause_rows(part)))
+
+    def test_retired_holders_use_recorded_phase_origins_and_unknown_projects_stay_unknown(self) -> None:
+        records: list[log_records.JsonObject] = [
+            {"event_type": "phase_started", "unit": {"state": "Recorded", "value": "retired-builds"},
+             "owner_session": "retired-director", "main_agent": {"session_id": "retired-main"},
+             "repository": {"state": "Recorded", "value": "build-tools"},
+             "production": {"state": "Recorded", "value": "builds"}},
+            {"event_type": "phase_started", "unit": {"state": "Recorded", "value": "retired-hana"},
+             "main_agent": {"session_id": "retired-hana-director"},
+             "repository": {"state": "Recorded", "value": "/retired/hana"},
+             "production": {"state": "Recorded", "value": "tool-based-ui"}},
+            {"event_type": "phase_started", "unit": "unknown-project",
+             "repository": {"state": "NotRecorded", "reason": "worktree retired"},
+             "production": {"state": "NotRecorded", "reason": "production not recorded"}},
+        ]
+        projects = self.projects_from_history(records)
+        part = self.part(self.before_window, 0)
+        record = wait_fixture("retired-holder", "WaitingForMemoryOrSlot", part.window.since, 3)
+        record["holders"] = [holder_observation(part.window.since, {
+            "state": "NamedHolder", "resource_kind": "memory", "resource": "natedev",
+            "holder": {"state": "UnitHolder", "unit": "retired-builds"},
+        })]
+        records = [record]
+        for identity, session, minutes in (("retired-main-holder", "retired-main", 2),
+                                           ("retired-hana-holder", "retired-hana-director", 4)):
+            record = wait_fixture(identity, "WaitingForQuotaRefusal", part.window.since, minutes)
+            holder = named_holder_fixture("account", "worker/account-a")
+            holder["holder"] = {"state": "SessionHolder", "session_id": session}
+            record["holders"] = [holder_observation(part.window.since, holder)]
+            records.append(record)
+        part = self.with_waits(part, records, projects)
+        rows = m.wait_cause_rows(part)
+        causes = [row for row in rows if row.measure == "Hana wait cause / retired-holder"]
+        self.assertEqual(len(causes), 1)
+        self.assertIn("non-Hana cause unit:retired-builds; project build-tools; 3.0 min", causes[0].value)
+        main = [row for row in rows if row.measure == "Hana wait cause / retired-main-holder"]
+        self.assertEqual(len(main), 1)
+        self.assertIn("non-Hana cause session:retired-main; project build-tools; 2.0 min", main[0].value)
+        hana = [row for row in rows if row.measure == "Hana wait cause / retired-hana-holder"]
+        self.assertEqual(len(hana), 1)
+        self.assertIn("Hana cause session:retired-hana-director; 4.0 min", hana[0].value)
+        self.assertNotIn("non-Hana cause", hana[0].value)
+        self.assertIsInstance(m.project_cause("unit:unknown-project", projects), m.CauseNotRecorded)
+
+    def test_hourly_tokens_keep_account_changes_inside_one_hour_and_unknown_attribution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            other, hana = home / "rust/other-project", home / "rust/hana"
+            for repo in (other, hana):
+                (repo / ".git").mkdir(parents=True)
+            path = home / "usage.sqlite"
+            hour = self.before_window.since.replace(minute=0, second=0, microsecond=0)
+            write_token_ledger(path, [("worker", str(other)), ("hana", str(hana))], [
+                (hour.isoformat(), "workers", "account-a"),
+                ((hour + timedelta(minutes=40)).isoformat(), "workers", "account-b"),
+            ], [
+                ("natedev", "worker", (hour + timedelta(minutes=30)).isoformat(), "worker", 15),
+                ("natedev", "worker", (hour + timedelta(minutes=45)).isoformat(), "worker", 20),
+                ("natedev", "hana", (hour + timedelta(minutes=46)).isoformat(), "worker", 30),
+                ("natedev", "missing", (hour + timedelta(minutes=47)).isoformat(), None, 7),
+                ("mac", "worker", (hour + timedelta(minutes=48)).isoformat(), "worker", 900),
+                ("natedev", "worker", self.before_window.until.isoformat(), "worker", 1000),
+            ])
+            original = path.read_bytes()
+            with patch.object(Path, "home", return_value=home):
+                hourly = m.read_hourly_tokens(path, self.before_window)
+                known = {(turn.account.account, turn.repository): (turn.hour, turn.tokens, turn.turns)
+                         for turn in hourly if isinstance(turn.account, m.RoleAccount)}
+                self.assertEqual(known, {("account-a", str(other)): (hour, 15, 1),
+                                        ("account-b", str(other)): (hour, 20, 1),
+                                        ("account-b", str(hana)): (hour, 30, 1)})
+                unknown = [turn for turn in hourly if isinstance(turn.account, m.AccountNotRecorded)]
+                self.assertEqual([(turn.tokens, turn.turns) for turn in unknown], [(7, 1)])
+                part = self.part(self.before_window, 0)
+                record = wait_fixture("quota-load", "WaitingForQuotaRefusal", hour + timedelta(minutes=30), 20)
+                record["holders"] = [holder_observation(hour + timedelta(minutes=30), {
+                    "state": "NamedHolder", "resource_kind": "account", "resource": "worker/account-b",
+                    "holder": {"state": "SessionHolder", "session_id": "unknown-project-director"},
+                })]
+                part = replace(self.with_waits(part, [record]), hourly_tokens=hourly)
+                rows = m.wait_cause_rows(part)
+                contexts = [row for row in rows if row.measure.startswith("Same-hour non-Hana tokens /")]
+                self.assertEqual(len(contexts), 1)
+                self.assertIn("worker/account-b: 20 tokens", contexts[0].value)
+                self.assertNotIn("15 tokens", contexts[0].value)
+                self.assertNotIn("30 tokens", contexts[0].value)
+                self.assertIn("1 turns with attribution not recorded", contexts[0].value)
+                self.assertEqual(contexts[0].n, 1)
+                self.assertTrue(all("non-Hana cause" not in row.value for row in rows))
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_real_worker_and_showrunner_roles_keep_their_same_account_token_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            repo = home / "rust/build-tools"
+            (repo / ".git").mkdir(parents=True)
+            path = home / "usage.sqlite"
+            at = self.before_window.since
+            roles = ("impl", "test", "fix", "review", "showrunner")
+            write_token_ledger(path, [(role, str(repo)) for role in roles], [
+                (at.isoformat(), "workers", "worker-account"),
+                (at.isoformat(), "showrunners", "production-account"),
+            ], [("natedev", role, (at + timedelta(minutes=1)).isoformat(), role, 10 + index)
+                for index, role in enumerate(roles)])
+            original = path.read_bytes()
+            with patch.object(Path, "home", return_value=home):
+                turns = m.read_hourly_tokens(path, self.before_window)
+            known = {turn.account.role: (turn.account.account, turn.tokens, turn.turns)
+                     for turn in turns if isinstance(turn.account, m.RoleAccount)}
+            self.assertEqual(known, {
+                "impl": ("worker-account", 10, 1), "test": ("worker-account", 11, 1),
+                "fix": ("worker-account", 12, 1), "review": ("worker-account", 13, 1),
+                "showrunner": ("production-account", 14, 1),
+            })
+            self.assertEqual(len(turns), 5)
+            part = self.part(self.before_window, 0)
+            records: list[log_records.JsonObject] = []
+            for role in roles:
+                record = wait_fixture(role, "WaitingForQuotaRefusal", at, 5)
+                account = "production-account" if role == "showrunner" else "worker-account"
+                record["holders"] = [holder_observation(at, named_holder_fixture("account", role + "/" + account))]
+                records.append(record)
+            part = replace(self.with_waits(part, records), hourly_tokens=turns)
+            contexts = [row for row in m.wait_cause_rows(part) if row.measure.startswith("Same-hour non-Hana tokens /")]
+            self.assertEqual(len(contexts), 5)
+            for index, role in enumerate(roles):
+                row = next(row for row in contexts if row.measure.startswith("Same-hour non-Hana tokens / " + role + " /"))
+                account = "production-account" if role == "showrunner" else "worker-account"
+                self.assertIn(f"{role}/{account}: {10 + index} tokens", row.value)
+                self.assertEqual(row.n, 1)
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_a_build_across_two_hours_is_memory_context_without_becoming_cause_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "builds.sqlite"
+            hour = self.before_window.since.replace(minute=0, second=0, microsecond=0)
+            start = hour + timedelta(minutes=30)
+            with closing(sqlite3.connect(path)) as db:
+                _ = db.execute("CREATE TABLE steps(repo,started_at,duration_s,peak_mem_bytes,host)")
+                _ = db.executemany("INSERT INTO steps VALUES ('build-tools',?,5400,?,?)", [
+                    (start.isoformat(), 4096, "natedev"), (start.isoformat(), 9000, "mac"),
+                ])
+                db.commit()
+            original = path.read_bytes()
+            memory = m.read_build_memory(path)
+            self.assertIsInstance(memory, m.BuildMemoryHistory)
+            part = self.part(self.before_window, 0)
+            record = wait_fixture("memory-load", "WaitingForMemoryOrSlot", start, 60)
+            part = replace(self.with_waits(part, [record]), build_memory=memory)
+            rows = m.wait_cause_rows(part)
+            contexts = [row for row in rows if row.measure.startswith("Same-hour non-Hana build memory /")]
+            self.assertEqual([row.measure for row in contexts], [
+                "Same-hour non-Hana build memory / memory-load / " + (hour + timedelta(hours=i)).astimezone(timezone.utc).isoformat()
+                for i in (0, 1)
+            ])
+            self.assertEqual([(row.value, row.n) for row in contexts], [("build-tools: peak 4096 bytes", 1)] * 2)
+            self.assertTrue(all("steps.peak_mem_bytes" in row.source and "context only" in row.source for row in contexts))
+            self.assertTrue(all("non-Hana cause" not in row.value for row in rows))
+            absent = replace(part, build_memory=m.read_build_memory(Path(directory) / "missing.sqlite"))
+            missing = [row for row in m.wait_cause_rows(absent) if row.measure.startswith("Same-hour non-Hana build memory /")]
+            self.assertEqual([(row.measure, row.n) for row in missing], [(row.measure, 0) for row in contexts])
+            self.assertTrue(all(row.value.startswith("not recorded:") and "missing.sqlite" in row.value for row in missing))
+            self.assertEqual(path.read_bytes(), original)
+
+
 class SourcesTest(unittest.TestCase):
     def test_merge_count_uses_fixture_ref_commit_dates_and_exact_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2036,6 +3216,10 @@ class SourcesTest(unittest.TestCase):
                 '[{"since":"2026-10-05T12:00","text":"Which?","question":"Which size?"},' +
                 '{"since":"2026-10-01T12:00","text":"A reminder"}]'
             )
+            answered = state / "showrunner/outstanding/hana.answered.jsonl"
+            _ = answered.write_text(json.dumps({"time": "2026-10-07T11:00:00-04:00", "slug": "hana",
+                                                "text": "Answered recently", "asked_by": "fixture-unit"}) + "\n")
+            answered_bytes = answered.read_bytes()
             found = m.read_issues(vault / "issues")
             problems: list[log_records.SourceProblem] = []
             waiting = m.read_waiting(state, vault, found, problems)
@@ -2048,6 +3232,13 @@ class SourcesTest(unittest.TestCase):
             rows = m.pending_attention(waiting, snapshot, window)
             self.assertEqual(rows[3].value, "1; oldest 2.0 days")
             self.assertIn("showrunner/outstanding", rows[3].source)
+            for days in (7, 28):
+                with self.subTest(answer_window_days=days):
+                    answer_rows = m.pending_attention(waiting, snapshot, log_records.Window(snapshot - timedelta(days=days), snapshot))[-2:]
+                    self.assertEqual([(row.value, row.n) for row in answer_rows], [("not recorded", 0)] * 2)
+                    self.assertTrue(all("48-hour" in row.source and "replay" in row.source for row in answer_rows))
+                    self.assertTrue(all("no answer history" not in row.source for row in answer_rows))
+            self.assertEqual(answered.read_bytes(), answered_bytes)
 
     def test_change_review_without_pending_section_reports_problem(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2173,7 +3364,7 @@ class SourcesTest(unittest.TestCase):
                 _ = db.execute("INSERT INTO turns VALUES ('natedev','codex','','a','2026-10-20',99,99,99,99,99)")
                 db.commit()
             before = path.read_bytes()
-            self.assertEqual(m.read_builds(path)[0].seconds, 120)
+            self.assertEqual(m.read_builds(path, [])[0].seconds, 120)
             start = log_records.required_time("2026-10-13T00:00:00Z")
             window = log_records.Window(start, start + timedelta(days=7))
             tokens = m.read_tokens(path, window)
@@ -2191,7 +3382,7 @@ class SourcesTest(unittest.TestCase):
                 _ = db.execute("INSERT INTO steps VALUES ('hana','nextest','2026-10-14',120,'natedev')")
                 db.commit()
             start = log_records.required_time("2026-10-13")
-            rows = m.resource_use(m.read_builds(path), [], log_records.Window(start, start + timedelta(days=7)))
+            rows = m.resource_use(m.read_builds(path, []), [], log_records.Window(start, start + timedelta(days=7)))
             build_rows = {row.measure: (row.value, row.n) for row in rows if "minutes /" in row.measure}
             self.assertEqual(build_rows, {
                 "test minutes / hana": ("2.0", 1),

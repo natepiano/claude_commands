@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import ClassVar, cast, final, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production.staff_test_support import StaffTestCase, showrunner_relationship, unit_membership
 from test_support import ShutdownTestCase, linux_process_fixture
@@ -26,10 +28,10 @@ import shutdown_record
 import inventory
 import conversation_pause
 import unit_runs
-import account
+from scripts.whoami import account
 import herdr
 import sessions
-import showrunners
+from scripts.production import showrunners
 import unit_lookup
 import restart
 import shutdown

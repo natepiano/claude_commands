@@ -27,8 +27,10 @@ from socket import gethostname
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, cast
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import production_units
-import showrunners
+from scripts.production import showrunners
 import unit_lookup
 from session_pane import HerdrFailure, agent_status, read_place
 

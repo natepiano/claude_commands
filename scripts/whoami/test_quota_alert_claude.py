@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
+import sys
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
 from scripts.whoami import agent_accounts
-from agent_accounts import ClaudeAccountsInUse, Quota, Report
+from scripts.whoami.agent_accounts import ClaudeAccountsInUse, Quota, Report
 import agent_notes
-import session_table
-import note_file
-import account
-from note_file import read_note
+from scripts.whoami import session_table
+from scripts.whoami import note_file
+from scripts.whoami import account
+from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, next_moves
 from user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes
@@ -130,7 +133,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
         session_only = read_note(session_only.path)
         assert isinstance(session_only, note_file.Note)
         notes = [role_only, session_only, spare]
-        self.assertEqual([note.label for note in quota_alert.low(notes, 5)], ["claude1", "claude2"])
+        self.assertEqual([note.label for note in quota_alert.low(notes, 5, now=self.now)], ["claude1", "claude2"])
 
     def test_alert_opens_episodes_for_role_only_and_peer_sessions_only_accounts(self) -> None:
         """F001: a note's role or peer session count suffices without a local session."""

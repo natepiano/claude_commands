@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.lib.atomic_file import write_text_atomic
+from scripts.lib.process_failure import failure_detail
 from zoneinfo import ZoneInfo
 
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 import unit_lookup
 from scripts.production import staff
@@ -571,7 +573,7 @@ def phase_table_path() -> Path:
 def phase_tables(production_doc: Path, zone: ZoneInfo) -> PhaseTablesState:
     result = command(phase_table_path(), "show", "--production-doc", str(production_doc), "--json")
     if result.returncode:
-        return PhaseTablesUnavailable(result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
+        return PhaseTablesUnavailable(failure_detail(result))
     try:
         raw = cast(object, json.loads(result.stdout))
         fields = as_map(raw, "phase tables")
@@ -796,8 +798,8 @@ def style_summary(production: Production) -> JsonMap:
     try:
         result = command(script, "summary", "--repo", str(production.checkout), "--json")
         if result.returncode:
-            reason = result.stderr.strip() or result.stdout.strip() or f"summary exited {result.returncode}"
-            return {"unavailable": reason.splitlines()[0]}
+            reason = f"summary: {failure_detail(result, lines=1)}"
+            return {"unavailable": reason.replace("\n", "; ")}
         raw = cast(object, json.loads(result.stdout))
         if not isinstance(parse_style_summary(raw, "style", production.zone), StyleSummary):
             raise InputError("style: expected the ledger summary object")
@@ -1072,7 +1074,7 @@ def run(args: argparse.Namespace) -> int:
         action = "restart" if user_run else "status"
         clock = command(notifier, action, instance)
         if clock.returncode:
-            raise DailiesFailure("clock", clock.stderr.strip() or clock.stdout.strip())
+            raise DailiesFailure("clock", failure_detail(clock))
         result["next_run"] = next_due(clock.stdout, now, production.zone)
         if user_run:
             production.log.parent.mkdir(parents=True, exist_ok=True)

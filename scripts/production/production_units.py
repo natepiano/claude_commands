@@ -9,7 +9,7 @@ from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 import unit_lookup
-import showrunners
+from scripts.production import showrunners
 from collections.abc import Iterable
 from scripts.production import staff
 import unit_names

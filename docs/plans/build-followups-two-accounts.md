@@ -58,7 +58,7 @@ Everything else is a symlink into `~/.claude`: `settings.json`, `CLAUDE.md`, `co
 
 **Calls I made (each a one-line revert):**
 
-- Showrunners, top-level sessions, the fix pipeline and the `send.py` relay stay on `~/.claude`'s login. The nightly review ran there too until 2026-10-11, when it moved to the unit role's account (Phase 7). Only units get a role account, because they spend about 70% and they are the sessions that can be stopped safely and resumed.
+- Showrunners, top-level sessions and the `send.py` relay stay on `~/.claude`'s login. The nightly review ran there too until 2026-10-11, when it moved to the unit role's account (Phase 7). Only units get a role account, because they spend about 70% and they are the sessions that can be stopped safely and resumed.
 - A swap reuses `/shutdown`'s safe stop and resume instead of moving each unit at its next checkpoint.
 - The Mac is out of scope: units launch only on natedev (`add_unit.py` used `systemd-run` and tmux then; it now starts each unit in its own herdr session). Mac sessions stay on `~/.claude`.
 - A long-lived `CLAUDE_CODE_OAUTH_TOKEN` per launch is ruled out: such a token "can't establish Remote Control sessions", and every unit runs with `--remote-control`.
@@ -2831,126 +2831,176 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 
 **Ruled out:** trusting a stored registration id alone, without its owner check; marking a showrunner line sent before the send returns.
 
-### Phase 100 — All consumers import shared whoami modules by one name  · status: todo
+### Phase 100 — All consumers import shared whoami modules by one name  · status: done
 
-**Depends on:** Phase 94d, Phase 94e, Phase 96, Phase 97, Phase 98 (order only; each edits files whose imports this phase changes), and the completed Phase 99 remerge: natedev with shutdown-unit phase 5 merged in, the `settle.py` timer save fixed on it, and its new hash merged by the showrunner
+#### As-built
 
-**Also touches:** the herdr, shutdown, message, production and agents owners.
-
-#### Work Order
-
-**Goal:** Every consumer imports each shared whoami module by its package name, `scripts.whoami.<module>`, and the two-name registrations go. Today sibling imports (`import note_file`) and package imports (`from scripts.whoami import note_file`) coexist. Six modules register both names in `sys.modules` to keep one module object, so type identity and patched settings stay shared: `agent_accounts`, `account`, `note_file`, `session_table`, `run_out` and `usage_store`.
-
-**Spec:**
-- The package name is the one name: it works from every directory with only the repository root on `sys.path`, and the agents, herdr, usage and nix_env consumers already use it.
-- Change every bare import of the six modules (`import <module>`, `from <module> import …`, also inside functions) to the package form. Bare-import consumers found at planning:
-  - `scripts/whoami`: `five_hour.py`, `quota_alert.py`, `codex_pacer.py`, `agent_notes.py`, `run_out.py`, `session_table.py`, `whoami.py`, `profile_notes_pass.py` (added by Phase 94b; also string imports `import_module("<module>")` of three of the six).
-  - `scripts/accounts`: `accounts.py`, `new_account.py`, `refusal_watch.py`, `refusals.py`, `unit_watchdog.py`.
-  - `scripts/shutdown`: `inventory.py`, `pane_record.py`, `pane_restore.py`, `shutdown_record.py`, `restart.py`, `settle.py`, `shutdown.py`.
-  - `scripts/production`: `cli_fixture.py`, `dailies_render.py`, `showrunner_move.py`.
-  - `scripts/message/roster.py`; `scripts/nightly_review/nightly_review.py` (not in the next-items entry; found at planning).
-  - The test files and test support files listed under Files, in `scripts/whoami`, `scripts/accounts`, `scripts/shutdown`, `scripts/production` and `scripts/nightly_review` (28 test files and 2 support files at `5ad6542f`).
-  - `scripts/agents/agent_exec.sh`: its inline Python puts only `scripts/whoami` on `sys.path` and runs `from agent_accounts import workers_home`. It puts the repository root (`$script_dir/../..`) on `sys.path` and imports `scripts.whoami.agent_accounts`.
-- The repository root must be on `sys.path` before the first `scripts.` import of each consumer. Today many consumers get the root only as a side effect of a bare `import account` or `import agent_accounts` (`account.py:19` and `agent_accounts.py:46` insert `parents[2]`); `settle.py:42` and `restart.py:28` already import `scripts.accounts` through that side effect. After the change the package import must find the root first. Each consumer file that has no module-level root insert adds `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))` before its first `scripts.` import. Found at planning: `scripts/whoami/whoami.py` (its root insert is inside a function, line 69), `run_out.py`, `session_table.py`; `scripts/accounts/refusals.py`, `unit_watchdog.py`; `scripts/production/dailies_render.py`, `cli_fixture.py`; `scripts/shutdown/inventory.py`, `pane_record.py`, `pane_restore.py`, `shutdown_record.py`, `restart.py`, `settle.py`, `shutdown.py`. Also files that already import `scripts.*` with no module-level root insert: `scripts/whoami/usage_store.py` (line 28), `scripts/production/add_unit_test_support.py` (line 5), `scripts/whoami/quota_alert_test_support.py` (line 5).
-- Remove the `if __name__ == "<module>": … elif __name__ == "scripts.whoami.<module>": …` block from each of the six modules.
-- Other whoami modules (`quota_alert`, `five_hour`, `codex_pacer`, `agent_notes`) keep their current import names; `scripts/lib/nix_env.py` keeps its own two-name block. Both are out of scope.
-- No other behavior changes.
+- Every consumer imports `agent_accounts`, `account`, `note_file`, `session_table`, `run_out` and `usage_store` as `scripts.whoami.<module>`, also inside functions and in `import_module` strings. Code and tests share one module object, so type identity (`KnownCodexAccount`, `Report`, `UsageClaimFailed`, `UsageSaveFailed`) and patched settings such as `note_file.AGENTS_DIR` hold.
+- The six modules carry no `if __name__ == "<module>": … elif __name__ == "scripts.whoami.<module>": …` two-name registration block; no `sys.modules.setdefault` remains in `scripts/whoami`.
+- Root-insert rule: each consumer puts `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))` at module level before its first `scripts.` import, and none depends on the side-effect insert in `account.py` or `agent_accounts.py`. The inline Python in `scripts/agents/agent_exec.sh` puts the repository root (`$script_dir/../..`) on `sys.path` and imports `scripts.whoami.agent_accounts`.
+- `quota_alert`, `five_hour`, `codex_pacer` and `agent_notes` keep their own import names; `scripts/lib/nix_env.py` keeps its own two-name block.
+- The one approved relative import is `from ..whoami import account, agent_accounts` in `scripts/message/test_roster.py`.
 
 **Files:**
-- `scripts/whoami/agent_accounts.py`, `scripts/whoami/account.py`, `scripts/whoami/note_file.py`, `scripts/whoami/session_table.py`, `scripts/whoami/run_out.py`, `scripts/whoami/usage_store.py` — the registration blocks.
-- `scripts/whoami/five_hour.py`, `scripts/whoami/quota_alert.py`, `scripts/whoami/codex_pacer.py`, `scripts/whoami/agent_notes.py`, `scripts/whoami/whoami.py` — consumers.
-- `scripts/accounts/accounts.py`, `scripts/accounts/new_account.py`, `scripts/accounts/refusal_watch.py`, `scripts/accounts/refusals.py`, `scripts/accounts/unit_watchdog.py` — consumers.
-- `scripts/shutdown/inventory.py`, `scripts/shutdown/pane_record.py`, `scripts/shutdown/pane_restore.py`, `scripts/shutdown/shutdown_record.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/settle.py`, `scripts/shutdown/shutdown.py` — consumers.
-- `scripts/production/cli_fixture.py`, `scripts/production/dailies_render.py`, `scripts/production/showrunner_move.py` — consumers.
-- `scripts/message/roster.py`, `scripts/nightly_review/nightly_review.py` — consumers.
-- `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_codex_alert_accounts.py`, `scripts/whoami/test_codex_homes.py`, `scripts/whoami/test_codex_pacer.py`, `scripts/whoami/test_five_hour.py`, `scripts/whoami/test_note_file.py`, `scripts/whoami/test_quota_alert.py`, `scripts/whoami/test_run_out.py`, `scripts/whoami/test_session_table.py`, `scripts/whoami/test_usage_store.py`, `scripts/whoami/test_quota_zero_episode.py`, `scripts/whoami/test_quota_alert_claude.py`, `scripts/whoami/test_quota_alert_delivery.py` — tests; the last two import `agent_accounts` bare at lines 14 and 21.
-- `scripts/whoami/quota_alert_test_support.py` — test support: bare imports of `agent_accounts`, `session_table`, `note_file`, `account` and `usage_store` (lines 27–34) and `import usage_store` inside a function (line 275).
-- `scripts/accounts/test_accounts.py`, `scripts/accounts/test_cutover_home.py`, `scripts/accounts/test_new_account.py`, `scripts/accounts/test_refusals.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/accounts/test_unit_watchdog.py` — tests.
-- `scripts/shutdown/test_account_move.py`, `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_pane_record.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_settle.py`, `scripts/shutdown/test_shutdown_cli.py`, `scripts/shutdown/test_shutdown_status.py`, `scripts/shutdown/test_stop.py`, `scripts/shutdown/test_bounded_stop.py`, `scripts/shutdown/test_staff_parent.py` — tests; the last two import bare at lines 27 (`from account import Account`) and 16.
-- `scripts/production/test_add_showrunner.py`, `scripts/production/test_transfer_unit.py`, `scripts/production/add_unit_test_support.py`, `scripts/nightly_review/test_nightly_review.py` — tests; the support file has `import usage_store` at line 39, and `test_transfer_unit.py` a bare import at line 383.
-- `scripts/whoami/profile_notes_pass.py` — consumer: `import usage_store` and `from agent_accounts import …` inside a function, and `import_module("usage_store")`, `import_module("run_out")`, `import_module("agent_accounts")` in `load_pass` and `patch_list`.
-- `scripts/agents/agent_exec.sh` — the inline Python import.
-- `scripts/agents/codex_mesh.py`, `scripts/herdr/herdr_sessions.py` — already package form; read to confirm, change only a bare import found.
+- `scripts/whoami/{agent_accounts,account,note_file,session_table,run_out,usage_store}.py` — the six shared modules, registered under the package name only.
+- Consumers and tests in `scripts/{whoami,accounts,shutdown,production,message,nightly_review}` — package imports and module-level root inserts.
+- `scripts/whoami/profile_notes_pass.py` — loads and patches the package modules; `test_profile_notes_pass.py` takes the save counter key from the real patch entry.
+- `scripts/agents/agent_exec.sh` — inline Python imports the package name.
 
-**Workers:** 2 writers, split by directory (no file in both). Both lanes freeze their files before the shared acceptance run, so the run tests one tree.
-- `whoami` — `scripts/whoami` modules and tests, the six registration blocks.
-- `consumers` — `scripts/accounts`, `scripts/shutdown`, `scripts/production`, `scripts/message`, `scripts/nightly_review`, `scripts/agents`, `scripts/herdr`, and their tests.
-
-**Constraints from prior phases:** Tests sit beside the code (Delegation Context); after this phase they import the six modules by the package name, the same object the code uses. Tests never touch live dirs: `HOME`, `AGENT_NOTES_DIR` and the patched `note_file.AGENTS_DIR` point at scratch folders. No `Any`, no file-level ignores.
-- Phase 94c: `scripts/accounts/accounts.py` now also calls `agent_accounts.usage_store_warning_line` and reads `agent_accounts.UsageClaimFailed`, `UsageSaveFailed` and `Report.store_warnings`; type identity of these classes depends on the one module object. `scripts/accounts/role_map.py` has no bare import of the six modules.
-- Phases 96–99 edit `accounts.py`, `role_map.py`, `refusal_watch.py`, `quota_alert.py`, `five_hour.py` and `settle.py` bodies. Phase 99 changes `settle.py` `begin`, `now`, the timer save and `send_showrunner_line`, and `scripts/message/send.py`; this phase starts only after its remerge (Depends on) and changes imports only. herdr-unit also edits `settle.py`; merge origin/natedev before the work starts and before the gate.
-- Phase 99 behavior this phase keeps (plan review 2026-10-30). The shutdown and message gates must still pass these tests unchanged: `test_settle.py` `test_archived_restart_reports_back_after_retrying_its_stopping_line`, `test_rerun_down_releases_abandoned_account_registration`, `test_legacy_registration_releases_when_its_last_session_finishes` and `test_rerun_down_keeps_timer_snapshot_for_cancel_after_stop`; `test_restart.py` `test_outcome_replays_a_queued_fallback_without_a_second_back_line`; `test_send.py` `test_a_failed_keyed_session_send_retries_but_a_delivered_send_keeps_its_window` and its queued-copy and later-run tests. Phase 7 proves that the showrunner receives the lines.
-- The `grep` in the acceptance gate found these bare-import files at `5ad6542f`; rerun it at the start to catch files added since.
-- Merge timing: no checkpoint merge during the natedev build hold, 00:05–03:05 EDT (showrunner, 2026-10-29). While any natedev build hold is in force, run no tests, gates or type checks unless this unit holds it; check `build_hold.py status` first.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `whoami`, `accounts`, `shutdown`, `production`, `message`, `nightly_review`, `agents`, `herdr`, `usage`, `nix_env` and `lib`; `basedpyright` on every changed file and each caller module reads `0 errors, 0 warnings, 0 notes`; `grep -rnE '^\s*(import|from) (agent_accounts|account|note_file|session_table|run_out|usage_store)\b' scripts` finds nothing (it covers the `.sh` inline Python too); `grep -rnE 'import_module\("(agent_accounts|account|note_file|session_table|run_out|usage_store)"\)' scripts` finds nothing; no `sys.modules.setdefault` remains in `scripts/whoami`; with `/tmp` as the working directory and only the file's own directory on `sys.path` (as a script run has it), `python3 -c 'import sys; sys.path.insert(0, "<dir>"); import <module>'` imports each changed non-test consumer without `ModuleNotFoundError` (import only; never call its `main`). A file whose name is not an identifier (a hook with hyphens) loads through `importlib.util.spec_from_file_location` and `exec_module` instead. A `.sh` file's changed inline Python runs once in a scratch `HOME` from `/tmp`, import only.
+**Binds later work:** a new consumer of the six modules uses the package form with a module-level root insert. `test_consumers_share_the_one_account_module` compares the `quota_alert` and `accounts` bindings with the one module object.
 
 **Gotchas:**
-- A test that imports a module by the other name gets a second module object. Its `patch.object(note_file, "AGENTS_DIR", …)` then misses the object the code uses, and the code can write to the live notes dir. Change each test's import in the same commit as its module's consumers.
-- Type identity: a `KnownCodexAccount` or `Report` made from one module object fails `isinstance` against the other. A remaining bare import shows as a failing `isinstance` test, not an import error.
-- The unit suites run from the repository root, so the working directory puts the root on `sys.path` and hides a missing root insert. Only the import check from `/tmp` in the acceptance gate finds one.
-- `scripts/whoami/profile_notes_pass.py` patches the pass's write and act calls to no-ops on the module objects it loads. If it keeps a bare name after the registration blocks go, its patches attach to a second module object, and a director's profile run can write the live usage store and run_out log or start a live Codex read. `test_profile_notes_pass.py` `test_argument_free_pass_keeps_all_input_files_unchanged` (zero `usage_store.save_timer_usage` calls, read through the package import) is the guard.
+- Suites run from the repository root put the root on `sys.path` and hide a missing root insert; only an import check from `/tmp`, with only the file's own directory on `sys.path`, finds one.
+- A name built from `owner.__name__` follows the package name, so a literal Counter key such as `"usage_store.save_timer_usage"` reads zero; take the key from the real patch entry.
+- A test that compares two import forms of one module now compares the module with itself and always passes; compare consumer bindings with the one module instead.
+- A module loaded under a second name is a second object: its patches miss the code's object (writes can reach live dirs), and the failure shows as a failing `isinstance`, not an import error.
+- A multi-name import (`import dailies_render, showrunners, note_file`) escapes a `^(import|from) <module>` grep; the multi-name grep catches it.
 
-### Phase 100b — Every consumer imports the showrunner registry by one name  · status: todo
+### Phase 100b — Every consumer imports the showrunner registry by one name  · status: done
 
-**Depends on:** Phase 100 (order only: both change imports in `settle.py`, `restart.py`, `inventory.py`, `cli_fixture.py`, `roster.py` and their tests)
+#### As-built
 
-**Also touches:** the production, herdr, style, shutdown, message, hooks, lint, bevy_upgrade and whoami owners.
-
-#### Work Order
-
-**Goal:** Every consumer imports `scripts/production/showrunners.py` by its package name, `scripts.production.showrunners`, so one module object holds the registry paths. Today 79 files import it bare (`import showrunners`, with `scripts/production` on `sys.path`) and 33 by the package name. The two names load two module objects, each with its own import-time `NOTIFIER_STATE_DIR`, `SESSIONS_DIR` and `SHOWRUNNER_STATE_DIR`. A test that patches one copy leaves the other on the live registry: the watchdog test leak fixed at `33c970ec` came from this. Requested by the natedev showrunner, 2026-10-30.
-
-**Spec:**
-- The package name is the one name, as Phase 100 settles for whoami: it works from every directory with only the repository root on `sys.path`.
-- Change every bare import of `showrunners` (`import showrunners`, `from showrunners import …`, also inside functions and inside a `.sh` file's inline Python) and every `import_module("showrunners")` to the package form.
-- Each consumer file with no module-level root insert adds `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))` before its first `scripts.` import (hooks: the root is `parents[2]` of `scripts/hooks/<file>`; check each path).
-- Fixtures that patch both copies go back to one: `scripts/accounts/test_refusal_watch.py:101` and `:2257`, `scripts/production/merge_gate_test_support.py:437`, `scripts/whoami/test_profile_notes_pass.py:92`, `scripts/shutdown/test_account_move.py:90` and `:548`, and `scripts/lint/memory_admit.py:325`. Each patches the one object the code uses; no patch is dropped.
-- `showrunners.py` itself gets no two-name block. No other behavior changes.
-- Files lists the bare importers at `fcc6d2d5`; rerun the gate's `grep` at the start to catch files added since.
+- Every consumer imports `scripts/production/showrunners.py` by its package name, `scripts.production.showrunners`. No bare `import showrunners`, `from showrunners import`, `import_module("showrunners")` or `"showrunners.…"` patch string remains, also not in `.sh` inline Python or generated test code.
+- One module object holds `NOTIFIER_STATE_DIR`, `SESSIONS_DIR` and `SHOWRUNNER_STATE_DIR`, so a test patch on it reaches all code. `showrunners.py` has no two-name block.
+- Each consumer with no module-level root insert runs `sys.path.insert(0, str(Path(__file__).resolve().parents[2]))` before its first `scripts.` import. This is the settled form, not a copy.
+- Fixtures that patched both copies now patch the one object. The registry setup for tests lives in one helper, `scratch_showrunner_registry` in `scripts/production/showrunner_registry_test_support.py`.
+- `test_dailies_render.py`'s cold-import test now expects `scripts.production.showrunners` in the loaded modules.
 
 **Files:**
-- `scripts/production/add_showrunner.py`, `scripts/production/add_showrunner_test_support.py`, `scripts/production/add_unit.py`, `scripts/production/change_review.py`, `scripts/production/cli_fixture.py`, `scripts/production/codex_winddown.py`, `scripts/production/dailies_input.py`, `scripts/production/live_units.py`, `scripts/production/merge_checkpoint.py`, `scripts/production/merge_gate_test_support.py`, `scripts/production/production_lifecycle.py`, `scripts/production/production_lifecycle_test_support.py`, `scripts/production/production_tree.py`, `scripts/production/promote_showrunner.py`, `scripts/production/proposal_issue.py`, `scripts/production/proposals_folder.py`, `scripts/production/proposals_table.py`, `scripts/production/rename_checkout.py`, `scripts/production/rename_outside.py`, `scripts/production/rename.py`, `scripts/production/rename_test_support.py`, `scripts/production/rename_unit.py`, `scripts/production/retire_unit.py`, `scripts/production/roles_audit.py`, `scripts/production/showrunner_parent.py`, `scripts/production/staff_sources.py`, `scripts/production/stall_watch.py`, `scripts/production/transfer_unit.py`, `scripts/production/unit_lookup.py`, `scripts/production/units_table.py`, `scripts/production/unit_status.sh`, `scripts/production/update_registration.py`, `scripts/production/update_registration_test_support.py`, `scripts/production/test_add_showrunner.py`, `scripts/production/test_change_review.py`, `scripts/production/test_codex_winddown.py`, `scripts/production/test_footer_counts.py`, `scripts/production/test_merge_checkpoint.py`, `scripts/production/test_next_item.py`, `scripts/production/test_production_lifecycle.py`, `scripts/production/test_production_tree.py`, `scripts/production/test_promote_showrunner.py`, `scripts/production/test_proposals_table.py`, `scripts/production/test_rename_checkout.py`, `scripts/production/test_roles_audit.py`, `scripts/production/test_showrunner_parent.py`, `scripts/production/test_showrunners.py`, `scripts/production/test_staff_sources.py`, `scripts/production/test_stall_watch.py`, `scripts/production/test_unit_lookup.py`, `scripts/production/test_units_table.py` — `production` consumers and tests.
-- `scripts/shutdown/inventory.py`, `scripts/shutdown/restart.py`, `scripts/shutdown/settle.py`, `scripts/shutdown/test_account_move.py`, `scripts/shutdown/test_inventory.py`, `scripts/shutdown/test_restart.py`, `scripts/shutdown/test_settle.py` — `shutdown` consumers and tests.
-- `scripts/message/escalate.py`, `scripts/message/rca.py`, `scripts/message/roster.py`, `scripts/message/test_rca.py`, `scripts/message/test_roster.py` — `message` consumers and tests.
-- `scripts/style/add_style.py`, `scripts/style/style_plan.py`, `scripts/style/style_sync.py`, `scripts/style/test_style_plan_split.py`, `scripts/style/test_style_sync.py` — `style` consumers and tests.
-- `scripts/hooks/post-tool-use-context-usage.py`, `scripts/hooks/pre-tool-use-showrunner-move-guard.py`, `scripts/hooks/showrunner-compaction.py` — `hooks` consumers and tests.
-- `scripts/bevy_upgrade/bevy_upgrade.py`, `scripts/bevy_upgrade/cli_test_support.py`, `scripts/bevy_upgrade/upgrade_schedule.py` — `bevy_upgrade` consumers and tests.
-- `scripts/herdr/herdr_sessions.py`, `scripts/herdr/test_herdr_sessions.py` — `herdr` consumers and tests.
-- `scripts/lint/memory_admit.py`, `scripts/accounts/test_refusal_watch.py`, `scripts/whoami/test_profile_notes_pass.py` — both-copy patches go back to one.
-- `scripts/production/test_proposal_issue.py` — a string patch target (`mock.patch("showrunners.production_of")`, line 678) names the package path; `cli_test_support.py` line 280 is generated Python that does the same.
+- `scripts/production/` — consumers, test support and tests on the package import; `showrunner_registry_test_support.py` holds `scratch_showrunner_registry`.
+- `scripts/{shutdown,message,style,hooks,bevy_upgrade,herdr,lint,accounts,whoami}/` — consumers and tests on the package import, with one patch each.
+- `pyrightconfig.json` — the `scripts/bevy_upgrade` environment has `.` in `extraPaths`.
 
-**Workers:** 2 writers, split by directory (no file in both). Both freeze their files before the shared acceptance run.
-- `production` — `scripts/production`.
-- `consumers` — every other folder above.
-
-**Constraints from prior phases:** Phase 100's constraints hold here: tests never touch live dirs, no `Any`, no file-level ignores, no tests or type checks during a natedev build hold this unit does not hold. Merge origin/natedev before the work starts and before the gate.
-
-**Acceptance gate:** `python3 -m unittest discover -s scripts/<dir> -p 'test_*.py'` passes for `production`, `shutdown`, `message`, `style`, `hooks`, `bevy_upgrade`, `herdr`, `lint`, `accounts` and `whoami`; `basedpyright` on every changed file and each caller module reads `0 errors, 0 warnings, 0 notes`; `grep -rnE '^\s*(import showrunners\b|from showrunners import)|import_module\("showrunners"\)|patch(\.object)?\("showrunners\.' scripts` finds nothing, and `grep -rn 'import showrunners' scripts` finds no embedded or generated import (it covers `.sh` inline Python too); the import check from `/tmp` in Phase 100's gate passes for each changed non-test consumer; the four `test_unit_watchdog.py` grace and slow-probe tests pass with a poisoned outer registry (a fake `showrunners` module on `sys.path` whose `NOTIFIER_STATE_DIR` names a scratch folder), as at `33c970ec`.
+**Binds later work:** A new consumer imports `from scripts.production import showrunners` after the root insert. A test that isolates the registry uses `scratch_showrunner_registry`.
 
 **Gotchas:**
-- Phase 100's first three gotchas apply to this module too: a second module object misses a patch, fails `isinstance`, and a root insert hidden by the working directory shows only in the `/tmp` import check.
+- A second module object for one file misses a patch, fails `isinstance`, and a root insert that the working directory hides shows only in an import check run from `/tmp`.
+- A name built from `owner.__name__` follows the package name, so a literal key for the old name reads zero from a `Counter` and its guard can never fail.
+- A test that compares two import forms of one module compares it with itself once one form goes; test real consumers instead.
+- `pyrightconfig.json` environments need `.` in `extraPaths` for `scripts.production.*` imports.
+- The style suite needs the real HOME (`~/rust/nate_style`); a scratch HOME gives `setUpClass` errors that are not code defects.
 
-### Phase 101 — The account readout names a turned-off MCP server only where it differs from ~/.claude  · status: todo
+### Phase 100c — The five-hour alert test holds across daylight-saving  · status: done
+
+#### As-built
+
+- `five_hour.watch(reports, *, now: datetime | None = None, codex_readings=...)` resolves `now` once (the real UTC clock when absent) and passes it on; fixture reading times come from the same `now`, because `selected_codex_report` refuses readings whose times disagree.
+- `quota_alert.resolve_codex_readings(value, *, now)`, `ahead(resets, *, now)` and `low(notes, threshold, *, now)` take a required `now: datetime`; only the entry points `alert`, `refresh` and `_route_refusal` read the real clock, then pass it on.
+- Tests use fixed clocks: `test_five_hour.py` has one `NOW` of 2026-10-15 18:20 UTC with the reset at 21:20 UTC that day and keeps the literal `resets at 14:20 PDT`; `test_agent_notes.ResetTimeTests` passes one class-level fixed `now` to `ahead`; `test_quota_alert_claude` passes its `self.now` to `low`.
+- Alert text is unchanged. The whoami suite passes on any run date, also under faketime after the Nov 1 clock change.
+
+**Files:**
+- `scripts/whoami/five_hour.py` — `watch` with the injectable `now`.
+- `scripts/whoami/quota_alert.py` — helpers with a required `now`; entry points read the clock.
+- `scripts/whoami/test_five_hour.py` — fixed `NOW` and reset instant in PDT.
+- `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_quota_alert_claude.py` — fixed clock passed to `ahead` and `low`.
+
+**Gotchas:** The checkpoint assertion guard reads an assert whose call gains an argument as removed when a class attribute is inserted above it; such a commit needs Assertion-Change lines.
+
+**Ruled out:** Taking the expected text from the alert's formatter: the literal `resets at 14:20 PDT` stays so the test still catches a formatter defect.
+
+### Phase 101 — The account readout names a turned-off MCP server only where it differs from ~/.claude  · status: done
 
 **Depends on:** Phase 100 (order only; both edit `scripts/accounts/accounts.py`).
 
-#### Work Order
+#### As-built
 
-**Goal:** The accounts readout reports an MCP server difference as one short, exact line per account and server, and only where the account differs from the same project in `~/.claude`. Today `mcpServers differ from ~/.claude` lists `- brp` for claude2 and claude3 with no project count and a step that sends the user to read two whole config files. Showrunner design, approved 2026-10-30.
-
-**Spec:**
-- `_mcp_differences` keeps its per-project comparison: the home scope, then each project path from either file, with a project absent from one file compared against that file's global servers. It returns, per server and direction, the project paths where the account differs (`turned off` = on in `~/.claude`, off in the account; `turned on` = the reverse). A project where both files agree adds nothing.
-- The problem line reads, per account and server: `claude2 turns brp off in 3 projects where ~/.claude does not: <command>` (and `… turns <server> on in N project(s) where ~/.claude does not: <command>`). One project reads `1 project`. The home scope counts as a project named `~` in the count.
-- `<command>` is one read-only command the user can paste that prints those project paths from the account's `.claude.json` (for example a `jq` filter on `.projects` for that server). It changes no file.
-- When no project differs, there is no MCP line. An unreadable `~/.claude` config keeps its current `mcp_baseline_problems` line.
-- The `--detail` match at `accounts.py:5003` follows the new text.
-- No change to which accounts are read, to the config files, or to the brp setting itself (the user's open question).
+- `_mcp_differences` compares the home scope (`~`) and every project path from either file, sorted; a project absent from one file compares against that file's global servers. It returns `McpServerDifferences(entries: tuple[McpServerDifference, ...])`, each `McpServerDifference(server, direction: McpDirection, projects)`, with `McpDirection = Literal["off", "on"]`. A project where both files agree adds nothing.
+- `_inspect_mcp_configuration(directory) -> McpConfigurationInspection` is the one read of `~/.claude`'s config and the account's `.claude.json` under the linked-folder rule; `_status_for` and `mcp_projects` both call it. `AccountStatus.mcp_differences` replaces `missing_mcp_servers`/`extra_mcp_servers`.
+- The readout prints one line per account, server and direction: `claude2 turns brp off in 3 projects where ~/.claude does not: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py mcp-projects claude2 brp off` (`1 project` when one). The line's cause location is `McpServerCause(server, direction)`, so `merge_status_problems` keeps each line. Terminal and JSON `problems` carry the same lines; the `--detail` read-warning match follows the new text.
+- `accounts.py mcp-projects <account> <server> <off|on>` is read-only and prints one project path per line, `~` for the home scope. The printed command puts `--` before its arguments only when one starts with `-`.
+- `docs/accounts.md` describes the MCP line as the one exception to the problem-line form, and the command.
 
 **Files:**
-- `scripts/accounts/accounts.py` — `_mcp_differences`, `McpServerDifferences`, `AccountStatus` MCP fields, the problem text and the `--detail` match.
-- `scripts/accounts/test_accounts.py` — tests.
+- `scripts/accounts/accounts.py` — comparison result, shared inspection, problem lines, cause identity, `--detail` match, `mcp-projects`.
+- `scripts/accounts/test_accounts.py` — acceptance cases and the leading-dash server regression.
+- `docs/accounts.md` — the MCP line and `mcp-projects`.
 
-**Workers:** 1 writer + 1 tester. `impl` owns `scripts/accounts/accounts.py`; `test` owns `scripts/accounts/test_accounts.py`.
+**Gotchas:** Before Phase 101b, the accounts suite failed two `test_cutover_home` tests when run from a real home; Phase 101b fixed that.
 
-**Acceptance gate:** in a scratch `HOME`, a test home whose `.claude.json` turns `brp` off in 3 projects that `~/.claude` leaves on prints exactly `claude2 turns brp off in 3 projects where ~/.claude does not: <command>`, and running `<command>` against that file prints those 3 paths; a home that matches `~/.claude` in every project prints no MCP line; a project present in only one file compares against the other file's global servers. `python3 -m unittest discover -s scripts/accounts -p 'test_*.py'` passes; `basedpyright` on both files reads `0 errors, 0 warnings, 0 notes`.
+### Phase 101b — The accounts tests pass when run from a real home  · status: done
+
+**Depends on:** Phase 101 (order only; both edit `scripts/accounts/test_accounts.py`).
+
+#### As-built
+
+- `scripts/accounts/home_test_support.scratch_account_home(home, environment, *, clear=True)` is the one fixture that sets a test's `HOME`. It also enters `scripts/production/showrunner_registry_test_support.scratch_showrunner_registry(home)`, because `showrunners.py` computes its registry, sessions and notifier folders from `Path.home()` at import.
+- Nine accounts test files use it in place of their own `HOME` patches: `test_accounts`, `test_cutover_home`, `test_launch_accounts`, `test_moves`, `test_new_account`, `test_next_moves`, `test_refusal_watch`, `test_refusals`, `test_role_map`. No product change, no assertion change.
+- The suite passes from the real home and from a scratch `HOME` (835 tests).
+
+**Files:**
+- `scripts/accounts/home_test_support.py` — the fixture.
+- `scripts/accounts/test_*.py` (nine files above) — callers.
+
+### Phase 101c — A failed CI point names its cause  · status: done
+
+**Depends on:** none (order only).
+
+#### As-built
+
+- `scripts/lib/process_failure.failure_detail(result, *, lines=20)` returns the last `lines` lines of stderr and of stdout, each labelled (`stderr: …`, `stdout: …`), stderr first, an empty stream left out, and `exit <code>` when both are empty.
+- `ci_points.py` uses it in `required`, the validation step and the review watch; `merge_checkpoint.push_validate` uses it for its validate_and_push failure. `report()` joins the lines with `; `, so each step is still one line. A validation failure with no output now reads `exit <code>`, not `validation failed`.
+- 37 other copies of the old pattern remain; Phase 101e moves them.
+
+**Files:**
+- `scripts/lib/process_failure.py`, `scripts/lib/test_process_failure.py` — helper and its tests.
+- `scripts/production/ci_points.py`, `scripts/production/merge_checkpoint.py` — callers.
+- `scripts/production/test_ci_points.py` — memory-wait stderr with the failing check on stdout.
+
+### Phase 101d — A CI point validates one fixed commit  · status: done
+
+#### As-built
+
+- `ci_points.py ci start` records the merge branch tip and validates it in a private `git clone --shared --no-checkout` copy under the state dir, with `CARGO_TARGET_DIR=<copy>/target`. The production checkout is never the validation tree. The copy is removed when the run ends, pass or fail.
+- `validate_and_push.sh --validate-only` runs validation in the copy and makes at most one fix commit there. It does not push.
+- Publish runs under `merge_checkpoint.merge_lock`: it fetches the copy's `HEAD` into the production checkout, does a guarded `git merge --ff-only`, then runs `push_direct.sh --publish-only <sha>`, which prints `<sha> pushed` or `<sha> contained`.
+- The publish rule: if `origin/<merge branch>` contains the sha, the run passes and nothing is pushed. A fix commit is pushed only when it fast-forwards `origin/<merge branch>`. Otherwise the run fails with `merge branch moved during validation`. Nothing is ever force-pushed.
+- After the lock is released, `push_direct.sh --follow-published <sha> <state>` runs the hook, the CI-run lookup and the cancellation of older runs (`CANCEL_PRIOR` env). The validation report line follows the publish receipt. Failures keep `failure_detail`.
+
+**Files:**
+- `scripts/production/ci_points.py` — the fixed sha, the copy, publish under `merge_lock`, the report line.
+- `scripts/validate_and_push/push_direct.sh` — the one publish rule (`--publish-only`), the follow step (`--follow-published`), `cancel_prior_runs`.
+- `scripts/validate_and_push/validate_and_push.sh` — `--validate-only`.
+- `scripts/production/test_ci_points.py` — copy, contained, fast-forward, moved-branch, retry and lock-wait cases.
+
+**Binds later work:** The publish rule and the cancellation of older runs live only in `push_direct.sh`; other callers use them there. A fix commit reaches the local merge branch through the fetch and `--ff-only` merge under `merge_lock`, so the local branch and `origin` stay equal. The outcomes `pushed`, `contained` and `merge branch moved during validation` show in the CI point's validation line.
+
+**Gotchas:**
+- A push of a fix commit from the copy alone leaves the local merge branch stale: collect rejects it, a rerun makes a second fix, and a later merge-gate push is refused. The fix must go through the checkout under the lock.
+- A retry after a failed publish starts with the local branch at fix F; the publish rule fast-forwards `origin` to F.
+- Copy disk use, peak memory and the fresh-target build time are not yet measured. They are measured at the first real CI point and reported to the showrunner.
+
+**Ruled out:** `--ci-base` (removed); validation in the production checkout; a shared cargo target folder with the checkout (a merge gate builds there at the same time); a second copy of the CI-run lookup or `cancel_prior_runs`.
+
+### Phase 101e — One helper reports a failed command's output  · status: done
+
+#### As-built
+
+- `failure_detail(result: subprocess.CompletedProcess[str], *, lines: int = 20) -> str` in `scripts/lib/process_failure.py` is the one way to describe a failed command. It returns labelled tails of both streams, `stderr: …` first and then `stdout: …`, each cut to the last `lines` lines. It omits an empty stream. When both streams are empty, it returns `exit <code>`. A `lines` value below 1 raises `ValueError`.
+- All 24 non-test modules that had a local `stderr.strip() or stdout.strip()` fallback (either order) now call `failure_detail`. `waiting.detail` stays as a one-call wrapper.
+- Callers keep their command-name prefix (`send.py: …`, `mesh: …`) in front of `failure_detail(result)`, so each message still names its source.
+- A scan test walks every non-test `.py` file under `scripts/` with `ast` and fails on a stream fallback outside `process_failure.py`. Conditions that test both streams (`if result.stdout.strip() or result.stderr.strip()`) do not match.
+
+**Files:**
+- `scripts/lib/process_failure.py` — `failure_detail`
+- `scripts/lib/test_process_failure.py` — the scan test and the helper's output tests
+- `scripts/production/unit_status_test_support.py` — the fixed list of lib files the unit-status fixture copies; includes `process_failure.py`
+- `scripts/production/` — 9 callers: `add_unit`, `codex_winddown`, `dailies_input`, `merge_checkpoint`, `merge_gate`, `production_lifecycle`, `unit_move`, `update_registration`, `waiting`
+- `scripts/{bevy_upgrade,build_hold,direct,herdr,lib,lint,message,nightly_review,shutdown,style,whoami}/` — the other 15 callers; their tests expect the `stderr:`/`stdout:` labels
+
+**Gotchas:** `unit_status_test_support.py` copies lib files into its fixture by a fixed list. A new lib helper that a copied module imports must join that list, or the unit-status suites fail on import.
+
+**Ruled out:** a local `stderr or stdout` fallback at a call site, because it drops one stream; the scan test fails on it.
+
+### Phase 101f — A queued quota alert counts as delivered again  · status: done
+
+#### As-built
+
+- `quota_alert.relay` reads `send.py`'s result with `scripts.message.send.parse_outcome`. For a QUEUED outcome (exit 1) it returns `QUEUED: <why>`, so `refusal_watch` treats a queued cleared-hold notice as delivered and enqueues it once. Every other failure still uses `failure_detail`.
+- The add-showrunner refusal test expects the labelled herdr stream: `herdr session list: stderr: …`.
+
+**Files:**
+- `scripts/whoami/quota_alert.py` — `relay` keeps send.py's QUEUED header
+- `scripts/production/test_add_showrunner.py` — the herdr refusal text
+
+**Gotchas:** `refusal_watch` decides "queued" from the text `not delivered: QUEUED:` in the delivery outcome line. A change to `relay`'s text breaks that check.

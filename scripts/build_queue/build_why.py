@@ -53,6 +53,8 @@ def charge_text(basis: gate.ChargeBasis, zone: ZoneInfo) -> str:
         return "promise: no reading yet"
     if isinstance(basis, gate.RampPromise):
         return f"ramp promise: first {gate.RAMP_SECONDS // 60} min after admission"
+    if isinstance(basis, gate.LifetimePromise):
+        return "release build promise: holds until the step ends"
     if isinstance(basis, gate.PeakSoFar):
         text = f"compiling, peak so far {gib(basis.bytes)}"
         if isinstance(basis.peak_at, float):
@@ -79,6 +81,32 @@ def charge_text(basis: gate.ChargeBasis, zone: ZoneInfo) -> str:
 def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:
     if isinstance(source, gate.NeedSourceNotRecorded):
         return "source not recorded"
+    basis = source.basis
+    if isinstance(basis, (gate.ShapeP90, gate.ShapeLargest, gate.ShapeFallback)):
+        if isinstance(basis, gate.ShapeP90):
+            text = f"same-shape p90 of {basis.runs} runs"
+        elif isinstance(basis, gate.ShapeLargest):
+            text = f"same-shape largest peak of {basis.runs} runs"
+        else:
+            text = "same-shape fallback: no runs; heavier of fallback and same-profile builds"
+        text += f", last {source.history_days} days"
+        if isinstance(basis, gate.ShapeFallback):
+            text += "; no headroom factor"
+        else:
+            if isinstance(basis.floor, gate.FailedPeakFloor):
+                text += (f"; failed-build floor {gib(basis.floor.peak)} from "
+                         + minute(datetime.fromisoformat(basis.floor.ended_at).timestamp(), user_zone()))
+            else:
+                text += "; no failed-build floor"
+            if isinstance(basis.factor, gate.ReleaseHeadroom):
+                text += f"; release headroom × {basis.factor.factor:.3f}"
+            elif isinstance(basis.factor, gate.DevHeadroom):
+                text += f"; dev promise factor × {basis.factor.factor:.3f}"
+            else:
+                text += "; no headroom factor"
+        text += (f"; capped at {gib(gate.BUILD_BUDGET_BYTES)} (uncapped {gib(basis.cap.uncapped)})"
+                 if isinstance(basis.cap, gate.CappedAtBudget) else "; under build budget")
+        return text
     if source.source == "measured":
         text = f"measured process-memory p90 of {source.runs} runs"
     elif source.source == "buildlog":
@@ -87,6 +115,8 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:
         text = f"pooled over all repos, {source.runs} runs"
     elif source.source == "fallback":
         text = "fallback: fewer than 5 runs"
+    elif source.source == "shape":
+        text = "same-shape promise: basis not recorded"
     else:
         assert_never(source.source)
     text += f", last {source.history_days} days"
@@ -100,10 +130,8 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:
 
 
 def budget_text(check: gate.BudgetCheck) -> str:
-    total = check.charged + check.need + check.head_need
+    total = check.charged + check.need
     terms = f"charged {check.charged / gate.GIB:.1f} + need {check.need / gate.GIB:.1f}"
-    if check.head_need:
-        terms += f" + head need {check.head_need / gate.GIB:.1f}"
     relation = "<=" if total <= check.budget else ">"
     result = "pass" if check.passes else "blocked"
     exception = "; run-alone exception" if check.passes and total > check.budget else ""
@@ -114,8 +142,6 @@ def budget_text(check: gate.BudgetCheck) -> str:
 def free_text(check: gate.FreeCheck) -> str:
     terms = f"need {check.need / gate.GIB:.1f} + earlyoom {check.reserve / gate.GIB:.1f}"
     terms += f" + promise not yet used {check.growth / gate.GIB:.1f}"
-    if check.head_need:
-        terms += f" + head need {check.head_need / gate.GIB:.1f}"
     relation = ">=" if check.passes else "<"
     result = "pass" if check.passes else "blocked"
     return f"Free memory: free {gib(check.available)} {relation} {terms} = {gib(check.threshold)}: {result}"
@@ -129,20 +155,30 @@ def pressure_text(pressure: gate.MemoryPressure, zone: ZoneInfo) -> str:
 
 
 def release_text(explanation: gate.QueueExplanation,
-                 labels: Mapping[str, roster.UnitLabels]) -> str:
+                 labels: Mapping[str, roster.UnitLabels], zone: ZoneInfo) -> str:
     release = gate.smallest_head_release(explanation)
-    if isinstance(release, gate.HeadAdmitsAfterEnd):
+    if isinstance(release, gate.HeadRelease):
         if not release.ended:
-            return "no running step needs to end"
-        names = [build_queue.step_labels(explanation.running[index].step, labels).session
-                 + " " + explanation.running[index].step.step for index in release.ended]
-        return (f"{' + '.join(names)} end (budget charge drops {gib(release.charge_drop)}; "
-                + f"free memory rises {gib(release.freed)} and promise not yet used drops {gib(release.growth_drop)})")
-    if isinstance(release, gate.HeadStillHeld):
-        return "all running steps ending still leaves " + ", ".join(release.causes) + " holding the head"
-    if isinstance(release, gate.ReadingUnavailable):
-        return "admission memory reading unavailable"
-    return "nothing waits"
+            text = "no running step needs to end"
+        else:
+            names = [build_queue.step_labels(explanation.running[index].step, labels).session
+                     + " " + explanation.running[index].step.step for index in release.ended]
+            text = (f"{' + '.join(names)} end (budget charge drops {gib(release.charge_drop)}; "
+                    + f"free memory rises {gib(release.freed)} and promise not yet used drops {gib(release.growth_drop)})")
+        if isinstance(release, gate.HeadStartsAt):
+            starts_at = datetime.fromtimestamp(release.at, zone).strftime("%H:%M:%S %Z")
+            text += ("; then " if release.ended else "; ") + f"recovery spacing starts it at {starts_at}"
+    elif isinstance(release, gate.HeadStillHeld):
+        text = "all running steps ending still leaves " + ", ".join(release.causes) + " holding the head"
+    elif isinstance(release, gate.ReadingUnavailable):
+        text = "admission memory reading unavailable"
+    else:
+        text = "nothing waits"
+    head = explanation.head
+    if (isinstance(head, gate.HeadExplanation) and isinstance(head.decision.pressure, gate.MemoryPressure)
+            and not isinstance(release, gate.HeadStartsAt)):
+        text += "; the pressure hold or recovery spacing must also clear"
+    return text
 
 
 def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
@@ -211,9 +247,7 @@ def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
         causes = ["ready for the next admission check"]
     elif not causes:
         causes = ["queue order"]
-    releases = release_text(explanation, labels)
-    if isinstance(head.decision.pressure, gate.MemoryPressure):
-        releases += "; the pressure hold or recovery spacing must also clear"
+    releases = release_text(explanation, labels, zone)
     lines.extend(("", "Waiting because: " + ", ".join(causes) + ". Frees when: " + releases + "."))
     return lines
 

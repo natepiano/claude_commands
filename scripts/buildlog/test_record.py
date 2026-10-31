@@ -174,6 +174,21 @@ class RecordTests(unittest.TestCase):
             found += [cast(Record, json.loads(line)) for line in path.read_text().splitlines()]
         return found
 
+    def test_floor_scan_records_free_space_shortfall_and_the_idle_target_inventory(self) -> None:
+        targets: list[recorder.IdleFloorTarget] = [
+            {"folder": "/trees/older/target", "last_use": START - 7200, "bytes": 123456},
+            {"folder": "/trees/recent/target", "last_use": START - 60, "bytes": 789012},
+        ]
+        recorder.floor_scan(7 << 30, 10 << 30, targets, START)
+        row, = self.records()
+        self.assertEqual((row["kind"], row["v"], row["host"], row["at"]),
+                         ("floor_scan", recorder.RECORD_VERSION, store.host_name(), store.utc_iso(START)))
+        self.assertEqual((row["free_after_scan"], row["floor"], row["shortfall"]),
+                         (7 << 30, 10 << 30, 3 << 30))
+        self.assertEqual(row["idle_targets"], targets)
+        self.assertIsInstance(row["id"], str)
+
+
     def handoff(self) -> Path:
         path = self.base / "handoff.log"
         _ = shutil.copyfile(TESTDATA / "nextest.txt", path)
@@ -741,15 +756,6 @@ class RecordTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.records()[-1]["mac_holder"], "hana nextest")
-
-    def test_queue_bump_uses_the_hold_event_log_and_names_the_move(self) -> None:
-        recorder.queue_bump("actor-id", "moved-id", "nextest", "/tmp/tree", 4, START)
-        row = self.records()[-1]
-        self.assertEqual({key: row[key] for key in ("kind", "actor", "session", "step", "folder", "old_position")},
-                         {"kind": "queue_bump", "actor": "actor-id", "session": "moved-id", "step": "nextest",
-                          "folder": "/tmp/tree", "old_position": 4})
-        self.assertEqual(row["at"], store.utc_iso(START))
-        self.assertTrue(store.host_file(store.host_name(), START).exists())
 
     def test_hold_event_keeps_the_key_and_the_locked_utc_time(self) -> None:
         result = self.record("hold-event", "began", "mac", "block-key", "hana", "render",

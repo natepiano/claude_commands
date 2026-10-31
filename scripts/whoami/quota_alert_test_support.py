@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
-
-from scripts.whoami.note_file import note_name
-
 import io
 import base64
 import json
@@ -22,19 +18,23 @@ from pathlib import Path
 from typing import ClassVar, cast, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.test_agents_registry import ExactRows, registry_text, write_registry
+from scripts.whoami.note_file import note_name
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import quota_alert
 from push_texts import RenderedPush
 from scripts.whoami import agent_accounts
-from agent_accounts import ClaudeAccountsInUse, CodexHomeSource, Quota, Report
+from scripts.whoami.agent_accounts import ClaudeAccountsInUse, CodexHomeSource, Quota, Report
 import agent_notes
-import session_table
-import note_file
-import account
-import usage_store
+from scripts.whoami import session_table
+from scripts.whoami import note_file
+from scripts.whoami import account
+from scripts.whoami import usage_store
 from agent_notes import local_reset
-from note_file import read_note
+from scripts.whoami.note_file import read_note
 from scripts.accounts import accounts, moves, next_moves, role_map
 from scripts.production import showrunners
 
@@ -267,7 +267,7 @@ class QuotaReminderFixture(unittest.TestCase):
             return_value=account.Account("claude", identity.login, identity.label)))
 
     def stored_room(self, login: str, left: float, days: float) -> None:
-        import usage_store
+        from scripts.whoami import usage_store
         saved = usage_store.load()
         saved[usage_store.key("Claude", login)] = usage_store.StoredUsage(weekly=usage_store.StoredWindow(
             left=left, at=datetime.now(timezone.utc).isoformat(),

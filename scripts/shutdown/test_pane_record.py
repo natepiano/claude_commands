@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
-import pane_record  # first: it puts the whoami scripts on the path
-import account  # noqa: E402  Imported before a test sets the platform to the Mac: urllib checks it on import.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+import pane_record
+from scripts.whoami import account  # noqa: E402  Imported before a test sets the platform to the Mac: urllib checks it on import.
 
 HOOK = Path(__file__).resolve().parent.parent / "hooks/session-start-pane-record.py"
 BASH = shutil.which("bash") or "/bin/sh"

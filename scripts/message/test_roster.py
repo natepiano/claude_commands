@@ -19,6 +19,8 @@ from collections.abc import Mapping
 from contextlib import AbstractContextManager, ExitStack, redirect_stderr, redirect_stdout
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
@@ -44,7 +46,7 @@ import unit_runs
 import herdr
 from fake_herdr import CommandResponse, herdr_listener
 import sessions
-import showrunners
+from scripts.production import showrunners
 if TYPE_CHECKING:
     from ..whoami import account, agent_accounts
 else:

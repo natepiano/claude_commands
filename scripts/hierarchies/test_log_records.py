@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime, timezone
 import unittest
 
 from scripts.hierarchies import log_records
@@ -55,7 +56,117 @@ def read_report_blocks(output: str) -> list[log_records.MeasureRow]:
     return rows
 
 
+class ReportTimeTest(unittest.TestCase):
+    def test_date_only_window_end_includes_that_day_and_time_end_stays_exclusive(self) -> None:
+        now = datetime(2026, 11, 1, tzinfo=timezone.utc)
+        expected = log_records.Window(log_records.required_time("2026-10-23"), log_records.required_time("2026-10-31"))
+        self.assertEqual(log_records.parse_window("2026-10-23..2026-10-30"), expected)
+        self.assertEqual(log_records.window_bounds("2026-10-23", "2026-10-30", now), expected)
+        timed = log_records.parse_window("2026-10-23T12:00:00Z..2026-10-30T12:00:00Z")
+        self.assertEqual(timed, log_records.Window(datetime(2026, 10, 23, 12, tzinfo=timezone.utc),
+                                                  datetime(2026, 10, 30, 12, tzinfo=timezone.utc)))
+        self.assertFalse(timed.contains(timed.until))
+        for text in ("2026-10-31..2026-10-30", "2026-10-30T12:00Z..2026-10-30T12:00Z"):
+            with self.subTest(window=text), self.assertRaises(ValueError):
+                _ = log_records.parse_window(text)
+
+    def test_strict_timestamps_keep_offsets_and_refuse_an_unrecorded_offset(self) -> None:
+        expected = datetime(2026, 10, 13, 21, 24, tzinfo=timezone.utc)
+        for value in ("2026-10-13T21:24:00Z", "2026-10-13T17:24:00-04:00", expected):
+            with self.subTest(value=value):
+                at = log_records.strict_time(value)
+                self.assertEqual(at, expected)
+                self.assertIsNotNone(at.utcoffset())
+        for value in ("2026-10-13T17:24:00", datetime(2026, 10, 13, 17, 24)):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "offset"):
+                _ = log_records.strict_time(value)
+        for value in ("bad time", "", 1791926640):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _ = log_records.strict_time(value)
+        self.assertEqual(log_records.required_time("2026-10-13T17:24:00").tzinfo,
+                         log_records.required_time("2026-10-13").tzinfo)
+
+
+class SourceProblemTest(unittest.TestCase):
+    def test_problem_identity_preserves_source_kind_and_skipped_count(self) -> None:
+        state = log_records.SourceProblem("same input", "access denied", log_records.SourceNotApplicable.STATE)
+        phases = log_records.SourceProblem("same input", "access denied", log_records.EventSource.PHASES)
+        skipped_one = log_records.SourceProblem("same input", "access denied", log_records.EventSource.PHASES,
+                                                log_records.RowsSkipped(1))
+        skipped_two = log_records.SourceProblem("same input", "access denied", log_records.EventSource.PHASES,
+                                                log_records.RowsSkipped(2))
+        repeated = log_records.SourceProblem("same input", "access denied", log_records.EventSource.PHASES)
+        problems = list(dict.fromkeys((state, phases, skipped_one, skipped_two, repeated)))
+        self.assertEqual(problems, [state, phases, skipped_one, skipped_two])
+        window = log_records.parse_window("2026-10-13..2026-10-19")
+        rows = log_records.source_problem_rows(problems, window)
+        self.assertEqual([(row.event_source, row.quantity) for row in rows], [
+            (log_records.SourceNotApplicable.STATE, log_records.NotRecorded("access denied")),
+            (log_records.EventSource.PHASES, log_records.NotRecorded("access denied")),
+            (log_records.EventSource.PHASES, log_records.Diagnostic(1, "access denied")),
+            (log_records.EventSource.PHASES, log_records.Diagnostic(2, "access denied")),
+        ])
+
+
 class ReportBlocksTest(unittest.TestCase):
+    def test_most_common_window_and_source_head_mixed_snapshot_and_window_rows(self) -> None:
+        rows = [log_records.MeasureRow("Live units", "3", 3, "snapshot now", "unit roster"),
+                log_records.MeasureRow("Build minutes", "12", 2, "seven days", "build ledger"),
+                log_records.MeasureRow("Build count", "2", 2, "seven days", "build ledger"),
+                log_records.MeasureRow("Other build", "4", 1, "seven days", "other ledger")]
+        output = log_records.blocks("Capacity", rows)
+        heading, *blocks = output.split("\n\n")
+        self.assertEqual(displayed_fields(heading.splitlines(), {}),
+                         {"window": "seven days", "source": "build ledger"})
+        self.assertEqual(output.count("Window:"), 1)
+        self.assertEqual(output.count("Source:"), 1)
+        self.assertEqual([line.strip().partition(":")[0] for line in blocks[0].splitlines()[1:]],
+                         ["value", "n", "window", "source"])
+        self.assertTrue(all("  window:" not in block and "  source:" not in block for block in blocks[1:3]))
+        self.assertNotIn("  window:", blocks[3])
+        self.assertIn("  source: other ledger", blocks[3])
+        self.assertEqual(read_report_blocks(output), rows)
+        self.assertEqual(phone_overflow_lines(output), [])
+
+    def test_tied_heading_fields_use_the_first_rows_value_independently(self) -> None:
+        rows = [log_records.MeasureRow("First", "1", 1, "snapshot", "log B"),
+                log_records.MeasureRow("Second", "2", 2, "window", "log A"),
+                log_records.MeasureRow("Third", "3", 3, "window", "log B"),
+                log_records.MeasureRow("Fourth", "4", 4, "snapshot", "log A")]
+        output = log_records.blocks("Tied evidence", rows)
+        heading, *blocks = output.split("\n\n")
+        self.assertEqual(displayed_fields(heading.splitlines(), {}), {"window": "snapshot", "source": "log B"})
+        self.assertNotIn("  window:", blocks[0])
+        self.assertNotIn("  source:", blocks[0])
+        self.assertEqual(output.count("  window: window"), 2)
+        self.assertEqual(output.count("  source: log A"), 2)
+        self.assertEqual(read_report_blocks(output), rows)
+        self.assertEqual(phone_overflow_lines(output), [])
+
+    def test_id_lists_keep_every_id_in_heading_or_row_sources(self) -> None:
+        for kind in ("phases", "waits"):
+            for count in (3, 4):
+                for shared in (False, True):
+                    with self.subTest(kind=kind, count=count, shared=shared):
+                        identities = [f"run/identity-{index}" for index in range(count)]
+                        source = "recorded history; " + kind + ": " + ", ".join(identities)
+                        rows = [log_records.MeasureRow("First cause", "ambiguous", count, "window", source),
+                                log_records.MeasureRow("Other cause", "different", count, "window",
+                                                      source if shared else "other source")]
+                        output = log_records.blocks("History", rows)
+                        parsed = read_report_blocks(output)
+                        self.assertEqual(parsed, rows)
+                        self.assertNotIn("+1 more", output)
+                        self.assertEqual(rows[0].source, source)
+                        self.assertEqual(phone_overflow_lines(output), [])
+
+    def test_recorded_reason_occurrence_count_is_preserved_beside_candidates(self) -> None:
+        value = "phase attribution is ambiguous (26 times); candidates: run=hana-run; phase=4; cwd=not recorded"
+        rows = [log_records.MeasureRow("Uncertain coverage", value, 26, "window", "recorded phases")]
+        output = log_records.blocks("Wait evidence", rows)
+        self.assertEqual(read_report_blocks(output), rows)
+        self.assertEqual(phone_overflow_lines(output), [])
+
     def test_shared_window_and_source_appear_once_above_the_row_blocks(self) -> None:
         window = "2026-10-13 17:24 EDT to 2026-10-20 17:24 EDT (end excluded)"
         source = "progress history with recorded phase identities"
@@ -127,7 +238,7 @@ class ReportBlocksTest(unittest.TestCase):
                                       "window", "read " + path + " without changing it")]
         output = log_records.blocks("Receipt evidence", rows)
         self.assertEqual([line.strip() for line in output.splitlines() if len(line) > log_records.PHONE_WIDTH],
-                         [path, commit])
+                         [commit, path])
         self.assertEqual(read_report_blocks(output), rows)
         self.assertEqual(phone_overflow_lines(output), [])
 

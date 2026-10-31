@@ -2,23 +2,25 @@
 
 from __future__ import annotations
 
-from scripts.lib.test_agents_registry import write_registry
-
 import io
 import json
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 from contextlib import redirect_stdout
 from datetime import timedelta
 from typing import cast
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.lib.test_agents_registry import write_registry
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
 import review
 from push_texts import render
 import agent_notes
-import note_file
+from scripts.whoami import note_file
 from user_action import ActionRequired
 from scripts.whoami.quota_alert_test_support import Notes, REAL_TELL_USER, REFUSAL_ACTION, REGISTRY as REGISTRY
 
@@ -66,7 +68,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
     def test_user_delivery_names_success_process_failure_and_launch_failure(self) -> None:
         push = render("quota.claude_next_move", account="claude2", remaining="0%")
         for code, line, expected in ((0, "SENT: to the user", quota_alert.PushSent()),
-                                     (3, "FAILED: channel unavailable", quota_alert.PushFailed("FAILED: channel unavailable"))):
+                                     (3, "FAILED: channel unavailable", quota_alert.PushFailed("stdout: FAILED: channel unavailable"))):
             with self.subTest(code=code), mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], code, line, "")):
                 self.assertEqual(REAL_TELL_USER(push), expected)
         with mock.patch.object(subprocess, "run", side_effect=OSError("sender unavailable")):

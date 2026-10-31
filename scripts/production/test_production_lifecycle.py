@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import fake_unit_host
 import production_lifecycle
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 import showrunner_parent
 from production_units import read_production

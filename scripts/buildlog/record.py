@@ -968,15 +968,6 @@ def hold_event(args: list[str]) -> None:
     store.append_line(store.host_file(host, instant.timestamp()), record)
 
 
-def queue_bump(actor: str, session: str, step: str, folder: str, old_position: int, at: float) -> None:
-    host = store.host_name()
-    store.append_line(store.host_file(host, at), {
-        "kind": "queue_bump", "v": RECORD_VERSION,
-        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
-        "actor": actor, "session": session, "step": step, "folder": folder, "old_position": old_position,
-    })
-
-
 def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step: str,
                    need: int, free: int, reserve: int, why: str, set_by: str, at: float) -> None:
     host = store.host_name()
@@ -985,6 +976,33 @@ def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step
         "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
         "action": action, "unit": unit, "step": step, "need": need, "free": free,
         "reserve": reserve, "why": why, "set_by": set_by,
+    })
+
+
+
+class IdleFloorTarget(TypedDict):
+    folder: str
+    last_use: float
+    bytes: int
+
+
+def floor_scan(free_after_scan: int, floor: int, idle_targets: list[IdleFloorTarget], at: float) -> None:
+    host = store.host_name()
+    store.append_line(store.host_file(host, at), {
+        "kind": "floor_scan", "v": RECORD_VERSION,
+        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
+        "free_after_scan": free_after_scan, "floor": floor, "shortfall": floor - free_after_scan,
+        "idle_targets": idle_targets,
+    })
+
+
+def sweep_trim(folder: str, bytes_freed: int, extent: Literal["whole", "partial"],
+               cause: Literal["budget take", "floor take"], at: float) -> None:
+    host = store.host_name()
+    store.append_line(store.host_file(host, at), {
+        "kind": "sweep_trim", "v": RECORD_VERSION,
+        "id": f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
+        "folder": folder, "bytes_freed": bytes_freed, "extent": extent, "cause": cause,
     })
 
 

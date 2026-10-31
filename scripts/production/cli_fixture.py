@@ -14,19 +14,20 @@ import shutil
 import subprocess
 import sys
 from types import ModuleType
-from typing import TYPE_CHECKING, cast
+from typing import cast
 from unittest.mock import patch
+
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 @contextmanager
 def production_paths(environment: Mapping[str, str]) -> Generator[None]:
     """Bind source readers to the same fixture paths for direct and CLI calls."""
     import dailies_render
-    import showrunners
-    if TYPE_CHECKING:
-        from ..whoami import note_file
-    else:
-        import note_file
+    from scripts.production import showrunners
+    from scripts.whoami import note_file
 
     home = Path(environment.get("HOME", str(Path.home())))
     with ExitStack() as scope:
@@ -65,7 +66,7 @@ def invoke_cli(module: ModuleType, main: Callable[[], int], arguments: list[str]
     if production_state:
         with patch.object(sys, "path", sys.path.copy()):
             _ = import_module("dailies_render")
-            _ = import_module("showrunners")
+            _ = import_module("scripts.production.showrunners")
 
     before = vars(module).copy()
     directory = Path.cwd()

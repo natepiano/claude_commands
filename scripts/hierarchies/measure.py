@@ -4,8 +4,8 @@
 Counts describe recorded work, not proof that commits reached Hana main. Windows
 are half open. Date bounds use the user's zone; a date-only --until includes that
 whole day. A date-time --until is the excluded end.
-The baseline command prints a short summary. Add --full to print the tables
-after the summary.
+The baseline and compare commands print short summaries. Compare takes two
+START..END windows; date-only END includes that day. Add --full to print the tables.
 """
 from __future__ import annotations
 
@@ -14,12 +14,13 @@ from contextlib import closing, redirect_stderr
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import json
 import io
 from functools import lru_cache
+from itertools import groupby
 import math
 import os
 from pathlib import Path
@@ -38,6 +39,7 @@ for directory in ("lib", "production", "message", "direct", "nightly_review"):
 from user_zone import user_zone
 from scripts.accounts.role_map import stored_role_map
 from scripts.hierarchies import log_records, push_audit
+from scripts.hierarchies.log_records import EventSource as EventSource
 from scripts.lib import unit_runs
 from scripts.message import roster
 from scripts.production import showrunners, production_units, issues, change_review, dailies_render
@@ -105,6 +107,8 @@ class WindowTokenUsage:
     repository: str
     tokens: float
     turns: int
+    events: tuple[log_records.TimedAmount, ...] = ()
+    population: tuple[datetime, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -188,7 +192,7 @@ class WaitCandidate:
 
     @property
     def label(self) -> str:
-        return f"run={self.run}; phase={self.phase}; instance={self.instance}; cwd={self.working_dir}"
+        return f"run={self.run}; phase={self.phase}; instance={self.instance}; cwd={self.working_dir or 'not recorded'}"
 
 
 @dataclass(frozen=True)
@@ -525,8 +529,8 @@ def capacity(units: Sequence[Unit], workers: Sequence[Worker], snapshot: str) ->
         scope = "Hana" if hana else "other"
         rows.append(log_records.MeasureRow(
             f"units / {production} / {repo} / {scope}", str(count), count, snapshot,
-            "showrunners + units_table production_units loader",
-        ))
+            "showrunners + units_table production_units loader", quantity=log_records.Snapshot(count),
+        event_source=log_records.SourceNotApplicable.STATE))
     for tree in sorted({worker.worktree for worker in workers}):
         group = [worker for worker in workers if worker.worktree == tree]
         orphan = sum(not worker.director_running for worker in group)
@@ -536,27 +540,30 @@ def capacity(units: Sequence[Unit], workers: Sequence[Worker], snapshot: str) ->
             scope = "scope not recorded"
         rows.append(log_records.MeasureRow(
             f"workers / {worktree} / {scope}", f"{len(group)}; director not running {orphan}",
-            len(group), snapshot, "codex_mesh via session roster; natedev only",
-        ))
+            len(group), snapshot, "codex_mesh via session roster; natedev only", quantity=log_records.Snapshot(len(group)),
+        event_source=log_records.SourceNotApplicable.STATE))
     if not units:
-        rows.append(log_records.MeasureRow("live units", "0", 0, snapshot, "showrunners + units_table"))
+        rows.append(log_records.MeasureRow("live units", "0", 0, snapshot, "showrunners + units_table", quantity=log_records.Snapshot(0), event_source=log_records.SourceNotApplicable.STATE))
     if not workers:
-        rows.append(log_records.MeasureRow("workers", "0", 0, snapshot, "session roster; natedev only"))
+        rows.append(log_records.MeasureRow("workers", "0", 0, snapshot, "session roster; natedev only", quantity=log_records.Snapshot(0), event_source=log_records.SourceNotApplicable.STATE))
     return rows
 
 
 def resource_use(builds: Sequence[BuildStep], tokens: Sequence[WindowTokenUsage], window: log_records.Window) -> list[log_records.MeasureRow]:
     rows: list[log_records.MeasureRow] = []
-    groups: dict[tuple[str, str], list[float]] = defaultdict(list)
+    groups: dict[tuple[str, str], list[BuildStep]] = defaultdict(list)
     for build in builds:
         if window.contains(build.started):
             lane = "test" if build.step in ("test", "nextest", "example-test") else "build/check"
-            groups[(build.repository, lane)].append(build.seconds / 60)
+            groups[(build.repository, lane)].append(build)
     for (repo, lane), values in sorted(groups.items()):
         rows.append(log_records.MeasureRow(
-            f"{lane} minutes / {repo}", f"{sum(values):.1f}", len(values), window.label,
+            f"{lane} minutes / {repo}", f"{sum(build.seconds / 60 for build in values):.1f}", len(values), window.label,
             "buildlog index steps; natedev only; by start time",
-        ))
+            quantity=log_records.EventValue(sum(build.seconds / 60 for build in values), " min",
+                tuple(log_records.TimedAmount(build.started, build.seconds / 60) for build in values),
+                tuple(build.started for build in values)),
+        event_source=EventSource.BUILDS))
     totals: dict[str, float] = defaultdict(float)
     turn_counts: Counter[str] = Counter()
     for turn in tokens:
@@ -567,11 +574,14 @@ def resource_use(builds: Sequence[BuildStep], tokens: Sequence[WindowTokenUsage]
         rows.append(log_records.MeasureRow(
             f"tokens / {repo}", f"{total:,.0f}", turn_counts[repo], window.label,
             "usage ledger; input + cache writes + cache reads + output; natedev only",
-        ))
+            quantity=log_records.EventValue(total, " tokens",
+                tuple(event for turn in tokens if turn.repository == repo and turn.window == window for event in turn.events),
+                tuple(at for turn in tokens if turn.repository == repo and turn.window == window for at in turn.population)),
+        event_source=EventSource.TOKENS))
     if not groups:
-        rows.append(log_records.MeasureRow("build/test minutes", "no records in window", 0, window.label, "buildlog index; natedev only"))
+        rows.append(log_records.MeasureRow("build/test minutes", "no records in window", 0, window.label, "buildlog index; natedev only", quantity=log_records.EventValue(0, " min"), event_source=EventSource.BUILDS))
     if not totals:
-        rows.append(log_records.MeasureRow("tokens", "no records in window", 0, window.label, "usage ledger; natedev only"))
+        rows.append(log_records.MeasureRow("tokens", "no records in window", 0, window.label, "usage ledger; natedev only", quantity=log_records.EventValue(0, " tokens"), event_source=EventSource.TOKENS))
     return rows
 
 
@@ -581,7 +591,8 @@ def distribution(name: str, values: Sequence[float], window: log_records.Window,
     if ordered:
         p90 = ordered[math.ceil(.9 * len(ordered)) - 1]
         value = f"median {median(ordered):.1f} min; p90 {p90:.1f} min"
-    return log_records.MeasureRow(name, value, len(ordered), window.label, source)
+    return log_records.MeasureRow(name, value, len(ordered), window.label, source,
+        quantity=log_records.Statistic(tuple(ordered)))
 
 
 def object_rows(record: log_records.JsonObject, key: str) -> list[log_records.JsonObject]:
@@ -679,7 +690,7 @@ def parse_wait_report(record: log_records.JsonObject, prefixes: Sequence[str] = 
             origins = tuple(origin_field(phase, key) for key in ("plan_doc", "production", "repository"))
         except ValueError as error:
             problems.append(log_records.SourceProblem(
-                f"phase {phase.get('run_id')!r}/{phase.get('phase_instance_id')!r}", str(error)))
+                f"phase {phase.get('run_id')!r}/{phase.get('phase_instance_id')!r}", str(error), event_source=EventSource.WAITS, kind=log_records.RowsSkipped(1)))
             continue
         if not belongs_to_hana:
             if all(isinstance(origin, OriginNotRecorded) for origin in origins):
@@ -706,7 +717,7 @@ def parse_wait_report(record: log_records.JsonObject, prefixes: Sequence[str] = 
             phases.append(PhaseWaitCoverage(run, instance, coverage))
             hana_phases.add((run, instance))
         except ValueError as error:
-            problems.append(log_records.SourceProblem(f"phase {run}/{instance}", str(error)))
+            problems.append(log_records.SourceProblem(f"phase {run}/{instance}", str(error), event_source=EventSource.WAITS, kind=log_records.RowsSkipped(1)))
     waits: dict[str, HanaWait] = {}
     misses: dict[str, AttributionMiss] = {}
     for item in (*object_rows(record, "waits"), *object_rows(record, "missing")):
@@ -779,10 +790,10 @@ def parse_wait_report(record: log_records.JsonObject, prefixes: Sequence[str] = 
             holders = parse_holder_history(item, started)
             waits[identity] = HanaWait(identity, kind, started, end, owner, phase_owner, supplier, wait_reason, holders)
         except ValueError as error:
-            problems.append(log_records.SourceProblem("wait " + log_records.field_text(item, "wait_id"), str(error)))
+            problems.append(log_records.SourceProblem("wait " + log_records.field_text(item, "wait_id"), str(error), event_source=EventSource.WAITS, kind=log_records.RowsSkipped(1)))
     without_id = log_records.field_number(record, "wait_without_id_n")
     if without_id:
-        problems.append(log_records.SourceProblem("progress_history waits", f"{int(without_id)} wait events without wait_id; wait_without_id_n={int(without_id)}"))
+        problems.append(log_records.SourceProblem("progress_history waits", f"{int(without_id)} wait events without wait_id; wait_without_id_n={int(without_id)}", event_source=EventSource.WAITS, kind=log_records.RowsSkipped(int(without_id))))
     return HanaWaitHistory(tuple(waits.values()), tuple(phases), tuple(misses.values()), tuple(unresolved), tuple(problems))
 
 
@@ -802,7 +813,7 @@ def read_wait_history(
             raise ValueError("external wait history contains an unknown event type")
         for index, item in enumerate(external_records, 1):
             if not log_records.field_text(item, "wait_id"):
-                rejected.append(log_records.SourceProblem(f"{external}:row {index}", "wait event without wait_id"))
+                rejected.append(log_records.SourceProblem(f"{external}:row {index}", "wait event without wait_id", event_source=EventSource.WAITS, kind=log_records.RowsSkipped(1)))
     result = subprocess.run(
         [sys.executable, str(SCRIPTS / "direct/progress_history.py"), "waits",
          "--since", window.since.isoformat(), "--until", window.until.isoformat()],
@@ -834,7 +845,7 @@ def read_wait_history(
                                           log_records.field_number(previous_report, "wait_without_id_n"))
     ignored = log_records.field_number(report, "ignored_n")
     if ignored:
-        rejected.append(log_records.SourceProblem("progress_history waits", f"{int(ignored)} unreadable or unsupported history rows; counts can be incomplete"))
+        rejected.append(log_records.SourceProblem("progress_history waits", f"{int(ignored)} unreadable or unsupported history rows; counts can be incomplete", event_source=EventSource.WAITS, kind=log_records.RowsSkipped(int(ignored))))
     history = parse_wait_report(report, prefixes)
     history = HanaWaitHistory(history.waits, history.phases, history.attribution_misses, history.unresolved_origins,
                               (*history.problems, *rejected))
@@ -869,8 +880,8 @@ def wait_coverage_rows(
     source = "progress_history.py waits; incomplete coverage counts"
     if isinstance(history, HistoryNotRecorded):
         return [log_records.MeasureRow(table + " / coverage / HistoryNotRecorded", "not recorded (HistoryNotRecorded)",
-                                       0, window.label, source + "; " + history.reason)]
-    return [log_records.MeasureRow(f"{table} / coverage / {name}", str(count), count, window.label, source)
+                                       0, window.label, source + "; " + history.reason, quantity=log_records.NotRecorded(history.reason), event_source=EventSource.WAITS)]
+    return [log_records.MeasureRow(f"{table} / coverage / {name}", str(count), count, window.label, source, quantity=log_records.Diagnostic(count), event_source=EventSource.WAITS)
             for name, count in wait_coverage_counts(history, window, phases).items()]
 
 
@@ -919,6 +930,17 @@ def holder_wait_duration(waits: Sequence[HanaWait], complete_coverage: bool) -> 
     return f"{minutes:.1f} min" if completed or complete_coverage else "not recorded (HistoryNotRecorded)"
 
 
+def wait_quantity(waits: Sequence[HanaWait], complete: bool, partial: bool = False) -> log_records.Quantity:
+    if any(isinstance(wait.end, UnknownEndedWait) for wait in waits):
+        return log_records.NotRecorded("duration unknown for open waits")
+    if not waits and not complete:
+        return log_records.NotRecorded("HistoryNotRecorded")
+    events = tuple(log_records.TimedAmount(wait.started, (wait.end.at - wait.started).total_seconds() / 60)
+                   for wait in waits if isinstance(wait.end, CompletedWait))
+    return log_records.EventValue(sum(event.amount for event in events), " min", events,
+                                 tuple(wait.started for wait in waits), wait_rate=True, partial=partial)
+
+
 def holder_rows(
     history: HanaWaitHistory | HistoryNotRecorded, window: log_records.Window,
     completions: Sequence[PhaseCompletion],
@@ -934,7 +956,7 @@ def holder_rows(
         for coverage in HolderCoverage:
             selected = [wait for wait in waits if wait.kind == kind and holder_coverage(wait) == coverage]
             rows.append(log_records.MeasureRow(f"Hana wait holders / {kind.value} / {coverage.value}",
-                                               partial_wait_total(holder_wait_duration(selected, complete_coverage), partial), len(selected), window.label, source))
+                                               partial_wait_total(holder_wait_duration(selected, complete_coverage), partial), len(selected), window.label, source, quantity=wait_quantity(selected, complete_coverage, partial), event_source=EventSource.WAITS))
     unnamed_groups: dict[tuple[str, str], list[HanaWait]] = {}
     for wait in waits:
         observations = wait.holders.observations
@@ -962,18 +984,31 @@ def holder_rows(
                 end, duration = "not recorded", "duration unknown"
             rows.append(log_records.MeasureRow(f"Hana wait holder / {wait.identity}",
                                                f"{detail}; observed={observed}; from={start}; until={end}; {duration}",
-                                               1, window.label, wait.identity))
+                                               1, window.label, wait.identity, detail=True, event_source=EventSource.WAITS))
     for (kind_label, reason), grouped in sorted(unnamed_groups.items()):
         rows.append(log_records.MeasureRow(f"Hana wait holders unnamed / {kind_label} / {reason}",
-                                           partial_wait_total(holder_wait_duration(grouped, complete_coverage), partial), len(grouped), window.label, source))
+                                           partial_wait_total(holder_wait_duration(grouped, complete_coverage), partial), len(grouped), window.label, source, quantity=wait_quantity(grouped, complete_coverage, partial), event_source=EventSource.WAITS))
     return rows
 
 
 def candidate_summary(candidates: Sequence[WaitCandidate]) -> str:
-    counts: dict[str, int] = {}
-    for candidate in candidates:
-        counts[candidate.label] = counts.get(candidate.label, 0) + 1
-    return " | ".join(label + (f" ({count} times)" if count > 1 else "") for label, count in counts.items())
+    return " | ".join(dict.fromkeys(candidate.label for candidate in candidates))
+
+
+def collapse_wait_rows(
+    rows: Sequence[log_records.MeasureRow], source: str, identity_kind: str,
+) -> list[log_records.MeasureRow]:
+    groups: dict[tuple[str, str], list[log_records.MeasureRow]] = {}
+    for row in rows:
+        groups.setdefault((row.measure, row.value), []).append(row)
+    collapsed: list[log_records.MeasureRow] = []
+    for grouped in groups.values():
+        first = grouped[0]
+        count = sum(row.n for row in grouped)
+        quantity = replace(first.quantity, amount=count) if isinstance(first.quantity, log_records.Diagnostic) else first.quantity
+        collapsed.append(replace(first, n=count, source=source + "; " + identity_kind + ": "
+                                 + ", ".join(row.source for row in grouped), quantity=quantity))
+    return collapsed
 
 
 def hana_wait_rows(
@@ -995,10 +1030,10 @@ def hana_wait_rows(
         complete_coverage = covered and not partial
         value = f"{minutes:.1f} min" if completed or complete_coverage else "not recorded (HistoryNotRecorded)"
         value = partial_wait_total(value, partial)
-        rows.append(log_records.MeasureRow(f"Hana wait / {kind.value}", value, len(completed), window.label, source))
+        rows.append(log_records.MeasureRow(f"Hana wait / {kind.value}", value, len(completed), window.label, source, quantity=wait_quantity(completed, bool(complete_coverage), partial), event_source=EventSource.WAITS))
         open_waits = [wait for wait in waits if wait.kind == kind and isinstance(wait.end, UnknownEndedWait)]
         if open_waits:
-            rows.append(log_records.MeasureRow(f"Hana wait unknown-ended / {kind.value}", "duration not recorded", len(open_waits), window.label, source))
+            rows.append(log_records.MeasureRow(f"Hana wait unknown-ended / {kind.value}", "duration not recorded", len(open_waits), window.label, source, quantity=log_records.NotRecorded("duration not recorded"), event_source=EventSource.WAITS))
     handoffs = [wait for wait in waits if isinstance(wait.phase, ProductionHandoff)]
     if handoffs:
         completed_handoffs = [wait for wait in handoffs if isinstance(wait.end, CompletedWait)]
@@ -1006,48 +1041,57 @@ def hana_wait_rows(
                       if isinstance(wait.end, CompletedWait))
         value = f"{minutes:.1f} min" if completed_handoffs else "duration not recorded"
         rows.append(log_records.MeasureRow("Hana wait / production handoffs without a phase", partial_wait_total(value, partial),
-                                           len(handoffs), window.label, source + "; excluded from phase share"))
+                                           len(handoffs), window.label, source + "; excluded from phase share",
+            quantity=wait_quantity(completed_handoffs, bool(completed_handoffs), partial), event_source=EventSource.WAITS))
         open_handoffs = len(handoffs) - len(completed_handoffs)
         if open_handoffs:
             rows.append(log_records.MeasureRow("Hana wait unknown-ended / production handoffs without a phase",
-                                               "duration not recorded", open_handoffs, window.label, source))
+                                               "duration not recorded", open_handoffs, window.label, source, quantity=log_records.NotRecorded("duration not recorded"), event_source=EventSource.WAITS))
     for wait in waits:
         if isinstance(wait.kind, WaitKindNotRecorded):
-            rows.append(log_records.MeasureRow("Hana wait / WaitKindNotRecorded", wait.kind.reason, 1, window.label, wait.identity))
+            rows.append(log_records.MeasureRow("Hana wait / WaitKindNotRecorded", wait.kind.reason, 1, window.label, wait.identity, quantity=log_records.Diagnostic(1, wait.kind.reason), event_source=EventSource.WAITS))
             if isinstance(wait.end, UnknownEndedWait):
-                rows.append(log_records.MeasureRow("Hana wait unknown-ended / WaitKindNotRecorded", "duration not recorded", 1, window.label, wait.identity))
+                rows.append(log_records.MeasureRow("Hana wait unknown-ended / WaitKindNotRecorded", "duration not recorded", 1, window.label, wait.identity, quantity=log_records.NotRecorded("duration not recorded"), event_source=EventSource.WAITS))
         if wait.production_handoff:
             owner_text = wait.owner.session if isinstance(wait.owner, RecordedWaitOwner) else f"not recorded: {wait.owner.reason}"
-            rows.append(log_records.MeasureRow("Hana wait / production handoff", f"no phase; owner={owner_text}", 1, window.label, wait.identity))
+            rows.append(log_records.MeasureRow("Hana wait / production handoff", f"no phase; owner={owner_text}", 1, window.label, wait.identity, quantity=log_records.Diagnostic(1), event_source=EventSource.WAITS))
         elif isinstance(wait.phase, WaitPhaseNotRecorded):
-            rows.append(log_records.MeasureRow("Hana wait / WaitPhaseNotRecorded", wait.phase.reason, 1, window.label, wait.identity))
+            rows.append(log_records.MeasureRow("Hana wait / WaitPhaseNotRecorded", wait.phase.reason, 1, window.label, wait.identity, quantity=log_records.Diagnostic(1, wait.phase.reason), event_source=EventSource.WAITS))
         if isinstance(wait.owner, WaitOwnerNotRecorded):
-            rows.append(log_records.MeasureRow("Hana wait / WaitOwnerNotRecorded", wait.owner.reason, 1, window.label, wait.identity))
+            rows.append(log_records.MeasureRow("Hana wait / WaitOwnerNotRecorded", wait.owner.reason, 1, window.label, wait.identity, quantity=log_records.Diagnostic(1, wait.owner.reason), event_source=EventSource.WAITS))
     if isinstance(history, HistoryNotRecorded) or not phases and not waits:
         reason = history.reason if isinstance(history, HistoryNotRecorded) else "no Hana phase or wait records in window"
-        rows.append(log_records.MeasureRow("Hana wait coverage / HistoryNotRecorded", "not recorded (HistoryNotRecorded)", 0, window.label, source + "; " + reason))
+        rows.append(log_records.MeasureRow("Hana wait coverage / HistoryNotRecorded", "not recorded (HistoryNotRecorded)", 0, window.label, source + "; " + reason, quantity=log_records.NotRecorded(reason), event_source=EventSource.WAITS))
     missing_reasons: dict[str, list[str]] = {}
     for phase in missing:
         if isinstance(phase.state, HistoryNotRecorded):
             missing_reasons.setdefault(phase.state.reason, []).append(f"{phase.run}/{phase.instance}")
     for reason, identities in missing_reasons.items():
         rows.append(log_records.MeasureRow("Hana wait coverage / HistoryNotRecorded", reason, len(identities),
-                                           window.label, source + "; phases: " + ", ".join(identities)))
+                                           window.label, source + "; phases: " + ", ".join(identities), quantity=log_records.NotRecorded(reason), event_source=EventSource.WAITS))
+    phase_rows: list[log_records.MeasureRow] = []
     for phase in uncertain:
         if isinstance(phase.state, UncertainWaitCoverage):
             detail = phase.state.reason + "; candidates: " + candidate_summary(phase.state.candidates)
-            rows.append(log_records.MeasureRow("Hana wait coverage / UncertainCoverage", detail, 1, window.label, f"{phase.run}/{phase.instance}"))
+            phase_rows.append(log_records.MeasureRow("Hana wait coverage / UncertainCoverage", detail, 1, window.label, f"{phase.run}/{phase.instance}", quantity=log_records.Diagnostic(1, detail), event_source=EventSource.WAITS))
+    rows.extend(collapse_wait_rows(phase_rows, source, "phases"))
     if isinstance(history, HanaWaitHistory) and history.attribution_misses:
+        miss_rows: list[log_records.MeasureRow] = []
         misses = history.attribution_misses
         for miss in misses:
             detail = miss.reason + "; candidates: " + candidate_summary(miss.candidates)
-            rows.append(log_records.MeasureRow("Hana wait attribution / Unresolved", detail, 1, window.label, miss.wait_id))
+            miss_rows.append(log_records.MeasureRow("Hana wait attribution / Unresolved", detail, 1, window.label, miss.wait_id, quantity=log_records.Diagnostic(1, detail), event_source=EventSource.WAITS))
+        rows.extend(collapse_wait_rows(miss_rows, source, "waits"))
     if isinstance(history, HanaWaitHistory):
+        origin_rows: list[log_records.MeasureRow] = []
         for origin in history.unresolved_origins:
-            rows.append(log_records.MeasureRow("Hana wait origin / UnresolvedPhaseOrigin", origin.reason, 1,
-                                               window.label, f"{origin.run}/{origin.instance}"))
+            origin_rows.append(log_records.MeasureRow("Hana wait origin / UnresolvedPhaseOrigin", origin.reason, 1,
+                                               window.label, f"{origin.run}/{origin.instance}", quantity=log_records.Diagnostic(1, origin.reason), event_source=EventSource.WAITS))
+        rows.extend(collapse_wait_rows(origin_rows, source, "phases"))
+        problem_rows: list[log_records.MeasureRow] = []
         for problem in history.problems:
-            rows.append(log_records.MeasureRow("Hana wait / source problem", problem.reason, 1, window.label, problem.source))
+            problem_rows.append(log_records.MeasureRow("Hana wait / source problem", problem.reason, 1, window.label, problem.source, quantity=log_records.Diagnostic(1, problem.reason), event_source=EventSource.WAITS))
+        rows.extend(collapse_wait_rows(problem_rows, source, "waits"))
     return rows
 
 
@@ -1085,24 +1129,28 @@ def receipt_rows(
 ) -> list[log_records.MeasureRow]:
     source = "progress_history merge_receipts.jsonl; exact project, target branch and merge commit"
     if isinstance(receipts, HistoryNotRecorded):
-        rows = [log_records.MeasureRow("merge receipts / all projects", f"not recorded (HistoryNotRecorded): {receipts.reason}", 0, window.label, source)]
+        rows = [log_records.MeasureRow("merge receipts / all projects", f"not recorded (HistoryNotRecorded): {receipts.reason}", 0, window.label, source, quantity=log_records.NotRecorded(receipts.reason), event_source=EventSource.RECEIPTS)]
         recorded: Sequence[MergeReceipt] = ()
     else:
         selected = {(item.project, item.target_branch, item.commit): item for item in receipts if window.contains(item.merged_at)}
         recorded = tuple(selected.values())
-        rows = [log_records.MeasureRow("merge receipts / all projects", str(len(selected)), len(selected), window.label, source)]
+        rows = [log_records.MeasureRow("merge receipts / all projects", str(len(selected)), len(selected), window.label, source,
+            quantity=log_records.EventValue(len(selected), events=tuple(log_records.TimedAmount(item.merged_at) for item in recorded),
+                population=tuple(item.merged_at for item in recorded)), event_source=EventSource.RECEIPTS)]
     if isinstance(merges, MergeHistoryNotRecorded):
-        rows.append(log_records.MeasureRow("Hana merge receipts / origin/init/catalyst", "not recorded (merge history not recorded)", 0, window.label, source))
+        rows.append(log_records.MeasureRow("Hana merge receipts / origin/init/catalyst", "not recorded (merge history not recorded)", 0, window.label, source, quantity=log_records.NotRecorded("merge history not recorded"), event_source=EventSource.RECEIPTS))
         return rows
     selected_merges = {merge.commit: merge for merge in merges if window.contains(merge.at)}
     matched = 0
     for merge in selected_merges.values():
         result = receipt_for_merge(merge, recorded)
         if isinstance(result, ReceiptMissing):
-            rows.append(log_records.MeasureRow("Hana merge / ReceiptMissing", result.commit, 1, window.label, source))
+            rows.append(log_records.MeasureRow("Hana merge / ReceiptMissing", result.commit, 1, window.label, source,
+                quantity=log_records.EventValue(1, events=(log_records.TimedAmount(merge.at),), population=(merge.at,)), event_source=EventSource.RECEIPTS))
         else:
             matched += 1
-    rows.insert(1, log_records.MeasureRow("Hana merge receipts / origin/init/catalyst", f"{matched}/{len(selected_merges)}", len(selected_merges), window.label, source))
+    rows.insert(1, log_records.MeasureRow("Hana merge receipts / origin/init/catalyst", f"{matched}/{len(selected_merges)}", len(selected_merges), window.label, source,
+        quantity=log_records.Fraction(matched, len(selected_merges)), event_source=EventSource.RECEIPTS))
     return rows
 
 
@@ -1151,6 +1199,7 @@ def wait_share_row(
 ) -> log_records.MeasureRow:
     selected = completed_hana_phases(phases, window)
     value = "not recorded (HistoryNotRecorded)"
+    quantity: log_records.Quantity = log_records.NotRecorded("HistoryNotRecorded")
     partial = bool(wait_coverage_counts(history, window, selected))
     if isinstance(history, HanaWaitHistory):
         seconds = sum(phase_wait_seconds(phase, history.waits) for phase in selected)
@@ -1163,9 +1212,10 @@ def wait_share_row(
         if seconds or covered and not partial:
             total = sum(max(0.0, (phase.at - phase_interval_start(phase)).total_seconds()) for phase in selected)
             value = f"{seconds / total * 100:.1f}%" if total > 0 else "not recorded (phase time unavailable)"
+            quantity = log_records.Fraction(seconds, total, percent=True, partial=partial) if total > 0 else log_records.NotRecorded("phase time unavailable")
     return log_records.MeasureRow("Hana wait / share of phase time with a recorded kind", partial_wait_total(value, partial),
                                   len(selected), window.label,
-                                  "progress_history.py waits / Hana phase time; union of completed known-kind waits per completed phase / full phase time")
+                                  "progress_history.py waits / Hana phase time; union of completed known-kind waits per completed phase / full phase time", quantity=quantity, event_source=EventSource.WAITS)
 
 
 def phase_flow(
@@ -1177,8 +1227,10 @@ def phase_flow(
     times = [event.seconds / 60 for event in selected if not isinstance(event.seconds, DurationNotRecorded)]
     source = "progress_history run records; elapsed wall time; no merge-to-main receipt; natedev only"
     rows = [
-        log_records.MeasureRow("Hana phases done", str(len(unique)), len(unique), window.label, source),
-        distribution("Hana phase time", times, window, source),
+        log_records.MeasureRow("Hana phases done", str(len(unique)), len(unique), window.label, source,
+            quantity=log_records.EventValue(len(unique), events=tuple(log_records.TimedAmount(event.at) for event in unique.values()),
+                population=tuple(event.at for event in unique.values())), event_source=EventSource.PHASES),
+        replace(distribution("Hana phase time", times, window, source), event_source=EventSource.PHASES),
     ]
     rows.extend(hana_wait_rows(wait_history, window, selected))
     rows.append(wait_share_row(wait_history, window, selected))
@@ -1201,6 +1253,11 @@ def is_declined(issue: issues.Issue) -> bool:
     return bool(words) and words[0].casefold().removesuffix(":") == "declined"
 
 
+def issue_quantity(records: Sequence[issues.Issue], field: str = "date_closed") -> log_records.EventValue:
+    times = tuple(log_records.required_time(issue.value(field)) for issue in records)
+    return log_records.EventValue(len(records), events=tuple(log_records.TimedAmount(at) for at in times), population=times)
+
+
 def issue_flow(found: Sequence[issues.Issue], window: log_records.Window) -> list[log_records.MeasureRow]:
     goal = [issue for issue in found if issue.value("backlog_goal") == "1 - Ship Hana"]
     activated = [issue for issue in goal if window.contains(log_records.moment(issue.value("date_active")))]
@@ -1218,10 +1275,12 @@ def issue_flow(found: Sequence[issues.Issue], window: log_records.Window) -> lis
     active_value = str(len(activated)) if any(issue.value("date_active") for issue in goal) else "not recorded"
     rows = [
         log_records.MeasureRow("goal 1 issues moved to active", active_value, len(activated), window.label,
-                   "Hanadocs date_active; stage/date_modified do not record a transition"),
+                   "Hanadocs date_active; stage/date_modified do not record a transition",
+                   quantity=issue_quantity(activated, "date_active") if any(issue.value("date_active") for issue in goal)
+                   else log_records.NotRecorded("activation time not recorded"), event_source=EventSource.ISSUES),
         log_records.MeasureRow("goal 1 issues closed", str(len(closed)), len(closed), window.label,
-                   "Hanadocs date_closed; date-only precision; reason declined excluded"),
-        distribution("goal 1 active to closed", durations, window, "Hanadocs date_active + date_closed; date-only precision"),
+                   "Hanadocs date_closed; date-only precision; reason declined excluded", quantity=issue_quantity(closed), event_source=EventSource.ISSUES),
+        replace(distribution("goal 1 active to closed", durations, window, "Hanadocs date_active + date_closed; date-only precision"), event_source=EventSource.ISSUES),
     ]
     source = "Hanadocs project + date_closed; date-only precision; reason declined excluded"
     for project in sorted({issue.value("project") for issue in (*closed, *undated)}):
@@ -1230,17 +1289,20 @@ def issue_flow(found: Sequence[issues.Issue], window: log_records.Window) -> lis
         scope = "Hana" if project in HANA_PROJECTS else "other"
         value = str(count) if not missing else f"not recorded ({count} dated in window; {missing} closure dates not recorded)"
         rows.append(log_records.MeasureRow(f"goal 1 issues closed / {project or 'project not recorded'} / {scope}",
-                               value, count, window.label, source))
+                               value, count, window.label, source, quantity=issue_quantity([issue for issue in closed if issue.value("project") == project])
+                if not missing else log_records.NotRecorded(f"{count} dated in window; {missing} closure dates not recorded"), event_source=EventSource.ISSUES))
     hana = [issue for issue in closed if issue.value("project") in HANA_PROJECTS]
-    rows.append(log_records.MeasureRow("goal 1 Hana-project issues closed", str(len(hana)), len(hana), window.label, source))
+    rows.append(log_records.MeasureRow("goal 1 Hana-project issues closed", str(len(hana)), len(hana), window.label, source, quantity=issue_quantity(hana), event_source=EventSource.ISSUES))
     rows.append(log_records.MeasureRow("goal 1 declined closures excluded", str(len(declined)), len(declined), window.label,
-                           "Hanadocs reason declined + date_closed; date-only precision"))
+                           "Hanadocs reason declined + date_closed; date-only precision", quantity=issue_quantity(declined), event_source=EventSource.ISSUES))
     receipts = sum(closure_names_merge(issue) for issue in hana)
     receipt_source = "Hanadocs reason naming a merge commit or merge_commit; text only, not checked against Git"
-    rows.append(log_records.MeasureRow("goal 1 Hana closures naming a merge commit", str(receipts), len(hana), window.label, receipt_source))
+    rows.append(log_records.MeasureRow("goal 1 Hana closures naming a merge commit", str(receipts), len(hana), window.label, receipt_source,
+        quantity=replace(issue_quantity([issue for issue in hana if closure_names_merge(issue)]),
+                         population=tuple(log_records.required_time(issue.value("date_closed")) for issue in hana)), event_source=EventSource.ISSUES))
     for issue in sorted(hana, key=lambda issue: issue.path.stem):
         value = "yes" if closure_names_merge(issue) else "not recorded"
-        rows.append(log_records.MeasureRow(f"Hana closure merge commit / {issue.path.stem}", value, 1, window.label, receipt_source))
+        rows.append(log_records.MeasureRow(f"Hana closure merge commit / {issue.path.stem}", value, 1, window.label, receipt_source, detail=True, event_source=EventSource.ISSUES))
     return rows
 
 
@@ -1269,15 +1331,17 @@ def hana_repository(units: Sequence[Unit]) -> Path:
 def merge_flow(merges: Sequence[HanaMerge] | MergeHistoryNotRecorded, window: log_records.Window) -> list[log_records.MeasureRow]:
     source = "git log --first-parent --merges origin/init/catalyst; local ref; commit time; no fetch"
     if isinstance(merges, MergeHistoryNotRecorded):
-        return [log_records.MeasureRow("Hana merges / origin/init/catalyst", "not recorded", 0, window.label, source)]
+        return [log_records.MeasureRow("Hana merges / origin/init/catalyst", "not recorded", 0, window.label, source, quantity=log_records.NotRecorded("merge history not recorded"), event_source=EventSource.MERGES)]
     selected = {merge.commit: merge for merge in merges if window.contains(merge.at)}
-    rows = [log_records.MeasureRow("Hana merges / origin/init/catalyst", str(len(selected)), len(selected), window.label, source)]
+    rows = [log_records.MeasureRow("Hana merges / origin/init/catalyst", str(len(selected)), len(selected), window.label, source,
+        quantity=log_records.EventValue(len(selected), events=tuple(log_records.TimedAmount(merge.at) for merge in selected.values()),
+            population=tuple(merge.at for merge in selected.values())), event_source=EventSource.MERGES)]
     days = Counter(merge.at.astimezone(user_zone()).date() for merge in selected.values())
     day = window.since.astimezone(user_zone()).date()
     last = (window.until - timedelta(microseconds=1)).astimezone(user_zone()).date()
     while day <= last:
         count = days[day]
-        rows.append(log_records.MeasureRow(f"Hana merges / {day.isoformat()}", str(count), count, window.label, source))
+        rows.append(log_records.MeasureRow(f"Hana merges / {day.isoformat()}", str(count), count, window.label, source, detail=True, event_source=EventSource.MERGES))
         day += timedelta(days=1)
     return rows
 
@@ -1302,20 +1366,29 @@ def attention(
         count, failed = push_days[day_text], failed_days[day_text]
         rows.append(log_records.MeasureRow(
             f"phone pushes / {day_text}", f"{count}; after failed review {failed}",
-            count, window.label, "pushover + review log; natedev only",
-        ))
+            count, window.label, "pushover + review log; natedev only", detail=True,
+        event_source=EventSource.PUSHES))
         for kind in SenderKind:
             count = message_days[(day_text, kind)]
             rows.append(log_records.MeasureRow(
                 f"messages / {day_text} / {kind.value}", str(count), count, window.label,
                 "message log; kind/route, else sender-name heuristic; natedev only",
-            ))
+                comparison_name="messages / " + kind.value,
+                quantity=log_records.EventValue(count, events=tuple(log_records.TimedAmount(message.at) for message in messages
+                    if window.contains(message.at) and message.kind is kind and message.at.astimezone(zone).date() == day),
+                    population=tuple(message.at for message in messages if window.contains(message.at)
+                    and message.kind is kind and message.at.astimezone(zone).date() == day)),
+            event_source=EventSource.MESSAGES))
         day += timedelta(days=1)
     source = "pushover + review log; natedev only"
     total_pushes = len(push_report.delivered_pushes)
     rows.extend([
-        log_records.MeasureRow("phone pushes sent", str(total_pushes), total_pushes, window.label, source),
-        log_records.MeasureRow("phone pushes after failed review", str(len(push_report.entries)), total_pushes, window.label, source),
+        log_records.MeasureRow("phone pushes sent", str(total_pushes), total_pushes, window.label, source,
+            quantity=log_records.EventValue(total_pushes, events=tuple(log_records.TimedAmount(push.at) for push in push_report.delivered_pushes),
+                population=tuple(push.at for push in push_report.delivered_pushes)), event_source=EventSource.PUSHES),
+        log_records.MeasureRow("phone pushes after failed review", str(len(push_report.entries)), total_pushes, window.label, source,
+            quantity=log_records.EventValue(len(push_report.entries), events=tuple(log_records.TimedAmount(entry.at) for entry in push_report.entries),
+                population=tuple(push.at for push in push_report.delivered_pushes)), event_source=EventSource.PUSHES),
     ])
     return rows
 
@@ -1336,10 +1409,13 @@ def pending_attention(items: Sequence[WaitingItem], snapshot: datetime, window: 
         rows.append(log_records.MeasureRow(
             f"waiting / {kind}", f"{len(group)}; oldest {age}", len(group),
             f"snapshot {snapshot.astimezone(user_zone()):%Y-%m-%d %H:%M %Z}", source,
-        ))
-    answer_source = "showrunner/outstanding: no answer history or answered_at; producer must record answers; natedev only"
-    rows.append(log_records.MeasureRow("questions answered", "not recorded", 0, window.label, answer_source))
-    rows.append(distribution("question answer time", [], window, answer_source))
+            quantity=log_records.Snapshot(len(group), visibility_changed=kind == "changes"),
+        event_source=log_records.SourceNotApplicable.STATE))
+    answer_source = ("showrunner/outstanding: answer history is a 48-hour replay record; "
+                     "no window-complete answer history or question opening time for latency; natedev only")
+    rows.append(log_records.MeasureRow("questions answered", "not recorded", 0, window.label, answer_source, quantity=log_records.NotRecorded(answer_source), event_source=log_records.SourceNotApplicable.STATE))
+    rows.append(replace(distribution("question answer time", [], window, answer_source),
+                        event_source=log_records.SourceNotApplicable.STATE))
     return rows
 
 
@@ -1357,18 +1433,23 @@ def rank_coverage(found: Sequence[issues.Issue], rankings: Sequence[IssueRank], 
     by_name = {row.name: row for row in reversed(ranked)}
     scores = [by_name[name].score for name in top]
     weighted = "not recorded"
+    weighted_quantity: log_records.Fraction | log_records.NotRecorded = log_records.NotRecorded("ranking scores not recorded")
     if scores and all(isinstance(score, float) and score >= 0 for score in scores):
         total = sum(score for score in scores if isinstance(score, float))
         covered_score = sum(score for name in covered_names if isinstance(score := by_name[name].score, float))
         if total > 0:
             weighted = f"{covered_score:g}/{total:g} ({covered_score / total:.1%})"
+            weighted_quantity = log_records.Fraction(covered_score, total)
     return [
         log_records.MeasureRow("top 20 goal 1 open issues with a unit", f"{covered}/{len(top)}", len(top), snapshot,
-                   "backlog-rankings + open issue links; unit has a running phase or live session"),
+                   "backlog-rankings + open issue links; unit has a running phase or live session",
+                   quantity=log_records.Snapshot(log_records.Fraction(covered, len(top))), event_source=log_records.SourceNotApplicable.STATE),
         log_records.MeasureRow("live units naming an open issue", f"{linked}/{len(units)}", len(units), snapshot,
-                   "open production Issue link or open issue unit + showrunner; running phase or live session"),
+                   "open production Issue link or open issue unit + showrunner; running phase or live session",
+                   quantity=log_records.Snapshot(log_records.Fraction(linked, len(units))), event_source=log_records.SourceNotApplicable.STATE),
         log_records.MeasureRow("top 20 goal 1 open issues covered score", weighted, len(top), snapshot,
-                   "backlog-rankings score; covered score / all top 20 scores; running phase or live session"),
+                   "backlog-rankings score; covered score / all top 20 scores; running phase or live session",
+                   quantity=log_records.Snapshot(weighted_quantity), event_source=log_records.SourceNotApplicable.STATE),
     ]
 
 
@@ -1382,13 +1463,14 @@ def unit_names_issue(unit: Unit, issue: issues.Issue) -> bool:
     return Path(target).name.removesuffix(".md") == issue.path.stem
 
 
-def read_source[T](source: str, loader: Callable[[], T], fallback: T, problems: list[log_records.SourceProblem]) -> T:
+def read_source[T](source: str, loader: Callable[[], T], fallback: T, problems: list[log_records.SourceProblem],
+                   event_source: EventSource | log_records.SourceNotApplicable = log_records.SourceNotApplicable.UNSPECIFIED) -> T:
     try:
         return loader()
     except (OSError, ValueError, UnicodeError, sqlite3.Error, RuntimeError, production_units.Refusal, subprocess.SubprocessError,
             change_review.ChangeReviewError, dailies_render.InputError) as error:
         reason = "missing" if isinstance(error, FileNotFoundError) else "unreadable"
-        problems.append(log_records.SourceProblem(source, f"{reason}: {error}"))
+        problems.append(log_records.SourceProblem(source, f"{reason}: {error}", event_source))
         return fallback
 
 
@@ -1411,14 +1493,14 @@ def read_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
     with redirect_stderr(warnings):
         runners = showrunners.registered_showrunners()
     if warnings.getvalue().strip():
-        problems.append(log_records.SourceProblem("showrunners", warnings.getvalue().strip().replace("\n", "; ")))
-    marks = read_source("unit sessions", unit_lookup.every_marked_unit, unit_lookup.MarkedProductions({}, {}), problems)
-    running = read_source("unit running phases", lambda: running_phase_worktrees(unit_lookup.runs_dir(), problems), set[str](), problems)
+        problems.append(log_records.SourceProblem("showrunners", warnings.getvalue().strip().replace("\n", "; "), event_source=log_records.SourceNotApplicable.STATE))
+    marks = read_source("unit sessions", unit_lookup.every_marked_unit, unit_lookup.MarkedProductions({}, {}), problems, event_source=log_records.SourceNotApplicable.STATE)
+    running = read_source("unit running phases", lambda: running_phase_worktrees(unit_lookup.runs_dir(), problems), set[str](), problems, event_source=log_records.SourceNotApplicable.STATE)
     for runner in runners:
         doc = Path(runner["doc"])
-        lines = read_source(str(doc), lambda: doc.read_text(encoding="utf-8").splitlines(), [], problems)
-        repo = read_source(str(doc), lambda: production_units.production_field(lines, "Repository"), "repository not recorded", problems)
-        rows = read_source(str(doc), lambda: production_units.live_unit_table(lines, runner["slug"]), [], problems)
+        lines = read_source(str(doc), lambda: doc.read_text(encoding="utf-8").splitlines(), [], problems, event_source=log_records.SourceNotApplicable.STATE)
+        repo = read_source(str(doc), lambda: production_units.production_field(lines, "Repository"), "repository not recorded", problems, event_source=log_records.SourceNotApplicable.STATE)
+        rows = read_source(str(doc), lambda: production_units.live_unit_table(lines, runner["slug"]), [], problems, event_source=log_records.SourceNotApplicable.STATE)
         for row in rows:
             tree = production_units.cell_value(row.get("Worktree", ""))
             name = production_units.cell_value(row.get("Unit", ""))
@@ -1429,7 +1511,7 @@ def read_units(problems: list[log_records.SourceProblem]) -> list[Unit]:
                 activity = UnitActivity.LIVE
             elif marks.production_fault(runner["slug"]) or (marked is not None and isinstance(marked.claude, unit_lookup.ClaudeUnknown)):
                 activity = UnitActivity.UNKNOWN
-                problems.append(log_records.SourceProblem(f"unit activity / {runner['slug']} / {name}", "running phase or live session not recorded"))
+                problems.append(log_records.SourceProblem(f"unit activity / {runner['slug']} / {name}", "running phase or live session not recorded", event_source=log_records.SourceNotApplicable.STATE))
             result.append(Unit(runner["slug"], name, repo, tree, is_hana(tree), issue, runner["session"], activity))
     return result
 
@@ -1439,14 +1521,14 @@ def running_phase_worktrees(folder: Path, problems: list[log_records.SourceProbl
     for path in folder.iterdir():
         if path.suffix != ".jsonl":
             continue
-        records = read_source(str(path), lambda: json_lines(path, log_records.object_record), [], problems)
+        records = read_source(str(path), lambda: json_lines(path, log_records.object_record), [], problems, event_source=log_records.SourceNotApplicable.STATE)
         if not records or log_records.field_text(records[0], "event_type") != "run_started":
             continue
         first = records[0]
         tree = log_records.field_text(first, "working_dir")
         started = log_records.moment(first.get("run_started_at", first.get("timestamp")))
         if not isinstance(started, datetime):
-            problems.append(log_records.SourceProblem(str(path), "unreadable: run start time not recorded"))
+            problems.append(log_records.SourceProblem(str(path), "unreadable: run start time not recorded", event_source=log_records.SourceNotApplicable.STATE))
             continue
         phases: set[str] = set()
         for record in records:
@@ -1458,7 +1540,7 @@ def running_phase_worktrees(folder: Path, problems: list[log_records.SourceProbl
                 continue
             phase = log_records.field_text(record, "phase_instance_id") or log_records.field_text(record, "phase_id")
             if not phase:
-                problems.append(log_records.SourceProblem(str(path), "unreadable: phase identity not recorded"))
+                problems.append(log_records.SourceProblem(str(path), "unreadable: phase identity not recorded", event_source=log_records.SourceNotApplicable.STATE))
                 continue
             if kind == "phase_started":
                 phases.add(phase)
@@ -1482,42 +1564,42 @@ def read_workers() -> tuple[list[Worker], list[str]]:
     return workers, observed.problems
 
 
-def read_builds(path: Path) -> list[BuildStep]:
+def read_builds(path: Path, problems: list[log_records.SourceProblem]) -> list[BuildStep]:
     with closing(usage_report.open_read_store(path)) as db:
         query = "SELECT repo,step,started_at,duration_s FROM steps WHERE host='natedev'"
         rows = cast(Iterable[sqlite3.Row], db.execute(query))
         result: list[BuildStep] = []
+        invalid: Counter[str] = Counter()
         for row in rows:
             fields: log_records.JsonObject = dict(zip(("repo", "step", "at", "seconds"), cast(tuple[object, ...], tuple(row))))
-            # Older build records have SQL NULL when the repository was unknown.
-            repo = "repository not recorded" if fields["repo"] is None else log_records.field_text(fields, "repo")
-            result.append(BuildStep(repo, log_records.field_text(fields, "step"), log_records.record_time(fields), log_records.field_number(fields, "seconds")))
+            try:
+                # Older build records have SQL NULL when the repository was unknown.
+                repo = "repository not recorded" if fields["repo"] is None else log_records.field_text(fields, "repo")
+                result.append(BuildStep(repo, log_records.field_text(fields, "step"), log_records.record_time(fields), log_records.field_number(fields, "seconds")))
+            except (ValueError, OverflowError) as error:
+                invalid[str(error)] += 1
+        if invalid:
+            detail = "; ".join(f"{reason} ({count})" for reason, count in invalid.items())
+            problems.append(log_records.SourceProblem(str(path), f"invalid build rows skipped: {sum(invalid.values())}; {detail}", kind=log_records.RowsSkipped(sum(invalid.values())), event_source=EventSource.BUILDS))
         return result
 
 
 def read_tokens(path: Path, window: log_records.Window) -> list[WindowTokenUsage]:
     with closing(usage_report.open_read_store(path)) as db:
-        # Filter before grouping. One row per cwd keeps the window's sum and n
-        # without loading each turn into Python. This total belongs to this window.
-        query = """SELECT f.folder,
-            sum(t.input+t.cache_write_5m+t.cache_write_1h+t.cache_read+t.output), count(*)
+        query = """SELECT f.folder,t.at,
+            t.input+t.cache_write_5m+t.cache_write_1h+t.cache_read+t.output AS tokens
         FROM turns t LEFT JOIN folders f USING(machine,family,parent_id,agent_id)
-        WHERE t.machine='natedev' AND julianday(t.at)>=julianday(?) AND julianday(t.at)<julianday(?)
-        GROUP BY f.folder"""
-        parameters = (window.since.isoformat(), window.until.isoformat())
-        rows = cast(Iterable[sqlite3.Row], db.execute(query, parameters))
-        result: list[WindowTokenUsage] = []
-        for row in rows:
-            fields: log_records.JsonObject = dict(zip(("cwd", "tokens", "turns"), cast(tuple[object, ...], tuple(row))))
+        WHERE t.machine='natedev' AND julianday(t.at)>=julianday(?) AND julianday(t.at)<julianday(?)"""
+        events: dict[str, list[log_records.TimedAmount]] = defaultdict(list)
+        for row in cast(Iterable[sqlite3.Row], db.execute(query, (window.since.isoformat(), window.until.isoformat()))):
+            fields: log_records.JsonObject = dict(zip(("cwd", "at", "tokens"), cast(tuple[object, ...], tuple(row))))
             cwd = fields["cwd"]
-            repo = "cwd not recorded"
-            if cwd is not None:
-                if not isinstance(cwd, str):
-                    raise ValueError("cwd: expected text or SQL NULL")
-                if cwd:
-                    repo = repository(cwd)
-            result.append(WindowTokenUsage(window, repo, log_records.field_number(fields, "tokens"), int(log_records.field_number(fields, "turns"))))
-        return result
+            if cwd is not None and not isinstance(cwd, str):
+                raise ValueError("cwd: expected text or SQL NULL")
+            repo = repository(cwd) if isinstance(cwd, str) and cwd else "cwd not recorded"
+            events[repo].append(log_records.TimedAmount(log_records.record_time(fields), log_records.field_number(fields, "tokens")))
+        return [WindowTokenUsage(window, repo, sum(event.amount for event in samples), len(samples), tuple(samples),
+                                 tuple(event.at for event in samples)) for repo, samples in events.items()]
 
 
 def hana_origin(origin: PhaseOrigin, prefixes: Sequence[str]) -> bool:
@@ -1601,12 +1683,12 @@ def read_phases(folder: Path, problems: list[log_records.SourceProblem], prefixe
                 except ValueError:
                     bad_fields += 1
             if bad_json:
-                problems.append(log_records.SourceProblem(str(path), f"unreadable: {bad_json} invalid JSON rows; counts can be incomplete"))
+                problems.append(log_records.SourceProblem(str(path), f"unreadable: {bad_json} invalid JSON rows; counts can be incomplete", kind=log_records.RowsSkipped(bad_json), event_source=EventSource.PHASES))
             if bad_fields:
-                problems.append(log_records.SourceProblem(str(path), f"unreadable: {bad_fields} invalid phase field rows; counts can be incomplete"))
+                problems.append(log_records.SourceProblem(str(path), f"unreadable: {bad_fields} invalid phase field rows; counts can be incomplete", kind=log_records.RowsSkipped(bad_fields), event_source=EventSource.PHASES))
             return completed
 
-        events.extend(read_source(str(path), read_file, [], problems))
+        events.extend(read_source(str(path), read_file, [], problems, event_source=EventSource.PHASES))
     if not folder.is_dir():
         raise FileNotFoundError(folder)
     return events
@@ -1617,10 +1699,10 @@ def read_waiting(
 ) -> list[WaitingItem]:
     waiting: list[WaitingItem] = []
     changes = vault / "change-review"
-    paths = read_source(str(changes), lambda: list(changes.iterdir()), [], problems)
+    paths = read_source(str(changes), lambda: list(changes.iterdir()), [], problems, event_source=log_records.SourceNotApplicable.STATE)
     for path in paths:
         if path.suffix == ".md":
-            rows = read_source(str(path), lambda: change_review.pending(path), [], problems)
+            rows = read_source(str(path), lambda: change_review.pending(path), [], problems, event_source=log_records.SourceNotApplicable.STATE)
             for row in rows:
                 match = re.search(r"\d{4}-\d{2}-\d{2}", row.get("Merged", ""))
                 waiting.append(WaitingItem("changes", log_records.moment(match[0] if match else "")))
@@ -1637,16 +1719,16 @@ def read_waiting(
             return []
         return [WaitingItem("proposals", log_records.moment(row.date)) for row in backlog_rows(backlog) if row.state == REVIEW_STATE]
 
-    waiting.extend(read_source(str(backlog_path), read_backlog, [], problems))
+    waiting.extend(read_source(str(backlog_path), read_backlog, [], problems, event_source=log_records.SourceNotApplicable.STATE))
     ledger = state / "nightly-review/ledger.md"
-    lines = read_source(str(ledger), lambda: ledger.read_text(encoding="utf-8").splitlines(), [], problems)
+    lines = read_source(str(ledger), lambda: ledger.read_text(encoding="utf-8").splitlines(), [], problems, event_source=log_records.SourceNotApplicable.STATE)
     for candidate in candidates.ranked(lines):
         if candidate.state == "proposed":
             waiting.append(WaitingItem("efficiency items", log_records.moment(candidate.night[:10])))
     folder = state / "showrunner/outstanding"
-    paths = read_source(str(folder), lambda: [path for path in folder.iterdir() if path.suffix == ".json"], [], problems)
+    paths = read_source(str(folder), lambda: [path for path in folder.iterdir() if path.suffix == ".json"], [], problems, event_source=log_records.SourceNotApplicable.STATE)
     for path in sorted(paths):
-        outstanding = read_source(str(path), lambda: dailies_render.read_outstanding(path), [], problems)
+        outstanding = read_source(str(path), lambda: dailies_render.read_outstanding(path), [], problems, event_source=log_records.SourceNotApplicable.STATE)
         for item in outstanding:
             if isinstance(item, dailies_render.OutstandingReminder):
                 continue
@@ -1657,45 +1739,50 @@ def read_waiting(
 
 
 def load_sources(window: log_records.Window) -> BaselineSources:
+    return load_window_sources(window, push_audit.load_sources(Path.home() / ".local/state/notify"))
+
+
+def load_window_sources(window: log_records.Window, notifications: push_audit.AuditSources) -> BaselineSources:
     state, vault = Path.home() / ".local/state", Path.home() / "rust/hanadocs"
     problems: list[log_records.SourceProblem] = []
-    units = read_source("showrunners / units_table", lambda: read_units(problems), [], problems)
+    units = read_source("showrunners / units_table", lambda: read_units(problems), [], problems, event_source=log_records.SourceNotApplicable.STATE)
     # The roster and usage store do not depend on the other sources. Read them
     # while the main thread reads files. Each reader keeps its own diagnostics.
     worker_problems: list[log_records.SourceProblem] = []
     token_problems: list[log_records.SourceProblem] = []
     token_path = collect.store_path()
     with ThreadPoolExecutor(max_workers=2) as readers:
-        worker_read = readers.submit(read_source, "session roster / codex_mesh", read_workers, ([], []), worker_problems)
-        token_read = readers.submit(read_source, str(token_path), lambda: read_tokens(token_path, window), [], token_problems)
-        builds = read_source("buildlog/index.sqlite", lambda: read_builds(state / "buildlog/index.sqlite"), [], problems)
+        worker_read = readers.submit(read_source, "session roster / codex_mesh", read_workers, ([], []), worker_problems,
+                                     log_records.SourceNotApplicable.STATE)
+        token_read = readers.submit(read_source, str(token_path), lambda: read_tokens(token_path, window), [], token_problems, EventSource.TOKENS)
+        builds = read_source("buildlog/index.sqlite", lambda: read_builds(state / "buildlog/index.sqlite", problems), [], problems, event_source=EventSource.BUILDS)
         hana_prefixes = [Path(unit.worktree).name for unit in units if unit.hana and unit.worktree]
         phases = read_source("progress_history runs",
-                             lambda: read_phases(unit_runs.history_root_in(state) / "runs", problems, hana_prefixes), [], problems)
-        push_report = push_audit.audit(push_audit.load_sources(state / "notify"), window)
+                             lambda: read_phases(unit_runs.history_root_in(state) / "runs", problems, hana_prefixes), [], problems, event_source=EventSource.PHASES)
+        push_report = push_audit.audit(notifications, window)
         problems.extend(push_report.problems)
-        messages = read_source("message/log.jsonl", lambda: json_lines(state / "message/log.jsonl", parse_message), [], problems)
-        found = read_source("Hanadocs issues", lambda: read_issues(vault / "issues"), [], problems)
+        messages = read_source("message/log.jsonl", lambda: json_lines(state / "message/log.jsonl", parse_message), [], problems, event_source=EventSource.MESSAGES)
+        found = read_source("Hanadocs issues", lambda: read_issues(vault / "issues"), [], problems, event_source=EventSource.ISSUES)
         archive = vault / "archive"
-        for folder in read_source(str(archive), lambda: [p for p in archive.rglob("*") if p.is_dir()], [], problems):
-            archived = read_source(str(folder), lambda: [issues.Issue(p, issues.frontmatter(p)) for p in folder.glob("*.md")], [], problems)
+        for folder in read_source(str(archive), lambda: [p for p in archive.rglob("*") if p.is_dir()], [], problems, event_source=EventSource.ISSUES):
+            archived = read_source(str(folder), lambda: [issues.Issue(p, issues.frontmatter(p)) for p in folder.glob("*.md")], [], problems, event_source=EventSource.ISSUES)
             found.extend(issue for issue in archived if issue.value("status") == "closed")
-        rankings = read_source("Hanadocs backlog-rankings", lambda: json_lines(vault / "backlog-rankings.jsonl", parse_rank), [], problems)
+        rankings = read_source("Hanadocs backlog-rankings", lambda: json_lines(vault / "backlog-rankings.jsonl", parse_rank), [], problems, event_source=log_records.SourceNotApplicable.STATE)
         waiting = read_waiting(state, vault, found, problems)
         workers, roster_problems = worker_read.result()
         tokens = token_read.result()
     problems.extend(worker_problems)
-    problems.extend(log_records.SourceProblem("session roster", problem) for problem in roster_problems)
+    problems.extend(log_records.SourceProblem("session roster", problem, event_source=log_records.SourceNotApplicable.STATE) for problem in roster_problems)
     problems.extend(token_problems)
     def load_merges() -> list[HanaMerge] | MergeHistoryNotRecorded:
         return read_hana_merges(hana_repository(units))
 
-    merges = read_source("Hana origin/init/catalyst merge log", load_merges, MergeHistoryNotRecorded.MISSING, problems)
+    merges = read_source("Hana origin/init/catalyst merge log", load_merges, MergeHistoryNotRecorded.MISSING, problems, event_source=EventSource.MERGES)
     history_root = unit_runs.history_root()
     wait_history = read_source("progress_history waits", lambda: read_wait_history(history_root, window, problems, hana_prefixes, phases),
-                               WAIT_HISTORY_NOT_RECORDED, problems)
+                               WAIT_HISTORY_NOT_RECORDED, problems, event_source=EventSource.WAITS)
     receipts = read_source("progress_history merge receipts", lambda: read_receipts(history_root / "merge_receipts.jsonl"),
-                           HistoryNotRecorded("merge receipt history not recorded"), problems)
+                           HistoryNotRecorded("merge receipt history not recorded"), problems, event_source=EventSource.RECEIPTS)
     return BaselineSources(units, workers, builds, tokens, phases, push_report, messages, found, rankings, waiting, problems,
                            merges, wait_history, receipts)
 
@@ -1719,36 +1806,849 @@ def baseline_summary(
     ])
 
 
-def render(sources: BaselineSources, window: log_records.Window, now: datetime, full: bool = False) -> str:
+def baseline_groups(
+    sources: BaselineSources, window: log_records.Window, now: datetime,
+) -> tuple[tuple[str, list[log_records.MeasureRow]], ...]:
     flow_rows = phase_flow(sources.phases, window, sources.wait_history)
     flow_rows.extend(issue_flow(sources.issue_records, window))
     flow_rows.extend(merge_flow(sources.merges, window))
     flow_rows.extend(receipt_rows(sources.receipts, sources.merges, window))
     attention_rows = attention(sources.push_report, sources.messages)
-    problem_rows = log_records.source_problem_rows(sources.problems, window)
-    summary = baseline_summary(window, flow_rows, attention_rows, problem_rows, full=full)
-    if not full:
-        return summary
     snapshot = f"snapshot {now.astimezone(user_zone()):%Y-%m-%d %H:%M %Z}"
     capacity_rows = capacity(sources.units, sources.workers, snapshot)
     capacity_rows.extend(resource_use(sources.builds, sources.tokens, window))
     attention_rows.extend(pending_attention(sources.waiting, now, window))
     coverage_rows = rank_coverage(sources.issue_records, sources.rankings, sources.units, snapshot)
-    groups = [
-        summary,
-        log_records.blocks("Capacity on Hana", capacity_rows),
-        log_records.blocks("Flow to Hana main (recorded phase/issue completion; local-ref merge commits)", flow_rows),
-        log_records.blocks("User attention", attention_rows),
-        log_records.blocks("Rank coverage", coverage_rows),
-    ]
+    return (
+        ("Capacity on Hana", capacity_rows),
+        ("Flow to Hana main (recorded phase/issue completion; local-ref merge commits)", flow_rows),
+        ("User attention", attention_rows),
+        ("Rank coverage", coverage_rows),
+    )
+
+
+def render(sources: BaselineSources, window: log_records.Window, now: datetime, full: bool = False) -> str:
+    row_groups = baseline_groups(sources, window, now)
+    problem_rows = log_records.source_problem_rows(sources.problems, window)
+    summary = baseline_summary(window, row_groups[1][1], row_groups[2][1], problem_rows, full=full)
+    if not full:
+        return summary
+    groups = [summary, *(log_records.blocks(title, rows) for title, rows in row_groups)]
     if problem_rows:
         groups.append(log_records.blocks("Source problems (dependent counts can be incomplete)", problem_rows))
     return "\n\n".join(groups)
 
 
+@dataclass(frozen=True)
+class RecordedCoverage:
+    intervals: tuple[log_records.Window, ...]
+
+    def __post_init__(self) -> None:
+        if any(interval.since >= interval.until for interval in self.intervals):
+            raise ValueError("coverage intervals must have a positive duration")
+
+
+@dataclass(frozen=True)
+class SourceUnavailable:
+    reason: str
+
+
+@dataclass(frozen=True)
+class CoverageUnknown:
+    reason: str
+
+
+SourceCoverage = RecordedCoverage | SourceUnavailable | CoverageUnknown
+
+
+@dataclass(frozen=True)
+class RoleAccount:
+    role: str
+    account: str
+
+
+@dataclass(frozen=True)
+class AccountNotRecorded:
+    reason: str
+
+
+@dataclass(frozen=True)
+class HourlyTokenUsage:
+    hour: datetime
+    account: RoleAccount | AccountNotRecorded
+    repository: str
+    tokens: float
+    turns: int
+
+
+@dataclass(frozen=True)
+class HanaProject:
+    name: str
+
+
+@dataclass(frozen=True)
+class NonHanaProject:
+    name: str
+
+
+@dataclass(frozen=True)
+class ProjectNotRecorded:
+    reason: str
+
+
+ProjectEvidence = HanaProject | NonHanaProject | ProjectNotRecorded
+
+
+@dataclass(frozen=True)
+class CauseProject:
+    subject: str
+    project: ProjectEvidence
+
+
+@dataclass(frozen=True)
+class NonHanaCause:
+    subject: str
+    project: str
+
+
+@dataclass(frozen=True)
+class HanaCause:
+    subject: str
+
+
+@dataclass(frozen=True)
+class CauseNotRecorded:
+    reason: str
+
+
+WaitCause = NonHanaCause | HanaCause | CauseNotRecorded
+
+
+@dataclass(frozen=True)
+class WaitCauseInterval:
+    wait: str
+    kind: WaitKind | WaitKindNotRecorded
+    started: datetime
+    until: datetime
+    cause: WaitCause
+    holder: NamedHolder | HolderNotNamed | MalformedHolder
+
+
+@dataclass(frozen=True)
+class BuildMemoryUsage:
+    repository: str
+    started: datetime
+    until: datetime
+    peak_bytes: float
+
+
+@dataclass(frozen=True)
+class BuildMemoryHistory:
+    records: tuple[BuildMemoryUsage, ...]
+    source: str
+
+
+@dataclass(frozen=True)
+class MemoryNotRecorded:
+    reason: str
+
+
+@dataclass(frozen=True)
+class ComparisonWindow:
+    window: log_records.Window
+    sources: BaselineSources
+    coverage: dict[EventSource, SourceCoverage]
+    snapshot_rows: tuple[log_records.MeasureRow, ...]
+    hourly_tokens: tuple[HourlyTokenUsage, ...]
+    projects: tuple[CauseProject, ...]
+    build_memory: BuildMemoryHistory | MemoryNotRecorded
+
+
+def parse_compare_window(text: str) -> log_records.Window:
+    return log_records.parse_window(text)
+
+
+BASELINE_WINDOW = parse_compare_window("2026-10-13T17:24-04:00..2026-10-20T17:24-04:00")
+BASELINE_DOCUMENT = SCRIPTS.parent / "docs/plans/build-followups-hierarchies-design.md"
+COVERAGE_CONFIG = SCRIPTS.parent / "config/hierarchies/coverage.toml"
+
+
+def recorded_baseline_rows(path: Path = BASELINE_DOCUMENT) -> tuple[log_records.MeasureRow, ...]:
+    """Read the saved report, without reconstructing its snapshots from live state."""
+    content = path.read_text(encoding="utf-8")
+    if "## Baseline\n" not in content:
+        raise ValueError(f"{path}: saved Baseline section not recorded")
+    text = content.split("## Baseline\n", 1)[1].split("### Prior-week Hana merges", 1)[0]
+    rows: list[log_records.MeasureRow] = []
+    for line in text.splitlines():
+        fields = re.split(r"\s{2,}", line.strip())
+        if len(fields) == 5 and fields[2].isdigit():
+            count = re.fullmatch(r"(\d+)(?:;.*)?", fields[1])
+            fraction = re.fullmatch(r"(\d+)/(\d+)(?: \((\d+(?:\.\d+)?)%\))?", fields[1])
+            amount: float | log_records.Fraction | log_records.NotRecorded
+            if count:
+                amount = float(count[1])
+            elif fraction:
+                amount = log_records.Fraction(float(fraction[1]), float(fraction[2]), fraction[3] is not None)
+            else:
+                amount = log_records.NotRecorded(fields[1])
+            rows.append(log_records.MeasureRow(fields[0], fields[1], int(fields[2]), fields[3], fields[4],
+                        log_records.SourceNotApplicable.STATE, log_records.Snapshot(amount)))
+    if not rows:
+        raise ValueError(f"{path}: saved Baseline report not recorded")
+    return tuple(rows)
+
+
+def covered_days(coverage: RecordedCoverage, window: log_records.Window) -> float:
+    intervals = sorted((max(item.since, window.since), min(item.until, window.until))
+                       for item in coverage.intervals if item.since < window.until and item.until > window.since)
+    seconds = 0.0
+    end = window.since
+    for start, finish in intervals:
+        seconds += max(0.0, (finish - max(start, end)).total_seconds())
+        end = max(end, finish)
+    return seconds / 86400
+
+
+def rate_text(amount: float, coverage: SourceCoverage, window: log_records.Window, unit: str = "") -> str:
+    if not isinstance(coverage, RecordedCoverage):
+        label = "source unavailable" if isinstance(coverage, SourceUnavailable) else "coverage unknown"
+        return f"not recorded ({label}: {coverage.reason})"
+    days = covered_days(coverage, window)
+    if days <= 0:
+        return "not recorded (0 covered days)"
+    partial = days < (window.until - window.since).total_seconds() / 86400
+    return f"{amount * 7 / days:.1f}{unit}/week; {days:g} covered days" + (" (partial)" if partial else "")
+
+
+def snapshot_row(row: log_records.MeasureRow) -> bool:
+    return isinstance(row.quantity, log_records.Snapshot)
+
+
+def comparable_rows(part: ComparisonWindow, now: datetime, *, before: bool) -> list[log_records.MeasureRow]:
+    rows = [row for group in dict(baseline_groups(part.sources, part.window, now)).values() for row in group]
+    saved = {row.measure: row for row in part.snapshot_rows}
+    rows = [saved.pop(row.measure) if row.measure in saved else
+            replace(row, value="comparison unavailable (no recorded before row)", n=0,
+                    window="snapshot not recorded", quantity=log_records.NotRecorded("no recorded before row"))
+            if before and snapshot_row(row) else row for row in rows]
+    rows.extend(saved.values())
+    return comparison_measure_rows(rows)
+
+
+def comparison_measure_rows(rows: Sequence[log_records.MeasureRow]) -> list[log_records.MeasureRow]:
+    grouped: dict[str, list[log_records.MeasureRow]] = defaultdict(list)
+    for row in rows:
+        if not row.detail:
+            grouped[row.comparison_name or row.measure].append(row)
+    result: list[log_records.MeasureRow] = []
+    for name, members in grouped.items():
+        first = members[0]
+        if len(members) == 1:
+            result.append(replace(first, measure=name))
+            continue
+        quantities = tuple(row.quantity for row in members)
+        n = sum(row.n for row in members)
+        if all(isinstance(value, log_records.EventValue) for value in quantities):
+            events = tuple(value for value in quantities if isinstance(value, log_records.EventValue))
+            quantity: log_records.Quantity = log_records.EventValue(
+                sum(value.amount for value in events), events[0].unit,
+                tuple(event for value in events for event in value.events),
+                tuple(at for value in events for at in value.population),
+                events[0].wait_rate, any(value.partial for value in events))
+            text = f"{quantity.amount:g}"
+        elif all(isinstance(value, log_records.Diagnostic) for value in quantities):
+            quantity = log_records.Diagnostic(sum(value.amount for value in quantities if isinstance(value, log_records.Diagnostic)))
+            text = f"{quantity.amount:g}"
+        elif any(isinstance(value, log_records.NotRecorded) for value in quantities):
+            reason = "; ".join(dict.fromkeys(value.reason for value in quantities if isinstance(value, log_records.NotRecorded)))
+            quantity = log_records.NotRecorded(reason)
+            text = "not recorded (" + reason + ")"
+        else:
+            quantity = first.quantity
+            text = "; ".join(dict.fromkeys(row.value for row in members))
+        source = (first.event_source.value if isinstance(first.event_source, EventSource)
+                  and all(row.event_source is first.event_source for row in members)
+                  else "; ".join(dict.fromkeys(row.source for row in members)))
+        result.append(replace(first, measure=name, value=text, n=n, quantity=quantity, source=source))
+    return result
+
+
+@dataclass(frozen=True)
+class WeeklyRate:
+    amount: float
+    unit: str
+
+
+@dataclass(frozen=True)
+class ComparedValue:
+    text: str
+    quantity: log_records.Quantity | WeeklyRate
+    n: int
+
+
+def covered_event(at: datetime, coverage: RecordedCoverage, window: log_records.Window) -> bool:
+    return window.contains(at) and any(interval.contains(at) for interval in coverage.intervals)
+
+
+def covered_event_count(starts: Iterable[datetime], coverage: SourceCoverage, window: log_records.Window) -> int:
+    return sum(covered_event(at, coverage, window) if isinstance(coverage, RecordedCoverage) else 1 for at in starts)
+
+
+def evaluate_row(row: log_records.MeasureRow, part: ComparisonWindow) -> ComparedValue:
+    quantity = row.quantity
+    if isinstance(quantity, log_records.NotRecorded):
+        text = row.value if quantity.reason == "no recorded before row" else "not recorded (" + quantity.reason + ")"
+        return ComparedValue(text, quantity, row.n)
+    if isinstance(quantity, log_records.Statistic) and not quantity.amounts:
+        return ComparedValue(row.value, log_records.NotRecorded("duration samples not recorded"), row.n)
+    if not isinstance(quantity, log_records.EventValue):
+        return ComparedValue(row.value, quantity, row.n)
+    coverage = part.coverage.get(row.event_source, CoverageUnknown("continuous source coverage not recorded")) if isinstance(row.event_source, EventSource) else CoverageUnknown("event source not recorded")
+    if not isinstance(coverage, RecordedCoverage) or covered_days(coverage, part.window) <= 0:
+        text = rate_text(quantity.amount, coverage, part.window, quantity.unit)
+        return ComparedValue(text, log_records.NotRecorded(text), row.n)
+    days = covered_days(coverage, part.window)
+    if quantity.amount and not quantity.events and days < (part.window.until - part.window.since).total_seconds() / 86400:
+        return ComparedValue("not recorded (event times not recorded)", log_records.NotRecorded("event times not recorded"), row.n)
+    amount = sum(event.amount for event in quantity.events if covered_event(event.at, coverage, part.window)) if quantity.events else quantity.amount
+    n = covered_event_count(quantity.population, coverage, part.window) if quantity.population else row.n
+    text = rate_text(amount, coverage, part.window, quantity.unit)
+    if quantity.wait_rate:
+        text += "; waits " + rate_text(n, coverage, part.window)
+    if quantity.partial and days >= (part.window.until - part.window.since).total_seconds() / 86400:
+        text += " (partial)"
+    skipped = sum(problem.kind.count for problem in dict.fromkeys((*part.sources.problems, *part.sources.push_report.problems))
+                  if problem.event_source == row.event_source and isinstance(problem.kind, log_records.RowsSkipped))
+    if skipped:
+        text += f"; incomplete: {skipped} rows skipped"
+    return ComparedValue(text, WeeklyRate(amount * 7 / days, quantity.unit), n)
+
+
+def quantity_change(before: ComparedValue, after: ComparedValue) -> str:
+    left, right = before.quantity, after.quantity
+    if isinstance(left, log_records.NotRecorded) or isinstance(right, log_records.NotRecorded):
+        return "not recorded"
+    if isinstance(left, WeeklyRate) and isinstance(right, WeeklyRate) and left.unit == right.unit:
+        return f"{right.amount - left.amount:+.1f}/week"
+    if isinstance(left, log_records.Snapshot) and isinstance(right, log_records.Snapshot):
+        left, right = left.amount, right.amount
+    if isinstance(left, log_records.NotRecorded) or isinstance(right, log_records.NotRecorded):
+        return "not recorded"
+    if isinstance(left, log_records.Fraction) and isinstance(right, log_records.Fraction):
+        if left.denominator <= 0 or right.denominator <= 0:
+            return "not recorded"
+        change = right.numerator / right.denominator - left.numerator / left.denominator
+        return f"{change * 100:+.1f} percentage points" if change else "unchanged"
+    if isinstance(left, (float, int)) and isinstance(right, (float, int)):
+        return f"{right - left:+.1f}" if right != left else "unchanged"
+    if isinstance(left, log_records.Diagnostic) and isinstance(right, log_records.Diagnostic):
+        return f"{right.amount - left.amount:+.1f}" if right.amount != left.amount else "unchanged"
+    if left == right:
+        return "unchanged"
+    return "see before and after"
+
+
+def comparison_rows(before: ComparisonWindow, after: ComparisonWindow, now: datetime) -> list[log_records.MeasureRow]:
+    left = {row.measure: row for row in comparable_rows(before, now, before=True)}
+    right = {row.measure: row for row in comparable_rows(after, now, before=False)}
+    rows: list[log_records.MeasureRow] = []
+    for key in dict.fromkeys((*left, *right)):
+        first, second = left.get(key), right.get(key)
+        before_value = evaluate_row(first, before) if first is not None else ComparedValue(
+            "comparison unavailable (no recorded before row)", log_records.NotRecorded("no recorded before row"), 0)
+        after_value = evaluate_row(second, after) if second is not None else ComparedValue(
+            "comparison unavailable (no recorded after row)", log_records.NotRecorded("no recorded after row"), 0)
+        source = "; ".join(dict.fromkeys(row.source for row in (first, second) if row is not None))
+        windows = f"before {before.window.label}; after {after.window.label}"
+        if first is not None and snapshot_row(first):
+            windows += "; before " + first.window
+        if second is not None and snapshot_row(second):
+            windows += "; after " + second.window
+        detail = f"before: {before_value.text}; after: {after_value.text}; change: {quantity_change(before_value, after_value)}"
+        detail += f"; n before={before_value.n}; after={after_value.n}"
+        if any(isinstance(row.quantity, log_records.Snapshot) and row.quantity.visibility_changed
+               for row in (first, second) if row is not None):
+            detail += "; visibility changed: current reader includes earlier lists; delta is not backlog growth"
+        rows.append(log_records.MeasureRow(key, detail, after_value.n, windows, source))
+    return rows
+
+
+def project_cause(subject: str, projects: Sequence[CauseProject]) -> WaitCause:
+    matches = {item.project for item in projects if item.subject == subject}
+    if len(matches) != 1:
+        return CauseNotRecorded(f"{subject}: project not recorded or conflicting")
+    project = next(iter(matches))
+    if isinstance(project, NonHanaProject):
+        return NonHanaCause(subject, project.name)
+    if isinstance(project, HanaProject):
+        return HanaCause(subject)
+    return CauseNotRecorded(f"{subject}: {project.reason}")
+
+
+def holder_subject(holder: NamedHolder) -> str:
+    return ("session:" + holder.holder.session_id if isinstance(holder.holder, SessionHolder)
+            else "unit:" + holder.holder.unit)
+
+
+def wait_causes(wait: HanaWait, projects: Sequence[CauseProject], window: log_records.Window) -> tuple[WaitCauseInterval, ...]:
+    if not isinstance(wait.end, CompletedWait):
+        return ()
+    start, end = max(wait.started, window.since), min(wait.end.at, window.until)
+    if start >= end:
+        return ()
+    if wait.kind is WaitKind.SUPPLIER:
+        supplier = wait.expected_supplier
+        cause = (project_cause(supplier.address, projects) if isinstance(supplier, NamedSupplier)
+                 else CauseNotRecorded(supplier.reason))
+        return (WaitCauseInterval(wait.identity, wait.kind, start, end, cause,
+                                  HolderNotNamed("supplier evidence, no resource holder")),)
+    if wait.kind not in (WaitKind.QUOTA, WaitKind.CAPACITY):
+        return ()
+    result: list[WaitCauseInterval] = []
+    cursor = start
+    for interval in holder_intervals(wait):
+        if not isinstance(interval.end, CompletedWait):
+            continue
+        left, right = max(interval.started, start), min(interval.end.at, end)
+        if right <= left:
+            continue
+        if cursor < left:
+            result.append(WaitCauseInterval(wait.identity, wait.kind, cursor, left,
+                          CauseNotRecorded("holder not named before first observation"), HolderNotNamed("no observation")))
+        holder = interval.holder
+        valid_resource = (holder.resource_kind is HolderResourceKind.ACCOUNT if wait.kind is WaitKind.QUOTA
+                          else holder.resource_kind in (HolderResourceKind.SLOT, HolderResourceKind.MEMORY)) if isinstance(holder, NamedHolder) else False
+        if isinstance(holder, NamedHolder) and valid_resource:
+            cause = project_cause(holder_subject(holder), projects)
+        elif isinstance(holder, NamedHolder):
+            cause = CauseNotRecorded("holder resource does not match wait kind")
+        else:
+            cause = CauseNotRecorded(type(holder).__name__ + ": " + holder.reason)
+        result.append(WaitCauseInterval(wait.identity, wait.kind, left, right, cause, holder))
+        cursor = max(cursor, right)
+    if cursor < end:
+        result.append(WaitCauseInterval(wait.identity, wait.kind, cursor, end,
+                      CauseNotRecorded("holder not named"), HolderNotNamed("no observation")))
+    return tuple(result)
+
+
+@dataclass(frozen=True)
+class CauseMinutes:
+    cause: WaitCause
+    minutes: float
+    wait_started: datetime
+
+
+@dataclass(frozen=True)
+class WaitEvidence:
+    wait: HanaWait
+    intervals: tuple[WaitCauseInterval, ...]
+    causes: tuple[CauseMinutes, ...]
+    named_minutes: float
+    unnamed_minutes: float
+    malformed: bool
+
+
+def wait_evidence(part: ComparisonWindow) -> tuple[WaitEvidence, ...]:
+    history = part.sources.wait_history
+    if isinstance(history, HistoryNotRecorded):
+        return ()
+    result: list[WaitEvidence] = []
+    for wait in history.waits:
+        if wait.kind not in (WaitKind.QUOTA, WaitKind.CAPACITY, WaitKind.SUPPLIER):
+            continue
+        intervals = wait_causes(wait, part.projects, part.window)
+        if not intervals and not (part.window.contains(wait.started) and isinstance(wait.end, UnknownEndedWait)):
+            continue
+        grouped: dict[WaitCause, float] = defaultdict(float)
+        named = unnamed = 0.0
+        for interval in intervals:
+            minutes = (interval.until - interval.started).total_seconds() / 60
+            grouped[interval.cause] += minutes
+            if isinstance(interval.holder, NamedHolder):
+                named += minutes
+            else:
+                unnamed += minutes
+        result.append(WaitEvidence(wait, intervals, tuple(CauseMinutes(cause, minutes, wait.started) for cause, minutes in grouped.items()),
+                      named, unnamed, any(isinstance(interval.holder, MalformedHolder) for interval in intervals)))
+    return tuple(result)
+
+
+WAIT_CAUSE_SOURCE = "progress_history.py waits; named supplier/holder and recorded project; same-hour load is context only"
+
+
+def holder_evidence_row(evidence: WaitEvidence, window: log_records.Window) -> log_records.MeasureRow:
+    return log_records.MeasureRow(f"Hana wait holder minutes / {evidence.wait.identity}",
+        f"named {evidence.named_minutes:.1f} min; not named {evidence.unnamed_minutes:.1f} min", 1, window.label,
+        WAIT_CAUSE_SOURCE, EventSource.WAITS, log_records.Diagnostic(1))
+
+
+def cause_description(item: CauseMinutes, part: ComparisonWindow) -> str:
+    cause = item.cause
+    if isinstance(cause, NonHanaCause):
+        label = f"non-Hana cause {cause.subject}; project {cause.project}"
+    elif isinstance(cause, HanaCause):
+        label = f"Hana cause {cause.subject}"
+    else:
+        label = "cause not recorded: " + cause.reason
+    coverage = part.coverage.get(EventSource.WAITS, CoverageUnknown("continuous wait coverage not recorded"))
+    count = covered_event_count((item.wait_started,), coverage, part.window)
+    return f"{label}; {item.minutes:.1f} min; " + rate_text(count, coverage, part.window)
+
+
+def wait_cause_rows(part: ComparisonWindow) -> list[log_records.MeasureRow]:
+    history = part.sources.wait_history
+    if isinstance(history, HistoryNotRecorded):
+        return [log_records.MeasureRow("Hana wait causes", "not recorded: " + history.reason, 0, part.window.label,
+                WAIT_CAUSE_SOURCE, EventSource.WAITS, log_records.NotRecorded(history.reason))]
+    rows: list[log_records.MeasureRow] = []
+    for evidence in wait_evidence(part):
+        wait = evidence.wait
+        if not evidence.intervals:
+            rows.append(log_records.MeasureRow(f"Hana wait cause / {wait.identity}", "cause not recorded; duration unknown",
+                        1, part.window.label, WAIT_CAUSE_SOURCE, EventSource.WAITS, log_records.NotRecorded("duration unknown")))
+            continue
+        rows.append(holder_evidence_row(evidence, part.window))
+        rows.extend(log_records.MeasureRow(f"Hana wait cause / {wait.identity}", cause_description(item, part),
+                    1, part.window.label, WAIT_CAUSE_SOURCE, EventSource.WAITS, log_records.Diagnostic(1))
+                    for item in evidence.causes)
+        rows.extend(wait_load_context(wait, evidence.intervals, part))
+    return rows
+
+
+def wait_hours(intervals: Sequence[WaitCauseInterval]) -> tuple[datetime, ...]:
+    hours: set[datetime] = set()
+    for interval in intervals:
+        hour = interval.started.replace(minute=0, second=0, microsecond=0)
+        while hour < interval.until:
+            hours.add(hour)
+            hour += timedelta(hours=1)
+    return tuple(sorted(hours))
+
+
+def wait_accounts(intervals: Sequence[WaitCauseInterval], hour: datetime) -> set[str]:
+    return {interval.holder.resource for interval in intervals if isinstance(interval.holder, NamedHolder)
+            and interval.holder.resource_kind is HolderResourceKind.ACCOUNT
+            and interval.started < hour + timedelta(hours=1) and interval.until > hour}
+
+
+def wait_load_context(wait: HanaWait, intervals: Sequence[WaitCauseInterval], part: ComparisonWindow) -> list[log_records.MeasureRow]:
+    rows: list[log_records.MeasureRow] = []
+    hours = wait_hours(intervals)
+    source = "usage ledger turns + account_role_changes at each turn; same-hour context, never proof of cause"
+    if wait.kind is WaitKind.QUOTA:
+        for hour in sorted(hours):
+            selected, unknown = hourly_context_tokens(hour, wait_accounts(intervals, hour), part.hourly_tokens)
+            value = "; ".join(f"{turn.account.role}/{turn.account.account}: {turn.tokens:,.0f} tokens ({turn.repository})"
+                              for turn in selected if isinstance(turn.account, RoleAccount))
+            if not value:
+                value = "not recorded (no matched non-Hana account/role token records)"
+            if unknown:
+                value += f"; {sum(turn.turns for turn in unknown)} turns with attribution not recorded"
+            rows.append(log_records.MeasureRow(f"Same-hour non-Hana tokens / {wait.identity} / {hour.isoformat()}",
+                        value, sum(turn.turns for turn in selected), part.window.label, source, EventSource.TOKENS,
+                        log_records.Diagnostic(sum(turn.turns for turn in selected))))
+    elif wait.kind is WaitKind.CAPACITY:
+        for hour in sorted(hours):
+            if isinstance(part.build_memory, MemoryNotRecorded):
+                value, n = "not recorded: " + part.build_memory.reason, 0
+                memory_source = "buildlog steps on natedev"
+            else:
+                builds = hourly_context_builds(hour, part.build_memory)
+                value = "; ".join(f"{record.repository}: peak {record.peak_bytes:g} bytes" for record in builds)
+                value = value or "not recorded (no overlapping attributed non-Hana memory records)"
+                n, memory_source = len(builds), part.build_memory.source
+            rows.append(log_records.MeasureRow(f"Same-hour non-Hana build memory / {wait.identity} / {hour.isoformat()}",
+                        value, n, part.window.label, memory_source + "; per-step peaks, not concurrent usage; context only",
+                        EventSource.BUILDS, log_records.Diagnostic(n)))
+    return rows
+
+
+def hourly_context_tokens(
+    hour: datetime, resources: set[str], turns: Sequence[HourlyTokenUsage],
+) -> tuple[tuple[HourlyTokenUsage, ...], tuple[HourlyTokenUsage, ...]]:
+    selected = tuple(turn for turn in turns if turn.hour == hour and isinstance(turn.account, RoleAccount)
+                     and (turn.account.account in resources or f"{turn.account.role}/{turn.account.account}" in resources
+                          or f"{account_group(turn.account.role)}/{turn.account.account}" in resources)
+                     and isinstance(repository_project(turn.repository), NonHanaProject))
+    unknown = tuple(turn for turn in turns if turn.hour == hour
+                    and (isinstance(turn.account, AccountNotRecorded)
+                         or isinstance(repository_project(turn.repository), ProjectNotRecorded)))
+    return selected, unknown
+
+
+def hourly_context_builds(hour: datetime, memory: BuildMemoryHistory) -> tuple[BuildMemoryUsage, ...]:
+    return tuple(record for record in memory.records if record.started < hour + timedelta(hours=1)
+                 and record.until > hour and isinstance(repository_project(record.repository), NonHanaProject))
+
+
+class WaitMeasure(Enum):
+    NAMED = "holder named"
+    UNNAMED = "holder not named"
+    HANA = "Hana cause"
+    UNKNOWN = "cause not recorded"
+    UNKNOWN_DURATION = "cause not recorded; duration unknown"
+
+
+def compact_wait_rows(part: ComparisonWindow) -> list[log_records.MeasureRow]:
+    history = part.sources.wait_history
+    if isinstance(history, HistoryNotRecorded):
+        return wait_cause_rows(part)
+    evidence_rows = wait_evidence(part)
+    minutes: dict[tuple[WaitKind, WaitMeasure], float] = defaultdict(float)
+    counts: dict[tuple[WaitKind, WaitMeasure], dict[str, datetime]] = defaultdict(dict)
+    token_context: set[HourlyTokenUsage] = set()
+    memory_context: set[BuildMemoryUsage] = set()
+    memory_waits: set[str] = set()
+    rows: list[log_records.MeasureRow] = []
+    for evidence in evidence_rows:
+        wait = evidence.wait
+        if not isinstance(wait.kind, WaitKind):
+            continue
+        kind = wait.kind
+        if not evidence.intervals:
+            counts[(kind, WaitMeasure.UNKNOWN_DURATION)][wait.identity] = wait.started
+        for label, amount in ((WaitMeasure.NAMED, evidence.named_minutes), (WaitMeasure.UNNAMED, evidence.unnamed_minutes)):
+            if amount:
+                minutes[(kind, label)] += amount
+                counts[(kind, label)][wait.identity] = wait.started
+        if evidence.malformed:
+            rows.append(holder_evidence_row(evidence, part.window))
+        named = tuple(item for item in evidence.causes if isinstance(item.cause, NonHanaCause))
+        if named:
+            rows.append(log_records.MeasureRow(f"Hana wait cause / {wait.identity}",
+                        "; ".join(cause_description(item, part) for item in named), 1, part.window.label,
+                        WAIT_CAUSE_SOURCE, EventSource.WAITS, log_records.Diagnostic(1)))
+        for item in evidence.causes:
+            if not isinstance(item.cause, NonHanaCause):
+                label = WaitMeasure.HANA if isinstance(item.cause, HanaCause) else WaitMeasure.UNKNOWN
+                minutes[(kind, label)] += item.minutes
+                counts[(kind, label)][wait.identity] = wait.started
+        for hour in wait_hours(evidence.intervals):
+            if kind is WaitKind.QUOTA:
+                selected, unknown = hourly_context_tokens(hour, wait_accounts(evidence.intervals, hour), part.hourly_tokens)
+                token_context.update((*selected, *unknown))
+            elif kind is WaitKind.CAPACITY:
+                memory_waits.add(wait.identity)
+                if isinstance(part.build_memory, BuildMemoryHistory):
+                    memory_context.update(hourly_context_builds(hour, part.build_memory))
+    coverage = part.coverage.get(EventSource.WAITS, CoverageUnknown("continuous wait coverage not recorded"))
+    for (kind, label), identities in counts.items():
+        value = label.value
+        if label is not WaitMeasure.UNKNOWN_DURATION:
+            value += f"; {minutes[(kind, label)]:.1f} min"
+        value += "; waits " + rate_text(covered_event_count(identities.values(), coverage, part.window), coverage, part.window)
+        rows.append(log_records.MeasureRow("Hana wait causes / " + kind.value + " / " + label.value, value,
+                    len(identities), part.window.label, WAIT_CAUSE_SOURCE, EventSource.WAITS, log_records.Diagnostic(len(identities))))
+    if any(evidence.wait.kind is WaitKind.QUOTA for evidence in evidence_rows):
+        totals: dict[RoleAccount, float] = defaultdict(float)
+        unknown = 0
+        for turn in token_context:
+            if isinstance(turn.account, RoleAccount) and isinstance(repository_project(turn.repository), NonHanaProject):
+                totals[turn.account] += turn.tokens
+            else:
+                unknown += turn.turns
+        value = "; ".join(f"{account.role}/{account.account}: {amount:,.0f} tokens" for account, amount in sorted(
+            totals.items(), key=lambda item: (item[0].role, item[0].account))) or "not recorded (no matched non-Hana account/role token records)"
+        if unknown:
+            value += f"; {unknown} turns with attribution not recorded"
+        rows.append(log_records.MeasureRow("Same-hour non-Hana tokens / WaitingForQuotaRefusal", value,
+                    sum(turn.turns for turn in token_context), part.window.label,
+                    "usage ledger turns + account_role_changes; unique same-hour turns across waits; context only", EventSource.TOKENS,
+                    log_records.Diagnostic(sum(turn.turns for turn in token_context))))
+    if memory_waits:
+        if isinstance(part.build_memory, MemoryNotRecorded):
+            value = "not recorded: " + part.build_memory.reason
+        else:
+            peak = max((record.peak_bytes for record in memory_context), default=0)
+            value = f"maximum recorded step peak {peak:g} bytes" if memory_context else "not recorded (no overlapping attributed non-Hana memory records)"
+        rows.append(log_records.MeasureRow("Same-hour non-Hana build memory / WaitingForMemoryOrSlot", value,
+                    len(memory_context), part.window.label, "buildlog steps on natedev; unique overlapping steps; per-step peaks, not concurrent usage; context only",
+                    EventSource.BUILDS, log_records.Diagnostic(len(memory_context))))
+    return rows
+
+
+def origin_project(origin: PhaseOrigin) -> ProjectEvidence:
+    if hana_origin(origin, ()):
+        name = origin.production.value if isinstance(origin.production, RecordedOrigin) else origin.working_dir
+        return HanaProject(name)
+    if isinstance(origin.repository, RecordedOrigin):
+        return NonHanaProject(origin.repository.value)
+    if isinstance(origin.production, RecordedOrigin):
+        return NonHanaProject(origin.production.value)
+    return ProjectNotRecorded("project attribution not recorded")
+
+
+def repository_project(path: str) -> ProjectEvidence:
+    if path in ("", "repository not recorded", "cwd not recorded", "cwd has no repository", "unknown"):
+        return ProjectNotRecorded("repository attribution not recorded")
+    return origin_project(PhaseOrigin(path, OriginNotRecorded("plan not recorded"),
+                          OriginNotRecorded("production not recorded"), RecordedOrigin(path)))
+
+
+ROLE_ACCOUNT_GROUPS = {
+    "impl": "workers", "test": "workers", "fix": "workers", "review": "workers",
+    "worker": "workers", "workers": "workers", "director": "units", "unit": "units", "units": "units",
+    "showrunner": "showrunners", "interactive": "showrunners", "showrunners": "showrunners",
+}
+
+
+def account_group(role: str) -> str:
+    return ROLE_ACCOUNT_GROUPS.get(role, role)
+
+
+def read_hourly_tokens(path: Path, window: log_records.Window) -> tuple[HourlyTokenUsage, ...]:
+    with closing(usage_report.open_read_store(path)) as db:
+        db.create_function("account_group", 1, account_group, deterministic=True)
+        query = """SELECT t.at,t.role,f.folder,
+            t.input+t.cache_write_5m+t.cache_write_1h+t.cache_read+t.output AS tokens,
+            (SELECT c.label FROM account_role_changes c WHERE c.machine=t.machine
+             AND c.role=account_group(t.role)
+             AND julianday(c.at)<=julianday(t.at) ORDER BY julianday(c.at) DESC LIMIT 1) AS account
+            FROM turns t LEFT JOIN folders f USING(machine,family,parent_id,agent_id)
+            WHERE t.machine='natedev' AND julianday(t.at)>=julianday(?) AND julianday(t.at)<julianday(?)"""
+        totals: dict[tuple[datetime, RoleAccount | AccountNotRecorded, str], float] = defaultdict(float)
+        counts: Counter[tuple[datetime, RoleAccount | AccountNotRecorded, str]] = Counter()
+        for row in cast(Iterable[sqlite3.Row], db.execute(query, (window.since.isoformat(), window.until.isoformat()))):
+            values = cast(tuple[object, ...], tuple(row))
+            at = log_records.required_time(values[0]).astimezone(timezone.utc)
+            role, folder, account = values[1:3] + (values[4],)
+            identity = RoleAccount(role, account) if isinstance(role, str) and role and isinstance(account, str) and account else AccountNotRecorded("role account at turn time not recorded")
+            repo = repository(folder) if isinstance(folder, str) and folder else "repository not recorded"
+            key = (at.replace(minute=0, second=0, microsecond=0), identity, repo)
+            totals[key] += log_records.field_number({"tokens": values[3]}, "tokens")
+            counts[key] += 1
+        return tuple(HourlyTokenUsage(hour, account, repo, amount, counts[(hour, account, repo)])
+                     for (hour, account, repo), amount in totals.items())
+
+
+def read_build_memory(path: Path) -> BuildMemoryHistory | MemoryNotRecorded:
+    try:
+        with closing(usage_report.open_read_store(path)) as db:
+            rows = cast(Iterable[sqlite3.Row], db.execute(
+                "SELECT repo,started_at,duration_s,peak_mem_bytes FROM steps WHERE host='natedev' AND peak_mem_bytes IS NOT NULL"))
+            records: list[BuildMemoryUsage] = []
+            for row in rows:
+                record: log_records.JsonObject = dict(zip(("repository", "at", "seconds", "bytes"), cast(tuple[object, ...], tuple(row))))
+                started = log_records.record_time(record)
+                records.append(BuildMemoryUsage(log_records.field_text(record, "repository"), started,
+                               started + timedelta(seconds=log_records.field_number(record, "seconds")), log_records.field_number(record, "bytes")))
+        return BuildMemoryHistory(tuple(records), str(path) + ": steps.peak_mem_bytes; natedev")
+    except (OSError, ValueError, sqlite3.Error) as error:
+        return MemoryNotRecorded(str(path) + ": " + str(error))
+
+
+def read_cause_projects(folder: Path, units: Sequence[Unit], problems: list[log_records.SourceProblem]) -> tuple[CauseProject, ...]:
+    projects: dict[str, set[ProjectEvidence]] = defaultdict(set)
+    for path in folder.glob("*.jsonl"):
+        records = read_source(str(path), lambda: json_lines(path, lambda record: record), [], problems,
+                              event_source=log_records.SourceNotApplicable.ATTRIBUTION)
+        for record in records:
+            try:
+                if log_records.field_text(record, "event_type") != "phase_started":
+                    continue
+                origin = PhaseOrigin(log_records.field_text(record, "working_dir"), origin_field(record, "plan_doc"),
+                                     origin_field(record, "production"), origin_field(record, "repository"))
+                unit = origin_field(record, "unit")
+                project = origin_project(origin)
+                if isinstance(unit, RecordedOrigin):
+                    projects["unit:" + unit.value].add(project)
+                    projects[unit.value].add(project)
+                sessions = [log_records.field_text(record, field) for field in ("owner_session", "session_id")]
+                if "main_agent" in record:
+                    sessions.append(log_records.field_text(log_records.object_record(record["main_agent"]), "session_id"))
+                for identity in sessions:
+                    if identity:
+                        for subject in ("session:" + identity, "codex:" + identity, identity):
+                            projects[subject].add(project)
+            except ValueError as error:
+                problems.append(log_records.SourceProblem(str(path), "cause project: " + str(error),
+                                log_records.SourceNotApplicable.ATTRIBUTION, log_records.RowsSkipped(1)))
+    for unit in units:
+        subjects = ("unit:" + unit.name, unit.name)
+        recorded = {project for subject in subjects for project in projects.get(subject, ())}
+        if not recorded:
+            recorded = {origin_project(PhaseOrigin(unit.worktree, OriginNotRecorded("plan not recorded"),
+                        RecordedOrigin(unit.production), RecordedOrigin(unit.repository)))}
+        for subject in subjects:
+            projects[subject].update(recorded)
+    return tuple(CauseProject(subject, project) for subject, values in projects.items() for project in values)
+
+
+def comparison_coverage(sources: BaselineSources) -> dict[EventSource, SourceCoverage]:
+    coverage: dict[EventSource, SourceCoverage] = {
+        key: CoverageUnknown("continuous coverage bounds not recorded by this source") for key in EventSource}
+    problems = tuple(dict.fromkeys((*sources.problems, *sources.push_report.problems)))
+    for key in EventSource:
+        failures = [problem.reason for problem in problems if problem.event_source is key
+                    and isinstance(problem.kind, log_records.SourceUnreadable)]
+        if failures:
+            coverage[key] = SourceUnavailable("; ".join(failures))
+    return coverage
+
+
+def load_comparison(before: log_records.Window, after: log_records.Window) -> tuple[ComparisonWindow, ComparisonWindow]:
+    state = Path.home() / ".local/state"
+    notifications = push_audit.load_sources(state / "notify")
+    config_problems: list[log_records.SourceProblem] = []
+    claims = push_audit.read_coverage(COVERAGE_CONFIG, datetime.now(timezone.utc), config_problems)
+    for key in claims.keys() - {source.value for source in EventSource}:
+        config_problems.append(log_records.SourceProblem(str(COVERAGE_CONFIG), f"coverage config [{key}]: unknown source key", event_source=log_records.SourceNotApplicable.CONFIG))
+    parts: list[ComparisonWindow] = []
+    memory = read_build_memory(state / "buildlog/index.sqlite")
+    for index, window in enumerate((before, after)):
+        sources = load_window_sources(window, notifications)
+        sources.problems.extend(config_problems)
+        saved: tuple[log_records.MeasureRow, ...] = ()
+        if index == 0 and window == BASELINE_WINDOW:
+            saved = read_source(str(BASELINE_DOCUMENT), recorded_baseline_rows, (), sources.problems, event_source=log_records.SourceNotApplicable.STATE)
+            saved = tuple(row for row in saved if row.window.startswith("snapshot"))
+        hourly = read_source("hourly usage ledger", lambda: read_hourly_tokens(collect.store_path(), window), (), sources.problems, event_source=EventSource.TOKENS)
+        projects = read_cause_projects(unit_runs.history_root_in(state) / "runs", sources.units, sources.problems)
+        coverage = comparison_coverage(sources)
+        for key in EventSource:
+            if key.value in claims and not isinstance(coverage[key], SourceUnavailable):
+                coverage[key] = RecordedCoverage(claims[key.value].intervals)
+        parts.append(ComparisonWindow(window, sources, coverage, saved, hourly, projects, memory))
+    return parts[0], parts[1]
+
+
+def render_compare(before: ComparisonWindow, after: ComparisonWindow, now: datetime, full: bool = False) -> str:
+    rows = comparison_rows(before, after, now)
+    by_name = {row.measure: row.value for row in rows}
+    non_hana = sum(isinstance(item.cause, NonHanaCause) for part in (before, after)
+                   for evidence in wait_evidence(part) for item in evidence.causes)
+    problems = list(dict.fromkeys((*before.sources.problems, *after.sources.problems)))
+    summary = "\n".join(log_records.wrap_text(line) for line in (
+        "Before: " + before.window.label,
+        "After: " + after.window.label,
+        "Hana: merges " + by_name.get("Hana merges / origin/init/catalyst", "not recorded"),
+        "User attention: failed text checks " + by_name.get("phone pushes after failed review", "not recorded"),
+        f"Non-Hana causes: {non_hana} named wait causes; " + ("HI10 proposal evidence recorded." if non_hana else "no named non-Hana cause recorded."),
+        f"Source problems: {len(problems)}." + ("" if full else " Use --full to print the tables."),
+    ))
+    if not full:
+        return summary
+    groups = [summary]
+    groups.extend(log_records.blocks("Baseline comparison (rates per covered week; snapshots retain their dates)", list(chunk[1]))
+                  for chunk in groupby(rows, key=lambda row: row.window))
+    for label, part in (("Before", before), ("After", after)):
+        groups.append(log_records.blocks(label + " waits, named causes and same-hour context", compact_wait_rows(part)))
+        groups.append(log_records.blocks(label + " source coverage", [log_records.MeasureRow(
+            key.value, f"{covered_days(value, part.window):g} covered days" if isinstance(value, RecordedCoverage)
+            else type(value).__name__ + ": " + value.reason, 0, part.window.label, key.value)
+            for key, value in part.coverage.items()]))
+    if problems:
+        groups.append(log_records.blocks("Source problems", log_records.source_problem_rows(problems, after.window)))
+    return "\n\n".join(groups)
+
+
 def main(arguments: Sequence[str] = ()) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    _ = parser.add_argument("command", choices=("baseline",))
+    _ = parser.add_argument("command", choices=("baseline", "compare"))
+    _ = parser.add_argument("--before", metavar="START..END", default="", help="compare before window; date-only END includes that day; local zone without offset")
+    _ = parser.add_argument("--after", metavar="START..END", default="", help="compare after window; date-only END includes that day; local zone without offset")
     _ = parser.add_argument("--since", metavar="DATE_OR_TIME", default="")
     _ = parser.add_argument("--until", metavar="DATE_OR_TIME", default="")
     _ = parser.add_argument("--full", action="store_true", help="print the tables after the summary")
@@ -1757,6 +2657,12 @@ def main(arguments: Sequence[str] = ()) -> int:
     since_text = cast(str, args.since)
     until_text = cast(str, args.until)
     try:
+        if cast(str, args.command) == "compare":
+            before = parse_compare_window(cast(str, args.before))
+            after = parse_compare_window(cast(str, args.after))
+            comparison = load_comparison(before, after)
+            print(render_compare(*comparison, now, full=cast(bool, args.full)))
+            return 0
         window = log_records.window_bounds(since_text, until_text, now)
     except ValueError as error:
         parser.error(str(error))

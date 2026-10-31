@@ -25,6 +25,20 @@ CODEX_CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
 CODEX_MODELS_CACHE_FILE="${CODEX_MODELS_CACHE_FILE:-$HOME/.codex/models_cache.json}"
 CODEX_CATALOG_SYNC_STATE_FILE="${CODEX_CATALOG_SYNC_STATE_FILE:-$HOME/.local/state/codex-agent-catalog-sync/last_success}"
 CODEX_PACER_TIER_FILE="${CODEX_PACER_TIER_FILE:-$HOME/.local/state/codex-pacer/tier}"
+
+# Resolve the signed-in workers account rather than an inherited CODEX_HOME.
+agents_workers_home() {
+    "$AGENTS_CONFIG_DIR/../lib/py" - "$AGENTS_CONFIG_DIR/../.." <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from scripts.whoami.agent_accounts import workers_home
+try:
+    print(workers_home())
+except (OSError, ValueError) as error:
+    sys.exit(str(error))
+PY
+}
+
 # One shared registry for every reader and writer.
 agents_registry_text() {
     if [[ "${AGENTS_REGISTRY_BASE+x}" == x ]]; then
@@ -126,9 +140,7 @@ _agents_section_keys_inline() {
 # substitution. Returning early from `while read ... < <(producer)` leaves the
 # producer writing into a pipe with no reader, and every remaining printf in
 # _agents_config_section_values reports "write error: Broken pipe" on stderr.
-# On the Mac that went to /tmp/style-fix-stderr.log and nobody looked; on NixOS
-# the systemd journal carries it, which is where the 39 lines per fix run came
-# from. The functions below that read their input to the end are fine as-is.
+# Reading the complete section avoids these errors in callers and job logs.
 _agents_registry_get() {
     local section="$1" key="$2" values line row_key value
     values="$(_agents_config_section_values "$section")"

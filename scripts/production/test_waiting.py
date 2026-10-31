@@ -553,7 +553,7 @@ os.execv(os.environ["WAITING_TEST_REAL_GIT"], [os.environ["WAITING_TEST_REAL_GIT
         lines = [line for line in result.stdout.splitlines() if line.startswith("scratch-test:")]
         self.assertEqual(len(lines), 2, result.stdout)
         self.assertIn("ok — green", lines[0])
-        self.assertIn("failed — temporary worktree cleanup: cleanup refused by test wrapper", lines[1])
+        self.assertIn("failed — temporary worktree cleanup: stderr: cleanup refused by test wrapper", lines[1])
 
     def test_search_reports_other_unit_branch_and_uncommitted_worktree_sites(self) -> None:
         _ = self.commit(self.beta, "src/beta.py", "old_public_name()\n")

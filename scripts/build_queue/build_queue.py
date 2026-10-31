@@ -82,9 +82,9 @@ def age(since: float, now: float) -> int:
     return max(0, int((now - since) // 60))
 
 
-def free_memory_text(threshold: int, need: int, growth: int, reserve: int, head_need: int = 0) -> str:
+def free_memory_text(threshold: int, need: int, growth: int, reserve: int) -> str:
     parts = [f"this step {need / memory_admit.GIB:.1f}"]
-    for name, value in (("running steps may grow", growth), ("head", head_need), ("earlyoom", reserve)):
+    for name, value in (("running steps may grow", growth), ("earlyoom", reserve)):
         amount = f"{value / memory_admit.GIB:.1f}"
         if amount != "0.0":
             parts.append(f"{name} {amount}")
@@ -105,7 +105,7 @@ def head_reason_text(head: memory_admit.HeadExplanation, zone: ZoneInfo, facts: 
                          + f"(starts when build use falls to {memory_text(head.budget.starts_at)})")
         if not head.free.passes:
             parts.append(free_memory_text(head.free.threshold, head.free.need, head.free.growth,
-                                          head.free.reserve, head.free.head_need))
+                                          head.free.reserve))
     parts.append(head_facts.order_text(facts, zone))
     return "head: " + "; ".join(parts)
 
@@ -123,11 +123,14 @@ def reason_text(step: memory_admit.WaitingStep, reading: memory_admit.QueueRead,
             return (f"builds use {reason.charged / memory_admit.GIB:.1f} of the "
                     + f"{reason.budget / memory_admit.GIB:.1f} GiB budget")
         case memory_admit.NeedsMemory():
-            return free_memory_text(reason.threshold, reason.need, reason.growth, reason.reserve, reason.head_need)
+            return free_memory_text(reason.threshold, reason.need, reason.growth, reason.reserve)
         case memory_admit.BehindHead():
             identity = labels.get(reason.head_session_id, roster.UnitLabels(field(reason.head_name)))
             return (f"behind {identity.session} "
                     + f"(waiting {age(reason.head_since, view.now)} min)")
+        case memory_admit.BehindOlderFit():
+            identity = labels.get(reason.older_session_id, roster.UnitLabels(field(reason.older_name)))
+            return memory_admit.older_fit_text(reason, identity.session)
         case memory_admit.HeadAdmissionStatus():
             head = reading.explanation.head
             return (head_reason_text(head, zone, facts)
@@ -246,54 +249,29 @@ def render_queue(reading: memory_admit.QueueRead, zone: ZoneInfo,
     return lines
 
 
-def bump_selector(selector: str, reading: memory_admit.QueueRead,
-                  labels: Mapping[str, roster.UnitLabels]) -> str | memory_admit.WaiterRowSelector:
-    matches = [(position, step) for position, step in enumerate(reading.view.waiting, 1)
-               if step_labels(step, labels).session == selector]
-    if len(matches) > 1:
-        descriptions = ", ".join(f"{position}: {step_labels(step, labels).session} {step.folder}"
-                                 for position, step in matches)
-        raise memory_admit.UnmatchedWaiter(f"{selector!r}: ambiguous waiter; matches: {descriptions}")
-    if matches:
-        position = matches[0][0] - 1
-        return memory_admit.WaiterRowSelector(reading.ordered[position][0].name, selector)
-    return selector
-
-
 def caller() -> str:
     return (os.environ.get("CODEX_THREAD_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID")
             or f"user:{os.environ.get('USER', 'unknown')}")
-
-
-def refusal_text(refusal: memory_admit.UnmatchedWaiter) -> str:
-    escaped = "".join(character if character.isprintable() else json.dumps(character)[1:-1]
-                      for character in str(refusal))
-    return f"build queue: {escaped}"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--json", action="store_true", help="print formatted queue cells as JSON")
     commands = parser.add_subparsers(dest="command")
-    bump = commands.add_parser("bump", help="move a waiting position, session or folder to the head")
+    bump = commands.add_parser("bump", help="refuse queue bumps until user queue priority is available")
     _ = bump.add_argument("selector")
     arguments = parser.parse_args(namespace=QueueArguments())
     try:
-        reading, sessions = read_queue_and_roster()
         if arguments.command == "bump":
-            actor = caller()
-            labels = roster.unit_labels(sessions.entries)
-            try:
-                moved = memory_admit.bump_waiter(bump_selector(arguments.selector, reading, labels), actor)
-            except memory_admit.UnmatchedWaiter as error:
-                print(refusal_text(error))
-                return 3
-            print(f"{field(actor)} moved {step_labels(moved, labels).session}: "
-                  + f"{field(moved.step)} in {field(moved.folder)} to the head; memory limits still apply")
-        elif arguments.json:
+            memory_admit.bump_waiter(arguments.selector, caller())
+        reading, sessions = read_queue_and_roster()
+        if arguments.json:
             print(json.dumps(queue_snapshot(reading, user_zone(), sessions.entries, sessions.problems)))
         else:
             print("\n".join(render_queue(reading, user_zone(), sessions.entries, sessions.problems)))
+    except memory_admit.BumpOff as error:
+        print(f"build queue: {error}")
+        return 3
     except (OSError, ValueError) as error:
         print(f"build queue: {error}", file=sys.stderr)
         return 2

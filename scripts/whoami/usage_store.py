@@ -19,11 +19,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
-# Package callers and sibling scripts share the same store and claim types.
-if __name__ == "usage_store":
-    _ = sys.modules.setdefault("scripts.whoami.usage_store", sys.modules[__name__])
-elif __name__ == "scripts.whoami.usage_store":
-    _ = sys.modules.setdefault("usage_store", sys.modules[__name__])
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.whoami.agent_accounts import AccountSourceUnspecified, ClaudeDirectorySource, CodexHomeSource, KnownUsageLogin, NoWeeklyReadSkip, Quota, Report, StaleTokenSkip, UsageReadOutcome, UsageReadClaim, UsageReadHeld
 from scripts.whoami.note_file import canonical_label

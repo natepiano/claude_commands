@@ -6,7 +6,9 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
-import showrunners
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.production import showrunners
 import unit_lookup
 from production_units import order_unit_names
 

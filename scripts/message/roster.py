@@ -30,7 +30,7 @@ for _directory in (SCRIPTS / "production", SCRIPTS / "direct", SCRIPTS / "herdr"
 import production_units  # noqa: E402
 import remove_workers  # noqa: E402
 from worker_state import worker_ledger  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
 import unit_runs  # noqa: E402
 import herdr  # noqa: E402
@@ -42,7 +42,7 @@ from scripts.lib import names  # noqa: E402
 from scripts.lib.names import JobKey  # noqa: E402
 if TYPE_CHECKING:
     from ..accounts.role_map import role_map_command
-    from ..whoami import account, agent_accounts, note_file
+    from scripts.whoami import account, agent_accounts, note_file
 else:
     import importlib.util
     from scripts.accounts.role_map import role_map_command
@@ -61,9 +61,9 @@ else:
         loader.exec_module(module)
         return module
 
-    account = _lazy_module("account")
-    agent_accounts = _lazy_module("agent_accounts")
-    note_file = _lazy_module("note_file")
+    account = _lazy_module("scripts.whoami.account")
+    agent_accounts = _lazy_module("scripts.whoami.agent_accounts")
+    note_file = _lazy_module("scripts.whoami.note_file")
 from scripts.shutdown import remote as remote  # noqa: E402
 from sessions import SessionRecord, messaging_socket_exists, running_sessions  # noqa: E402
 

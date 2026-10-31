@@ -39,12 +39,13 @@ import sys
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "message"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.production import staff, staff_sources
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import showrunner_tree
 import unit_lookup  # noqa: E402
 import unit_runs  # noqa: E402
