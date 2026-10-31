@@ -71,6 +71,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from test_phase import (
+    NO_TEST_PHASE_RECORD as NO_TEST_PHASE_RECORD,
+    NoTestPhaseRecord as NoTestPhaseRecord,
+    ObservedTestPhase as ObservedTestPhase,
+    TestPhaseContext as TestPhaseContext,
+    TestPhaseRecord as TestPhaseRecord,
+    UnobservedTestPhase as UnobservedTestPhase,
+    UnreadableTestPhaseRecord as UnreadableTestPhaseRecord,
+)
+
 if __package__:
     from . import cgroup_capture, store
 else:
@@ -150,47 +161,6 @@ class NoHeldLog:
 @dataclass(frozen=True)
 class NoPeakFile:
     pass
-
-
-@dataclass(frozen=True)
-class NoTestPhaseRecord:
-    pass
-
-
-NO_TEST_PHASE_RECORD = NoTestPhaseRecord()
-
-
-@dataclass(frozen=True)
-class UnobservedTestPhase:
-    pass
-
-
-@dataclass(frozen=True)
-class ObservedTestPhase:
-    peak_bytes: int
-    started_at: float
-
-
-class TestPhaseContext(TypedDict):
-    """Admission selection and actual width at the JSON persistence boundary."""
-
-    repo_identity: str | None
-    test_scope: Literal["full", "filtered"] | None
-    package: str | None
-    filters: list[str] | None
-    call_id: str | None
-    test_threads: int | None
-
-
-@dataclass(frozen=True)
-class TestPhaseRecord:
-    window: ObservedTestPhase | UnobservedTestPhase
-    context: TestPhaseContext
-
-
-@dataclass(frozen=True)
-class UnreadableTestPhaseRecord:
-    reason: str
 
 
 @dataclass(frozen=True)

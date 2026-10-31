@@ -1357,12 +1357,12 @@ def matching_recipients(
 
     matches = _recipient_matches(to, observed.entries)
     if matches or isinstance(scope, LocalOnly):
-        return RecipientMatches(matches, LocalOnly(), observed.problems)
+        return RecipientMatches(matches, LocalOnly(), observed.diagnostics)
     addressed = to.startswith(("session:", "worker:", "codex:"))
     if observed.problems and not addressed:
-        return LocalRosterIncomplete(observed.problems)
+        return LocalRosterIncomplete(observed.diagnostics)
     peer = roster.peer_roster(os.environ)
-    problems = [*observed.problems, *peer.problems]
+    problems = [*observed.diagnostics, *peer.diagnostics]
     matches = _recipient_matches(to, peer.entries)
     if not matches and peer.problems:
         return RecipientSearchFailed("; ".join(peer.problems), problems)
@@ -2223,7 +2223,7 @@ def send(options: Options) -> Result:
             raise AssertionError("a user message must state its action")
         result = user(message, options.need, options.action, options.timeout, answerable=options.answerable, text_id=options.text_id, values=options.values)
         if options.text_id == AUTO_MODE_TEXT and result.outcome in ("sent", "kept"):
-            _ = rca.open_case(refusal_report(options))
+            _ = rca.open_case(refusal_report(options), defer_owner=True)
     elif isinstance(route, CodexWorkerRecipient):
         transport = Message(
             route.name,

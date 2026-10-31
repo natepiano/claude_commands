@@ -1381,6 +1381,10 @@ class HerdrTests(unittest.TestCase):
         isolated.mkdir(parents=True)
         _ = shutil.copy2(Path(herdr.__file__), isolated / "herdr.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("place.py"), isolated / "place.py")
+        _ = shutil.copy2(Path(herdr.__file__).with_name("pane_launch.py"), isolated / "pane_launch.py")
+        message = isolated.parent / "message"
+        message.mkdir()
+        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "message/sessions.py", message / "sessions.py")
         library = isolated.parent / "lib"
         library.mkdir()
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
@@ -3573,7 +3577,7 @@ class HerdrTests(unittest.TestCase):
         })
         _ = self.process(13, 10, ["/bin/codex"], {"HERDR_PANE_ID": "pane-codex"})
         import unit_lookup as lookup
-        import session_staff
+        from scripts.production import session_staff
 
         def current_slug(slug: str) -> str:
             return slug

@@ -23,7 +23,7 @@ import production_units  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import unit_names  # noqa: E402
 from scripts.production import staff  # noqa: E402
-from scripts.direct import workers, review_pool  # noqa: E402
+from scripts.direct import workers  # noqa: E402
 from scripts.astra import astra_roles, design_roles  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 from scripts.message import sessions  # noqa: E402
@@ -125,7 +125,6 @@ def seed(*, dry_run: bool = False) -> None:
             _ = staff.apply_seed(seed_input)
 
 
-
 # The source scan is shared by seed and the live handler. It never writes source records.
 LiveRole = Literal["showrunner", "unit", "impl", "test", "review", "fix", "astra-designer", "astra-reviewer"]
 
@@ -134,32 +133,6 @@ LiveRole = Literal["showrunner", "unit", "impl", "test", "review", "fix", "astra
 class WorkerOwner:
     key: str
     match: staff.StaffRow | staff.NewSeedMember
-
-
-@dataclass(frozen=True)
-class NoPoolLease:
-    """This worker is not a pool reviewer."""
-
-
-@dataclass(frozen=True)
-class PoolUnleased:
-    """The holder has not leased this reviewer."""
-
-
-@dataclass(frozen=True)
-class PoolServesUnit:
-    staff_id: staff.StaffId
-
-
-@dataclass(frozen=True)
-class PoolLeaseUnresolved:
-    unit: str
-
-
-@dataclass(frozen=True)
-class ReviewPoolLease:
-    busy: bool
-    serves: PoolUnleased | PoolServesUnit | PoolLeaseUnresolved
 
 
 @dataclass(frozen=True)
@@ -173,7 +146,6 @@ class WorkerObservation:
     owner: WorkerOwner
     role: LiveRole
     identity: dict[str, str] | BackendUnavailable
-    pool: NoPoolLease | ReviewPoolLease = NoPoolLease()
 
 
 def _problem(path: Path | str, error: object) -> None:
@@ -367,7 +339,10 @@ class _WorkerSources:
                     try:
                         parent = self.owner(UnitMember(path.parent.name, path.stem))
                     except ValueError:
-                        found = self.sources.member(ObservedUnit(path.stem), self.record)
+                        # An adhoc stem is a worktree name and digest; `.claude-<digest>` names no unit.
+                        observed = ObservedUnit(path.stem)
+                        found = (self.sources.member(observed, self.record)
+                                 if unit_names.NAME.fullmatch(path.stem) else NoSuchMember(observed))
                         if isinstance(found, MemberFound):
                             parent = WorkerOwner(f"staff:{found.row.id}", found.row)
                         elif isinstance(worker.ownership, workers.HeldBy):
@@ -488,38 +463,6 @@ class _WorkerSources:
         except (ValueError, OSError, KeyError, staff.StaffRefused) as error:
             _problem(path, error)
 
-    def pool(self, path: Path) -> None:
-        try:
-            owner = self.owner(ShowrunnerMember(path.parent.name))
-            fields = self.read(path)
-            for key in ("reviewers", "templates", "next_index"):
-                if key in fields:
-                    _ = _object(fields[key])
-            pool = review_pool.decode_pool(cast(review_pool.PoolJson, cast(object, fields)))
-            for name, reviewer in pool.reviewers.items():
-                raw = _object(_object(self.read(path).get("reviewers", {})).get(name))
-                identity = self.backend(owner, name, raw)
-                if isinstance(identity, BackendUnavailable):
-                    _problem(f"{path} worker {name}", "worker backend is unavailable")
-                serves: PoolUnleased | PoolServesUnit | PoolLeaseUnresolved = PoolUnleased()
-                if isinstance(reviewer.lease, review_pool.UnitLease):
-                    serves = PoolLeaseUnresolved(reviewer.lease.unit)
-                    try:
-                        served = self.owner(UnitMember(path.parent.name, reviewer.lease.unit))
-                        if isinstance(served.match, staff.StaffRow):
-                            serves = PoolServesUnit(served.match.id)
-                    except ValueError as error:
-                        _problem(f"{path} reviewer {name} lease", error)
-                # A pool owns its reviewer; a lease never reparents the row.
-                if not isinstance(identity, BackendUnavailable):
-                    self.observed = {key: entry for key, entry in self.observed.items()
-                                     if entry.identity != identity}
-                busy = (isinstance(reviewer.ownership, review_pool.ClaimedReviewer)
-                        and _alive(reviewer.ownership.pid))
-                self.add(WorkerObservation(name, owner, "review", identity, ReviewPoolLease(busy, serves)))
-        except (ValueError, OSError, TypeError, KeyError, AttributeError, staff.StaffRefused) as error:
-            _problem(path, error)
-
     def astra(self, path: Path) -> None:
         try:
             fields = self.read(path)
@@ -566,9 +509,6 @@ class _WorkerSources:
                 self.claude_workers(run)
             except (OSError, UnicodeError, ValueError) as error:
                 _problem(run, error)
-        pool_root = Path(os.environ.get("REVIEW_POOL_STATE", "~/.local/state/review-pool")).expanduser()
-        for path in sorted(pool_root.glob("*/pool.json")):
-            self.pool(path)
         for path in sorted(design_roles.state_root().glob("*/design.json")):
             self.design(path.parent.name)
         for path in sorted(astra_roles.state_root().glob("*.json")):
@@ -623,10 +563,6 @@ def live() -> dict[str, object]:
             continue
         row = rows[0]
         member: dict[str, object] = {**row.to_json(), "role": entry.role, "identity": entry.identity}
-        if isinstance(entry.pool, ReviewPoolLease):
-            lease = entry.pool.serves
-            member["pool"] = {"state": "busy" if entry.pool.busy else "idle",
-                              "serves": lease.staff_id if isinstance(lease, PoolServesUnit) else None}
         members[row.id] = member
     # Every emitted edge ends inside this document, even if source evidence is incomplete.
     while missing := [key for key, member in members.items()
@@ -634,7 +570,7 @@ def live() -> dict[str, object]:
         for key in missing:
             _problem(key, "parent has no session identity; omitted from live staff")
             del members[key]
-    return {"schema": 2, "inputs": sorted(scan.inputs), "members": [members[key] for key in sorted(members)]}
+    return {"schema": 3, "inputs": sorted(scan.inputs), "members": [members[key] for key in sorted(members)]}
 
 
 def cli_live() -> int:

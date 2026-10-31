@@ -36,6 +36,7 @@ class TopLevelTests(unittest.TestCase):
     rows: list[roster.RosterEntry] = []
     records: list[sessions.SessionRecord] = []
     problems: list[str] = []
+    warnings: list[str] = []
 
     @override
     def setUp(self) -> None:
@@ -62,6 +63,7 @@ class TopLevelTests(unittest.TestCase):
         }, clear=True))
         _ = self.enterContext(environment_context)
         self.rows, self.records, self.problems = [], [], []
+        self.warnings = []
         _ = self.enterContext(mock.patch.object(roster, "roster", side_effect=self.fixture_roster))
         _ = self.enterContext(mock.patch.object(sessions, "running_sessions", side_effect=self.fixture_records))
         _ = self.enterContext(mock.patch.object(sessions, "messaging_socket_exists", side_effect=self.fixture_socket_exists))
@@ -69,7 +71,7 @@ class TopLevelTests(unittest.TestCase):
 
     def fixture_roster(self, _environment: Mapping[str, str], scope: roster.RosterScope) -> roster.Roster:
         self.assertEqual(scope, roster.ThisMachine())
-        return roster.Roster(self.rows, self.problems)
+        return roster.Roster(self.rows, self.problems, self.warnings)
 
     def fixture_records(self) -> list[sessions.SessionRecord]:
         return sorted(self.records, key=lambda record: record["updatedAt"], reverse=True)
@@ -255,6 +257,15 @@ class TopLevelTests(unittest.TestCase):
         self.assertEqual(lines, [f"reachable\tuds:{address}"])
         self.assertEqual(errors, ["top_level: roster: daemon closed mid-call"])
         self.assertEqual(recorded, [("reachable", "reachable-id")])
+
+    def test_durable_warning_prints_once_without_losing_a_readable_recipient(self) -> None:
+        address = self.add('reachable', session_id='reachable-id')
+        self.warnings = ['durable role /fixture/design.json: missing or invalid repository']
+        result, lines, errors, recorded = self.run_main()
+        self.assertEqual(result, 0)
+        self.assertEqual(lines, [f'reachable\tuds:{address}'])
+        self.assertEqual(errors, ['top_level: roster: warning: durable role /fixture/design.json: missing or invalid repository'])
+        self.assertEqual(recorded, [('reachable', 'reachable-id')])
 
     def test_codex_and_non_session_addresses_are_not_forwarded_to_sendmessage(self) -> None:
         _ = self.add("Codex window")

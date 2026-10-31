@@ -134,9 +134,7 @@ A call site's arguments are what that file calls `$ARGUMENTS`.
 <LongLivedWorkers>
 Unit workers persist across phases and plans. Dispatch with `assign.sh --role
 implement|test|fix|review --prompt <path> --cwd <worktree>`. The unit owns its
-read-only `review` worker; a concurrent review uses `review2`. The first use
-adopts a leased reviewer on the same thread. A busy leased reviewer finishes
-before adoption; new work uses `review2` meanwhile.
+read-only `review` worker; a concurrent review uses `review2`.
 
 Keep each worker's thread. Pause, move and end it with the unit ledger as
 `docs/as-built/long-lived-workers.md` describes. Never open a fresh reviewer

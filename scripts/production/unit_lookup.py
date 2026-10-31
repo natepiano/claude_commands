@@ -32,7 +32,7 @@ from scripts.lib import unit_runs  # noqa: E402
 USAGE = "usage: unit_lookup.py list <production slug> | pane <production slug> <unit>"
 
 
-from session_staff import (
+from scripts.production.session_staff import (
     PRODUCTION_MARK as PRODUCTION_MARK,
     UNIT_MARK as UNIT_MARK,
     ShowrunnerMember as ShowrunnerMember,

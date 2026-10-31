@@ -17,6 +17,7 @@ from contextlib import ExitStack
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.astra import design_roles
+from scripts.astra.design_role_test_support import write_empty_binding_record
 from scripts.direct import workers
 from scripts.production import staff, staff_sources, staff_move
 from scripts.production.rename_test_support import legacy_staff_journal, stop_at_staff_write
@@ -34,6 +35,19 @@ import fake_unit_host
 
 @final
 class UnitTransferTests(UnitTransferFixture):
+    def test_bad_unrelated_record_warns_once_across_move_and_verification(self) -> None:
+        self.env['DESIGN_ROLES_STATE'] = str(self.root / 'state/astra/design-roles')
+        with mock.patch.dict(os.environ, self.env):
+            bad = write_empty_binding_record(self.unit, design_roles.UnitHolder('unrelated', 'other-unit'),
+                                             lifecycle=design_roles.RoleOpen('unrelated-thread'))
+        completed = self.transfer('apply')
+        self.assert_ok(completed)
+        self.assertEqual(completed.stderr.splitlines(), [f'warning: {bad}: missing or invalid repository'])
+        self.assertTrue(bad.is_file())
+        verified = self.transfer('verify')
+        self.assert_ok(verified)
+        self.assertEqual(verified.stderr.splitlines(), [f'warning: {bad}: missing or invalid repository'])
+
     def test_transfer_moves_the_running_tab_and_sends_three_notices_without_launch_commands(self) -> None:
         pid = self.running_unit()
         log = self.seed_record()
@@ -501,8 +515,6 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertTrue(self.unit.is_dir())
         self.assertFalse(self.stall_path("demo", "alpha-unit").exists())
         self.assertEqual(self.stall_path("other", "alpha-unit").read_text(encoding="utf-8"), '{"stretch": 17}\n')
-        pool = (self.root / "state/review-pool/demo/pool.json").read_text(encoding="utf-8")
-        self.assertNotIn("alpha-unit", pool)
         self.assert_ok(self.transfer("verify"))
 
     def test_a_held_role_moves_to_the_receiving_holder_and_keeps_its_thread_and_paths(self) -> None:

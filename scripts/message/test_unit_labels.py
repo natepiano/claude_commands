@@ -27,7 +27,7 @@ import sys
 from unittest import mock
 from scripts.message import unit_labels
 from scripts.production import staff
-import session_staff
+from scripts.production import session_staff
 
 record = json.loads(sys.stdin.read())
 with (mock.patch.object(unit_labels, "newest_sessions", return_value=[record]),

@@ -26,7 +26,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NoReturn, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
+from typing import BinaryIO, Callable, Literal, NoReturn, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
 from functools import lru_cache
 from itertools import chain
 from types import UnionType
@@ -43,8 +43,13 @@ from atomic_file import write_text_atomic
 from config_values import config_values
 
 
-if TYPE_CHECKING:
-    from ..buildlog import record as build_record
+from test_phase import (
+    NoTestPhaseRecord,
+    ObservedTestPhase,
+    TestPhaseRecord,
+    UnobservedTestPhase,
+    UnreadableTestPhaseRecord,
+)
 
 
 class GitFacts(TypedDict):
@@ -59,11 +64,7 @@ class StepParser(Protocol):
 
 
 class GitIdentityReader(Protocol):
-    TestPhaseRecord: type[build_record.TestPhaseRecord]
-    ObservedTestPhase: type[build_record.ObservedTestPhase]
-    UnobservedTestPhase: type[build_record.UnobservedTestPhase]
-
-    def read_test_phase(self, path: Path) -> build_record.TestPhaseRecord | build_record.NoTestPhaseRecord | build_record.UnreadableTestPhaseRecord: ...
+    def read_test_phase(self, path: Path) -> TestPhaseRecord | NoTestPhaseRecord | UnreadableTestPhaseRecord: ...
 
     def git_directory(self, argv: list[str], cwd: str) -> str: ...
     def git_facts(self, directory: str) -> GitFacts: ...
@@ -2010,13 +2011,13 @@ def test_phase_path(row: Reservation) -> Path | NoTestPhaseFile:
     return Path(sidecar.removesuffix(".cgroup") + ".test-phase.json") if sidecar.endswith(".cgroup") else NoTestPhaseFile()
 
 
-def observed_test_phase(row: Reservation) -> build_record.ObservedTestPhase | build_record.UnobservedTestPhase:
+def observed_test_phase(row: Reservation) -> ObservedTestPhase | UnobservedTestPhase:
     path = test_phase_path(row)
     if isinstance(path, Path):
         phase = record.read_test_phase(path)
-        if isinstance(phase, record.TestPhaseRecord) and isinstance(phase.window, record.ObservedTestPhase):
+        if isinstance(phase, TestPhaseRecord) and isinstance(phase.window, ObservedTestPhase):
             return phase.window
-    return record.UnobservedTestPhase()
+    return UnobservedTestPhase()
 
 
 def history_arguments(raw: object) -> list[str]:
@@ -2444,12 +2445,12 @@ def release_build(row: Reservation) -> bool:
 
 
 def test_phase_history(row: Reservation, reading: StepMemory,
-                       phase: build_record.ObservedTestPhase | build_record.UnobservedTestPhase
+                       phase: ObservedTestPhase | UnobservedTestPhase
                        ) -> TestPhaseStarted | NoPeakRecorded:
     """A measured step past its promise may use its frozen test-phase need."""
     need = read_test_phase_need(row.get("test_phase_need"))
     if (isinstance(reading, MeasuredMemory) and isinstance(reading.promise, NoPromise)
-            and isinstance(need, TestPhaseNeed) and isinstance(phase, record.ObservedTestPhase)):
+            and isinstance(need, TestPhaseNeed) and isinstance(phase, ObservedTestPhase)):
         return TestPhaseStarted(phase.started_at, phase.peak_bytes, need)
     return NoPeakRecorded()
 
@@ -4138,7 +4139,7 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
         if isinstance(status, int):
             intent["status"] = status
         phase = observed_test_phase(row)
-        if isinstance(phase, record.ObservedTestPhase):
+        if isinstance(phase, ObservedTestPhase):
             intent["test_phase_peak_bytes"] = phase.peak_bytes
             intent["test_phase_started_at"] = phase.started_at
         if "test_phase_need" in row:
