@@ -29,9 +29,10 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
 
@@ -1093,15 +1094,22 @@ def _verify(rename: UnitRename, _save: Callable[[], None]) -> None:
         raise RenameRefused("verify failed:\n  " + "\n  ".join(failures))
 
 
+class MergeLockScope(Enum):
+    NONE = auto()
+    CHECKOUT_CHECK = auto()
+    STEP = auto()
+
+
 class Step(NamedTuple):
     run: Callable[[UnitRename, Callable[[], None]], None]
     describe: Callable[[UnitRename], str]
     # Whether the unit must be stopped before the step runs: the stop step stops it, and verify
     # runs after the relaunch.
     stopped: bool = True
-    # Whether the step runs under the merge lock. The steps that wait (stop, relaunch) and verify
-    # do not, so a merge gate is never held behind them.
-    locked: bool = True
+    # Checkout validation and git work wait for a gate before taking any staff operation.
+    # Steps needing neither skip the gate and its potentially mid-merge checkout entirely.
+    merge_lock: MergeLockScope = MergeLockScope.STEP
+    source_writes: bool = False
 
 
 def _describe_stop(r: UnitRename) -> str:
@@ -1161,17 +1169,17 @@ def _describe_verify(r: UnitRename) -> str:
 
 
 STEPS = (
-    Step(stop_unit, _describe_stop, stopped=False, locked=False),
+    Step(stop_unit, _describe_stop, stopped=False, merge_lock=MergeLockScope.CHECKOUT_CHECK, source_writes=True),
     Step(_merge, _describe_merge),
-    Step(_move_git, _describe_git),
-    Step(_move_claude, _describe_claude),
-    Step(_commit_doc, _describe_doc),
+    Step(_move_git, _describe_git, source_writes=True),
+    Step(_move_claude, _describe_claude, merge_lock=MergeLockScope.NONE, source_writes=True),
+    Step(_commit_doc, _describe_doc, source_writes=True),
     Step(_merge_rename, _describe_merge_rename),
-    Step(_move_state, _describe_state),
+    Step(_move_state, _describe_state, source_writes=True),
     Step(_retire, _describe_retire),
-    Step(_restart_record, _describe_record),
-    Step(_relaunch, _describe_relaunch, locked=False),
-    Step(_verify, _describe_verify, stopped=False, locked=False),
+    Step(_restart_record, _describe_record, merge_lock=MergeLockScope.NONE, source_writes=True),
+    Step(_relaunch, _describe_relaunch, merge_lock=MergeLockScope.NONE, source_writes=True),
+    Step(_verify, _describe_verify, stopped=False, merge_lock=MergeLockScope.NONE),
 )
 
 
@@ -1256,18 +1264,13 @@ def plan(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     return rename
 
 
-def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
-    with staff.operation():
-        return _apply(slug, old, new, scratch)
-
-
 def _rename_staff(rename: UnitRename) -> None:
     if isinstance(rename.staff_id, UnboundStaffMember):
         raise staff.StaffRefused(f"{rename.slug}/{rename.old}: no journaled staff identity")
     _ = staff.rename(rename.staff_id, unit_names.name(rename.new))
 
 
-def _apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
+def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     slug = showrunners.canonical_slug(slug)
     path = rename_state.unit_journal(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1280,21 +1283,23 @@ def _apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
             rename = _build(slug, old, new, scratch)
             with _merge_lock(rename):
                 _preflight(rename)
-            rename.staff_id = _staff_id(rename.slug, rename.old)
-            bind_stop_target(rename)
-            # The request is saved before anything changes, so every later refusal resumes.
-            _save(path, rename)
-        if rename.session_id and not rename.account:
-            # Old journals may have lost both the account and its launch entry. Refuse before
-            # changing staff or files when no surviving source can identify the account.
-            bind_stop_target(rename)
-            _save(path, rename)
-        try:
-            _rename_staff(rename)
-        except staff.StaffRefused:
+        with staff.operation():
             if fresh:
-                path.unlink(missing_ok=True)
-            raise
+                rename.staff_id = _staff_id(rename.slug, rename.old)
+                bind_stop_target(rename)
+                # The request is saved before anything changes, so every later refusal resumes.
+                _save(path, rename)
+            if rename.session_id and not rename.account:
+                # Old journals may have lost both the account and its launch entry. Refuse before
+                # changing staff or files when no surviving source can identify the account.
+                bind_stop_target(rename)
+                _save(path, rename)
+            try:
+                _rename_staff(rename)
+            except staff.StaffRefused:
+                if fresh:
+                    path.unlink(missing_ok=True)
+                raise
         if rename.step == len(STEPS):
             print("done; unchanged")
         for number in range(rename.step + 1, len(STEPS) + 1):
@@ -1303,16 +1308,20 @@ def _apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
                 rename.step = number
                 _save(path, rename)
                 continue
-            # Revalidated before every step: a resumed run may come back to a changed machine. A merge
-            # gate leaves the checkout mid-merge while it runs, so the check waits for it too.
-            with _merge_lock(rename):
-                _check_checkout(rename, resume_doc=step.run is _commit_doc)
-                if step.stopped:
-                    _check_stopped(rename, relaunch=step.run is _relaunch)
-                if step.locked:
+            with ExitStack() as merge_scope:
+                if step.merge_lock is not MergeLockScope.NONE:
+                    _ = merge_scope.enter_context(_merge_lock(rename))
+                    _check_checkout(rename, resume_doc=step.run is _commit_doc)
+                    if step.merge_lock is MergeLockScope.CHECKOUT_CHECK:
+                        merge_scope.close()
+                with ExitStack() as source_scope:
+                    if step.stopped or step.source_writes:
+                        _ = source_scope.enter_context(staff.operation())
+                    if step.stopped:
+                        _check_stopped(rename, relaunch=step.run is _relaunch)
+                    if not step.source_writes:
+                        source_scope.close()
                     step.run(rename, lambda: _save(path, rename))
-            if not step.locked:
-                step.run(rename, lambda: _save(path, rename))
             rename.step = number
             _save(path, rename)
     return rename
