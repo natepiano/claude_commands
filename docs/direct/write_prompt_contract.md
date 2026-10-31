@@ -294,7 +294,7 @@ mid-run, without waiting for a phase to end.
   finished Codex turn holds `send` for its next turn.** Its thread remains open.
   Only the unit director starts its next turn — a later phase, repair, or
   follow-up — through `implement.sh --to <worker>`. That turn receives the held
-  messages after its prompt. The launcher attempts compaction above
+  messages first and its prompt last. The launcher attempts compaction above
   `UNIT_COMPACT_ABOVE_TOKENS`, continues after a failed attempt, and
   presses on after overflow per <LongLivedWorkers/>.
 - **A codex member has no route to the unit director.** It reaches its peer with
