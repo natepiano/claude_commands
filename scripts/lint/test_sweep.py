@@ -3115,6 +3115,25 @@ if sys.argv[sys.argv.index("--to") + 1] == "user":
                 self.assertIn("build-speed holds natedev builds; its working folder was not found", output)
                 self.assertIn(f"{tree.parent} left alone", output)
 
+    def test_dry_floor_runs_beside_a_held_floor_lock_but_a_real_pass_stops(self) -> None:
+        base = self.base()
+        tree, output_file = cargo_target(base, "repo", APP, time.time() - DAY)
+        guard = sweep.try_lock(str(base / "floor.lock"))
+        assert guard is not None
+        self.addCleanup(os.close, guard)
+        with mock.patch.object(sweep, "try_lock", wraps=sweep.try_lock) as locks:
+            status, output = self.hold(base, 10 * GIB, [GIB, GIB], dry_run=True)
+        self.assertEqual(status, 0)
+        self.assertNotIn(mock.call(str(base / "floor.lock")), locks.call_args_list)
+        self.assertIn(f"from {tree.parent}, last used", output)
+        self.assertIn("the floor would take", output)
+        self.assertNotIn("another sweep is holding it", output)
+        self.assertTrue(output_file.exists())
+        status, output = self.hold(base, 10 * GIB, [GIB])
+        self.assertEqual(status, 0)
+        self.assertIn("another sweep is holding it", output)
+        self.assertTrue(output_file.exists())
+
     def test_at_the_floor_or_while_another_sweep_holds_it_nothing_goes(self) -> None:
         base = self.base()
         _, output_file = cargo_target(base, "repo", APP, time.time() - 5 * DAY)

@@ -2338,12 +2338,14 @@ def hold_floor(
     free = free_bytes(home)
     if free >= floor:
         return 0
-    lock_path = os.path.expanduser(lock)
-    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-    guard = try_lock(lock_path)
-    if guard is None:
-        print(f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; another sweep is holding it")
-        return 0
+    guard = None
+    if not dry_run:
+        lock_path = os.path.expanduser(lock)
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        guard = try_lock(lock_path)
+        if guard is None:
+            print(f"lint sweep: {gib(free)} free, under the {gib(floor)} floor; another sweep is holding it")
+            return 0
     try:
         planned_at = time.time()
         record_path = floor_record_path()
@@ -2488,7 +2490,8 @@ def hold_floor(
                                                        KnownHeldRoots(frozenset(hold_targets))))
         return 1 if failures else 0
     finally:
-        os.close(guard)
+        if guard is not None:
+            os.close(guard)
 
 
 def size_bytes(raw: str, unit: int) -> int | None:
