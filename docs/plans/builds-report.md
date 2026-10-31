@@ -400,24 +400,14 @@ including the details to make it clear
 
 **Depends on:** Phase 8
 
-#### Work Order
+#### As-built
 
-**Goal:** basedpyright reports no import cycle on the builds merge of this branch. The cycle is `disk.py > lint/sweep.py > record.py > sample.py > disk.py`: `sample.py` imports `disk` only to call `disk.filesystem_usage()`, and `disk.py` imports `sweep`.
-
-**Spec:**
-- Move `FilesystemUsage` and `filesystem_usage(path)` from `scripts/buildlog/disk.py` into one small module that imports neither `sweep` nor `record`, for example `scripts/buildlog/filesystem.py`. `sample.py` and `disk.py` both import it there. Keep one copy only; leave no re-export shim in `disk.py` unless a caller outside these files needs it.
-- No type ignore and no local import used to hide the cycle.
-- Behavior does not change: the sample row's disk fields and `buildlog disk` output stay byte-identical.
+`FilesystemUsage` and `filesystem_usage(path)` live only in `scripts/buildlog/filesystem.py`, which imports `cgroup_capture` and neither `sweep` nor `record`. `disk.py` and `sample.py` both import `filesystem` at module level, so `sample` no longer imports `disk`, and the cycle `disk > lint/sweep > record > sample > disk` that basedpyright reported on the builds merge is gone. No re-export remains in `disk.py`; output is unchanged.
 
 **Files:**
-- `scripts/buildlog/disk.py`
-- `scripts/buildlog/sample.py`
-- `scripts/buildlog/filesystem.py`
-- `scripts/buildlog/test_disk.py`
-- `scripts/buildlog/test_sample.py`
+- `scripts/buildlog/filesystem.py` — the one filesystem capacity and device reader.
+- `scripts/buildlog/disk.py`, `scripts/buildlog/sample.py` — import it there.
+- `scripts/buildlog/test_disk.py` — patches and fixtures name `filesystem`.
+- `scripts/buildlog/test_sample.py` — `test_filesystem_reading_does_not_import_disk_or_sweep` reads a sample in a fresh process and requires that neither `disk` nor `sweep` is imported.
 
-**Workers:** impl3 writes production files; test3 writes tests.
-
-**Acceptance gate:** on a trial merge with `origin/builds-resources` 5c9b01fd (or origin/builds once it holds that set), `basedpyright scripts/buildlog/disk.py scripts/buildlog/sample.py scripts/buildlog/filesystem.py scripts/buildlog/record.py scripts/lint/sweep.py` reads 0 errors, 0 warnings, 0 notes; `python3 -m unittest scripts.buildlog.test_disk scripts.buildlog.test_sample scripts.buildlog.test_record` passes.
-
-**Constraints:** no worktree commit from workers; tests run with `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD`; never write the live build log.
+**Gotchas:** the cycle exists only on a tree that also holds the builds `sweep > record` edge, so basedpyright on this branch alone cannot see it; check import cycles on a trial merge with builds. The build-log tests need `PYTHONPATH=scripts/buildlog` when run as `python3 -m unittest scripts.buildlog.…`.
