@@ -34,7 +34,7 @@ from scripts.lib import unit_runs  # noqa: E402
 USAGE = "usage: unit_lookup.py list <production slug> | pane <production slug> <unit>"
 
 
-from scripts.production.unit_marks import (
+from scripts.production.session_staff import (
     PRODUCTION_MARK as PRODUCTION_MARK,
     UNIT_MARK as UNIT_MARK,
     ShowrunnerMember as ShowrunnerMember,
@@ -58,7 +58,7 @@ from scripts.production.unit_marks import (
     lookup_slug as _lookup_slug,
     production_members as production_members,
     group_marked_units as group_marked_units,
-    session_unit_marks as session_unit_marks,
+    session_staff_and_directors as session_staff_and_directors,
 )
 
 
@@ -410,7 +410,7 @@ def _herdr_marked(claudes: dict[int, LiveClaude], unread: UnreadAt,
         yield slug, MarkedUnit(unit, claude, place, process.pid, process.command, staff_id)
 
 
-def observed_unit_marks(*, running: Sequence[SessionRecord] | None = None) -> tuple[tuple[str, MarkedUnit], ...]:
+def observed_staff_marks(*, running: Sequence[SessionRecord] | None = None) -> tuple[tuple[str, MarkedUnit], ...]:
     """Read pane marks for stop and cleanup checks, including former staff names."""
     try:
         processes = herdr.herdr_processes()
@@ -422,7 +422,7 @@ def observed_unit_marks(*, running: Sequence[SessionRecord] | None = None) -> tu
 
 def every_marked_unit(*, record: staff.StaffSnapshot | None = None) -> MarkedProductions:
     """Read all herdr units once. An unreadable host raises OSError."""
-    return group_marked_units(observed_unit_marks(), record=record)
+    return group_marked_units(observed_staff_marks(), record=record)
 
 
 def marked_units(slug: str, *, record: staff.StaffSnapshot | None = None) -> dict[str, MarkedUnit]:
@@ -439,7 +439,7 @@ def marked_unit(slug: str, name: str, *, record: staff.StaffSnapshot | None = No
                 running: Sequence[SessionRecord] | None = None) -> MarkedUnit | None:
     """One unit of the production. Unreadable herdr, or this unit's mark on two sessions, raises OSError."""
     slug = _lookup_slug(slug)
-    found = group_marked_units(observed_unit_marks(running=running), record=record, sources=sources)
+    found = group_marked_units(observed_staff_marks(running=running), record=record, sources=sources)
     if fault := found.faults.get(slug, {}).get(name):
         raise OSError(fault)
     return found.units.get(slug, {}).get(name)

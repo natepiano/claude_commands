@@ -46,7 +46,7 @@ from scripts.whoami.account import (  # noqa: E402
 from scripts.shutdown import folder_trust, stop_resume  # noqa: E402
 import pane_record  # noqa: E402
 import production_units  # noqa: E402
-from scripts.production import staff, staff_sources, unit_marks  # noqa: E402
+from scripts.production import staff, staff_sources, session_staff  # noqa: E402
 import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import inventory as inventory_work  # noqa: E402
@@ -771,7 +771,7 @@ def _resume_parts(session: Session, prompt: str, target: str = "", *, login: str
     entry = pane_record.PaneLaunch(pane_id="", session_id=session["session_id"], config_dir=str(config_dir),
         cwd=session["cwd"], name=session["name"], model=model["name"] if model["kind"] == "model" else "",
         remote_control=True, environment=environment, flags_read=True, ended=False, written_at=at)
-    environment = unit_marks.record_membership(entry)["environment"]
+    environment = session_staff.record_membership(entry)["environment"]
     argv = stop_resume.resume_arguments(entry)
     if isinstance(conversation, StartFreshConversation):
         argv[0] = "--session-id"

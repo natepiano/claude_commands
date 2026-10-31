@@ -69,7 +69,7 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
                     later = ahead.since > step.since
                     minutes = age(step.since, ahead.since) if later else age(ahead.since, step.since)
                     detail = f"joined {clock(model, ahead.since)}, {minutes} min {'after' if later else 'before'} it"
-                add((Span(f"  #{place} "), Span("↑  " if is_moved(model, place) else "   ", "warning"),
+                add((Span(f"  #{place} "), Span("↑  " if is_moved(model, place) else "   "),
                      *name_spans(ahead, model.labels), Span(f" {ahead.step}  {detail}")), 6)
             if position > 6:
                 add((Span(f"  and {position - 6} more"),))
@@ -80,6 +80,9 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
         add((Span("Waits on", bold=True),))
         if not isinstance(checks, gate.ReadingUnavailable):
             add((Span("  "), *order_check(model, position)), 4)
+        if isinstance(step.reason, gate.EstimateExpired):
+            add((Span("  "), *check_line(False, "estimate       expired at "
+                + clock(model, step.reason.estimated_at) + "; refreshes on its next poll")), 4)
         for check in check_lines(checks, model, pressure_first=False):
             add((Span("  "), *check), 4)
         if estimate_minutes(model, position):
