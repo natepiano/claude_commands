@@ -226,6 +226,8 @@ As built (b20effdf, on origin/builds e2773be6, 2026-10-31; builds showrunner, ur
 **Files:** `scripts/production/` (the module, its importers and tests), `scripts/herdr/` (herdr.py and its tests), `scripts/message/` (unit_labels.py, rca.py and their tests), `docs/as-built/herdr-adoption.md`, `docs/as-built/session-roster.md`.
 **Acceptance:** `git grep unit_marks` finds nothing; every importer's tests pass; basedpyright clean on changed files.
 
+### Phase 4f — builds at a546fe66: Phase 4 and the rename carry the live-budget view fix  · status: todo
+The builds showrunner asked (2026-10-31): merge `origin/builds` (a546fe66, the view fix b20effdf) into this branch and send one notice for Phase 4 and Phase 4e. Two merges meet: Phase 4's `admission_pass(inputs, now)` reads `inputs.limits`, and the view fix removed `limits` from `QueueInputs` (the reader resolves them live and passes them to `queue_read_from(inputs, limits)`). The second to land (this branch) carries the view fix's state: no budget in `QueueInputs` or the snapshot, limits passed in. `unit_lookup.py`: keep this branch's name `observed_staff_marks` with the builds side's `running` parameter.
 ### Phase 5 — The queue service, its socket protocol and its client exist and pass in-process tests; no build uses them yet  · status: todo
 **Depends on:** Phase 4
 **Blocked by:** none. This phase adds files only and changes no caller and no admission (builds showrunner, 2026-10-31).
