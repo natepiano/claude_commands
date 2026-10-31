@@ -226,7 +226,7 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     explanation = model.reading.explanation
     head, host = explanation.head, explanation.host
     budget_bytes = (host.budget if isinstance(host, gate.HostAvailable) else
-                    head.budget.budget if isinstance(head, gate.HeadExplanation) else gate.BUILD_BUDGET_BYTES)
+                    head.budget.budget if isinstance(head, gate.HeadExplanation) else gate.build_budget_bytes())
     budget = budget_bytes / gate.GIB
     taken = explanation.totals.charged / gate.GIB
     free = max(0.0, budget - taken)

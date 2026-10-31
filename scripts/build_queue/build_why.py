@@ -99,7 +99,7 @@ def need_text(source: gate.RecordedNeed | gate.NeedSourceNotRecorded) -> str:
                 text += f"; dev promise factor × {basis.factor.factor:.3f}"
             else:
                 text += "; no headroom factor"
-        text += (f"; capped at {gib(gate.BUILD_BUDGET_BYTES)} (uncapped {gib(basis.cap.uncapped)})"
+        text += (f"; capped at {gib(gate.build_budget_bytes())} (uncapped {gib(basis.cap.uncapped)})"
                  if isinstance(basis.cap, gate.CappedAtBudget) else "; under build budget")
         return text
     if source.source == "measured":

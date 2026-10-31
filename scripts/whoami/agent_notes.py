@@ -8,8 +8,9 @@ UTC so a saved reading is distinguishable from live usage. No credentials are
 saved. Other frontmatter and note bodies are preserved. Run as a script, it then
 hands the notes to quota_alert.py, which records routing when an account runs
 low, and to codex_pacer.py, which decides the `pace` tier from them; `refresh`
-(/quota_refresh) is the run after the user reports a usage reset. `blocked` is
-codex_mesh.py reporting that Codex refused a launch for quota: it reads the notes
+(/quota_refresh) is the run after the user reports a usage reset.
+`usage-only` reads and saves usage without running these consumers.
+`blocked` is codex_mesh.py reporting that Codex refused a launch for quota: it reads the notes
 as the timer left them and hands them to quota_alert.blocked().
 """
 
@@ -266,7 +267,7 @@ def apply(
     *, multiple_codex_homes: bool = False,
 ) -> QuotaUpdates:
     """Compute quota updates without writing any note."""
-    if account.usage_read_outcome == UsageReadOutcome.HELD:
+    if account.usage_read_outcome in (UsageReadOutcome.HELD, UsageReadOutcome.CREDENTIALS_UNAVAILABLE):
         return QuotaUpdates({}, (), ())
     messages: list[str] = []
     by_label: dict[str, dict[str, str]] = {}
@@ -356,6 +357,31 @@ class UpdatedAgentNotes:
     usage_reused: bool = False
 
 
+@dataclass(frozen=True)
+class RefreshedUsage:
+    """Reports and store diagnostics from a usage-only read-and-save attempt."""
+    reports: list[Report]
+    observed_at: datetime
+    messages: tuple[str, ...]
+
+
+def refresh_usage(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome,
+                  logins: dict[str, str]) -> RefreshedUsage:
+    """Read and save usage for both the notes timer and the Mac refresher."""
+    reports = asyncio.run(live_reports(selection, workers_home))
+    observed_at = datetime.now(timezone.utc)
+    messages: list[str] = []
+    try:
+        usage_store.save(reports, observed_at, logins)
+    except (OSError, ValueError) as error:
+        messages.append(f"usage store: {error}")
+    unavailable = sum(report.usage_read_outcome == UsageReadOutcome.CREDENTIALS_UNAVAILABLE
+                      for report in reports)
+    if unavailable:
+        messages.append(f"usage refresh: {unavailable} account(s) have login credentials unavailable in this session")
+    return RefreshedUsage(reports, observed_at, tuple(messages))
+
+
 def timer_usage_signature(selection: ClaudeAccountsInUse, workers_home: Path | NoWorkersHome) -> str:
     """Invalidate reuse when a login, directory, or account selection changes."""
     identities = sorted((str(home), codex_email_on_disk(home)) for home in codex_homes(workers_home))
@@ -434,17 +460,15 @@ def update_alert_pass(selection: ClaudeAccountsInUse, workers_home: Path | NoWor
         reports = recent.reports
         observed_at = recent.observed_at
     else:
-        reports = asyncio.run(live_reports(selection, workers_home))
-        checked_at = datetime.now(timezone.utc)
-        observed_at = checked_at
+        refreshed = refresh_usage(selection, workers_home, claude_note_logins(notes))
+        reports, observed_at = refreshed.reports, refreshed.observed_at
+        checked_at = observed_at
+        messages.extend(refreshed.messages)
     codex_readings = codex_alert_pass(workers_home, reports, observed_at)
     if not notes:
         messages.append(f"no agent notes in {note_file.notes_dir()}")
     try:
-        # Usage history and process labels use the stable account label.
-        logins = claude_note_logins(notes)
         if fresh:
-            usage_store.save(reports, checked_at, logins)
             usage_store.save_timer_usage(signature, reports, observed_at)
     except (OSError, ValueError) as error:
         # The saved readings must never cost the notes or the alerts.
@@ -567,8 +591,17 @@ def main() -> None:
         for line in blocked(list(note_file.read_notes()), identity, window=window, refused_at=refused_at, stopped=stopped):
             print(line)
         return
+    if sys.argv[1:] == ["usage-only"]:
+        from scripts.accounts import accounts
+
+        with role_map.stored_role_map():
+            refreshed = refresh_usage(accounts.claude_account_selection(usage_only=True), resolve_workers_home(),
+                                      claude_note_logins(note_file.read_notes()))
+        for line in refreshed.messages:
+            print(line)
+        return
     if sys.argv[1:] not in ([], ["refresh"]):
-        sys.exit("usage: agent_notes.py [refresh|blocked]")
+        sys.exit("usage: agent_notes.py [refresh|usage-only|blocked]")
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.accounts import accounts
 

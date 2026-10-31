@@ -11205,6 +11205,13 @@ class WorkerPauseTests(MeshCommandFixture):
     @override
     def setUp(self) -> None:
         super().setUp()
+        from scripts.production import fake_unit_host
+        host = fake_unit_host.environment(self.session_dir)
+        fake_unit_host.write(host, [])
+        self.patches.enter_context(patch.dict(os.environ, host))
+        from scripts.production.staff_test_support import isolated_staff_file, production_membership
+        _ = self.enterContext(isolated_staff_file(self.session_dir / "staff.json", {}))
+        production_membership("demo", "builders")
         respond = self.server.respond
         @bounded_fixture
         def loaded_worker(request: dict[str, object]) -> list[dict[str, object]] | None:

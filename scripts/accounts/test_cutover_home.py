@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, role_map
 from scripts.accounts.nix_env_fake import fake_nix_loader, imports_with_nix_loader
+from scripts.accounts.nix_env_fake import installed_program
 from scripts.message import sessions
 from scripts.whoami import agent_accounts
 from scripts.whoami.test_agent_accounts import ServiceKeychain, folder_service
@@ -313,6 +314,11 @@ class CodexHomeCutoverTests(unittest.TestCase):
     def journal_record(self) -> dict[str, str]:
         return cast(dict[str, str], json.loads(self.journal.read_text()))
 
+    def archived_auth(self) -> Path:
+        paths = list(self.journal.parent.glob("cutover-codex-home.*.auth.json"))
+        self.assertEqual(len(paths), 1)
+        return paths[0]
+
     def history(self) -> list[dict[str, str]]:
         configuration = cast(dict[str, object], json.loads(accounts.accounts_config_file().read_text()))
         return cast(list[dict[str, str]], configuration["home_cutovers"])
@@ -345,6 +351,57 @@ class CodexHomeCutoverTests(unittest.TestCase):
         self.assertFalse(self.target.exists())
         self.assertEqual(self.run_cutover(), 0)
         self.assert_login_moved()
+
+    def test_duplicate_codex_cutover_archives_legacy_identity_and_launches_the_numbered_home(self) -> None:
+        self.target.mkdir()
+        # Link the synthetic identity already made by this fixture; never inspect credentials.
+        os.link(self.source / "auth.json", self.target / "auth.json")
+        target_inode = (self.target / "auth.json").stat().st_ino
+        before = accounts.codex_statuses(self.target)
+        self.assertEqual([row.label for row in before], ["codex2", "codex3"])
+        self.assertEqual(len([row for row in before if row.login]), 1)
+        self.assertTrue(any("two homes" in problem for row in before for problem in row.problems))
+        with patch.object(sys, "platform", "darwin"):
+            self.assertEqual(self.run_cutover(), 0)
+        archive = self.archived_auth()
+        self.assertFalse((self.source / "auth.json").exists())
+        self.assertEqual(archive.stat().st_ino, self.auth_inode)
+        self.assertEqual((self.target / "auth.json").stat().st_ino, target_inode)
+        self.assertEqual(self.journal_record()["identity_action"], "archive")
+        program = installed_program(self.home, "codex")
+        with patch.object(accounts, "role_account", return_value=accounts.CodexWorkersAccount("codex2", self.target)):
+            for label in ("codex2", "workers"):
+                with self.subTest(label=label), patch.object(os, "execvpe") as launch:
+                    self.assertEqual(accounts.main(["exec", label, "--version"]), 0)
+                    self.assertEqual(launch.call_args.args[:2], (program, [program, "--version"]))
+                    self.assertEqual(launch.call_args.args[2]["CODEX_HOME"], str(self.target))
+        self.assertEqual(self.run_cutover(), 0)
+        self.assertEqual(archive.stat().st_ino, self.auth_inode)
+        self.assertEqual(self.run_cutover(undo=True), 0)
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+        self.assertEqual((self.target / "auth.json").stat().st_ino, target_inode)
+        self.assertFalse(archive.exists())
+
+    def test_duplicate_archive_cutover_resumes_after_rename_and_undo_interruption(self) -> None:
+        self.target.mkdir()
+        os.link(self.source / "auth.json", self.target / "auth.json")
+        replace_identity = os.replace
+        def interrupted(source: str | Path, destination: str | Path) -> None:
+            replace_identity(source, destination)
+            if Path(source).name == "auth.json" or Path(source).name.endswith(".auth.json"):
+                raise OSError("fixture interruption after identity rename")
+        with patch.object(os, "replace", side_effect=interrupted):
+            self.assertNotEqual(self.run_cutover(), 0)
+        self.assertEqual(self.journal_record()["state"], "moving")
+        self.assertEqual(self.run_cutover(), 0)
+        self.assertEqual(self.journal_record()["state"], "complete")
+        with patch.object(os, "replace", side_effect=interrupted):
+            self.assertNotEqual(self.run_cutover(undo=True), 0)
+        self.assertEqual(self.journal_record()["state"], "undoing")
+        self.assertEqual(self.run_cutover(undo=True), 0)
+        self.assertEqual(self.journal_record()["state"], "undone")
+        self.assertEqual((self.source / "auth.json").stat().st_ino, self.auth_inode)
+        self.assertEqual((self.target / "auth.json").stat().st_ino, self.auth_inode)
 
     def test_cutover_waits_for_initialize_after_moving_the_login_before_reporting_ready(self) -> None:
         wait_line = (
@@ -434,16 +491,16 @@ class CodexHomeCutoverTests(unittest.TestCase):
         self.assertEqual(self.journal_record()["state"], "complete")
         self.assertEqual(self.history(), [first, {key: self.journal_record()[key] for key in ("label", "login", "at")}])
 
-    def test_completed_cutover_with_a_new_source_login_still_refuses_an_occupied_numbered_home(self) -> None:
+    def test_completed_cutover_archives_a_new_source_with_the_same_numbered_login(self) -> None:
         self.assertEqual(self.run_cutover(), 0)
         before = (self.journal.read_bytes(), accounts.accounts_config_file().read_bytes())
         _ = (self.source / "auth.json").write_text("synthetic replacement identity")
         replacement_inode = (self.source / "auth.json").stat().st_ino
         with patch.object(agent_accounts, "codex_email_on_disk", return_value="codex-cutover@example.invalid"):
-            self.assertNotEqual(self.run_cutover(), 0)
-        self.assertIn("already holds auth.json", self.errors.getvalue())
-        self.assertEqual((self.journal.read_bytes(), accounts.accounts_config_file().read_bytes()), before)
-        self.assertEqual((self.source / "auth.json").stat().st_ino, replacement_inode)
+            self.assertEqual(self.run_cutover(), 0)
+        self.assertNotEqual((self.journal.read_bytes(), accounts.accounts_config_file().read_bytes()), before)
+        self.assertFalse((self.source / "auth.json").exists())
+        self.assertEqual(self.archived_auth().stat().st_ino, replacement_inode)
         self.assertEqual((self.target / "auth.json").stat().st_ino, self.auth_inode)
 
     def test_completed_cutover_revalidates_the_new_source_login_against_the_requested_account(self) -> None:

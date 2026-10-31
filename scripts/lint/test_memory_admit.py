@@ -125,6 +125,7 @@ def setUpModule() -> None:
             "BUILDLOG_LIVE_MEMORY_TRIPWIRE", str(root / "live-memory-reads.jsonl")
         ),
         "BUILDLOG_BUILD_BUDGET_GIB": "20",
+        "LINT_CONFIG_FILE": str(root / "lint.conf"),
         "BUILDLOG_BUILDS_CGROUP": str(root / "builds.slice"),
         "USER_ZONE": "America/New_York",
     })))
@@ -144,6 +145,45 @@ class MemoryTestSupportTests(unittest.TestCase):
                         os.environ["BUILDLOG_LIVE_MEMORY_TRIPWIRE"] = setting
                     environment = fake_memory_readings(root)
                     self.assertEqual(environment["BUILDLOG_LIVE_MEMORY_TRIPWIRE"], expected)
+
+
+class BuildBudgetTests(unittest.TestCase):
+    config: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        self.config = Path(self.enterContext(tempfile.TemporaryDirectory())) / "lint.conf"
+        _ = cast(object, self.enterContext(patch.dict(os.environ, {"LINT_CONFIG_FILE": str(self.config)})))
+        _ = os.environ.pop("BUILDLOG_BUILD_BUDGET_GIB", None)
+
+    def test_positive_environment_budget_wins_without_reading_config(self) -> None:
+        _ = self.config.write_text("[memory]\nbuild_budget_gib=7.25\n")
+        with patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "31.5"}), \
+             patch.object(gate, "config_values", side_effect=AssertionError("environment wins")):
+            self.assertEqual(gate.build_budget_bytes(), int(31.5 * GIB))
+
+    def test_config_budget_is_read_again_after_each_change(self) -> None:
+        for budget in ("7.25", "8"):
+            _ = self.config.write_text(f"[memory]\nbuild_budget_gib={budget} # trial\n")
+            self.assertEqual(gate.build_budget_bytes(), int(float(budget) * GIB))
+            self.assertEqual(gate.decide(60 * GIB, 60 * GIB, GIB, []).budget,
+                             int(float(budget) * GIB))
+            self.assertEqual(gate.AdmissionDecision("admit", 0, 0, 0, 0).budget,
+                             int(float(budget) * GIB))
+
+    def test_invalid_environment_budget_uses_config(self) -> None:
+        _ = self.config.write_text("[memory]\nbuild_budget_gib=9\n")
+        for budget in ("", "bad", "0", "-1", "nan", "inf", "1e999"):
+            with self.subTest(budget=budget), patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": budget}):
+                self.assertEqual(gate.build_budget_bytes(), 9 * GIB)
+
+    def test_missing_or_invalid_config_budget_uses_the_fallback(self) -> None:
+        self.assertEqual(gate.build_budget_bytes(), 21 * GIB)
+        for setting in ("[memory]\n", *(f"[memory]\nbuild_budget_gib={value}\n"
+                         for value in ("", "bad", "0", "-1", "nan", "inf", "1e999"))):
+            with self.subTest(setting=setting):
+                _ = self.config.write_text(setting)
+                self.assertEqual(gate.build_budget_bytes(), 21 * GIB)
 
 
 class DecisionTests(unittest.TestCase):
@@ -171,7 +211,7 @@ class DecisionTests(unittest.TestCase):
         result = gate.decide(5 * GIB, gate.UnknownHostTotal(), 5 * GIB, [])
         self.assertEqual((result.reserve, result.threshold, result.state), (0, 5 * GIB, "admit"))
 
-    def test_positive_budget_override_changes_admission_and_invalid_values_use_21(self) -> None:
+    def test_positive_budget_override_changes_admission_and_invalid_values_use_fallback(self) -> None:
         for setting, state in (("24", "admit"), ("20", "hold"), ("0", "admit"), ("-1", "admit"),
                                ("bad", "admit"), ("nan", "admit"), ("inf", "admit"), ("", "admit")):
             with self.subTest(setting=setting), patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": setting}):

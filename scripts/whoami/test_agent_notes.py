@@ -93,6 +93,56 @@ class AgentNotesTests(unittest.TestCase):
         with patch.object(agent_notes, "live_reports", return_value=reports), patch.object(five_hour, "watch", return_value=[]):
             return agent_notes.update_alert_pass(selection, agent_accounts.observe_workers_home(), force_usage=True)
 
+    def test_usage_only_refresh_saves_usage_without_notes_alerts_or_routing(self) -> None:
+        note = self.note("claude2.md", "desktop@example.invalid")
+        before = note.path.read_bytes()
+        selection = agent_accounts.ClaudeAccountsInUse(
+            agent_accounts.UnreadableIdentity(self.root / ".claude", "fixture"), False, (), frozenset())
+        home = self.root / ".codex2"
+        report = Report("Claude", email="desktop@example.invalid",
+            source=ClaudeDirectorySource(self.root / ".claude2"),
+            quotas=[Quota("Weekly", 25, self.future)],
+            usage_read_outcome=agent_accounts.UsageReadOutcome.OK)
+        with (patch.object(sys, "argv", ["agent_notes.py", "usage-only"]),
+              patch.object(accounts, "claude_account_selection", return_value=selection),
+              patch.object(agent_notes, "resolve_workers_home", return_value=home),
+              patch.object(agent_notes, "live_reports", return_value=[report]) as reads,
+              patch.object(agent_notes, "update_alert_pass", side_effect=AssertionError("full notes pass")),
+              patch.object(agent_notes, "alert", side_effect=AssertionError("alert")),
+              patch.object(agent_notes, "refresh", side_effect=AssertionError("alert refresh")),
+              patch.object(five_hour, "watch", side_effect=AssertionError("five hour alert")),
+              patch.object(codex_pacer, "tick", side_effect=AssertionError("pacer")),
+              patch.object(refusal_watch, "run", side_effect=AssertionError("routing"))):
+            _ = agent_notes.main()
+        _ = reads.assert_awaited_once_with(selection, home)
+        stored = usage_store.load()["desktop@example.invalid"]
+        weekly = stored.get("weekly")
+        self.assertIsNotNone(weekly)
+        assert weekly is not None
+        self.assertEqual(weekly["left"], 75)
+        self.assertEqual(usage_store.latest_read_outcome(stored), agent_accounts.UsageReadOutcome.OK)
+        self.assertEqual(note.path.read_bytes(), before)
+        self.assertFalse(usage_store.timer_file().exists())
+        self.assertFalse((self.root / "readings.jsonl").exists())
+        self.rows.assert_not_called()
+
+    def test_usage_only_reports_unavailable_credentials_without_changing_saved_notes(self) -> None:
+        note = self.note("claude2.md", "desktop@example.invalid")
+        before = note.path.read_bytes()
+        selection = agent_accounts.ClaudeAccountsInUse(
+            agent_accounts.UnreadableIdentity(self.root / ".claude", "fixture"), False, (), frozenset())
+        report = Report("Claude", email="desktop@example.invalid",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE)
+        with patch.object(agent_notes, "live_reports", return_value=[report]):
+            refreshed = agent_notes.refresh_usage(selection, self.root / ".codex", {})
+        self.assertEqual(refreshed.messages, (
+            "usage refresh: 1 account(s) have login credentials unavailable in this session",))
+        self.assertFalse(usage_store.store_file().exists())
+        applied = agent_notes.apply([note], report, self.now)
+        self.assertEqual(applied.updates, {})
+        self.assertEqual(applied.readings, ())
+        self.assertEqual(note.path.read_bytes(), before)
+
     def test_timer_reuses_usage_but_updates_session_sections_each_pass(self) -> None:
         home = self.root / ".codex"
         self.codex_login(home, "timer@example.invalid")

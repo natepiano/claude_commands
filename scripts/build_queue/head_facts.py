@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import cached_property
 import json
@@ -107,7 +107,7 @@ class HeadFacts:
     has_priority: bool
     token_waits: TokenWaitsNotRecorded | RecordedTokenWaits
     bump_records: tuple[BumpRecord, ...] = ()
-    budget: int = gate.BUILD_BUDGET_BYTES
+    budget: int = field(default_factory=gate.build_budget_bytes)
     head_need: int = 0
     priority: gate.QueuePriority | gate.NoQueuePriority = gate.NO_QUEUE_PRIORITY
 
