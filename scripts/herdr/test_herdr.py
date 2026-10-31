@@ -3292,35 +3292,76 @@ class HerdrTests(unittest.TestCase):
         self.assertEqual(herdr.herdr_places(), {})
         self.assertEqual(herdr.herdr_processes(), [])
 
-    def test_unreadable_live_panes_refuse_place_reads_instead_of_reporting_absence(self) -> None:
+    def test_process_scan_keeps_launch_places_when_live_panes_are_unreadable(self) -> None:
+        server = self.process(10, 1, ["herdr", "server"], {})
+        self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
+        self.socket_fd(server, 100)
+        expected: dict[int, herdr.HerdrPlace] = {}
+        for pid in (11, 12, 13):
+            pane = f"w1:p{pid}"
+            _ = self.process(pid, 10, ["claude"], {"HERDR_PANE_ID": pane})
+            expected[pid] = herdr.HerdrPlace("fixture", pane)
+        for reply, code in (("", 0), ("not JSON", 0), ("", 1)):
+            with self.subTest(reply=reply, code=code):
+                self.configure_herdr(["pane", "list"], reply, code=code)
+                self.log.unlink(missing_ok=True)
+                self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
+                self.assertEqual(self.commands(), [["--session", "fixture", "pane", "list"]])
+        with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
+            self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
+
+    def test_process_scan_reads_live_panes_once_per_session(self) -> None:
+        expected: dict[int, herdr.HerdrPlace] = {}
+        for session, server_pid in (("fixture", 10), ("writing", 20)):
+            server = self.process(server_pid, 1, ["herdr", "server"], {})
+            self.unix_socket(self.root / f"config/herdr/sessions/{session}/herdr.sock", server_pid)
+            self.socket_fd(server, server_pid)
+            for pid in (server_pid + 1, server_pid + 2):
+                pane = f"w1:p{pid}"
+                _ = self.process(pid, server_pid, ["claude"], {"HERDR_PANE_ID": pane})
+                expected[pid] = herdr.HerdrPlace(session, pane)
+        self.log.unlink(missing_ok=True)
+        self.assertEqual({row.pid: row.place for row in herdr.herdr_processes()}, expected)
+        self.assertCountEqual(self.commands(), [
+            ["--session", "fixture", "pane", "list"],
+            ["--session", "writing", "pane", "list"],
+        ])
+
+    def test_unreadable_live_panes_keep_the_launch_place(self) -> None:
         server = self.process(10, 1, ["herdr", "server"], {})
         self.unix_socket(self.root / "config/herdr/sessions/fixture/herdr.sock", 100)
         self.socket_fd(server, 100)
         _ = self.process(11, 10, ["claude"], {"HERDR_PANE_ID": "w1:p1"})
-        readers: tuple[Callable[[], object], ...] = (
-            lambda: herdr.herdr_place_of(11), herdr.herdr_places, herdr.herdr_processes)
+        place = herdr.HerdrPlace("fixture", "w1:p1")
+        readers: tuple[tuple[Callable[[], object], object], ...] = (
+            (lambda: herdr.herdr_place_of(11), place),
+            (herdr.herdr_places, {11: place}),
+            (lambda: [(row.pid, row.place) for row in herdr.herdr_processes()], [(11, place)]))
         for reply in ("not JSON", json.dumps({"result": {"panes": None}})):
             self.configure_herdr(["pane", "list"], reply)
-            for read in readers:
-                with self.subTest(reply=reply, reader=read), self.assertRaises(herdr.HerdrFailure):
-                    _ = read()
+            for read, expected in readers:
+                with self.subTest(reply=reply, reader=read):
+                    self.assertEqual(read(), expected)
         with patch.dict(os.environ, {"HERDR_BIN": "/nonexistent/herdr"}):
-            for read in readers:
-                with self.subTest(reader=read), self.assertRaises(herdr.HerdrFailure):
-                    _ = read()
+            for read, expected in readers:
+                with self.subTest(reader=read):
+                    self.assertEqual(read(), expected)
 
-    def test_darwin_unreadable_live_panes_refuse_place_reads(self) -> None:
+    def test_darwin_unreadable_live_panes_keep_the_launch_place(self) -> None:
         self.darwin()
         uid = os.getuid()
         self.darwin_process_table(f"70 1 {uid} herdr server\n71 70 {uid} claude\n")
         self.darwin_sockets(f"p70\nf3\nn{self.root}/config/herdr/sessions/writing/herdr.sock\n")
         self.darwin_environment(71, "claude", "HERDR_PANE_ID=w1:p1")
         self.configure(["--session", "writing", "pane", "list"], "not JSON")
-        readers: tuple[Callable[[], object], ...] = (
-            lambda: herdr.herdr_place_of(71), herdr.herdr_places, herdr.herdr_processes)
-        for read in readers:
-            with self.subTest(reader=read), self.assertRaises(herdr.HerdrFailure):
-                _ = read()
+        place = herdr.HerdrPlace("writing", "w1:p1")
+        readers: tuple[tuple[Callable[[], object], object], ...] = (
+            (lambda: herdr.herdr_place_of(71), place),
+            (herdr.herdr_places, {71: place}),
+            (lambda: [(row.pid, row.place) for row in herdr.herdr_processes()], [(71, place)]))
+        for read, expected in readers:
+            with self.subTest(reader=read):
+                self.assertEqual(read(), expected)
 
     def test_darwin_moved_pane_resolves_processes_from_the_retained_shell(self) -> None:
         self.darwin()
