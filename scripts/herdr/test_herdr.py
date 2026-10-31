@@ -32,6 +32,7 @@ import fake_herdr
 import trust_survey
 from fake_herdr import CommandResponse
 from scripts.production import staff
+from scripts.message.sessions_test_support import copy_session_modules
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership
 
 GIT_BINARY = shutil.which("git") or "git"
@@ -1383,10 +1384,7 @@ class HerdrTests(unittest.TestCase):
         _ = shutil.copy2(Path(herdr.__file__).with_name("place.py"), isolated / "place.py")
         _ = shutil.copy2(Path(herdr.__file__).with_name("pane_launch.py"), isolated / "pane_launch.py")
         message = isolated.parent / "message"
-        message.mkdir()
-        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "message/sessions.py", message / "sessions.py")
-        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "message/relay_identity.py", message / "relay_identity.py")
-        _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "message/process_identity.py", message / "process_identity.py")
+        copy_session_modules(message)
         library = isolated.parent / "lib"
         library.mkdir()
         _ = shutil.copy2(Path(herdr.__file__).resolve().parents[1] / "lib/nix_env.py", library / "nix_env.py")
