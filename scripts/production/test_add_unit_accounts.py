@@ -150,20 +150,11 @@ class AddUnitAccountsTests(AddUnitTestCase):
         self.assertEqual(self.agent_arguments()[:2], ["--model", "sonnet"])
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
 
-    def test_new_work_is_refused_while_account_is_down(self) -> None:
+    def test_stale_account_shutdown_does_not_block_new_work(self) -> None:
         self.write_shutdown_record(self.shutdown_record("down"))
-        document = self.doc.read_text(encoding="utf-8")
-        head = self.git("rev-parse", "HEAD")
-
-        result = self.cli("alpha", "--plan", "docs/plans/given.md")
-
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(
-            result.stderr,
-            "add_unit: claude2 is held by a shutdown "
-            + "(since 2026-10-09 14:49 PDT), requested in a terminal; /shutdown restart first\n",
-        )
-        self.assert_no_launch_change(document, head)
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
+        self.assertEqual(len(self.servers_started()), 1)
 
     def test_named_unit_account_paths_are_literal_pane_environment_values(self) -> None:
         home = self.root / "home with 'quotes' $()"
@@ -177,26 +168,14 @@ class AddUnitAccountsTests(AddUnitTestCase):
         self.assertNotIn("CLAUDE_TEST_SECRET", self.pane_environment())
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", self.pane_environment())
 
-    def test_held_named_unit_account_refuses_new_work_before_changes(self) -> None:
-        """F001: the launch guard checks the selected unit account's shutdown."""
-        _ = self.prepare_unit_account("claude3")
-        login = "claude-3@example.invalid"
+    def test_stale_named_account_shutdown_does_not_block_new_work(self) -> None:
+        directory = self.prepare_unit_account("claude3")
         held = self.shutdown_record("down")
-        held["login"] = login
-        held["label"] = "claude3"
-        self.write_shutdown_record(held, login=login)
-        document = self.doc.read_text(encoding="utf-8")
-        head = self.git("rev-parse", "HEAD")
-
-        result = self.cli("alpha", "--plan", "docs/plans/given.md")
-
-        self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-        self.assertEqual(
-            result.stderr,
-            "add_unit: claude3 is held by a shutdown "
-            + "(since 2026-10-09 14:49 PDT), requested in a terminal; /shutdown restart first\n",
-        )
-        self.assert_no_launch_change(document, head)
+        held.update(login="claude-3@example.invalid", label="claude3")
+        self.write_shutdown_record(held, login="claude-3@example.invalid")
+        _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
+        self.assertEqual(len(self.servers_started()), 1)
 
     def test_default_account_shutdown_does_not_block_a_named_unit(self) -> None:
         """F001: another account's shutdown does not block the selected unit account."""
@@ -207,30 +186,11 @@ class AddUnitAccountsTests(AddUnitTestCase):
 
         self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
 
-    def test_claude2_guard_environment_selects_its_numbered_folder(self) -> None:
-        """The guard sees the selected folder, never the caller or config home."""
+    def test_selected_account_launch_never_reads_shutdown_holds(self) -> None:
         self.env["CLAUDE_CONFIG_DIR"] = str(self.root / "caller account")
-        with (
-            patch.dict(os.environ, self.env),
-            patch.object(
-                launch_permission, "launch_permission",
-                return_value=launch_permission.AllowedByShutdownState(),
-            ) as permission,
-        ):
-            expected = {
-                key: value for key, value in os.environ.items()
-                if not key.startswith("CLAUDE_")
-            }
-            result = add_unit.main([
-                "--production", str(self.doc), "alpha",
-                "--plan", "docs/plans/given.md", "--check",
-            ])
-
-        self.assertEqual(result, 0)
-        expected["CLAUDE_CONFIG_DIR"] = str(Path(self.env["HOME"]) / ".claude2")
-        permission.assert_called_once_with(
-            expected, launch_permission.NewWorkLaunchPurpose()
-        )
+        with patch.object(launch_permission, "launch_permission", side_effect=AssertionError("stale hold queried")):
+            _ = self.successful("alpha", "--plan", "docs/plans/given.md")
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(Path(self.env["HOME"]) / ".claude2"))
 
     def test_better_candidate_after_readiness_keeps_the_stored_group_account(self) -> None:
         """Better readings neither replace the stored group nor the checked launch account."""
@@ -352,11 +312,11 @@ class AddUnitAccountsTests(AddUnitTestCase):
         self.assertEqual(self.servers_started(), [])
         self.assertFalse((Path(self.env["HOME"]) / ".local/state/unit-launch").exists())
 
-    def test_unit_resume_uses_configured_account_instead_of_recorded_account(self) -> None:
-        """F004: the configured units account decides resumes too."""
+    def test_unit_resume_uses_its_pane_account_instead_of_the_current_group(self) -> None:
+        """A conversation stays on its launch account unless explicitly moved."""
         old = self.prepare_unit_account("claude2")
         caller = self.prepare_unit_account("claude3")
-        directory = self.prepare_unit_account("claude1")
+        _ = self.prepare_unit_account("claude1")
         self.env["CLAUDE_CONFIG_DIR"] = str(caller)
         self.persist_unit_account(old, session="alpha")
         prior = self.root / "prior-session"
@@ -368,11 +328,11 @@ class AddUnitAccountsTests(AddUnitTestCase):
             code = add_unit.main(["--production", str(self.doc), "alpha", "--plan", "docs/plans/given.md",
                 "--resume", "session-123", "--cwd", str(prior)])
         self.assertEqual(code, 0)
-        prepared.assert_any_call("claude1", resume=True)
-        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
+        prepared.assert_any_call("claude2", resume=True)
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(old))
         self.assertIn("--resume session-123", self.launch_command())
 
-    def test_unit_resume_uses_configured_account_instead_of_old_named_account(self) -> None:
+    def test_restore_uses_its_pane_account_instead_of_the_current_group(self) -> None:
         self.commit_prepared_row(self.unit_row())
         directory = self.prepare_unit_account("claude1")
         other_directory = self.prepare_unit_account("claude3")
@@ -390,7 +350,7 @@ class AddUnitAccountsTests(AddUnitTestCase):
             "--session-name", "recorded-name", "--host-session", "recorded-herdr",
         )
 
-        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(other_directory))
+        self.assertEqual(self.pane_environment()["CLAUDE_CONFIG_DIR"], str(directory))
         self.assertFalse(any(argument.endswith("/accounts.py") for argument in self.agent_arguments()))
         self.assertIn("--resume session-123", self.launch_command())
         self.assertNotIn(str(directory), self.launch_command())

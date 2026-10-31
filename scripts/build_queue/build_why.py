@@ -9,7 +9,6 @@ import io
 import os
 from pathlib import Path
 import sys
-import unicodedata
 from contextlib import redirect_stderr
 from typing import assert_never
 from zoneinfo import ZoneInfo
@@ -19,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.build_queue import build_queue, head_facts
 from scripts.lint import memory_admit as gate
 from scripts.lib.user_zone import user_zone
+from scripts.lib.terminal_cells import terminal_width
 from scripts.message import roster
 
 
@@ -30,18 +30,13 @@ def minute(instant: float, zone: ZoneInfo) -> str:
     return datetime.fromtimestamp(instant, zone).strftime("%H:%M")
 
 
-def _terminal_width(text: str) -> int:
-    return sum(0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-               for char in text)
-
-
 def aligned_table(headers: Sequence[str], rows: Sequence[Sequence[str]], numeric: frozenset[int]) -> list[str]:
-    widths = [max(_terminal_width(header), *(_terminal_width(row[index]) for row in rows))
+    widths = [max(terminal_width(header), *(terminal_width(row[index]) for row in rows))
               for index, header in enumerate(headers)]
 
     def row_text(row: Sequence[str]) -> str:
-        cells = [(" " * (widths[index] - _terminal_width(cell)) + cell) if index in numeric
-                 else (cell + " " * (widths[index] - _terminal_width(cell)))
+        cells = [(" " * (widths[index] - terminal_width(cell)) + cell) if index in numeric
+                 else (cell + " " * (widths[index] - terminal_width(cell)))
                  for index, cell in enumerate(row)]
         return "| " + " | ".join(cells) + " |"
 
@@ -256,7 +251,10 @@ def main() -> int:
     try:
         # A damaged recovery record must not turn the one-line failure protocol into a traceback.
         with redirect_stderr(io.StringIO()):
-            reading = gate.locked_queue_read()
+            reading = gate.queue_read()
+            if isinstance(reading, gate.QueueBusy):
+                print("queue busy; try again")
+                return 0
             explanation = reading.explanation
             facts = head_facts.read_head_facts(reading)
             session_ids = [row.step.session_id for row in explanation.running]

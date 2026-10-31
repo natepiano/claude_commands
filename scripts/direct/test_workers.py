@@ -107,6 +107,19 @@ def json_object(path: Path) -> dict[str, object]:
 
 
 class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
+    def test_restarted_director_comes_from_its_current_unit_mark(self) -> None:
+        from scripts.production import unit_lookup
+        from scripts.message import sessions
+        from herdr import HerdrPlace
+
+        _ = (self.session_dir / workers.STATE).write_text(json.dumps({"production": "demo", "unit": "builders"}))
+        _ = (self.session_dir / "director").write_text("old-director")
+        current = unit_lookup.MarkedUnit("builders", unit_lookup.LiveClaude("Builders", "new-director", "/socket", 4321),
+                                         HerdrPlace("agents", "w1:p2"))
+        with patch.object(sessions, "live_sessions", return_value=[]), patch.object(unit_lookup, "marked_unit", return_value=current):
+            found = workers.live_unit_director(self.session_dir)
+        self.assertEqual(found, workers.LiveUnitDirector("new-director", 4321))
+
     def test_ledger_uses_canonical_production_for_both_headers_and_saved_metadata(self) -> None:
         worktree = self.session_dir.parent / "repository"
         plan = worktree / "plan.md"
