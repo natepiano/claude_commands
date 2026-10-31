@@ -1,0 +1,178 @@
+# Standing gate checkouts
+
+`scripts/copies/copies.py` is the single place that makes gate, review, merge,
+and landing checkouts. A unit reuses one tree and its build output across
+commits. Another caller can use the second tree while the first is busy.
+
+## Configuration, place, and names
+
+`config/copies.conf` owns the settings. The existing
+`scripts.lint.config_values.config_values` reader reads its key-value settings
+(section headings are organizational); there is no separate parser. `COPIES_CONFIG` can select
+another configuration file, including a private test fixture. Every setting
+below is required; the implementation has no fallback values.
+
+| Key | Shipped value | Meaning |
+| --- | --- | --- |
+| `root` | `~/worktrees/gates` | Absolute pool root after expanding `~`. |
+| `wait_seconds` | `1` | Positive, finite interval in seconds for rechecking the second checkout while both are busy. |
+| `git_timeout_seconds` | `600` | Positive, finite deadline in seconds for each Git subprocess. |
+| `guard_timeout_seconds` | `10` | Positive, finite deadline in seconds for the combined repository-copy and scratch guard. |
+
+These are shipped configuration values, not defaults in code. `owner.nightly`
+(`nightly`) and `owner.style` (`style`) are required only when their caller needs
+a fallback owner because production context is unavailable. There is no
+configurable pool size: each owner and repository has exactly two checkout slots.
+
+The same file holds `allow.<path>=<reason>` entries under `[allow-list]`, with
+paths relative to `scripts/`. `copies.load_config().allow_list` supplies these
+entries to the guard's scan. The guard does not read configuration separately.
+
+Trees live at `<root>/<repo>/<owner>-gate` and `<owner>-gate-2`.
+`<repo>` is the repository folder name: `hana`, `.claude`,
+or `cargo-liner`. Linked worktrees use the main repository's name, so a unit
+worktree of `.claude` uses `.claude/verify-unit-gate`. The root under
+`~/worktrees` belongs to the existing trusted direnv root.
+
+Owners are unit or production names, such as `verify-unit` or `builds`, and must
+match `[a-z0-9][a-z0-9-]*`. Use no phase, run, or session ids. The caller supplies
+the owner from its existing context; the helper does not consult a roster.
+
+## Reset and build output
+
+First use makes a shared clone with its own `.git` directory. It never copies a
+linked worktree's `.git` pointer or changes the source's branches. The clone's
+Git metadata is staged inside the already locked directory and then installed,
+so first creation has the same busy protection as reuse.
+
+Each use fetches the selected commit from the source, checks it out with
+`checkout --force --detach`, and runs `clean -ffdq`. It keeps ignored files,
+including `target/`. Git updates changed files while preserving unchanged file
+modification times, allowing the next build to remain incremental. There is no
+seed copy or shared build directory.
+
+`scratch.mark_cargo_cache` marks and refreshes `target/`. The existing floor
+sweep can reclaim idle build output; a later gate rebuilds it. The checkout's
+busy mark also protects its target while a caller uses the tree.
+Cache refresh never follows a `target` symlink planted by a caller. The next
+use removes that link and restores a local cache without changing its target.
+
+## Acquisition and cleanup
+
+A use holds `scratch.busy_locks(tree, create=True)` throughout preparation and
+the entire command or Python context. The mark is the existing `.claude-busy`
+flock. There is no second lock implementation or central registry.
+
+Acquisition tries both trees in order without waiting. If both trees are
+busy, it prints one stderr line naming the trees and their recorded holder
+pids, then blocks on the primary tree's flock while rechecking the second at
+`wait_seconds` intervals (one second in the shipped configuration). Primary
+release wakes acquisition immediately. A third simultaneous caller waits; it
+never creates a third tree. Failed
+preparation and failed commands release the lock.
+
+Each tree has one `.gate.json` record:
+
+```json
+{
+  "owner": "verify-unit",
+  "repo": ".claude",
+  "source": "/home/natepiano/worktrees/claude-build-followups-verify",
+  "commit": "1111111111111111111111111111111111111111",
+  "last_use": 1793448000.0,
+  "holder_pid": 12345
+}
+```
+
+The record contains the most recent commit, use time, and holder pid. An idle
+tree retains its last holder pid; the lock determines whether it is busy.
+Records are written atomically under the busy lock. Git's `info/exclude` ignores
+`/.gate.json`, `/.claude-busy`, and `/target/`.
+
+## Commands and Python API
+
+Run a gate with the source worktree's uncommitted changes and a merge, in that
+order:
+
+```sh
+python3 ~/.claude/scripts/copies/copies.py run \
+  --owner verify-unit --repo ~/worktrees/claude-build-followups-verify \
+  --commit HEAD \
+  --apply-uncommitted ~/worktrees/claude-build-followups-verify \
+  --merge origin/builds -- \
+  python3 ~/.claude/scripts/production/merge_gate.py --checkout '{tree}' --tests-only
+```
+
+`run --owner O --repo R --commit C [--apply-uncommitted W] [--merge REF]
+-- <cmd> ...` executes the command with the checkout as its working directory.
+Every `{tree}` occurrence in an argument becomes the checkout's absolute path.
+The command's exit status is returned, and its output passes through.
+
+`--apply-uncommitted` applies staged and unstaged tracked changes plus untracked,
+not ignored files. It commits on top of the selected commit with `--no-verify`
+and subject `gate: uncommitted <worktree> at <short sha>`. It reads the source
+without changing it. For `--merge origin/<branch>`, copies.py first fetches the
+branch from the source's origin into the standing checkout, then merges it, so a
+stale source tracking ref cannot select an old merge. Other merge refs are fetched from the
+source repository. Local origin paths resolve relative to the source repository;
+remote URLs keep their original form. Source refs stay unchanged. The merge uses `--no-ff --no-edit`.
+Failed application or a merge conflict exits 3,
+names the affected files, and releases the tree. The next use resets it clean.
+
+```sh
+python3 ~/.claude/scripts/copies/copies.py list
+python3 ~/.claude/scripts/copies/copies.py remove \
+  --owner verify-unit --repo ~/worktrees/claude-build-followups-verify
+```
+
+`list` prints one row per tree: path, owner, repo, commit, busy or idle, last
+holder pid, and target size. `remove` acquires all the owner's existing trees
+before deleting any. A busy tree refuses with exit 2 and a holder pid. Repeating
+removal succeeds when the trees are already gone.
+
+Success exits 0; invalid owners, invalid configuration, and other refused
+operations exit 2. Apply and merge failures exit 3. `run` returns its command's
+status. Repeating a use resets the same checkout and retains its build files;
+only the last-use record and cache-use stamp are refreshed.
+
+Script callers use the same implementation:
+
+```python
+from scripts.copies import copies
+
+with copies.standing(owner, repo, commit,
+                     apply_uncommitted=worktree, merge=merge_ref) as tree:
+    run_gate(tree)
+```
+
+Both keyword arguments default to `None`. `standing` yields a `Path` while
+holding the tree. `CopyError` represents a refusal; `PreparationError` is its
+subclass for apply or merge failures.
+
+## Guard and exceptions
+
+`scripts/copies/copy_guard.py` owns the creation rule; `config/copies.conf` owns
+the allow list. The
+PreToolUse Bash dispatcher refuses direct repository cloning, worktree
+creation, and recursive repository copying, and points to `copies.py run` with
+an example. The repository scan applies the same allow list to script code.
+
+The guard distinguishes no forbidden operation, a specific detected repository-tree operation, and an unresolved relevant operation. One invocation decoder handles shell commands, tool argv and Python subprocess vectors. It distinguishes command text, stdin programs, script/module operands and informational invocations using interpreter-specific option semantics: CPython options and operands, Bash/Zsh invocation options, and portable POSIX sh meanings. Script stdin and informational invocation input are data, while executable outer expansions are inspected before exemptions. Ordered descriptor duplication through <& and >&, moves, closure and replacement determine selected stdin; an unknown selected input refuses with a specific unresolved reason. Nested parsing distinguishes program, array word-list, parameter and arithmetic context. Literal data stays data while executable substitutions are inspected recursively. Runtime unresolved relevant programs refuse; static abstract analysis may defer unknown interpreter input to concrete call sites. Known gaps remain interprocedural analysis, generated programs such as bash -c "$(printf ...)", aliases and sourced files. Supported syntax is bounded by the documented tested forms rather than a claim to implement every shell dialect.
+
+| Allowed creator | Reason |
+| --- | --- |
+| `scripts/copies/copies.py` | The standing gate checkout implementation. |
+| `scripts/production/add_unit.py` | Creates original unit worktrees. |
+| `scripts/production/resume_unit.py` | Restores original unit worktrees. |
+| `scripts/mac_test/offload.py` | Mac mirrors move in a later checkpoint. |
+| `scripts/production/mac_run.sh` | Mac mirrors move in a later checkpoint. |
+| `scripts/direct/verify.sh` | Its documentation checkout is already standing. |
+| `scripts/berth_fix/launch.sh` | Creates a standing original fixer worktree, not a build copy. |
+| `scripts/style/add_style.py` | Creates a unit's original checkout, like `add_unit.py`. |
+| `scripts/bevy_migration_plan/bevy_migration_ensure_repo.sh` | Clones external upstream at a version, not a copy of our work. |
+| `scripts/worktree/make_worktree.sh` | Makes an original work worktree, not a build copy. |
+
+Before/after comparisons run in turn in one tree or use the second tree.
+Mac mirrors move in a later checkpoint. More than two simultaneous builds for
+one owner and repository wait. Old copies under `/tmp` are left for the existing
+floor sweep; this checkpoint does not delete them.

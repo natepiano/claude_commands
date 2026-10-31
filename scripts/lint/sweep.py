@@ -181,6 +181,7 @@ from process_failure import failure_detail
 from user_zone import user_zone  # noqa: E402
 if TYPE_CHECKING:
     from . import tmp_sweep
+    from ..copies import copies
     from ..lib import scratch
     from ..lib.atomic_file import write_text_atomic
     from ..buildlog import record, store
@@ -190,6 +191,8 @@ if TYPE_CHECKING:
 else:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import tmp_sweep
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.copies import copies
     import scratch
     from atomic_file import write_text_atomic
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildlog"))
@@ -2326,10 +2329,15 @@ def build_hold_targets(targets: Sequence[str], known_trees: dict[str, list[str]]
     return protected
 
 
+def floor_roots() -> tuple[str, ...]:
+    """Include the standing pool wherever copies configuration places it."""
+    return (*FLOOR_ROOTS, str(copies.gates_root()))
+
+
 def hold_floor(
     floor: int,
     dry_run: bool,
-    roots: Sequence[str] = FLOOR_ROOTS,
+    roots: Sequence[str] = (),
     lock: str = FLOOR_LOCK,
 ) -> int:
     """Below the floor, take the shortfall from the least used idle targets."""
@@ -2352,7 +2360,7 @@ def hold_floor(
         idle: list[str] = []
         tree_targets: dict[str, str] = {}
         busy: dict[str, TargetUse | LockHeld | BuildHoldTarget] = {}
-        targets = target_dirs(roots)
+        targets = target_dirs(roots or floor_roots())
         known_trees: dict[str, list[str]] = {}
         hold_targets = build_hold_targets(targets, known_trees)
         uses = process_uses(targets)

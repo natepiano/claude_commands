@@ -23,6 +23,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol, cast, override
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.copies import copies
+import style_sync
+
 import bulk_constants as constants
 import bulk_rename as bulk
 import coverage_report
@@ -617,10 +621,7 @@ def require_test_tree(repo: Path, tree: str) -> None:
 
 
 def test_tree(repo: Path, commit: str, tree: str, runner: Runner, times: dict[str, float]) -> CommandResult:
-    with tempfile.TemporaryDirectory(prefix="bulk-rule-test-") as folder:
-        checkout = Path(folder) / "repo"
-        _ = git(repo, "clone", "--shared", "--no-checkout", str(repo), str(checkout))
-        _ = git(checkout, "checkout", "--detach", commit)
+    with copies.standing(style_sync.gate_owner(repo), repo, commit) as checkout:
         require_test_tree(checkout, tree)
         result = tested_tree_proof(checkout, tree, runner, times)
         require_test_tree(checkout, tree)

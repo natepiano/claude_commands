@@ -323,7 +323,13 @@ def judgment_lock(path: Path) -> Generator[bool]:
 
 
 @contextmanager
-def busy_locks(path: Path, *, create: bool) -> Generator[bool]:
+def busy_locks(path: Path, *, create: bool, inherited_fds: list[int] | None = None,
+               wait: bool = False) -> Generator[bool]:
+    """Hold busy marks; optionally export live descriptors or wait for their release.
+
+    Exported descriptors belong to this context. A child can retain the same
+    flock with subprocess pass_fds; callers must not close them themselves.
+    """
     held: list[int] = []
     acquired = True
     try:
@@ -342,9 +348,11 @@ def busy_locks(path: Path, *, create: bool) -> Generator[bool]:
                         break
                     continue
                 held.append(fd)
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
         except OSError:
             acquired = False
+        if acquired and inherited_fds is not None:
+            inherited_fds.extend(held)
         yield acquired
     finally:
         for fd in held:

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import cast, override
 
 import bulk_run as run
+import style_sync
 import bulk_rename as bulk
 import rules
 import style_ledger as ledger_api
@@ -173,6 +174,9 @@ class WorkspaceRunTests(CargoProjectTests):
     @override
     def setUp(self) -> None:
         super().setUp()
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.root / "gate-home")}))
+        _ = self.enterContext(mock.patch.object(style_sync, "gate_owner", return_value="sample-style"))
+
         _ = (self.repo / "Cargo.toml").write_text((self.repo / "Cargo.toml").read_text() + '\n[workspace]\nmembers=[".", "beta"]\n')
         (self.repo / "beta/src").mkdir(parents=True)
         _ = (self.repo / "beta/Cargo.toml").write_text('[package]\nname="beta"\nversion="0.1.0"\nedition="2021"\n')
@@ -842,7 +846,7 @@ class WorkspaceRunTests(CargoProjectTests):
                                        ("bash", verify, "final-pass", str(report["tested_tree"]))])
         self.assertTrue(all(folder == self.runner.test_checkout for folder, args in self.runner.calls if args[0] == "bash"))
         self.assertNotEqual(self.runner.test_checkout, self.repo)
-        self.assertFalse(self.runner.test_checkout.exists())
+        self.assertTrue((self.runner.test_checkout / ".git").is_dir())
         self.assertEqual(self.runner.test_tree, report["tested_tree"])
         self.assertEqual(self.git("rev-list", "--count", f"{self.base}..HEAD"), "1")
         self.assertIn(f"Tested-Tree: {report['tested_tree']}", self.git("log", "-1", "--format=%B"))
@@ -1043,7 +1047,7 @@ class WorkspaceRunTests(CargoProjectTests):
                 self.runner.mutate_stage = stage
                 with self.assertRaisesRegex(bulk.BulkRenameError, "clean checkout"):
                     _ = run.test_tree(self.repo, self.base, self.tree, self.runner, {})
-                self.assertFalse(self.runner.test_checkout.exists())
+                self.assertTrue((self.runner.test_checkout / ".git").is_dir())
                 self.assertEqual(self.runner.calls[-1][1][2], stage)
 
     def test_hidden_untracked_test_output_never_publishes_or_keeps_the_batch_commit(self) -> None:
@@ -1067,7 +1071,7 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertEqual(self.git("rev-parse", "HEAD"), self.base)
         self.assertEqual(self.git("status", "--porcelain=v1", "--untracked-files=all"), "")
         self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == "bash"], ["final"])
-        self.assertFalse(self.runner.test_checkout.exists())
+        self.assertTrue((self.runner.test_checkout / ".git").is_dir())
         self.assertFalse(tuple(ticket for ticket in ledger.proposal_tickets()
                                if ticket["state"] not in ledger_api.FINAL_TICKET_STATES))
         self.assertTrue(all(isinstance(f.build_ticket, ledger_api.NoBuildTicket)

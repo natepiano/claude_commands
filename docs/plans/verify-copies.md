@@ -1,3 +1,5 @@
+> **Replaced:** One standing gate checkout per unit, in `docs/plans/natedev-verify.md` Phase 18. This entire plan is historical; its named copies and seed targets are not instructions.
+
 # Frozen copies: one helper makes every build copy
 
 > **Production: builds** — unit `verify-unit`; production doc `docs/plans/builds-production.md`
@@ -207,7 +209,7 @@ Hold length: 3 h. Count: about 17 hana builds — A 2, B 4, C 4, D 5 (one pair a
 
 Rough duration: half a day each, in parallel with Phase 1.
 
-### Phase 3 — The helper  · status: todo
+### Phase 3 — The helper (now Phases 18 and 19 of `docs/plans/natedev-verify.md`)  · status: todo
 
 #### Work Order
 

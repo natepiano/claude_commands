@@ -18,10 +18,12 @@ from unittest import mock
 
 import rust_release
 if TYPE_CHECKING:
+    from ..lib import scratch
     from ..notify import review
     from ..notify.push_texts import RenderedPush, render, user_send_argv
     from ..notify.user_action import ActionRequired
 else:
+    from scripts.lib import scratch
     import review
     from push_texts import RenderedPush, render, user_send_argv
     from user_action import ActionRequired
@@ -60,23 +62,24 @@ class FakeRunner:
     def __call__(self, args: list[str], cwd: Path | None, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
         self.calls.append((args, cwd, env, timeout))
         step = "toolchain" if args[0] == "rustup" else "clone" if args[:2] == ["git", "clone"] else "revision" if "rev-parse" in args else "checkout" if "checkout" in args else "clippy" if args[0] == "nix" else "cargo-mend"
-        if step == "clone":
-            self.clone.mkdir()
         if step == "clippy":
             target = self.clone / "target"
-            target.mkdir()
+            target.mkdir(parents=True, exist_ok=True)
             _ = (target / "output").write_bytes(b"clippy")
         if step == "cargo-mend":
             target = self.clone / "mend-target"
-            target.mkdir()
+            target.mkdir(parents=True, exist_ok=True)
             _ = (target / "output").write_bytes(b"mend")
+            root = Path(args[args.index("--root") + 1]) / "bin"
+            root.mkdir(parents=True, exist_ok=True)
+            _ = (root / "cargo-mend").write_bytes(b"installed")
         if step == self.timeout:
             raise subprocess.TimeoutExpired(args, timeout)
         if step == self.fail:
             return subprocess.CompletedProcess(args, 1, "", f"error: {step} broke\n")
         if step == self.killed:
             return subprocess.CompletedProcess(args, self.kill_status, "", self.kill_output)
-        output = "abc123\n" if step == "revision" else self.diagnostics if step == "clippy" else ""
+        output = subprocess.run(["git", "-C", str(rust_release.HANA), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout if step == "revision" else self.diagnostics if step == "clippy" else ""
         return subprocess.CompletedProcess(args, self.clippy_exit if step == "clippy" else 0, output, "")
 
 
@@ -96,6 +99,17 @@ class RustReleaseTests(unittest.TestCase):
         _ = self.enterContext(mock.patch.object(rust_release, "LINT_CONFIG", self.config))
         _ = self.enterContext(mock.patch.object(tempfile, "gettempdir", return_value=str(self.scratch)))
         point_root_at(self, self.root)
+        self.enterContext(mock.patch.dict(os.environ, {"HOME": str(self.scratch)}))
+        source = self.scratch / "hana"
+        source.mkdir()
+        for arguments in (("init", "-q"), ("config", "user.name", "Trial tests"),
+                          ("config", "user.email", "trial@example.invalid")):
+            _ = subprocess.run(["git", "-C", str(source), *arguments], check=True, capture_output=True)
+        _ = (source / ".gitignore").write_text("/target/\n/mend-target/\n/mend-root/\n")
+        _ = subprocess.run(["git", "-C", str(source), "add", "."], check=True, capture_output=True)
+        _ = subprocess.run(["git", "-C", str(source), "commit", "-qm", "trial source"], check=True, capture_output=True)
+        _ = self.enterContext(mock.patch.object(rust_release, "HANA", source))
+
 
     def invoke(
         self,
@@ -315,7 +329,7 @@ class RustReleaseTests(unittest.TestCase):
             compiler_message("beta", "warning", "dead_code", 2),
             compiler_message("beta", "error", "E001", 3),
         ])
-        clone = self.scratch / "rust-release-trial-1.100.0"
+        clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
         runner = FakeRunner(clone, diagnostics=diagnostics)
         texts: list[tuple[str, str]] = []
         self.assertEqual(0, self.invoke(runner=runner, texts=texts))
@@ -327,8 +341,8 @@ class RustReleaseTests(unittest.TestCase):
         self.assertTrue(trial["mend_builds"])
         self.assertGreater(trial["target_gib"], 0)
         self.assertGreater(trial["mend_target_gib"], 0)
-        self.assertFalse(clone.exists())
-        self.assertEqual(["rustup", "git", "git", "git", "nix", "cargo"], [args[0] for args, _, _, _ in runner.calls])
+        self.assertTrue((clone / ".git").is_dir())
+        self.assertEqual(["rustup", "git", "nix", "cargo"], [args[0] for args, _, _, _ in runner.calls])
         clippy = next(call for call in runner.calls if call[0][0] == "nix")
         self.assertEqual(clone, clippy[1])
         self.assertEqual(7200, clippy[3])
@@ -341,25 +355,37 @@ class RustReleaseTests(unittest.TestCase):
         self.assertIn("Errors: 1; new warnings: 2", texts[0][1])
         self.assertIn("Hana still uses Rust 1.99.0", texts[0][1])
 
-    def test_stale_trial_clone_is_removed_before_commands_and_after_success(self) -> None:
-        clone = self.scratch / "rust-release-trial-1.100.0"
-        clone.mkdir()
-        _ = (clone / "stale-output").write_text("old build")
+    def test_mend_outputs_remain_in_marked_caches_after_success_failure_and_timeout(self) -> None:
+        clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
+        for outcome in ("success", "failure", "timeout"):
+            with self.subTest(outcome=outcome):
+                runner = FakeRunner(clone, fail="cargo-mend" if outcome == "failure" else "",
+                                    timeout="cargo-mend" if outcome == "timeout" else "")
+                _ = rust_release.trial_release("1.100.0", runner, lambda: False)
+                mend = runner.calls[-1]
+                root = Path(mend[0][mend[0].index("--root") + 1])
+                self.assertTrue(root.is_relative_to(clone / "target"))
+                self.assertTrue((root / "bin/cargo-mend").is_file())
+                for cache in (clone / "target", clone / "mend-target"):
+                    self.assertIn(scratch.CARGO_TAG_LINE, (cache / scratch.CACHE_TAG).read_text())
+                    self.assertTrue((cache / scratch.USE_STAMP).is_file())
+
+    def test_next_trial_resets_sources_and_keeps_its_build_cache(self) -> None:
+        clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
         fake = FakeRunner(clone)
-
-        def run(args: list[str], cwd: Path | None, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
-            if args[0] == "rustup":
-                self.assertFalse(clone.exists())
-            return fake(args, cwd, env, timeout)
-
-        self.assertEqual(0, self.invoke(runner=run))
-        self.assertFalse(clone.exists())
+        self.assertEqual(0, self.invoke(runner=fake))
+        _ = (clone / "stale-output").write_text("old source")
+        _ = (clone / "target/warm").write_text("retained")
+        rust_release.state_path().unlink()
+        self.assertEqual(0, self.invoke(runner=fake))
+        self.assertFalse((clone / "stale-output").exists())
+        self.assertEqual((clone / "target/warm").read_text(), "retained")
         state = rust_release.read_state()
         assert state is not None
         self.assertEqual("finished", state["trial"]["status"])
 
     def test_mend_nonzero_finishes_and_text_says_does_not_build(self) -> None:
-        clone = self.scratch / "rust-release-trial-1.100.0"
+        clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
         runner = FakeRunner(clone, fail="cargo-mend")
         texts: list[tuple[str, str]] = []
         self.assertEqual(0, self.invoke(runner=runner, texts=texts))
@@ -368,11 +394,11 @@ class RustReleaseTests(unittest.TestCase):
         trial = state["trial"]
         assert trial["status"] == "finished"
         self.assertFalse(trial["mend_builds"])
-        self.assertFalse(clone.exists())
+        self.assertTrue((clone / ".git").is_dir())
         self.assertIn("The tool that repairs Rust build errors fails to compile", texts[0][1])
 
     def test_failed_clippy_step_records_first_error_and_is_not_retried(self) -> None:
-        clone = self.scratch / "rust-release-trial-1.100.0"
+        clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
         runner = FakeRunner(clone, fail="clippy")
         self.assertEqual(0, self.invoke(runner=runner))
         state = rust_release.read_state()
@@ -380,13 +406,13 @@ class RustReleaseTests(unittest.TestCase):
         trial = state["trial"]
         assert trial["status"] == "failed"
         self.assertEqual(("clippy", "error: clippy broke"), (trial["step"], trial["reason"]))
-        self.assertFalse(clone.exists())
+        self.assertTrue((clone / ".git").is_dir())
         calls = len(runner.calls)
         self.assertEqual(0, self.invoke(runner=runner))
         self.assertEqual(calls, len(runner.calls))
 
     def test_killed_trial_waits_and_retries_next_night(self) -> None:
-        clone = self.scratch / "rust-release-trial-1.100.0"
+        clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
         for status, output in ((137, ""), (1, "process failed: signal: 9\n"), (1, "process failed: signal 15\n"), (143, "")):
             with self.subTest(status=status, output=output):
                 rust_release.state_path().unlink(missing_ok=True)
@@ -395,7 +421,7 @@ class RustReleaseTests(unittest.TestCase):
                 state = rust_release.read_state()
                 assert state is not None
                 self.assertEqual("waiting", state["trial"]["status"])
-                self.assertFalse(clone.exists())
+                self.assertTrue((clone / ".git").is_dir())
                 retry = FakeRunner(clone)
                 self.assertEqual(0, self.invoke(at=datetime(2026, 11, 13, 3), runner=retry))
                 state = rust_release.read_state()
@@ -403,8 +429,8 @@ class RustReleaseTests(unittest.TestCase):
                 self.assertEqual("finished", state["trial"]["status"])
                 self.assertEqual("cargo", retry.calls[-1][0][0])
 
-    def test_hold_arriving_mid_trial_deletes_clone_and_leaves_pending(self) -> None:
-        clone = self.scratch / "rust-release-trial-1.100.0"
+    def test_hold_arriving_mid_trial_leaves_pending_before_checkout(self) -> None:
+        clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
         runner = FakeRunner(clone)
         checks = 0
 
@@ -422,8 +448,8 @@ class RustReleaseTests(unittest.TestCase):
         self.assertFalse(clone.exists())
         self.assertEqual(["rustup", "git"], [args[0] for args, _, _, _ in runner.calls])
 
-    def test_timeout_deletes_clone_and_records_failed_step(self) -> None:
-        clone = self.scratch / "rust-release-trial-1.100.0"
+    def test_timeout_releases_checkout_and_records_failed_step(self) -> None:
+        clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
         runner = FakeRunner(clone, timeout="clippy")
         self.assertEqual(0, self.invoke(runner=runner))
         state = rust_release.read_state()
@@ -431,12 +457,13 @@ class RustReleaseTests(unittest.TestCase):
         trial = state["trial"]
         assert trial["status"] == "failed"
         self.assertEqual("clippy", trial["step"])
-        self.assertFalse(clone.exists())
+        self.assertGreater(trial["target_gib"], 0)
+        self.assertTrue((clone / ".git").is_dir())
 
     def test_waiting_text_is_not_repeated_after_later_trial_or_new_day(self) -> None:
         texts: list[tuple[str, str]] = []
         self.assertEqual(0, self.invoke(held=True, texts=texts))
-        runner = FakeRunner(self.scratch / "rust-release-trial-1.100.0")
+        runner = FakeRunner(self.scratch / "worktrees/gates/hana/toolchain-trial-gate")
         self.assertEqual(0, self.invoke(runner=runner, texts=texts))
         self.assertEqual(0, self.invoke(at=datetime(2026, 11, 13, 3), runner=runner, texts=texts))
         self.assertEqual(1, len(texts))
@@ -451,7 +478,7 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual(texts, [])
 
     def test_clippy_diagnostics_finish_trial_but_non_diagnostic_exit_fails(self) -> None:
-        clone = self.scratch / "rust-release-trial-1.100.0"
+        clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
         diagnostic = compiler_message("alpha", "error", "E001", 3)
         runner = FakeRunner(clone, diagnostics=diagnostic, clippy_exit=101)
         texts: list[tuple[str, str]] = []
@@ -489,7 +516,7 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual([], rust_release.report_line())
 
         self.assertEqual(0, self.invoke(pin="1.99.0", at=datetime(2026, 11, 12, 12)))
-        runner = FakeRunner(self.scratch / "rust-release-trial-1.100.0")
+        runner = FakeRunner(self.scratch / "worktrees/gates/hana/toolchain-trial-gate")
         texts: list[tuple[str, str]] = []
         self.assertEqual(1, self.invoke(at=datetime(2026, 11, 13, 3), runner=runner, texts=texts, fetch_channel=unavailable))
         state = rust_release.read_state()
@@ -500,8 +527,8 @@ class RustReleaseTests(unittest.TestCase):
         self.assertEqual(1, len(texts))
         self.assertEqual("cargo", runner.calls[-1][0][0])
 
-    def test_hold_after_nonzero_clippy_keeps_trial_waiting_and_deletes_clone(self) -> None:
-        clone = self.scratch / "rust-release-trial-1.100.0"
+    def test_hold_after_nonzero_clippy_keeps_trial_waiting_and_checkout(self) -> None:
+        clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
         runner = FakeRunner(clone, fail="clippy")
 
         def held() -> bool:
@@ -511,11 +538,11 @@ class RustReleaseTests(unittest.TestCase):
         state = rust_release.read_state()
         assert state is not None
         self.assertEqual({"status": "waiting", "version": "1.100.0", "reason": "build hold active"}, state["trial"])
-        self.assertFalse(clone.exists())
+        self.assertTrue((clone / ".git").is_dir())
         self.assertEqual("nix", runner.calls[-1][0][0])
 
     def test_missing_pin_keeps_finished_trial_and_sent_text_for_return(self) -> None:
-        clone = self.scratch / "rust-release-trial-1.100.0"
+        clone = self.scratch / "worktrees/gates/hana/toolchain-trial-gate"
         runner = FakeRunner(clone)
         texts: list[tuple[str, str]] = []
         self.assertEqual(0, self.invoke(runner=runner, texts=texts))

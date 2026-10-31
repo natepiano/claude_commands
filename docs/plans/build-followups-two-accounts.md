@@ -2951,7 +2951,7 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 
 #### As-built
 
-- `ci_points.py ci start` records the merge branch tip and validates it in a private `git clone --shared --no-checkout` copy under the state dir, with `CARGO_TARGET_DIR=<copy>/target`. The production checkout is never the validation tree. The copy is removed when the run ends, pass or fail.
+- `ci_points.py ci start` records the merge branch tip and validates it through `copies.standing(production.slug, production.checkout, tip)`, with `CARGO_TARGET_DIR=<checkout>/target`. The production checkout is never the validation tree. The checkout stays for later runs; its busy lock is released on either outcome.
 - `validate_and_push.sh --validate-only` runs validation in the copy and makes at most one fix commit there. It does not push.
 - Publish runs under `merge_checkpoint.merge_lock`: it fetches the copy's `HEAD` into the production checkout, does a guarded `git merge --ff-only`, then runs `push_direct.sh --publish-only <sha>`, which prints `<sha> pushed` or `<sha> contained`.
 - The publish rule: if `origin/<merge branch>` contains the sha, the run passes and nothing is pushed. A fix commit is pushed only when it fast-forwards `origin/<merge branch>`. Otherwise the run fails with `merge branch moved during validation`. Nothing is ever force-pushed.

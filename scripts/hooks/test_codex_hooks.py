@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
+
+from scripts.copies.test_copy_guard import argv_policy_cases, repair_policy_cases, shell_policy_cases, unresolved_policy_cases
 
 import codex_hooks
 
@@ -27,7 +30,7 @@ FN_HANDLER: dict[str, object] = {"type": "command", "command": FN_COMMAND, "time
 BERTH_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/pre-tool-use-berth.py"'
 BERTH_GROUP: dict[str, object] = {"matcher": "apply_patch",
                                   "hooks": [{"type": "command", "command": BERTH_COMMAND, "timeout": 30}]}
-GUARD_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/pre-tool-use-scratch-guard.py"'
+GUARD_COMMAND = '"$HOME/.claude/scripts/lib/py" "$HOME/.claude/scripts/hooks/../copies/copy_guard.py"'
 GUARD_GROUP: dict[str, object] = {"matcher": "Bash",
                                   "hooks": [{"type": "command", "command": GUARD_COMMAND, "timeout": 10}]}
 HOLD_COMMAND = '"$HOME/.claude/scripts/hooks/pre-tool-use-build-hold-guard.sh"'
@@ -164,6 +167,57 @@ class CodexHookInstallerTests(unittest.TestCase):
             capture_output=True, text=True, check=False,
             env=self.environment, cwd=cwd, timeout=TEST_HANG_GUARD_SECS,
         )
+
+    def run_bash_policy(self, command: str | list[str]) -> subprocess.CompletedProcess[str]:
+        hook = next(hook for hook in codex_hooks.HOOKS if hook.name == "scratch-guard")
+        script = shlex.split(hook.command)[-1].replace("$HOME/.claude", str(INSTALLER.resolve().parents[2]))
+        return subprocess.run([sys.executable, script], input=json.dumps({
+            "tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(self.root)}),
+            env={**self.environment, "PATH": os.environ["PATH"]}, text=True,
+            capture_output=True, timeout=TEST_HANG_GUARD_SECS, check=False)
+
+    def test_registered_bash_policy_refuses_clones_and_allows_the_checkout_service(self) -> None:
+        hook = next(hook for hook in codex_hooks.HOOKS if hook.name == "scratch-guard")
+        self.assertEqual((hook.event, hook.matcher), ("PreToolUse", "Bash"))
+        for command, expected in (("git clone source destination", 2),
+                                  ("copies.py run --owner verify-unit --repo . --commit HEAD -- true", 0)):
+            with self.subTest(command=command):
+                result = self.run_bash_policy(command)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                if expected:
+                    self.assertIn("copies.py run", result.stderr)
+
+    def test_registered_policy_distinguishes_literal_and_executable_substitutions(self) -> None:
+        for case in shell_policy_cases():
+            with self.subTest(command=case.command):
+                result = self.run_bash_policy(case.command)
+                self.assertEqual(result.returncode, 2 if case.operation else 0, result.stderr)
+                if case.operation:
+                    self.assertTrue(result.stderr.startswith(case.operation + ":"), result.stderr)
+                else:
+                    self.assertEqual(result.stdout, "")
+
+    def test_interpreter_vectors_and_unresolved_programs_reach_the_codex_policy(self) -> None:
+        for command, operation in argv_policy_cases():
+            with self.subTest(command=command):
+                result = self.run_bash_policy(command)
+                self.assertEqual(result.returncode, 2 if operation else 0, result.stderr)
+                self.assertEqual(result.stderr.split(":", 1)[0] if result.stderr else "", operation)
+        for command, reason in unresolved_policy_cases():
+            with self.subTest(command=command):
+                result = self.run_bash_policy(command)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertTrue(result.stderr.startswith("unresolved relevant operation: " + reason + ":"), result.stderr)
+
+    def test_recorded_commands_and_interpreter_descriptor_context_matrix(self) -> None:
+        for case in repair_policy_cases():
+            with self.subTest(case=case.name, provenance=case.provenance):
+                result = self.run_bash_policy(case.command)
+                self.assertEqual(result.returncode, 2 if case.expected else 0, result.stderr)
+                if case.expected:
+                    self.assertTrue(result.stderr.startswith(case.expected + ":"), result.stderr)
+                else:
+                    self.assertNotIn("copies.py run", result.stderr)
 
     def state(self) -> dict[str, object]:
         return cast(dict[str, object], json.loads(self.state_file.read_text()))

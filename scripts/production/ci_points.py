@@ -9,13 +9,13 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from scripts.copies import copies
 from scripts.lib.process_failure import failure_detail
 from production_units import Production, read_production
 from production_units import Refusal, cell_value
@@ -157,19 +157,24 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
     checkpoint = (f"{last_code.unit} phase {last_code.phase}" if isinstance(last_code, MergeEntry)
                   else "production wrap")
     state_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="ci-point-", dir=state_dir.resolve()) as temporary:
-        checkout = Path(temporary) / "checkout"
-        _ = required(command("ci start", "git", "clone", "--shared", "--no-checkout", "--",
-                             str(production.checkout.resolve()), str(checkout)), "ci start")
-        _ = required(git(checkout, "remote", "set-url", "origin", origin), "ci start")
-        _ = required(git(checkout, "remote", "set-url", "--push", "origin", push_origin), "ci start")
-        _ = required(git(checkout, "checkout", "--detach", tip), "ci start")
-        # A checkout can set its commit identity locally instead of globally.
+    with copies.standing(production.slug, production.checkout, tip) as checkout:
+        source_url = required(git(checkout, "config", "--local", "--get", "remote.origin.url"), "ci start")
+        # Remote URLs are multivalued: a command-scoped remote.origin.url adds
+        # another URL instead of replacing the clone's first URL. Rewrite that
+        # URL for validation so both Git transport and remote get-url see origin.
+        settings = [(f"url.{origin}.insteadOf", source_url),
+                    (f"url.{push_origin}.pushInsteadOf", source_url)]
         for key in ("user.name", "user.email"):
             identity = git(production.checkout, "config", "--get", key)
             if identity.returncode == 0:
-                _ = required(git(checkout, "config", key, identity.stdout.strip()), "ci start")
-        argv = ("env", f"CARGO_TARGET_DIR={checkout / 'target'}", "bash", str(script.resolve()),
+                settings.append((key, identity.stdout.strip()))
+        # Git's command environment reaches validation's child commands without
+        # changing the standing checkout's persistent configuration.
+        inherited = int(os.environ.get("GIT_CONFIG_COUNT", "0"))
+        configuration = [f"GIT_CONFIG_COUNT={inherited + len(settings)}"]
+        for index, (key, value) in enumerate(settings, inherited):
+            configuration.extend((f"GIT_CONFIG_KEY_{index}={key}", f"GIT_CONFIG_VALUE_{index}={value}"))
+        argv = ("env", *configuration, f"CARGO_TARGET_DIR={checkout / 'target'}", "bash", str(script.resolve()),
                 "--validate-only", "--fix-commit",
                 f"ci({production.slug}): validation fixes after {checkpoint}")
         result = command("validation", *argv, cwd=checkout)
@@ -367,7 +372,7 @@ def main() -> int:
             notice(production, cast(str, args.gate_id), cast(str, args.notice_action),
                    cast(Path | None, getattr(args, "log", None)))
         return 0
-    except (PointFailure, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
+    except (copies.CopyError, PointFailure, Refusal, OSError, ValueError, json.JSONDecodeError) as error:
         report(error.step if isinstance(error, PointFailure) else step, "failed", str(error))
         return 2
 

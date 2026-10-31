@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""Run gates in one warm checkout per owner, with a second checkout when busy."""
+from __future__ import annotations
+
+import argparse
+from collections.abc import Generator
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from enum import Enum, auto
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from threading import Event, Thread
+from typing import NoReturn, cast, override
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.lib import scratch
+from scripts.lib.atomic_file import remove_dead_temporary_files, write_text_atomic
+from scripts.lint.config_values import config_values
+
+GATE_RECORD = ".gate.json"
+OWNER = re.compile(r"[a-z0-9][a-z0-9-]*")
+CLONE_STAGE = ".gate-clone"
+GATE_SUFFIXES = ("", "-2")
+COMMAND_LOCKS: ContextVar[tuple[int, ...]] = ContextVar("gate_command_locks", default=())
+
+
+class CopyError(Exception):
+    """An invalid request or an unavailable checkout."""
+
+    exit_code: int = 2
+
+
+class PreparationError(CopyError):
+    """Uncommitted changes or a merge could not be applied to the gate commit."""
+
+    exit_code: int = 3
+
+
+class PostUseError(CopyError):
+    """The caller finished, but refreshing its standing checkout metadata failed."""
+
+    def __init__(self, message: str, *, caller_error: BaseException | None = None) -> None:
+        super().__init__(message)
+        self.caller_error: BaseException | None = caller_error
+
+
+class ClaimState(Enum):
+    ACQUIRED = auto()
+    BUSY = auto()
+    REPLACED = auto()
+
+
+@dataclass(frozen=True)
+class GateLease:
+    tree: Path
+    descriptors: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class KnownHolder:
+    pid: int
+
+    @override
+    def __str__(self) -> str:
+        return str(self.pid)
+
+
+@dataclass(frozen=True)
+class UnreadableHolder:
+    reason: str
+
+    @override
+    def __str__(self) -> str:
+        return f"unreadable holder ({self.reason})"
+
+
+@dataclass(frozen=True)
+class GateRecord:
+    owner: str
+    repo: str
+    source: str
+    commit: str
+    last_use: float
+    holder_pid: int
+
+
+@dataclass(frozen=True)
+class CopiesConfiguration:
+    root: Path
+    wait_seconds: float
+    git_timeout_seconds: float
+    guard_timeout_seconds: float
+    allow_list: dict[str, str]
+
+
+def config_settings() -> tuple[Path, dict[str, str]]:
+    path = Path(os.environ.get("COPIES_CONFIG") or Path(__file__).resolve().parents[2] / "config/copies.conf")
+    path = path.expanduser()
+    return path, config_values(str(path))
+
+
+def load_config() -> CopiesConfiguration:
+    path, values = config_settings()
+    try:
+        root = Path(values["root"]).expanduser()
+        delay = float(values["wait_seconds"])
+        git_timeout = float(values["git_timeout_seconds"])
+        guard_timeout = float(values["guard_timeout_seconds"])
+        if not root.is_absolute():
+            raise ValueError("root must be absolute")
+        if any(not math.isfinite(value) or value <= 0 for value in (delay, git_timeout, guard_timeout)):
+            raise ValueError("wait_seconds, git_timeout_seconds and guard_timeout_seconds must be finite and positive")
+    except (KeyError, ValueError) as error:
+        raise CopyError(f"{path}: invalid copies configuration: {error}") from error
+    allow_list = {key.removeprefix("allow."): reason for key, reason in values.items()
+                  if key.startswith("allow.") and reason}
+    return CopiesConfiguration(root.resolve(), delay, git_timeout, guard_timeout, allow_list)
+
+
+def fallback_owner(role: str) -> str:
+    """Use a configured role owner when the caller has no production context."""
+    path, values = config_settings()
+    try:
+        return checked_owner(values[f"owner.{role}"])
+    except KeyError as error:
+        raise CopyError(f"{path}: no configured owner for {role}") from error
+
+
+def gates_root() -> Path:
+    return load_config().root
+
+
+def git(repo: Path, *arguments: str, data: bytes | None = None) -> bytes:
+    timeout = load_config().git_timeout_seconds
+    try:
+        result = subprocess.run(["git", "-C", str(repo), *arguments], input=data,
+                                capture_output=True, timeout=timeout, pass_fds=COMMAND_LOCKS.get())
+    except subprocess.TimeoutExpired as error:
+        raise CopyError(f"git {' '.join(arguments)} in {repo}: timed out after {timeout:g} seconds") from error
+    if result.returncode:
+        detail = "\n".join(part.decode(errors="replace").strip() for part in (result.stdout, result.stderr)
+                           if part.strip()) or f"exit {result.returncode}"
+        raise CopyError(f"git {' '.join(arguments)} in {repo}: {detail}")
+    return result.stdout
+
+
+def commit_at(repo: Path, revision: str) -> str:
+    return git(repo, "rev-parse", "--verify", "--end-of-options", f"{revision}^{{commit}}").decode().strip()
+
+
+def repository_name(source: Path) -> str:
+    common = Path(git(source, "rev-parse", "--path-format=absolute", "--git-common-dir").decode().strip())
+    # Linked unit worktrees share the main repository's name, including .claude.
+    return common.parent.name if common.name == ".git" else source.name
+
+
+def checked_owner(owner: str) -> str:
+    if not OWNER.fullmatch(owner):
+        raise CopyError(f"{owner!r}: owner must match [a-z0-9][a-z0-9-]*")
+    return owner
+
+
+def tree_paths(owner: str, repo: str, pool: CopiesConfiguration) -> tuple[Path, ...]:
+    parent = pool.root / repo
+    return tuple(parent / f"{owner}-gate{suffix}" for suffix in GATE_SUFFIXES)
+
+
+def read_record(tree: Path) -> GateRecord:
+    try:
+        raw = cast(object, json.loads((tree / GATE_RECORD).read_text(encoding="utf-8")))
+        if not isinstance(raw, dict):
+            raise ValueError("expected an object")
+        fields = cast(dict[str, object], raw)
+        labels = [fields.get(key) for key in ("owner", "repo", "source", "commit")]
+        moment, pid = fields.get("last_use"), fields.get("holder_pid")
+        if (not all(isinstance(value, str) for value in labels)
+                or not isinstance(moment, (int, float)) or not isinstance(pid, int)):
+            raise ValueError("invalid owner, repo, source, commit, last_use or holder_pid")
+        owner, repo, source, commit = cast(list[str], labels)
+        return GateRecord(owner, repo, source, commit, float(moment), pid)
+    except (OSError, ValueError) as error:
+        raise CopyError(f"{tree / GATE_RECORD}: unreadable gate record: {error}") from error
+
+
+def write_record(tree: Path, owner: str, repo: str, source: Path, commit: str) -> None:
+    fields = {"owner": owner, "repo": repo, "source": str(source), "commit": commit,
+              "last_use": time.time(), "holder_pid": os.getpid()}
+    write_text_atomic(tree / GATE_RECORD, json.dumps(fields) + "\n")
+
+
+def holder(tree: Path) -> KnownHolder | UnreadableHolder:
+    try:
+        return KnownHolder(read_record(tree).holder_pid)
+    except CopyError as error:
+        return UnreadableHolder(str(error))
+
+
+@contextmanager
+def claim_tree(tree: Path, *, create: bool, inherited_fds: list[int] | None = None) -> Generator[ClaimState]:
+    """Use scratch's busy mark; reject a directory replaced during acquisition."""
+    try:
+        if create:
+            tree.mkdir(parents=True, exist_ok=True)
+        if tree.is_symlink() or not tree.is_dir():
+            if not create and not tree.exists():
+                yield ClaimState.REPLACED
+                return
+            raise CopyError(f"{tree}: expected a standing checkout directory")
+        before = tree.stat()
+    except FileNotFoundError:
+        yield ClaimState.REPLACED
+        return
+    except OSError as error:
+        raise CopyError(f"{tree}: cannot claim checkout: {error}") from error
+    with scratch.busy_locks(tree, create=True, inherited_fds=inherited_fds) as idle:
+        try:
+            after = tree.stat()
+            same = (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+        except FileNotFoundError:
+            same = False
+        yield ClaimState.ACQUIRED if idle and same else ClaimState.BUSY if same else ClaimState.REPLACED
+
+
+@contextmanager
+def available_tree(owner: str, repo: str, pool: CopiesConfiguration) -> Generator[GateLease]:
+    candidates = tree_paths(owner, repo, pool)
+    announced = False
+    wake = Event()
+
+    def first_tree_released() -> None:
+        try:
+            # Wait on the existing busy mark, using scratch's only flock path.
+            with scratch.busy_locks(candidates[0], create=False, wait=True):
+                pass
+        finally:
+            wake.set()
+
+    waiter = Thread(target=first_tree_released, daemon=True)
+    while True:
+        for tree in candidates:
+            if removing_path(tree).exists():
+                continue
+            descriptors: list[int] = []
+            with claim_tree(tree, create=not tree.exists(), inherited_fds=descriptors) as state:
+                if state is ClaimState.ACQUIRED:
+                    yield GateLease(tree, tuple(descriptors))
+                    return
+        if not announced:
+            held = "; ".join(f"{tree} held by pid {holder(tree)}" for tree in candidates)
+            print(f"copies: waiting for {held}", file=sys.stderr, flush=True)
+            announced = True
+        if (candidates[0] / scratch.BUSY).exists() and not removing_path(candidates[0]).exists():
+            if not waiter.is_alive():
+                wake.clear()
+                waiter = Thread(target=first_tree_released, daemon=True)
+                waiter.start()
+        _ = wake.wait(pool.wait_seconds)
+
+
+def initialize(tree: Path, source: Path, owner: str, repo: str, base: str) -> None:
+    remove_dead_temporary_files(tree / GATE_RECORD)
+    replace_git = False
+    if (tree / GATE_RECORD).exists():
+        previous = read_record(tree)
+        if previous.owner != owner or previous.repo != repo:
+            raise CopyError(f"{tree}: gate record belongs to another owner or repository")
+        replace_git = previous.source != str(source)
+    elif any(child.name != scratch.BUSY for child in tree.iterdir()):
+        raise CopyError(f"{tree}: refusing an unregistered existing directory")
+    if (tree / ".git").is_dir() and not replace_git:
+        try:
+            _ = git(tree, "rev-list", "--objects", "--all", "--quiet")
+        except CopyError:
+            replace_git = True
+    write_record(tree, owner, repo, source, base)
+    if replace_git and (tree / ".git").is_dir() and not (tree / ".git").is_symlink():
+        shutil.rmtree(tree / ".git")
+    if not (tree / ".git").exists():
+        # clone needs an empty destination; the tree already holds scratch's busy mark.
+        # Stage only Git metadata, so first creation never has an unlocked checkout.
+        stage = tree / CLONE_STAGE
+        if stage.exists():
+            shutil.rmtree(stage)
+        _ = git(source, "clone", "--shared", "--no-checkout", "--quiet", "--", str(source), str(stage))
+        _ = (stage / ".git").rename(tree / ".git")
+        stage.rmdir()
+    if (tree / ".git").is_symlink() or not (tree / ".git").is_dir():
+        raise CopyError(f"{tree}: standing checkout must own its .git directory")
+    actual = git(tree, "rev-parse", "--absolute-git-dir").decode().strip()
+    if actual != str(tree / ".git"):
+        raise CopyError(f"{tree}: Git directory is {actual}, expected {tree / '.git'}")
+    exclude = tree / ".git/info/exclude"
+    text = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+    entries = [entry for entry in (f"/{GATE_RECORD}", f"/{scratch.BUSY}", "/target/")
+               if entry not in text.splitlines()]
+    if entries:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(exclude, text + ("\n" if text and not text.endswith("\n") else "")
+                          + "\n".join(entries) + "\n")
+
+
+def apply_changes(tree: Path, worktree: Path, base: str) -> None:
+    changed: list[str] = []
+    try:
+        changed = [os.fsdecode(name) for name in git(worktree, "diff", "--name-only", "-z", "HEAD").split(b"\0")
+                   if name]
+        diff = git(worktree, "diff", "--binary", "HEAD", "--")
+        if diff:
+            _ = git(tree, "apply", "--index", "--3way", "--binary", "-", data=diff)
+        for name in git(worktree, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0"):
+            if not name:
+                continue
+            relative = Path(os.fsdecode(name))
+            changed.append(str(relative))
+            if relative.parts[0] in (GATE_RECORD, scratch.BUSY, ".git", CLONE_STAGE):
+                raise CopyError(f"{relative}: path conflicts with gate metadata")
+            original, destination = worktree / relative, tree / relative
+            mode = original.lstat().st_mode
+            if not destination.parent.resolve().is_relative_to(tree):
+                raise CopyError(f"{relative}: path escapes the gate checkout")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.is_symlink():
+                destination.unlink()
+            if stat.S_ISLNK(mode):
+                destination.symlink_to(os.readlink(original))
+            elif stat.S_ISREG(mode):
+                _ = shutil.copyfile(original, destination)
+                shutil.copymode(original, destination)
+            else:
+                raise CopyError(f"{relative}: not a regular file or symlink")
+            _ = git(tree, "--literal-pathspecs", "add", "--force", "--", str(relative))
+        short = git(tree, "rev-parse", "--short", base).decode().strip()
+        _ = git(tree, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
+                "-c", "commit.gpgsign=false", "commit", "--quiet", "--no-verify", "--allow-empty", "-m",
+                f"gate: uncommitted {worktree} at {short}")
+    except (CopyError, OSError) as error:
+        files = ", ".join(changed) or "no changed files could be read"
+        raise PreparationError(f"cannot apply uncommitted {worktree}; files: {files}; {error}") from error
+
+
+def merge_changes(tree: Path, source: Path, revision: str) -> None:
+    try:
+        if revision.startswith("origin/"):
+            branch = revision.removeprefix("origin/")
+            origin = git(source, "remote", "get-url", "origin").decode().strip()
+            # Git treats a colon before the first slash as a URL or scp-style
+            # remote. Local paths must retain the source's resolution context.
+            if not re.match(r"^[^/]+:", origin):
+                origin = str((source / Path(origin).expanduser()).resolve())
+            _ = git(source, "check-ref-format", f"refs/heads/{branch}")
+            _ = git(tree, "fetch", "-q", "--", origin,
+                    f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+            commit = commit_at(tree, revision)
+        else:
+            commit = commit_at(source, revision)
+            _ = git(tree, "fetch", "-q", "--", str(source), commit)
+        _ = git(tree, "-c", "user.name=copies.py", "-c", "user.email=copies@localhost",
+                "-c", "commit.gpgsign=false", "merge", "--no-ff", "--no-edit", "--no-verify", commit)
+    except CopyError as error:
+        conflicts = git(tree, "diff", "--name-only", "--diff-filter=U").decode(errors="replace").strip()
+        raise PreparationError(f"cannot merge {revision}; files: {conflicts or 'see git error'}; {error}") from error
+
+
+def mark_target(tree: Path) -> None:
+    """Refresh only the gate's own cache, including when a caller replaced target."""
+    target = tree / "target"
+    if not target.is_symlink():
+        scratch.mark_cargo_cache(target)
+
+
+def prepare(tree: Path, source: Path, owner: str, name: str, base: str,
+            apply_uncommitted: str | Path | None, merge: str | None) -> None:
+    """Convert only our own preparation errors, before entering caller code."""
+    try:
+        initialize(tree, source, owner, name, base)
+        _ = git(tree, "fetch", "-q", "--", str(source), base)
+        _ = git(tree, "checkout", "-q", "--force", "--detach", base)
+        _ = git(tree, "clean", "-ffdq")
+        target = tree / "target"
+        if target.is_symlink():
+            target.unlink()
+        mark_target(tree)
+        if apply_uncommitted is not None:
+            apply_changes(tree, Path(apply_uncommitted).expanduser().resolve(), base)
+        if merge is not None:
+            merge_changes(tree, source, merge)
+        write_record(tree, owner, name, source, commit_at(tree, "HEAD"))
+    except (OSError, scratch.ScratchError) as error:
+        raise CopyError(str(error)) from error
+
+
+@contextmanager
+def standing(owner: str, repo: str | Path, commit: str, *, apply_uncommitted: str | Path | None = None,
+             merge: str | None = None) -> Generator[Path]:
+    """Hold a warm gate checkout through preparation and the caller's entire use."""
+    owner = checked_owner(owner)
+    try:
+        source = Path(repo).expanduser().resolve()
+        name = repository_name(source)
+        base = commit_at(source, commit)
+    except OSError as error:
+        raise CopyError(str(error)) from error
+    with available_tree(owner, name, load_config()) as lease:
+        tree = lease.tree
+        token = COMMAND_LOCKS.set(lease.descriptors)
+        try:
+            prepare(tree, source, owner, name, base, apply_uncommitted, merge)
+            try:
+                yield tree
+            finally:
+                caller_error = sys.exception()
+                try:
+                    mark_target(tree)
+                    write_record(tree, owner, name, source, commit_at(tree, "HEAD"))
+                except (OSError, scratch.ScratchError, CopyError) as error:
+                    raise PostUseError(f"{tree}: post-use refresh failed: {error}",
+                                       caller_error=caller_error) from error
+        finally:
+            COMMAND_LOCKS.reset(token)
+
+
+def list_trees() -> None:
+    root = gates_root()
+    if not root.exists():
+        return
+    for directory in sorted(root.iterdir()):
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        for tree in sorted(directory.iterdir()):
+            if tree.is_symlink() or not tree.is_dir():
+                continue
+            try:
+                record = read_record(tree)
+            except CopyError as error:
+                print(f"{tree}\t{error}")
+                continue
+            with scratch.busy_locks(tree, create=False) as idle:
+                state = "idle" if idle else "busy"
+            target = tree / "target"
+            disk = "0"
+            if target.exists():
+                size = subprocess.run(["du", "-sh", str(target)], capture_output=True, text=True)
+                words = size.stdout.split()
+                disk = words[0] if size.returncode == 0 and words else "unreadable"
+            print(f"{tree}\t{record.owner}\t{record.repo}\t{record.commit}\t{state}\t{record.holder_pid}\t{disk}")
+
+
+def removing_path(tree: Path) -> Path:
+    return tree.with_name(tree.name + ".removing")
+
+
+def remove_trees(owner: str, repo: str | Path) -> None:
+    owner = checked_owner(owner)
+    source = Path(repo).expanduser()
+    name = repository_name(source.resolve())
+    candidates = tree_paths(owner, name, load_config())
+    with ExitStack() as locks:
+        present: list[Path] = []
+        for candidate in candidates:
+            for tree in (removing_path(candidate), candidate):
+                if not tree.exists():
+                    continue
+                if locks.enter_context(claim_tree(tree, create=False)) is not ClaimState.ACQUIRED:
+                    raise CopyError(f"{tree}: busy; held by pid {holder(tree)}")
+                if (tree / GATE_RECORD).exists():
+                    record = read_record(tree)
+                    if record.owner != owner or record.repo != name:
+                        raise CopyError(f"{tree}: gate record belongs to another owner or repository")
+                present.append(tree)
+        for tree in present:
+            tombstone = tree if tree.name.endswith(".removing") else removing_path(tree)
+            if tombstone != tree:
+                _ = tree.rename(tombstone)
+            shutil.rmtree(tombstone)
+            print(f"removed {tree}")
+
+
+class CopyParser(argparse.ArgumentParser):
+    @override
+    def error(self, message: str) -> NoReturn:
+        raise CopyError(message)
+
+
+class CopyArguments(argparse.Namespace):
+    action: str = ""
+    owner: str = ""
+    repo: str = ""
+    commit: str = ""
+    apply_uncommitted: str | None = None
+    merge: str | None = None
+    command: list[str] = []
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = CopyParser(description=__doc__)
+    commands = parser.add_subparsers(dest="action", required=True)
+    run = commands.add_parser("run", help="prepare a standing tree and run a command in it")
+    remove = commands.add_parser("remove", help="remove an owner's idle standing trees")
+    for command in (run, remove):
+        _ = command.add_argument("--owner", required=True)
+        _ = command.add_argument("--repo", required=True)
+    _ = run.add_argument("--commit", required=True)
+    _ = run.add_argument("--apply-uncommitted")
+    _ = run.add_argument("--merge")
+    _ = run.add_argument("command", nargs=argparse.REMAINDER)
+    _ = commands.add_parser("list", help="list standing trees and their busy state")
+    try:
+        args = parser.parse_args(argv, namespace=CopyArguments())
+        if args.action == "run":
+            command = args.command[1:] if args.command[:1] == ["--"] else args.command
+            if not command:
+                raise CopyError("run requires a command after --")
+            with standing(args.owner, args.repo, args.commit,
+                          apply_uncommitted=args.apply_uncommitted, merge=args.merge) as tree:
+                result = subprocess.run([part.replace("{tree}", str(tree)) for part in command],
+                                        cwd=tree, pass_fds=COMMAND_LOCKS.get())
+                return result.returncode if result.returncode >= 0 else 128 - result.returncode
+        if args.action == "list":
+            list_trees()
+        else:
+            remove_trees(args.owner, args.repo)
+    except (CopyError, OSError, scratch.ScratchError) as error:
+        print(f"copies: {error}", file=sys.stderr)
+        return error.exit_code if isinstance(error, CopyError) else 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+from pathlib import Path
 import selectors
 import shutil
 import subprocess
@@ -41,15 +42,23 @@ class ShellHookFront(NamedTuple):
 class CodexHook:
     """A named handler for one hook event and tool matcher that must be installed and trusted."""
 
-    __slots__: tuple[str, ...] = ("name", "command", "event", "timeout", "matcher")
+    __slots__: tuple[str, ...] = ("name", "command", "event", "_timeout", "matcher")
 
     def __init__(self, name: str, script: PythonHookScript | ShellHookFront, event: str = "PostToolUse", timeout: int = 10,
                  matcher: str = "apply_patch") -> None:
         self.name: str = name
         self.command: str = script.command()
         self.event: str = event
-        self.timeout: int = timeout
+        self._timeout: int = timeout
         self.matcher: str = matcher
+
+    @property
+    def timeout(self) -> float:
+        if self.name == "scratch-guard":
+            sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+            from scripts.copies.copy_guard import hook_timeout
+            return hook_timeout()
+        return self._timeout
 
     def handler(self) -> dict[str, object]:
         return {"type": "command", "command": self.command, "timeout": self.timeout}
@@ -64,7 +73,7 @@ HOOKS: tuple[CodexHook, ...] = (
     # cargo-berth's own deadline is ten seconds; the hook allows for a slow start under load.
     CodexHook("berth", PythonHookScript("pre-tool-use-berth.py"), "PreToolUse", 30),
     # Codex sends a shell command as tool `Bash`, as Claude Code does.
-    CodexHook("scratch-guard", PythonHookScript("pre-tool-use-scratch-guard.py"), "PreToolUse", 10, "Bash"),
+    CodexHook("scratch-guard", PythonHookScript("../copies/copy_guard.py"), "PreToolUse", matcher="Bash"),
     CodexHook("build-hold-guard", ShellHookFront("pre-tool-use-build-hold-guard.sh"), "PreToolUse", 10, "Bash"),
 )
 

@@ -60,7 +60,7 @@ STOP and wait for user response. If user provides alternative name, use their na
 Mark third todo as in_progress.
 
 **Create Worktree:**
-- Use Bash tool to run `git worktree add ../[worktree-name] -b [branch-name]` to create worktree and branch
+- Use Bash tool to run `bash ~/.claude/scripts/worktree/make_worktree.sh ../[worktree-name] [branch-name]` to create worktree and branch
 - If command fails, display error message and ask user for guidance
 
 **Verify (without changing directory):**
