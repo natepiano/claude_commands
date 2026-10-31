@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from scripts.build_queue import head_facts
 from scripts.build_queue.queue_lines import Line, Span, age, wrap
 from scripts.build_queue.queue_view import (QueueModel, check_line, check_lines, clock, estimate_minutes,
-    has_move_priority, name_spans, name_text, shown_waiters, reason_phrase, start_text, step_checks, step_labels, waiting_moves)
+    has_move_priority, is_moved, name_spans, name_text, shown_waiters, reason_phrase, start_text, step_checks, step_labels, waiting_moves)
 from scripts.lint import memory_admit as gate
 
 
@@ -26,7 +26,7 @@ def order_check(model: QueueModel, position: int) -> Line:
     if isinstance(reason, gate.BehindOlderFit):
         return check_line(False, "queue order      " + reason_phrase(reason, model.reading.view.waiting))
     if isinstance(reason, gate.BehindHead) and isinstance(model.facts, head_facts.HeadFacts):
-        return check_line(False, "#1's turn      " + head_facts.order_text(model.facts, model.zone, include_record=False))
+        return check_line(False, "#1's turn      " + head_facts.order_text(model.facts, model.zone))
     return check_line(True, "queue order")
 
 
@@ -45,6 +45,9 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
              Span(f" · {step.step} · {step.need / gate.GIB:.1f} GiB", bold=True)))
         add((Span(f"Folder {step.folder}. Waited {age(step.since, model.reading.explanation.now)} min (since {clock(model, step.since)}). "
                   + (f"Likely start {start_text(model, position, clock_time=True)}." if estimate_minutes(model, position) else "Likely start —.")),))
+        priority = head_facts.priority_text(model.reading.explanation.priority)
+        if priority:
+            add((Span(priority),))
         add()
         checks = step_checks(model, position)
         if (isinstance(step.reason, gate.ReadyForAdmission)
@@ -66,7 +69,7 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
                     later = ahead.since > step.since
                     minutes = age(step.since, ahead.since) if later else age(ahead.since, step.since)
                     detail = f"joined {clock(model, ahead.since)}, {minutes} min {'after' if later else 'before'} it"
-                add((Span(f"  #{place} "), Span("   "),
+                add((Span(f"  #{place} "), Span("↑  " if is_moved(model, place) else "   "),
                      *name_spans(ahead, model.labels), Span(f" {ahead.step}  {detail}")), 6)
             if position > 6:
                 add((Span(f"  and {position - 6} more"),))

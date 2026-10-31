@@ -7,7 +7,7 @@ import time
 import unittest
 from unittest import mock
 
-from scripts.build_queue import head_facts, queue_view
+from scripts.build_queue import head_facts, queue_card, queue_view
 from scripts.build_queue.queue_fixture import (
     ASKING_SESSION, GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
@@ -25,7 +25,7 @@ class QueueViewTests(QueueFixtureTests):
             host=gate.HostMemory(60 * gate.GIB, 60 * gate.GIB),
             limits=gate.AdmissionLimits(gate.GIB, 3 * gate.GIB),
             ordered=[(path, {**row, "need": gate.GIB, "estimated_at": NOW - 600,
-                            "priority_since": NOW - 42, "holds_younger": True}), inputs.ordered[1]])
+                            "priority_since": NOW - 42}), inputs.ordered[1]])
         reading = gate.queue_read_from(inputs)
         head = reading.explanation.head
         assert isinstance(head, gate.HeadExplanation)
@@ -43,6 +43,34 @@ class QueueViewTests(QueueFixtureTests):
         self.assertTrue(any(span.text.endswith("estimate expired") and span.tone == "error"
                             for line in lines for span in line))
 
+    def test_live_priority_marks_and_cards_use_the_snapshot_without_bump_history(self) -> None:
+        model = self.fixture.model()
+        facts = model.facts
+        assert isinstance(facts, head_facts.HeadFacts)
+        model = replace(model, facts=replace(facts, bump_records=(), bumps=head_facts.BumpHistory((), 0, ())))
+        self.assertEqual([step.session_id for step in model.reading.view.waiting[:3]],
+                         ["id-work-pan", "id-work-lead", "id-work-lead"])
+        with mock.patch.object(gate, "priority_labels", side_effect=AssertionError("captured roster")), \
+             mock.patch.object(gate, "read_queue_priority", side_effect=AssertionError("captured priority")):
+            self.assertEqual([queue_view.is_moved(model, position) for position in range(1, 5)],
+                             [True, True, True, False])
+            self.assertEqual(queue_view.waiting_moves(model, 1), ())
+            view = plain(queue_view.render_view(model, 100))
+            card = plain(queue_card.render_card(model, [1], 100))
+            frozen = gate.head_after_steps_end(model.reading.explanation, ())
+        self.assertIn("queue priority: cables (the user's bump)", view)
+        self.assertIn("queue priority: cables (the user's bump)", card)
+        self.assertIn("Waited 36 min", card)
+        for text in (view, card):
+            self.assertNotIn("head_since", text)
+            self.assertNotIn("became first", text)
+        head = model.reading.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        self.assertEqual(head.waiter.session_id, "id-work-pan")
+        self.assertIsInstance(frozen, gate.HeadStillHeld)
+        assert isinstance(frozen, gate.HeadStillHeld)
+        self.assertEqual(frozen.decision, head.decision)
+
     def test_stale_snapshot_marks_only_the_original_header_time_as_warning(self) -> None:
         model = self.fixture.budget_model()
         current = queue_view.render_view(model, 100)
@@ -56,7 +84,8 @@ class QueueViewTests(QueueFixtureTests):
 
     def test_older_fit_phrase_requires_both_recorded_identity_and_join_time(self) -> None:
         waiting = self.fixture.model().reading.view.waiting
-        older = waiting[2]
+        older = replace(waiting[2], since=waiting[2].since + 1)
+        waiting = (*waiting[:2], older, *waiting[3:])
         reason = gate.BehindOlderFit(older.session_name, older.since, older.session_id)
         self.assertEqual(queue_view.reason_phrase(reason, waiting), "behind #3, an older step that fits")
         for changed in (replace(reason, older_since=older.since + 1),
@@ -125,11 +154,11 @@ class QueueViewTests(QueueFixtureTests):
                          for row in wrap(check, columns)]
                 text = "".join(plain(lines).split())
                 for fact in ("✗ memory pressure: full avg10 7.7 now; starts below 5.0",
-                             "✗ build budget: 11.1 of 21.0 GiB held; needs 11.5; starts when held falls to 9.5",
-                             "✓ free memory 24.5 GiB; needs 20.5: this step 11.5 + earlyoom 3.0 + promised not yet used 6.0"):
+                             "✓ build budget: 11.1 of 21.0 GiB held; needs 7.6",
+                             "✓ free memory 24.5 GiB; needs 16.6: this step 7.6 + earlyoom 3.0 + promised not yet used 6.0"):
                     self.assertIn("".join(fact.split()), text)
-                self.assertEqual(sum(span.text.count("✗") for row in lines for span in row if span.tone == "error"), 2)
-                self.assertEqual(sum(span.text.count("✓") for row in lines for span in row if span.tone == "success"), 1)
+                self.assertEqual(sum(span.text.count("✗") for row in lines for span in row if span.tone == "error"), 1)
+                self.assertEqual(sum(span.text.count("✓") for row in lines for span in row if span.tone == "success"), 2)
 
     def test_step_columns_align_wide_and_combining_names_by_cells(self) -> None:
         model = self.fixture.budget_model()
@@ -141,7 +170,7 @@ class QueueViewTests(QueueFixtureTests):
                              terminal_width(rows[1][:rows[1].index(marker)]))
         self.assertIn("界e\u0301", rows[0])
 
-    def test_view_ignores_move_head_time_token_history_and_pace(self) -> None:
+    def test_view_ignores_historical_moves_token_history_and_pace(self) -> None:
         model = self.fixture.budget_model()
         facts = model.facts
         assert isinstance(facts, head_facts.HeadFacts)
@@ -150,8 +179,7 @@ class QueueViewTests(QueueFixtureTests):
                                        head_facts.TokenReturned(NOW - 46))
         for changed in (replace(facts, bumps=head_facts.BumpsUnavailable("unreadable")),
                         replace(facts, bump_records=()),
-                        replace(facts, head_time=head_facts.RecordedHeadTime(NOW - 125),
-                                token_waits=head_facts.RecordedTokenWaits((wait,), False, (wait,)))):
+                        replace(facts, token_waits=head_facts.RecordedTokenWaits((wait,), False, (wait,)))):
             for pace in (head_facts.RecordedPace(0), head_facts.PaceUnavailable()):
                 self.assertEqual(plain(queue_view.render_view(replace(model, facts=changed, pace=pace), 100)), expected)
         for removed in ("unknown", "cargo token:", "Head for", "moved up:", "starts:"):
@@ -174,8 +202,8 @@ class QueueViewTests(QueueFixtureTests):
         with mock.patch.object(gate, "decide", side_effect=AssertionError("admission decides once")), \
              mock.patch.object(gate, "build_charge", side_effect=AssertionError("recorded charge")):
             text = plain(queue_view.check_lines(queue_view.step_checks(model, 1), model))
-        self.assertIn("11.1 of 21.0 GiB held; needs 11.5", text)
-        self.assertIn("needs 20.5", text)
+        self.assertIn("11.1 of 21.0 GiB held; needs 7.6", text)
+        self.assertIn("needs 16.6", text)
 
 
 
@@ -193,23 +221,24 @@ class BudgetViewTests(QueueFixtureTests):
         lines = queue_view.render_view(model, 60)
         text = plain(lines).splitlines()
         self.assertEqual(text[:2], ["Build queue · 10:46", ""])
-        self.assertEqual(text[2], " " * 36 + "free 4.4 │ taken 16.6")
-        self.assertEqual(text[3], "budget 21.0" + " " * 25 + "░" * 4 + "█" * 17)
-        self.assertEqual(text[4], "")
+        self.assertEqual(text[2], "queue priority: cables (the user's bump)")
+        self.assertEqual(text[3], " " * 36 + "free 4.4 │ taken 16.6")
+        self.assertEqual(text[4], "budget 21.0" + " " * 25 + "░" * 4 + "█" * 17)
+        self.assertEqual(text[5], "")
         rows = waiting_rows(lines)
         self.assertEqual(len(rows), 32)
         self.assertEqual(rows[0][36:], "██████▊ 6.8 ↑ ≤14.2 9:18")
         self.assertEqual(rows[0][3:13], "tool-base…")
         self.assertEqual(rows[0][14:23], "cables   ")
-        self.assertEqual(rows[0][24:31], "nextest")
-        self.assertEqual(rows[0][32:35], "  6")
+        self.assertEqual(rows[0][24:31], "mend   ")
+        self.assertEqual(rows[0][32:35], " 36")
         self.assertNotIn("Running", plain(lines))
         self.assertNotIn("moved up", plain(lines))
         self.assertNotIn("starts", plain(lines))
 
     def test_colour_budget_has_a_free_fraction_on_taken_background(self) -> None:
         lines = queue_view.render_view(self.fixture.budget_model(), 60, colour=True)
-        budget = lines[3]
+        budget = lines[4]
         free = [span for span in budget if span.tone == "success"]
         taken = [span for span in budget if span.tone == "suggestion"]
         self.assertEqual("".join(span.text for span in free), "████▍")
@@ -289,12 +318,12 @@ class BudgetViewTests(QueueFixtureTests):
                 totals=replace(model.reading.explanation.totals, charged=0),
                 head=replace(head, waiter=step, budget=replace(head.budget, need=budget, budget=budget)))))
         lines = queue_view.render_view(model, 100, colour=True)
-        budget_spans = [span for span in lines[3] if span.tone in ("success", "suggestion") and span.text]
-        need_bar = "".join(span.text for span in lines[6] if span.tone == "warning" and "█" in span.text)
+        budget_spans = [span for span in lines[4] if span.tone in ("success", "suggestion") and span.text]
+        need_bar = "".join(span.text for span in lines[7] if span.tone == "warning" and "█" in span.text)
         self.assertEqual(need_bar, "█" * 21)
         self.assertEqual("".join(span.text for span in budget_spans), need_bar)
         self.assertTrue(all(span.tone == "success" and span.background == "default" for span in budget_spans))
-        plain_budget = queue_view.render_view(model, 100)[3]
+        plain_budget = queue_view.render_view(model, 100)[4]
         self.assertTrue(plain([plain_budget]).endswith("░" * 21))
         self.assertNotIn("█", plain([plain_budget]))
 
@@ -308,14 +337,14 @@ class BudgetViewTests(QueueFixtureTests):
             explanation=replace(model.reading.explanation,
                 head=replace(head, waiter=step, budget=replace(head.budget, need=step.need)))))
         wide = queue_view.render_view(model, 60, colour=True)
-        self.assertEqual([span.until for span in wide[6] if span.until is not None], [NOW + 558])
+        self.assertEqual([span.until for span in wide[7] if span.until is not None], [NOW + 558])
         narrow = queue_view.render_view(model, 53, colour=True)
-        first = narrow[6]
+        first = narrow[7]
         self.assertTrue(plain([first]).endswith("…"))
         self.assertTrue(plain([first]).endswith(" ⊘ …"))
         self.assertLessEqual(terminal_width(plain([first])), 53)
         self.assertTrue(all(span.until is None for span in first))
-        self.assertTrue(all("until" not in span for span in json_form(narrow, 53, NOW)["lines"][6]))
+        self.assertTrue(all("until" not in span for span in json_form(narrow, 53, NOW)["lines"][7]))
 
     def test_row_styles_and_you_marker_match_the_drawn_page(self) -> None:
         lines = queue_view.render_view(self.fixture.budget_model(), 60, colour=True, you=ASKING_SESSION)
@@ -324,10 +353,10 @@ class BudgetViewTests(QueueFixtureTests):
             with self.subTest(position=position):
                 self.assertTrue(any(str(position) in span.text and span.tone == ("warning" if position == 1 else "inactive")
                                     for span in row))
-                self.assertTrue(any(span.tone == "suggestion" and ("cables" in span.text or position > 2)
+                self.assertTrue(any(span.tone == "suggestion" and ("cables" in span.text or position > 3)
                                     for span in row))
                 self.assertEqual(sum(span.text.count("▸") for span in row if span.tone == "suggestion"),
-                                 1 if position <= 2 else 0)
+                                 1 if position in (2, 3) else 0)
                 self.assertTrue(any(span.tone == "warning" and "█" in span.text for span in row))
         self.assertEqual(lines[0][0].tone, "inactive")
 
@@ -336,8 +365,8 @@ class BudgetViewTests(QueueFixtureTests):
         reading = replace(model.reading, explanation=replace(model.reading.explanation,
             totals=replace(model.reading.explanation.totals, charged=25 * gate.GIB)))
         lines = queue_view.render_view(replace(model, reading=reading), 60, colour=True)
-        self.assertIn("free 0.0 │ taken 25.0", plain([lines[2]]))
-        self.assertEqual(plain([lines[3]])[36:], "█" * 21)
+        self.assertIn("free 0.0 │ taken 25.0", plain([lines[3]]))
+        self.assertEqual(plain([lines[4]])[36:], "█" * 21)
         self.assertTrue(all(terminal_width(plain([line])) <= 60 for line in lines))
 
     def test_size_bars_use_nearest_eighth_zero_and_budget_cap(self) -> None:
@@ -354,6 +383,7 @@ class BudgetViewTests(QueueFixtureTests):
     def test_long_name_growth_prefix_removal_and_missing_unit(self) -> None:
         model = self.fixture.budget_model()
         first, second = model.reading.view.waiting[:2]
+        first = replace(first, step="nextest")
         labels = dict(model.labels)
         labels[first.session_id] = UnitLabels(
             "session", "performance", "performance-metrics-viewer")
@@ -410,7 +440,7 @@ class BudgetViewTests(QueueFixtureTests):
         model = self.fixture.budget_model()
         head = model.reading.explanation.head
         assert isinstance(head, gate.HeadExplanation)
-        step = replace(head.waiter, need=7 * gate.GIB, reason=gate.NeedsMemory())
+        step = replace(head.waiter, step="nextest", need=7 * gate.GIB, reason=gate.NeedsMemory())
         model = with_waiting(model, [step, model.reading.view.waiting[1]])
         model = replace(model, reading=replace(model.reading,
             explanation=replace(model.reading.explanation, head=replace(head, waiter=step))))
@@ -420,8 +450,8 @@ class BudgetViewTests(QueueFixtureTests):
         self.assertTrue(all(terminal_width(plain([line])) <= 60 for line in lines))
         self.assertEqual(rows[0].index("nextest"), rows[1].index("nextest"))
         self.assertEqual(rows[0].index("█"), rows[1].index("█"))
-        self.assertTrue(any("↑ ≤14.0" in span.text and span.tone == "success" for span in lines[6]))
-        self.assertTrue(any("low memory" in span.text and span.tone == "error" for span in lines[6]))
+        self.assertTrue(any("↑ ≤14.0" in span.text and span.tone == "success" for span in lines[7]))
+        self.assertTrue(any("low memory" in span.text and span.tone == "error" for span in lines[7]))
 
     def test_host_holds_add_short_words_and_a_large_head_keeps_columns_aligned(self) -> None:
         model = self.fixture.budget_model()
@@ -430,7 +460,7 @@ class BudgetViewTests(QueueFixtureTests):
         for reason, word in ((gate.NeedsMemory(), "low memory"), (gate.MemoryPressure(7.7), "pressure"),
                              (gate.NeedsBuildBudget(21 * gate.GIB, 16 * gate.GIB, 21 * gate.GIB), "")):
             with self.subTest(reason=reason):
-                step = replace(head.waiter, reason=reason, need=21 * gate.GIB)
+                step = replace(head.waiter, step="nextest", reason=reason, need=21 * gate.GIB)
                 changed = with_waiting(model, [step, model.reading.view.waiting[1]])
                 changed = replace(changed, reading=replace(changed.reading,
                     explanation=replace(changed.reading.explanation, head=replace(head, waiter=step))))

@@ -153,34 +153,62 @@ class QueueTests(unittest.TestCase):
         path = self.fixture.directory / "queue.json"
         before = (path.read_bytes(), path.stat().st_mtime_ns)
         with mock.patch.object(memory_admit, "queue_read", side_effect=AssertionError("bump read snapshot")):
-            status, output, errors = self.bump_output("1")
+            status, output, errors = self.bump_output("berth")
         self.assertEqual((status, output, errors),
-                         (3, "build queue: bump is off; nothing can move a waiting step\n", ""))
+                         (3, "build queue: type /build:queue bump berth in a showrunner pane\n", ""))
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
-    def test_bump_refuses_raw_selectors_without_moving_or_logging(self) -> None:
+    def test_bump_refuses_other_sessions_without_moving_or_logging(self) -> None:
         first = self.fixture.waiter(100, "head-id", "head")
         second = self.fixture.waiter(200, "worker-id", "worker")
         self.labels_read.return_value = dict([self.entry("head-id", "shared"), self.entry("worker-id", "shared")])
         before = (first.read_bytes(), second.read_bytes())
         for selector in ("2", "worker-id", "worker", "/tmp/tree-200", "tree-200", "shared", "unknown"):
             with self.subTest(selector=selector):
-                with mock.patch.object(memory_admit, "bump_waiter", wraps=memory_admit.bump_waiter) as bump, \
-                     mock.patch.object(memory_admit, "queue_read", side_effect=AssertionError("bump read the queue")), \
+                with mock.patch.object(memory_admit, "queue_read", side_effect=AssertionError("bump read the queue")), \
                      mock.patch.object(unit_labels, "unit_labels_for", side_effect=AssertionError("bump read labels")):
                     status, output, errors = self.bump_output(selector)
                 self.assertEqual(status, 3)
-                self.assertEqual(output, "build queue: bump is off; nothing can move a waiting step\n")
+                self.assertEqual(output, f"build queue: type /build:queue bump {selector} in a showrunner pane\n")
                 self.assertEqual(errors, "")
-                bump.assert_called_once_with(selector, "actor-id")
                 self.assertEqual((first.read_bytes(), second.read_bytes()), before)
             self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [100, 200])
             self.assertEqual(list((self.root / "buildlog").glob("*/*.jsonl")), [])
 
-    def bump_output(self, selector: str) -> tuple[int, str, str]:
+    def test_bump_sets_the_units_priority_and_reports_its_resolved_place(self) -> None:
+        first = self.fixture.waiter(100, "head-id", "head")
+        second = self.fixture.waiter(200, "worker-id", "worker")
+        before = (first.read_bytes(), second.read_bytes())
+        with mock.patch.object(memory_admit, "require_showrunner", return_value="showrunner"), \
+             mock.patch.object(memory_admit, "priority_labels", return_value={"worker-id": UnitLabels("worker", unit="berth")}):
+            status, output, errors = self.bump_output("berth")
+            self.assertEqual([step.pid for step in memory_admit.queue_view().waiting], [200, 100])
+        self.assertEqual((status, output, errors), (0, "queue priority set for berth: first step now #1\n", ""))
+        self.assertEqual((first.read_bytes(), second.read_bytes()), before)
+        priority = memory_admit.read_queue_priority(self.fixture.directory)
+        self.assertNotIsInstance(priority, memory_admit.NoQueuePriority)
+        if not isinstance(priority, memory_admit.NoQueuePriority):
+            self.assertEqual((priority["unit"], priority["why"]), ("berth", "the user's bump"))
+
+    def test_bump_keeps_priority_when_the_unit_has_no_waiting_step(self) -> None:
+        with mock.patch.object(memory_admit, "require_showrunner", return_value="showrunner"):
+            status, output, errors = self.bump_output("berth")
+        self.assertEqual((status, output, errors), (0, "queue priority set for berth: no waiting step yet\n", ""))
+        priority = memory_admit.read_queue_priority(self.fixture.directory)
+        self.assertNotIsInstance(priority, memory_admit.NoQueuePriority)
+        if not isinstance(priority, memory_admit.NoQueuePriority):
+            self.assertEqual(priority["unit"], "berth")
+
+    def test_bump_requires_exactly_one_unit_without_running_priority(self) -> None:
+        for units in ((), ("berth", "other"), ("two words",)):
+            with self.subTest(units=units), \
+                 mock.patch.object(memory_admit, "run_priority", side_effect=AssertionError("usage ran priority")):
+                self.assertEqual(self.bump_output(*units), (3, "build queue: use /build:queue bump <unit>\n", ""))
+
+    def bump_output(self, *units: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
         with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "actor-id"}), \
-             mock.patch("sys.argv", ["build_queue.py", "bump", selector]), \
+             mock.patch("sys.argv", ["build_queue.py", "bump", *units]), \
              redirect_stdout(output), redirect_stderr(errors):
             status = build_queue.main()
         return status, output.getvalue(), errors.getvalue()
@@ -240,7 +268,11 @@ class QueueTests(unittest.TestCase):
 
     def test_every_text_table_marks_numbers_right_and_text_left(self) -> None:
         with QueueFixture() as fixture:
-            rows = waiting_rows(queue_view.render_view(fixture.model(), 140))
+            model = fixture.model()
+            first = replace(model.reading.view.waiting[0], step="nextest")
+            model = replace(model, reading=replace(model.reading, view=replace(model.reading.view,
+                waiting=(first, *model.reading.view.waiting[1:]))))
+            rows = waiting_rows(queue_view.render_view(model, 140))
         self.assertEqual(len(rows), 32)
         self.assertEqual([row[:2] for row in rows[:10]], [f"{n:>2}" for n in range(1, 11)])
         self.assertEqual([row.index("nextest") for row in rows[:2]], [39, 39])
@@ -267,6 +299,20 @@ class QueueTests(unittest.TestCase):
         self.assertNotIn("head for: unknown", text)
         self.assertNotIn("no bumps since it joined", text)
         self.assertNotIn("head for 10 min", text)
+
+    def test_legacy_head_clock_is_ignored_in_view_card_and_json(self) -> None:
+        reading = head_reading(since=NOW - 2400, now=NOW,
+            fields={"head_state": "head", "head_since": NOW - 125})
+        model = self.model(reading)
+        for lines in (queue_view.render_view(model, 400), queue_card.render_card(model, [1], 400)):
+            text = plain(lines)
+            self.assertIn("40", text)
+            self.assertNotIn("became first", text)
+            self.assertNotIn("head for", text.lower())
+            self.assertNotIn("head_since", text)
+        data = self.snapshot(reading)
+        self.assertNotIn("head_since", json.dumps(data))
+        self.assertIn("40", self.snapshot_text(data))
 
     def test_no_strict_window_without_admissions_head_priority(self) -> None:
         reading = head_reading(now=NOW, since=NOW - 600)
@@ -840,7 +886,9 @@ class QueueTests(unittest.TestCase):
                 need = int(need_gib * GIB)
                 decision = memory_admit.decide(available, 60 * GIB, need, [memory_admit.MeasuredMemory(GIB)])
                 row: memory_admit.Waiter = {"pid": 10, "start_time": "10", "need": need,
-                                           "since": now - waited, "bump_order": bump}
+                                           "since": now - waited}
+                if bump:
+                    row["priority_since"] = now
                 waiting = memory_admit.WaitingStep(
                     10, "waiting-id", "unit", "nextest", "/tmp/tree", row["since"], need,
                     memory_admit.head_wait_reason(decision, need, available, row, now))
@@ -896,7 +944,7 @@ class QueueTests(unittest.TestCase):
                     full.assert_not_called()
                     self.assertIn("#4 of 32" if args else "Build queue · 10:46", text)
                     if not args:
-                        self.assertEqual(len(text.splitlines()[6:]), 32)
+                        self.assertEqual(len(waiting_rows(queue_view.render_view(self.model(reading), 100))), 32)
 
     def test_you_marks_every_waiting_step_of_only_the_asking_session(self) -> None:
         fixture = self.enterContext(QueueFixture())
@@ -908,7 +956,7 @@ class QueueTests(unittest.TestCase):
                 self.assertEqual(status, 0, errors)
                 self.assertEqual(text.count("▸"), count)
                 self.assertEqual([row[:row.index("▸")].strip() for row in text.splitlines() if "▸" in row],
-                                 ["1", "2"] if count else [])
+                                 ["2", "3"] if count else [])
 
     def test_inline_you_defaults_to_the_caller_and_a_shell_has_no_mark(self) -> None:
         fixture = self.enterContext(QueueFixture())
@@ -934,20 +982,19 @@ class QueueTests(unittest.TestCase):
         self.assertTrue(text.startswith("Build queue · 10:46\n\n"))
         self.assertNotIn("starts", text)
 
-    def test_unknown_selector_refusal_stays_short_with_many_waiters(self) -> None:
+    def test_bump_permission_refusal_stays_short_with_many_waiters(self) -> None:
         for pid in range(100, 132):
             _ = self.fixture.waiter(pid, f"session-{pid}", f"worker-{pid}")
-        status, text, errors = self.bump_output("nosuchstep")
+        status, text, errors = self.bump_output("berth")
         self.assertEqual(status, 3)
         self.assertEqual(errors, "")
         self.assertEqual(len(text.splitlines()), 1)
         self.assertLess(len(text.encode()), 120)
-        self.assertIn("build queue: bump is off; nothing can move a waiting step", text)
-        self.assertNotIn("/showrunner:bump", text)
+        self.assertEqual(text.strip(), "build queue: type /build:queue bump berth in a showrunner pane")
         self.assertNotIn("worker-", text)
         docs = (Path(__file__).resolve().parents[2] / "commands/build/queue.md").read_text()
-        self.assertIn(text.strip(), docs)
-        self.assertNotIn("/showrunner:bump", docs)
+        self.assertIn(text.strip().replace("berth", "<unit>"), docs)
+        self.assertIn("/build:queue bump <unit>", docs)
 
     def test_explicit_columns_override_environment_for_text_and_json(self) -> None:
         reading = queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW))
@@ -974,10 +1021,9 @@ class QueueTests(unittest.TestCase):
 
     def test_cli_card_no_match_succeeds_without_a_bump(self) -> None:
         reading = queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW))
-        with mock.patch.object(memory_admit, "bump_waiter") as bump:
+        with mock.patch.object(memory_admit, "run_priority", side_effect=AssertionError("card cannot move queue")):
             status, text, errors = self.invoke(reading, "nobody")
         self.assertEqual((status, text, errors), (0, "No waiting or running step matches nobody.\n", ""))
-        bump.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,17 +1,18 @@
-#4 of 32 · cargo-liner · berth · cargo-liner-berth-parallel-impl · clippy · 2.9 GiB
-Folder /home/natepiano/rust/cargo-liner/repo. Waited 37 min (since 10:09). Likely start ~10:51.
+#4 of 32 · tool-based-ui · hana-migration · mend · 7.6 GiB
+Folder /tmp/hana_catalyst-hana-migration. Waited 39 min (since 10:07). Likely start ~10:51.
+queue priority: cables (the user's bump)
 
-Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.
-  #1    tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40; from #1 by
+Next? No. 3 steps are ahead of it: 3 moved up, 0 joined earlier.
+  #1 ↑  tool-based-ui · cables · work-pan mend  joined 10:10, 3 min after it
+  #2 ↑  tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40; from #1 by
       work-lead at 10:46
-  #2    tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40
-  #3    tool-based-ui · hana-migration mend  joined 10:07, 2 min before it
-  Moved-up steps go first, then the longest wait. It joined 2nd of the steps waiting now.
+  #3 ↑  tool-based-ui · cables · work-lead nextest  from #27 by work-lead at 10:40
+  Moved-up steps go first, then the longest wait. It joined 1st of the steps waiting now.
 
 Waits on
   ✓ queue order
-  ✓ build budget: 11.1 of 21.0 GiB held; needs 2.9
-  ✓ free memory 24.5 GiB; needs 11.9: this step 2.9 + earlyoom 3.0 + promised not yet used 6.0
+  ✓ build budget: 11.1 of 21.0 GiB held; needs 7.6
+  ✓ free memory 24.5 GiB; needs 16.6: this step 7.6 + earlyoom 3.0 + promised not yet used 6.0
   ✗ memory pressure: full avg10 7.7 now; starts below 5.0
 
 Likely start ~10:51: 4th in line at 44 steps an hour, an estimate.
