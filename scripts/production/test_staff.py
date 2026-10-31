@@ -52,6 +52,58 @@ def concurrent_ensure(
 
 
 class StaffTests(StaffTestCase):
+    def test_launcher_names_are_accepted_without_a_fixed_role_suffix(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc")
+        unit = staff.ensure("unit", name="models", parent=runner.id)
+        for prefix, slot in (("bevy_brp", "impl"), ("hana_catalyst-lfo", "review"),
+                             ("cargo-liner", "berth-hook"), ("cargo-liner-style", "modules-judge"),
+                             ("claude-build-followups-two-accounts", "writer"),
+                             ("cargo-liner-tile", "review_m73"), ("3D.Project", "audit")):
+            with self.subTest(prefix=prefix, slot=slot):
+                result = subprocess.run(["bash", str(CHECKOUT / "scripts/direct/worker_name.sh"),
+                                         str(self.root), slot, "impl", prefix],
+                                        capture_output=True, text=True, check=True, timeout=PROCESS_TIMEOUT)
+                name = result.stdout.strip()
+                _ = staff.WorkerName.parse(name)
+                row = staff.ensure_worker(name, unit.id)
+                self.assertEqual(row.name, name)
+                self.assertEqual(staff.by_id(row.id), row)
+
+    def test_pending_showrunner_retirement_waits_for_direct_workers_without_rolling_back_other_rows(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc")
+        worker = staff.ensure_worker("sdlc-handler-astra-reviewer", runner.id)
+        other = staff.ensure("showrunner", name="unheld")
+        staff.defer_retire((runner.id, other.id))
+        self.assertEqual(staff.retire_pending(), (runner.id,))
+        self.assertIsNone(staff.by_id(other.id))
+        self.assertEqual(staff.by_id(worker.id), worker)
+        self.assert_refused(lambda: staff.retire(runner.id))
+        _ = staff.retire(worker.id)
+        self.assertEqual(staff.retire_pending(), ())
+        self.assertIsNone(staff.by_id(runner.id))
+
+    def test_row_write_transport_refuses_unit_and_showrunner_retirement(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc")
+        unit = staff.ensure("unit", name="models", parent=runner.id)
+        before = self.staff_file.read_bytes()
+        refused = self.cli("retire", unit.id, "--row-write", "--json", code=2)
+        self.assertIn("worker", refused.stderr)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        empty = staff.ensure("showrunner", name="empty")
+        before = self.staff_file.read_bytes()
+        refused = self.cli("retire", empty.id, "--row-write", "--json", code=2)
+        self.assertIn("worker", refused.stderr)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+
+    def test_showrunner_worker_paths_printed_by_show_round_trip_through_get(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc")
+        worker = staff.ensure_worker("sdlc-handler-astra-reviewer", runner.id)
+        line = next(line for line in self.cli("show").stdout.splitlines() if line.startswith(worker.id))
+        path = line.split()[2]
+        self.assertEqual(staff.by_path(path), worker)
+        self.assertEqual(staff.snapshot().by_path(path), worker)
+        self.assertEqual(cast(object, json.loads(self.cli("get", path, "--json").stdout)), worker.to_json())
+
     def assert_refused(self, action: Callable[[], object]) -> None:
         before = self.staff_file.read_bytes()
         with self.assertRaises(staff.StaffRefused):
@@ -107,16 +159,62 @@ class StaffTests(StaffTestCase):
             for result in results:
                 result.close()
 
-    def test_worker_names_preserve_role_and_positive_number(self) -> None:
+    def test_worker_names_accept_numbered_and_custom_slots_and_refuse_invalid_shapes(self) -> None:
         for role in ("impl", "test", "fix", "review", "designer", "reviewer"):
             for number in (1, 12):
                 with self.subTest(role=role, number=number):
                     name = staff.WorkerName.parse(f"{role}{number}")
-                    self.assertEqual(name.role.value, role)
-                    self.assertEqual(name.number, number)
-        for invalid in ("impl", "impl0", "bob1", "impl-1", "impl1x", " impl1", "impl1\n"):
+                    self.assertEqual(name.value, f"{role}{number}")
+        for text in ("impl0", "bob1", "impl-1", "impl1x"):
+            with self.subTest(name=text):
+                self.assertEqual(staff.WorkerName.parse(text).value, text)
+        for invalid in ("", " impl1", "impl1 ", "impl 1", "impl/1", "impl1\n", "impl\t1", "impl\x001"):
             with self.subTest(invalid=invalid), self.assertRaises(staff.StaffRefused):
                 _ = staff.WorkerName.parse(invalid)
+
+    def test_live_worker_names_preserve_their_full_identity(self) -> None:
+        names = (
+            "impl", "impl2", "test", "review2", "fix3", "code1", "ui2",
+            "widget-impl", "widget-test2", "sdlc-handler-astra-designer",
+            "sdlc-handler-astra-reviewer",
+        )
+        for text in names:
+            with self.subTest(name=text):
+                parsed = staff.WorkerName.parse(text)
+                self.assertEqual(parsed.value, text)
+
+    def test_ensure_worker_reuses_its_row_after_unit_move_and_rename(self) -> None:
+        runner = staff.ensure("showrunner", name="sdlc")
+        unit = staff.ensure("unit", name="models", parent=runner.id)
+        worker = staff.ensure_worker("impl", unit.id)
+        before = self.staff_file.read_bytes()
+        self.assertEqual(staff.ensure_worker("impl", unit.id), worker)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assertRegex(worker.id, r"^s[a-z0-9]{11}$")
+        self.assertNotIn(worker.id, (runner.id, unit.id))
+        destination = staff.ensure("showrunner", name="tools")
+        _ = staff.move(unit.id, destination.id)
+        _ = staff.rename(unit.id, "registry")
+        self.assertEqual(staff.ensure_worker("impl", unit.id), worker)
+        self.assertEqual(staff.by_path("tools/registry/impl"), worker)
+        self.assertEqual(set(worker.to_json()), {"id", "kind", "name", "parent"})
+        _ = staff.retire(worker.id)
+        self.assertIsNone(staff.by_id(worker.id))
+
+    def test_workers_accept_unit_and_showrunner_parents_and_refuse_invalid_parents(self) -> None:
+        runner, unit, ordinary = self.tree()
+        designer = staff.ensure_worker("sdlc-handler-astra-designer", runner.id)
+        reviewer = staff.ensure_worker("sdlc-handler-astra-reviewer", runner.id)
+        self.assertEqual((designer.parent, reviewer.parent), (runner.id, runner.id))
+        self.assertEqual(staff.ensure_worker(designer.name, runner.id), designer)
+        direct_test = staff.ensure_worker("test", runner.id)
+        self.assertEqual(staff.by_path("sdlc/test"), direct_test)
+        for parent, name in ((ordinary.id, "fix"), (MISSING_ID, "impl")):
+            with self.subTest(parent=parent, name=name):
+                self.assert_refused(lambda: staff.ensure_worker(name, parent))
+        self.assert_refused(lambda: staff.ensure("worker", name="impl"))
+        unit_reviewer = staff.ensure_worker("review", unit.id)
+        self.assertEqual(unit_reviewer.parent, unit.id)
 
     def test_row_round_trip_is_frozen_and_stores_only_membership(self) -> None:
         _, _, worker = self.tree()
@@ -175,13 +273,15 @@ class StaffTests(StaffTestCase):
         promoted = staff.ensure("showrunner", name=unit.name)
         self.assertNotEqual(promoted.id, unit.id)
 
-    def test_invalid_parent_graph_and_worker_mutations_preserve_the_file(self) -> None:
+    def test_valid_worker_shapes_and_holders_coexist_with_refused_graph_and_worker_mutations(self) -> None:
         showrunner, unit, worker = self.tree()
         child = staff.ensure("showrunner", name="child", parent=showrunner.id)
+        direct_worker = staff.ensure("worker", name="test1", parent=showrunner.id)
+        custom_worker = staff.ensure("worker", name="impl0", parent=unit.id)
+        self.assertEqual(staff.by_path("sdlc/test1"), direct_worker)
+        self.assertEqual(staff.by_path("sdlc/models/impl0"), custom_worker)
         rejected: tuple[Callable[[], object], ...] = (
-            lambda: staff.ensure("worker", name="test1", parent=showrunner.id),
             lambda: staff.ensure("worker", name="test1"),
-            lambda: staff.ensure("worker", name="impl0", parent=unit.id),
             lambda: staff.ensure("unit", name="bad", parent=unit.id),
             lambda: staff.ensure("unit", name="bad", parent=MISSING_ID),
             lambda: staff.ensure("unit", name="bad"),

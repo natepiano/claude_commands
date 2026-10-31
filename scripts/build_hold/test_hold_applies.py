@@ -15,6 +15,11 @@ from typing import override
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from override_guard import require_checkout
+
+require_checkout(Path(__file__))
+
+
 import hold_applies
 import build_hold
 import build_targets

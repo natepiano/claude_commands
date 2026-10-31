@@ -1357,12 +1357,12 @@ def matching_recipients(
 
     matches = _recipient_matches(to, observed.entries)
     if matches or isinstance(scope, LocalOnly):
-        return RecipientMatches(matches, LocalOnly(), observed.problems)
+        return RecipientMatches(matches, LocalOnly(), observed.diagnostics)
     addressed = to.startswith(("session:", "worker:", "codex:"))
     if observed.problems and not addressed:
-        return LocalRosterIncomplete(observed.problems)
+        return LocalRosterIncomplete(observed.diagnostics)
     peer = roster.peer_roster(os.environ)
-    problems = [*observed.problems, *peer.problems]
+    problems = [*observed.diagnostics, *peer.diagnostics]
     matches = _recipient_matches(to, peer.entries)
     if not matches and peer.problems:
         return RecipientSearchFailed("; ".join(peer.problems), problems)

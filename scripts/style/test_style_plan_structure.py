@@ -39,7 +39,7 @@ class StylePlanTests(StylePlanFixture):
             with redirect_stdout(preview):
                 self.assertEqual(style_plan.main(["queue", "--repo", str(self.repo)]), 0)
         self.assertTrue(preview.getvalue().startswith("modules-unit: structure"))
-        self.assertNotIn(self.sources[0], preview.getvalue())
+        self.assertIn(self.sources[0], preview.getvalue())
         self.assertIn(self.sources[1], preview.getvalue())
         ledger = self.ledger()
         for path in self.sources:
