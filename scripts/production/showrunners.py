@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+from time import monotonic
 import os
 import re
 import shlex
@@ -117,11 +119,17 @@ def load_settings_from(path: Path) -> ShowrunnerSettings:
         raise ValueError(f"{path}: {error}") from error
 
 
-def socket_for(target: str) -> str | None:
+def socket_for(target: str, *, deadline: float = math.inf) -> str | None:
     """The session's socket, or None when it is not running. Raises OSError when the session
     records cannot be read, which says nothing about whether it runs."""
-    result = subprocess.run([sys.executable, str(SESSIONS), "socket", target], capture_output=True,
-                            text=True, check=False)
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"{target}: session lookup deadline exhausted; retained for the next pass")
+    try:
+        result = subprocess.run([sys.executable, str(SESSIONS), "socket", target], capture_output=True,
+                                text=True, check=False, timeout=remaining if math.isfinite(remaining) else None)
+    except subprocess.TimeoutExpired as error:
+        raise TimeoutError(f"{target}: session lookup timed out; retained for the next pass") from error
     # Exit 1 is no such live session. Any other failure is the lookup itself failing.
     if result.returncode not in (0, 1):
         reason = result.stderr.strip() or f"sessions.py exited {result.returncode}"
@@ -235,9 +243,11 @@ DISCOVER_SESSIONS = DiscoverSessions()
 
 
 def _registered(timer: Timer, *,
-                known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS) -> Showrunner:
+                known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS,
+                deadline: float = math.inf) -> Showrunner:
     if isinstance(known_sessions, DiscoverSessions):
-        socket = socket_for(timer.target) or ""
+        socket = (socket_for(timer.target, deadline=deadline) if math.isfinite(deadline)
+                  else socket_for(timer.target)) or ""
         name = _session_name(timer.target[8:]) if socket else ""
     else:
         record = known_sessions.get(timer.target[8:])
@@ -250,6 +260,7 @@ def _registered(timer: Timer, *,
 def registered_showrunners(
     state_dir: Path | None = None, *,
     known_sessions: Mapping[str, SessionRecord] | DiscoverSessions = DISCOVER_SESSIONS,
+    deadline: float = math.inf,
 ) -> list[Showrunner]:
     """Every showrunner that has an update timer, running or not.
 
@@ -262,7 +273,7 @@ def registered_showrunners(
     found: list[Showrunner] = []
     for source in read_sources(state_dir, unreadable=UnreadableTimerPolicy.RAISE):
         try:
-            found.append(_registered(source.timer, known_sessions=known_sessions))
+            found.append(_registered(source.timer, known_sessions=known_sessions, deadline=deadline))
         except (KeyError, ValueError, UnicodeError) as error:
             print(f"showrunners: skipping showrunner-{source.timer.slug}: {error}", file=sys.stderr)
     return found
@@ -401,11 +412,11 @@ def space_from_text(slug: str, text: str) -> str:
     return line[1] if line else slug
 
 
-def current_address(slug: str) -> str:
+def current_address(slug: str, *, deadline: float = math.inf) -> str:
     """Where `SendMessage` reaches the production's showrunner now: its session on this machine.
     Empty while it is not running or has no update timer."""
     slug = canonical_slug(slug)
-    socket = next((runner["socket"] for runner in registered_showrunners() if runner["slug"] == slug), "")
+    socket = next((runner["socket"] for runner in registered_showrunners(deadline=deadline) if runner["slug"] == slug), "")
     return f"uds:{socket}" if socket else ""
 
 
