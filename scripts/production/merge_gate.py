@@ -54,6 +54,9 @@ import tempfile
 import time
 from typing import Literal, TextIO, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import process_group
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.production import change_review  # noqa: E402
 from scripts.production.affected_modules import (  # noqa: E402
@@ -498,7 +501,7 @@ def command(arguments: Sequence[str], repo: Path) -> subprocess.CompletedProcess
             output, errors = process.communicate()
         except BaseException:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                process_group.send_process_group(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             _ = process.wait()
@@ -683,7 +686,7 @@ def kill_job_group(job: RunningGateJob) -> None:
     # Also run this after the leader exits: a successful module may have leaked
     # children. SIGKILL prevents a child that ignores TERM from surviving cleanup.
     try:
-        os.killpg(job.process.pid, signal.SIGKILL)
+        process_group.send_process_group(job.process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
     reap_gate_job(job, block=True)

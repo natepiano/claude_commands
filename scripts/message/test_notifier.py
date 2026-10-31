@@ -17,6 +17,7 @@ from typing import override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from scripts.lib.process_group import send_process_group
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
@@ -502,7 +503,7 @@ class NotifierTests(unittest.TestCase):
             self.assertFalse(finished.exists())
         finally:
             try:
-                os.killpg(tick.pid, signal.SIGKILL)
+                send_process_group(tick.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
         self.assertEqual(self.wait_for_text(finished, "finished"), "finished")
@@ -562,7 +563,7 @@ elif action == "remove":
             pid_file = launch_state / "pid"
             if pid_file.exists():
                 try:
-                    os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+                    send_process_group(int(pid_file.read_text()), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
 

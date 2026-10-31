@@ -125,6 +125,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple, NoReturn, NotRequired, Ty
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+import process_group
 import sessions  # noqa: E402
 import postmaster  # noqa: E402
 import codex_daemon  # noqa: E402
@@ -859,7 +860,7 @@ def check_exit(command: str, timeout: float) -> int | None:
             return process.wait(timeout)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                process_group.send_process_group(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             _ = process.wait()
@@ -1386,7 +1387,7 @@ def run(command: list[str], stdin: str, timeout: float, env: dict[str, str] | No
         except subprocess.TimeoutExpired:
             for sig, wait in ((signal.SIGTERM, KILL_GRACE), (signal.SIGKILL, None)):
                 try:
-                    os.killpg(process.pid, sig)
+                    process_group.send_process_group(process.pid, sig)
                 except ProcessLookupError:
                     pass
                 try:

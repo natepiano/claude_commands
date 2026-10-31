@@ -306,7 +306,7 @@ Source: the user via the sdlc showrunner, 2026-10-31: "yes i want a fast track" 
 
 **Acceptance gate:** from the worktree root, `python3 -m unittest discover -s scripts/production -p test_fast_track.py`, the same for `test_merge_checkpoint_promotion.py`, and `python3 -m unittest discover -s scripts/direct -p test_review_launcher.py` green, covering: each refusal and its exit 2, each config key missing and invalid, a conflicting patch, origin/main moving between check and push (re-apply, re-check, push), the time limit, a rerun (exit 0, no change), the worktree restore, the record row, `--pending`, and a review pass marking rows reviewed. `basedpyright` on each slot's Python files `0 errors, 0 warnings, 0 notes`. Live, by the director: one real small fix through the command to main, then the same command again (exit 0, `already on main`); a fast fix landing while a real `merge_checkpoint` runs, with that merge's promotion still finishing, and the showrunner's 08:54 gate result as the second case. Put the timings in the checkpoint notice.
 
-### Phase 7e — Every process-group kill checks its pid  · status: todo
+### Phase 7e — Every process-group kill checks its pid  · status: done
 **Depends on:** Phase 7d (checkpoint order only: two caller files are in its list)
 
 Source: the sdlc showrunner and natedev, 2026-10-31. Both natedev-wide stops today (11:53:50, 11:59:21) most likely came from `os.killpg` with a mocked pid: `MagicMock.__index__` is 1, and `killpg(1)` is `kill(-1)`, SIGTERM to every process of the user.
@@ -392,3 +392,28 @@ Source: the sdlc showrunner, 2026-10-31. Phase 7f review found that `unbind_run(
 **State:** design-role records (tests use a temporary state root only).
 
 **Acceptance gate:** tests with a temporary state root and a planted damaged record of another unit show that `unbind-run` unbinds this run's records, prints one named stderr line, and exits 0; a rerun writes nothing; `list` prints the named line on stderr and nothing about the record on stdout.
+
+### Phase 7h — The group-kill guard reads commands, not text  · status: todo
+**Depends on:** Phase 7e (same test file; it checkpoints first)
+
+Source: Phase 7e closure review (F002), moved here under the landing rule (models-unit waits on Phase 7e; the guard is a backstop, and no such call is in the tree). The guard in `scripts/lib/test_process_group.py` matches text with regular expressions. Each review round found one more form that it lets through: `kill -TERM -- 0` inside an `if`/`else` arm (line 43), and a Python heredoc that binds `send = platform.killpg`, then calls `send(pid, 15)` (line 116).
+
+#### Work Order
+
+**Goal:** the guard finds every group signal outside `process_group.py` by the meaning of the code, not by its spelling.
+
+**Spec:**
+1. Python files and Python text inside other files are parsed with `ast`: any reference to `killpg` (attribute or name, through any alias or assignment) outside `scripts/lib/process_group.py` fails the guard.
+2. Shell text is split into commands with a real shell tokenizer (`shlex` in punctuation mode), so a `kill` in any command position (after `;`, `&&`, `||`, `then`, `else`, `do`, a pipe, or inside `bash -c '…'`) is found; a target of `0`, `-0`, or a negative group fails the guard unless the command is the process_group CLI.
+3. Text the guard cannot parse fails the guard with its path, so a new form is refused, never let through.
+4. Each form named in the Source, plus each form of Phase 7e's F002, is a planted case in a temporary tree that fails the guard. The real tree passes.
+
+**Files:**
+- `scripts/lib/test_process_group.py` — the guard and its planted cases
+
+**Workers:** 1 writer
+- `test` — `test_process_group.py`
+
+**State:** none (a temporary tree only; no signal is sent, `os.killpg` stays patched).
+
+**Acceptance gate:** `python3 -m unittest discover -s scripts/lib -p test_process_group.py` passes on the real tree, and every planted case named in the Spec fails the guard.

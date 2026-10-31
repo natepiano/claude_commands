@@ -59,9 +59,9 @@ mkdir "$SCRATCH/xdg"
 HANA_PID=""
 cleanup() {
     if [[ -n "$HANA_PID" ]] && kill -0 "$HANA_PID" 2>/dev/null; then
-        kill -TERM -- "-$HANA_PID" 2>/dev/null || true
+        "$LIB/py" "$LIB/process_group.py" "$HANA_PID" TERM 2>/dev/null || true
         sleep 2
-        kill -KILL -- "-$HANA_PID" 2>/dev/null || true
+        "$LIB/py" "$LIB/process_group.py" "$HANA_PID" KILL 2>/dev/null || true
     fi
     rm -rf "$SCRATCH"
 }

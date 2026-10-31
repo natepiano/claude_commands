@@ -13,6 +13,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import ClassVar, cast, override
+from scripts.lib.process_group import send_process_group
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.direct.recorder_fixture import invoke_recorder
 from scripts.direct.local_release_wait import LocalReleaseEvents, local_release_waiter
@@ -271,7 +272,7 @@ esac
 
     def end_group(self, group: int) -> None:
         try:
-            os.killpg(group, signal.SIGKILL)
+            send_process_group(group, signal.SIGKILL)
         except ProcessLookupError:
             pass
         deadline = time.monotonic() + TEST_HANG_GUARD_SECS
@@ -474,7 +475,7 @@ if sys.argv[1] == "wait-local":
             step_group = cast(int, step_record["group"])
             self.started_groups.add(step_group)
 
-            os.killpg(first.pid, interruption)
+            send_process_group(first.pid, interruption)
             _ = first.wait(timeout=TEST_HANG_GUARD_SECS)
             self.assertNotEqual(first.returncode, 0)
             self.assertFalse(lock.exists(), "interrupted verify kept its token")

@@ -10,6 +10,7 @@ import subprocess
 import sys
 from typing import final
 from unittest import mock
+from scripts.lib.process_group import send_process_group
 from scripts.production import merge_gate
 from scripts.direct.wait_for_test_state import wait_until
 from scripts.production.merge_gate_test_support import gate_suites
@@ -49,7 +50,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
         finally:
             for job in launched:
                 if job.process.poll() is None:
-                    os.killpg(job.process.pid, signal.SIGKILL)
+                    send_process_group(job.process.pid, signal.SIGKILL)
                 _ = job.process.wait(timeout=TEST_HANG_GUARD_SECS)
                 job.output.close()
 
@@ -80,7 +81,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
             held = self.state / "module-held"
             if held.exists():
                 try:
-                    os.killpg(int(held.read_text()), signal.SIGKILL)
+                    send_process_group(int(held.read_text()), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
 
@@ -128,7 +129,7 @@ class MergeGateSignalsTests(GateSuitesFixture):
                     _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     if child:
                         try:
-                            os.killpg(child, signal.SIGKILL)
+                            send_process_group(child, signal.SIGKILL)
                         except ProcessLookupError:
                             pass
                     _ = self.git(self.checkout, "reset", "--keep", self.base)

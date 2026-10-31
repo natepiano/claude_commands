@@ -13,6 +13,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import TypedDict, cast, final, override
+from scripts.lib.process_group import send_process_group
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 
 
@@ -447,10 +448,10 @@ class MacRunTests(unittest.TestCase):
                 )
                 try:
                     self.wait_for_path(self.stub_state / "build-started")
-                    os.killpg(process.pid, signal_number)
+                    send_process_group(process.pid, signal_number)
                     output, errors = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                 except BaseException:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    send_process_group(process.pid, signal.SIGKILL)
                     _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
                     raise
 

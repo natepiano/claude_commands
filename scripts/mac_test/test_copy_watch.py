@@ -23,8 +23,10 @@ import mac_test
 import offload
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
+    from ..lib.process_group import send_process_group
 else:
     from scripts.lib import test_hang_guard
+    from scripts.lib.process_group import send_process_group
 
 
 SCRIPT = Path(__file__).with_name("copy_watch.py")
@@ -627,7 +629,7 @@ class CopyWatchProcessTests(unittest.TestCase):
                 self.assertTrue((self.root / "runner-stopped").exists())
         finally:
             try:
-                os.killpg(parent.pid, signal.SIGKILL)
+                send_process_group(parent.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             _ = parent.communicate(timeout=test_hang_guard.TEST_HANG_GUARD_SECS)

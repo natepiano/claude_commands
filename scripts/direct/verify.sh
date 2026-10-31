@@ -1153,7 +1153,7 @@ cancel_tree_run() {
     # Board release also stops a step's separately owned process group.
     if declare -F release_token >/dev/null; then release_token || true; fi
     if [[ -n "${RUN_STEP_PID:-}" ]]; then
-        kill -KILL -- "-$RUN_STEP_PID" 2>/dev/null || true
+        "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" KILL 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""
     fi
@@ -2526,7 +2526,7 @@ child = os.fork()
 if child:
     def forward(signum, _frame):
         try:
-            os.killpg(child, signum)
+            if (sent := subprocess.run([str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "py"), str(Path(os.environ["VERIFY_PROCESS_GROUP_LIB"]) / "process_group.py"), str(child), str(signum)], capture_output=True, text=True)).returncode: raise ProcessLookupError if sent.returncode == 3 else SystemExit("verify.sh: process group helper failed: " + " ".join(sent.stderr.splitlines()))
         except ProcessLookupError:
             # The child has not created its new group yet, or has exited.
             try:
@@ -2565,7 +2565,7 @@ sys.exit(shell_status(subprocess.call(command)))
 eval "$(declare -f buildlog_exec | sed '1s/buildlog_exec/buildlog_exec_unowned/')"
 buildlog_exec() {
     if [[ "${TOKEN_HELD}" -eq 1 ]]; then
-        buildlog_exec_unowned python3 -c "$STEP_OWNER_PY" \
+        buildlog_exec_unowned env VERIFY_PROCESS_GROUP_LIB="${STEP_RECORD_SCRIPT%/*}/../lib" python3 -c "$STEP_OWNER_PY" \
             "${BOARD_DIR}/locks/cargo.d" "$$" "$@"
     else
         buildlog_exec_unowned "$@"
@@ -2812,7 +2812,7 @@ verify_interrupted() {
     EXIT_STATUS=$((128 + $1))
     interrupt_hold_wait
     if [[ -n "$RUN_STEP_PID" ]]; then
-        kill -s "$1" -- "-$RUN_STEP_PID" 2>/dev/null || true
+        "${STEP_RECORD_SCRIPT%/*}/../lib/py" "${STEP_RECORD_SCRIPT%/*}/../lib/process_group.py" "$RUN_STEP_PID" "$1" 2>/dev/null || { [[ $? == 3 ]] || printf 'verify.sh: process group helper failed for pid %s\n' "$RUN_STEP_PID" >&2; }
         release_token || true
         wait "$RUN_STEP_PID" 2>/dev/null || true
         RUN_STEP_PID=""

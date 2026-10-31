@@ -83,6 +83,12 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NoReturn, NotRequired, NamedTuple, Protocol, TextIO, TypedDict, cast, final
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+if TYPE_CHECKING:
+    from scripts.lib import process_group
+else:
+    import process_group
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.direct import plan_history
@@ -2958,7 +2964,7 @@ def _discard_failed_server_start(
     # Popen starts a new session: its pid is also the group id. Signal even when
     # the leader already exited, since a failed Nix evaluation can leave children.
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        process_group.send_process_group(process.pid, signal.SIGTERM)
     except OSError:
         if process.poll() is None:
             with contextlib.suppress(OSError):
@@ -2966,7 +2972,7 @@ def _discard_failed_server_start(
     with contextlib.suppress(OSError, subprocess.TimeoutExpired):
         _ = process.wait(timeout=5)
     with contextlib.suppress(OSError):
-        os.killpg(process.pid, signal.SIGKILL)
+        process_group.send_process_group(process.pid, signal.SIGKILL)
     if process.poll() is None:
         with contextlib.suppress(OSError):
             process.kill()

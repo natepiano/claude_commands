@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import signal
 import subprocess
 import sys
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import final, override
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from scripts.lib.process_group import send_process_group
 from scripts.lib.rerun_test_support import ScriptRepositoryTestCase
 from test_renumber import GOALS, issue_text  # pyright: ignore[reportImplicitRelativeImport]
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -260,7 +260,7 @@ class RunWatcherTests(ScriptRepositoryTestCase):
                 owner.terminate()
                 _ = owner.wait(timeout=TEST_HANG_GUARD_SECS)
             if daemon.poll() is None:
-                os.killpg(daemon.pid, signal.SIGTERM)
+                send_process_group(daemon.pid, signal.SIGTERM)
                 _ = daemon.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def test_daemon_absorbs_its_own_canonical_rank_writes(self) -> None:
@@ -317,7 +317,7 @@ raise SystemExit(0)
             self.assertNotIn("starting one fresh pass", log)
         finally:
             if daemon.poll() is None:
-                os.killpg(daemon.pid, signal.SIGTERM)
+                send_process_group(daemon.pid, signal.SIGTERM)
                 _ = daemon.wait(timeout=TEST_HANG_GUARD_SECS)
 
     def _make_filtered_git_vault(self) -> Path:
@@ -592,7 +592,7 @@ raise SystemExit(0)
             self.assertNotIn("error: renumber apply failed exit=3", log)
         finally:
             if daemon.poll() is None:
-                os.killpg(daemon.pid, signal.SIGTERM)
+                send_process_group(daemon.pid, signal.SIGTERM)
                 _ = daemon.wait(timeout=TEST_HANG_GUARD_SECS)
 
 

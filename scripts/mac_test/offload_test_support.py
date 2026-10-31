@@ -23,8 +23,10 @@ import treekey
 from offload_test_commands import COMMAND_STUB, write_shell
 if TYPE_CHECKING:
     from ..lib import test_hang_guard
+    from ..lib.process_group import send_process_group
 else:
     from scripts.lib import test_hang_guard
+    from scripts.lib.process_group import send_process_group
 
 if TYPE_CHECKING:
     from ..production.cli_fixture import invoke_cli
@@ -663,7 +665,7 @@ raise SystemExit(offload.main())
         try:
             self.wait_for_path(self.stub_directory / "claim-started")
             if signal_group:
-                os.killpg(process.pid, signal_number)
+                send_process_group(process.pid, signal_number)
             else:
                 process.send_signal(signal_number)
             self.wait_for_ignored_signals(process)

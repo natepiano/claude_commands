@@ -30,6 +30,7 @@ import style_sync
 import scratch
 import style_ledger
 import style_rules
+from scripts.lib.process_group import send_process_group
 from scripts.production import showrunners
 from scripts.direct import test_verify_lint_scope as verify_fixture
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -89,7 +90,7 @@ def wait_until(condition: Callable[[], bool], seconds: float) -> bool:
 
 def group_running(group: int) -> bool:
     try:
-        os.killpg(group, 0)
+        send_process_group(group, 0)
     except ProcessLookupError:
         return False
     return True
@@ -97,7 +98,7 @@ def group_running(group: int) -> bool:
 
 def kill_group(group: int) -> None:
     with suppress(ProcessLookupError):
-        os.killpg(group, signal.SIGKILL)
+        send_process_group(group, signal.SIGKILL)
 
 
 def ended_pid() -> int:

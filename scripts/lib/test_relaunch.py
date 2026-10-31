@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parents[1] / "shutdown"))
 sys.path.insert(0, str(Path(__file__).parents[2]))
+from scripts.lib.process_group import send_process_group
 from scripts.shutdown.test_support import ShutdownTestCase
 from scripts.lib import relaunch
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -64,7 +65,7 @@ class RelaunchTests(ShutdownTestCase):
 
     def reap(self, process: subprocess.Popen[str]) -> None:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            send_process_group(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         _ = process.communicate(timeout=TEST_HANG_GUARD_SECS)
@@ -220,7 +221,7 @@ class RelaunchTests(ShutdownTestCase):
         self.wait_for_file(self.root / "ready", process)
         self.assertEqual(int((self.root / "ready").read_text()), process.pid)
         request = self.request(process.pid)
-        os.killpg(process.pid, signal.SIGINT)
+        send_process_group(process.pid, signal.SIGINT)
         self.assert_relaunched(process, request)
         self.assertEqual((self.root / "interrupted").read_text(), str(signal.SIGINT))
 

@@ -9,6 +9,7 @@ import shlex
 import signal
 import unittest
 from unittest import mock
+from scripts.lib.process_group import send_process_group
 from scripts.whoami import quota_alert_test_support as support
 import quota_alert
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
@@ -43,7 +44,7 @@ class QuotaAlertTests(support.SeededQuotaReminderFixture):
 
                 def kill_editor_group() -> None:
                     try:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        send_process_group(process.pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                     _ = process.wait(timeout=TEST_HANG_GUARD_SECS)
