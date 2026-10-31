@@ -17,7 +17,7 @@ for directory in (SCRIPTS / "message", SCRIPTS / "production", SCRIPTS / "herdr"
         sys.path.insert(0, str(directory))
 from scripts.production import staff, showrunners
 import production_units
-import unit_marks as unit_lookup
+from scripts.production import unit_marks as unit_lookup
 import unit_runs
 from sessions import SessionRecord, running_sessions
 if TYPE_CHECKING:

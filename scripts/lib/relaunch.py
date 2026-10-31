@@ -19,6 +19,33 @@ HOLD_SECONDS = 300
 POLL_SECONDS = 0.5
 
 
+def restored_launch(argv: list[str], environment: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    """Restore only this pane's resumed conversation; explicit prompts remain unchanged."""
+    if not argv or Path(argv[0]).name != "claude" or environment.get("HERDR_ENV") != "1":
+        return argv, environment
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.shutdown import pane_record
+
+    parsed = pane_record.parse_claude_arguments(argv)
+    identity = parsed.value(pane_record.RESUME_FLAGS)
+    if not identity:
+        return argv, environment
+    from scripts.shutdown.stop_resume import resume_message
+    from scripts.herdr import herdr
+    from scripts.production import unit_marks
+
+    place = herdr.HerdrPlace(environment.get("HERDR_SESSION", "default"),
+                            environment.get("HERDR_PANE_ID", ""))
+    entry = pane_record.matching_launch(place, identity)
+    if entry is None:
+        return argv, environment
+    entry = unit_marks.record_membership(entry)
+    restored = {**environment, **entry["environment"]}
+    if not parsed.has_prompt:
+        argv = [*argv, resume_message("the herdr server restarted")]
+    return argv, restored
+
+
 class RelaunchRequest(TypedDict):
     argv: list[str]
     cwd: str
@@ -98,6 +125,7 @@ def _execute_request(path: Path) -> None:
 
 def run(argv: list[str]) -> int:
     """Run a child on this terminal, then consume a restart or wait under a hold."""
+    argv, environment = restored_launch(argv, dict(os.environ))
     if argv and argv[0] in ("claude", "codex"):
         sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         from scripts.accounts.accounts import resolve_program
@@ -125,7 +153,7 @@ def run(argv: list[str]) -> int:
             _ = signal.signal(number, ignore)
         for number in (signal.SIGTERM, signal.SIGHUP):
             _ = signal.signal(number, forward)
-        child = subprocess.Popen(argv, env={**os.environ, "RELAUNCH_SUPERVISED": "1"})
+        child = subprocess.Popen(argv, env={**environment, "RELAUNCH_SUPERVISED": "1"})
         code = child.wait()
     finally:
         for number, handler in previous.items():

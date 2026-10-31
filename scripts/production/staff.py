@@ -805,7 +805,7 @@ def _parser() -> argparse.ArgumentParser:
     verbs = parser.add_subparsers(dest="verb", required=True)
     show = verbs.add_parser("show", help="show the production staff")
     _ = show.add_argument("--kind", choices=_KINDS)
-    _ = show.add_argument("--live", action="store_true", help="show live member identities and pool leases")
+    _ = show.add_argument("--live", action="store_true", help="show live member identities")
     _ = show.add_argument("--under", help="parent staff id or path")
     _ = show.add_argument("--snapshot", action="store_true", help=argparse.SUPPRESS)
     get = verbs.add_parser("get", help="find a member by id or path")

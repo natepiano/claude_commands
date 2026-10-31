@@ -180,6 +180,29 @@ print(observed.row.id)
         self.assertEqual(list(found), ["alpha-unit"])
         self.assertIsInstance(found["alpha-unit"].claude, LiveClaude)
 
+    def test_restarted_unit_without_process_marks_uses_its_repaired_pane_record(self) -> None:
+        from scripts.shutdown import pane_record
+        from scripts.production import unit_marks
+        import session_pane
+
+        owner = unit_membership("show", "alpha-unit")
+        fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
+        self.claude("alpha", "w4:p1", session_id="same-conversation")
+        pid = os.getpid()
+        registry = self.records / f"{pid}.json"
+        _ = registry.write_bytes((self.records / "alpha-1.json").read_bytes())
+        record = sessions.read_session(registry)
+        assert not isinstance(record, sessions.UnreadableSessionRecord)
+        marks = {"SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit", "STAFF_ID": owner.id}
+        pane_record.write("agents", pane_record.launch("w4:p1", "same-conversation", str(self.root), marks, ["claude"]))
+        found = unit_lookup.marked_units("show")
+        self.assertIsInstance(found["alpha-unit"].claude, LiveClaude)
+        self.assertEqual(found["alpha-unit"].staff_id, owner.id)
+        self.assertEqual(session_pane.record_place(record), herdr.HerdrPlace("agents", "w4:p1"))
+        self.assertEqual(session_pane.session_place("same-conversation"), herdr.HerdrPlace("agents", "w4:p1"))
+        grouped, _ = unit_marks.session_unit_marks([record], self.environment)
+        self.assertIsInstance(grouped.units["show"]["alpha-unit"].claude, LiveClaude)
+
     def renamed_production(self) -> None:
         for name in ("trunk-unit", "other-unit", "first-unit", "second-unit", "third-unit"):
             _ = unit_membership("new", name)
