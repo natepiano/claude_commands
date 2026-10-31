@@ -52,7 +52,7 @@ import sessions  # noqa: E402
 import herdr  # noqa: E402  session_pane puts scripts/herdr on the path
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterable, Iterator
 
 STATE_DIR = Path(os.environ.get("STALL_WATCH_STATE_DIR") or Path.home() / ".local/state/stall-watch")
 SESSIONS_DIR = Path(os.environ.get("NOTIFIER_SESSIONS_DIR") or Path.home() / ".claude/sessions")
@@ -475,17 +475,40 @@ def prompt_key(slug: str, unit: str) -> str:
     return f"stall-watch:prompt:{slug}:{unit}"
 
 
+def watch_config(*, status_defaults: bool = False) -> dict[str, str]:
+    """Read person-edited settings at use, without an import-time cache."""
+    defaults = Path(__file__).resolve().parents[2] / "config/stall_watch.conf"
+    path = Path(os.environ.get("STALL_WATCH_CONFIG") or defaults)
+    paths = (defaults, path) if status_defaults and path != defaults else (path,)
+    return dict(line.split("=", 1) for source in paths for line in source.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#") and "=" in line)
+
+
+def status_defers_bump(status: str, peers: Iterable[str]) -> bool:
+    """Explicit pauses and waits on another owner outrank a context-compaction wake."""
+    fields = watch_config(status_defaults=True)
+    if re.search(fields["paused_status_pattern"].strip(), status, re.IGNORECASE):
+        return True
+    waiting = re.search(fields["external_wait_pattern"].strip(), status, re.IGNORECASE)
+    if waiting is None:
+        return False
+    owner = waiting.groupdict().get("owner")
+    if owner is None or not owner.strip():
+        raise ValueError("external_wait_pattern must capture a nonempty owner")
+    owner = owner.strip()
+    return (re.search(fields["external_owner_pattern"].strip(), owner, re.IGNORECASE) is not None
+            or any(re.match(re.escape(peer) + r"\b", owner, re.IGNORECASE) for peer in peers if peer))
+
+
 def prompt_grace_seconds() -> float:
     """Read the person-edited grace each tick; missing or invalid settings are reported by the caller."""
-    path = Path(os.environ.get("STALL_WATCH_CONFIG") or Path(__file__).resolve().parents[2] / "config/stall_watch.conf")
-    fields = dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines()
-                  if line.strip() and not line.lstrip().startswith("#") and "=" in line)
+    fields = watch_config()
     try:
         grace = float(fields["prompt_grace_seconds"].strip())
         if not math.isfinite(grace) or grace < 0:
             raise ValueError("expected a finite nonnegative number")
     except (KeyError, ValueError) as error:
-        raise ValueError(f"{path}: invalid prompt_grace_seconds: {error}") from error
+        raise ValueError(f"invalid prompt_grace_seconds: {error}") from error
     return grace
 
 
@@ -1098,11 +1121,16 @@ def tick(now: float, *, deadline: float = math.inf) -> None:
             turns = list(TURN_END.finditer(pane))
             turn = turns[-1] if turns else transcript_turn_end(session_id)
             last = turn.group("status").strip() if turn else "none on screen"
+            try:
+                deferred = bool(turn) and status_defers_bump(last, (*(live.keys() - {name}), configured["session"], slug))
+            except (OSError, UnicodeError, KeyError, ValueError, re.error, IndexError) as error:
+                print(f"stall-watch: {name}: no bump: invalid status rule: {error}", file=sys.stderr)
+                continue
             # A hold that states when it ends waits like a gate until then; the idle clock starts after it.
             held_until = (stated_hold_end(turn.group(0), now, zone)
                           if turn and turn.group("kind") == HOLDING_KIND else None)
-            if (turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now))
-                    and not context_near_compaction(session_id)):
+            if deferred or (turn and (turn.group("kind") in WAITING_KINDS or (held_until is not None and held_until > now))
+                            and not context_near_compaction(session_id)):
                 stretch = Stretch(pane_hash=hashlib.sha256(pane.encode()).hexdigest(), since=now,
                                   bump_sent=False, tell_sent=False, reported_status="")
                 save_stretch(path, stretch)
