@@ -14,6 +14,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pane_record
+import herdr
+from test_pane_restore import FakeClient
 from scripts.whoami import account  # noqa: E402  Imported before a test sets the platform to the Mac: urllib checks it on import.
 
 HOOK = Path(__file__).resolve().parent.parent / "hooks/session-start-pane-record.py"
@@ -63,6 +65,35 @@ class PaneRecordTests(unittest.TestCase):
     def entries(self) -> dict[str, dict[str, object]]:
         return cast(dict[str, dict[str, object]], json.loads((self.records / "agents.json").read_text()))
 
+    def test_moved_session_uses_newest_launch_across_accounts_and_record_files(self) -> None:
+        old = pane_record.launch("old-pane", "moved", "/old", {"CLAUDE_CONFIG_DIR": "/accounts/.claude4"},
+                                 ["claude", "-n", "old", "--model", "opus"])
+        old["written_at"] = "2026-10-31T01:00:00+00:00"
+        newest = pane_record.launch("new-pane", "moved", "/new", {"CLAUDE_CONFIG_DIR": "/accounts/.claude2"},
+                                    ["claude", "-n", "new", "--model", "sonnet"])
+        newest["written_at"] = "2026-10-31T02:00:00+00:00"
+        newest["ended"] = True
+        with mock.patch.object(pane_record, "RECORD_DIR", self.records):
+            pane_record.write("first", newest)
+            pane_record.write("last", old)
+            self.assertEqual(pane_record.launch_for_session("moved"), newest)
+            self.assertIsNone(pane_record.launch_for_session("absent"))
+
+    def test_seed_process_info_reads_only_selected_panes_and_defaults_to_all(self) -> None:
+        client = FakeClient([{"pane_id": pane, "workspace_id": "w1"} for pane in ("w1:p1", "w1:p2", "w2:p1")])
+        original = client.result
+        def result(*arguments: str) -> dict[str, object]:
+            return {"process_info": {"foreground_processes": []}} if arguments[:2] == ("pane", "process-info") else original(*arguments)
+        info = mock.Mock(side_effect=result)
+        with mock.patch.object(herdr, "Herdr", return_value=client), mock.patch.object(client, "result", info):
+            _ = pane_record.seed("agents", select=lambda pane: pane["pane_id"] == "w1:p2")
+            self.assertEqual([invocation for invocation in info.call_args_list if invocation.args[:2] == ("pane", "process-info")],
+                             [mock.call("pane", "process-info", "--pane", "w1:p2")])
+            info.reset_mock()
+            _ = pane_record.seed("agents")
+            self.assertEqual([invocation for invocation in info.call_args_list if invocation.args[:2] == ("pane", "process-info")],
+                             [mock.call("pane", "process-info", "--pane", pane) for pane in ("w1:p1", "w1:p2", "w2:p1")])
+
     def test_shared_parent_reader_reads_linux_comm_with_parentheses(self) -> None:
         process = self.root / "proc/42"
         process.mkdir(parents=True)
@@ -93,6 +124,15 @@ class PaneRecordTests(unittest.TestCase):
             "environment": {"ENABLE_TOOL_SEARCH": "true", "SHOWRUNNER_UNIT": "demo",
                             "SHOWRUNNER_UNIT_ID": "alpha-unit"},
             "flags_read": True, "ended": False})
+
+    def test_hook_preserves_staff_identity_for_restore_and_membership(self) -> None:
+        self.env["STAFF_ID"] = "s123456789ab"
+        result = self.start("w1:p2", "sid-alpha", "-n", "alpha")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = self.entries()["w1:p2"]
+        environment = cast(dict[str, str], entry["environment"])
+        self.assertEqual(environment.get("STAFF_ID"), "s123456789ab")
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", environment)
 
     def test_a_new_start_replaces_its_own_pane_and_keeps_the_others(self) -> None:
         for pane, session_id in (("w1:p2", "sid-alpha"), ("w2:p1", "sid-ups"), ("w1:p2", "sid-alpha-2")):

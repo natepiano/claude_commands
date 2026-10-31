@@ -25,6 +25,7 @@ from fake_unit_host import HostedUnit
 
 
 from scripts.production import production_doc, staff
+from scripts.production.staff_test_support import unit_membership
 from scripts.production.production_lifecycle_test_support import LifecycleFixture, SCRIPT
 
 
@@ -315,6 +316,9 @@ class LifecycleTests(LifecycleFixture):
 
     def test_load_finds_each_unit_session_by_its_mark_whatever_it_is_called(self) -> None:
         self.running()
+        with mock.patch.dict(os.environ, self.env):
+            self.staff.register_production("example", self.doc)
+        _ = unit_membership("old-showrunner", "beta-unit")
         fake_unit_host.write(self.env, [
             HostedUnit("alpha", "w1:p1", {}),
             HostedUnit("renamed-since-launch", "w2:p1", {
@@ -486,6 +490,16 @@ class LifecycleTests(LifecycleFixture):
         self.assertIn("ci: ok", passed.stdout)
         self.assertIn("smoke-launch: ok", passed.stdout)
         self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
+
+    def test_showrunner_instructions_explain_stop_resume_and_account_move(self) -> None:
+        commands = Path(__file__).parents[2] / "commands/showrunner"
+        for name in ("produce.md", "move.md"):
+            with self.subTest(command=name):
+                text = (commands / name).read_text(encoding="utf-8")
+                for command in ("agents stop", "agents resume", "accounts.py move"):
+                    self.assertIn(command, text)
+                self.assertIn("--why", text)
+                self.assertNotIn("<PauseForMove>", text)
 
     def test_produce_names_live_ci_and_smoke_steps(self) -> None:
         command = Path(__file__).parents[2] / "commands/showrunner/produce.md"

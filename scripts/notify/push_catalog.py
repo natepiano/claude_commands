@@ -43,38 +43,6 @@ ENTRIES = (
             "request": "edit send.py"})),
         purpose="A session waits for you to answer its permission prompt.",
         session=SessionTemplate("{unit}")),
-    PushText("shutdown.holdout", "shutdown", "decision", "{session} {operation} is blocked",
-        ActionTemplate("answer the open form"),
-        "Reason: {operation} is blocked because {session}'s claude session is showing a form and it can't proceed.\n\n"
-        + "Answer the form (recommended): the session pauses, and the {operation} goes on.\n\n"
-        + "Stop the session: it ends, its uncommitted work stays, and the {operation} goes on without it. "
-        + "In a terminal on {machine}, run:\n\n{command}",
-        (PushExample("typical", {"session": "pm-move-ghostty", "machine": "natedev",
-            "operation": "restart",
-            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude4 --here --only d5b35898-290f-4b44-8e6f-6f2586c975a8"}),),
-        purpose="A shutdown or restart waits for a session that shows a form.",
-        session=SessionTemplate("{session}")),
-    PushText("shutdown.holdout_unanswered", "shutdown", "decision", "Your Claude {operation} is stuck",
-        ActionTemplate("In a terminal on {machine}, stop {session} with the command below"),
-        "Your Claude {operation} waits for each session to pause. The session {session} has not paused, so the {operation} is stuck.\n\n"
-        + "Stopping it ends only that session and keeps its uncommitted work. Then the {operation} goes on.\n\n{command}",
-        (PushExample("typical", {"session": "pm-move-ghostty", "machine": "natedev",
-            "operation": "restart",
-            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude4 --here --only d5b35898-290f-4b44-8e6f-6f2586c975a8"}),
-         PushExample("long_session", {"session": "build-followups-director", "machine": "Mac",
-            "operation": "shutdown",
-            "command": "~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude2 --here --only 5b3a1624-bb7e-46af-8cb1-4d960d719a32"})),
-        purpose="A shutdown or restart is stuck on a session that did not pause.",
-        session=SessionTemplate("{session}")),
-    # Shutdown examples use test_settle.py and test_restart.py facts.
-    # The failing shutdown deliveries are recorded in notify/review.jsonl, 2026-10-14T02:05Z.
-    PushText("shutdown.stop_failed", "shutdown", "decision", "Claude account shutdown is incomplete",
-        ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown now {account}.'),
-        "The shutdown of Claude account {account} did not finish on {machine}. "
-        + "{stopped} did not stop, so work may still be running there. The command above retries the cleanup.",
-        (PushExample("typical", {"account": 'claude2', "machine": "natedev", "stopped": "One session"}),
-         PushExample("many_long_names", {"account": '"claude-team-build-followups-12"', "machine": "Mac", "stopped": "14 sessions"})),
-        purpose="An account shutdown did not stop all of its sessions."),
     PushText("shutdown.restart_failed", "shutdown", "decision", "Claude coding work is still stopped",
         ActionTemplate('In the Claude session named natedev on the natedev computer, run /shutdown restart {account}.'),
         "After your restart request, Claude coding work for account {account} is still stopped on {machine}. "
