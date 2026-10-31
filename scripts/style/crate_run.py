@@ -133,7 +133,7 @@ class SourceOwnership:
     def __init__(self, repo: Path, commit: str, members: tuple[rules.WorkspaceMember, ...]) -> None:
         self.directories: tuple[str, ...] = tuple(member.directory for member in members)
         self.owners: dict[str, set[str]] = {}
-        self.uncertain: list[str] = []
+        self.uncertain: dict[str, list[str]] = defaultdict(list)
         inventory = ledger_api.tree_entries(repo, commit)
         blobs = {path: entry.object for path, entry in inventory.items()
                  if path.endswith(".rs") and entry.kind == "blob"
@@ -143,48 +143,48 @@ class SourceOwnership:
             if path.endswith(".rs"):
                 self.owners[path] = {self.home(path)}
                 if entry.kind != "blob" or entry.mode not in ledger_api.REGULAR_FILE_MODES:
-                    self.uncertain.append(path + ": source is not a regular file")
+                    self.uncertain[path].append("source is not a regular file")
         for path, content in ledger_api.blob_contents(repo, blobs):
-            source = content.decode()
             try:
+                source = content.decode()
                 parsed = bulk.BindingText(source)
-            except bulk.BulkRenameError as error:
-                self.uncertain.append(f"{path}: {error}")
+            except (bulk.BulkRenameError, UnicodeError) as error:
+                self.uncertain[path].append(str(error))
                 continue
             for mount in _path_attributes(path, source.encode()):
                 if isinstance(mount, ledger_api.UnreadPathAttribute):
-                    self.uncertain.append(f"{path}: {mount.reason}")
+                    self.uncertain[path].append(mount.reason)
                 elif isinstance(mount, ledger_api.MountedFolder):
                     for folder in mount.readings:
                         edges[path].update(name for name in blobs if name.startswith(folder + "/"))
                 else:
                     edges[path].update(mount.readings)
-            for index, word in enumerate(parsed.words):
-                if word.removeprefix("r#") not in {"include", "include_str", "include_bytes"}:
+            for bang, stop in parsed.macros:
+                word = parsed.words[bang - 1].removeprefix("r#")
+                if word not in {"include", "include_str", "include_bytes"}:
                     continue
-                if parsed.words[index + 1:index + 2] != ("!",):
-                    self.uncertain.append(f"{path}: possibly aliased {word} source loader")
+                # BindingText owns real macro token-tree boundaries. Field/method names,
+                # imports, strings and comments do not establish a loader invocation.
+                if parsed.words[max(0, bang - 2):bang - 1] == (".",):
                     continue
-                opening = index + 2
-                end = parsed.ends.get(opening, opening)
-                arguments = parsed.words[opening + 1:end]
+                arguments = parsed.words[bang + 2:stop - 1]
                 if arguments[-1:] == (",",):
                     arguments = arguments[:-1]
                 literal = ledger_api.PLAIN_STRING.fullmatch(arguments[0]) if len(arguments) == 1 else None
                 if literal is None:
-                    self.uncertain.append(f"{path}: nonliteral {word} source loader")
+                    self.uncertain[path].append(f"nonliteral {word} source loader")
                 elif literal[1].endswith(".rs"):
                     edges[path].add(posixpath.normpath(str(Path(path).parent / literal[1])))
-                elif word.removeprefix("r#") == "include":
-                    self.uncertain.append(f"{path}: include! code outside the Rust source inventory")
+                elif word == "include":
+                    self.uncertain[path].append("include! code outside the Rust source inventory")
         # Target roots can be configured outside their package directory.
         # Inspect the exact frozen manifests and paths in a read-only exported checkout.
-        self.edges: dict[str, set[str]] = dict(edges)
         for source, targets in edges.items():
             for target in targets:
                 if target not in self.owners:
-                    self.uncertain.append(f"{source}: missing or external source {target}")
-        self.edges = {source: targets & self.owners.keys() for source, targets in edges.items()}
+                    self.uncertain[source].append(f"missing or external source {target}")
+        self.edges: dict[str, frozenset[str]] = {
+            source: frozenset(targets & self.owners.keys()) for source, targets in edges.items()}
         self.propagate()
 
     def propagate(self) -> None:
@@ -220,10 +220,10 @@ class SourceOwnership:
                 try:
                     path = target.path.resolve().relative_to(checkout).as_posix()
                 except ValueError:
-                    self.uncertain.append("target outside checkout: " + str(target.path))
+                    self.uncertain[str(target.path)].append("target outside checkout")
                     continue
                 if path not in self.owners:
-                    self.uncertain.append("target absent from frozen sources: " + path)
+                    self.uncertain[path].append("target absent from frozen sources")
                 else:
                     self.owners[path].add(member.directory)
         self.propagate()
@@ -231,10 +231,16 @@ class SourceOwnership:
     def home(self, path: str) -> str:
         return style_proposals.crate_for(self.directories, path)
 
+    def reachable(self, paths: Sequence[str]) -> frozenset[str]:
+        """Only loader edges from these sources establish reachability, never reverse edges."""
+        return frozenset(run.dependent_files(self.edges, set(paths)))
+
     def require(self, directory: str, paths: tuple[str, ...]) -> None:
-        if self.uncertain:
-            raise bulk.BulkRenameError("ambiguous shared-source ownership: " + self.uncertain[0])
         for path in paths:
+            for source in sorted(self.reachable((path,))):
+                if source in self.uncertain:
+                    raise bulk.BulkRenameError("ambiguous shared-source ownership: " + source
+                                               + ": " + "; ".join(self.uncertain[source]))
             # An edited loader participates in the shared-source group even when its
             # cross-package target itself is unchanged in the final diff.
             if (Path(path).is_absolute() or ".." in Path(path).parts
@@ -591,47 +597,84 @@ class CrateRun:
             ownership.require(record["directory"], (path,))
             available(self.repo, path)
         selected = run.Selection(self.ledger.named_held(record["tickets"]), ())
-        planned = planner(checkout, self.ledger, base, selected,
-                          run.PlanningFileAvailability(checkout, boundary), definition)
-        # A planner may never introduce a path the complete pre-overlay group has not admitted.
-        paths = tuple(file.path for file in planned.files)
-        ownership.require(record["directory"], paths)
+        refused: dict[str, str] = {}
+        availability = run.PlanningFileAvailability(checkout, boundary)
+
+        def admitted(identities: frozenset[str]) -> run.PlannedEdits:
+            findings: list[ledger_api.HeldFinding] = []
+            for finding in selected.findings:
+                if finding.finding_id not in identities:
+                    continue
+                try:
+                    availability.require((finding.path,))
+                except bulk.BulkRenameError as error:
+                    refused[finding.finding_id] = str(error)
+                else:
+                    findings.append(finding)
+            rebuilt = planner(checkout, self.ledger, base, run.Selection(tuple(findings), ()),
+                              availability, definition)
+            # The shared plan owner removes whole dependent edit groups, including files
+            # introduced by a planner. No overlay may precede this boundary check.
+            return run.available_constant_plan(rebuilt, availability)
+
+        planned = admitted(frozenset(record["tickets"]))
         unchanged_base()
         record["stage"] = CrateStage.EDITED
         self.save(manifest)
-        if isinstance(executor, ExecutionService):
-            match executor:
-                case ExecutionService.BULK_RUN:
-                    def replan(identities: frozenset[str]) -> run.PlannedEdits:
-                        survivors = run.Selection(tuple(finding for finding in selected.findings
-                                                        if finding.finding_id in identities), ())
-                        rebuilt = planner(checkout, self.ledger, base, survivors,
-                                          run.PlanningFileAvailability(checkout, boundary), definition)
-                        ownership.require(record["directory"], tuple(file.path for file in rebuilt.files))
-                        for file in rebuilt.files:
-                            boundary(checkout, file.path)
-                        return rebuilt
-                    workspace = run.WorkspaceEdits(checkout, base, ())
-                    refusals: dict[str, str] = {}
-                    kept_paths = run.execute_plan(
-                        workspace, planned, definition, self.ledger, intent, runner, boundary,
-                        replan, dict.fromkeys(("rename", "fmt", "check_clippy"), 0.0), [], refusals)
-                    validated = ValidatedEdits(tuple(sorted(kept_paths)),
-                                              tuple(item.finding.finding_id for path in sorted(kept_paths)
-                                                    for item in workspace.files[path].kept), refusals)
-        else:
-            validated = executor(checkout, base, planned, intent, runner, boundary)
-        kept, surviving = validated.paths, validated.findings
-        if not surviving:
-            raise bulk.BulkRenameError("no surviving findings")
-        refused = {identity: validated.refusals.get(identity, "not retained by crate planner")
+        while True:
+            refused.update((item.finding_id, item.reason) for item in planned.refusals)
+            if not planned.files:
+                validated = ValidatedEdits((), (), refused)
+            elif isinstance(executor, ExecutionService):
+                match executor:
+                    case ExecutionService.BULK_RUN:
+                        workspace = run.WorkspaceEdits(checkout, base, ())
+                        kept_paths = run.execute_plan(
+                            workspace, planned, definition, self.ledger, intent, runner, boundary,
+                            admitted, dict.fromkeys(("rename", "fmt", "check_clippy"), 0.0), [], refused)
+                        validated = ValidatedEdits(tuple(sorted(kept_paths)),
+                                                  tuple(item.finding.finding_id for path in sorted(kept_paths)
+                                                        for item in workspace.files[path].kept), refused)
+            else:
+                validated = executor(checkout, base, planned, intent, runner, boundary)
+            refused.update(validated.refusals)
+            kept, surviving = validated.paths, validated.findings
+            if not surviving:
+                # Even an entirely refused selection retains every reason and uses the
+                # ledger's normal refusal publication before the untested claims are dropped.
+                with ledger_api.refill_lock(self.repo):
+                    self.owned(record)
+                    for ticket in sorted(set(record["tickets"].values())):
+                        reasons = {identity: refused.get(identity, "not retained by crate planner")
+                                   for identity, owner in record["tickets"].items() if owner == ticket}
+                        _ = self.ledger.bulk_release(ticket, reasons)
+                    manifest["refusals"].extend({"finding_id": identity, "reason": reason}
+                                                for identity, reason in refused.items())
+                    self.save(manifest)
+                raise bulk.BulkRenameError("no surviving findings: " + "; ".join(sorted(set(refused.values()))))
+            _ = run.git(checkout, "add", "--", *sorted(kept))
+            tree = run.git(checkout, "write-tree")
+            final_ownership = SourceOwnership(checkout, tree, members)
+            final_ownership.target_roots(checkout, members)
+            def final_boundary(_repo: Path, path: str) -> None:
+                ownership.require(record["directory"], (path,))
+                final_ownership.require(record["directory"], (path,))
+            final_plan = run.available_constant_plan(
+                planned, run.PlanningFileAvailability(checkout, final_boundary))
+            refused.update((item.finding_id, item.reason) for item in final_plan.refusals)
+            removed = {item.finding_id for item in final_plan.refusals} & set(surviving)
+            if not removed:
+                for path in changed(checkout, base, tree):
+                    final_boundary(checkout, path)
+                break
+            # A newly introduced loader can invalidate one atomic group. Restore through
+            # WorkspaceEdits, then let the existing planner prove only the survivors anew.
+            rollback = run.WorkspaceEdits(checkout, base, ())
+            rollback.set_plan(planned)
+            rollback.restore(sorted(kept))
+            planned = admitted(frozenset(surviving) - removed)
+        refused = {identity: refused.get(identity, "not retained by crate planner")
                    for identity in record["tickets"] if identity not in surviving}
-        _ = run.git(checkout, "add", "--", *sorted(kept))
-        tree = run.git(checkout, "write-tree")
-        ownership.require(record["directory"], changed(checkout, base, tree))
-        final_ownership = SourceOwnership(checkout, tree, members)
-        final_ownership.target_roots(checkout, members)
-        final_ownership.require(record["directory"], changed(checkout, base, tree))
         commit = run.git(checkout, "commit-tree", tree, "-p", base, "-m",
                          f"style({definition.name}): crate batch\n\nTested-Tree: {tree}\nRun: {self.run_id}")
         result: CommitEvidence = {"commit": commit, "tree": tree, "paths": sorted(kept),

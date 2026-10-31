@@ -32,7 +32,7 @@ from urllib.parse import quote
 import store
 import parse
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 # Step and call fields under a former name, read as the current name.
 FORMER_FIELDS = (("seat", "worker"), ("delegate_session", "unit_session"))
 LOCK_NAME = "index.lock"
@@ -114,6 +114,7 @@ STEP_COLUMNS: list[Column] = [
     ("log", "TEXT", "gzipped output of a failed step, relative to the root"),
     ("started_at_us", "INTEGER", "UTC epoch microseconds; strict instant order for build history"),
     ("test_build_key", "TEXT", "verify test Cargo build-input key, excluding nextest run-only selection; NULL for older or changed builds"),
+    ("scope_resources", "TEXT", "JSON own-scope CPU (excludes sccache.service compiles) and IO counters"),
 ]
 
 TEST_COLUMNS: list[Column] = [
@@ -270,6 +271,9 @@ SAMPLE_COLUMNS: list[Column] = [
     ("cpu_total_ticks", "INTEGER", "CPU total ticks since boot from /proc/stat, USER_HZ, excluding guest fields; NULL when not recorded"),
     ("power_profile", "TEXT", "power-profiles-daemon profile; NULL when not recorded"),
     ("power_profile_since", "TEXT", "UTC ISO mtime of the daemon's state file: when the profile was set"),
+    ("slices", "TEXT", "JSON raw builds and CI slice readings; memory.current is the whole held charge"),
+    ("filesystem", "TEXT", "JSON filesystem free/used/total and top-layer device identity"),
+    ("jobserver", "TEXT", "JSON free pool tokens, not CPUs in use; measured or unavailable"),
 ]
 
 MEMORY_SNAPSHOT_COLUMNS: list[Column] = [

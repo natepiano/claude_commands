@@ -3037,6 +3037,22 @@ class Ledger:
             raise LedgerError(f"{ticket['id']}: empty pipeline footprint")
         return frozenset(files)
 
+    def ticket_changed_paths(self, ticket: TicketRecord, end: str) -> frozenset[str]:
+        """Paths touched by this ticket's own non-merge commits, excluding imported style work.
+
+        End may be a worktree snapshot, so uncommitted ticket edits count as well. Keep reverted paths:
+        they were touched by the ticket even when its endpoint trees happen to match.
+        """
+        if not ticket["base"]:
+            raise LedgerError(f"{ticket['id']}: changed paths require a ticket base")
+        style_tip = self._style_branch_tip()[1]
+        revisions = (end, f"^{ticket['base']}", *((f"^{style_tip}",) if style_tip else ()))
+        paths = _git_bytes(self.repo, "log", "--no-merges", "--name-only", "--no-renames", "-z",
+                           "--format=", *revisions, "--").stdout
+        if paths and not paths.endswith(b"\0"):
+            raise LedgerError("unreadable changed paths")
+        return frozenset(os.fsdecode(path) for path in paths.split(b"\0") if path)
+
     def _check_ticket_pair(self, predecessor: TicketRecord, successor: TicketRecord) -> None:
         """Reprove disjointness from fresh rows and resolved tips; any uncertainty refuses the transaction."""
         try:
@@ -3058,13 +3074,7 @@ class Ledger:
             footprints: list[frozenset[str]] = []
             for ticket in (predecessor, successor):
                 end = ticket["checkpoint"] or live[successor["branch"]]
-                # Neither inherited predecessor work nor imported style work belongs to this ticket.
-                revisions = (end, f"^{ticket['base']}", *((f"^{style_tip}",) if style_tip else ()))
-                paths = _git_bytes(self.repo, "log", "--no-merges", "--name-only", "--no-renames", "-z",
-                                   "--format=", *revisions, "--").stdout
-                if paths and not paths.endswith(b"\0"):
-                    raise LedgerError("unreadable changed paths")
-                actual = frozenset(os.fsdecode(path) for path in paths.split(b"\0") if path)
+                actual = self.ticket_changed_paths(ticket, end)
                 footprints.append(self._pipeline_footprint(ticket, trees) | actual)
             waiting, selected = footprints
             overlap = ((waiting & protected_ticket_files(selected, crates))

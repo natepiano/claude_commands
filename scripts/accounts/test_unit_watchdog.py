@@ -260,7 +260,7 @@ class UnitWatchdogTests(unittest.TestCase):
         with (self.stop_process_leaves(), patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
               patch.object(stop_resume, "resume", return_value=stop_resume.ResumeFailed("alpha", "never started"))):
             self.assertEqual(self.shared_move(["alpha"], "claude2", why="account move"),
-                             [stop_resume.ResumeFailed("alpha", "never started")])
+                             [stop_resume.ResumePending("alpha", "claude2", "never started")])
         self.assertFalse(pane_record.read("shared")["alpha"].get("ended", False))
         for minute in (0, 2, 4):
             _ = self.pass_at(minute)
