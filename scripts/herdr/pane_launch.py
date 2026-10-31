@@ -101,5 +101,5 @@ class RecordedLabels:
             except (staff.StaffUnreadable, OSError, ValueError):
                 self.membership = StaffLabelsRead.UNAVAILABLE
         if not isinstance(self.membership, StaffLabelsRead):
-            values = self.membership.environment(values, record["sessionId"], record["name"])
+            values = self.membership.environment(values, record["sessionId"], record["name"], record.get("cwd", ""))
         return values

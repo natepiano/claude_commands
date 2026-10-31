@@ -4,18 +4,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NotRequired, TypedDict, final, override
 from zoneinfo import ZoneInfo
 
 from scripts.accounts import new_account
-from scripts.production import session_labels, staff
+from scripts.production import session_labels, showrunners, staff
+from scripts.shutdown import remote
 
 PROGRAM = Path(__file__).with_name("statusline.jq")
 SHIPPED_COLORS = PROGRAM.parents[2] / "config/statusline.conf"
@@ -474,7 +477,9 @@ class RoleTests(unittest.TestCase):
                         .startswith("unassigned | "))
 
     def test_missing_damaged_and_wrong_schema_staff_render_without_environment_fallback(self) -> None:
-        for text in ("", "{", "[]", '{"schema":2,"rows":[]}', '{"schema":1,"rows":[42]}'):
+        for text in ("", "{", "[]", '{"schema":3,"rows":[]}', '{"schema":1,"rows":[42]}',
+                     json.dumps({"schema": 2, "rows": [{**UNIT.to_json(), "worktree": "bad"}]}),
+                     json.dumps({"schema": 2, "rows": [{**OWNER.to_json(), "doc": {"state": "live"}}]})):
             path = self.write_staff()
             _ = path.write_text(text, encoding="utf-8")
             for shell in SHELLS:
@@ -524,6 +529,57 @@ class RoleTests(unittest.TestCase):
                         self.assertIsNotNone(parent)
                         assert parent is not None
                         self.assertEqual(role, f"{row.name} unit for {parent.name}")
+
+    def test_python_and_jq_share_timer_folder_and_name_precedence(self) -> None:
+        machine = remote.local_machine()
+        doc = self.home / "runner's production.md"
+        runner = replace(OWNER, name="hana", doc=staff.LiveDoc(machine, doc))
+        folder = str(self.home / "geometry material")
+        unit = replace(UNIT, name="geometry-material", worktree=staff.PresentWorktree(machine, Path(folder)))
+        other = staff.StaffRow(staff.StaffId("s00000000004"), "showrunner", "other", None)
+        duplicate = replace(unit, id=staff.StaffId("s00000000005"), parent=other.id)
+        source = showrunners.ShowrunnerSource(showrunners.Timer("different-slug", "session:runner-id", doc, "UTC"), "")
+        sources = {source.timer.slug: source}
+        instance = self.home / ".local/state/notifier/showrunner-different-slug"
+        instance.mkdir(parents=True)
+        _ = doc.write_text("# No Units table\n")
+        _ = (instance / "conf").write_text(
+            f"TARGET=session:runner-id\nCHECK=zsh /scripts/production_check.sh {shlex.quote(str(doc))}\n")
+        cases: list[tuple[str, tuple[staff.StaffRow, ...], dict[str, str], str, str, str, str]] = [
+            ("folder before name", (runner, unit, other), {}, "own-id", "other", folder, unit.id),
+            ("timer before folder", (runner, unit, other), {}, "runner-id", "other", folder, runner.id),
+            ("identity before timer", (runner, unit, other), {"STAFF_ID": other.id}, "runner-id", "", folder, other.id),
+            ("unknown identity", (runner, unit, other), {"STAFF_ID": "s99999999999"}, "runner-id", "hana", folder, ""),
+            ("duplicate folders", (runner, unit, other, duplicate), {}, "own-id", "organon", folder, ""),
+            ("duplicate falls to name", (runner, unit, other, duplicate), {}, "own-id", "other", folder, other.id),
+            ("remote folder ignored", (runner, replace(unit, worktree=staff.PresentWorktree("elsewhere", Path(folder))), other),
+             {}, "own-id", "other", folder, other.id),
+            ("removed folder ignored", (runner, replace(unit, worktree=staff.RemovedWorktree(machine, Path(folder))), other),
+             {}, "own-id", "organon", folder, ""),
+            ("unfilled folder ignored", (runner, replace(unit, worktree=staff.WorktreeUnfilled()), other),
+             {}, "own-id", "organon", folder, ""),
+            ("descendant is not equal", (runner, unit, other), {}, "own-id", "organon", folder + "/child", ""),
+            ("prefix is not equal", (runner, unit, other), {}, "own-id", "organon", folder + "-other", ""),
+            ("empty cwd", (runner, unit, other), {}, "own-id", "organon", "", ""),
+            ("name fallback", (runner, unit, other), {}, "own-id", "geometry-material_unit", "/elsewhere", unit.id),
+            ("retained name fallback", (runner, unit, other), {"SHOWRUNNER_UNIT_ID": "geometry-material-unit"},
+             "own-id", "organon", "/elsewhere", unit.id),
+        ]
+        for label, rows, environment, session_id, name, cwd, expected in cases:
+            with self.subTest(case=label):
+                path = self.write_staff(*rows)
+                # Exercise the schema emitted by staff's current writer.
+                _ = path.write_text(json.dumps({"schema": 2, "rows": [row.to_json() for row in rows]}))
+                reader = session_labels.StaffLabels(staff.StaffSnapshot(rows), sources, {source.timer.slug: runner})
+                resolved = reader.environment(environment, session_id, name, cwd)
+                row = reader.record.by_id(staff.StaffId(resolved.get("STAFF_ID", "")))
+                self.assertEqual(row.id if row is not None else "", expected)
+                self.showrunner_record(os.getpid(), name, session_id=session_id)
+                role = (f"{row.name} unit for hana" if row is not None and row.kind == "unit"
+                        else f"{row.name} showrunner" if row is not None else "unassigned")
+                for shell in SHELLS:
+                    rendered = self.command_lines({"session_id": session_id, "cwd": cwd}, shell=shell, **environment)
+                    self.assertEqual(ANSI.sub("", rendered[0]).split(" | ")[0], role)
 
     @unittest.skipUnless(shutil.which("zsh"), "zsh is not installed")
     def test_zsh_settings_command_renders_both_lines_without_any_notifier_directory(self) -> None:
