@@ -13,7 +13,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-from typing import cast, override
+from typing import TypedDict, Unpack, cast, override
 from unittest import mock
 
 from scripts.build_queue import build_why, head_facts
@@ -29,6 +29,11 @@ NOW = datetime(2026, 10, 30, 1, 51, tzinfo=UTC).timestamp()
 
 def gib(value: float) -> int:
     return int(value * GIB)
+
+
+class FinishedTokenGapTimes(TypedDict):
+    token_left_at: float
+    token_back_at: float
 
 
 class BuildWhyTests(unittest.TestCase):
@@ -501,6 +506,37 @@ class BuildWhyTests(unittest.TestCase):
         for path in self.directory.glob("*.waiting"):
             path.unlink()
         self.assertTrue(self.output().rstrip().endswith("Nothing waits."))
+
+    def check_waiting_head(self, at: float, **token_times: Unpack[FinishedTokenGapTimes]) -> gate.CheckResult:
+        self.reset_running(available=0, need=11.8)
+        _ = self.running(800, "holder", "clippy", 1, 1, 3600)
+        self.head_path = self.head_path.rename(self.directory / "500-500.waiting")
+        waiter = gate.read_waiter(self.head_path)
+        waiter["token_left_at"] = token_times["token_left_at"]
+        _ = self.head_path.write_text(json.dumps(waiter))
+        with mock.patch.object(gate, "process_start_time", side_effect=str), \
+             mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "id-inspectors-fix", "CLAUDE_SESSION_NAME": "inspectors-fix",
+                                          "BUILDLOG_MEM_TOKEN_BACK_AT": str(token_times["token_back_at"])}):
+            return gate.check(self.root / "meminfo", 500, "", ["cargo", "nextest"], NOW - 122 * 60,
+                              now=datetime.fromtimestamp(at, UTC),
+                              profile=gate.StepProfile("hana", "nextest", "inspectors-fix",
+                                                       gate.ExpectedPeak(gib(11.8), "measured", 7)))
+
+    def test_admission_written_token_gap_matches_the_reader_and_both_commands(self) -> None:
+        result = self.check_waiting_head(NOW, token_left_at=NOW - 200, token_back_at=NOW - 46)
+        self.assertEqual(result.decision.state, "hold")
+        facts = head_facts.read_head_facts(gate.locked_queue_read())
+        self.assertIsInstance(facts, head_facts.HeadFacts)
+        if not isinstance(facts, head_facts.HeadFacts):
+            self.fail("the held step must have head facts")
+        waits = facts.token_waits
+        self.assertIsInstance(waits, head_facts.RecordedTokenWaits)
+        if not isinstance(waits, head_facts.RecordedTokenWaits):
+            self.fail("admission's token gap must match its waiting step")
+        self.assertEqual([(wait.session_id, wait.pid, wait.start_time, wait.left_at, wait.returned.at)
+                          for wait in waits.head_waits], [("id-inspectors-fix", 500, "500", NOW - 200, NOW - 46)])
+        self.assertIn("Cargo token: inspectors-fix-session nextest: waited 154 s (21:47-21:50)", self.output())
+        self.assertIn("cargo token waited 154 s", head_facts.cargo_token_text(facts))
 
     def test_four_head_facts_follow_first_in_line_in_the_specified_order(self) -> None:
         write_bumps(NOW, [bump_line(NOW - 1)])
