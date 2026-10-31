@@ -3382,7 +3382,6 @@ class AccountDaemonRoutingTests(unittest.TestCase):
             "ROSTER_RUN_ROOT": str(self.root / "runs"),
             "DESIGN_ROLES_STATE": str(self.root / "design-roles"),
             "DESIGN_OWNERSHIP_STATE": str(self.root / "design-ownership"),
-            "REVIEW_POOL_STATE": str(self.root / "review-pool"),
             "UNIT_HISTORY_DIR": str(self.root / "history"),
         }, clear=True)))
 

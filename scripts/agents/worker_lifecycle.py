@@ -1,4 +1,4 @@
-"""Serialize worker operations, between design/pool locks and inbox/roster locks.
+"""Serialize worker operations, between design locks and inbox/roster locks.
 
 An operation owns this lock through its server effects and final publication,
 but releases it before watching a turn. Nested acquisition is a programming

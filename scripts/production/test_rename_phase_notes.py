@@ -325,7 +325,7 @@ class ProductionRenamePhaseNoteTests(unittest.TestCase):
         # These are all the apply steps before phase-note repair was added.
         journal["completed"] = [
             "_rename_doc", "_rewrite_plans", "_rename_timer", "_rename_showrunner_state",
-            "_rename_stall_watch", "_rename_review_pool", "_rename_unit_workers", "_rename_branch",
+            "_rename_stall_watch", "_rename_unit_workers", "_rename_branch",
         ]
         fixture.write(fixture.state / "new/rename.json", json.dumps(journal))
         note = write_note(self.vault, "runner", "alpha-unit", f'production_file: "{OLD_LINK}"')
