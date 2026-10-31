@@ -321,3 +321,16 @@ buildlog_release_memory() {
     [[ -n "$reservation" ]] || return 0
     buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" release "$reservation" "${1:-0}" >/dev/null 2>&1 || true
 }
+
+# Release memory for the CPU token wait; keep the original queue place.
+buildlog_token_wait() {
+    local reservation="${BUILDLOG_MEM_RESERVATION:-}"
+    [[ -n "$reservation" ]] || return 0
+    local status=0
+    buildlog_memory_python "$BUILDLOG_MEM_ADMIT_SCRIPT" token-wait "$reservation" || status=$?
+    if (( status != 0 )); then
+        buildlog_memory_refuse "cannot enter token wait (exit $status)"
+        return 2
+    fi
+    BUILDLOG_MEM_RESERVATION=""
+}

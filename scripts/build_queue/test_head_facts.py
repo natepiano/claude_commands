@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 import json
 import unittest
+from typing import cast
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -13,7 +14,7 @@ from scripts.build_queue import head_facts
 from scripts.build_queue.queue_fixture import (
     AdmissionLogTests, bump_line as bump_line, head_reading, queue_read_fixture as queue_read_fixture,
     queue_time_line as queue_time_line, token_gap_line as token_gap_line,
-    write_bumps as write_bumps, write_lines, write_token_gaps as write_token_gaps,
+    write_bumps as write_bumps, write_lines, write_token_gaps as write_token_gaps, with_waiting_process,
 )
 from scripts.buildlog import store
 from scripts.lint import memory_admit as gate
@@ -188,26 +189,41 @@ class HeadFactsTests(AdmissionLogTests):
             "bumped-session", "check", "/tmp/bumped", 1, ("actor-session",), NOW - 5),), 1,
             (head_facts.BumpRecord(NOW - 5, "actor-session", "bumped-session", "check", "/tmp/bumped", 3),)))
 
-    def test_head_time_does_not_come_from_a_younger_rows_record(self) -> None:
+    def test_total_wait_ignores_every_legacy_head_clock(self) -> None:
+        for fields in cast(tuple[dict[str, object], ...], ({}, {"head_state": "head", "head_since": NOW - 125},
+                       {"head_state": "not_head"}, {"head_since": float("inf")})):
+            with self.subTest(fields=fields):
+                reading = head_reading(since=NOW - 158 * 60, fields=fields)
+                facts = self.facts(reading)
+                self.assertEqual(facts.joined_at, NOW - 158 * 60)
+                self.assertNotIn("head_since", repr(facts))
+                self.assertNotIn("Head for", head_facts.order_text(facts, ZONE))
+
+    def test_follower_token_gap_never_becomes_the_same_sessions_head_gap(self) -> None:
         reading = head_reading()
-        younger = head_reading(fields={"head_since": NOW - 1}).ordered[0]
-        facts = self.facts(replace(reading, ordered=[*reading.ordered, younger]))
-        self.assertIsInstance(facts.head_time, head_facts.HeadTimeNotRecorded)
+        follower = replace(reading.view.waiting[0], pid=456)
+        reading = with_waiting_process(reading, follower, "456")
+        write_token_gaps([token_gap_line(NOW - 200, NOW - 46, pid=456, start_time="456")])
+        facts = self.facts(reading)
+        self.assertEqual(head_facts.cargo_token_lines(facts, ZONE, {}),
+                         ["Cargo token: head-session nextest: waited 154 s (06:56-06:59)"])
+        self.assertEqual(head_facts.cargo_token_text(facts), "no cargo token wait")
 
-    def test_head_time_is_unknown_without_record_even_with_priority_and_join_times(self) -> None:
-        facts = self.facts(head_reading(since=NOW - 158 * 60,
-                                       fields={"priority_since": NOW - 60}))
-        self.assertIsInstance(facts.head_time, head_facts.HeadTimeNotRecorded)
-        self.assertEqual(head_facts.head_time_text(facts, ZONE), "Head for: unknown")
-        self.assertEqual(head_facts.head_time_text(facts, ZONE, short=True), "head for: unknown")
+    def test_token_gap_without_process_identity_matches_no_waiter(self) -> None:
+        write_token_gaps([token_gap_line(NOW - 200, NOW - 46, start_time="")])
+        facts = self.facts(head_reading())
+        self.assertEqual(head_facts.cargo_token_text(facts), "no cargo token wait")
 
-    def test_head_time_uses_only_the_new_recorded_field(self) -> None:
-        facts = self.facts(head_reading(since=NOW - 158 * 60,
-            fields={"head_since": NOW - 125, "priority_since": NOW - 1200}))
-        self.assertEqual(facts.head_time, head_facts.RecordedHeadTime(NOW - 125))
-        self.assertRegex(head_facts.head_time_text(facts, ZONE),
-                         r"(?i)^head for:? 2 min \(since 06:57:55\)$")
-        self.assertEqual(head_facts.head_time_text(facts, ZONE, short=True), "head for 2 min")
+    def test_live_queue_priority_is_shown_with_legacy_bump_history(self) -> None:
+        reading = head_reading()
+        priority: gate.QueuePriority = {"unit": "resources", "why": "user work", "set_at": NOW,
+            "set_by": "showrunner"}
+        reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
+        write_bumps(NOW, [bump_line(NOW - 5)])
+        facts = self.facts(reading)
+        self.assertIn("queue priority: resources (the user's bump)", head_facts.order_text(facts, ZONE))
+        self.assertEqual(self.history(reading).total, 1)
+        self.assertEqual(head_facts.bump_text(facts, ZONE), "Bumps since it joined at 06:50:00: 1")
 
     def test_three_order_texts_use_recorded_priority_and_deadline(self) -> None:
         reading = head_reading()
@@ -258,10 +274,10 @@ class HeadFactsTests(AdmissionLogTests):
         self.assertIn("head-session", lines[0])
         self.assertIn("waited 154 s (06:56-06:59)", lines[0])
 
-    def test_token_gaps_match_session_and_step_without_requiring_the_same_process(self) -> None:
+    def test_another_process_gap_on_the_same_step_is_not_the_heads(self) -> None:
         write_token_gaps([token_gap_line(NOW - 200, NOW - 46, pid=456, start_time="different")])
         lines = head_facts.cargo_token_lines(self.facts(head_reading()), ZONE, {})
-        self.assertEqual(lines, ["Cargo token: head-session nextest: waited 154 s (06:56-06:59)"])
+        self.assertEqual(lines, ["Cargo token waits: none"])
 
     def test_token_gaps_fall_back_to_both_pid_and_start_time_for_legacy_identity(self) -> None:
         write_token_gaps([token_gap_line(NOW - 200, NOW - 46, session="", step="legacy-check")])
@@ -356,7 +372,7 @@ class HeadFactsTests(AdmissionLogTests):
     def test_token_scan_uses_the_oldest_waiter_join_instead_of_the_head_join(self) -> None:
         reading = head_reading(since=NOW - 60)
         follower = replace(reading.view.waiting[0], pid=456, session_id="follower", since=NOW - 400)
-        reading = replace(reading, view=replace(reading.view, waiting=(*reading.view.waiting, follower)))
+        reading = with_waiting_process(reading, follower, "123")
         write_token_gaps([token_gap_line(NOW - 300, NOW - 146, session="follower", pid=456)])
         facts = self.facts(reading)
         self.assertEqual(head_facts.cargo_token_lines(facts, ZONE, {}),
@@ -390,8 +406,8 @@ class HeadFactsTests(AdmissionLogTests):
                           since=NOW - 300)
         running = gate.RunningStep("running-session", "runner", "check", "/tmp/run", gate.GIB,
                                    gate.MeasuredMemory(gate.GIB))
-        reading = replace(reading, view=replace(reading.view,
-            waiting=(*reading.view.waiting, younger), running=(running,)))
+        reading = with_waiting_process(reading, younger, "123")
+        reading = replace(reading, view=replace(reading.view, running=(running,)))
         write_token_gaps([
             token_gap_line(NOW - 400, NOW - 300, session="running-session", step="check", pid=789),
             token_gap_line(NOW - 200, NOW - 46, session="younger-session", step="clippy", pid=456),
@@ -481,10 +497,10 @@ class HeadFactsTests(AdmissionLogTests):
         self.assertEqual(facts.bumps.total, 1)
         self.assertEqual(facts.bumps.groups[0].session, "bumped-session")
 
-    def test_waiting_moves_match_identity_join_boundary_and_negative_order(self) -> None:
+    def test_waiting_move_history_matches_identity_join_boundary_and_resolved_priority(self) -> None:
         reading = head_reading(since=NOW - 60)
         step = reading.view.waiting[0]
-        row: gate.Waiter = {**reading.ordered[0][1], "bump_order": -1}
+        row: gate.Waiter = {**reading.ordered[0][1], "priority_rank": 0}
         write_bumps(NOW, [
             bump_line(NOW - 61, session="head-session", step="nextest", folder="/tmp/head"),
             bump_line(NOW - 60, session="head-session", step="nextest", folder="/tmp/head", old_position=9),

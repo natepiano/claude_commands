@@ -1,14 +1,15 @@
 Build queue · 10:46
 
+queue priority: cables (the user's bump)
                                     free 4.4 │ taken 16.6
 budget 21.0                         ░░░░█████████████████
 
  # showrunner unit      step    min need
- 1▸tool-base… cables    nextest   6 ██████▊ 6.8 ↑ ≤14.2 9:18
+ 1 tool-base… cables    mend     36 ██████▊ 6.8 ↑ ≤14.2 9:18
  2▸tool-base… cables    nextest   6 ███████████▌ 11.5
- 3 tool-base… hana-mig… mend     39 ███████▋ 7.6
- 4 cargo-lin… berth     clippy   37 ██▉ 2.9
- 5 tool-base… cables    mend     36 ███████▋ 7.6
+ 3▸tool-base… cables    nextest   6 ███████████▌ 11.5
+ 4 tool-base… hana-mig… mend     39 ███████▋ 7.6
+ 5 cargo-lin… berth     clippy   37 ██▉ 2.9
  6 tool-base… lfo       nextest  35 ██████████▊ 10.8
  7 cargo-lin… modules   doc      35 ███▌ 3.5
  8 cargo-lin… —         nextest  33 █▊ 1.8
