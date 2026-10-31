@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "shutdown"))
 import add_unit
 import production_units
+from unit_lookup import ProductionMembers, unit_is_retired
 from scripts.production import staff
 import launch_permission
 import unit_lookup
@@ -25,7 +26,8 @@ import sessions
 from scripts.shutdown import stop_resume
 import herdr
 from herdr import HerdrPlace
-from production_units import cell_value, live_unit_table, plan_cell_is_retired, retired_units
+from production_units import cell_value, plan_cell_is_retired
+from unit_lookup import live_unit_table, retired_units
 from test_support import ShutdownTestCase
 
 
@@ -627,7 +629,7 @@ class RetiredRowTests(ShutdownTestCase):
         found = {} if gone else {"some-unit": self.session("some-unit")}
         cells = production_units.unit_table([*OLD_HEADER, self.row("some", worktree, plan)])[0]
         with patch.object(unit_lookup, "marked_units", return_value=found) as asked:
-            return production_units.unit_is_retired(cells, production_units.ProductionMembers("show")), asked.call_count
+            return unit_is_retired(cells, ProductionMembers("show")), asked.call_count
 
     def test_membership_lasts_until_the_staff_row_is_retired(self) -> None:
         self.assertEqual(self.retired(self.linked, gone=False), (True, 0))

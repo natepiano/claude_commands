@@ -26,7 +26,7 @@ from scripts.agents import codex_mesh
 from scripts.direct import workers
 from scripts.direct.worker_state import worker_claim_lock, worker_record_path
 from scripts.astra import design_roles
-from scripts.lib import unit_runs
+from scripts.lib import tunables, unit_runs
 from scripts.usage.agents_log import LENSES
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -375,8 +375,11 @@ def claim_worker(dispatch: Dispatch) -> WorkerClaim:
         if record.get("held_design_id"):
             refuse(f"{dispatch.worker}: held roles resume through design_roles.py")
         config = Path(os.environ.get("UNIT_CONFIG", str(Path.home() / ".claude/config/direct.conf")))
-        match = re.search(r"^UNIT_COMPACT_ABOVE_TOKENS=(\d+)", config.read_text(), re.M) if config.is_file() else None
-        threshold = int(match.group(1)) if match else 0
+        try:
+            raw_threshold = tunables.values(config).get("UNIT_COMPACT_ABOVE_TOKENS", "")
+        except tunables.TunableUnusable as error:
+            refuse(str(error))
+        threshold = int(raw_threshold) if re.fullmatch(r"\d+", raw_threshold) else 0
         if threshold <= 0:
             refuse(f"UNIT_COMPACT_ABOVE_TOKENS in {config} must be a positive integer")
         context_tokens = record.get("context_tokens")

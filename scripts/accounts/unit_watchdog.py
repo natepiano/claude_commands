@@ -312,7 +312,7 @@ def _run(now: datetime, *, dry_run: bool) -> list[str]:
                 continue
             doc = Path(runner["doc"])
             try:
-                rows = production_units.live_unit_table(doc.read_text(encoding="utf-8").splitlines(), runner["slug"])
+                rows = unit_lookup.live_unit_table(doc.read_text(encoding="utf-8").splitlines(), runner["slug"])
                 for row in rows:
                     unit = production_units.cell_value(row.get("Unit", ""))
                     try:
