@@ -129,6 +129,7 @@ def setUpModule() -> None:
         + "full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"
     )
     _ = cast(object, unittest.enterModuleContext(patch.dict(os.environ, {
+        "BUILDLOG_DIR": str(root / "buildlog"),
         "BUILDLOG_MEMINFO": str(root / "meminfo"),
         "BUILDLOG_MEMORY_PRESSURE": str(root / "pressure"),
         "BUILDLOG_LIVE_MEMORY_TRIPWIRE": os.environ.get(
@@ -5131,6 +5132,16 @@ class QueueApiTests(MemoryQueueFixture):
         return (self.waiter(300, NOW.timestamp() - 2400, "/tmp/clone88ci", "clone88ci"),
                 self.waiter(400, NOW.timestamp() - 300, "/tmp/warmup-tree", "warmup"),
                 self.waiter(500, NOW.timestamp() - 60, "/tmp/third", "third"))
+
+    def poll_at(self, seconds: int, *, pid: int = 300, free: float = 0) -> gate.CheckResult:
+        instant = NOW + timedelta(seconds=seconds)
+        with patch(__name__ + ".NOW", instant), patch.object(time, "time", return_value=instant.timestamp()):
+            return self.check(pid=pid, need=1, free=free)
+
+    def test_first_wait_and_plain_recheck_do_not_record_a_token_gap(self) -> None:
+        _ = self.poll_at(0)
+        _ = self.poll_at(10)
+        self.assertFalse((self.root / "admission/queue_times.jsonl").exists())
 
     def test_waiter_identity_keeps_the_bare_step_and_caller_identity(self) -> None:
         with patch.dict(os.environ, {"CODEX_THREAD_ID": "worker-id", "CLAUDE_CODE_SESSION_ID": "parent-id",

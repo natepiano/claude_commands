@@ -26,6 +26,7 @@ import rca  # noqa: E402
 import review  # noqa: E402
 import send  # noqa: E402
 import sessions  # noqa: E402
+import session_staff  # noqa: E402
 from scripts.production import showrunners  # noqa: E402
 import silence  # noqa: E402
 from user_action import NoActionRequired  # noqa: E402
@@ -104,7 +105,7 @@ class RcaTests(unittest.TestCase):
         # A fixed clock: a case id carries the day, so a call with no time of its own opens 261023-<n> on any day.
         _ = self.enterContext(mock.patch.object(rca, "now", return_value=OPENED))
         (self.root / "sessions").mkdir()
-        removed = (rca.PRODUCTION_MARK, "CLAUDE_CODE_SESSION_ID", "RCA_TEST_EXIT")
+        removed = (session_staff.PRODUCTION_MARK, "CLAUDE_CODE_SESSION_ID", "RCA_TEST_EXIT")
         environment = {key: value for key, value in os.environ.items() if key not in removed}
         self.enterContext(mock.patch.dict(os.environ, environment | {
             "RCA_TEST_LOG": str(self.log), "USER_ZONE": "America/Puerto_Rico",
@@ -212,7 +213,7 @@ class RcaTests(unittest.TestCase):
     def test_the_owner_is_natedev_without_a_running_showrunner_and_the_mark_names_the_production(self) -> None:
         _ = rca.open_case(HANDLER._replace(production=""), OPENED)
         _ = rca.open_case(HANDLER._replace(session="other", production="stopped-production"), OPENED)
-        with mock.patch.dict(os.environ, {rca.PRODUCTION_MARK: "cargo-liner"}):
+        with mock.patch.dict(os.environ, {session_staff.PRODUCTION_MARK: "cargo-liner"}):
             _ = rca.open_case(HANDLER._replace(session="marked", production=""), OPENED)
         self.assertEqual([flags(argv)["--to"] for argv in self.sends()], ["natedev", "natedev", SHOWRUNNER])
         self.assertEqual(self.case("261023-3")["production"], "cargo-liner")
@@ -220,7 +221,7 @@ class RcaTests(unittest.TestCase):
     def test_the_mark_is_the_one_unit_lookup_reads(self) -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
         import unit_lookup
-        self.assertEqual(rca.PRODUCTION_MARK, unit_lookup.PRODUCTION_MARK)
+        self.assertEqual(session_staff.PRODUCTION_MARK, unit_lookup.PRODUCTION_MARK)
 
     def test_a_by_hand_open_takes_the_newest_transcript_of_the_session_it_names(self) -> None:
         _ = self.transcript("-home-handler-old", "sid-handler", 1000)
