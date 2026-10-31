@@ -1,6 +1,6 @@
 # Quota alerts: the receiver's protocol
 
-natedev's two-minute notes timer checks Claude and Codex weekly readings. Account notes have numbered labels, role lists, live-session counts and a `## Live sessions` table; an account is in use when it has a role or a live session.
+Natedev's agent-notes job checks Claude and Codex weekly readings. Its notes and quota parts have separate process limits in `config/agent_notes.toml`; quota uses the notes part's saved readings. Account notes have numbered labels, role lists, live-session counts and a `## Live sessions` table; an account is in use when it has a role or a live session.
 
 ## Claude: what happens next
 
