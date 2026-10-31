@@ -879,7 +879,7 @@ def close_finished_decision(ledger: style_ledger.Ledger, issue: Path) -> bool:
     if not findings or left_to_build(findings):
         return False
     tickets = sorted(ticket["id"] for ticket in ledger.proposal_tickets()
-                     if ticket["state"] == "merged" and Path(ticket["proposal"]) == issue)
+                     if ticket["state"] == "merged" and issue in ledger.ticket_proposals(ticket["id"]))
     if tickets:
         reason = BUILT_REASON + ", ".join(tickets)
     else:
@@ -1035,7 +1035,7 @@ def plan_moves(ledger: style_ledger.Ledger, proposals: Path, issues: list[Issue]
     all_findings = {finding.finding_id: finding for finding in ledger.held_findings(style_ledger.AllHeldFindings())}
     open_tickets = tuple(ticket for ticket in ledger.proposal_tickets()
                          if ticket["state"] not in style_ledger.FINAL_TICKET_STATES)
-    holding = {Path(ticket["proposal"]): ticket for ticket in open_tickets}
+    holding = {issue: ticket for ticket in open_tickets for issue in ledger.ticket_proposals(ticket["id"])}
     open_ids = {ticket["id"] for ticket in open_tickets}
     refile: Mapping[str, style_ledger.PersonReading] = scope.refilings if isinstance(scope, FileBuiltAgain) else {}
     directories = workspace_directories(ledger)
@@ -1331,7 +1331,8 @@ def file_unapplied_again(ledger: style_ledger.Ledger, issue: Path, parent: str, 
     Every refusal comes before the first write.
     """
     building = [ticket["id"] for ticket in ledger.proposal_tickets()
-                if Path(ticket["proposal"]) == issue and ticket["state"] not in style_ledger.FINAL_TICKET_STATES]
+                if ticket["state"] not in style_ledger.FINAL_TICKET_STATES
+                and issue in ledger.ticket_proposals(ticket["id"])]
     if building:
         raise style_ledger.LedgerError(f"{issue}: open ticket {building[0]} builds it")
     commit = ledger.synced_commit()

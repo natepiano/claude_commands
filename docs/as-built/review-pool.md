@@ -113,7 +113,7 @@ Lens `ux` with no pool is accepted. From there the launcher:
 3. For `ui`, reads `${SESSION_DIR}/ux_shots_${PASS_INDEX}.txt`, one path per line, into `--image` arguments. An unreadable file (`ERROR: UI shots file is unreadable: <path>.`) or one with no paths (`ERROR: UI shots file has no paths: <path>.`) exits 1 before allocation.
 4. Runs `review_pool.py allocate --production <slug> --type <type> --unit <unit> --phase <phase> --pass <pass_index> [--lens L] --pid $$`. A failure prints `ERROR: pool allocation failed: <the pool's last stderr line>; see <log>.` and exits 1 with no turn; the log is `review_agent_<N>[_<lens>]-pool.log`.
 5. Takes `reviewer`, `mesh_dir`, `thread_id`, `lease_ordinal` and `prime_hash` from the allocation line. Its slot is `pool_<reviewer>`: exported as `UNIT_TEAM_ROLE` and written as one line to the slot file, since the slot is known only after allocation and the unit director needs it to cancel.
-7. Claims the reviewer in the pool's `mesh_dir` (`can-follow --claim-pid $$`), compacting it first when its recorded context is an integer over `UNIT_COMPACT_ABOVE_TOKENS` (100000 in `config/direct.conf`). Roster, compaction, claim and claim release use the pool's `mesh_dir`; status file, findings, agent log, heartbeat, board and pass stay in the unit's `${SESSION_DIR}`.
+7. Claims the reviewer in the pool's `mesh_dir` (`can-follow --claim-pid $$`), compacting it first when its recorded context is an integer over `UNIT_COMPACT_ABOVE_TOKENS` (100000 in `config/direct.conf`). Compaction exit 3 (live turn) or 4 (roster changed) refuses the follow-up; exit 4 advises inspection and same-thread `reopen` when idle. Other compaction failures allow the follow-up. Roster, compaction, claim and claim release use the pool's `mesh_dir`; status file, findings, agent log, heartbeat, board and pass stay in the unit's `${SESSION_DIR}`.
 8. Records the review pass under its slot, except for lens `ux` (`record_pass_start` returns at once, with a pool and without one): the unit director's `UX review` activity already carries that time, and a pass would count it twice. An early launch defers the pass until its sentinel file appears, as on the assigned path; it checks for the file every `UNIT_EARLY_POLL_SECS` (default 5 s; tests set it small).
 9. Runs `codex_mesh.py follow --session-dir <mesh_dir> --to <reviewer> --claim-pid $$ --role review [--lens L] --cwd "${WORKING_DIR}" --read-only [--image …] --message-file … --summary-file <findings> --reply-file … --log-file … --model … --effort … --service-tier …` with the review model, effort and tier.
 10. After the turn, checks that the working tree is unchanged, counts the findings, writes `reviewed` or `error` to the status file and closes the pass (`finish-pass --status completed` or `error`).
@@ -336,3 +336,12 @@ A reason given beside its mechanism above is not repeated here.
 - `scripts/agents/test_codex_mesh.py`, with a fake app-server, covers `prime`, `fork`, `set-instructions`, `reset`, the three `follow` flags, and standing instructions restored on resume, fork, compact and a replaced thread.
 - `scripts/production/test_review_unit_phase.py` (3 tests): the standing phase reads as `1 of 1`, running; a resume adds no run and no phase; shutdown finishes the run while the plan heading stays `todo`.
 - `scripts/direct/test_progress_history.py` covers the `UX review` activity's time.
+
+
+Reviewer transfer takes unit ledgers before the pool lock, then the shared
+worker lifecycle locks for the source reviewer and destination worker in sorted
+`(session, name)` order. The lifecycle fence covers source identity validation,
+queue transfer and writer release through destination publication and recovery.
+Inbox acquisition during adoption remains nonblocking. Ordinary worker turn
+watching never holds the lifecycle lock; the lock order is ledger, design/pool,
+lifecycle, inbox, roster.
