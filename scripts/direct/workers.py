@@ -204,6 +204,7 @@ def _required(record: Mapping[str, object], key: str) -> str:
 
 
 def _read(path: Path) -> dict[str, object]:
+    """Read worker evidence; other record kinds use read_json_object instead."""
     return worker_lifecycle.read_worker_state(path)
 
 
@@ -424,7 +425,7 @@ def _ledger_for_run(run: Path) -> UnitWorkerLedger:
     """Use explicit unit metadata, then the plan's production header, else the worktree."""
     from scripts.direct.progress_history import ProductionUnitIdentity, resolve_production_unit
 
-    state = _read(run / STATE)
+    state = worker_lifecycle.read_json_object(run / STATE)
     worktree = Path(_text(state.get("working_dir")) or str(run)).expanduser().resolve()
     identity = resolve_production_unit({**state, "working_dir": str(worktree)})
     if isinstance(identity, ProductionUnitIdentity):
@@ -449,7 +450,7 @@ def ledger_for_run(run: Path) -> UnitWorkerLedger:
         _finish_move(_read(journal))
         store = _ledger_for_run(run)
     if store.path.parent.name != "adhoc" and (run / STATE).exists():
-        state = _read(run / STATE)
+        state = worker_lifecycle.read_json_object(run / STATE)
         if (state.get("production"), state.get("unit")) != (store.path.parent.name, store.path.stem):
             from scripts.direct import progress_history
             progress_history.set_unit(run, store.path.parent.name, store.path.stem)
@@ -1235,7 +1236,7 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
 def _reviewer_destination(
     run: Path, working_dir: Path | NoLauncherWorkingDirectory = NO_LAUNCHER_WORKING_DIRECTORY,
 ) -> str:
-    state = _read(run / STATE)
+    state = worker_lifecycle.read_json_object(run / STATE)
     directory = _text(state.get("working_dir"))
     if not directory and isinstance(working_dir, Path):
         directory = str(working_dir.expanduser().resolve())
@@ -1290,13 +1291,13 @@ def resolve_live_unit_director(
         if director and session["sessionId"] == director:
             return LiveUnitDirector(session["sessionId"], session["pid"])
     dependencies(run / STATE)
-    context = _read(run / STATE)
+    context = worker_lifecycle.read_json_object(run / STATE)
     production, unit = context.get("production"), context.get("unit")
     names: set[str] = set()
     for path in shutdown_state_root().glob("*/history/*.json"):
         dependencies(path)
         try:
-            saved = _read(path)
+            saved = worker_lifecycle.read_json_object(path)
         except (OSError, ValueError, WorkerUnavailable):
             continue
         previous = _object(saved.get("session"))
@@ -1424,7 +1425,7 @@ def live_detached_runs(run: Path) -> tuple[tuple[Path, dict[str, object]], ...]:
     from scripts.agents import mesh_runs
     records: list[tuple[Path, dict[str, object]]] = []
     for path in sorted((run / "mesh_runs").glob("*.json")):
-        record = _read(path)
+        record = worker_lifecycle.read_json_object(path)
         pid = record.get("pid")
         if record.get("status") == "running" and isinstance(pid, int) and mesh_runs.supervises(pid, path):
             records.append((path, record))
@@ -1746,7 +1747,7 @@ def find_moved_unit_runs(units: tuple[UnitWorktree, ...], former: tuple[str, ...
         os.environ.get("UNIT_RUN_ROOT") or os.environ.get("RETIRE_UNIT_RUN_ROOT"))
         for name in (STATE, ROSTER) for path in root.glob(f"*/{name}")}
     for run in sorted(paths):
-        state = _read(run / STATE)
+        state = worker_lifecycle.read_json_object(run / STATE)
         working = _text(state.get("working_dir"))
         roster = _read(run / ROSTER)
         worker_paths = [_text(_object(value).get("cwd")) for value in roster.values()]
@@ -1802,7 +1803,7 @@ def repoint_unit_worktree(production: str, unit: str, old: Path, new: Path, bran
     runs: set[Path] = set()
     for directory in unit_runs.run_roots(os.environ.get("UNIT_RUN_ROOT") or os.environ.get("RETIRE_UNIT_RUN_ROOT")):
         for path in directory.glob(f"*/{STATE}"):
-            state = _read(path)
+            state = worker_lifecycle.read_json_object(path)
             if (state.get("working_dir") in (str(old), str(new))
                     or (state.get("production") in (from_production, production) and state.get("unit") == unit)):
                 runs.add(path.parent)
@@ -1873,7 +1874,7 @@ def _repoint_worktree_runs(production: str, unit: str, old: Path, new: Path, bra
                 if not dry_run:
                     lock = locks.enter_context((run / ".progress_history.lock").open("a+", encoding="utf-8"))
                     worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
-                state = _read(run / STATE)
+                state = worker_lifecycle.read_json_object(run / STATE)
                 updated = dict(state)
                 updated.update({"production": production, "unit": unit})
                 if state.get("working_dir") in (str(old), str(new)):

@@ -16,7 +16,7 @@ import json
 import threading
 import time
 import select
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -324,8 +324,8 @@ def validate_worker_state_value(path: Path, value: object) -> object:
     return validate_worker_state(path, value)
 
 
-def read_worker_value(path: Path) -> object:
-    """One strict JSON parser for object state and the message-id manifest."""
+def _read_validated_json(path: Path, validate: Callable[[Path, object], object]) -> object:
+    """Parse one complete publication, then apply the record's own schema."""
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -338,7 +338,17 @@ def read_worker_value(path: Path) -> object:
         value = cast(object, json.loads(text))
     except (ValueError, UnicodeError) as error:
         raise WorkerStateUnreadable(path, str(error)) from error
-    return validate_worker_state_value(path, value)
+    return validate(path, value)
+
+
+def read_json_object(path: Path) -> dict[str, object]:
+    """Strict atomic object snapshot without imposing a worker record schema."""
+    return _state_object(path, _read_validated_json(path, _state_object))
+
+
+def read_worker_value(path: Path) -> object:
+    """Strict worker state or message-id manifest, including its nested schema."""
+    return _read_validated_json(path, validate_worker_state_value)
 
 
 def read_worker_state(path: Path) -> dict[str, object]:
