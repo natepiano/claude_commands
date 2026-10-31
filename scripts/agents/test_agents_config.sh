@@ -119,6 +119,68 @@ assert_registry_matches() {
     diff -u <(registry_records < "$1") <(agents_registry_text | registry_records)
 }
 
+test_resolve_reads_registry_once() (
+    AGENTS_CONFIG_FILE="$TEST_DIR/read-once.conf"
+    write_fixture "$TEST_DIR/base.conf"
+    # A file counts reads in command substitutions as well as this shell.
+    registry_reader="$(declare -f agents_registry_text)"
+    eval "${registry_reader/agents_registry_text /test_original_registry_text }"
+    agents_registry_text() {
+        printf 'read\n' >> "$TEST_DIR/registry-reads"
+        test_original_registry_text "$@"
+    }
+    for task in alpha.work alpha.claude_task; do
+        : > "$TEST_DIR/registry-reads"
+        agents_resolve "$task" || fail "read-count task did not resolve: $task"
+        read_count="$(wc -l < "$TEST_DIR/registry-reads")"
+        [[ "$read_count" -eq 1 ]] \
+            || fail "$task read the registry $read_count times; expected one read per resolve"
+        if [[ "$task" == alpha.work ]]; then
+            [[ "$AGENT_FAMILY" == codex && "$AGENT_MODEL" == gpt-test && "$AGENT_EFFORT" == high ]] \
+                || fail "single-read resolve changed the Codex result"
+        else
+            [[ "$AGENT_FAMILY" == claude && "$AGENT_MODEL" == opus && "$AGENT_EFFORT" == max ]] \
+                || fail "single-read resolve changed the exact-task override"
+        fi
+    done
+    echo "agents_config single-read tests passed"
+)
+
+test_registry_edit_refreshes_readers() (
+    AGENTS_CONFIG_FILE="$TEST_DIR/edit-refresh.conf"
+    write_fixture "$TEST_DIR/base.conf"
+    agents_resolve alpha.work
+    [[ "$AGENT_EFFORT" == high ]] || fail "edit fixture did not start at high effort"
+    store_changed_effort() {
+        sed 's/^work=gpt-test:high$/work=gpt-test:medium/' < <(agents_registry_text) \
+            > "$TEST_DIR/edited-registry.conf"
+        agents_registry_store "$TEST_DIR/edited-registry.conf" "test effort edit"
+    }
+    agents_registry_edit store_changed_effort
+    agents_resolve alpha.work
+    [[ "$AGENT_MODEL" == gpt-test && "$AGENT_EFFORT" == medium ]] \
+        || fail "same-shell resolve kept registry values from before the edit"
+    echo "agents_config edit refresh tests passed"
+)
+
+test_changed_registry_file_refreshes_readers() (
+    AGENTS_CONFIG_FILE="$TEST_DIR/first-registry.conf"
+    write_fixture "$TEST_DIR/base.conf"
+    sed 's/^work=gpt-test:high$/work=gpt-test:medium/' "$TEST_DIR/base.conf" \
+        > "$TEST_DIR/second-registry.conf"
+    agents_resolve alpha.work
+    [[ "$AGENT_EFFORT" == high ]] || fail "first registry did not resolve high effort"
+    AGENTS_CONFIG_FILE="$TEST_DIR/second-registry.conf"
+    agents_resolve alpha.work
+    [[ "$AGENT_MODEL" == gpt-test && "$AGENT_EFFORT" == medium ]] \
+        || fail "same-shell resolve kept values from the previous registry file"
+    AGENTS_CONFIG_FILE="$TEST_DIR/first-registry.conf"
+    agents_resolve alpha.work
+    [[ "$AGENT_MODEL" == gpt-test && "$AGENT_EFFORT" == high ]] \
+        || fail "switching back to the first registry kept the second file's values"
+    echo "agents_config file refresh tests passed"
+)
+
 test_model_families() (
     # Keep these fixtures separate from the legacy mutation cases below. A
     # generated family row may lag the cache until the next catalog sync.
@@ -885,5 +947,9 @@ admin_output="$(admin production.director sonnet:xhigh)"
 agents_resolve production.director
 [[ "$AGENT_FAMILY" == "claude" && "$AGENT_MODEL" == "sonnet" && "$AGENT_EFFORT" == "xhigh" ]] \
     || fail "director row edit did not resolve sonnet:xhigh"
+
+test_registry_edit_refreshes_readers
+test_changed_registry_file_refreshes_readers
+test_resolve_reads_registry_once
 
 echo "agents_config tests passed"

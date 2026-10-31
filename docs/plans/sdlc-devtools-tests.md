@@ -163,18 +163,51 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
 - The signal mask covers the calling thread only. The gate starts no other thread.
 - `module_seconds.json` holds the first attempt's wall time, and `module_cpu_seconds.json` holds the last finished attempt's CPU. Compare the two only from one attempt.
 
-### Phase 5 — The gate runs a large module's test classes as separate jobs  · status: todo
-**Depends on:** Phase 4; resources-unit's be4d46f7 on main (it changes the same `merge_gate.py` hunks)
+### Phase 5 — The gate runs a large module's test classes as separate jobs  · status: done
 
-Source: devtools-unit from the full gate 3 measure, 2026-10-30; natedev's go, 2026-10-30, with one condition (below). The gate already starts the slowest recorded module first (`module_order`), so the wall time is the largest single module: `agents/test_codex_mesh.py` took 1057 s of the gate's 1062 s (32 classes, 593 tests). The next largest are `direct/test_assign_launcher.py` 734 s (1 class), `shutdown/test_bounded_stop.py` 442 s (2 classes) and `direct/test_verify_hold_wait.py` 311 s (1 class). herdr deletes `test_codex_mesh.py` only in its Phase 18. Goal: a module whose recorded time is over a limit runs as one job per test class, each with its own recorded time, peak and CPU time, so no test file changes and the wall time drops to about 734 s. natedev's condition: a module with `setUpModule`, `tearDownModule` or module-level state that its classes share stays one job; split only modules whose classes run alone, and a test proves that a split module gives the same pass and fail result as one job. The Work Order is written when be4d46f7 is on main.
+Dropped 2026-10-30 by its own rule: no module that natedev's condition allows to split would cut the gate's wall time. From `module_history.json` (last five runs) and each module's classes: the slowest module, `direct/test_assign_launcher.py` (413-1204 s), has one class and `setUpModule`; `agents/test_codex_mesh.py` has `setUpModule`; the modules with more than one class and no module setup all ran under 60 s last time (`hana_shot/test_hana_shot.py` 59 s, 12 classes; `agents/test_agents_conf_publish.py` 46 s, 3 classes; `herdr/test_herdr.py` 41 s, 3 classes). The wall-time lever is Phase 6: the waits in `direct/test_assign_launcher.py`.
 
-Precondition (the sdlc showrunner, 2026-10-30): `production/test_dailies_input.py` `test_style_summary_is_saved_only_for_a_style_production_and_keeps_every_ledger_key` fails only in a full `scripts/production` discover run (`rules_total` 58, expected 1) and passes alone. The likely cause: `style_rules` reads `NATE_STYLE_DIR` at import, and `dailies_input_test_support.py:276` runs `style_ledger` in the same process, so an earlier test's rule catalog stays. Fix it at the cause (read the variable when called, not at import). A class or module split must not hide it.
-
-From Phase 4 (architect review, 2026-10-30): `agents/test_codex_mesh.py` has `setUpModule`, so natedev's condition keeps it one job, and the other named modules have one class each. Before the Work Order, list the modules that the condition allows and that hold more than one class, with their recorded seconds. If no allowed module would cut the gate's wall time, tell the sdlc showrunner and drop this phase. A Work Order must: give each job one explicit target (whole module or `module:Class`) carried through the job lifecycle with one identity rule, so class records do not overwrite each other in `module_seconds.json`, `module_peak_mib.json` and `module_cpu_seconds.json`; say how `module_order` and Phase 6 read class records and ignore stale module records; keep `reap_gate_job` as the one reaping path (be4d46f7 still uses `poll()`/`wait()`); keep the interrupt-cleanup, waited-child, retry-total and killed-record tests; accept on distinct class records, nested paths and a rerun of only the failed class.
-
-### Phase 6 — The slowest modules lose their real-time waits  · status: todo
+### Phase 6 — One agents.conf parse per resolve  · status: done
 **Depends on:** Phase 4; Phase 2
 
 Source: devtools-unit, 2026-10-30. From Phase 4's CPU measure, each module over 60 s whose time is mostly waiting (low CPU) gets its cause found and fixed in its own test or fixture. First candidates: `direct/test_verify_hold_wait.py` (5 tests, 311 s) and `direct/test_assign_launcher.py` (41 tests, 734 s). Fence (the sdlc showrunner, 2026-10-30): models owns the real-time waits in `scripts/agents/test_codex_mesh.py` and `scripts/agents/test_heartbeat.py` (its hang guard checkpoint). This phase leaves those two files out, unless Phase 4's measure still shows them on top after models' checkpoint merges; then agree the split with models first. The Work Order is written from Phase 4's measure.
 
 From Phase 4: the input is `module_cpu_seconds.json` beside `module_seconds.json`. The two can come from different attempts (wall time from the first attempt, CPU time from the last attempt that finished; a limit kill updates wall time only), so the ranking uses wall and CPU seconds from the same attempt (the paired `GateJobResult` values), with tests for a retry and a limit kill.
+
+From the measure on 2026-10-30 (`module_history.json`, last five runs): `direct/test_verify_hold_wait.py` now takes 16-51 s (last 22 s wall, 14 s CPU), so it is off the list. `direct/test_assign_launcher.py` took 413-1204 s (last 413 s wall, 198 s CPU) and stays the first candidate. `direct/test_workers.py` (65-279 s) and `hana_shot/test_hana_shot.py` (59-107 s) are next to check.
+
+From Phase 2c (architect review, 2026-10-30): `direct/test_assign_launcher.py` `AssignLauncherTests` inherits `MeshCommandFixture` and its `LifecycleTestClock` from the models-owned `scripts/agents/test_codex_mesh.py`, and it already freezes that clock (`self.lifecycle_clock.freeze()`). Find the wait against that current fixture first. A change to the shared fixture, or its move out of `test_codex_mesh.py` (herdr deletes that file in its Phase 18), is agreed with models before the Work Order; a reusable clock or fixture has one owner and one implementation, never a second copy under `scripts/direct/`.
+
+**Constraints from prior phases:** synchronous `LauncherHangGuard.protect()` expiry raises `FixtureHang`, a `BaseException`; the guard's ordinary timeout methods raise `TimeoutError`. A test of an expired guard expects that class (Phase 2 needed a repair for expecting `AssertionError`). Keep the expiry and cleanup tests in `scripts/lib/test_hang_guard_behavior.py`.
+
+Measure and split (devtools-unit, 2026-10-30, trace notes in the run's diagnosis): `direct/test_assign_launcher.py` runs 42 tests in 545 s, each 10-35 s. One 32 s test with 3 dispatches spends about 12 s in `agents_resolve` and 9 s in codex_mesh's queue grace. models-unit agreed (2026-10-30) that devtools makes both changes: the parse now (this phase), the queue grace after models' compaction repair 2 checkpoint (Phase 6b).
+
+#### Work Order
+
+**Goal:** `agents_resolve` and the other registry readers in `scripts/agents/agents_config.sh` parse agents.conf once per call, so one resolve takes well under its current 1.8-2.4 s and gives the same result.
+
+**Spec:**
+- Cause (measured): every section lookup (`_agents_config_has_section`, `_agents_config_section_values`, through `_agents_registry_get` and `_agents_registry_has_key`) reads the whole registry again through `agents_registry_text` and re-parses each line, and `agents_config_trim` runs in a `$(...)` subshell for each line. One resolve reads agents.conf about 8 times with about 250 ms between reads.
+- Parse the registry text once into one in-shell table (sections and their trimmed `key=value` rows) and have every reader use that table. Trim with parameter expansion in the same shell, never a subshell per line. `agents_registry_text` stays the one read point, and the table is built from it, so `AGENTS_REGISTRY_BASE` (an edit's snapshot) and the file give the same answers as now.
+- The table must never give stale answers: an edit (`agents_registry_edit`, `agents_registry_store`) or a changed `AGENTS_CONFIG_FILE` makes the next reader parse again. One parse per top-level call is enough; do not keep it across separate `bash -c` calls.
+- Same outputs, errors and exit codes for every reader as now, the ones in `codex_mesh.py` (`mesh-turn` at about line 5443, the workers resolve at about line 6117, `codex-mesh-tier`) included. No change to agents.conf format.
+- No copy: one parser, one table, one trim.
+
+**Files:**
+- `scripts/agents/agents_config.sh` — the one parse and the readers that use it
+- `scripts/agents/test_agents_config.sh` — tests for one parse per call, edit invalidation and unchanged results
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `scripts/agents/agents_config.sh`
+- `test` — `scripts/agents/test_agents_config.sh`, from this Spec alone: a reader call parses the registry once (count calls of the one read point), an edit then a read sees the edit, and the existing cases keep their results
+
+**State:** none
+
+**Constraints from prior phases:** the merge gate runs only `test_*.py` modules, so `test_agents_config.sh` runs by hand: `bash scripts/agents/test_agents_config.sh` from the worktree root. Python callers that cover this file: `scripts/agents/test_models_cache.py`, `scripts/agents/test_agents_conf_publish.py`, `scripts/lib/test_nix_env_launches.py`, `scripts/direct/test_assign_launcher.py`.
+
+**Acceptance gate:** `bash scripts/agents/test_agents_config.sh` green, with the new one-parse test failing on the old code; `python3 -m unittest scripts.agents.test_models_cache scripts.agents.test_agents_conf_publish scripts.lib.test_nix_env_launches` green; `python3 -m unittest --durations 0 scripts.direct.test_assign_launcher` green, with its total time before and after on the same machine in the summary.
+
+### Phase 6b — The queue grace reaches child processes in tests  · status: todo
+**Depends on:** Phase 6; models' compaction repair 2 checkpoint (models sends the hash, ETA 23:00 EDT 2026-10-30)
+
+Source: devtools-unit diagnosis, 2026-10-30; models-unit's go, 2026-10-30. `QUEUE_GRACE_SECS = 3.0` (`scripts/agents/codex_mesh.py:306`, used at about line 2978) makes `follow` wait 3 s after each turn. `MeshCommandFixture` patches it to 0.0 in the test process (`scripts/agents/test_codex_mesh.py:831`), but `direct/test_assign_launcher.py` runs codex_mesh as a child process, so the child still waits: 3 s per dispatch. Goal: codex_mesh reads the grace from one env var at use (default 3.0), and `MeshCommandFixture` sets that env var where it patches the constant now. Build on models' checkpoint, which rewrites much of both files; send models the diff for those two files before the merge. The Work Order is written when the hash arrives.

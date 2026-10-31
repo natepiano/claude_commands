@@ -37,14 +37,17 @@ agents_registry_text() {
 # Validation and transformation see the same snapshot. Storage alone reads the
 # latest file and replays the intended row delta onto concurrent changes.
 agents_registry_edit() {
+    _agents_table_valid=0
     local AGENTS_REGISTRY_BASE
-    AGENTS_REGISTRY_BASE="$(cat "$AGENTS_CONFIG_FILE")" || return 1
-    "$@"
+    unset AGENTS_REGISTRY_BASE
+    AGENTS_REGISTRY_BASE="$(agents_registry_text)" || return 1
+    _agents_registry_read "$@"
 }
 
 # All editors use the same atomic row replay and publication path. The caller's
 # local snapshot identifies its changes without reverting a concurrent editor.
 agents_registry_store() {
+    _agents_table_valid=0
     local registry="$1" description="${2:-update registry}" result=0
     local extra=()
     [[ "${3:-}" != additive-catalog ]] || extra+=(--additive-catalog)
@@ -67,48 +70,92 @@ if [[ "${AGENTS_CONFIG_TIER_ONLY:-}" != 1 && -f "$AGENTS_CONFIG_FILE" \
     fi
 fi
 
+# With an output variable, trim in this shell. Without one, keep the printed API.
 agents_config_trim() {
-    local value="$1"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    printf '%s' "$value"
+    local agents_trim_value="$1"
+    agents_trim_value="${agents_trim_value#"${agents_trim_value%%[![:space:]]*}"}"
+    agents_trim_value="${agents_trim_value%"${agents_trim_value##*[![:space:]]}"}"
+    if [[ $# -gt 1 ]]; then
+        printf -v "$2" '%s' "$agents_trim_value"
+    else
+        printf '%s' "$agents_trim_value"
+    fi
 }
 
-_agents_config_has_section() {
-    local want_section="$1" line stripped section text
-    [[ -f "$AGENTS_CONFIG_FILE" ]] || return 1
+# A table belongs to one reader call. Bash's dynamic scope lets nested readers
+# and command substitutions share it, without caching across separate calls.
+# File and snapshot identity also protect readers inside an edit callback.
+_agents_registry_read() {
+    if [[ "${_agents_table_valid:-0}" == 1 \
+        && "${_agents_table_file:-}" == "$AGENTS_CONFIG_FILE" \
+        && "${_agents_table_base_set:-}" == "${AGENTS_REGISTRY_BASE+x}" \
+        && "${_agents_table_base:-}" == "${AGENTS_REGISTRY_BASE:-}" ]]; then
+        "$@"
+        return $?
+    fi
+    local _agents_table_valid=1 _agents_table_file="$AGENTS_CONFIG_FILE"
+    local _agents_table_base_set="${AGENTS_REGISTRY_BASE+x}"
+    local _agents_table_base="${AGENTS_REGISTRY_BASE:-}"
+    local -a _agents_table_sections=() _agents_table_rows=()
+    _agents_registry_parse
+    "$@"
+}
+
+# Empty rows mark section headers, including sections that have no values.
+# Other rows keep their order and their original key spelling.
+_agents_registry_parse() {
+    local text line stripped section=""
+    [[ -f "$AGENTS_CONFIG_FILE" ]] || return 0
     text="$(agents_registry_text)"
     while IFS= read -r line || [[ -n "$line" ]]; do
-        stripped="${line%%#*}"
-        stripped="$(agents_config_trim "$stripped")"
+        agents_config_trim "${line%%#*}" stripped
         [[ -z "$stripped" ]] && continue
         if [[ "$stripped" =~ ^\[(.+)\]$ ]]; then
             section="${BASH_REMATCH[1]}"
-            [[ "$section" == "$want_section" ]] && return 0
+            _agents_table_sections+=("$section")
+            _agents_table_rows+=("")
+        else
+            _agents_table_sections+=("$section")
+            _agents_table_rows+=("$stripped")
         fi
     done <<< "$text"
+    return 0
+}
+
+_agents_config_has_section() {
+    _agents_registry_read _agents_table_has_section "$@"
+}
+
+_agents_table_has_section() {
+    local want_section="$1" index
+    for index in "${!_agents_table_sections[@]}"; do
+        if [[ "${_agents_table_sections[index]}" == "$want_section" \
+            && -z "${_agents_table_rows[index]}" ]]; then
+            return 0
+        fi
+    done
     return 1
 }
 
 _agents_config_section_values() {
-    local want_section="$1" line stripped section text
-    [[ -f "$AGENTS_CONFIG_FILE" ]] || return 0
-    text="$(agents_registry_text)"
-    section=""
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        stripped="${line%%#*}"
-        stripped="$(agents_config_trim "$stripped")"
-        [[ -z "$stripped" ]] && continue
-        if [[ "$stripped" =~ ^\[(.+)\]$ ]]; then
-            section="${BASH_REMATCH[1]}"
-            continue
-        fi
-        [[ "$section" == "$want_section" ]] || continue
-        printf '%s\n' "$stripped"
-    done <<< "$text"
+    _agents_registry_read _agents_table_section_values "$@"
+}
+
+_agents_table_section_values() {
+    local want_section="$1" index
+    for index in "${!_agents_table_sections[@]}"; do
+        [[ "${_agents_table_sections[index]}" == "$want_section" ]] || continue
+        [[ -n "${_agents_table_rows[index]}" ]] || continue
+        printf '%s\n' "${_agents_table_rows[index]}"
+    done
+    return 0
 }
 
 _agents_section_keys_inline() {
+    _agents_registry_read _agents_section_keys_inline_from_table "$@"
+}
+
+_agents_section_keys_inline_from_table() {
     local section="$1" line key first=1
     while IFS= read -r line; do
         key="${line%%=*}"
@@ -121,37 +168,41 @@ _agents_section_keys_inline() {
     done < <(_agents_config_section_values "$section")
 }
 
-# These two return from inside the loop as soon as they find their row, so they
-# read the section into a variable first rather than looping over a process
-# substitution. Returning early from `while read ... < <(producer)` leaves the
-# producer writing into a pipe with no reader, and every remaining printf in
-# _agents_config_section_values reports "write error: Broken pipe" on stderr.
-# Reading the complete section avoids these errors in callers and job logs.
 _agents_registry_get() {
-    local section="$1" key="$2" values line row_key value
-    values="$(_agents_config_section_values "$section")"
-    while IFS= read -r line; do
-        [[ -n "$line" ]] || continue
-        row_key="${line%%=*}"
-        [[ "$row_key" == "$key" ]] || continue
-        value="${line#*=}"
-        agents_config_trim "$value"
+    _agents_registry_read _agents_table_get "$@"
+}
+
+_agents_table_get() {
+    local section="$1" key="$2" index line
+    for index in "${!_agents_table_sections[@]}"; do
+        [[ "${_agents_table_sections[index]}" == "$section" ]] || continue
+        line="${_agents_table_rows[index]}"
+        [[ -n "$line" && "${line%%=*}" == "$key" ]] || continue
+        agents_config_trim "${line#*=}"
         return 0
-    done <<< "$values"
+    done
+    return 0
 }
 
 _agents_registry_has_key() {
-    local section="$1" key="$2" values line row_key
-    values="$(_agents_config_section_values "$section")"
-    while IFS= read -r line; do
-        [[ -n "$line" ]] || continue
-        row_key="${line%%=*}"
-        [[ "$row_key" == "$key" ]] && return 0
-    done <<< "$values"
+    _agents_registry_read _agents_table_has_key "$@"
+}
+
+_agents_table_has_key() {
+    local section="$1" key="$2" index line
+    for index in "${!_agents_table_sections[@]}"; do
+        [[ "${_agents_table_sections[index]}" == "$section" ]] || continue
+        line="${_agents_table_rows[index]}"
+        [[ -n "$line" && "${line%%=*}" == "$key" ]] && return 0
+    done
     return 1
 }
 
 _agents_function_families_inline() {
+    _agents_registry_read _agents_function_families_inline_from_table "$@"
+}
+
+_agents_function_families_inline_from_table() {
     local function="$1" family first=1
     for family in codex claude; do
         _agents_config_has_section "$function.$family" || continue
@@ -166,6 +217,10 @@ _agents_function_families_inline() {
 
 # Print the sole family of a function with exactly one configured set.
 _agents_pinned_family() {
+    _agents_registry_read _agents_pinned_family_from_table "$@"
+}
+
+_agents_pinned_family_from_table() {
     local function="$1" family found=""
     for family in codex claude; do
         _agents_config_has_section "$function.$family" || continue
@@ -184,6 +239,10 @@ _agents_pinned_error() {
 # are disjoint across families, so exactly one match names a row's family and
 # two means the catalogs collided and the caller must refuse rather than pick.
 _agents_agent_families_inline() {
+    _agents_registry_read _agents_agent_families_inline_from_table "$@"
+}
+
+_agents_agent_families_inline_from_table() {
     local agent="$1" family first=1
     for family in codex claude; do
         if ! _agents_registry_has_key "$family.agents" "$agent" \
@@ -201,6 +260,10 @@ _agents_agent_families_inline() {
 
 # Every family with an agent catalog, inline for error text.
 _agents_families_inline() {
+    _agents_registry_read _agents_families_inline_from_table "$@"
+}
+
+_agents_families_inline_from_table() {
     local family first=1
     for family in codex claude; do
         _agents_config_has_section "$family.agents" || continue
@@ -256,6 +319,10 @@ _agents_caller_error() {
 # The assignment a task resolves through today: an exact-task override if one
 # exists, otherwise the function's. Raw -- may be `caller`.
 _agents_active_family() {
+    _agents_registry_read _agents_active_family_from_table "$@"
+}
+
+_agents_active_family_from_table() {
     local function="$1" subtask="$2" family
     family="$(_agents_registry_get assignments "$function.$subtask")"
     if [[ -z "$family" ]]; then
@@ -266,6 +333,10 @@ _agents_active_family() {
 
 # The concrete family a task runs on right now; empty for an undetectable caller.
 _agents_live_family() {
+    _agents_registry_read _agents_live_family_from_table "$@"
+}
+
+_agents_live_family_from_table() {
     _agents_concrete_family "$(_agents_active_family "$1" "$2")"
 }
 
@@ -274,7 +345,7 @@ _agents_effort_allowed() {
     local old_ifs="$IFS"
     IFS=','
     for item in $allowed; do
-        item="$(agents_config_trim "$item")"
+        agents_config_trim "$item" item
         if [[ "$item" == "$effort" ]]; then
             IFS="$old_ifs"
             return 0
@@ -287,6 +358,10 @@ _agents_effort_allowed() {
 # Resolve visible model-family versions with known effort rows. Numeric ties
 # use slug order, independent of cache order; a full slug needs no cache.
 _agents_model_slug() {
+    _agents_registry_read _agents_model_slug_from_table "$@"
+}
+
+_agents_model_slug_from_table() {
     local family="$1" word="$2" model cache_text
     if ! _agents_registry_has_key "$family.families" "$word"; then
         printf '%s' "$word"
@@ -321,6 +396,10 @@ _agents_model_slug() {
 }
 
 _agents_validate_pair() {
+    _agents_registry_read _agents_validate_pair_from_table "$@"
+}
+
+_agents_validate_pair_from_table() {
     local context="$1" family="$2" pair="$3"
     local word model effort allowed_efforts allowed_agents
 
@@ -354,6 +433,10 @@ _agents_validate_pair() {
 }
 
 agents_resolve() {
+    _agents_registry_read _agents_resolve_from_table "$@"
+}
+
+_agents_resolve_from_table() {
     local task="$1" function subtask family pair section configured allowed_families
 
     function="${task%%.*}"
@@ -385,6 +468,10 @@ agents_resolve() {
 
 # The part of resolution that follows family selection: section, row, pair.
 _agents_resolve_in_family() {
+    _agents_registry_read _agents_resolve_in_family_from_table "$@"
+}
+
+_agents_resolve_in_family_from_table() {
     local task="$1" family="$2" function subtask section pair configured allowed_families
 
     function="${task%%.*}"
@@ -421,6 +508,10 @@ _agents_resolve_in_family() {
 # wrote, and default once that is over ten minutes old or missing (the Mac has no
 # pacer, so there `pace` is default).
 _agents_stored_service_tier() {
+    _agents_registry_read _agents_stored_service_tier_from_table "$@"
+}
+
+_agents_stored_service_tier_from_table() {
     local function="$1" subtask="$2" tier
     tier="$(_agents_registry_get "$function.options" "codex_service_tier.$subtask")"
     [[ -n "$tier" ]] || tier="$(_agents_registry_get "$function.options" codex_service_tier)"
@@ -428,6 +519,10 @@ _agents_stored_service_tier() {
 }
 
 _agents_resolve_service_tier() {
+    _agents_registry_read _agents_resolve_service_tier_from_table "$@"
+}
+
+_agents_resolve_service_tier_from_table() {
     local task="$1" family="$2" function tier
 
     AGENT_SERVICE_TIER=""
@@ -467,7 +562,7 @@ _agents_codex_config_tier() {
     local line
     [[ -f "$CODEX_CONFIG_FILE" ]] || return 0
     while IFS= read -r line || [[ -n "$line" ]]; do
-        line="$(agents_config_trim "${line%%#*}")"
+        agents_config_trim "${line%%#*}" line
         [[ "$line" == \[* ]] && return 0
         if [[ "$line" =~ ^service_tier[[:space:]]*=[[:space:]]*\"?([^\"]*)\"?$ ]]; then
             printf '%s' "${BASH_REMATCH[1]}"
@@ -479,6 +574,10 @@ _agents_codex_config_tier() {
 # A running Codex turn uses only the registry. An empty setting means default.
 # A task without a row uses only the function's setting.
 agents_turn_service_tier() {
+    _agents_registry_read _agents_turn_service_tier_from_table "$@"
+}
+
+_agents_turn_service_tier_from_table() {
     local task="${1:-delegate}"
     if [[ ! -r "$AGENTS_CONFIG_FILE" ]]; then
         echo "ERROR: cannot read agent registry: $AGENTS_CONFIG_FILE" >&2
@@ -507,6 +606,10 @@ _agents_tier_display() {
 }
 
 _agents_print_resolved() {
+    _agents_registry_read _agents_print_resolved_from_table "$@"
+}
+
+_agents_print_resolved_from_table() {
     local tier="$AGENT_SERVICE_TIER" word_field=""
     if _agents_registry_has_key "$AGENT_FAMILY.families" "$AGENT_WORD"; then
         word_field=" word=$AGENT_WORD"
@@ -518,12 +621,20 @@ _agents_print_resolved() {
 }
 
 agents_resolve_print() {
+    _agents_registry_read _agents_resolve_print_from_table "$@"
+}
+
+_agents_resolve_print_from_table() {
     local task="$1"
     agents_resolve "$task" || return 1
     _agents_print_resolved "$task"
 }
 
 _agents_resolve_print_in_family() {
+    _agents_registry_read _agents_resolve_print_in_family_from_table "$@"
+}
+
+_agents_resolve_print_in_family_from_table() {
     local task="$1" family="$2"
     AGENT_FAMILY="$family"
     _agents_resolve_in_family "$task" "$family" || return 1
@@ -533,6 +644,10 @@ _agents_resolve_print_in_family() {
 # Print one function's rows in one family, skipping sub-tasks an exact-task
 # assignment override shadows (those print once, from their own key).
 _agents_list_function_rows() {
+    _agents_registry_read _agents_list_function_rows_from_table "$@"
+}
+
+_agents_list_function_rows_from_table() {
     local function="$1" family="$2" line subtask
     while IFS= read -r line; do
         subtask="${line%%=*}"
@@ -544,10 +659,14 @@ _agents_list_function_rows() {
 }
 
 agents_list_assignments() {
+    _agents_registry_read _agents_list_assignments_from_table "$@"
+}
+
+_agents_list_assignments_from_table() {
     local filter="${1:-}" assignment key family live matched=0
     while IFS= read -r assignment; do
         key="${assignment%%=*}"
-        family="$(agents_config_trim "${assignment#*=}")"
+        agents_config_trim "${assignment#*=}" family
         if [[ -n "$filter" && "$key" != "$filter" && "$key" != "$filter".* ]]; then
             continue
         fi
@@ -585,6 +704,10 @@ agents_list_assignments() {
 # Print every family's rows for one function, then a comment naming the
 # active family (plus any per-subtask assignment overrides).
 agents_list_function() {
+    _agents_registry_read _agents_list_function_from_table "$@"
+}
+
+_agents_list_function_from_table() {
     local function="$1" active family line key subtask pair model effort overrides=""
     local row_active live tier word_field resolved_model
 
@@ -598,7 +721,7 @@ agents_list_function() {
         _agents_config_has_section "$function.$family" || continue
         while IFS= read -r line; do
             subtask="${line%%=*}"
-            pair="$(agents_config_trim "${line#*=}")"
+            agents_config_trim "${line#*=}" pair
             model="${pair%%:*}"
             word_field=""
             if _agents_registry_has_key "$family.families" "$model"; then
@@ -626,7 +749,8 @@ agents_list_function() {
     while IFS= read -r line; do
         key="${line%%=*}"
         [[ "$key" == "$function".* ]] || continue
-        overrides="$overrides, ${key#"$function".}=$(agents_config_trim "${line#*=}")"
+        agents_config_trim "${line#*=}" pair
+        overrides="$overrides, ${key#"$function".}=$pair"
     done < <(_agents_config_section_values assignments)
     if [[ "$active" == "$AGENTS_CALLER_ASSIGNMENT" ]]; then
         live="$(_agents_caller_family)"
@@ -720,7 +844,8 @@ _agents_set_all_assignments() {
         key="${line%%=*}"
         # A caller function is not switched, so it is not validated against the
         # target either; it already resolves through whichever family asks.
-        [[ "$(agents_config_trim "${line#*=}")" == "$AGENTS_CALLER_ASSIGNMENT" ]] && continue
+        agents_config_trim "${line#*=}" row
+        [[ "$row" == "$AGENTS_CALLER_ASSIGNMENT" ]] && continue
         fn="${key%%.*}"
         pinned="$(_agents_pinned_family "$fn")"
         if [[ -n "$pinned" ]]; then
@@ -830,7 +955,7 @@ _agents_set_model() {
 
     while IFS= read -r line; do
         key="${line%%=*}"
-        value="$(agents_config_trim "${line#*=}")"
+        agents_config_trim "${line#*=}" value
         fn="${key%%.*}"
         [[ -n "$only" && "$fn" != "$only" ]] && continue
         matched=1
@@ -866,7 +991,7 @@ _agents_set_model() {
         esac
         sections="$sections $section"
         while IFS= read -r row; do
-            pair="$(agents_config_trim "${row#*=}")"
+            agents_config_trim "${row#*=}" pair
             if ! _agents_validate_pair "$fn.${row%%=*}" "$family" "$agent${pair#"${pair%%:*}"}"; then
                 echo "ERROR: change rejected because [$section] row '${row%%=*}' keeps an effort '$agent' does not allow." >&2
                 return 1
