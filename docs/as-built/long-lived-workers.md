@@ -490,10 +490,49 @@ use the same lock module. Normal turn watching and capacity backoff release
 the lifecycle lock. Ledger telemetry refresh runs after releasing lifecycle
 and inbox locks, then reacquires ledger before lifecycle and roster.
 
-Known limit: bulk pause, bulk stop and held-server release lock the lifecycle of
-the workers present when they start, then act on every current roster entry. A
-worker added after that snapshot is changed without its lifecycle lock. A run-level
-membership lock is the planned fix (models-unit follow-up, F024 residual).
+The lock order is unit ledger, design/pool, run membership, future staff lock,
+worker lifecycle, server, inbox, then roster. `membership.lock` in each session
+serializes admissions and shared-server maintenance; multiple runs are locked
+in sorted path order. `lock_membership`/`lock_memberships` and lifecycle/server
+locks share recursion diagnostics and support an absolute shutdown deadline.
+An admission holds membership from before server selection or thread creation
+through roster publication. It releases lifecycle, inbox and roster before
+membership, leaving the point for a future `staff.ensure_worker`/`staff.retire`
+call under membership alone. No staff calls are installed here.
+
+Bulk pause, stop, held-server release and server reaping own membership through
+cleanup. `_bulk_workers` acquires every lifecycle, then returns fresh validated
+records; role, transfer and ownership refusals precede mutation. Effects use
+only that work set. A changed set during acquisition is retried within the
+same deadline. `_server_lock` serializes server selection, retirement, reaping
+and conditional record removal; cleanup never removes a replacement record.
+Held-server refresh explicitly passes its membership lease and lifecycle
+ownership. A partially owned worker set refuses with recovery instructions.
+Account moves pass bulk ownership through interruption and release all these
+locks before waiting for continuations. Acquisition timeout reports incomplete
+shutdown, without claiming a turn or server has stopped.
+
+Shutdown establishes one monotonic deadline before director/ledger lookup,
+migration or adoption recovery reached during a timed shutdown. Standalone
+`recover_adoptions` establishes no finite scope. `worker_lifecycle.operation_deadline` carries
+that budget through callbacks and nested helpers; an omitted deadline inherits
+it, and an explicit limit can only shorten it. Nested scopes restore their
+parent on every exit. New threads and processes must receive the absolute
+deadline explicitly. `acquire_flock` is the sole acquisition primitive for
+shared, exclusive and immediate try-locks, including roster/server-record
+reads, ledger migration, design locks and inboxes. Ownership bookkeeping is
+thread-local and takes no auxiliary mutex. Read fallbacks propagate lock
+expiry as `OperationDeadlineExpired` to the incomplete-shutdown report.
+Ordinary socket timeouts retain their queue-preservation and recovery results.
+Legacy `Client(deadline=...)` and frame-read deadlines use wall time and are
+converted once to monotonic limits. `Client(operation_deadline=...)` accepts an
+absolute monotonic shutdown limit. One setup deadline covers connection and
+handshake, and one RPC deadline covers its send and every reply fragment;
+neither renews the operation budget. The operation wins equal deadlines, while
+a strictly earlier transport limit keeps its transport result even if handling
+runs late. A tighter active scope also applies to an existing client.
+Reaping reports success only after exit is confirmed within that same budget;
+a refused signal or surviving server retains its records.
 
 Settlement closes only its own inbox and checks ownership before cleanup and
 terminal publication. A replacement-thread failure normalizes both port and

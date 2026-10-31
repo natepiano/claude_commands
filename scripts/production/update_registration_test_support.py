@@ -225,6 +225,9 @@ class RegistrationFixture(unittest.TestCase):
         _ = shutil.copytree(SCRIPT.parent, tree / "scripts/production")
         for name in ("build_hold", "build_targets", "buildlog", "direct", "herdr", "lib", "lint", "mac_test", "message", "shutdown", "usage", "whoami"):
             _ = shutil.copytree(SCRIPT.parent.parent / name, tree / "scripts" / name)
+        agents = tree / "scripts/agents"
+        agents.mkdir(parents=True)
+        _ = shutil.copy2(SCRIPT.parent.parent / "agents/worker_lifecycle.py", agents)
         hooks = tree / "scripts/hooks"
         hooks.mkdir(parents=True)
         _ = shutil.copy2(SCRIPT.parent.parent / "hooks/showrunner_footer.py", hooks)

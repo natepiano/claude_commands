@@ -26,6 +26,7 @@ from typing import Literal, NoReturn, TypedDict, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.agents import worker_lifecycle  # noqa: E402
 from scripts.direct import phase_reservation, plan_history, recorder_state  # noqa: E402
 from scripts.direct.recorder_state import OPEN_PHASES_KEY as OPEN_PHASES_KEY  # noqa: E402
 from scripts.direct.tag_inventory import contract_table_paths  # noqa: E402
@@ -415,7 +416,7 @@ def set_unit(session_dir: Path, production: str, unit: str) -> None:
            for value in (production, unit)):
         raise ValueError("invalid production or unit identity")
     with (session_dir / ".progress_history.lock").open("a+", encoding="utf-8") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
         state = _read_state(session_dir)
         state.update({"production": production, "unit": unit})
         _write_state(session_dir, state)

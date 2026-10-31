@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import BinaryIO, Literal, TextIO, cast, override
 from unittest.mock import patch
 
-from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
+from scripts.agents import codex_mesh, worker_lifecycle, test_codex_mesh as mesh_fixture
 from scripts.direct import progress_history, review_pool, workers
 from scripts.direct.recorder_fixture import invoke_recorder
 
@@ -1990,6 +1990,99 @@ class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
         self.assertEqual(self.methods("thread/queue/delete"), [])
         self.assertEqual(self.methods("turn/interrupt"), [])
         self.assertEqual(json_object(workers.ledger_for_run(destination).path)["adoptions"], {})
+
+    def test_pause_deadline_covers_unfinished_adoption_recovery_and_leaves_it_retryable(self) -> None:
+        self.open_worker("worker")
+        pending = self.session_dir / "worker.pending.json"
+        _ = pending.write_text(json.dumps({"thread_id": mesh_fixture.THREAD_ID,
+            "messages": ["keep once"], "accepting_messages": True}))
+        destination = self.next_run("deadline-adoption")
+
+        def interrupt(stage: str) -> None:
+            if stage == "intent":
+                raise AdoptionWriteInterrupted(stage)
+
+        with observe_adoption_writes(self.session_dir, destination, interrupt):
+            with self.assertRaises(AdoptionWriteInterrupted):
+                _ = workers.adopt(self.session_dir, destination, "worker")
+        store = workers.ledger_for_run(self.session_dir)
+        paths = (store.path, pending, self.session_dir / codex_mesh.ROSTER_FILE,
+                 self.session_dir / codex_mesh.SERVER_FILE)
+        before = {path: path.read_bytes() for path in paths}
+        membership = destination / "membership.lock"
+        membership.touch()
+        self.lifecycle_clock.freeze()
+        callbacks: list[str] = []
+        with membership.open("a+") as owner:
+            mesh_fixture.KERNEL_FLOCK(owner, fcntl.LOCK_EX)
+            with (self.expire_contended_lock(membership, 2),
+                  patch.object(worker_lifecycle, "time", self.lifecycle_clock),
+                  ThreadPoolExecutor(max_workers=1) as executor):
+                pause = executor.submit(workers.pause_run, self.session_dir,
+                    deadline=self.lifecycle_clock.monotonic() + 1,
+                    pause_workers=lambda: callbacks.append("paused"))
+                with self.assertRaisesRegex(TimeoutError, "membership.lock"):
+                    _ = LauncherHangGuard("pause adoption recovery deadline").result(pause)
+        self.assertEqual(callbacks, [])
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+        self.assertEqual(self.methods("turn/interrupt"), [])
+        self.assertEqual(self.methods("thread/queue/delete"), [])
+        workers.pause_run(self.session_dir, pause_workers=lambda: callbacks.append("paused"))
+        self.assertEqual(callbacks, ["paused"])
+        self.assertEqual(json_object(store.path)["adoptions"], {})
+        self.assertEqual(json_object(destination / "worker.pending.json")["messages"], ["keep once"])
+        target = cast(dict[str, object], json_object(destination / codex_mesh.ROSTER_FILE)["worker"])
+        self.assertEqual(target["thread_id"], mesh_fixture.THREAD_ID)
+        self.assertEqual(target["status"], "paused")
+        giving = cast(dict[str, object], json_object(self.session_dir / codex_mesh.ROSTER_FILE)["worker"])
+        self.assertEqual(giving["adopted_to"], str(destination))
+        with store.locked() as ledger:
+            self.assertEqual(ledger.workers["worker"].ownership, workers.Adopted(str(destination)))
+        self.assertEqual(self.methods("thread/start"), [])
+
+    def test_pause_deadline_starts_before_progress_identity_publication(self) -> None:
+        state_path = self.session_dir / workers.STATE
+        state = json_object(state_path)
+        state.update(production="deadline-production", unit="deadline-unit")
+        _ = state_path.write_text(json.dumps(state))
+        # A canonical rename makes ledger_for_run publish the new identity before
+        # it opens the ledger; contention here must spend the shutdown budget too.
+        lock = self.session_dir / ".progress_history.lock"
+        lock.touch()
+        before = state_path.read_bytes()
+        self.lifecycle_clock.freeze()
+        with lock.open("a+") as owner:
+            mesh_fixture.KERNEL_FLOCK(owner, fcntl.LOCK_EX)
+            with (self.expire_contended_lock(lock, 2),
+                  patch.object(worker_lifecycle, "time", self.lifecycle_clock),
+                  patch.object(progress_history, "resolve_production_unit",
+                               return_value=progress_history.ProductionUnitIdentity("canonical-production", "deadline-unit")),
+                  ThreadPoolExecutor(max_workers=1) as executor):
+                pause = executor.submit(workers.pause_run, self.session_dir,
+                                        deadline=self.lifecycle_clock.monotonic() + 1)
+                with self.assertRaisesRegex(TimeoutError, "progress_history.lock"):
+                    _ = LauncherHangGuard("pause progress identity deadline").result(pause)
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_migration_ledger_locks_inherit_the_shutdown_deadline(self) -> None:
+        source = self.session_dir / "migration-source.json"
+        destination = self.session_dir / "migration-destination.json"
+        source_lock = source.with_suffix(".lock")
+        destination_lock = destination.with_suffix(".lock")
+        source_lock.touch()
+        destination_lock.touch()
+        self.lifecycle_clock.freeze()
+        with destination_lock.open("a+") as owner:
+            mesh_fixture.KERNEL_FLOCK(owner, fcntl.LOCK_EX)
+            with (self.expire_contended_lock(destination_lock, 2),
+                  patch.object(worker_lifecycle, "time", self.lifecycle_clock),
+                  worker_lifecycle.operation_deadline(timeout=1)):
+                with self.assertRaisesRegex(TimeoutError, "migration-destination.lock"):
+                    with workers._migration_locks(source, destination):  # pyright: ignore[reportPrivateUsage]
+                        self.fail("migration passed the contended lock")
+        with workers._migration_locks(source, destination):  # pyright: ignore[reportPrivateUsage]
+            self.assertFalse(source.exists())
+            self.assertFalse(destination.exists())
 
     def test_adoption_recovers_every_durable_write_before_the_next_command_on_either_run(self) -> None:
         for stage in ("intent", "source", "destination", "ledger", "complete"):

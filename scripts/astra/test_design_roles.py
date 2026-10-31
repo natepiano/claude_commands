@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 from scripts.astra import astra_roles  # noqa: E402
 from scripts.accounts import role_map  # noqa: E402
-from scripts.agents import codex_mesh  # noqa: E402
+from scripts.agents import codex_mesh, worker_lifecycle  # noqa: E402
 from scripts.lib.code_kind import is_test_code  # noqa: E402
 from scripts.astra import astra_work, design_roles  # noqa: E402
 from scripts.astra.design_roles import resolve_holder as resolve_current_holder  # noqa: E402
@@ -447,8 +447,11 @@ class DurableRolesTests(unittest.TestCase):
         operations: list[str] = []
         environments: list[dict[str, str]] = []
 
-        def release_server(folder: str) -> None:
+        def release_server(folder: str, *, membership: worker_lifecycle.MembershipLease,
+                           owned_workers: tuple[worker_lifecycle.WorkerIdentity, ...]) -> None:
             self.assertEqual(folder, str(mesh))
+            self.assertTrue(membership.covers(mesh))
+            self.assertEqual(owned_workers, ())
             operations.append("release")
             server.unlink()
 

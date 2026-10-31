@@ -86,6 +86,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.accounts.role_map import is_role_map_host, role_map_command, RoleMapUnavailable, RoleAccountUnavailable  # noqa: E402
 from scripts.direct import plan_history
 from scripts.agents import worker_lifecycle
+
+NO_LOCK_DEADLINE = worker_lifecycle.NO_LOCK_DEADLINE
 from scripts.lib import nix_env, unit_runs
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
@@ -114,7 +116,7 @@ class UnitWorkerRegistry(Protocol):
     WorkerUnavailable: type[Exception]
 
     def recover_adoptions(self, run: Path) -> None: ...
-    def pause_run(self, run: Path) -> None: ...
+    def pause_run(self, run: Path, *, pause_workers: Callable[[], None], deadline: float) -> None: ...
     def run_has_live_director(self, run: Path) -> bool: ...
     def note_backend(self, run: Path, name: str, thread_id: str, home: Path) -> None: ...
     def ledger_for_run(self, run: Path) -> UnitWorkerLedgerLocation: ...
@@ -248,6 +250,8 @@ def _serving_request(
     opened = time.time()
     try:
         return _require(client.call(method, params), method)
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except (ConnectionError, OSError, SystemExit) as error:
         serving = client.serving
         detail = str(error) or type(error).__name__
@@ -1067,37 +1071,90 @@ _IGNORED_DELTA = re.compile(b"".join((
 )))
 
 
+@dataclass(frozen=True)
+class TransportDeadline:
+    """One wait's local limit and operation limit, both on the monotonic clock.
+
+    Retaining both limits prevents a late transport failure from being relabelled
+    as shutdown expiry. Operation expiry wins ties, but never an early timeout.
+    """
+    local: float
+    operation: float
+
+    @property
+    def expires(self) -> float:
+        return min(self.local, self.operation)
+
+    def check_operation(self) -> None:
+        if self.operation <= self.local and time.monotonic() >= self.operation:
+            raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: RPC operation deadline expired")
+
+    def remaining(self) -> float:
+        remaining = self.expires - time.monotonic()
+        if remaining <= 0:
+            self.check_operation()
+            raise TimeoutError("app-server transport deadline expired")
+        return remaining
+
+
 @final
 class WebSocket:
-    def __init__(self, port: int, host: str = "127.0.0.1", timeout: float = CONNECT_TIMEOUT_SECS) -> None:
-        self._sock: socket.socket = socket.create_connection((host, port), timeout=timeout)
-        key = base64.b64encode(secrets.token_bytes(16)).decode()
-        self._sock.sendall(
-            (
-                f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\n"
-                f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
-                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-            ).encode()
-        )
-        buffer = b""
-        expires = time.monotonic() + timeout
-        while b"\r\n\r\n" not in buffer:
-            remaining = expires - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("app-server handshake timed out")
-            self._sock.settimeout(remaining)
-            chunk = self._sock.recv(4096)
-            if not chunk:
-                raise ConnectionError("app-server closed during handshake")
-            buffer += chunk
-        head, _, rest = buffer.partition(b"\r\n\r\n")
-        if b" 101 " not in head.split(b"\r\n")[0]:
-            detail = head.decode(errors="replace")[:200]
-            raise ConnectionError(f"handshake refused: {detail}")
-        self._buffer: bytearray = bytearray(rest)
+    def __init__(self, port: int, host: str = "127.0.0.1", timeout: float = CONNECT_TIMEOUT_SECS,
+                 *, client_limit: float = NO_LOCK_DEADLINE,
+                 operation_deadline: float = NO_LOCK_DEADLINE) -> None:
+        setup = TransportDeadline(min(client_limit, time.monotonic() + timeout),
+                                  worker_lifecycle.effective_deadline(operation_deadline))
+        try:
+            connection = socket.create_connection((host, port), timeout=setup.remaining())
+        except TimeoutError:
+            setup.check_operation()
+            raise
+        self._sock: socket.socket = connection
+        self._deadline: TransportDeadline = setup
+        try:
+            _ = setup.remaining()
+            key = base64.b64encode(secrets.token_bytes(16)).decode()
+            with self._waiting():
+                self._sock.sendall(
+                    (
+                        f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\n"
+                        f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+                    ).encode()
+                )
+            buffer = b""
+            while b"\r\n\r\n" not in buffer:
+                with self._waiting():
+                    chunk = self._sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError("app-server closed during handshake")
+                buffer += chunk
+            head, _, rest = buffer.partition(b"\r\n\r\n")
+            if b" 101 " not in head.split(b"\r\n")[0]:
+                detail = head.decode(errors="replace")[:200]
+                raise ConnectionError(f"handshake refused: {detail}")
+            self._buffer: bytearray = bytearray(rest)
+            # Setup's allowance is not the lifetime of the connected socket.
+            self._deadline = TransportDeadline(NO_LOCK_DEADLINE, NO_LOCK_DEADLINE)
+        except BaseException:
+            self.close()
+            raise
 
-    def settimeout(self, seconds: float) -> None:
-        self._sock.settimeout(seconds)
+    def set_deadline(self, deadline: TransportDeadline) -> None:
+        """Install the same absolute budget for sending and assembling a reply."""
+        self._deadline = deadline
+
+    @contextlib.contextmanager
+    def _waiting(self) -> Generator[None]:
+        deadline = self._deadline
+        remaining = deadline.remaining()
+        self._sock.settimeout(None if remaining == NO_LOCK_DEADLINE else remaining)
+        try:
+            yield
+        except TimeoutError:
+            deadline.check_operation()
+            raise
+        _ = deadline.remaining()
 
     def send(self, payload: str) -> None:
         data = payload.encode()
@@ -1114,22 +1171,21 @@ class WebSocket:
             frame += struct.pack(">Q", length)
         frame += mask
         frame += bytes(byte ^ mask[index % 4] for index, byte in enumerate(data))
-        self._sock.sendall(bytes(frame))
+        with self._waiting():
+            self._sock.sendall(bytes(frame))
 
     def _fill(self, count: int, wake: FollowEvents | SocketOnlyWait) -> None:
-        expires = time.monotonic() + (self._sock.gettimeout() or CALL_TIMEOUT_SECS)
         while len(self._buffer) < count:
-            remaining = expires - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("app-server frame timed out")
-            self._sock.settimeout(remaining)
             if isinstance(wake, FollowEvents):
-                result = wake.wait(self._sock, expires)
+                with self._waiting():
+                    result = wake.wait(self._sock, self._deadline.expires)
                 if isinstance(result, StateFilesChanged):
                     raise SessionStateChanged()
                 if result is WaitDeadlineExpired.EXPIRED:
+                    self._deadline.check_operation()
                     raise TimeoutError("app-server frame timed out")
-            chunk = self._sock.recv(262144)
+            with self._waiting():
+                chunk = self._sock.recv(262144)
             if not chunk:
                 raise ConnectionError("app-server closed the connection")
             self._buffer.extend(chunk)
@@ -1139,13 +1195,18 @@ class WebSocket:
         """Bytes already read or ready on the socket must precede lifecycle readbacks."""
         return bool(self._buffer) or bool(select.select([self._sock], [], [], 0)[0])
 
-    def wait_for_activity(self, wake: FollowEvents, deadline: float) -> None:
+    def wait_for_activity(self, wake: FollowEvents, deadline: float, *,
+                          operation_deadline: float = NO_LOCK_DEADLINE) -> None:
         """Wake for unread bytes or file changes without consuming a notice."""
+        self.set_deadline(TransportDeadline(deadline, worker_lifecycle.effective_deadline(operation_deadline)))
+        _ = self._deadline.remaining()
         if not self._buffer:
-            _ = wake.wait(self._sock, deadline)
+            with self._waiting():
+                _ = wake.wait(self._sock, self._deadline.expires)
 
     def recv(self, wake: FollowEvents | SocketOnlyWait = SOCKET_ONLY_WAIT) -> RpcMessage | None:
         """Read one frame; None skips ignored deltas and non-JSON frames."""
+        _ = self._deadline.remaining()
         self._fill(2, wake)
         opcode = self._buffer[0] & 0x0F
         length = self._buffer[1] & 0x7F
@@ -1161,6 +1222,7 @@ class WebSocket:
         self._fill(offset + length, wake)
         payload = bytes(self._buffer[offset : offset + length])
         del self._buffer[:offset + length]
+        _ = self._deadline.remaining()
         if opcode == 0x8:
             raise ConnectionError("app-server sent close")
         if opcode not in (0x1, 0x2):
@@ -1178,72 +1240,96 @@ class WebSocket:
 class Client:
     """A JSON-RPC conversation with the app-server over one websocket."""
 
-    def __init__(self, port: int, name: str, deadline: float | None = None) -> None:
+    def __init__(self, port: int, name: str, deadline: float | None = None, *,
+                 operation_deadline: float = NO_LOCK_DEADLINE) -> None:
         self.port: int = port
         self.name: str = name
         self.session_dir: str = ""
         self.launcher_pid: int = os.getpid()
         self.serving: CodexServingState = NotBoundCodexServer()
         self.turn_submitted_at: float = time.time()
-        # Every call ends by this wall-clock time, whatever timeout it asks for.
-        self._deadline: float | None = deadline
-        self._ws: WebSocket = WebSocket(port, timeout=self._bounded(CONNECT_TIMEOUT_SECS))
+        # Legacy wall-clock limits are converted exactly once at this boundary.
+        self._client_limit: float = (NO_LOCK_DEADLINE if deadline is None else
+                                     time.monotonic() + max(0.0, deadline - time.time()))
+        self._operation_deadline: float = worker_lifecycle.effective_deadline(operation_deadline)
+        self._ws: WebSocket = WebSocket(port, client_limit=self._client_limit,
+                                        operation_deadline=self._operation_deadline)
         self._name: str = name
         self._counter: int = 0
         self._pending: list[RpcMessage] = []
         self.wake: FollowEvents | SocketOnlyWait = SOCKET_ONLY_WAIT
-        # experimentalApi is what unlocks thread/queue/*; without it those calls
-        # fail with a bare -32600 that never mentions a capability.
-        _ = self.call(
-            "initialize",
-            {
-                "clientInfo": {"name": name, "version": "1.0"},
-                "capabilities": {"experimentalApi": True},
-            },
-        )
+        try:
+            # experimentalApi unlocks thread/queue/*.
+            _ = self.call(
+                "initialize",
+                {"clientInfo": {"name": name, "version": "1.0"},
+                 "capabilities": {"experimentalApi": True}},
+            )
+        except BaseException:
+            self.close()
+            raise
+
+    def _call_deadline(self, timeout: float) -> TransportDeadline:
+        return TransportDeadline(min(self._client_limit, time.monotonic() + timeout),
+                                 worker_lifecycle.effective_deadline(self._operation_deadline))
 
     def call(
         self, method: str, params: dict[str, object], timeout: float = CALL_TIMEOUT_SECS
     ) -> RpcMessage:
-        if self._deadline is not None and time.time() >= self._deadline:
+        deadline = self._call_deadline(timeout)
+        try:
+            _ = deadline.remaining()
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
+        except TimeoutError:
             return {"error": {"message": f"operation deadline reached before {method}"}}
         self._counter += 1
         request_id = f"{self._name}-{self._counter}"
-        self._ws.send(
-            json.dumps(
-                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-            )
-        )
-        deadline = time.time() + self._bounded(timeout)
-        expires = time.monotonic() + max(0.0, deadline - time.time())
-        while time.monotonic() < expires:
-            for index, message in enumerate(self._pending):
-                if message.get("id") == request_id:
-                    return self._pending.pop(index)
-            frame = self._read(time.time() + max(0.0, expires - time.monotonic()))
-            if frame is None:
-                continue
-            if frame.get("id") == request_id:
-                return frame
-            self._pending.append(frame)
+        self._ws.set_deadline(deadline)
+        self._ws.send(json.dumps(
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}))
+        try:
+            while True:
+                _ = deadline.remaining()
+                for index, message in enumerate(self._pending):
+                    if message.get("id") == request_id:
+                        return self._pending.pop(index)
+                frame = self._read_until(deadline)
+                _ = deadline.remaining()
+                if frame is None:
+                    # An early transport timeout keeps its ordinary RPC result.
+                    break
+                if frame.get("id") == request_id:
+                    return frame
+                self._pending.append(frame)
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
+        except TimeoutError:
+            deadline.check_operation()
+        deadline.check_operation()
         return {"error": {"message": f"timed out waiting for {method}"}}
 
-    def _bounded(self, timeout: float) -> float:
-        if self._deadline is None:
-            return timeout
-        return max(0.1, min(timeout, self._deadline - time.time()))
+    def _read_until(self, deadline: TransportDeadline,
+                    wake: FollowEvents | SocketOnlyWait = SOCKET_ONLY_WAIT) -> RpcMessage | None:
+        self._ws.set_deadline(deadline)
+        try:
+            while True:
+                _ = deadline.remaining()
+                frame = self._ws.recv(wake)
+                _ = deadline.remaining()
+                if frame is not None:
+                    return frame
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
+        except TimeoutError:
+            deadline.check_operation()
+            return None
+        except SessionStateChanged:
+            return None
 
     def _read(self, deadline: float, wake: FollowEvents | SocketOnlyWait = SOCKET_ONLY_WAIT) -> RpcMessage | None:
-        expires = time.monotonic() + max(0.0, deadline - time.time())
-        while time.monotonic() < expires:
-            self._ws.settimeout(max(0.001, expires - time.monotonic()))
-            try:
-                frame = self._ws.recv(wake)
-            except (TimeoutError, SessionStateChanged):
-                return None
-            if frame is not None:
-                return frame
-        return None
+        """Legacy wall-clock frame boundary; assembly uses one monotonic limit."""
+        return self._read_until(self._call_deadline(max(0.0, deadline - time.time())), wake)
 
     @property
     def has_pending_frames(self) -> bool:
@@ -1251,11 +1337,11 @@ class Client:
         return bool(self._pending) or self._ws.has_pending_frames
 
     def next_frame(self, deadline: float) -> RpcMessage | None:
-        """Next frame of any kind, or None once `deadline` passes."""
+        """Next frame of any kind, or None once the legacy wall deadline passes."""
         if self._pending:
+            TransportDeadline(NO_LOCK_DEADLINE,
+                worker_lifecycle.effective_deadline(self._operation_deadline)).check_operation()
             return self._pending.pop(0)
-        if time.time() >= deadline:
-            return None
         return self._read(deadline, self.wake)
 
     def push_back(self, frame: RpcMessage) -> None:
@@ -1263,12 +1349,15 @@ class Client:
         self._pending.insert(0, frame)
 
     def wait_for_activity(self, wake: FollowEvents, deadline: float) -> None:
-        """Wait for new input, leaving RPC-buffered notices for the stream.
-
-        Pending notices deliberately do not wake this wait: the next state RPC
-        reads new socket bytes and preserves their order behind those notices.
-        """
-        self._ws.wait_for_activity(wake, deadline)
+        """Wait for new input without consuming buffered notices."""
+        budget = TransportDeadline(min(deadline, self._client_limit),
+                                   worker_lifecycle.effective_deadline(self._operation_deadline))
+        try:
+            self._ws.wait_for_activity(wake, budget.local, operation_deadline=budget.operation)
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
+        except TimeoutError:
+            return
 
     def close(self) -> None:
         self._ws.close()
@@ -1294,9 +1383,11 @@ def _session_path(session_dir: str, filename: str) -> Path:
 def _read_json_object(path: Path) -> dict[str, object]:
     try:
         with path.open(encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_SH)
             text = handle.read()
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_UN)
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except OSError:
         return {}
     return _as_dict(_loads(text))
@@ -1514,7 +1605,7 @@ def _update_roster(session_dir: str, name: str, record: ThreadRecord, *,
     path = _session_path(session_dir, ROSTER_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         previous = _as_dict(roster.get(name))
@@ -1550,7 +1641,7 @@ def _set_roster_assignment(session_dir: str, name: str, role: WorkerRole, task: 
     with worker_lifecycle.lock_worker(session_dir, name):
         path = _session_path(session_dir, ROSTER_FILE)
         with path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
             _ = handle.seek(0)
             roster = _load_roster_for_write(handle)
             entry = _as_dict(roster.get(name))
@@ -1568,23 +1659,15 @@ def _set_roster_assignment(session_dir: str, name: str, role: WorkerRole, task: 
                 handle.flush()
 
 
-def _mark_all_roster_ended(session_dir: str) -> None:
-    """Make every worker in this run terminal while retaining its metadata."""
-    path = _session_path(session_dir, ROSTER_FILE)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        _ = handle.seek(0)
-        roster = _load_roster_for_write(handle)
-        for name, value in roster.items():
-            entry = _as_dict(value)
-            if entry and not entry.get("adopted_to"):
-                entry["status"] = "ended"
-                _advance_roster_revision(entry)
-                roster[name] = entry
-        _ = handle.seek(0)
-        _ = handle.truncate()
-        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
-        handle.flush()
+def _mark_all_roster_ended(session_dir: str, roster: dict[str, object], *, deadline: float) -> None:
+    """Make only this validated work set terminal, retaining adopted entries."""
+    for name, value in roster.items():
+        entry = _as_dict(value)
+        if entry and not entry.get("adopted_to"):
+            entry["status"] = "ended"
+            _advance_roster_revision(entry)
+            roster[name] = entry
+    _publish_bulk_records(session_dir, roster, deadline=deadline)
 
 
 def _lookup(session_dir: str, name: str) -> ThreadRecord:
@@ -1625,14 +1708,14 @@ def _design_claim_lock(session_dir: str, name: str, *, lock_inbox: bool = True) 
     _role_fence(record)
     design_id = _as_str(record.get("held_design_id"))
     if not design_id:
-        with worker_lifecycle.lock_worker(session_dir, name):
+        with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
             yield
         return
     from scripts.astra import design_roles
     directory = design_roles.design_directory(design_id)
     with (directory / "lock").open("a", encoding="utf-8") as design_lock:
-        fcntl.flock(design_lock, fcntl.LOCK_EX)
-        with worker_lifecycle.lock_worker(session_dir, name):
+        worker_lifecycle.acquire_flock(design_lock, mode=fcntl.LOCK_EX)
+        with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
             with _pending_file(session_dir, name) if lock_inbox else contextlib.nullcontext():
                 yield
 
@@ -1714,7 +1797,7 @@ def _claim_follow_locked(
     """Publish a claim after the operation proved eligibility under its lifecycle lock."""
     path = _session_path(session_dir, ROSTER_FILE)
     with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
@@ -1766,7 +1849,7 @@ def _restore_follow_claim(session_dir: str, name: str, launcher_pid: int,
     with worker_lifecycle.lock_worker(session_dir, name):
         path = _session_path(session_dir, ROSTER_FILE)
         with path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
             _ = handle.seek(0)
             roster = _load_roster_for_write(handle)
             entry = _as_dict(roster.get(name))
@@ -1938,16 +2021,21 @@ def _loaded_thread_ids(client: Client, deadline: float) -> set[str]:
             raise SystemExit("server returned an invalid loaded-thread cursor")
         cursor = next_cursor
         seen.add(cursor)
+    TransportDeadline(deadline, worker_lifecycle.effective_deadline()).check_operation()
     raise SystemExit("loaded-thread list timed out")
 
 
 def _server_holds(port: int, thread_id: str) -> bool:
     try:
         client = Client(port, f"worker-lookup-{os.getpid()}")
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except (ConnectionError, OSError, SystemExit):
         return False
     try:
         return thread_id in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS)
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except (ConnectionError, OSError, SystemExit):
         return False
     finally:
@@ -1958,7 +2046,7 @@ def _note_worker_port(session_dir: str, name: str, launcher_pid: int, port: int)
     """Record the server a follow-up launcher attached to, while its claim is still its own."""
     path = _session_path(session_dir, ROSTER_FILE)
     with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))
@@ -2050,15 +2138,21 @@ def _fail_account_move(session_dir: str, name: str, marker: AccountMoveMarker, r
                             {"move_id": marker.move_id, "error": reason})
 
 
+
+
 @contextlib.contextmanager
-def _pending_file(session_dir: str, name: str, *, blocking: bool = True) -> Generator[TextIO]:
+def _pending_file(session_dir: str, name: str, *, blocking: bool = True,
+                  deadline: float = NO_LOCK_DEADLINE) -> Generator[TextIO]:
     path = _session_path(session_dir, f"{name}.pending.json")
     with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        if blocking:
+            worker_lifecycle.acquire_flock(handle, deadline=deadline)
+        else:
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             yield handle
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_UN)
 
 
 def _pending_for_thread(handle: TextIO, thread_id: str) -> list[str]:
@@ -2432,7 +2526,7 @@ def _finish_summary(
 
 
 @contextlib.contextmanager
-def _server_lock(session_dir: str) -> Generator[None]:
+def _server_lock(session_dir: str, *, deadline: float = NO_LOCK_DEADLINE) -> Generator[None]:
     """Serialize starting and dropping this session's app-server.
 
     The workers of a phase launch in one message and reach `ensure_server`
@@ -2441,13 +2535,8 @@ def _server_lock(session_dir: str) -> Generator[None]:
     unreachable, and a retry that started a fresh server for every failed worker
     would multiply them.
     """
-    Path(session_dir).mkdir(parents=True, exist_ok=True)
-    with _session_path(session_dir, LOCK_FILE).open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with worker_lifecycle.lock_server(session_dir, LOCK_FILE, deadline=deadline):
+        yield
 
 
 def _retire_server(session_dir: str, port: int) -> bool:
@@ -2462,7 +2551,7 @@ def _retire_server(session_dir: str, port: int) -> bool:
     at threads that are live on a server this worker knows nothing about, and this
     worker rewrites its own entry when it re-attaches.
     """
-    with _server_lock(session_dir):
+    with worker_lifecycle.membership_operation(session_dir), _server_lock(session_dir):
         record = _read_json_object(_session_path(session_dir, SERVER_FILE))
         if record.get("port") != port:
             return False
@@ -2579,7 +2668,7 @@ def _start_watcher(session_dir: str, pid: int, port: int) -> subprocess.Popen[by
     )
     with _session_path(session_dir, f"mesh-watcher-{pid}-{port}.lock").open("a") as lock:
         try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return ExistingServerWatcher()
         return subprocess.Popen(
@@ -2613,23 +2702,39 @@ def _design_context(session_dir: str) -> dict[str, object]:
     return _as_dict(_loads(json.dumps(context)))
 
 
-def _release_held_server(session_dir: str) -> None:
-    """Park every queue before releasing a proven-idle server. Keep evidence on uncertainty."""
-    identities = _run_lifecycle_workers(session_dir)
-    held = set(worker_lifecycle.held_workers())
-    if set(identities).issubset(held):
-        _release_held_server_locked(session_dir)
-    elif any(worker.session == Path(session_dir).resolve() for worker in held):
-        raise SystemExit("RoleNeedsRecovery: server environment changed during the worker operation; "
-                         + "run release-held-server, then retry through the holder")
-    else:
-        with worker_lifecycle.lock_workers(*identities):
-            _release_held_server_locked(session_dir)
+@dataclass(frozen=True)
+class BulkWorkers:
+    """Fresh operation work set validated under membership and every lifecycle."""
+    records: dict[str, object]
+    membership: worker_lifecycle.MembershipLease
+    deadline: float
 
 
-def _release_held_server_locked(session_dir: str) -> None:
-    """Release a shared server while the caller owns all of its worker identities."""
-    roster = _read_json_object(_session_path(session_dir, ROSTER_FILE))
+@dataclass(frozen=True)
+class AcquireMembership:
+    """This operation must acquire its own run admission boundary."""
+
+
+ACQUIRE_MEMBERSHIP = AcquireMembership()
+
+
+@worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS)
+def _release_held_server(session_dir: str, *,
+                         membership: worker_lifecycle.MembershipLease | AcquireMembership = ACQUIRE_MEMBERSHIP,
+                         owned_workers: tuple[worker_lifecycle.WorkerIdentity, ...] = ()) -> None:
+    """Park the validated work set through shared-server cleanup under membership."""
+    deadline = worker_lifecycle.effective_deadline()
+    try:
+        with _bulk_workers(session_dir, deadline=deadline, membership=membership,
+                           owned_workers=owned_workers, allow_held_roles=True) as workers, _server_lock(session_dir, deadline=deadline):
+            _release_held_server_locked(session_dir, workers)
+    except worker_lifecycle.OperationDeadlineExpired as error:
+        raise SystemExit(f"RoleNeedsRecovery: shutdown incomplete: {error}") from error
+
+
+def _release_held_server_locked(session_dir: str, workers: BulkWorkers) -> None:
+    """Release a shared server while the caller owns its validated worker set."""
+    roster = workers.records
     record = _read_json_object(_session_path(session_dir, SERVER_FILE))
     if record.get("codex_home"):
         home_path = _session_path(session_dir, "serving_home.json")
@@ -2649,14 +2754,14 @@ def _release_held_server_locked(session_dir: str) -> None:
             thread_id = _as_str(entry.get("thread_id"))
             if not thread_id:
                 continue
-            client = Client(port, "held-environment-release", deadline=time.time() + THREAD_RELEASE_TIMEOUT_SECS)
+            client = Client(port, "held-environment-release", operation_deadline=workers.deadline)
             try:
-                with _pending_file(session_dir, name) as pending:
+                with _pending_file(session_dir, name, deadline=workers.deadline) as pending:
                     def park(message: str) -> None:
                         _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
                     state = _read_live_turn(client, thread_id)
                     if isinstance(state, ThreadStateUnknown):
-                        if thread_id not in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS):
+                        if thread_id not in _loaded_thread_ids(client, workers.deadline):
                             continue
                     _move_queue_to_pending(client, thread_id, park)
                     if not isinstance(state, ThreadIdle):
@@ -2666,12 +2771,13 @@ def _release_held_server_locked(session_dir: str) -> None:
                         raise SystemExit("RoleNeedsRecovery: " + released.reason)
             finally:
                 client.close()
-        with _server_lock(session_dir):
-            if not _reap(pid) and _pid_alive(pid):
-                raise SystemExit("RoleNeedsRecovery: old server release is uncertain")
-            current = _read_json_object(_session_path(session_dir, SERVER_FILE))
-            if current.get("pid") == pid:
-                _session_path(session_dir, SERVER_FILE).unlink(missing_ok=True)
+        if time.monotonic() >= workers.deadline:
+            raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: held server release deadline expired")
+        if not _reap(pid, deadline=workers.deadline) and _pid_alive(pid):
+            raise SystemExit("RoleNeedsRecovery: old server release is uncertain")
+        current = _read_json_object(_session_path(session_dir, SERVER_FILE))
+        if _record_names_server(current, pid, port):
+            _session_path(session_dir, SERVER_FILE).unlink(missing_ok=True)
 
 
 def command_release_held_server(args: argparse.Namespace) -> int:
@@ -2698,6 +2804,8 @@ def held_thread_end_confirmed(session_dir: str, thread_id: str) -> bool:
                 if thread_id not in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS):
                     continue
             return False
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
         except (ConnectionError, OSError, SystemExit):
             return False
         finally:
@@ -2727,6 +2835,8 @@ def _server_dev_shell(session_dir: str, cwd: str | None) -> DevShellProbe:
             _as_float(failed.get("retry_at"), 0),
         )
         return failure if failure.suppresses(dev_shell) else dev_shell
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except (OSError, ValueError) as error:
         return DevShellProbeUnavailable(str(error))
 
@@ -2757,62 +2867,63 @@ def ensure_server(session_dir: str, home: Path | None = None, cwd: str | None = 
     provider's answer. A caller that attached to one already running has proved
     nothing of the kind -- see _retry_warranted.
     """
-    selected_home = workers_home() if home is None else home
-    context = _design_context(session_dir)
-    previous = _read_json_object(_session_path(session_dir, SERVER_FILE))
-    if context and previous:
-        pid = _as_int(previous.get("pid"))
-        previous_home = server_record_home(previous)
-        if (previous.get("design_context") != context or previous_home != selected_home
-                or previous.get("auto_compact_tokens") != AUTO_COMPACT_TOKENS
-                or (_pid_alive(pid) and _holds_old_sign_in(pid, previous_home))):
-            _release_held_server(session_dir)
-    with _server_lock(session_dir):
-        # Read failures under the same lock as launch: another caller may have
-        # just fallen back for this revision while this caller was acquiring it.
-        dev_shell = _server_dev_shell(session_dir, cwd)
-        dev_shell_worktree = str(dev_shell.worktree) if isinstance(dev_shell, WorktreeDevShell) else ""
-        path = _session_path(session_dir, SERVER_FILE)
-        record = _read_json_object(path)
-        server = _recorded_server_availability(record)
-        if isinstance(server, LiveServer):
-            port, pid = server.port, _as_int(record.get("pid"))
-            recorded_home = server_record_home(record)
-            matching_home = recorded_home == selected_home
-            old_sign_in = matching_home and _holds_old_sign_in(pid, recorded_home)
-            old_limit = record.get("auto_compact_tokens") != AUTO_COMPACT_TOKENS
-            old_dev_shell = (cwd is not None and not isinstance(dev_shell, DevShellProbeUnavailable)
-                             and _as_str(record.get("dev_shell_worktree")) != dev_shell_worktree)
-            if matching_home and not old_sign_in and not old_limit and not old_dev_shell:
-                # The record's change time is when the server was last used; its watcher reads it.
-                os.utime(path)
-                if isinstance(dev_shell, WorktreeDevShell):
-                    _remember_server_dev_shell(session_dir, dev_shell)
-                elif cwd is not None and isinstance(dev_shell, InheritedServerEnvironment):
-                    _remember_server_dev_shell(session_dir, dev_shell)
-                return port, False
-            # A sign-in change `signin-changed` did not catch. The workers still on this server keep
-            # it until they let go; its watcher then stops it.
-            _retire_record(session_dir, record)
-            cause = (f"no longer serves the workers home {codex_home_display(selected_home)}" if not matching_home
-                     else f"holds the old sign-in at {codex_home_display(selected_home)}" if old_sign_in
-                     else f"serves another dev-shell than {dev_shell_worktree or 'the caller environment'}" if old_dev_shell
-                     else f"compacts at another limit than {AUTO_COMPACT_TOKENS} tokens")
-            _log_server(session_dir, f"app-server {pid} {cause}; retired, starting a new one")
-            if not _stop_unused_with_lock_held(None, pid, port):
-                _ = _start_watcher(session_dir, pid, port)
-        if cwd is None:
-            remembered = _as_str(_read_json_object(_session_path(session_dir, DEV_SHELL_FILE)).get("worktree"))
-            # Also migrate a shell recorded before the persistent preference existed.
-            remembered = remembered or _as_str(record.get("dev_shell_worktree"))
-            dev_shell = _server_dev_shell(session_dir, remembered or None)
-        if isinstance(dev_shell, DevShellProbeUnavailable):
-            _log_server(session_dir, f"dev-shell probe unavailable: {dev_shell.reason}; starting with caller environment")
-        if isinstance(dev_shell, WorktreeDevShell):
-            return _start_server(session_dir, selected_home, dev_shell), True
-        if isinstance(dev_shell, InheritedServerEnvironment):
-            _remember_server_dev_shell(session_dir, dev_shell)
-        return _start_server(session_dir, selected_home), True
+    with worker_lifecycle.membership_operation(session_dir) as membership:
+        selected_home = workers_home() if home is None else home
+        context = _design_context(session_dir)
+        previous = _read_json_object(_session_path(session_dir, SERVER_FILE))
+        if context and previous:
+            pid = _as_int(previous.get("pid"))
+            previous_home = server_record_home(previous)
+            if (previous.get("design_context") != context or previous_home != selected_home
+                    or previous.get("auto_compact_tokens") != AUTO_COMPACT_TOKENS
+                    or (_pid_alive(pid) and _holds_old_sign_in(pid, previous_home))):
+                _release_held_server(session_dir, membership=membership, owned_workers=worker_lifecycle.held_workers())
+        with _server_lock(session_dir):
+            # Read failures under the same lock as launch: another caller may have
+            # just fallen back for this revision while this caller was acquiring it.
+            dev_shell = _server_dev_shell(session_dir, cwd)
+            dev_shell_worktree = str(dev_shell.worktree) if isinstance(dev_shell, WorktreeDevShell) else ""
+            path = _session_path(session_dir, SERVER_FILE)
+            record = _read_json_object(path)
+            server = _recorded_server_availability(record)
+            if isinstance(server, LiveServer):
+                port, pid = server.port, _as_int(record.get("pid"))
+                recorded_home = server_record_home(record)
+                matching_home = recorded_home == selected_home
+                old_sign_in = matching_home and _holds_old_sign_in(pid, recorded_home)
+                old_limit = record.get("auto_compact_tokens") != AUTO_COMPACT_TOKENS
+                old_dev_shell = (cwd is not None and not isinstance(dev_shell, DevShellProbeUnavailable)
+                                 and _as_str(record.get("dev_shell_worktree")) != dev_shell_worktree)
+                if matching_home and not old_sign_in and not old_limit and not old_dev_shell:
+                    # The record's change time is when the server was last used; its watcher reads it.
+                    os.utime(path)
+                    if isinstance(dev_shell, WorktreeDevShell):
+                        _remember_server_dev_shell(session_dir, dev_shell)
+                    elif cwd is not None and isinstance(dev_shell, InheritedServerEnvironment):
+                        _remember_server_dev_shell(session_dir, dev_shell)
+                    return port, False
+                # A sign-in change `signin-changed` did not catch. The workers still on this server keep
+                # it until they let go; its watcher then stops it.
+                _retire_record(session_dir, record)
+                cause = (f"no longer serves the workers home {codex_home_display(selected_home)}" if not matching_home
+                         else f"holds the old sign-in at {codex_home_display(selected_home)}" if old_sign_in
+                         else f"serves another dev-shell than {dev_shell_worktree or 'the caller environment'}" if old_dev_shell
+                         else f"compacts at another limit than {AUTO_COMPACT_TOKENS} tokens")
+                _log_server(session_dir, f"app-server {pid} {cause}; retired, starting a new one")
+                if not _stop_unused_with_lock_held(None, pid, port):
+                    _ = _start_watcher(session_dir, pid, port)
+            if cwd is None:
+                remembered = _as_str(_read_json_object(_session_path(session_dir, DEV_SHELL_FILE)).get("worktree"))
+                # Also migrate a shell recorded before the persistent preference existed.
+                remembered = remembered or _as_str(record.get("dev_shell_worktree"))
+                dev_shell = _server_dev_shell(session_dir, remembered or None)
+            if isinstance(dev_shell, DevShellProbeUnavailable):
+                _log_server(session_dir, f"dev-shell probe unavailable: {dev_shell.reason}; starting with caller environment")
+            if isinstance(dev_shell, WorktreeDevShell):
+                return _start_server(session_dir, selected_home, dev_shell), True
+            if isinstance(dev_shell, InheritedServerEnvironment):
+                _remember_server_dev_shell(session_dir, dev_shell)
+            return _start_server(session_dir, selected_home), True
 
 
 def _server_environment(session_dir: str, workers_home: Path) -> dict[str, str]:
@@ -2922,6 +3033,8 @@ def _start_server(
                     )
                 try:
                     probe = WebSocket(chosen)
+                except worker_lifecycle.OperationDeadlineExpired:
+                    raise
                 except (OSError, ConnectionError):
                     time.sleep(0.4)
                     continue
@@ -3461,31 +3574,59 @@ def _relaunch_refusal(name: str, record: dict[str, object]) -> str:
     return ""
 
 
+@dataclass(frozen=True)
+class WorkerAdmission:
+    """Selection ownership transferred to the thread publisher, never its watcher."""
+    locks: contextlib.ExitStack
+    membership: worker_lifecycle.MembershipLease
+
+    def published(self) -> None:
+        # Lifecycle, inbox and roster scopes have exited; membership is last.
+        self.locks.close()
+
+
+@dataclass(frozen=True)
+class IndependentWorkerAdmission:
+    """Direct callers acquire admission at the attachment operation itself."""
+
+    def published(self) -> None:
+        pass
+
+
+INDEPENDENT_WORKER_ADMISSION = IndependentWorkerAdmission()
+
+
 def command_start(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     resident = getattr(args, "resident", False) is True
-    with worker_lifecycle.lock_worker(session_dir, name):
-        record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
-        reason = _relaunch_refusal(name, record)
-        if reason:
-            print(f"codex_mesh: {name}: {reason}", file=sys.stderr)
-            return 2
-        port, fresh_server = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
-    outcome = _run_worker(args, port, started_here=fresh_server)
+    with contextlib.ExitStack() as admission:
+        membership = admission.enter_context(worker_lifecycle.lock_membership(session_dir))
+        with worker_lifecycle.lock_worker(session_dir, name):
+            record = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
+            reason = _relaunch_refusal(name, record)
+            if reason:
+                print(f"codex_mesh: {name}: {reason}", file=sys.stderr)
+                return 2
+            port, fresh_server = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
+        outcome = _run_worker(args, port, started_here=fresh_server,
+                              admission=WorkerAdmission(admission, membership))
     if isinstance(outcome, WorkerLaunchRefused):
         return 2
     tested = fresh_server
     if _retry_warranted(outcome, fresh_server, resident):
         _ = _retire_server(session_dir, port)
-        port, _fresh = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
         assert isinstance(outcome, (FailedBeforeThread, FailedWithThread))
         if isinstance(outcome, FailedWithThread):
             note = "the inherited app-server holds a Codex sign-in that has since changed"
         else:
             note = f"the inherited app-server failed in {outcome.seconds:.0f}s without reaching the provider"
         print(f"codex_mesh: {name}: {note}; retrying on a new one", file=sys.stderr)
-        outcome = _run_worker(args, port, started_here=_fresh)
+        with contextlib.ExitStack() as admission:
+            membership = admission.enter_context(worker_lifecycle.lock_membership(session_dir))
+            port, _fresh = ensure_server(session_dir, cwd=_as_str(_attr(args, "cwd")) or None)
+            outcome = _run_worker(args, port, started_here=_fresh,
+                                  admission=WorkerAdmission(admission, membership))
         tested = True
     if (isinstance(outcome, (FailedWithThread, CapacityRetriesExhausted))
             and isinstance(outcome.pending_refusal, PendingQuotaRefusal)):
@@ -3579,7 +3720,7 @@ def _follow_worker(args: argparse.Namespace) -> int:
     live_turn = ""
     try:
         _ = ensure_server(session_dir, workers_home(), cwd=_as_str(_attr(args, "turn_cwd")) or None)
-        with worker_lifecycle.lock_worker(session_dir, name):
+        with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
             current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
             if not RosterActiveLauncher(thread_id, (owner_pid, os.getpid())).owns(current):
                 raise SystemExit("worker ownership changed before resume; follow-up did not start")
@@ -3760,7 +3901,7 @@ def _abandon_compaction(client: Client, name: str, thread_id: str, timeout: Comp
 def command_compact(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "to"))
-    with worker_lifecycle.lock_worker(session_dir, name):
+    with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
         try:
             record = _lookup(session_dir, name)
             state = _roster_thread(record)
@@ -3925,14 +4066,15 @@ def command_release_follow(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_worker(args: argparse.Namespace, port: int, *, started_here: bool = False) -> RunOutcome:
+def _run_worker(args: argparse.Namespace, port: int, *, started_here: bool = False,
+                admission: WorkerAdmission | IndependentWorkerAdmission = INDEPENDENT_WORKER_ADMISSION) -> RunOutcome:
     """Attach one worker to the app-server on `port` and run it to its end."""
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
     timeout = _as_float(_attr(args, "timeout"), 86400.0)
     opened = time.time()
     try:
-        return _attach_and_run(args, port, session_dir, name, timeout, opened, started_here=started_here)
+        return _attach_and_run(args, port, session_dir, name, timeout, opened, started_here=started_here, admission=admission)
     except (ConnectionError, OSError, SystemExit) as exc:
         return FailedBeforeThread(str(exc) or exc.__class__.__name__, time.time() - opened,
             exc.serving if isinstance(exc, ServingRequestFailure) else NotBoundCodexServer(),
@@ -3973,11 +4115,12 @@ def _attach_and_run(
     timeout: float,
     opened: float,
     *, started_here: bool = False,
+    admission: WorkerAdmission | IndependentWorkerAdmission = INDEPENDENT_WORKER_ADMISSION,
 ) -> RunOutcome:
     prompt = Path(_as_str(_attr(args, "prompt_file"))).read_text(encoding="utf-8")
     log_path = Path(_as_str(_attr(args, "log_file")))
 
-    with worker_lifecycle.lock_worker(session_dir, name):
+    with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
         existing = _read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name)
         if isinstance(existing, dict):
             _role_fence(_as_dict(cast(object, existing)))
@@ -4070,6 +4213,7 @@ def _attach_and_run(
             if isinstance(role, AssignedWorkerRole):
                 _record_assignment(thread_id, role.role, _dispatch_lens(args))
 
+    admission.published()
     return _stream_turn(args, client, port, session_dir, name, thread_id, prompt, timeout, opened)
 
 
@@ -5218,6 +5362,8 @@ def _release_blocker_reason(client: Client, session_dir: str, thread_id: str) ->
     for identity, name in workers.items():
         try:
             reply = client.call("thread/read", {"threadId": identity, "includeTurns": False}, timeout=1.0)
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
         except (ConnectionError, OSError, SystemExit):
             continue
         thread = _as_dict(_as_dict(reply.get("result")).get("thread"))
@@ -5229,7 +5375,7 @@ def _release_blocker_reason(client: Client, session_dir: str, thread_id: str) ->
 
 
 def _release_worker_thread(client: Client, thread_id: str, session_dir: str) -> _ReleasedWorkerThread | WorkerThreadStateUnknown:
-    deadline = time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS
+    deadline = worker_lifecycle.effective_deadline(time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS)
     try:
         unsubscribed = _require(client.call("thread/unsubscribe", {"threadId": thread_id},
                                            timeout=THREAD_RELEASE_TIMEOUT_SECS), "thread/unsubscribe")
@@ -5241,9 +5387,12 @@ def _release_worker_thread(client: Client, thread_id: str, session_dir: str) -> 
             frame = client.next_frame(time.time() + min(0.1, max(0.0, deadline - time.monotonic())))
             if frame and frame.get("method") == "thread/closed" and _as_str(_as_dict(frame.get("params")).get("threadId")) == thread_id:
                 return _ReleasedWorkerThread()
+        TransportDeadline(deadline, worker_lifecycle.effective_deadline()).check_operation()
         if _recorded_server_gone(session_dir, client.port):
             return _ReleasedWorkerThread()
         return WorkerThreadStateUnknown(_release_blocker_reason(client, session_dir, thread_id))
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except (ConnectionError, OSError, SystemExit) as error:
         if _recorded_server_gone(session_dir, client.port):
             return _ReleasedWorkerThread()
@@ -5357,6 +5506,8 @@ def _release_other_worker_writers(
                 released = _release_worker_thread(client, thread_id, session_dir)
                 if isinstance(released, WorkerThreadStateUnknown):
                     return released
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
         except (ConnectionError, OSError, SystemExit) as error:
             if _recorded_server_gone(session_dir, port):
                 continue
@@ -5374,6 +5525,8 @@ def _move_resident(
 ) -> WorkerMoveResult:
     try:
         return _move_idle_worker(args, session_dir, name, thread_id, client, message=message)
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except (ConnectionError, OSError, SystemExit) as error:
         return WorkerThreadStateUnknown(str(error) or type(error).__name__)
 
@@ -5456,7 +5609,7 @@ def _move_idle_worker(
     *, message: str = "",
 ) -> WorkerMoveResult:
     """Check one new-turn boundary and move an idle thread onto the workers home."""
-    with worker_lifecycle.lock_worker(session_dir, name):
+    with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
         owner = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
         if not RosterActiveLauncher(thread_id, (client.launcher_pid, os.getpid())).owns(owner):
             return WorkerThreadStateUnknown("worker ownership changed before the new turn")
@@ -5751,7 +5904,7 @@ def _start_turn(
         session_dir = _as_str(_attr(args, "session_dir"))
         name = _as_str(_attr(args, "name")) or _as_str(_attr(args, "to"))
         with _session_path(session_dir, ROSTER_FILE).open("r+", encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
             roster = _load_roster_for_write(handle)
             entry = _as_dict(roster.get(name))
             if entry.get("thread_id") == thread_id and not entry.get("adopted_to"):
@@ -5785,29 +5938,29 @@ def _end_unwatched_turn(
 ) -> UnwatchedTurnCleanupResult:
     """Best effort cleanup when this launcher cannot watch another turn."""
     try:
-        deadline = time.time() + THREAD_RELEASE_TIMEOUT_SECS
-        client = Client(port, f"cleanup-{os.getpid()}", deadline=deadline)
-        try:
-            _ = _drop_queued_messages(client, thread_id)
-            live = _read_live_turn(client, thread_id)
-            turn_id = _interruptible_turn_id(client, thread_id, live)
-            if isinstance(turn_id, ThreadLive):
-                reply = _interrupt_turn(client, thread_id, turn_id.turn_id)
-                if "error" in reply:
-                    reason = _as_str(_as_dict(reply["error"]).get("message")) or "turn/interrupt failed"
-                    remaining = _read_live_turn(client, thread_id)
-                    if isinstance(remaining, (ThreadLive, ThreadActiveWithoutTurn)):
-                        _log_uninterrupted_thread(log_path, thread_id, reason)
+        with worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS) as deadline:
+            client = Client(port, f"cleanup-{os.getpid()}", operation_deadline=deadline)
+            try:
+                _ = _drop_queued_messages(client, thread_id)
+                live = _read_live_turn(client, thread_id)
+                turn_id = _interruptible_turn_id(client, thread_id, live)
+                if isinstance(turn_id, ThreadLive):
+                    reply = _interrupt_turn(client, thread_id, turn_id.turn_id)
+                    if "error" in reply:
+                        reason = _as_str(_as_dict(reply["error"]).get("message")) or "turn/interrupt failed"
+                        remaining = _read_live_turn(client, thread_id)
+                        if isinstance(remaining, (ThreadLive, ThreadActiveWithoutTurn)):
+                            _log_uninterrupted_thread(log_path, thread_id, reason)
+                            return RelaunchBlockedByLiveTurn()
+                        if isinstance(remaining, ThreadStateUnknown):
+                            _log_uninterrupted_thread(log_path, thread_id, reason)
+                elif isinstance(turn_id, (ThreadStateUnknown, ThreadActiveWithoutTurn)):
+                    reason = turn_id.reason if isinstance(turn_id, ThreadStateUnknown) else "no turn id"
+                    _log_uninterrupted_thread(log_path, thread_id, reason)
+                    if isinstance(turn_id, ThreadActiveWithoutTurn):
                         return RelaunchBlockedByLiveTurn()
-                    if isinstance(remaining, ThreadStateUnknown):
-                        _log_uninterrupted_thread(log_path, thread_id, reason)
-            elif isinstance(turn_id, (ThreadStateUnknown, ThreadActiveWithoutTurn)):
-                reason = turn_id.reason if isinstance(turn_id, ThreadStateUnknown) else "no turn id"
-                _log_uninterrupted_thread(log_path, thread_id, reason)
-                if isinstance(turn_id, ThreadActiveWithoutTurn):
-                    return RelaunchBlockedByLiveTurn()
-        finally:
-            client.close()
+            finally:
+                client.close()
     except (ConnectionError, OSError, SystemExit) as exc:
         _log_uninterrupted_thread(log_path, thread_id, str(exc))
     return RelaunchAllowed()
@@ -5843,7 +5996,7 @@ def command_send(args: argparse.Namespace) -> int:
         home = workers_home()
         # Retiring is enough here. A live launcher keeps its outgoing connection
         # and claims this held message at its next checked turn boundary.
-        with _server_lock(session_dir):
+        with worker_lifecycle.membership_operation(session_dir), _server_lock(session_dir):
             current = _read_json_object(_session_path(session_dir, SERVER_FILE))
             if current and server_record_home(current) != home:
                 _retire_record(session_dir, current)
@@ -5855,7 +6008,7 @@ def command_send(args: argparse.Namespace) -> int:
 def command_steer(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
-    with worker_lifecycle.lock_worker(session_dir, target):
+    with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, target):
         record = _lookup(session_dir, target)
         turn_id = record.get("turn_id", "")
         status = record.get("status", "unknown")
@@ -5923,7 +6076,7 @@ def command_interrupt(args: argparse.Namespace) -> int:
             return 2
         held = ("; the message opens its next turn" if isinstance(outcome, HeldForLauncher)
                 else "; no launcher is attached, so the message waits for its next dispatch")
-    with worker_lifecycle.lock_worker(session_dir, target):
+    with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, target):
         record = _lookup(session_dir, target)
         launcher_pid = _as_int(record.get("launcher_pid"))
         if _pid_alive(launcher_pid):
@@ -5985,8 +6138,11 @@ def command_end(args: argparse.Namespace) -> int:
     """
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
-    with worker_lifecycle.lock_worker(session_dir, target):
-        return end_worker_locked(args)
+    with worker_lifecycle.membership_operation(session_dir):
+        with worker_lifecycle.lock_worker(session_dir, target):
+            result = end_worker_locked(args)
+        # Retirement projection belongs here, with membership retained last.
+        return result
 
 
 def end_worker_locked(args: argparse.Namespace) -> int:
@@ -5995,7 +6151,7 @@ def end_worker_locked(args: argparse.Namespace) -> int:
     target = _as_str(_attr(args, "to"))
     with _pending_file(session_dir, target) as pending_file:
         with _session_path(session_dir, ROSTER_FILE).open("r+", encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
             roster = _load_roster_for_write(handle)
             record = _as_dict(roster.get(target))
             if not record:
@@ -6181,7 +6337,7 @@ def command_reopen(args: argparse.Namespace) -> int:
         except (unit_workers.WorkerUnavailable, OSError, ValueError) as error:
             print(f"codex_mesh: reopen: {error}", file=sys.stderr)
             return 2
-    with worker_lifecycle.lock_worker(session_dir, name):
+    with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
         record = _lookup(session_dir, name)
         if record.get("held_design_id"):
             raise SystemExit("codex_mesh: held roles recover through design_roles.py")
@@ -6216,7 +6372,7 @@ def command_reopen(args: argparse.Namespace) -> int:
             return 2
         path = _session_path(session_dir, ROSTER_FILE)
         with path.open("r+", encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
             roster = _load_roster_for_write(handle)
             entry = _as_dict(roster.get(name))
             if (entry.get("thread_id") != thread_id or _roster_revision(entry) != revision
@@ -6282,6 +6438,8 @@ def _recovery_idle_reason(session_dir: str, name: str, thread_id: str) -> str:
         finally:
             client.close()
         return ""
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except (ConnectionError, OSError, SystemExit) as error:
         return f"cannot establish idle state: {error}"
 
@@ -6428,6 +6586,8 @@ def _worker_idle_reason_with_inbox(
             finally:
                 client.close()
         return ""
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except (ConnectionError, OSError, SystemExit) as error:
         return f"cannot establish idle state: {error}"
 
@@ -6445,53 +6605,56 @@ class UnrecordedWorkerThread:
 def open_unit_worker(session_dir: str, name: str, role: str, *, model: str = "",
                      effort: str = "") -> dict[str, object]:
     """Open an idle thread; assignment starts its first turn later through follow."""
-    with worker_lifecycle.lock_worker(session_dir, name):
-        command = ['bash', '-c',
-                   'source "$1"; agents_resolve "direct.$2" || exit; printf "%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"', 'workers',
-                   str(Path(__file__).with_name("agents_config.sh")), role]
-        resolved = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
-        fields = resolved.stdout.strip().split()
-        if resolved.returncode or len(fields) != 4:
-            raise unit_workers.WorkerUnavailable(resolved.stderr.strip() or "cannot resolve worker model")
-        family, configured_model, configured_effort, service_tier = fields
-        model = model or configured_model
-        effort = effort or configured_effort
-        if family != "codex":
-            raise unit_workers.WorkerUnavailable("new persistent worker requires a Codex assignment")
-        state = _read_json_object(_session_path(session_dir, plan_history.STATE_FILENAME))
-        cwd = _as_str(state.get("working_dir")) or str(Path.cwd())
-        home = workers_home()
-        port, fresh = ensure_server(session_dir, home, cwd=cwd)
-        client = Client(port, name)
-        allocation: NoThreadToRelease | UnrecordedWorkerThread = NoThreadToRelease()
-        try:
-            _ = _bind_serving_server(client, session_dir, started_here=fresh)
-            policy: dict[str, object] = {"kind": "ReadOnlyReviewer" if role == "review" else "WorkerLaunchPolicy"}
-            launch = argparse.Namespace(cwd=cwd, model=model,
-                                        sandbox=READ_ONLY_SANDBOX if role == "review" else WORKER_SANDBOX,
-                                        service_tier=service_tier)
-            result = _serving_request(client, "thread/start", _thread_start_params(launch))
-            thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
-            if not thread_id:
-                raise unit_workers.WorkerUnavailable("thread/start returned no thread id")
-            allocation = UnrecordedWorkerThread(thread_id)
-            display_name = unit_workers.shown_name(Path(session_dir), name, role=role)
-            _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": display_name}), "thread/name/set")
-            record: FollowableRecord = {"thread_id": thread_id, "status": "paused", "role": cast(WorkerRole, role),
-                                        "model": model, "effort": effort, "access_policy": policy}
-            if not _update_roster_if_expected(session_dir, name, record, RosterAbsent()):
-                raise unit_workers.WorkerUnavailable(f"{name}: worker name was claimed")
-            allocation = NoThreadToRelease()
-            return {**record, "codex_home": str(home)}
-        finally:
+    with worker_lifecycle.membership_operation(session_dir):
+        with worker_lifecycle.lock_worker(session_dir, name):
+            command = ['bash', '-c',
+                       'source "$1"; agents_resolve "direct.$2" || exit; printf "%s\\n" "$AGENT_FAMILY" "$AGENT_MODEL" "$AGENT_EFFORT" "${AGENT_SERVICE_TIER:-default}"', 'workers',
+                       str(Path(__file__).with_name("agents_config.sh")), role]
+            resolved = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)
+            fields = resolved.stdout.strip().split()
+            if resolved.returncode or len(fields) != 4:
+                raise unit_workers.WorkerUnavailable(resolved.stderr.strip() or "cannot resolve worker model")
+            family, configured_model, configured_effort, service_tier = fields
+            model = model or configured_model
+            effort = effort or configured_effort
+            if family != "codex":
+                raise unit_workers.WorkerUnavailable("new persistent worker requires a Codex assignment")
+            state = _read_json_object(_session_path(session_dir, plan_history.STATE_FILENAME))
+            cwd = _as_str(state.get("working_dir")) or str(Path.cwd())
+            home = workers_home()
+            port, fresh = ensure_server(session_dir, home, cwd=cwd)
+            client = Client(port, name)
+            allocation: NoThreadToRelease | UnrecordedWorkerThread = NoThreadToRelease()
             try:
-                if isinstance(allocation, UnrecordedWorkerThread):
-                    released = _release_worker_thread(client, allocation.thread_id, session_dir)
-                    if isinstance(released, WorkerThreadStateUnknown):
-                        print(f"codex_mesh: unrecorded thread {allocation.thread_id}: {released.reason}; release unconfirmed",
-                              file=sys.stderr)
+                _ = _bind_serving_server(client, session_dir, started_here=fresh)
+                policy: dict[str, object] = {"kind": "ReadOnlyReviewer" if role == "review" else "WorkerLaunchPolicy"}
+                launch = argparse.Namespace(cwd=cwd, model=model,
+                                            sandbox=READ_ONLY_SANDBOX if role == "review" else WORKER_SANDBOX,
+                                            service_tier=service_tier)
+                result = _serving_request(client, "thread/start", _thread_start_params(launch))
+                thread_id = _as_str(_as_dict(result.get("thread")).get("id"))
+                if not thread_id:
+                    raise unit_workers.WorkerUnavailable("thread/start returned no thread id")
+                allocation = UnrecordedWorkerThread(thread_id)
+                display_name = unit_workers.shown_name(Path(session_dir), name, role=role)
+                _ = _require(client.call("thread/name/set", {"threadId": thread_id, "name": display_name}), "thread/name/set")
+                record: FollowableRecord = {"thread_id": thread_id, "status": "paused", "role": cast(WorkerRole, role),
+                                            "model": model, "effort": effort, "access_policy": policy}
+                if not _update_roster_if_expected(session_dir, name, record, RosterAbsent()):
+                    raise unit_workers.WorkerUnavailable(f"{name}: worker name was claimed")
+                allocation = NoThreadToRelease()
+                admitted = {**record, "codex_home": str(home)}
             finally:
-                client.close()
+                try:
+                    if isinstance(allocation, UnrecordedWorkerThread):
+                        released = _release_worker_thread(client, allocation.thread_id, session_dir)
+                        if isinstance(released, WorkerThreadStateUnknown):
+                            print(f"codex_mesh: unrecorded thread {allocation.thread_id}: {released.reason}; release unconfirmed",
+                                  file=sys.stderr)
+                finally:
+                    client.close()
+        # Admission projection belongs here, after lifecycle and before membership release.
+        return admitted
 
 
 def command_adopt(args: argparse.Namespace) -> int:
@@ -6505,8 +6668,8 @@ def command_adopt(args: argparse.Namespace) -> int:
     return 0
 
 
-def _preserve_paused_thread(client: Client, session_dir: str, name: str, thread_id: str) -> bool:
-    with _pending_file(session_dir, name) as pending:
+def _preserve_paused_thread(client: Client, session_dir: str, name: str, thread_id: str, *, deadline: float) -> bool:
+    with _pending_file(session_dir, name, deadline=deadline) as pending:
         def park(message: str) -> None:
             _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
             os.fsync(pending.fileno())
@@ -6521,46 +6684,87 @@ def _preserve_paused_thread(client: Client, session_dir: str, name: str, thread_
     return isinstance(state, ThreadLive)
 
 
-def _run_lifecycle_workers(session_dir: str) -> tuple[worker_lifecycle.WorkerIdentity, ...]:
-    return tuple(worker_lifecycle.WorkerIdentity(Path(session_dir), name)
-                 for name in _read_json_object(_session_path(session_dir, ROSTER_FILE)))
+@contextlib.contextmanager
+def _bulk_workers(session_dir: str, *, deadline: float,
+                  membership: worker_lifecycle.MembershipLease | AcquireMembership = ACQUIRE_MEMBERSHIP,
+                  owned_workers: tuple[worker_lifecycle.WorkerIdentity, ...] = (),
+                  allow_held_roles: bool = False) -> Generator[BulkWorkers]:
+    """Validate an authoritative work set; no caller rereads membership for effects."""
+    with worker_lifecycle.operation_deadline(deadline=deadline) as deadline, contextlib.ExitStack() as operation:
+        if isinstance(membership, AcquireMembership):
+            if any(worker.session == Path(session_dir).resolve() for worker in worker_lifecycle.held_workers()):
+                raise SystemExit("RoleNeedsRecovery: shared-server maintenance needs membership before lifecycle; "
+                                 + "run release-held-server, then retry through the holder")
+            membership = operation.enter_context(worker_lifecycle.lock_membership(session_dir, deadline=deadline))
+        elif not membership.covers(session_dir):
+            raise RuntimeError("bulk operation was passed membership it does not own")
+        while True:
+            records = _read_json_object(_session_path(session_dir, ROSTER_FILE))
+            identities = tuple(worker_lifecycle.WorkerIdentity(Path(session_dir), name) for name in records)
+            with contextlib.ExitStack() as workers:
+                if owned_workers:
+                    if not set(identities).issubset(owned_workers):
+                        raise SystemExit("RoleNeedsRecovery: server environment changed during a partial worker operation; "
+                                         + "run release-held-server, then retry through the holder")
+                else:
+                    _ = workers.enter_context(worker_lifecycle.lock_workers(*identities, deadline=deadline))
+                validated = _read_json_object(_session_path(session_dir, ROSTER_FILE))
+                if set(validated) != set(records):
+                    if time.monotonic() >= deadline:
+                        raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: membership did not stabilize")
+                    continue
+                for value in validated.values():
+                    entry = _as_dict(value)
+                    _role_fence(entry)
+                    if entry.get("held_design_id") and not allow_held_roles:
+                        raise SystemExit("codex_mesh: raw stop refuses held roles; use design_roles.py")
+                yield BulkWorkers(validated, membership, deadline)
+                break
+        # All worker/server/inbox/roster scopes have exited; membership remains
+        # available here for a future retirement staff projection.
 
 
-def _pause_roster(session_dir: str, *, stop_servers: bool = False) -> None:
-    with worker_lifecycle.lock_workers(*_run_lifecycle_workers(session_dir)):
-        _pause_roster_locked(session_dir)
-        if stop_servers:
-            _reap_run_servers(session_dir)
-
-
-def _pause_roster_locked(session_dir: str) -> None:
-    """Fence launcher completion writes before interrupting each retained thread."""
-    for value in _read_json_object(_session_path(session_dir, ROSTER_FILE)).values():
-        entry = _as_dict(value)
-        _role_fence(entry)
-        if entry.get("held_design_id"):
-            raise SystemExit("codex_mesh: raw stop --pause refuses held roles; use design_roles.py")
+def _publish_bulk_records(session_dir: str, records: dict[str, object], *, deadline: float) -> None:
+    """Publish only the validated work set, preserving entries outside that set."""
     path = _session_path(session_dir, ROSTER_FILE)
-    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(handle, deadline=deadline)
         _ = handle.seek(0)
-        roster = _load_roster_for_write(handle)
-        for name, raw in roster.items():
-            record = _as_dict(raw)
-            status = _as_str(record.get("status"))
-            if status == "ended" or record.get("adopted_to"):
-                continue
-            if status != "paused":
-                record.update({"status": "paused", "paused_from": status,
-                               "paused_turn": status in ("running", "starting")})
-            _advance_roster_revision(record)
-            roster[name] = record
+        current = _load_roster_for_write(handle)
+        current.update(records)
         _ = handle.seek(0)
         _ = handle.truncate()
-        _ = handle.write(json.dumps(roster, indent=2, sort_keys=True))
+        _ = handle.write(json.dumps(current, indent=2, sort_keys=True))
         handle.flush()
-    interrupt_by = time.time() + PAUSE_INTERRUPT_SECS
+
+
+@worker_lifecycle.operation_deadline(timeout=PAUSE_INTERRUPT_SECS)
+def _pause_roster(session_dir: str, *, stop_servers: bool = False, deadline: float = NO_LOCK_DEADLINE) -> None:
+    deadline = worker_lifecycle.effective_deadline(deadline)
+    try:
+        with _bulk_workers(session_dir, deadline=deadline) as workers, _server_lock(session_dir, deadline=deadline):
+            _pause_roster_locked(session_dir, workers)
+            if stop_servers:
+                _reap_run_servers(session_dir, operation=workers)
+    except worker_lifecycle.OperationDeadlineExpired as error:
+        raise SystemExit(f"codex_mesh: shutdown incomplete; workers and servers are not confirmed stopped: {error}") from error
+
+
+def _pause_roster_locked(session_dir: str, workers: BulkWorkers) -> None:
+    """Fence launcher completion writes before interrupting each retained thread."""
+    roster = workers.records
+    for name, raw in roster.items():
+        record = _as_dict(raw)
+        status = _as_str(record.get("status"))
+        if status == "ended" or record.get("adopted_to"):
+            continue
+        if status != "paused":
+            record.update({"status": "paused", "paused_from": status,
+                           "paused_turn": status in ("running", "starting")})
+        _advance_roster_revision(record)
+        roster[name] = record
+    _publish_bulk_records(session_dir, roster, deadline=workers.deadline)
+    interrupt_by = workers.deadline
     failures: list[str] = []
     for name, raw in roster.items():
         record = _as_dict(raw)
@@ -6570,99 +6774,140 @@ def _pause_roster_locked(session_dir: str) -> None:
         interrupted = False
         observed = False
         for live_port in _run_servers(session_dir):
-            if time.time() >= interrupt_by:
+            if time.monotonic() >= interrupt_by:
+                TransportDeadline(interrupt_by, worker_lifecycle.effective_deadline()).check_operation()
                 failures.append(f"{name}: server did not answer in time; queue preservation unconfirmed")
                 break
             try:
-                client = Client(live_port, f"pause-{os.getpid()}", deadline=interrupt_by)
+                client = Client(live_port, f"pause-{os.getpid()}", operation_deadline=interrupt_by)
+            except worker_lifecycle.OperationDeadlineExpired:
+                raise
             except OSError as error:
                 failures.append(f"{name}: cannot preserve server queue: {error}")
                 continue
             try:
-                if thread_id not in _loaded_thread_ids(client, time.monotonic() + THREAD_RELEASE_TIMEOUT_SECS):
+                if thread_id not in _loaded_thread_ids(client, interrupt_by):
                     continue
-                interrupted = _preserve_paused_thread(client, session_dir, name, thread_id) or interrupted
+                interrupted = _preserve_paused_thread(client, session_dir, name, thread_id, deadline=interrupt_by) or interrupted
                 observed = True
-            except (OSError, RuntimeError, TimeoutError, SystemExit) as error:
+            except worker_lifecycle.OperationDeadlineExpired:
+                raise
+            except (OSError, RuntimeError, SystemExit) as error:
                 failures.append(f"{name}: pause preservation failed: {error}")
             finally:
                 client.close()
         # A thread may still have work on a retired server even when its
         # recorded port names the current server. Preserve all before reaping.
         if observed:
-            with path.open("r+", encoding="utf-8") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                current = _load_roster_for_write(handle)
-                entry = _as_dict(current.get(name))
-                if entry.get("status") == "paused" and entry.get("thread_id") == thread_id:
-                    entry["paused_turn"] = interrupted
-                    current[name] = entry
-                    _ = handle.seek(0)
-                    _ = handle.truncate()
-                    _ = handle.write(json.dumps(current, indent=2, sort_keys=True))
+            record["paused_turn"] = interrupted
+            _publish_bulk_records(session_dir, {name: record}, deadline=workers.deadline)
     if failures:
         raise SystemExit("codex_mesh: servers kept alive: " + "; ".join(failures))
 
 
 def command_stop(args: argparse.Namespace) -> int:
-    """Reap this run's recorded servers, keeping paused workers and their work."""
+    """Keep one shutdown budget from director/ledger lookup through server exit."""
     session_dir = _as_str(_attr(args, "session_dir"))
-    if _attr(args, "pause") and unit_workers.run_has_live_director(Path(session_dir)):
-        print("kept workers and app-servers: unit director is live")
-        return 0
-    for value in _read_json_object(_session_path(session_dir, ROSTER_FILE)).values():
-        entry = _as_dict(value)
-        _role_fence(entry)
-        if entry.get("held_design_id"):
-            raise SystemExit("codex_mesh: raw stop refuses held roles; use design_roles.py")
-    if _attr(args, "pause"):
-        # Queue preservation may refuse a server that cannot answer. The work
-        # remains owned and protected even when that server must stay alive.
-        unit_workers.pause_run(Path(session_dir))
-        _pause_roster(session_dir, stop_servers=True)
-    else:
-        with worker_lifecycle.lock_workers(*_run_lifecycle_workers(session_dir)):
-            _mark_all_roster_ended(session_dir)
-            _reap_run_servers(session_dir)
+    pause = bool(_attr(args, "pause"))
+    try:
+        with worker_lifecycle.operation_deadline(
+                timeout=PAUSE_INTERRUPT_SECS if pause else THREAD_RELEASE_TIMEOUT_SECS) as deadline:
+            if pause and unit_workers.run_has_live_director(Path(session_dir)):
+                print("kept workers and app-servers: unit director is live")
+                return 0
+            if pause:
+                unit_workers.pause_run(Path(session_dir), deadline=deadline,
+                    pause_workers=lambda: _pause_roster(session_dir, stop_servers=True, deadline=deadline))
+            else:
+                with _bulk_workers(session_dir, deadline=deadline) as workers, _server_lock(session_dir, deadline=deadline):
+                    _mark_all_roster_ended(session_dir, workers.records, deadline=deadline)
+                    _reap_run_servers(session_dir, operation=workers)
+    except worker_lifecycle.OperationDeadlineExpired as error:
+        raise SystemExit(f"codex_mesh: shutdown incomplete; workers and servers are not confirmed stopped: {error}") from error
     return 0
 
 
-def _reap_run_servers(session_dir: str) -> None:
-    """Reap this operation's run servers while its worker locks remain held."""
-    retired_path = _session_path(session_dir, RETIRED_FILE)
-    stored = _read_json_object(retired_path).get("servers")
-    retired = cast("list[object]", stored) if isinstance(stored, list) else []
-    path = _session_path(session_dir, SERVER_FILE)
-    stopped = [
-        pid
-        for record in [*retired, _read_json_object(path)]
-        for pid in [_as_dict(record).get("pid")]
-        if isinstance(pid, int) and _reap(pid)
-    ]
-    retired_path.unlink(missing_ok=True)
-    path.unlink(missing_ok=True)
-    if not stopped:
-        print("no app-server running")
-    else:
-        print(f"stopped app-server {', '.join(str(pid) for pid in stopped)}")
+@worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS)
+def _reap_run_servers(session_dir: str, *, operation: BulkWorkers | AcquireMembership = ACQUIRE_MEMBERSHIP) -> None:
+    """Select, reap and conditionally forget servers under passed or acquired ownership."""
+    with contextlib.ExitStack() as locks:
+        if isinstance(operation, AcquireMembership):
+            deadline = worker_lifecycle.effective_deadline()
+            operation = locks.enter_context(_bulk_workers(session_dir, deadline=deadline))
+            _ = locks.enter_context(_server_lock(session_dir, deadline=deadline))
+        elif not operation.membership.covers(session_dir):
+            raise RuntimeError("run reaping requires its passed membership ownership")
+        _reap_validated_servers(session_dir, operation.deadline)
 
 
-def _reap(pid: int) -> bool:
-    """Stop one app-server, escalating to SIGKILL. False if it was not running."""
+def _reap_validated_servers(session_dir: str, deadline: float) -> None:
+    """Remove only identities selected under this operation's server lock."""
+    selected = [record for record in _recorded_run_servers(session_dir)
+                if _as_int(record.get("pid")) > 0 and _as_int(record.get("port")) > 0]
+    stopped: list[int] = []
+    for record in selected:
+        if time.monotonic() >= deadline:
+            raise worker_lifecycle.OperationDeadlineExpired("shutdown incomplete: server cleanup deadline expired")
+        pid, port = _as_int(record.get("pid")), _as_int(record.get("port"))
+        reaped = _reap(pid, deadline=deadline)
+        if reaped:
+            stopped.append(pid)
+        if not reaped and _pid_alive(pid):
+            raise SystemExit(f"codex_mesh: shutdown incomplete; workers and servers are not confirmed stopped: app-server {pid} is still alive")
+        current_path = _session_path(session_dir, SERVER_FILE)
+        if _record_names_server(_read_json_object(current_path), pid, port):
+            current_path.unlink(missing_ok=True)
+        retired_path = _session_path(session_dir, RETIRED_FILE)
+        retired = _read_json_object(retired_path).get("servers", [])
+        if isinstance(retired, list):
+            retained = [value for value in cast(list[object], retired)
+                        if not _record_names_server(_as_dict(value), pid, port)]
+            if retained:
+                _ = retired_path.write_text(json.dumps({"servers": retained}), encoding="utf-8")
+            else:
+                retired_path.unlink(missing_ok=True)
+    print(f"stopped app-server {', '.join(str(pid) for pid in stopped)}" if stopped else "no app-server running")
+
+
+@worker_lifecycle.operation_deadline(timeout=2 * REAP_WAIT_SECS)
+def _reap(pid: int, *, deadline: float = NO_LOCK_DEADLINE) -> bool:
+    """Stop one app-server; success requires confirmed exit within the budget."""
+    deadline = worker_lifecycle.effective_deadline(deadline)
     if not _pid_alive(pid):
+        return False
+    if time.monotonic() >= deadline:
         return False
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError as exc:
         print(f"could not signal app-server {pid}: {exc}")
         return False
-    deadline = time.time() + REAP_WAIT_SECS
-    while time.time() < deadline and _pid_alive(pid):
-        time.sleep(REAP_POLL_SECS)
-    if _pid_alive(pid):
-        with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGKILL)
-    return True
+    def exited() -> bool:
+        # Our child can be a zombie until reaped; kill(pid, 0) alone cannot
+        # distinguish that confirmed exit from a still executing process.
+        try:
+            waited = os.waitpid(pid, os.WNOHANG)[0]
+            if waited == pid:
+                return True
+        except OSError:
+            pass  # A server started by another launcher is not our child.
+        return not _pid_alive(pid)
+
+    term_until = min(deadline, time.monotonic() + REAP_WAIT_SECS)
+    while not exited() and time.monotonic() < term_until:
+        time.sleep(min(REAP_POLL_SECS, max(0.0, term_until - time.monotonic())))
+    if exited():
+        return True
+    if time.monotonic() >= deadline:
+        return False
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError as exc:
+        print(f"could not kill app-server {pid}: {exc}")
+        return False
+    while not exited() and time.monotonic() < deadline:
+        time.sleep(min(REAP_POLL_SECS, max(0.0, deadline - time.monotonic())))
+    return exited()
 
 
 # The run roots, each holding run folders and their run-active markers: unit/, and delegate/ for
@@ -7055,11 +7300,11 @@ def _daemon_stop_lock() -> Generator[None, None, None]:
     path = Path.home() / ".local/state/codex-mesh/daemon-stop.lock"
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with path.open("a") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_UN)
 
 
 def _list_codex_processes() -> str:
@@ -7339,7 +7584,7 @@ def _freeze_daemon_process(target: ProcessIdentity, frozen: list[FrozenDaemonMem
             return
         if time.monotonic() >= deadline:
             raise DaemonFreezeRefused(target.pid, "SIGSTOP was not confirmed")
-        time.sleep(REAP_POLL_SECS)
+        time.sleep(min(REAP_POLL_SECS, max(0, deadline - time.monotonic())))
 
 
 def _resume_daemon_family(frozen: list[FrozenDaemonMember]) -> None:
@@ -7611,7 +7856,7 @@ def _stop_daemon_locked(target: CodexDaemon) -> bool:
                 return True
             if time.monotonic() >= deadline:
                 return _family_kept(remaining[0].pid, "family member remains after shutdown")
-            time.sleep(REAP_POLL_SECS)
+            time.sleep(min(REAP_POLL_SECS, max(0, deadline - time.monotonic())))
     except DaemonFreezeRefused as error:
         return _family_kept(error.pid, error.reason)
     except (OSError, ValueError, subprocess.SubprocessError):
@@ -7721,7 +7966,7 @@ def _running_roster_workers(folder: Path) -> tuple[str, ...]:
     )
 
 
-def _forget_retired(folder: Path, pid: int) -> None:
+def _forget_retired(folder: Path, pid: int, port: int) -> None:
     """Drop a stopped server from RETIRED_FILE: `stop` signals every pid listed there, and by the
     run's end this one could belong to another process."""
     path = folder / RETIRED_FILE
@@ -7729,7 +7974,7 @@ def _forget_retired(folder: Path, pid: int) -> None:
     if not isinstance(stored, list):
         return
     records = cast("list[object]", stored)
-    kept = [record for record in records if _as_dict(record).get("pid") != pid]
+    kept = [record for record in records if not _record_names_server(_as_dict(record), pid, port)]
     if len(kept) != len(records):
         _ = path.write_text(json.dumps({"servers": kept}, indent=2), encoding="utf-8")
 
@@ -7741,14 +7986,17 @@ def _roster_threads(folder: Path) -> dict[str, str]:
     return {thread_id: name for thread_id, name in named.items() if thread_id}
 
 
-def _busy_threads(port: int, workers: dict[str, str]) -> tuple[str, ...]:
+def _busy_threads(port: int, workers: dict[str, str],
+                  *, deadline: float = NO_LOCK_DEADLINE) -> tuple[str, ...]:
     """Conversations on this server that are not idle, or why they could not be read.
 
     The server lists what it has loaded, so a turn left running by a launcher killed at its time
     limit is seen with no client connected and no roster. `workers` adds the roster's conversations
     and names them."""
     try:
-        client = Client(port, f"sweep-{os.getpid()}")
+        client = Client(port, f"sweep-{os.getpid()}", operation_deadline=deadline)
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except (ConnectionError, OSError, SystemExit) as exc:
         return (f"the server could not be asked ({str(exc) or exc.__class__.__name__})",)
     try:
@@ -7771,6 +8019,8 @@ def _busy_threads(port: int, workers: dict[str, str]) -> tuple[str, ...]:
             if not isinstance(state, ThreadIdle):
                 busy.append(f"{workers.get(thread_id, thread_id)}: {state.__class__.__name__}")
         return tuple(busy)
+    except worker_lifecycle.OperationDeadlineExpired:
+        raise
     except (ConnectionError, OSError, SystemExit) as exc:
         return (f"the server stopped answering ({str(exc) or exc.__class__.__name__})",)
     finally:
@@ -7778,7 +8028,7 @@ def _busy_threads(port: int, workers: dict[str, str]) -> tuple[str, ...]:
 
 
 def _judge(roots: tuple[Path, ...] | None, pid: int, port: int, age: float,
-           clients: int) -> SweepJudgment:
+           clients: int, *, deadline: float = NO_LOCK_DEADLINE) -> SweepJudgment:
     """Judge one running app-server without erasing its ownership state.
 
     `roots` hold the run-active markers. A server judging itself passes None: a stopped server
@@ -7811,10 +8061,11 @@ def _judge(roots: tuple[Path, ...] | None, pid: int, port: int, age: float,
     )
     workers = _roster_threads(folder) if folder is not None and exists else {}
     return SweepJudgment(
-        _sweep_verdict(facts, lambda: _busy_threads(port, workers)), ownership
+        _sweep_verdict(facts, lambda: _busy_threads(port, workers, deadline=deadline)), ownership
     )
 
 
+@worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS)
 def _stop_unused(
     roots: tuple[Path, ...] | None, pid: int, port: int, ownership: ServerOwnership
 ) -> bool:
@@ -7823,19 +8074,25 @@ def _stop_unused(
     The second look runs under the run folder's server lock, so a launcher reaching
     `ensure_server` meanwhile waits and then starts a server of its own. A deleted folder has no
     launcher to wait and is not created again for the lock."""
-    if isinstance(ownership, UnownedServerWithoutLog):
-        return _stop_unused_with_lock_held(roots, pid, port)
-    if not isinstance(ownership, (CurrentRunServer, HeldDesignServer, RetiredRunServer,
-                                  StartingDevShellServer, UnownedServerWithLog)):
+    try:
+        deadline = worker_lifecycle.effective_deadline()
+        if isinstance(ownership, UnownedServerWithoutLog):
+            return _stop_unused_with_lock_held(roots, pid, port, deadline=deadline)
+        if not isinstance(ownership, (CurrentRunServer, HeldDesignServer, RetiredRunServer,
+                                      StartingDevShellServer, UnownedServerWithLog)):
+            return False
+        folder = ownership.session_dir
+        if not folder.is_dir():
+            return _stop_unused_with_lock_held(roots, pid, port, deadline=deadline)
+        with worker_lifecycle.membership_operation(folder, deadline=deadline), _server_lock(str(folder), deadline=deadline):
+            return _stop_unused_with_lock_held(roots, pid, port, deadline=deadline)
+    except worker_lifecycle.OperationDeadlineExpired as error:
+        print(f"codex_mesh: shutdown incomplete: {error}; app-server {pid} kept", file=sys.stderr)
         return False
-    folder = ownership.session_dir
-    if not folder.is_dir():
-        return _stop_unused_with_lock_held(roots, pid, port)
-    with _server_lock(str(folder)):
-        return _stop_unused_with_lock_held(roots, pid, port)
 
 
-def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: int) -> bool:
+def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: int,
+                                *, deadline: float = NO_LOCK_DEADLINE) -> bool:
     """Repeat an unused-server judgment, then stop and forget that exact owner."""
     try:
         running = {(found, at): age for found, at, age in _running_servers()}
@@ -7847,8 +8104,15 @@ def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: 
     age = running.get((pid, port))
     if age is None:
         return False
-    judgment = _judge(roots, pid, port, age, clients.get(port, 0))
-    if not isinstance(judgment.verdict, ServerUnused) or not _reap(pid):
+    judgment = _judge(roots, pid, port, age, clients.get(port, 0), deadline=deadline)
+    if time.monotonic() >= deadline:
+        print(f"codex_mesh: shutdown incomplete: idle check deadline reached; app-server {pid} kept", file=sys.stderr)
+        return False
+    if not isinstance(judgment.verdict, ServerUnused):
+        return False
+    if not _reap(pid, deadline=deadline):
+        if _pid_alive(pid):
+            print(f"codex_mesh: shutdown incomplete: app-server {pid} remains alive; records kept", file=sys.stderr)
         return False
     if isinstance(judgment.ownership, UnownedServerWithoutLog):
         return True
@@ -7858,7 +8122,7 @@ def _stop_unused_with_lock_held(roots: tuple[Path, ...] | None, pid: int, port: 
         return False
     folder = ownership.session_dir
     if folder.is_dir():
-        _forget_retired(folder, pid)
+        _forget_retired(folder, pid, port)
         record = folder / SERVER_FILE
         if _record_names_server(_read_json_object(record), pid, port):
             record.unlink(missing_ok=True)
@@ -8054,7 +8318,6 @@ def _notify_holder(session_id: str, line: str, kind: CodexNoticeKind) -> None:
         print(f"codex_mesh: could not tell session {session_id}: {sent.stderr.strip()}", file=sys.stderr)
 
 
-@role_map_command
 def command_signin_changed(args: argparse.Namespace) -> int:
     """Move every run off an app-server started before the Codex sign-in last changed.
 
@@ -8065,42 +8328,44 @@ def command_signin_changed(args: argparse.Namespace) -> int:
     nothing uses it, otherwise by its watcher once nothing does. Run twice for one change, the
     second run finds nothing older and moves nothing.
     """
-    roots = _sweep_roots(args)
-    home = codex_home()
-    changed = _sign_in_changed_at(home)
-    if changed is None:
-        print("codex_mesh: no Codex sign-in file; nothing moved")
-        return 0
-    at = datetime.fromtimestamp(changed).astimezone(user_zone()).strftime("%H:%M %Z")
-    runs: list[WorkersRunMove | EndedWorkersRun] = []
-    folders = sorted({path.parent for root in roots for filename in (SERVER_FILE, RETIRED_FILE)
-                      for path in root.glob(f"*/{filename}")})
-    for folder in folders:
-        with _server_lock(str(folder)):
-            current = _read_json_object(folder / SERVER_FILE)
-            holders = tuple(_marker_sessions(roots, folder))
-            live = _run_is_live(folder, holders)
-            outgoing: dict[int, int] = {}
-            records = [current] if live else _recorded_run_servers(str(folder))
-            for record in records:
-                port, pid = record.get("port"), record.get("pid")
-                recorded_home = server_record_home(record)
-                if (recorded_home == home
-                        and isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid)
-                        and _holds_old_sign_in(pid, recorded_home)):
-                    outgoing[port] = pid
-            if not outgoing:
-                continue
-            current_port = current.get("port")
-            if isinstance(current_port, int) and current_port in outgoing:
-                _retire_record(str(folder), current)
-        if not live:
-            runs.append(EndedWorkersRun(folder, tuple(outgoing.items())))
-            continue
-        launcher_sessions = _launcher_sessions(folder) if not holders else ()
-        workers = tuple(worker for port in outgoing for worker in _switch_run_workers(
-            folder, port, codex_home_role_label(workers_home()), dry_run=False))
-        runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers, launcher_sessions))
+    with worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS):
+        roots = _sweep_roots(args)
+        home = codex_home()
+        changed = _sign_in_changed_at(home)
+        if changed is None:
+            print("codex_mesh: no Codex sign-in file; nothing moved")
+            return 0
+        at = datetime.fromtimestamp(changed).astimezone(user_zone()).strftime("%H:%M %Z")
+        runs: list[WorkersRunMove | EndedWorkersRun] = []
+        folders = sorted({path.parent for root in roots for filename in (SERVER_FILE, RETIRED_FILE)
+                          for path in root.glob(f"*/{filename}")})
+        for folder in folders:
+            deadline = worker_lifecycle.effective_deadline()
+            with _bulk_workers(str(folder), deadline=deadline, allow_held_roles=True) as operation, _server_lock(str(folder), deadline=deadline):
+                current = _read_json_object(folder / SERVER_FILE)
+                holders = tuple(_marker_sessions(roots, folder))
+                live = _run_is_live(folder, holders)
+                outgoing: dict[int, int] = {}
+                records = [current] if live else _recorded_run_servers(str(folder))
+                for record in records:
+                    port, pid = record.get("port"), record.get("pid")
+                    recorded_home = server_record_home(record)
+                    if (recorded_home == home
+                            and isinstance(port, int) and isinstance(pid, int) and _pid_alive(pid)
+                            and _holds_old_sign_in(pid, recorded_home)):
+                        outgoing[port] = pid
+                if not outgoing:
+                    continue
+                current_port = current.get("port")
+                if isinstance(current_port, int) and current_port in outgoing:
+                    _retire_record(str(folder), current)
+                if not live:
+                    runs.append(EndedWorkersRun(folder, tuple(outgoing.items())))
+                    continue
+                launcher_sessions = _launcher_sessions(folder) if not holders else ()
+                workers = tuple(worker for port in outgoing for worker in _switch_run_workers(
+                    folder, port, codex_home_role_label(workers_home()), dry_run=False, operation=operation))
+                runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers, launcher_sessions))
     switches = _finish_run_moves(runs)
     for run, switched in zip(runs, switches, strict=True):
         if isinstance(run, EndedWorkersRun):
@@ -8250,7 +8515,7 @@ def command_resume_account_move(args: argparse.Namespace) -> int:
             print(f"codex_mesh: {name}: {outcome.reason}", file=sys.stderr)
             return 1
         return 0
-    with worker_lifecycle.lock_worker(session_dir, name):
+    with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
         current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
         if current != record:
             print(f"codex_mesh: {name}: worker changed before account move claim", file=sys.stderr)
@@ -8333,11 +8598,12 @@ def _wait_account_move_resumes(
                 del pending[key]
         if not pending:
             break
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             for key in pending:
                 outcomes[key] = WorkerMoveFailed("resume not confirmed before timeout", _account_move_command(*key))
             break
-        time.sleep(0.05)
+        time.sleep(min(0.05, remaining))
     return outcomes
 
 
@@ -8402,10 +8668,19 @@ def _finish_run_moves(
         ), launcher_sessions=run.launcher_sessions) for run in runs)
 
 
+@worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS)
 def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[str, object],
-                                       port: int, label: str) -> SwitchingWorker | InterruptedWorkerMove:
-    _role_fence(entry)
-    with worker_lifecycle.lock_worker(session_dir, name):
+                                       port: int, label: str, *,
+                                       operation: BulkWorkers | AcquireMembership = ACQUIRE_MEMBERSHIP) -> SwitchingWorker | InterruptedWorkerMove:
+    deadline = operation.deadline if isinstance(operation, BulkWorkers) else worker_lifecycle.effective_deadline()
+    with contextlib.ExitStack() as locks:
+        if isinstance(operation, AcquireMembership):
+            _ = locks.enter_context(worker_lifecycle.membership_operation(session_dir, deadline=deadline))
+            _ = locks.enter_context(worker_lifecycle.lock_worker(session_dir, name, deadline=deadline))
+        elif (not operation.membership.covers(session_dir)
+              or worker_lifecycle.WorkerIdentity(Path(session_dir), name) not in worker_lifecycle.held_workers()):
+            raise RuntimeError("account move requires its passed bulk ownership")
+        _role_fence(entry)
         current = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
         if current != entry or current.get("adopted_to") or current.get("status") != "running":
             return SwitchingWorker(name, False, WorkerMoveFailed("worker ownership changed before account move", _account_move_command(session_dir, name)))
@@ -8415,7 +8690,7 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
         try:
             if not thread_id:
                 raise SystemExit("worker has no recorded thread")
-            client = Client(port, f"account-move-{name}")
+            client = Client(port, f"account-move-{name}", operation_deadline=deadline)
             state = _interruptible_turn_id(client, thread_id, _read_live_turn(client, thread_id))
             if isinstance(state, ThreadStateUnknown):
                 raise SystemExit(state.reason)
@@ -8429,11 +8704,11 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
             marker = AccountMoveMarker(thread_id, turn_id, label, secrets.token_hex(16))
             stored: StoredAccountMove = {"thread_id": marker.thread_id, "turn_id": marker.turn_id,
                                         "label": marker.label, "move_id": marker.move_id}
-            with _pending_file(session_dir, name):
+            with _pending_file(session_dir, name, deadline=deadline):
                 if _end_marker_path(session_dir, name).exists() or not _roster_still_on_thread(session_dir, name, thread_id):
                     raise SystemExit("worker ended or was replaced before interruption")
                 _write_account_move_json(_account_move_path(session_dir, name), stored)
-            with _pending_file(session_dir, name) as pending:
+            with _pending_file(session_dir, name, deadline=deadline) as pending:
                 def park(message: str) -> None:
                     _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
                 _move_queue_to_pending(client, thread_id, park)
@@ -8445,6 +8720,8 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
             client.close()
             client = None
             return InterruptedWorkerMove(session_dir, name, marker, _as_int(entry.get("launcher_pid")))
+        except worker_lifecycle.OperationDeadlineExpired:
+            raise
         except (ConnectionError, OSError, SystemExit) as error:
             reason = f"interrupt failed: {error}"
             if isinstance(marker, AccountMoveMarker):
@@ -8456,10 +8733,16 @@ def _interrupt_worker_for_account_move(session_dir: str, name: str, entry: dict[
                 client.close()
 
 
+@worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS)
 def _switch_run_workers(
     folder: Path, port: int, label: str, *, dry_run: bool,
+    operation: BulkWorkers | AcquireMembership = ACQUIRE_MEMBERSHIP,
 ) -> tuple[SwitchingWorker | InterruptedWorkerMove, ...]:
-    entries = _read_json_object(folder / ROSTER_FILE)
+    if isinstance(operation, AcquireMembership):
+        deadline = worker_lifecycle.effective_deadline()
+        with _bulk_workers(str(folder), deadline=deadline, allow_held_roles=True) as owned, _server_lock(str(folder), deadline=deadline):
+            return _switch_run_workers(folder, port, label, dry_run=dry_run, operation=owned)
+    entries = operation.records
     workers: list[SwitchingWorker | InterruptedWorkerMove] = []
     for name, value in sorted(entries.items()):
         entry = _as_dict(value)
@@ -8467,64 +8750,63 @@ def _switch_run_workers(
         if entry.get("status") == "ended" or entry.get("port", port) != port:
             continue
         if entry.get("status") == "running" and not dry_run:
-            workers.append(_interrupt_worker_for_account_move(str(folder), name, entry, port, label))
+            workers.append(_interrupt_worker_for_account_move(str(folder), name, entry, port, label, operation=operation))
         else:
             if entry.get("held_design_id") and not dry_run:
-                with worker_lifecycle.lock_worker(folder, name):
-                    if _as_dict(_read_json_object(folder / ROSTER_FILE).get(name)) != entry:
-                        raise SystemExit(f"{name}: ownership changed before account move")
-                    thread_id = _as_str(entry.get("thread_id"))
-                    client = Client(port, "held-idle-account-move")
-                    try:
-                        with _pending_file(str(folder), name) as pending:
-                            def park(message: str) -> None:
-                                _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
-                            _move_queue_to_pending(client, thread_id, park)
-                            released = _release_worker_thread(client, thread_id, str(folder))
-                            if isinstance(released, WorkerThreadStateUnknown):
-                                raise SystemExit("RoleNeedsRecovery: " + released.reason)
-                    finally:
-                        client.close()
+                thread_id = _as_str(entry.get("thread_id"))
+                client = Client(port, "held-idle-account-move", operation_deadline=operation.deadline)
+                try:
+                    with _pending_file(str(folder), name, deadline=operation.deadline) as pending:
+                        def park(message: str) -> None:
+                            _write_pending(pending, thread_id, [*_pending_for_thread(pending, thread_id), message])
+                        _move_queue_to_pending(client, thread_id, park)
+                        released = _release_worker_thread(client, thread_id, str(folder))
+                        if isinstance(released, WorkerThreadStateUnknown):
+                            raise SystemExit("RoleNeedsRecovery: " + released.reason)
+                finally:
+                    client.close()
             workers.append(SwitchingWorker(name, entry.get("status") == "running"))
     return tuple(workers)
 
 
 def retire_workers_servers(workers_home: Path, label: str, *, dry_run: bool = False) -> tuple[WorkersRunSwitch, ...]:
     """Retire run servers, interrupt running turns, and confirm their continuations."""
-    notices: dict[str, list[str]] = {}
-    notice_failures: dict[str, list[str]] = {}
-    runs: list[WorkersRunMove | EndedWorkersRun] = []
-    at = datetime.now().astimezone(user_zone()).strftime("%H:%M %Z")
-    from scripts.astra import design_roles
-    durable = set(design_roles.durable_meshes())
-    folders = sorted({path.parent for root in SWEEP_ROOTS
-                      for filename in (SERVER_FILE, RETIRED_FILE) for path in root.glob(f"*/{filename}")} | durable)
-    for folder in folders:
-        with _server_lock(str(folder)):
-            current = _read_json_object(folder / SERVER_FILE)
-            outgoing: dict[int, int] = {}
-            for record in _recorded_run_servers(str(folder)):
-                pid, port = record.get("pid"), record.get("port")
-                if (isinstance(pid, int) and isinstance(port, int) and _pid_alive(pid)
-                        and server_record_home(record) != workers_home):
-                    outgoing[port] = pid
-            if not outgoing:
-                continue
-            holders = tuple(_marker_sessions(SWEEP_ROOTS, folder))
-            if folder in durable:
-                context = _design_context(str(folder))
-                holders = (_as_str(context.get("holder_session")),)
-            live = folder in durable or _run_is_live(folder, holders)
-            current_port = current.get("port")
-            if not dry_run and isinstance(current_port, int) and current_port in outgoing:
-                _retire_record(str(folder), current)
-        if not live:
-            runs.append(EndedWorkersRun(folder, tuple(outgoing.items())))
-            continue
-        launcher_sessions = _launcher_sessions(folder) if not holders else ()
-        workers = tuple(worker for port in outgoing
-                        for worker in _switch_run_workers(folder, port, label, dry_run=dry_run))
-        runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers, launcher_sessions))
+    with worker_lifecycle.operation_deadline(timeout=THREAD_RELEASE_TIMEOUT_SECS):
+        notices: dict[str, list[str]] = {}
+        notice_failures: dict[str, list[str]] = {}
+        runs: list[WorkersRunMove | EndedWorkersRun] = []
+        at = datetime.now().astimezone(user_zone()).strftime("%H:%M %Z")
+        from scripts.astra import design_roles
+        durable = set(design_roles.durable_meshes())
+        folders = sorted({path.parent for root in SWEEP_ROOTS
+                          for filename in (SERVER_FILE, RETIRED_FILE) for path in root.glob(f"*/{filename}")} | durable)
+        for folder in folders:
+            deadline = worker_lifecycle.effective_deadline()
+            with _bulk_workers(str(folder), deadline=deadline, allow_held_roles=True) as operation, _server_lock(str(folder), deadline=deadline):
+                current = _read_json_object(folder / SERVER_FILE)
+                outgoing: dict[int, int] = {}
+                for record in _recorded_run_servers(str(folder)):
+                    pid, port = record.get("pid"), record.get("port")
+                    if (isinstance(pid, int) and isinstance(port, int) and _pid_alive(pid)
+                            and server_record_home(record) != workers_home):
+                        outgoing[port] = pid
+                if not outgoing:
+                    continue
+                holders = tuple(_marker_sessions(SWEEP_ROOTS, folder))
+                if folder in durable:
+                    context = _design_context(str(folder))
+                    holders = (_as_str(context.get("holder_session")),)
+                live = folder in durable or _run_is_live(folder, holders)
+                current_port = current.get("port")
+                if not dry_run and isinstance(current_port, int) and current_port in outgoing:
+                    _retire_record(str(folder), current)
+                if not live:
+                    runs.append(EndedWorkersRun(folder, tuple(outgoing.items())))
+                    continue
+                launcher_sessions = _launcher_sessions(folder) if not holders else ()
+                workers = tuple(worker for port in outgoing
+                                for worker in _switch_run_workers(folder, port, label, dry_run=dry_run, operation=operation))
+                runs.append(WorkersRunMove(folder, holders, tuple(outgoing.items()), workers, launcher_sessions))
     switches = _finish_run_moves(runs, dry_run=dry_run)
     for run, switched in zip(runs, switches, strict=True):
         if isinstance(run, EndedWorkersRun):
@@ -8579,7 +8861,7 @@ def command_prime(args: argparse.Namespace) -> int:
     """Create a read-only reviewer template without starting a turn."""
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
-    with worker_lifecycle.lock_worker(session_dir, name):
+    with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_worker(session_dir, name):
         client: Client | None = None
         try:
             existing = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
@@ -8665,7 +8947,7 @@ def command_fork(args: argparse.Namespace) -> int:
     """Load a template and create a named read-only reviewer from it."""
     session_dir = _as_str(_attr(args, "session_dir"))
     name = _as_str(_attr(args, "name"))
-    with worker_lifecycle.lock_workers(
+    with worker_lifecycle.membership_operation(session_dir), worker_lifecycle.lock_workers(
             worker_lifecycle.WorkerIdentity(Path(session_dir), name),
             worker_lifecycle.WorkerIdentity(Path(session_dir), _as_str(_attr(args, "from_name")))):
         client: Client | None = None
@@ -8753,7 +9035,7 @@ def command_set_instructions(args: argparse.Namespace) -> int:
             return 2
         path = _session_path(session_dir, ROSTER_FILE)
         with path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
             _ = handle.seek(0)
             roster = _load_roster_for_write(handle)
             entry = _as_dict(roster.get(name))
@@ -8775,7 +9057,7 @@ def _clear_reset_context(session_dir: str, name: str, thread_id: str, launcher_p
     """Clear context only while reset still owns this thread's worker claim."""
     path = _session_path(session_dir, ROSTER_FILE)
     with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
         _ = handle.seek(0)
         roster = _load_roster_for_write(handle)
         entry = _as_dict(roster.get(name))

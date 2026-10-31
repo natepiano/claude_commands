@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -278,7 +278,7 @@ def _read(path: Path) -> dict[str, object]:
 def _read_roster(run: Path) -> dict[str, object]:
     try:
         with (run / ROSTER).open(encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_SH)
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_SH)
             content = handle.read()
             if not content.strip():
                 return {}
@@ -434,60 +434,61 @@ class UnitWorkerLedger:
                            "quarantined_workers": ledger.quarantined_workers})
 
     @contextmanager
-    def locked(self, *, write: bool = True) -> Generator[UnitWorkers, None, None]:
-        journal = self.path.with_suffix(".move.json")
-        if journal.exists():
-            move = _read(journal)
-            _finish_move(move)
-            if not self.path.exists():
-                raise WorkerUnavailable(f"worker ledger moved to {move.get('destination')}; retry using current unit identity")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.with_suffix(".lock").open("a+", encoding="utf-8") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            data = _read(self.path)
-            ledger = UnitWorkers(
-                reviewers_adopted=data.get("reviewers_adopted") is True,
-                quarantined_adoptions={key: _object(value) for key, value in
-                                       _object(data.get("quarantined_adoptions")).items()},
-                quarantined_workers={key: _object(value) for key, value in
-                                     _object(data.get("quarantined_workers")).items()})
-            invalid_workers: list[str] = []
-            for name, record in _object(data.get("workers")).items():
-                try:
-                    ledger.workers[name] = _decode_worker(name, _object(record))
-                except WorkerUnavailable as error:
-                    ledger.quarantined_workers[name] = {"reason": str(error), "record": record}
-                    invalid_workers.append(name)
-            stored_adoptions = data.get("adoptions", {})
-            if not isinstance(stored_adoptions, dict):
-                ledger.quarantined_adoptions["invalid-journal"] = {
-                    "reason": "adoption journal is not an object", "intent": stored_adoptions}
-                self.save(ledger)
-                raise WorkerUnavailable(f"invalid adoption journal quarantined in {self.path}; retry command")
-            invalid: list[str] = []
-            for key, record in cast(dict[str, object], stored_adoptions).items():
-                try:
-                    intent = _decode_intent(key, _object(record))
-                    if intent.name not in ledger.workers:
-                        raise WorkerUnavailable("adoption has no registered worker")
-                    backend = ledger.workers[intent.name].backend
-                    if not isinstance(backend, CodexThread) or backend.thread_id != intent.after.get("thread_id"):
-                        raise WorkerUnavailable("adoption differs from saved backend")
-                    ledger.adoptions[key] = intent
-                except WorkerUnavailable as error:
-                    ledger.quarantined_adoptions[key] = {"reason": str(error), "intent": record}
-                    invalid.append(key)
-            if invalid or invalid_workers:
-                self.save(ledger)
-                failures: list[str] = []
-                if invalid_workers:
-                    failures.append(f"worker entries: {', '.join(invalid_workers)}")
-                if invalid:
-                    failures.append(f"adoption journal: {', '.join(invalid)}")
-                raise WorkerUnavailable(f"invalid {'; '.join(failures)} quarantined in {self.path}; retry command")
-            yield ledger
-            if write:
-                self.save(ledger)
+    def locked(self, *, write: bool = True, deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> Generator[UnitWorkers, None, None]:
+        with worker_lifecycle.operation_deadline(deadline=deadline):
+            journal = self.path.with_suffix(".move.json")
+            if journal.exists():
+                move = _read(journal)
+                _finish_move(move)
+                if not self.path.exists():
+                    raise WorkerUnavailable(f"worker ledger moved to {move.get('destination')}; retry using current unit identity")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.with_suffix(".lock").open("a+", encoding="utf-8") as lock:
+                worker_lifecycle.acquire_flock(lock, deadline=deadline)
+                data = _read(self.path)
+                ledger = UnitWorkers(
+                    reviewers_adopted=data.get("reviewers_adopted") is True,
+                    quarantined_adoptions={key: _object(value) for key, value in
+                                           _object(data.get("quarantined_adoptions")).items()},
+                    quarantined_workers={key: _object(value) for key, value in
+                                         _object(data.get("quarantined_workers")).items()})
+                invalid_workers: list[str] = []
+                for name, record in _object(data.get("workers")).items():
+                    try:
+                        ledger.workers[name] = _decode_worker(name, _object(record))
+                    except WorkerUnavailable as error:
+                        ledger.quarantined_workers[name] = {"reason": str(error), "record": record}
+                        invalid_workers.append(name)
+                stored_adoptions = data.get("adoptions", {})
+                if not isinstance(stored_adoptions, dict):
+                    ledger.quarantined_adoptions["invalid-journal"] = {
+                        "reason": "adoption journal is not an object", "intent": stored_adoptions}
+                    self.save(ledger)
+                    raise WorkerUnavailable(f"invalid adoption journal quarantined in {self.path}; retry command")
+                invalid: list[str] = []
+                for key, record in cast(dict[str, object], stored_adoptions).items():
+                    try:
+                        intent = _decode_intent(key, _object(record))
+                        if intent.name not in ledger.workers:
+                            raise WorkerUnavailable("adoption has no registered worker")
+                        backend = ledger.workers[intent.name].backend
+                        if not isinstance(backend, CodexThread) or backend.thread_id != intent.after.get("thread_id"):
+                            raise WorkerUnavailable("adoption differs from saved backend")
+                        ledger.adoptions[key] = intent
+                    except WorkerUnavailable as error:
+                        ledger.quarantined_adoptions[key] = {"reason": str(error), "intent": record}
+                        invalid.append(key)
+                if invalid or invalid_workers:
+                    self.save(ledger)
+                    failures: list[str] = []
+                    if invalid_workers:
+                        failures.append(f"worker entries: {', '.join(invalid_workers)}")
+                    if invalid:
+                        failures.append(f"adoption journal: {', '.join(invalid)}")
+                    raise WorkerUnavailable(f"invalid {'; '.join(failures)} quarantined in {self.path}; retry command")
+                yield ledger
+                if write:
+                    self.save(ledger)
 
 
 def _repository_name(worktree: Path) -> str:
@@ -551,7 +552,7 @@ def ledger_for_run(run: Path) -> UnitWorkerLedger:
 def _roster_locked(run: Path) -> Generator[tuple[TextIO, dict[str, object]], None, None]:
     run.mkdir(parents=True, exist_ok=True)
     with (run / ROSTER).open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
         _ = handle.seek(0)
         content = handle.read()
         roster = _object(cast(object, json.loads(content))) if content.strip() else {}
@@ -668,21 +669,11 @@ def _read_inbox(handle: TextIO) -> dict[str, object]:
 def _giving_inbox(locks: ExitStack, source: Path, name: str) -> tuple[TextIO, dict[str, object]]:
     inbox = locks.enter_context((source / f"{name}.pending.json").open("a+", encoding="utf-8"))
     try:
-        fcntl.flock(inbox, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        worker_lifecycle.acquire_flock(inbox, mode=fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as error:
         raise WorkerUnavailable(f"{name}: pending inbox is in use; retry adoption recovery") from error
     return inbox, _read_inbox(inbox)
 
-
-def _transfer_pending(locks: ExitStack, inbox: TextIO, destination: Path, name: str,
-                      after: dict[str, object], identity: str, messages: dict[str, object]) -> None:
-    target_inbox = locks.enter_context((destination / f"{name}.pending.json").open("a+", encoding="utf-8"))
-    try:
-        fcntl.flock(target_inbox, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as error:
-        raise WorkerUnavailable(f"{name}: destination inbox in use; retry recovery") from error
-    saved = _read_inbox(target_inbox)
-    _merge_pending(inbox, target_inbox, after, identity, messages, saved)
 
 
 def _merge_pending(inbox: TextIO, target_inbox: TextIO, after: dict[str, object],
@@ -694,103 +685,119 @@ def _merge_pending(inbox: TextIO, target_inbox: TextIO, after: dict[str, object]
     _write_inbox(inbox, {"thread_id": after["thread_id"], "messages": [], "accepting_messages": False})
 
 
+@dataclass(frozen=True)
+class AdoptionInboxTransfer:
+    giving: TextIO
+    taking: TextIO
+    saved: dict[str, object]
+
+
+@dataclass(frozen=True)
+class NoAdoptionInboxTransfer:
+    """The source is removed or the adoption refuses queued transport."""
+
+
 def _complete_adoption(store: UnitWorkerLedger, ledger: UnitWorkers, transaction: AdoptionIntent) -> None:
-    """Roll forward an intent under ledger -> giving -> taking -> inbox locks."""
+    """Roll forward under ledger, membership, lifecycle, inbox, then roster locks."""
     from scripts.agents import codex_mesh
     source, destination = transaction.giving.path, transaction.destination
     name, identity = transaction.name, transaction.identity
     after = transaction.after
-    with worker_lifecycle.lock_workers(
-            worker_lifecycle.WorkerIdentity(destination, name),
-            *(() if isinstance(transaction.giving, RemovedRun) else (worker_lifecycle.WorkerIdentity(source, name),))
-    ), ExitStack() as locks:
-        # A removed run has no roster to recreate. Its durable backend and owner
-        # remain in the ledger; only the taking roster participates in recovery.
-        if isinstance(transaction.giving, ExistingRun):
-            handle, records = locks.enter_context(_roster_locked(source))
-            giving: GivingRoster | RemovedGivingRoster = GivingRoster(handle, records, transaction.giving.before)
-        else:
-            giving = RemovedGivingRoster()
-        taking, new = locks.enter_context(_roster_locked(destination))
-        current = _object(giving.records.get(name)) if isinstance(giving, GivingRoster) else {}
-        target = _object(new.get(name))
-        source_after: dict[str, object] = {}
-        if isinstance(giving, GivingRoster):
-            source_after = dict(giving.before)
-            source_after.update({"status": "adopted", "adopted_to": str(destination), "adoption_id": identity})
-            codex_mesh.advance_worker_roster_revision(source_after)
-        source_done = isinstance(giving, RemovedGivingRoster) or current == source_after
-        destination_done = target == after
-        # Unknown revisions are never overwritten by transaction recovery.
-        if ((not source_done and isinstance(giving, GivingRoster) and current != giving.before)
-                or (not destination_done and target != transaction.destination_before)):
-            # Undo only our own writes. Preserve newer owners and their messages.
-            if isinstance(giving, GivingRoster) and source_done:
-                restored = dict(giving.before)
-                restored["revision"] = current.get("revision", 0)
-                codex_mesh.advance_worker_roster_revision(restored)
-                giving.records[name] = restored
-                _write_roster(giving.handle, giving.records)
-            if destination_done:
-                if transaction.destination_before:
-                    restored_target = dict(transaction.destination_before)
-                    restored_target["revision"] = target.get("revision", 0)
-                    codex_mesh.advance_worker_roster_revision(restored_target)
-                    new[name] = restored_target
-                else:
-                    _ = new.pop(name)
-                _write_roster(taking, new)
-            worker = ledger.workers[name]
-            if not isinstance(worker.ownership, Retired):
-                worker.ownership = HeldBy(str(source))
-            _quarantine(store, ledger, transaction, "roster revision changed; rolled back owned writes")
-        messages: dict[str, object] = {}
-        if (isinstance(transaction.giving, ExistingRun)
-                and transaction.queue_policy is AdoptionQueuePolicy.LEGACY_REFUSE_QUEUED):
-            _, messages = _giving_inbox(locks, source, name)
-        if messages.get("messages") and transaction.queue_policy is AdoptionQueuePolicy.LEGACY_REFUSE_QUEUED:
-            if isinstance(giving, GivingRoster) and source_done:
-                restored = dict(giving.before)
-                restored["revision"] = current.get("revision", 0)
-                codex_mesh.advance_worker_roster_revision(restored)
-                giving.records[name] = restored
-                _write_roster(giving.handle, giving.records)
-            if destination_done:
-                if transaction.destination_before:
-                    restored_target = dict(transaction.destination_before)
-                    restored_target["revision"] = target.get("revision", 0)
-                    codex_mesh.advance_worker_roster_revision(restored_target)
-                    new[name] = restored_target
-                else:
-                    _ = new.pop(name)
-                _write_roster(taking, new)
-            ledger.workers[name].ownership = HeldBy(str(source))
-            _quarantine(store, ledger, transaction, "source received a message; rolled back owned writes")
-        if not destination_done:
-            marker = transaction.account_move
-            if marker:
-                _atomic(destination / f"{name}.account-move.json", marker)
+    with worker_lifecycle.membership_operation(destination, *((source,) if isinstance(transaction.giving, ExistingRun) else ())):
+        with worker_lifecycle.lock_workers(
+                worker_lifecycle.WorkerIdentity(destination, name),
+                *(() if isinstance(transaction.giving, RemovedRun) else (worker_lifecycle.WorkerIdentity(source, name),))
+        ), ExitStack() as locks:
+            messages: dict[str, object] = {}
+            inbox_transfer: AdoptionInboxTransfer | NoAdoptionInboxTransfer = NoAdoptionInboxTransfer()
+            if isinstance(transaction.giving, ExistingRun):
+                inbox, messages = _giving_inbox(locks, source, name)
+                if transaction.queue_policy is AdoptionQueuePolicy.TRANSFER:
+                    target_inbox, saved = _giving_inbox(locks, destination, name)
+                    inbox_transfer = AdoptionInboxTransfer(inbox, target_inbox, saved)
+            # A removed run has no roster to recreate. Its durable backend and owner
+            # remain in the ledger; only the taking roster participates in recovery.
+            if isinstance(transaction.giving, ExistingRun):
+                handle, records = locks.enter_context(_roster_locked(source))
+                giving: GivingRoster | RemovedGivingRoster = GivingRoster(handle, records, transaction.giving.before)
             else:
-                (destination / f"{name}.account-move.json").unlink(missing_ok=True)
-            new[name] = dict(after)
-            _write_roster(taking, new)
-        if not source_done and isinstance(giving, GivingRoster):
-            giving.records[name] = source_after
-            _write_roster(giving.handle, giving.records)
-        if (isinstance(transaction.giving, ExistingRun)
-                and transaction.queue_policy is AdoptionQueuePolicy.TRANSFER):
-            # Publish the taking roster before routing source senders to it.
-            # After the source fence, no sender can append behind this copy.
-            inbox, messages = _giving_inbox(locks, source, name)
-            _transfer_pending(locks, inbox, destination, name, after, identity, messages)
-        worker = ledger.workers[name]
-        worker.ownership = Adopted(str(destination))
-        if not any(event.details.get("adoption_id") == identity for event in worker.events):
-            worker.events.append(_event("adopted", "new run", destination, adoption_id=identity,
-                                        from_run=str(source)))
-        store.save(ledger)
-        _ = ledger.adoptions.pop(identity)
-        store.save(ledger)
+                giving = RemovedGivingRoster()
+            taking, new = locks.enter_context(_roster_locked(destination))
+            current = _object(giving.records.get(name)) if isinstance(giving, GivingRoster) else {}
+            target = _object(new.get(name))
+            source_after: dict[str, object] = {}
+            if isinstance(giving, GivingRoster):
+                source_after = dict(giving.before)
+                source_after.update({"status": "adopted", "adopted_to": str(destination), "adoption_id": identity})
+                codex_mesh.advance_worker_roster_revision(source_after)
+            source_done = isinstance(giving, RemovedGivingRoster) or current == source_after
+            destination_done = target == after
+            # Unknown revisions are never overwritten by transaction recovery.
+            if ((not source_done and isinstance(giving, GivingRoster) and current != giving.before)
+                    or (not destination_done and target != transaction.destination_before)):
+                # Undo only our own writes. Preserve newer owners and their messages.
+                if isinstance(giving, GivingRoster) and source_done:
+                    restored = dict(giving.before)
+                    restored["revision"] = current.get("revision", 0)
+                    codex_mesh.advance_worker_roster_revision(restored)
+                    giving.records[name] = restored
+                    _write_roster(giving.handle, giving.records)
+                if destination_done:
+                    if transaction.destination_before:
+                        restored_target = dict(transaction.destination_before)
+                        restored_target["revision"] = target.get("revision", 0)
+                        codex_mesh.advance_worker_roster_revision(restored_target)
+                        new[name] = restored_target
+                    else:
+                        _ = new.pop(name)
+                    _write_roster(taking, new)
+                worker = ledger.workers[name]
+                if not isinstance(worker.ownership, Retired):
+                    worker.ownership = HeldBy(str(source))
+                _quarantine(store, ledger, transaction, "roster revision changed; rolled back owned writes")
+            if messages.get("messages") and transaction.queue_policy is AdoptionQueuePolicy.LEGACY_REFUSE_QUEUED:
+                if isinstance(giving, GivingRoster) and source_done:
+                    restored = dict(giving.before)
+                    restored["revision"] = current.get("revision", 0)
+                    codex_mesh.advance_worker_roster_revision(restored)
+                    giving.records[name] = restored
+                    _write_roster(giving.handle, giving.records)
+                if destination_done:
+                    if transaction.destination_before:
+                        restored_target = dict(transaction.destination_before)
+                        restored_target["revision"] = target.get("revision", 0)
+                        codex_mesh.advance_worker_roster_revision(restored_target)
+                        new[name] = restored_target
+                    else:
+                        _ = new.pop(name)
+                    _write_roster(taking, new)
+                ledger.workers[name].ownership = HeldBy(str(source))
+                _quarantine(store, ledger, transaction, "source received a message; rolled back owned writes")
+            if not destination_done:
+                marker = transaction.account_move
+                if marker:
+                    _atomic(destination / f"{name}.account-move.json", marker)
+                else:
+                    (destination / f"{name}.account-move.json").unlink(missing_ok=True)
+                new[name] = dict(after)
+                _write_roster(taking, new)
+            if not source_done and isinstance(giving, GivingRoster):
+                giving.records[name] = source_after
+                _write_roster(giving.handle, giving.records)
+            if isinstance(inbox_transfer, AdoptionInboxTransfer):
+                inbox, target_inbox, saved = inbox_transfer.giving, inbox_transfer.taking, inbox_transfer.saved
+                # Publish the taking roster before routing source senders to it.
+                # After the source fence, no sender can append behind this copy.
+                _merge_pending(inbox, target_inbox, after, identity, messages, saved)
+            worker = ledger.workers[name]
+            worker.ownership = Adopted(str(destination))
+            if not any(event.details.get("adoption_id") == identity for event in worker.events):
+                worker.events.append(_event("adopted", "new run", destination, adoption_id=identity,
+                                            from_run=str(source)))
+            store.save(ledger)
+            _ = ledger.adoptions.pop(identity)
+            store.save(ledger)
+        # Admission projection belongs here, with membership held after worker locks.
 
 
 def _recover(store: UnitWorkerLedger, ledger: UnitWorkers) -> None:
@@ -818,68 +825,75 @@ def _adopt(store: UnitWorkerLedger, ledger: UnitWorkers, source: Path, destinati
     if source_present and _ledger_for_run(source).path != store.path:
         raise WorkerUnavailable("worker belongs to another unit")
     history = codex_mesh.worker_run_history(str(source), name) if source_present else ()
-    before: dict[str, object]
-    with worker_lifecycle.lock_workers(
-            worker_lifecycle.WorkerIdentity(destination, name),
-            *((worker_lifecycle.WorkerIdentity(source, name),) if source_present else ())
-    ), ExitStack() as locks:
-        if source_present:
-            giving_roster = locks.enter_context(_roster_locked(source))
-            before = _object(giving_roster[1].get(name))
-            giving: ExistingRun | RemovedRun = ExistingRun(source, before)
-        else:
-            worker = ledger.workers.get(name)
-            if worker is None or not isinstance(worker.backend, CodexThread):
-                raise WorkerUnavailable(f"{name}: removed run has no saved Codex backend")
-            before = {"thread_id": worker.backend.thread_id, "codex_home": worker.backend.codex_home,
-                      "role": worker.role, "family": worker.family, "turn_model": worker.model,
-                      "turn_effort": worker.effort, "access_policy": worker.access_policy, "status": "paused"}
-            giving = RemovedRun(source)
-        taking_roster = locks.enter_context(_roster_locked(destination))
-        new = taking_roster[1]
-        if (before.get("adopted_to") == str(destination)
-                and _object(new.get(name)).get("thread_id") == before.get("thread_id")):
-            return name
-        if before.get("adopted_to"):
-            raise WorkerUnavailable(f"{name}: already adopted to {before['adopted_to']}")
-        destination_before = _object(new.get(name))
-        if name in new and not destination_before.get("adopted_to"):
-            raise WorkerUnavailable(f"{name}: destination already has this name")
-        registered = ledger.workers.get(name)
-        paused_owner = registered is not None and isinstance(registered.ownership, Paused)
-        reason = codex_mesh.worker_idle_reason(str(source if source_present else destination), name, before,
-                                              prior_runs=history[1:], paused=paused_owner, adopting=True)
-        if reason:
-            raise WorkerUnavailable(f"{name}: {reason}")
-        if name not in ledger.workers:
-            ledger.workers[name] = _worker_from_record(name, source, before)
-        worker = ledger.workers[name]
-        owner = worker.ownership
-        if (isinstance(owner, Retired)
-                or isinstance(owner, HeldBy) and owner.run != str(source)
-                or isinstance(owner, Adopted) and owner.to_run != str(source)):
-            raise WorkerUnavailable(f"{name}: ownership changed")
-        identity = str(uuid.uuid4())
-        after = dict(before)
-        for key in ("launcher_pid", "port", "turn_id", "paused_from", "paused_turn"):
-            _ = after.pop(key, None)
-        after.update({"status": "paused", "adoption_id": identity, "adopted_from": str(source)})
-        after["preserved_work"] = True
-        if not paused_owner:
-            clear_allocation(after)
-        after["giving_runs"] = list(dict.fromkeys([str(source), *history[1:]]))
-        after["unit_ledger"] = str(store.path)
-        if reserve and not allocation_is_live(after):
-            _reserve_allocation(after, owner_pid)
-        codex_mesh.advance_worker_roster_revision(after)
-        transaction = AdoptionIntent(identity, name, giving, destination, after, destination_before,
-                                     _read(source / f"{name}.account-move.json"))
-        ledger.adoptions[identity] = transaction
-        store.save(ledger)
-    _complete_adoption(store, ledger, transaction)
-    if _object(_read_roster(destination).get(name)).get("adoption_id") != identity:
-        raise WorkerUnavailable(f"{name}: adoption rolled back because the source changed")
-    return name
+    with worker_lifecycle.membership_operation(destination, *((source,) if source_present else ())):
+        before: dict[str, object]
+        with worker_lifecycle.lock_workers(
+                worker_lifecycle.WorkerIdentity(destination, name),
+                *((worker_lifecycle.WorkerIdentity(source, name),) if source_present else ())
+        ), ExitStack() as locks:
+            if source_present:
+                before = _object(_read_roster(source).get(name))
+                giving: ExistingRun | RemovedRun = ExistingRun(source, before)
+            else:
+                worker = ledger.workers.get(name)
+                if worker is None or not isinstance(worker.backend, CodexThread):
+                    raise WorkerUnavailable(f"{name}: removed run has no saved Codex backend")
+                before = {"thread_id": worker.backend.thread_id, "codex_home": worker.backend.codex_home,
+                          "role": worker.role, "family": worker.family, "turn_model": worker.model,
+                          "turn_effort": worker.effort, "access_policy": worker.access_policy, "status": "paused"}
+                giving = RemovedRun(source)
+            new = _read_roster(destination)
+            if (before.get("adopted_to") == str(destination)
+                    and _object(new.get(name)).get("thread_id") == before.get("thread_id")):
+                return name
+            if before.get("adopted_to"):
+                raise WorkerUnavailable(f"{name}: already adopted to {before['adopted_to']}")
+            destination_before = _object(new.get(name))
+            if name in new and not destination_before.get("adopted_to"):
+                raise WorkerUnavailable(f"{name}: destination already has this name")
+            registered = ledger.workers.get(name)
+            paused_owner = registered is not None and isinstance(registered.ownership, Paused)
+            reason = codex_mesh.worker_idle_reason(str(source if source_present else destination), name, before,
+                                                  prior_runs=history[1:], paused=paused_owner, adopting=True)
+            if reason:
+                raise WorkerUnavailable(f"{name}: {reason}")
+            if name not in ledger.workers:
+                ledger.workers[name] = _worker_from_record(name, source, before)
+            worker = ledger.workers[name]
+            owner = worker.ownership
+            if (isinstance(owner, Retired)
+                    or isinstance(owner, HeldBy) and owner.run != str(source)
+                    or isinstance(owner, Adopted) and owner.to_run != str(source)):
+                raise WorkerUnavailable(f"{name}: ownership changed")
+            # Eligibility probes acquire an inbox; no roster lock may precede them.
+            if source_present:
+                _, current_source = locks.enter_context(_roster_locked(source))
+                if _object(current_source.get(name)) != before:
+                    raise WorkerUnavailable(f"{name}: source changed during adoption eligibility")
+            _, current_destination = locks.enter_context(_roster_locked(destination))
+            if current_destination != new:
+                raise WorkerUnavailable(f"{name}: destination changed during adoption eligibility")
+            identity = str(uuid.uuid4())
+            after = dict(before)
+            for key in ("launcher_pid", "port", "turn_id", "paused_from", "paused_turn"):
+                _ = after.pop(key, None)
+            after.update({"status": "paused", "adoption_id": identity, "adopted_from": str(source)})
+            after["preserved_work"] = True
+            if not paused_owner:
+                clear_allocation(after)
+            after["giving_runs"] = list(dict.fromkeys([str(source), *history[1:]]))
+            after["unit_ledger"] = str(store.path)
+            if reserve and not allocation_is_live(after):
+                _reserve_allocation(after, owner_pid)
+            codex_mesh.advance_worker_roster_revision(after)
+            transaction = AdoptionIntent(identity, name, giving, destination, after, destination_before,
+                                         _read(source / f"{name}.account-move.json"))
+            ledger.adoptions[identity] = transaction
+            store.save(ledger)
+        _complete_adoption(store, ledger, transaction)
+        if _object(_read_roster(destination).get(name)).get("adoption_id") != identity:
+            raise WorkerUnavailable(f"{name}: adoption rolled back because the source changed")
+        return name
 
 
 def adopt(source: Path, destination: Path, name: str) -> str:
@@ -940,7 +954,7 @@ def _reserve(run: Path, name: str, store: UnitWorkerLedger, owner_pid: int, *, p
             raise WorkerUnavailable(f"{name}: work already reserved or owed")
         with (run / f"{name}.pending.json").open("a+", encoding="utf-8") as inbox:
             try:
-                fcntl.flock(inbox, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                worker_lifecycle.acquire_flock(inbox, mode=fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
                 raise WorkerUnavailable(f"{name}: message delivery in progress") from error
             _ = inbox.seek(0)
@@ -1002,8 +1016,11 @@ def _resolve(run: Path, role: str, owner_pid: int, *, model: str = "", effort: s
         if isinstance(incoming, IncomingReviewer):
             if role != "review":
                 raise WorkerUnavailable("incoming reviewer requires review role")
-            with worker_lifecycle.lock_worker(run, incoming.name):
-                return _register_reviewer(run, ledger, incoming)
+            with worker_lifecycle.membership_operation(run):
+                with worker_lifecycle.lock_worker(run, incoming.name):
+                    imported = _register_reviewer(run, ledger, incoming)
+                # Membership remains for the admission projection.
+                return imported
         for name, value in sorted(roster.items(), key=lambda item: (role == "review" and item[0] != reviewer_base, item[0])):
             record = _object(value)
             if record.get("role") != role or record.get("adopted_to") or new_name:
@@ -1152,66 +1169,69 @@ def _finish_reviewer_transfer(journal: Path, transaction: dict[str, object], rev
     source = Path(_required(transaction, "source"))
     store = _ledger_for_run(destination)
     _recover(store, ledger)
-    after = _object(transaction["after"])
-    reviewer = _required(transaction, "reviewer")
-    current = _object(_read_roster(source).get(reviewer))
-    fenced = current.get("reviewer_transfer") == transaction["id"]
-    conflict = _transfer_conflict(destination, source, _required(after, "thread_id"), reviewer_base)
-    if not fenced and isinstance(conflict, ReviewerConflictCause):
-        return ReviewerConflict(reviewer, _required(transaction, "unit"), conflict)
-    name = _required(transaction, "worker")
-    records = _read_roster(destination)
-    registered = ledger.workers.get(name)
-    occupied = _object(records.get(name))
-    backend = _worker_from_record(name, destination, after).backend
-    if ((occupied and occupied.get("thread_id") != after.get("thread_id"))
-            or (registered is not None and registered.backend != backend)):
+    with worker_lifecycle.membership_operation(source, destination):
+        after = _object(transaction["after"])
+        reviewer = _required(transaction, "reviewer")
+        current = _object(_read_roster(source).get(reviewer))
+        fenced = current.get("reviewer_transfer") == transaction["id"]
+        conflict = _transfer_conflict(destination, source, _required(after, "thread_id"), reviewer_base)
+        if not fenced and isinstance(conflict, ReviewerConflictCause):
+            return ReviewerConflict(reviewer, _required(transaction, "unit"), conflict)
+        name = _required(transaction, "worker")
+        records = _read_roster(destination)
+        registered = ledger.workers.get(name)
+        occupied = _object(records.get(name))
+        backend = _worker_from_record(name, destination, after).backend
+        if ((occupied and occupied.get("thread_id") != after.get("thread_id"))
+                or (registered is not None and registered.backend != backend)):
+            previous = transaction.get("previous_workers", [])
+            previous_names = [item for item in cast(list[object], previous) if isinstance(item, str)] if isinstance(previous, list) else []
+            transaction["previous_workers"] = [*previous_names, name]
+            name = _next_worker_name(ledger, records, reviewer_base)
+            transaction["worker"] = name
+            after["slot"] = "review" + name.removeprefix(reviewer_base)
+            transaction["after"] = after
+            _atomic(journal, transaction)
         previous = transaction.get("previous_workers", [])
-        previous_names = [item for item in cast(list[object], previous) if isinstance(item, str)] if isinstance(previous, list) else []
-        transaction["previous_workers"] = [*previous_names, name]
-        name = _next_worker_name(ledger, records, reviewer_base)
-        transaction["worker"] = name
-        after["slot"] = "review" + name.removeprefix(reviewer_base)
-        transaction["after"] = after
-        _atomic(journal, transaction)
-    previous = transaction.get("previous_workers", [])
-    former = [value for value in cast(list[object], previous) if isinstance(value, str)] if isinstance(previous, list) else []
-    with worker_lifecycle.lock_workers(worker_lifecycle.WorkerIdentity(source, reviewer),
-            *(worker_lifecycle.WorkerIdentity(destination, value) for value in [name, *former])):
-        previous = transaction.get("previous_workers", [])
-        if isinstance(previous, list):
-            for old_name in cast(list[object], previous):
-                if not isinstance(old_name, str):
-                    raise WorkerUnavailable("invalid prior reviewer name")
-                old_inbox = destination / f"{old_name}.pending.json"
-                if not old_inbox.exists():
-                    continue
-                with ExitStack() as locks:
-                    inbox, pending = _giving_inbox(locks, destination, old_name)
-                    if pending.get("adoption_id") == transaction["id"]:
-                        target, saved = _giving_inbox(locks, destination, name)
-                        if saved.get("thread_id", after["thread_id"]) != after["thread_id"]:
-                            raise WorkerUnavailable(f"{name}: destination inbox has another thread")
-                        merged: object = saved.get("reviewer_inbox_sources", []) if saved.get("adoption_id") == transaction["id"] else []
-                        if not isinstance(merged, list):
-                            raise WorkerUnavailable(f"{name}: invalid inbox transfer record")
-                        merged_sources = cast(list[object], merged)
-                        if old_name not in merged_sources:
-                            queue: list[str] = []
-                            for record in (pending, saved):
-                                messages = record.get("messages", [])
-                                if not isinstance(messages, list) or any(not isinstance(item, str) for item in cast(list[object], messages)):
-                                    raise WorkerUnavailable(f"{name}: invalid pending messages")
-                                queue.extend(cast(list[str], messages))
-                            saved.update({"thread_id": after["thread_id"], "messages": queue,
-                                          "accepting_messages": True, "adoption_id": transaction["id"],
-                                          "reviewer_inbox_sources": [*merged_sources, old_name]})
-                            # Persist the receipt with the messages before clearing the old
-                            # queue, so recovery after either write cannot copy them twice.
-                            _write_inbox(target, saved)
-                        pending.update({"messages": [], "accepting_messages": False})
-                        _write_inbox(inbox, pending)
-        return _finish_reviewer_transfer_locked(journal, transaction, ledger)
+        former = [value for value in cast(list[object], previous) if isinstance(value, str)] if isinstance(previous, list) else []
+        with worker_lifecycle.lock_workers(worker_lifecycle.WorkerIdentity(source, reviewer),
+                *(worker_lifecycle.WorkerIdentity(destination, value) for value in [name, *former])):
+            previous = transaction.get("previous_workers", [])
+            if isinstance(previous, list):
+                for old_name in cast(list[object], previous):
+                    if not isinstance(old_name, str):
+                        raise WorkerUnavailable("invalid prior reviewer name")
+                    old_inbox = destination / f"{old_name}.pending.json"
+                    if not old_inbox.exists():
+                        continue
+                    with ExitStack() as locks:
+                        inbox, pending = _giving_inbox(locks, destination, old_name)
+                        if pending.get("adoption_id") == transaction["id"]:
+                            target, saved = _giving_inbox(locks, destination, name)
+                            if saved.get("thread_id", after["thread_id"]) != after["thread_id"]:
+                                raise WorkerUnavailable(f"{name}: destination inbox has another thread")
+                            merged: object = saved.get("reviewer_inbox_sources", []) if saved.get("adoption_id") == transaction["id"] else []
+                            if not isinstance(merged, list):
+                                raise WorkerUnavailable(f"{name}: invalid inbox transfer record")
+                            merged_sources = cast(list[object], merged)
+                            if old_name not in merged_sources:
+                                queue: list[str] = []
+                                for record in (pending, saved):
+                                    messages = record.get("messages", [])
+                                    if not isinstance(messages, list) or any(not isinstance(item, str) for item in cast(list[object], messages)):
+                                        raise WorkerUnavailable(f"{name}: invalid pending messages")
+                                    queue.extend(cast(list[str], messages))
+                                saved.update({"thread_id": after["thread_id"], "messages": queue,
+                                              "accepting_messages": True, "adoption_id": transaction["id"],
+                                              "reviewer_inbox_sources": [*merged_sources, old_name]})
+                                # Persist the receipt with the messages before clearing the old
+                                # queue, so recovery after either write cannot copy them twice.
+                                _write_inbox(target, saved)
+                            pending.update({"messages": [], "accepting_messages": False})
+                            _write_inbox(inbox, pending)
+            imported = _finish_reviewer_transfer_locked(journal, transaction, ledger)
+        # Membership remains for the admission/retirement projection.
+        return imported
 
 
 def _finish_reviewer_transfer_locked(journal: Path, transaction: dict[str, object],
@@ -1227,24 +1247,24 @@ def _finish_reviewer_transfer_locked(journal: Path, transaction: dict[str, objec
     identity = _required(transaction, "id")
     # The durable intent precedes fencing the pool transport. A pool allocation
     # holds pool.lock too, so it cannot launch between this fence and removal.
-    with _roster_locked(source) as (handle, records):
-        current = _object(records.get(reviewer))
-        if current.get("thread_id") != after.get("thread_id"):
-            raise WorkerUnavailable(f"{reviewer}: source thread changed during transfer")
-        if current.get("reviewer_transfer") != identity:
-            if current != _object(transaction["before"]):
-                raise WorkerUnavailable(f"{reviewer}: source record changed during transfer")
-            current = dict(current)
-            current.update({"status": "ended", "reviewer_transfer": identity})
-            codex_mesh.advance_worker_roster_revision(current)
-            records[reviewer] = current
-            _write_roster(handle, records)
-        with ExitStack() as locks:
-            inbox, messages = _giving_inbox(locks, source, reviewer)
-            destination.mkdir(parents=True, exist_ok=True)
-            target, saved = _giving_inbox(locks, destination, name)
-            codex_mesh.detach_reviewer_transport(str(source), reviewer, _required(after, "thread_id"), inbox, messages)
-            _merge_pending(inbox, target, after, identity, messages, saved)
+    with ExitStack() as locks:
+        inbox, messages = _giving_inbox(locks, source, reviewer)
+        destination.mkdir(parents=True, exist_ok=True)
+        target, saved = _giving_inbox(locks, destination, name)
+        with _roster_locked(source) as (handle, records):
+            current = _object(records.get(reviewer))
+            if current.get("thread_id") != after.get("thread_id"):
+                raise WorkerUnavailable(f"{reviewer}: source thread changed during transfer")
+            if current.get("reviewer_transfer") != identity:
+                if current != _object(transaction["before"]):
+                    raise WorkerUnavailable(f"{reviewer}: source record changed during transfer")
+                current = dict(current)
+                current.update({"status": "ended", "reviewer_transfer": identity})
+                codex_mesh.advance_worker_roster_revision(current)
+                records[reviewer] = current
+                _write_roster(handle, records)
+        codex_mesh.detach_reviewer_transport(str(source), reviewer, _required(after, "thread_id"), inbox, messages)
+        _merge_pending(inbox, target, after, identity, messages, saved)
     marker = _object(transaction.get("account_move"))
     if marker:
         _atomic(destination / f"{name}.account-move.json", marker)
@@ -1275,7 +1295,7 @@ def _reviewer_busy_reason(source: Path, reviewer: str, record: Mapping[str, obje
     with ExitStack() as locks:
         try:
             inbox = locks.enter_context((source / f"{reviewer}.pending.json").open(encoding="utf-8"))
-            fcntl.flock(inbox, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            worker_lifecycle.acquire_flock(inbox, mode=fcntl.LOCK_SH | fcntl.LOCK_NB)
         except FileNotFoundError:
             inbox = locks.enter_context(io.StringIO())
         except BlockingIOError:
@@ -1610,27 +1630,39 @@ def _runs(ledger: UnitWorkers) -> tuple[Path, ...]:
 
 
 def pause_unit(production: str, unit: str) -> None:
-    store = UnitWorkerLedger(ledger_path(production, unit))
-    if not store.path.exists():
-        return
-    with store.locked() as ledger:
-        _recover(store, ledger)
-        for worker in ledger.workers.values():
-            if not isinstance(worker.ownership, Retired):
-                worker.ownership = Paused()
+    from scripts.agents import codex_mesh
+    with worker_lifecycle.operation_deadline(timeout=codex_mesh.PAUSE_INTERRUPT_SECS):
+        store = UnitWorkerLedger(ledger_path(production, unit))
+        if not store.path.exists():
+            return
+        with store.locked() as ledger:
+            _recover(store, ledger)
+            for worker in ledger.workers.values():
+                if not isinstance(worker.ownership, Retired):
+                    worker.ownership = Paused()
 
 
-def pause_run(run: Path) -> None:
-    store = ledger_for_run(run)
-    if not store.path.exists():
-        return
-    with store.locked() as ledger:
-        _recover(store, ledger)
-        for worker in ledger.workers.values():
-            owner = worker.ownership
-            if ((isinstance(owner, HeldBy) and owner.run == str(run.resolve()))
-                    or isinstance(owner, Adopted) and owner.to_run == str(run.resolve())):
-                worker.ownership = Paused()
+def _no_pause_operation() -> None:
+    pass
+
+
+def pause_run(run: Path, *, pause_workers: Callable[[], None] = _no_pause_operation,
+              deadline: float = worker_lifecycle.NO_LOCK_DEADLINE) -> None:
+    """Hold the ledger before a validated bulk pause, then save its ownership."""
+    from scripts.agents import codex_mesh
+    with worker_lifecycle.operation_deadline(deadline=deadline, timeout=codex_mesh.PAUSE_INTERRUPT_SECS):
+        store = ledger_for_run(run)
+        if not store.path.exists():
+            pause_workers()
+            return
+        with store.locked(deadline=deadline) as ledger:
+            _recover(store, ledger)
+            pause_workers()
+            for worker in ledger.workers.values():
+                owner = worker.ownership
+                if ((isinstance(owner, HeldBy) and owner.run == str(run.resolve()))
+                        or isinstance(owner, Adopted) and owner.to_run == str(run.resolve())):
+                    worker.ownership = Paused()
 
 
 def live_detached_runs(run: Path) -> tuple[tuple[Path, dict[str, object]], ...]:
@@ -1679,81 +1711,84 @@ def end_unit(production: str, unit: str) -> None:
     from scripts.agents import codex_mesh, mesh_runs
     # Run cleanup reads this ledger too; load only its binary lookup interface
     # here so neither module owns a static import cycle.
-    remove_workers = cast(ClaudeCommandLookup, cast(object, import_module("scripts.direct.remove_workers")))
-    store = UnitWorkerLedger(ledger_path(production, unit))
-    if not store.path.exists():
-        return
-    # Quarantine is a one-time diagnostic during ordinary work; retirement also
-    # removes already quarantined state and must not be held up by that notice.
-    try:
-        with store.locked():
+    with worker_lifecycle.operation_deadline(timeout=codex_mesh.THREAD_RELEASE_TIMEOUT_SECS):
+        remove_workers = cast(ClaudeCommandLookup, cast(object, import_module("scripts.direct.remove_workers")))
+        store = UnitWorkerLedger(ledger_path(production, unit))
+        if not store.path.exists():
+            return
+        # Quarantine is a one-time diagnostic during ordinary work; retirement also
+        # removes already quarantined state and must not be held up by that notice.
+        try:
+            with store.locked():
+                pass
+        except WorkerUnavailable:
             pass
-    except WorkerUnavailable:
-        pass
-    with store.locked() as ledger:
-        _recover(store, ledger)
-        histories = _runs(ledger)
-        for name, worker in ledger.workers.items():
-            for run in histories:
-                if not run.is_dir():
-                    continue
-                with worker_lifecycle.lock_worker(run, name):
-                    with (run / f"{name}.pending.json").open("a+", encoding="utf-8") as inbox:
-                        fcntl.flock(inbox, fcntl.LOCK_EX)
-                        _ = inbox.seek(0)
-                        content = inbox.read()
-                        pending = _object(cast(object, json.loads(content))) if content.strip() else {}
-                        raw_messages = pending.get("messages")
-                        queued = [item for item in cast(list[object], raw_messages) if isinstance(item, str)] if isinstance(raw_messages, list) else []
-                        for message in queued:
-                            print(f"cancelled pending message of {name}: {message}")
-                        _write_inbox(inbox, {})
-                    current = _object(_read_roster(run).get(name))
-                    if (isinstance(worker.backend, CodexThread) and current
-                            and not current.get("adopted_to") and current.get("status") != "ended"):
-                        result = codex_mesh.end_worker_locked(argparse.Namespace(session_dir=str(run), to=name))
-                        if result:
-                            raise WorkerUnavailable(f"cannot end worker {name} in {run}; retry retirement")
-                    # A giving roster is terminal after adoption, but its detached
-                    # supervisors remain there until they finish or the unit retires.
-                    for path, detached in live_detached_runs(run):
-                        if detached.get("worker") != name:
-                            continue
-                        pid = detached["pid"]
-                        if isinstance(pid, int) and mesh_runs.supervises(pid, path):
-                            try:
-                                os.kill(pid, signal.SIGTERM)
-                            except ProcessLookupError:
-                                pass
-                            print(f"cancelled detached run {path.stem} of {name} (pid {pid})")
-                    with _roster_locked(run) as (handle, roster):
-                        record = _object(roster.get(name))
-                        if not record or record.get("adopted_to"):
-                            continue
-                        if record.get("continuation_owed"):
-                            print(f"cancelled owed continuation of {name}")
-                        if record.get("allocation_pending"):
-                            print(f"cancelled reservation of {name}")
-                        clear_allocation(record)
-                        record.update({"continuation_owed": False, "status": "ended"})
-                        codex_mesh.advance_worker_roster_revision(record)
-                        _write_roster(handle, roster)
-            if isinstance(worker.backend, ClaudeSession):
-                claude = remove_workers.claude_bin()
-                result = subprocess.run([claude, "rm", worker.backend.session_id], capture_output=True,
-                                        text=True, timeout=30, check=False)
-                if result.returncode:
-                    raise WorkerUnavailable(f"cannot end Claude worker {name}: {result.stderr.strip()}")
-            worker.ownership = Retired()
-            print(f"ended worker {name}")
-        for name, record in ledger.quarantined_workers.items():
-            print(f"removed quarantined worker {name}: {record.get('reason', '')}; {store.path}")
-        for name, record in ledger.quarantined_adoptions.items():
-            print(f"removed quarantined adoption {name}: {record.get('reason', '')}; {store.path}")
-        ledger.workers.clear()
-        ledger.quarantined_workers.clear()
-        ledger.quarantined_adoptions.clear()
-    store.path.unlink(missing_ok=True)
+        with store.locked() as ledger:
+            _recover(store, ledger)
+            histories = _runs(ledger)
+            for name, worker in ledger.workers.items():
+                for run in histories:
+                    if not run.is_dir():
+                        continue
+                    with worker_lifecycle.membership_operation(run):
+                        with worker_lifecycle.lock_worker(run, name):
+                            with (run / f"{name}.pending.json").open("a+", encoding="utf-8") as inbox:
+                                worker_lifecycle.acquire_flock(inbox, mode=fcntl.LOCK_EX)
+                                _ = inbox.seek(0)
+                                content = inbox.read()
+                                pending = _object(cast(object, json.loads(content))) if content.strip() else {}
+                                raw_messages = pending.get("messages")
+                                queued = [item for item in cast(list[object], raw_messages) if isinstance(item, str)] if isinstance(raw_messages, list) else []
+                                for message in queued:
+                                    print(f"cancelled pending message of {name}: {message}")
+                                _write_inbox(inbox, {})
+                            current = _object(_read_roster(run).get(name))
+                            if (isinstance(worker.backend, CodexThread) and current
+                                    and not current.get("adopted_to") and current.get("status") != "ended"):
+                                result = codex_mesh.end_worker_locked(argparse.Namespace(session_dir=str(run), to=name))
+                                if result:
+                                    raise WorkerUnavailable(f"cannot end worker {name} in {run}; retry retirement")
+                            # A giving roster is terminal after adoption, but its detached
+                            # supervisors remain there until they finish or the unit retires.
+                            for path, detached in live_detached_runs(run):
+                                if detached.get("worker") != name:
+                                    continue
+                                pid = detached["pid"]
+                                if isinstance(pid, int) and mesh_runs.supervises(pid, path):
+                                    try:
+                                        os.kill(pid, signal.SIGTERM)
+                                    except ProcessLookupError:
+                                        pass
+                                    print(f"cancelled detached run {path.stem} of {name} (pid {pid})")
+                            with _roster_locked(run) as (handle, roster):
+                                record = _object(roster.get(name))
+                                if not record or record.get("adopted_to"):
+                                    continue
+                                if record.get("continuation_owed"):
+                                    print(f"cancelled owed continuation of {name}")
+                                if record.get("allocation_pending"):
+                                    print(f"cancelled reservation of {name}")
+                                clear_allocation(record)
+                                record.update({"continuation_owed": False, "status": "ended"})
+                                codex_mesh.advance_worker_roster_revision(record)
+                                _write_roster(handle, roster)
+                        # Worker locks are released before the retirement projection.
+                if isinstance(worker.backend, ClaudeSession):
+                    claude = remove_workers.claude_bin()
+                    result = subprocess.run([claude, "rm", worker.backend.session_id], capture_output=True,
+                                            text=True, timeout=30, check=False)
+                    if result.returncode:
+                        raise WorkerUnavailable(f"cannot end Claude worker {name}: {result.stderr.strip()}")
+                worker.ownership = Retired()
+                print(f"ended worker {name}")
+            for name, record in ledger.quarantined_workers.items():
+                print(f"removed quarantined worker {name}: {record.get('reason', '')}; {store.path}")
+            for name, record in ledger.quarantined_adoptions.items():
+                print(f"removed quarantined adoption {name}: {record.get('reason', '')}; {store.path}")
+            ledger.workers.clear()
+            ledger.quarantined_workers.clear()
+            ledger.quarantined_adoptions.clear()
+        store.path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -1787,7 +1822,7 @@ def _migration_locks(source: Path, destination: Path) -> Generator[None, None, N
         for path in sorted((source, destination), key=str):
             path.parent.mkdir(parents=True, exist_ok=True)
             handle = locks.enter_context(path.with_suffix(".lock").open("a+", encoding="utf-8"))
-            fcntl.flock(handle, fcntl.LOCK_EX)
+            worker_lifecycle.acquire_flock(handle, mode=fcntl.LOCK_EX)
         yield
 
 
@@ -1805,7 +1840,7 @@ def _apply_move(move: LedgerMigration) -> None:
         if not run.is_dir():
             continue
         if (run / ROSTER).exists():
-            with worker_lifecycle.lock_workers(*(worker_lifecycle.WorkerIdentity(run, name)
+            with worker_lifecycle.membership_operation(run), worker_lifecycle.lock_workers(*(worker_lifecycle.WorkerIdentity(run, name)
                     for name in _read_roster(run))), _roster_locked(run) as (handle, roster):
                 changed = False
                 for name, raw in roster.items():
@@ -2075,7 +2110,7 @@ def _repoint_worktree_runs(production: str, unit: str, old: Path, new: Path, bra
                 if dry_run:
                     _ = repoint_roster(run, _read_roster(run))
                 else:
-                    with worker_lifecycle.lock_workers(*(worker_lifecycle.WorkerIdentity(run, name)
+                    with worker_lifecycle.membership_operation(run), worker_lifecycle.lock_workers(*(worker_lifecycle.WorkerIdentity(run, name)
                             for name in _read_roster(run))), _roster_locked(run) as (handle, roster):
                         if repoint_roster(run, roster):
                             _write_roster(handle, roster)
@@ -2084,7 +2119,7 @@ def _repoint_worktree_runs(production: str, unit: str, old: Path, new: Path, bra
             with ExitStack() as locks:
                 if not dry_run:
                     lock = locks.enter_context((run / ".progress_history.lock").open("a+", encoding="utf-8"))
-                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    worker_lifecycle.acquire_flock(lock, mode=fcntl.LOCK_EX)
                 state = _read(run / STATE)
                 updated = dict(state)
                 updated.update({"production": production, "unit": unit})
