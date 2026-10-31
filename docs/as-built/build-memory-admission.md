@@ -36,8 +36,8 @@ The queue snapshot also keeps a matching `admit-head` record. The shared walk ap
 - **Ledger.** One `*.reservation` JSON file per admitted step under the build log's `admission/` directory (pid, pid start time, need, repo, step, worktree, admitted_at, sidecar path). Check, prune and write happen under one exclusive `flock` on `admission/lock`; the locked check finalizes a reservation whose owner and step scope have ended. `live_reservations` skips ended rows and writes nothing, including when the merge gate calls it outside the lock. `MemAvailable` is read inside the lock, after the process readings.
 - **`check` and `release`.** `check` returns a frozen `CheckResult` whose `reservation` is `Reserved(path)` or `NotReserved(held|launch|untracked)`. `StepProfile` (repo, step, worktree, peak) is resolved once per wait and passed back on later polls; each check reads one process table for all reservations while it holds the admission lock.
 - **`merge-gate` step.** The installed gate process joins the same queue after build holds clear, before its modules or types start, and keeps the checkout busy while it waits. `GateProfile` keeps repository `~/.claude`, the checkout, and a gate estimate through 600-second refreshes. `NoGateHistory` requests the gate's memory cap; `MeasuredGatePeak` uses the p90 of this host's `merge-gate` anon history over `HISTORY_DAYS`. New sampled tree peaks publish the usual `.max` and `.wave` files atomically. Release keeps the empty-scope sidecar until it has recorded the peak, then removes the reservation on every exit. Each module and type job also takes and returns one `/dev/steve` slot. `verify.sh test` keeps its existing admission.
-- **Queue API and cache.** `gather_queue_inputs(directory, processes, now, memory={})` resolves waiter file names and identities, running reservations and measurements, compiler-service memory, the host reading, raw pressure and recovery, and the matching head override into `QueueInputs`. `queue_read_from(inputs, limits)` reads no files, process state or environment: it applies recovery and the one ordered admission walk with explicitly supplied limits and the recorded override. `read_queue_pass` composes those two functions, so locked reads and cached reads share decisions. `decision_checks(decision, need, available)` alone constructs budget and free checks for the head and every `LineWaiter`; each follower also carries its walk decision. Its independent `fits_now` still tests resource fit without earlier waiters' charges.
-- **Snapshot publication.** Every exclusive admission section (`check`, `release`, `set_width`, `admit_head` and waiter cancellation) uses `exclusive_queue` to publish `admission/queue.json` after its changes, including exceptional exits. `check` supplies its existing process table and reservation memory readings. `write_queue_snapshot` writes version 2, `written_at` and serialized `QueueInputs` through `queue.json.tmp` and `os.replace`, with no fsync. The serializer and validating parser live together in `memory_admit.py`; raw `recovery`, queue priority and `override` survive the round trip. No budget or reserve is stored; readers resolve both live once per reading. Version-1 snapshots are ignored. A failed cache write leaves the previous snapshot and never changes admission's result. A bump from a session that is not a showrunner is refused before any lock or cache write.
+- **Queue API and cache.** `gather_queue_inputs(directory, processes, now, memory={})` resolves waiter file names and identities, running reservations and measurements, compiler-service memory, the host reading, raw pressure and recovery, and the matching head override into `QueueInputs`. `queue_read_from(inputs, limits)` reads no files, process state or environment: it applies recovery and the one ordered admission walk through `admission_pass(inputs, now, limits)` with explicitly supplied limits and the recorded override. Explanations retain those limits for pure release calculations. `read_queue_pass` composes those two functions, so locked reads and cached reads share decisions. `decision_checks(decision, need, available)` alone constructs budget and free checks for the head and every `LineWaiter`; each follower also carries its walk decision. Its independent `fits_now` still tests resource fit without earlier waiters' charges.
+- **Snapshot publication.** Every exclusive admission section (`check`, `release`, `set_width`, `admit_head` and waiter cancellation) uses `exclusive_queue` to publish `admission/queue.json` after its changes, including exceptional exits. `check` supplies its existing process table and reservation memory readings. `write_queue_snapshot` writes version 3, `written_at` and serialized `QueueInputs` through `queue.json.tmp` and `os.replace`, with no fsync. The serializer and validating parser live together in `memory_admit.py`; raw `recovery`, queue priority and `override` survive the round trip. No budget or reserve is stored; readers resolve both live once per reading. Versions 1 and 2 are ignored. Frozen per-step needs retain their own margins. A failed cache write leaves the previous snapshot and never changes admission's result. A bump from a session that is not a showrunner is refused before any lock or cache write.
 - **Bounded display read.** `queue_read()` uses a valid snapshot aged 0–10 seconds without a lock, retaining its `now` as the displayed reading time. Otherwise it calls `locked_queue_read(timeout=QUEUE_READ_LOCK_SECONDS)` with a 0.5-second bound; that function's default remains 10 seconds for existing callers. A timeout returns the parsed old or future snapshot with `StaleReading(written_at)`, or `QueueBusy` if no valid snapshot exists. Other readings carry `CurrentReading`. The compact view colours a stale header amber. The view, cards and build-why use `queue_read`; busy displays `queue busy; try again` and exits 0, including a one-line `QueueLines` response for the pane's JSON request. Labels still use one file-only lookup.
 - **Selection and checks.** `step_matches(selector, step)` is the single identity rule for session id, recorded name, folder and folder basename. `match_waiters(selector, view)` handles a decimal queue place or all identity matches; cards first try the shown name, then that matcher. Running cards use the same identity rule. Every waiting card prints its own pressure, budget and free checks through one renderer. A follower held behind a fitting older row says `behind #<k>, an older step that fits`, matched by session id and wait start, or `behind an older step that fits` if it has left. Check wait lines retain their recorded older-step name.
 
@@ -182,6 +182,94 @@ After expiry, current memory and any ramp promise still count. Release builds ke
 last changed. An unreadable, malformed, old time-only or mismatched record,
 or a negative time, keeps the peak charge.
 Release and stale-reservation cleanup remove `.wave` with `.max`.
+
+For nextest, `test_phase_path` derives the sampler's `.test-phase.json` from the
+reservation's `.cgroup` sidecar. Admission reads it only through
+`record.read_test_phase` and never writes or removes it. Once its window is
+observed, its reading is measured past the ramp and the reservation has a
+`TestPhaseNeed`, the compile peak and its wave decay no longer count.
+`test_phase_history` is the one eligibility rule. The observed term becomes
+`TestPhaseCharge`: `ceil(max(test-phase peak so far, N) × need.margin)`.
+`test_phase_margin()` reads `[memory] test_phase_margin` from `config/lint.conf`
+when a need is written after admission or a width change, currently **1.2**;
+a missing, nonnumeric, non-finite or below-1.0 value falls back to 1.2.
+The tagged need freezes that margin; old need records without it use the named
+fallback. Configuration changes apply to needs written afterward. Build-why
+prints the margin from the need that produced its charge. Neither the pure
+pass nor the charge calculation reads configuration. Snapshot version 2 stores
+no live budget or reserve; readers resolve those limits live. A step's frozen
+need travels with its reservation reading. The test-phase charge does not
+decay. Current use and the unreadable-peak floor still compete for the charge.
+During the 120 s ramp the step keeps its existing promise and compile peak.
+An unreadable `.max` keeps the existing unreadable-peak rule. Without a mark
+or a recorded need, the old charge and its 1500 s decay stay in force.
+
+`test_phase_need_from_rows` is the pure rule for N. Its reader uses
+`anonymous_history_rows`, shared with the other estimate consumers. It takes
+positive `test_phase_peak_bytes` from this host's nextest runs in the last
+`HISTORY_DAYS`, matching repository identity, test scope, package and sorted
+filters exactly. It uses the p90 at the same width (`same_width`); otherwise
+the nearest wider width without scaling down (`wider_unscaled`); otherwise
+the widest narrower width, scaled up by the width ratio and rounded up
+(`scaled_up`). The existing `FILTERED_FLOOR` is its only floor. Missing width
+or history gives `NoTestPhaseNeed`; a reservation without the field is
+`not_recorded`. N is computed outside the admission lock after admission and
+before a width update. Both publish through one locked atomic reservation
+updater, which skips a reservation that has ended. If this optional need
+calculation or write fails after admission, the caller still receives its
+reservation and the step keeps the existing charge without a recorded N.
+A repeated check still counts every live reservation in the pass; if admitted,
+it reuses its matching nextest reservation instead of creating another.
+The admission need and N remain separate types, serialized through one tagged
+need codec.
+
+After `check`'s pure pass, the checker records the first running step charge
+whose selected basis is `TestPhaseCharge`. It writes a separate
+`.test-phase-charge.json` file beside that reservation, under the admission
+lock, with selected charge bytes, selection time, reservation id and tagged
+frozen need. It never modifies another step's reservation. A failed evidence
+write never changes admission. Queue views and counterfactual decisions do
+not record use.
+
+The finalizer saves `test_phase_peak_bytes`, `test_phase_started_at`, the
+stored tagged `test_phase_need` and any `test_phase_charge_use` decision
+evidence in its finalization intent before the first history append. It
+copies the evidence; it never reconstructs charge use from elapsed time or
+eligibility. No evidence means no decision use was recorded. Failed and
+interrupted appends reuse the saved evidence after the sampler and evidence
+files have gone. A stored need survives even when no window was observed;
+window fields are absent in that case. Finalization removes the separate
+evidence file. History coverage starts with this change, so families without
+earlier observed test phases keep the old charge.
+
+The narrow-key replay found **20 of 869 (2.3%)** no-compile runs above N × 1.2.
+Widening the key raised this to 60 of 1,399 (4.3%), so the rule never widens.
+A 1.314 margin removed only 2–13 more excesses and freed 15% less memory.
+The margin is configurable without a release. The 4c replay on 2026-10-31
+had hana 2/22 and tool-based-ui-trunk 1/2 above the charge, 3/194 overall;
+the builds showrunner accepted margin 1.2 on 2026-10-31. The 24 h check
+reports each repository again. If hana remains above 2.3% on at least 50
+rows with an N, its margin goes up through configuration.
+The historical replay used no-compile peaks as a stand-in for test-phase
+history; its queue model failed validation, so wait savings are sensitivity
+bounds, not predictions.
+
+| Replay day | GiB·min freed at 1.2 | Maximum freed at once | Wait-minutes sensitivity |
+| --- | ---: | ---: | ---: |
+| 2026-10-29 | 795 | 11.6–11.7 GiB | 0–140 |
+| 2026-10-30 | 320 | 11.6–11.7 GiB | 31–199 |
+
+The phase's replay script reports observed test phases by repository using N
+from earlier rows through the production rule. Its follow-up script compares
+the first 24 h after the merge with the preceding 24 h. Per repository and
+outcome it reports rows with decision evidence and rows without it. The measure
+is **peak above the frozen estimate plus margin**: final test-phase peak above
+`ceil(N × need.margin)`, using the frozen need in that evidence. This is not a
+breach of the actual changing charge. Missing evidence is unknown and may bias
+the observed subset; the report does not treat it as proof of an adequate
+margin. It also reports memory wait, earlyoom journal entries and recorded
+memory kills. The check is due 24 h after the merge reaches main; it does not
+run during implementation.
 
 A pressure hold enables start spacing, including a launch hold before the
 admission ledger exists. The first step can start as soon as pressure clears and the ordinary memory rules allow it. Each later start is
@@ -502,3 +590,5 @@ A test-width update replaces the reservation atomically under the admission lock
 A cleanup plan is written to a temporary file and linked into place only when no plan exists; a rerun over an incomplete older plan names the file and asks the caller to inspect and remove it before making a new plan.
 
 Python queue layouts, build-why tables and production dailies share `scripts/lib/terminal_cells.py::terminal_width`: combining marks occupy zero cells and wide characters two.
+
+**One decision pass.** `admission_pass(QueueInputs, now)` returns ordered `PassRow` decisions, reasons, requested blocker indices, proposed admissions and head marks, together with totals, recovery and override outcomes. It performs one `admission_walk` per scenario; each possible running-step ending is a separate scenario. Earlier admitted rows charge their needs against later rows; recovery allows one proposed start whose spacing is committed only when that row starts; expired estimates hold their place and charge until refreshed. `next_recovery` advances recovery without consuming a proposed start. The check commits only its own proposal and otherwise applies the pass's no-admission outcomes. `queue_read_from` and the release helpers use the same pass, with `QueueExplanation.decided_from` retaining the exact inputs for counterfactual endings. `blockers_for` selects owner keys for blocker computation; all other rows report `BlockerNotRequested`. The snapshot codec writes this set as a sorted list. The merged ledger still records priority with `bump_order`, `holds_younger` and `priority_since`; these remain inputs to the existing resources rules.

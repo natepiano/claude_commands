@@ -147,7 +147,7 @@ class PaneRestoreTests(unittest.TestCase):
         self.assertIn("resumed sid-alpha", output)
 
     def test_restore_supplies_the_staff_owners_session_labels_to_the_new_tab(self) -> None:
-        from scripts.production import staff, unit_marks, showrunners
+        from scripts.production import staff, session_staff, showrunners
 
         parent = staff.StaffRow(staff.StaffId("s123456789aa"), "showrunner", "demo", None)
         owner = staff.StaffRow(staff.StaffId("s123456789ab"), "unit", "alpha", parent.id)
@@ -155,9 +155,9 @@ class PaneRestoreTests(unittest.TestCase):
         source = showrunners.ShowrunnerSource(
             showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), document)
         self.entry(environment={"STAFF_ID": owner.id})
-        membership = unit_marks.LaunchMembership(staff.StaffSnapshot((parent, owner)),
-            unit_marks.MemberSources({"demo": source}, ()))
-        with mock.patch.object(unit_marks.LaunchMembership, "read", return_value=membership):
+        membership = session_staff.LaunchMembership(staff.StaffSnapshot((parent, owner)),
+            session_staff.MemberSources({"demo": source}, ()))
+        with mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership):
             code, output = self.run_restore(self.restored())
         self.assertEqual(code, 0, output)
         self.assertEqual(len(self.opened), 1)

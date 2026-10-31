@@ -185,7 +185,7 @@ class PaneRecordTests(unittest.TestCase):
         self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
 
     def test_repair_recovers_history_and_staff_identity_without_changing_conversations(self) -> None:
-        from scripts.production import staff, unit_marks
+        from scripts.production import staff, session_staff
         from scripts.shutdown import pane_record
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
         import sessions
@@ -202,16 +202,16 @@ class PaneRecordTests(unittest.TestCase):
             self.records.mkdir(parents=True, exist_ok=True)
             path = self.records / "agents.json"
             _ = path.write_text(json.dumps({"old": old, "new": new}))
-            membership = unit_marks.LaunchMembership(staff.snapshot(), unit_marks.MemberSources({}, (old, new)))
-            with (mock.patch.object(unit_marks.LaunchMembership, "read", return_value=membership),
+            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, (old, new)))
+            with (mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership),
                   mock.patch.object(sessions, "running_sessions", return_value=[])):
-                self.assertEqual(len(unit_marks.repair_marks()), 1)
+                self.assertEqual(len(session_staff.repair_marks()), 1)
                 repaired = pane_record.read_strict("agents")
                 expected = {**new, "environment": {**old["environment"], **new["environment"], "STAFF_ID": owner.id}}
                 self.assertEqual(repaired["new"], expected)
                 self.assertEqual(repaired["old"], old)
                 before = (path.read_bytes(), path.stat().st_mtime_ns)
-                self.assertEqual(unit_marks.repair_marks(), [])
+                self.assertEqual(session_staff.repair_marks(), [])
                 self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_repair_command_reports_each_record_then_is_idle_on_rerun(self) -> None:
@@ -228,7 +228,7 @@ class PaneRecordTests(unittest.TestCase):
         self.records.mkdir(parents=True)
         path = self.records / "agents.json"
         _ = path.write_text(json.dumps({"old": old, "new": new}))
-        command = [sys.executable, "-m", "scripts.production.unit_marks", "repair"]
+        command = [sys.executable, "-m", "scripts.production.session_staff", "repair"]
         first = subprocess.run(command, cwd=HOOK.parents[2], env=environment,
                                capture_output=True, text=True, timeout=60)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -244,7 +244,7 @@ class PaneRecordTests(unittest.TestCase):
         self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_unmarked_compaction_keeps_repaired_labels_only_for_the_same_conversation(self) -> None:
-        from scripts.production import staff, unit_marks
+        from scripts.production import staff, session_staff
         from scripts.shutdown import pane_record
         from scripts.production.staff_test_support import isolated_staff_file, unit_membership
         import sessions
@@ -259,10 +259,10 @@ class PaneRecordTests(unittest.TestCase):
             damaged = pane_record.launch("w1:p2", "sid-alpha", "/work/alpha", {}, ["claude"])
             self.records.mkdir(parents=True)
             _ = (self.records / "agents.json").write_text(json.dumps({"old": old, "w1:p2": damaged}))
-            membership = unit_marks.LaunchMembership(staff.snapshot(), unit_marks.MemberSources({}, (old, damaged)))
-            with (mock.patch.object(unit_marks.LaunchMembership, "read", return_value=membership),
+            membership = session_staff.LaunchMembership(staff.snapshot(), session_staff.MemberSources({}, (old, damaged)))
+            with (mock.patch.object(session_staff.LaunchMembership, "read", return_value=membership),
                   mock.patch.object(sessions, "running_sessions", return_value=[])):
-                self.assertEqual(len(unit_marks.repair_marks()), 1)
+                self.assertEqual(len(session_staff.repair_marks()), 1)
             for key in ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID"):
                 del self.env[key]
             for _compaction in range(2):
@@ -276,7 +276,7 @@ class PaneRecordTests(unittest.TestCase):
             self.assertEqual(self.entries()["w1:p2"]["environment"], {"ENABLE_TOOL_SEARCH": "true"})
 
     def test_restored_unit_id_comes_from_the_productions_units_table(self) -> None:
-        from scripts.production import staff, unit_marks, showrunners
+        from scripts.production import staff, session_staff, showrunners
 
         parent = staff.StaffRow(staff.StaffId("s123456789aa"), "showrunner", "demo", None)
         owner = staff.StaffRow(staff.StaffId("s123456789ab"), "unit", "alpha", parent.id)
@@ -284,21 +284,21 @@ class PaneRecordTests(unittest.TestCase):
         source = showrunners.ShowrunnerSource(
             showrunners.Timer("demo", "session:runner", self.root / "demo.md", "UTC"), document)
         entry = pane_record.launch("new", "sid-alpha", "/fixture", {"STAFF_ID": owner.id}, ["claude"])
-        membership = unit_marks.LaunchMembership(staff.StaffSnapshot((parent, owner)),
-            unit_marks.MemberSources({"demo": source}, ()))
+        membership = session_staff.LaunchMembership(staff.StaffSnapshot((parent, owner)),
+            session_staff.MemberSources({"demo": source}, ()))
         self.assertEqual(membership.environment(entry), {"STAFF_ID": owner.id,
             "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha"})
 
-    def test_staff_owner_supersedes_a_promoted_showrunners_old_unit_marks(self) -> None:
-        from scripts.production import staff, unit_marks, showrunners
+    def test_staff_owner_supersedes_a_promoted_showrunners_old_session_staff(self) -> None:
+        from scripts.production import staff, session_staff, showrunners
 
         owner = staff.StaffRow(staff.StaffId("s123456789ab"), "showrunner", "demo", None)
         source = showrunners.ShowrunnerSource(
             showrunners.Timer("demo", "session:sid-alpha", self.root / "demo.md", "UTC"), "# demo\n")
         entry = pane_record.launch("new", "sid-alpha", "/fixture", {
             "SHOWRUNNER_UNIT": "former", "SHOWRUNNER_UNIT_ID": "demo-unit"}, ["claude"])
-        membership = unit_marks.LaunchMembership(staff.StaffSnapshot((owner,)),
-            unit_marks.MemberSources({"demo": source}, ()))
+        membership = session_staff.LaunchMembership(staff.StaffSnapshot((owner,)),
+            session_staff.MemberSources({"demo": source}, ()))
         repaired = membership.environment(entry)
         self.assertEqual(repaired, {"STAFF_ID": owner.id})
         entry["environment"] = {**entry["environment"], **repaired}
