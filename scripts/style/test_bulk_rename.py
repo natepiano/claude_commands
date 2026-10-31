@@ -27,7 +27,7 @@ import style_ledger
 from ledger_test_support import remove_generation_schema
 import style_rules
 from scripts.direct.test_verify_untested_examples import rust_tool_path, workspace_metadata
-from approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename_check, binding_scope
+from approved_renames import AppliedInCode, BindingRename, NoBindingScope, binding_rename_check, binding_scope, rename_declaration
 
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
@@ -460,6 +460,134 @@ class RenameTests(CargoProjectTests):
         result = self.rename(source, (self.finding(source),), ScriptedServer(refuse))
         self.assertEqual(result.kept, ())
         self.assertEqual(result.refusals[0].reason, "prepareRename refused")
+
+
+class CandidateEditTests(CargoProjectTests):
+    def test_unnormalizable_shorthand_refuses_before_an_overlay_and_keeps_another_binding(self) -> None:
+        source = ('enum Outcome { Honored { signal: u8 } }\nfn run() {\n'
+                  '    let signal = 1;\n    let other = 2;\n'
+                  '    consume(Outcome::Honored { signal });\n    consume(other);\n}\n')
+        def edits(text: str, _offset: int, new: str) -> tuple[bulk.SourceEdit, ...]:
+            old = 'signal' if new == 'owned_process_group_signal_outcome' else 'other'
+            return tuple(replace(edit, text=new + ' /* analyzer fragment */')
+                         if text[edit.end:].startswith(' });') else edit
+                         for edit in word_edits(text, old, new) if edit.start >= text.index('fn run'))
+        server = ScriptedServer(edits)
+        result = self.rename(source, (
+            self.finding(source, 'signal', 'owned_process_group_signal_outcome', 3, 'bad'),
+            self.finding(source, 'other', 'count', 4, 'good')), server)
+        self.assertEqual([item.finding.finding_id for item in result.kept], ['good'])
+        self.assertEqual(result.edited, source.replace('other', 'count'))
+        self.assertIn('record shorthand', result.refusals[0].reason)
+        self.assertEqual(server.documents[self.repo / 'src/lib.rs'], result.edited)
+        self.assertEqual((self.repo / 'src/lib.rs').read_text(), 'pub fn run() {\n    let old = 1;\n    let _ = old + 1;\n}\n')
+
+    def test_explicit_record_field_preservation_is_not_refused(self) -> None:
+        source = 'fn run() { let signal = 1; consume(Outcome::Honored { signal }); }\n'
+        edits = tuple(bulk.SourceEdit(edit.start, edit.end,
+                                      'signal: outcome' if source[edit.end:].startswith(' }') else 'outcome')
+                      for edit in word_edits(source, 'signal', 'outcome'))
+        server = ScriptedServer(lambda text, offset, new: ())
+        rename = BindingRename(1, source, 'signal', 'outcome')
+        for candidate in (edits, word_edits(source, 'signal', 'outcome')):
+            workspace = bulk.WorkspaceRename((bulk.DocumentEdits(self.repo / 'src/lib.rs', source, candidate),))
+            corrected = bulk.preserve_shorthand_field_labels(server.sources, workspace, rename)
+            document = corrected.documents[0]
+            bulk.shorthand_edit_guard(document, rename)
+            self.assertEqual(bulk.apply_edits(source, document.edits),
+                             'fn run() { let outcome = 1; consume(Outcome::Honored { signal: outcome }); }\n')
+
+    def test_proven_cfg_field_uses_join_analyzer_edits_before_write(self) -> None:
+        path = self.repo / 'src/lib.rs'
+        other = self.repo / 'src/other.rs'
+        source = 'mod other;\nstruct Prepared {\n    child: Child,\n}\n'
+        target_source = ('#[cfg(test)] fn exercise(child: Child) {\n'
+                         '    let prepared = Prepared { child };\n'
+                         '    let _ = Prepared { child: value };\n'
+                         '    consume(prepared.child);\n}\n')
+        _ = other.write_text(target_source)
+        server = ScriptedServer(lambda text, offset, new: (bulk.SourceEdit(offset, offset + len('child'), new),))
+        binding = bulk.DefinitionTarget(other.as_uri(), (0, 25), (0, 30))
+        def definitions(_document_path: Path, text: str, offsets: tuple[int, ...]) -> tuple[bulk.DefinitionResolution, ...]:
+            root = server.documents[path]
+            declaration = next(span for span in bulk.BindingText(root).spans
+                               if span.token.value in {'child', 'run_child'})
+            begin, end = bulk.lsp_position(root, declaration.start), bulk.lsp_position(root, declaration.end)
+            field = bulk.DefinitionTarget(path.as_uri(), (begin['line'], begin['character']),
+                                         (end['line'], end['character']))
+            tokens = bulk.BindingText(text)
+            return tuple(bulk.FieldShorthandTargets(field, binding)
+                         if isinstance(bulk.rename_edit_site(tokens, bulk.SourceEdit(point, point + len('child'), 'run_child')),
+                                       bulk.ShorthandFieldLabel) else field for point in offsets)
+        with mock.patch.object(server, 'definitions', side_effect=definitions):
+            result = self.rename(source, (self.finding(source, 'child', 'run_child', 3),), server)
+        self.assertEqual(result.refusals, ())
+        self.assertEqual(len(result.kept), 1)
+        self.assertEqual(result.edited, source.replace('child: Child', 'run_child: Child'))
+        expected = target_source.replace('Prepared { child }', 'Prepared { run_child: child }').replace(
+            'Prepared { child: value }', 'Prepared { run_child: value }').replace('prepared.child', 'prepared.run_child')
+        self.assertEqual(result.related[0].edited, expected)
+        self.assertEqual(server.documents[other], expected)
+        self.assertEqual(other.read_text(), target_source)
+
+    def test_unproved_cfg_field_use_refuses_before_overlay(self) -> None:
+        source = ('struct Prepared {\n    child: Child,\n}\n#[cfg(not(test))]\n'
+                  'fn prepare(child: Child) -> Prepared { Prepared { child } }\n')
+        server = ScriptedServer(lambda text, offset, new: (bulk.SourceEdit(offset, offset + len('child'), new),))
+        with mock.patch.object(server, 'definitions', return_value=(bulk.DefinitionUnavailable('inactive cfg'),)):
+            result = self.rename(source, (self.finding(source, 'child', 'run_child', 2),), server)
+        self.assertEqual(result.edited, source)
+        self.assertIn('cfg-dependent references', result.refusals[0].reason)
+        self.assertIn('inactive cfg', result.refusals[0].reason)
+        self.assertEqual(server.documents[self.repo / 'src/lib.rs'], source)
+
+    def test_cfg_unrelated_local_name_does_not_refuse_field_rename(self) -> None:
+        source = ('struct Prepared {\n    child: Child,\n}\n#[cfg(test)]\n'
+                  'fn exercise(child: Child) { let child = 1; consume(child); child.child(); }\n')
+        server = ScriptedServer(lambda text, offset, new: (bulk.SourceEdit(offset, offset + len('child'), new),))
+        result = self.rename(source, (self.finding(source, 'child', 'owned_run_child_process', 2),), server)
+        self.assertEqual(result.refusals, ())
+        self.assertIn('let child = 1', result.edited)
+
+    def test_cfg_field_coverage_includes_unchanged_files_and_unresolved_accesses(self) -> None:
+        source = 'struct Prepared {\n    child: Child,\n}\n'
+        path = self.repo / 'src/lib.rs'
+        for use in ('prepared.child', 'Prepared { child: value }', 'Prepared { child }'):
+            with self.subTest(use=use):
+                target = self.repo / 'src/other.rs'
+                _ = target.write_text('#[cfg(not(test))] fn use_it() { consume(' + use + '); }\n')
+                full = 'mod other;\n' + source
+                declaration = rename_declaration(full, BindingRename(3, '    child: Child,', 'child', 'run_child'))
+                self.assertNotIsInstance(declaration, NoBindingScope)
+                if isinstance(declaration, NoBindingScope):
+                    raise AssertionError(declaration.reason)
+                server = ScriptedServer(lambda text, offset, new: ())
+                server.open(path, full)
+                document = bulk.DocumentEdits(path, full, (bulk.SourceEdit(declaration.offset,
+                                                declaration.offset + len('child'), 'run_child'),))
+                with mock.patch.object(server, 'definitions', return_value=(bulk.DefinitionUnavailable('inactive cfg'),)):
+                    with self.assertRaisesRegex(bulk.BulkRenameError, 'cfg-dependent references'):
+                        _ = bulk.cfg_field_reference_guard(server, path, bulk.BindingText(full), declaration,
+                                                       BindingRename(3, '    child: Child,', 'child', 'run_child'),
+                                                       bulk.WorkspaceRename((document,)))
+                # A resolved different field is not part of this rename, even under cfg.
+                unrelated = bulk.DefinitionTarget(target.as_uri(), (0, 0), (0, 1))
+                with mock.patch.object(server, 'definitions', return_value=(unrelated,)):
+                    _ = bulk.cfg_field_reference_guard(server, path, bulk.BindingText(full), declaration,
+                                                   BindingRename(3, '    child: Child,', 'child', 'run_child'),
+                                                   bulk.WorkspaceRename((document,)))
+
+    def test_clippy_only_finding_now_writes(self) -> None:
+        source = '/// A scope owns deferred imports.\nstruct Scope {\n    deferred: Imports,\n}\n'
+        _ = (self.repo / 'src/lib.rs').write_text(source)
+        server = ScriptedServer(lambda text, offset, new: word_edits(text, 'deferred', new))
+        result = self.rename(source, (self.finding(source, 'deferred', 'deferred_item_uses', 3),), server)
+        self.assertEqual(result.refusals, ())
+        self.assertEqual(len(result.kept), 1)
+        workspace = bulk.BatchWorkspace(self.repo, (result,), ("bulk_sample",))
+        with mock.patch.object(bulk, "command"):
+            self.assertTrue(workspace.validate(("src/lib.rs",)))
+        self.assertEqual((self.repo / 'src/lib.rs').read_text(), source.replace('deferred', 'deferred_item_uses'))
 
 
 class SourceCoverageTests(CargoProjectTests):

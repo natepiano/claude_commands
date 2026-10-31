@@ -39,7 +39,7 @@ import style_ledger
 from approved_renames import (BindingComments, BindingRename, BindingScope, NoBindingScope,
                               RenameDeclaration, rename_declaration, refactor_rename, refactor_comments, binding_comments,
                               PatternBindingCollision, pattern_binding_check,
-                              backtick_mentions, identifier_mentions)
+                              backtick_mentions, identifier_mentions, field_sites)
 
 
 class BulkRenameError(Exception):
@@ -794,6 +794,82 @@ def module_exports(server: RenameServer, path: Path, source: str, module: int, n
     return False
 
 
+def cfg_field_reference_guard(server: RenameServer, path: Path, parsed: BindingText,
+                              declaration: RenameDeclaration, rename: BindingRename,
+                              workspace: WorkspaceRename) -> WorkspaceRename:
+    """Complete proven cfg field uses in the analyzer edit set; refuse missing proof."""
+    if declaration.scope.kind != "field":
+        return workspace
+    span = parsed.spans[declaration.scope.declaration]
+    begin, end = lsp_position(parsed.source, span.start), lsp_position(parsed.source, span.end)
+    target = DefinitionTarget(path.as_uri(), (begin["line"], begin["character"]),
+                              (end["line"], end["character"]))
+    documents = {document.path: document for document in workspace.documents}
+    for source in crate_source_documents(server, path):
+        tokens = server.sources.tokens(source.source)
+        if rename.old not in tokens.words:
+            continue
+        owners = style_footprint.attribute_owners(tokens.words)
+        gated: set[int] = set()
+        for start, finish in style_footprint.attribute_spans(tokens.words):
+            if not set(tokens.words[start:finish]) & {"cfg", "cfg_attr"}:
+                continue
+            item = owners.get(start, finish)
+            finish = item
+            while finish < len(tokens.words) and tokens.words[finish] not in {"{", ";", ","}:
+                finish = tokens.ends.get(finish, finish) + 1
+            finish = tokens.ends.get(finish, finish) + 1
+            gated.update(range(item, finish))
+        document = documents.get(source.path, DocumentEdits(source.path, source.source, ()))
+        missing: list[int] = []
+        for i in sorted(gated):
+            if i >= len(tokens.spans) or tokens.words[i] != rename.old:
+                continue
+            token = tokens.spans[i]
+            owner = tokens.parents.get(i, -1)
+            field_use = (tokens.words[max(0, i - 1):i] == (".",)
+                         and tokens.words[i + 1:i + 2] != ("(",)
+                         or isinstance(rename_edit_site(tokens, SourceEdit(token.start, token.end, rename.new)),
+                                       ShorthandFieldLabel)
+                         or owner >= 0 and tokens.words[owner] == "{"
+                         and i in field_sites(tokens.words, owner, tokens.ends[owner]))
+            if not field_use or source.path == path and token.start == span.start:
+                continue
+            if any(edit.start <= token.start and token.end <= edit.end and edit.text != rename.old
+                   for edit in document.edits):
+                continue
+            missing.append(token.start)
+        if not missing:
+            continue
+        server.open(source.path, source.source)
+        answers = server.definitions(source.path, source.source, tuple(missing))
+        if len(answers) != len(missing):
+            raise BulkRenameError("cfg field reference coverage unavailable: incomplete definition response")
+        edits = list(document.edits)
+        for point, answer in zip(missing, answers, strict=True):
+            if isinstance(answer, DefinitionUnavailable):
+                line = source.source.count("\n", 0, point) + 1
+                raise BulkRenameError(f"field rename has cfg-dependent references: {source.path}:{line}; "
+                                      + "field definition is unproved: " + answer.reason)
+            if answer == target or isinstance(answer, FieldShorthandTargets) and answer.field == target:
+                edit = SourceEdit(point, point + len(rename.old), rename.new)
+                site = rename_edit_site(tokens, edit)
+                edits.extend(site.field_edits(rename.new) if isinstance(site, ShorthandFieldLabel) else (edit,))
+        if tuple(edits) != document.edits:
+            documents[source.path] = replace(document, edits=tuple(edits))
+    return WorkspaceRename(tuple(documents.values()))
+
+
+def shorthand_edit_guard(document: DocumentEdits, rename: BindingRename) -> None:
+    """A local binding edit must keep the record field label intact."""
+    before = BindingText(document.source)
+    for edit in document.edits:
+        site = rename_edit_site(before, edit)
+        if (isinstance(site, ShorthandFieldLabel) and site.span.token.value == rename.old
+                and site.binding_edits(rename.new)[0] not in document.edits):
+            raise BulkRenameError("record shorthand edit was not normalized to preserve its field label")
+
+
 def rename_guard(server: RenameServer, path: Path, source: str, declaration: RenameDeclaration,
                  rename: BindingRename) -> PreservedFieldNames:
     parsed = server.sources.tokens(source)
@@ -888,6 +964,9 @@ class ShorthandFieldLabel:
     """One token that names both a record field and its local value or pattern binding."""
 
     span: style_footprint.TokenSpan
+
+    def field_edits(self, new: str) -> tuple[SourceEdit, ...]:
+        return (SourceEdit(self.span.start, self.span.end, new + ": " + self.span.token.value),)
 
     def binding_edits(self, new: str) -> tuple[SourceEdit, SourceEdit]:
         # Keeping the insertion separate maps the old binding boundary to the value,
@@ -1593,6 +1672,7 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
             if not own_doc and docs_name_binding(docs, comments, rename.old):
                 raise BulkRenameError("repository Markdown names the parameter; requires a coordinated documentation edit")
             workspace = server.rename(path, current, offset, rename.new)
+            workspace = cfg_field_reference_guard(server, path, server.sources.tokens(current), declaration, rename, workspace)
             documents: list[DocumentEdits] = []
             for document in workspace.documents:
                 if not document.path.is_relative_to(root) or crate_directory(document.path) != crate_directory(path):
@@ -1602,6 +1682,8 @@ def rename_file(server: RenameServer, path: Path, relative: str, source: str,
                     if any(not any(span.start <= edit.start and edit.end <= span.end for span in spans)
                            and (document.path != path or edit not in companion) for edit in document.edits):
                         raise BulkRenameError("parameter refactor changes text outside its proved comment mentions")
+                if declaration.scope.kind not in {"field", "variant", "item"}:
+                    shorthand_edit_guard(document, rename)
                 text_name_guard(server, document, rename)
                 public_edit_guard(document, rename)
                 edits = list(document.edits)
