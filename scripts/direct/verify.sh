@@ -2638,11 +2638,13 @@ buildlog_wait_for_memory() {
     [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
     TOKEN_WAITED=0
     if ! try_token_now; then
-        buildlog_release_memory 0
+        buildlog_token_wait || return $?
         acquire_token || return $?
+        local token_back_at
+        token_back_at=$(buildlog_memory_python -c 'import time; print(time.time())') || return $?
         memory_wait=$BUILDLOG_MEM_WAIT_S
         # The second pass keeps the step's place in the memory queue from its first wait.
-        BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@" || return $?
+        BUILDLOG_MEM_TOKEN_BACK_AT=$token_back_at BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM buildlog_wait_for_memory_only "$@" || return $?
         BUILDLOG_MEM_WAIT_S=$(( memory_wait + BUILDLOG_MEM_WAIT_S ))
         remember_tree_reservation
         if [[ "$BUILDLOG_MEM_OUTCOME" == LeftQueue ]]; then

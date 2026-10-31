@@ -10,13 +10,15 @@ import { CWD, drawnText, inspectDrawing, NOW, SESSION, sessionFixture } from './
 const HOME = '/test-home';
 const ARGV = [`${HOME}/.claude/scripts/lib/py`, `${HOME}/.claude/scripts/build_queue/build_queue.py`];
 const READ = [...ARGV, '--json', '--columns', '100', '--you', SESSION];
+const PRIORITY_ARGV = [`${HOME}/.claude/scripts/lib/py`, `${HOME}/.claude/scripts/lint/memory_admit.py`, 'priority', 'set', '--unit', 'berth', '--why', "the user's bump"];
 const command = (args = ''): CommandRunInput => ({ command: 'build:queue', args,
   origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 170 } });
 const start = { cwd: CWD, surface: null, isInteractive: false } as const;
 const turn: TurnCompleteInput = { answer: 'finished', reason: 'answer', durationMs: 100,
   isAborted: false, turnId: 'queue-turn' };
 const HEAD = 'Build queue 10:46:12 · 1 running · 1 waiting · #1 waits on memory pressure, budget';
-const BUMP = 'tester moved report: check in /tmp/report to the head; memory limits still apply';
+const BUMP = 'queue priority set for berth: first step now #1';
+const USAGE = 'build queue: use /build:queue bump <unit>';
 
 function snapshot(): QueueLines {
   return {
@@ -96,7 +98,7 @@ function queueHost(on: On) {
   });
   on('process.run', async (_$, e) => {
     processes.push([...e.argv]);
-    if (e.argv.includes('bump')) {
+    if (e.argv.includes('priority')) {
       return { value: { exitCode: bumpFailure ? 2 : bumpRefusal ? 3 : 0,
         stdout: bumpFailure ? 'PRIVATE stdout' : bumpRefusal || BUMP + '\n',
         stderr: bumpFailure ? 'PRIVATE stderr' : '',
@@ -485,15 +487,33 @@ describe('build queue pane', () => {
   }
 
   for (const open of [false, true]) {
-    test(`bump passes the selector as one argument and ${open ? 'refreshes the open' : 'does not open a closed'} pane`, async ($, on) => {
+    test(`bump sets unit priority and ${open ? 'refreshes the open' : 'does not open a closed'} pane`, async ($, on) => {
       const fake = queueHost(on);
       if (open) await $.command.run(command());
       fake.clear();
-      expect(await $.command.run(command('bump worker with spaces'))).toEqual({ text: BUMP });
+      const supplied = snapshot();
+      fake.replace(supplied);
+      const bytes = JSON.stringify(supplied);
+      expect(await $.command.run(command('bump berth'))).toEqual({ text: BUMP });
+      expect(JSON.stringify(supplied)).toBe(bytes);
       expect(fake.processes).toEqual(open
-        ? [[...ARGV, 'bump', 'worker with spaces'], READ]
-        : [[...ARGV, 'bump', 'worker with spaces']]);
+        ? [PRIORITY_ARGV, READ]
+        : [PRIORITY_ARGV]);
       expect(fake.opened).toEqual(open ? ['build-queue'] : []);
+      expect(fake.escaped).toEqual([]);
+    });
+  }
+
+  for (const args of ['bump', 'bump berth other']) {
+    test(`${args} gives usage without running a command or changing the pane`, async ($, on) => {
+      const fake = queueHost(on);
+      await $.command.run(command());
+      fake.clear();
+      expect(await $.command.run(command(args))).toEqual({ text: USAGE });
+      expect(fake.processes).toEqual([]);
+      expect(fake.writes).toEqual([]);
+      expect(fake.opened).toEqual(['build-queue']);
+      expect(fake.closed).toEqual([]);
       expect(fake.escaped).toEqual([]);
     });
   }
@@ -505,32 +525,31 @@ describe('build queue pane', () => {
     const pending = fake.pause();
     const ticking = fake.clock.advance(10_000);
     await pending.started;
-    expect(await $.command.run(command('bump 2'))).toEqual({ text: BUMP });
-    expect(fake.processes).toEqual([READ, [...ARGV, 'bump', '2']]);
+    expect(await $.command.run(command('bump berth'))).toEqual({ text: BUMP });
+    expect(fake.processes).toEqual([READ, PRIORITY_ARGV]);
     pending.finish();
     await ticking;
     await fake.clock.settle();
-    expect(fake.processes).toEqual([READ, [...ARGV, 'bump', '2'], READ]);
+    expect(fake.processes).toEqual([READ, PRIORITY_ARGV, READ]);
   });
 
-  test('a failed bump hides process diagnostics and a missing selector runs nothing', async ($, on) => {
+  test('bump failures hide process diagnostics and missing unit gives usage', async ($, on) => {
     const fake = queueHost(on);
     fake.failBump();
-    expect(await $.command.run(command('bump 9'))).toEqual({ text: 'Build queue could not be read.' });
-    expect(fake.processes).toEqual([[...ARGV, 'bump', '9']]);
+    expect(await $.command.run(command('bump berth'))).toEqual({ text: 'Build queue could not be read.' });
+    expect(fake.processes).toEqual([PRIORITY_ARGV]);
     fake.clear();
-    expect(await $.command.run(command('bump'))).toEqual({ text: 'Build queue could not be read.' });
+    expect(await $.command.run(command('bump'))).toEqual({ text: USAGE });
     expect(fake.processes).toEqual([]);
     expect(fake.escaped).toEqual([]);
   });
 
-  for (const refusal of ["build queue: 'unknown-worker': no waiting step matches",
-    "build queue: 'report': ambiguous waiter; matches: 1: report /one, 2: report /two"]) {
+  for (const refusal of ["build queue: type /build:queue bump berth in a showrunner pane"]) {
     test(`bump reports its refusal: ${refusal}`, async ($, on) => {
       const fake = queueHost(on);
       fake.refuseBump(refusal);
-      expect(await $.command.run(command('bump unknown-worker'))).toEqual({ text: refusal });
-      expect(fake.processes).toEqual([[...ARGV, 'bump', 'unknown-worker']]);
+      expect(await $.command.run(command('bump berth'))).toEqual({ text: refusal });
+      expect(fake.processes).toEqual([PRIORITY_ARGV]);
       expect(fake.opened).toEqual([]);
       expect(fake.escaped).toEqual([]);
     });
@@ -541,7 +560,7 @@ describe('build queue pane', () => {
     on('process.run', () => ({ value: { exitCode: 2, stdout: '',
       stderr: "build queue: [Errno 13] Permission denied: '/private/admission/lock'\n",
       isStdoutTruncated: false, isStderrTruncated: false } }));
-    expect(await $.command.run(command('bump unknown-worker'))).toEqual({ text: 'Build queue could not be read.' });
+    expect(await $.command.run(command('bump berth'))).toEqual({ text: 'Build queue could not be read.' });
   });
 
   test('an exit-2 locked queue ValueError stays behind the fixed failure reply', async ($, on) => {
@@ -549,19 +568,19 @@ describe('build queue pane', () => {
     on('process.run', () => ({ value: { exitCode: 2, stdout: '',
       stderr: 'build queue: PRIVATE locked queue reading invalid\n',
       isStdoutTruncated: false, isStderrTruncated: false } }));
-    expect(await $.command.run(command('bump unknown-worker'))).toEqual({ text: 'Build queue could not be read.' });
+    expect(await $.command.run(command('bump berth'))).toEqual({ text: 'Build queue could not be read.' });
   });
 
   test('an escaped newline in a selector refusal remains a readable single line', async ($, on) => {
     const fake = queueHost(on);
     const refusal = "build queue: 'unknown-worker': unknown waiter; matches: 1: head /tmp/tree\\nsecond";
     fake.refuseBump(refusal);
-    expect(await $.command.run(command('bump unknown-worker'))).toEqual({ text: refusal });
+    expect(await $.command.run(command('bump berth'))).toEqual({ text: refusal });
   });
 
   for (const result of ['success', 'refusal'] as const) {
     for (const failedWrites of [1, 2]) {
-      test(`a bump ${result} survives ${failedWrites} failed refresh state writes`, async () => {
+      test(`${result === 'success' ? 'a bump success' : 'an exit-3 bump refusal'} survives ${failedWrites} failed refresh state writes`, async () => {
         type Hook = (services: EngineInterface, event: CommandRunInput) => Promise<unknown>;
         const hooks = new Map<string, Hook>();
         const collect = (event: string, ...args: unknown[]) => {
@@ -591,15 +610,15 @@ describe('build queue pane', () => {
             },
           },
           process: { run: async (argv: string[]) => ({
-            exitCode: argv.includes('bump') && result === 'refusal' ? 3 : 0,
-            stdout: argv.includes('bump') ? (result === 'refusal' ? refusal : BUMP) : JSON.stringify(snapshot()),
+            exitCode: argv.includes('priority') && result === 'refusal' ? 3 : 0,
+            stdout: argv.includes('priority') ? (result === 'refusal' ? refusal : BUMP) : JSON.stringify(snapshot()),
             stderr: '', isStdoutTruncated: false, isStderrTruncated: false,
           }) },
         } as unknown as EngineInterface;
         const run = hooks.get('command.run:build:queue')!;
         await run(services, command());
         remaining = failedWrites;
-        expect(await run(services, command('bump unknown-worker'))).toEqual({ text: result === 'refusal' ? refusal : BUMP });
+        expect(await run(services, command('bump berth'))).toEqual({ text: result === 'refusal' ? refusal : BUMP });
         expect(failures).toBe(failedWrites);
         if (failedWrites === 1) {
           expect(state['build-queue']).toEqual({ kind: 'failed', reason: 'Build queue could not be read.', selection: { kind: 'view' } });
@@ -615,7 +634,7 @@ describe('build queue pane', () => {
         stdout: invalid === 'truncated' ? "build queue: 'unknown': unknown waiter"
           : "build queue: 'unknown': unknown waiter\nPRIVATE diagnostic\n",
         stderr: '', isStdoutTruncated: invalid === 'truncated', isStderrTruncated: false } }));
-      expect(await $.command.run(command('bump unknown'))).toEqual({ text: 'Build queue could not be read.' });
+      expect(await $.command.run(command('bump berth'))).toEqual({ text: 'Build queue could not be read.' });
     });
   }
 });

@@ -15,7 +15,6 @@ from typing import NamedTuple, cast
 from zoneinfo import ZoneInfo
 
 from scripts.buildlog import store
-from scripts.build_queue.queue_lines import age
 from scripts.lint import memory_admit as gate
 from scripts.message import unit_labels
 
@@ -24,16 +23,6 @@ MAX_SCAN_BYTES = 32 * BLOCK_BYTES
 BUMP_TABLE_ROWS = 8
 QUEUE_TIMES_PATH = Path("admission/queue_times.jsonl")
 _BUMP_KIND = re.compile(rb'"kind"\s*:\s*"queue_bump"')
-
-
-@dataclass(frozen=True)
-class HeadTimeNotRecorded:
-    pass
-
-
-@dataclass(frozen=True)
-class RecordedHeadTime:
-    since: float
 
 
 @dataclass(frozen=True)
@@ -113,15 +102,14 @@ class RecordedTokenWaits:
 class HeadFacts:
     now: float
     joined_at: float
-    head_time: HeadTimeNotRecorded | RecordedHeadTime
     bumps: BumpsUnavailable | BumpHistory
     order: gate.StrictUntil | gate.BackfillUntil | gate.WindowNotStarted
     has_priority: bool
     token_waits: TokenWaitsNotRecorded | RecordedTokenWaits
-    bump: gate.QueueBump | gate.NoBump = gate.NoBump()
     bump_records: tuple[BumpRecord, ...] = ()
     budget: int = gate.BUILD_BUDGET_BYTES
     head_need: int = 0
+    priority: gate.QueuePriority | gate.NoQueuePriority = gate.NO_QUEUE_PRIORITY
 
     @cached_property
     def moves_by_step(self) -> Mapping[MoveIdentity, tuple[BumpRecord, ...]]:
@@ -306,9 +294,9 @@ def _gap_matches_waiter(gap: CargoTokenWait, waiter: gate.WaitingStep,
                         process_starts: Mapping[int, str]) -> bool:
     if gap.step != waiter.step or gap.left_at < waiter.since:
         return False
-    if gap.session_id:
-        return gap.session_id == waiter.session_id
-    return gap.pid == waiter.pid and gap.start_time == process_starts.get(waiter.pid)
+    return (gap.pid == waiter.pid and bool(gap.start_time)
+            and gap.start_time == process_starts.get(waiter.pid)
+            and (not gap.session_id or gap.session_id == waiter.session_id))
 
 
 def _read_token_waits(reading: gate.QueueRead) -> RecordedTokenWaits | TokenWaitsNotRecorded:
@@ -373,30 +361,18 @@ def read_head_facts(reading: gate.QueueRead) -> HeadFacts | gate.NoWaiter:
     if isinstance(head, gate.NoWaiter):
         return head
     now = reading.explanation.now
-    head_time: HeadTimeNotRecorded | RecordedHeadTime = HeadTimeNotRecorded()
-    if reading.ordered:
-        since = _recorded_time(cast(Mapping[str, object], reading.ordered[0][1]), "head_since")
-        if isinstance(since, float) and since <= now:
-            head_time = RecordedHeadTime(since)
     history = _read_bumps(min(step.since for step in reading.view.waiting), now)
     records = history.records if isinstance(history, BumpHistory) else ()
     bumps = (group_bumps(tuple(record for record in records if record.at >= head.waiter.since))
              if isinstance(history, BumpHistory) else history)
-    return HeadFacts(now, head.waiter.since, head_time, bumps,
-                     head.order, head.has_priority, _read_token_waits(reading), head.bump, records,
-                     budget=head.decision.budget, head_need=head.waiter.need)
+    return HeadFacts(now, head.waiter.since, bumps,
+                     head.order, head.has_priority, _read_token_waits(reading), records,
+                     budget=head.decision.budget, head_need=head.waiter.need,
+                     priority=reading.explanation.priority)
 
 
 def clock(instant: float, zone: ZoneInfo, *, seconds: bool = True) -> str:
     return datetime.fromtimestamp(instant, zone).strftime("%H:%M:%S" if seconds else "%H:%M")
-
-
-def head_time_text(facts: HeadFacts, zone: ZoneInfo, *, short: bool = False) -> str:
-    prefix = "head for" if short else "Head for:"
-    if isinstance(facts.head_time, HeadTimeNotRecorded):
-        return "head for: unknown" if short else "Head for: unknown"
-    minutes = age(facts.head_time.since, facts.now)
-    return f"{prefix} {minutes} min" + ("" if short else f" (since {clock(facts.head_time.since, zone)})")
 
 
 def bump_text(facts: HeadFacts, zone: ZoneInfo, *, short: bool = False) -> str:
@@ -434,19 +410,22 @@ def bump_remainder(facts: HeadFacts) -> str:
     return f"and {len(remaining)} more steps with {sum(group.count for group in remaining)} bumps"
 
 
-def order_text(facts: HeadFacts, zone: ZoneInfo, *, include_record: bool = True) -> str:
+def priority_text(priority: gate.QueuePriority | gate.NoQueuePriority) -> str:
+    return ("" if isinstance(priority, gate.NoQueuePriority) else
+            f"queue priority: {priority['unit']} (the user's bump)")
+
+
+def order_text(facts: HeadFacts, zone: ZoneInfo) -> str:
     if not facts.has_priority:
-        return "no head priority: younger steps that fit may start"
-    if isinstance(facts.order, gate.WindowNotStarted):
-        return "head priority: window start not recorded; younger steps wait"
-    remaining = max(0, int(facts.order.deadline - facts.now))
-    minutes, seconds = divmod(remaining, 60)
-    text = gate.window_clause(facts.order, facts.budget, facts.head_need, zone)
-    text += f" ({minutes} min {seconds} s left)"
-    if include_record and isinstance(facts.bump, gate.QueueBump):
-        kind = "bumped by position" if facts.bump.by_position else "head priority recorded"
-        text += f"; {kind} at {clock(facts.bump.priority_since, zone, seconds=False)}"
-    return text
+        text = "no head priority: younger steps that fit may start"
+    elif isinstance(facts.order, gate.WindowNotStarted):
+        text = "head priority: window start not recorded; younger steps wait"
+    else:
+        remaining = max(0, int(facts.order.deadline - facts.now))
+        minutes, seconds = divmod(remaining, 60)
+        text = gate.window_clause(facts.order, facts.budget, facts.head_need, zone)
+        text += f" ({minutes} min {seconds} s left)"
+    return "; ".join(filter(None, [priority_text(facts.priority), text]))
 
 
 def cargo_token_lines(facts: HeadFacts, zone: ZoneInfo, labels: Mapping[str, unit_labels.UnitLabels]) -> list[str]:
@@ -537,7 +516,7 @@ def move_identity(step: gate.WaitingStep | gate.RunningStep) -> MoveIdentity:
 def waiting_moves(facts: HeadFacts | gate.NoWaiter, step: gate.WaitingStep,
                   row: gate.Waiter) -> tuple[BumpRecord, ...]:
     if (isinstance(facts, gate.NoWaiter) or isinstance(facts.bumps, BumpsUnavailable)
-            or row.get("bump_order", 0) >= 0):
+            or row.get("priority_rank", 1) != 0):
         return ()
     return tuple(record for record in facts.moves_by_step.get(move_identity(step), ())
                  if record.at >= step.since)

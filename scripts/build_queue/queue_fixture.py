@@ -140,7 +140,7 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
             host = reason
         first = gate.HeadExplanation(step, gate.NeedSourceNotRecorded(), decision,
             *gate.decision_checks(decision, step.need, view.available),
-            order, False, gate.NoBump())
+            order, False)
     followers: list[gate.LineWaiter] = []
     for step in view.waiting[1:]:
         own = gate.decide(view.available, gate.UnknownHostTotal(), step.need, [],
@@ -172,6 +172,14 @@ def head_reading(*, since: float = HEAD_NOW - 600, now: float = HEAD_NOW,
     return replace(reading, ordered=[(Path("123-123.waiting"), row)])
 
 
+def with_waiting_process(reading: gate.QueueRead, step: gate.WaitingStep, start: str) -> gate.QueueRead:
+    """Add a waiting row and its recorded process identity to the same snapshot."""
+    row: gate.Waiter = {"pid": step.pid, "start_time": start, "need": step.need,
+                        "since": step.since, "session_id": step.session_id, "step": step.step}
+    return replace(reading, ordered=[*reading.ordered, (Path(f"{step.pid}-{start}.waiting"), row)],
+                   view=replace(reading.view, waiting=(*reading.view.waiting, step)))
+
+
 
 class QueueFixture(ExitStack):
     """Private files for every renderer, card and CLI fixture consumer."""
@@ -190,6 +198,7 @@ class QueueFixture(ExitStack):
                             "BUILDLOG_BUILD_BUDGET_GIB": "21", "USER_ZONE": "America/New_York"})
         self.enter_context(mock.patch.dict(os.environ, environment))
         self.labels: dict[str, UnitLabels] = {}
+        _ = self.enter_context(mock.patch.object(gate, "priority_labels", return_value=self.labels))
         self.paths: list[Path] = []
         self.moves: list[bytes] = []
         self.reservation: Path = self.directory / "900-900.reservation"
@@ -205,7 +214,7 @@ class QueueFixture(ExitStack):
                 "since": since, "session_id": session_id, "session_name": session,
                 "step": step, "folder": folder}
             if position <= 2:
-                row.update(bump_order=-3 + position, priority_since=NOW - 12)
+                row.update(priority_since=NOW - 12)
             self.paths.append(self.write_waiter(row))
         self.labels["id-widget"] = UnitLabels("widget-enhancements-title", "tool-based-ui", "widget")
         self.labels["id-widget-director"] = UnitLabels("widget", "tool-based-ui", "widget")
@@ -213,6 +222,8 @@ class QueueFixture(ExitStack):
         self.moves = [self.move(1, NOW - 372, 27), self.move(2, NOW - 372, 27),
             bump_line(NOW - 192, session="id-widget", step="nextest", folder="/tmp/widget",
                       actor="id-widget-director", old_position=29), self.move(1, NOW - 12, 1)]
+        self.write_json(self.directory / "queue_priority.json", {"unit": "cables", "why": "captured priority",
+            "set_at": NOW - 12, "set_by": "user"})
         write_bumps(NOW, self.moves)
         self.write_pace([NOW - 3600 + index * 80 for index in range(44)])
 
