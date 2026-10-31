@@ -360,20 +360,16 @@ remove_step_record() {
     fi
 }
 
-# A failed step may be a process killed by earlyoom or the kernel. Keep the
-# journal query here so tests can put a journalctl stub first on PATH.
+# One classifier preserves signal-based retries and attributes wrapper-only
+# failures to an earlyoom rustc kill of the failed crate.
 memory_kill_in_journal() {
-    local started=$1 ended=$2
-    journalctl -u earlyoom --since "$started" --until "$ended" --no-pager 2>/dev/null \
-        | grep -E 'sending SIG(TERM|KILL) to process' >/dev/null && return 0
-    journalctl -k --since "$started" --until "$ended" --no-pager 2>/dev/null \
-        | grep -E 'Memory cgroup out of memory|Out of memory: Killed' >/dev/null
+    local started=$1 ended=$2 log=$3
+    "${PY:-python3}" "$VERIFY_START_DIR/memory_kill.py" "$started" "$ended" "$log"
 }
 
 step_was_killed_for_memory() {
     local log=$1 started=$2 ended=$3
-    grep -qaE 'SIGKILL|SIGTERM|signal: (9|15)' "$log" || return 1
-    memory_kill_in_journal "$started" "$ended"
+    memory_kill_in_journal "$started" "$ended" "$log"
 }
 
 run() {
@@ -392,7 +388,8 @@ run() {
             step_state local_noncompiling
         fi
         export BUILDLOG_TARGET=natedev
-        started="$(date '+%Y-%m-%d %H:%M:%S %z')"
+        buildlog_now
+        started=$BUILDLOG_NOW
         monitor=0
         [[ $- != *m* ]] || monitor=1
         set -m
@@ -448,7 +445,8 @@ run() {
             rm -f "$step_log"
             return "$status"
         fi
-        ended="$(date '+%Y-%m-%d %H:%M:%S %z')"
+        buildlog_now
+        ended=$BUILDLOG_NOW
         RUN_LAST_ATTEMPT_KILLED=0
         if grep -qaE 'SIGKILL|signal: 9' "$step_log"; then
             RUN_LAST_ATTEMPT_KILLED=1
