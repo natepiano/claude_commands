@@ -84,6 +84,14 @@ class QueueTests(unittest.TestCase):
     def snapshot_text(data: QueueLines) -> str:
         return "\n".join("".join(span["text"] for span in row) for row in data["lines"])
 
+    def test_head_line_uses_singular_for_one_recorded_bump(self) -> None:
+        write_bumps(NOW, [bump_line(NOW - 1)])
+        facts = head_facts.read_head_facts(head_reading(since=NOW - 600, now=NOW))
+        assert isinstance(facts, head_facts.HeadFacts)
+        text = head_facts.bump_text(facts, ZoneInfo("UTC"), short=True)
+        self.assertIn("1 bump since it joined, most: bumped check (1)", text)
+        self.assertNotIn("1 bumps", text)
+
 
     def test_older_fitting_step_reason_names_waiting_place_or_unmatched_fallback(self) -> None:
         older = memory_admit.WaitingStep(100, "older-id", "recorded-older", "check", "/tmp/older",

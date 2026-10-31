@@ -138,8 +138,7 @@ class StaffSourcesTests(StaffTestCase):
                 self.assertEqual(reads.call_count, 1)
                 inputs = cast(list[str], value["inputs"])
                 self.assertIn(str(config), inputs)
-                for path in inputs:
-                    self.assertFalse(path.startswith(("/proc/", "/dev/", "/usr/share/zoneinfo/")), path)
+                self.assert_no_system_inputs(inputs)
 
     def test_pool_lease_distinguishes_unleased_resolved_and_unresolved_units_before_json(self) -> None:
         _ = self.production("sdlc", "models-unit")
@@ -295,14 +294,21 @@ class StaffSourcesTests(StaffTestCase):
                 self.assertEqual(reads.call_count, 1)
                 inputs = cast(list[str], value["inputs"])
                 self.assertIn(str(self.staff_file), inputs)
-                for path in inputs:
-                    self.assertFalse(path.startswith(("/proc/", "/dev/", "/usr/share/zoneinfo/")), path)
+                self.assert_no_system_inputs(inputs)
         self.assertEqual(len(self.ssh_commands()), 1)
 
     def seed(self, *, dry_run: bool = False) -> tuple[str, str]:
         with redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
             staff_sources.seed(dry_run=dry_run)
         return output.getvalue(), errors.getvalue()
+
+    def assert_no_system_inputs(self, inputs: list[str]) -> None:
+        # The test's own temp root may sit under /dev/shm (the gate sets TMPDIR there).
+        root = f"{self.root}/"
+        for path in inputs:
+            if path.startswith(root):
+                continue
+            self.assertFalse(path.startswith(("/proc/", "/dev/", "/usr/share/zoneinfo/")), path)
 
     def test_worker_seed_imports_ledger_and_roster_once_and_keeps_replacement_identity(self) -> None:
         _ = self.production("sdlc", "models-unit")
