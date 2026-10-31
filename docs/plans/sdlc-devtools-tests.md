@@ -192,38 +192,19 @@ Dropped 2026-10-30 by its own rule: no module that natedev's condition allows to
 ### Phase 6b — The queue grace reaches child processes in tests  · status: done
 **Depends on:** Phase 6; models' compaction repair 2 checkpoint (met: 99d7b894)
 
-Source: devtools-unit diagnosis, 2026-10-30; models-unit's go, 2026-10-30. `QUEUE_GRACE_SECS = 3.0` (`scripts/agents/codex_mesh.py:306`, used at about line 2978) makes `follow` wait 3 s after each turn. `MeshCommandFixture` patches it to 0.0 in the test process (`scripts/agents/test_codex_mesh.py:831`), but `direct/test_assign_launcher.py` runs codex_mesh as a child process, so the child still waits: 3 s per dispatch. Goal: codex_mesh reads the grace from one env var at use (default 3.0), and `MeshCommandFixture` sets that env var where it patches the constant now. Build on models' checkpoint, which rewrites much of both files; send models the diff for those two files before the merge. The Work Order is written when the hash arrives.
+#### As-built
 
-From Phase 6: the agents.conf parse fix took `direct/test_assign_launcher.py` from 545 s to 300 s (42 tests, natedev, 2026-10-30). 300 s is the before figure for this phase's timing.
-
-**From the Phase 7 plan review (architect, 2026-10-31):** The models dependency is met: 99d7b894 is in this branch through d4749972. Current references: the grace use is at `scripts/agents/codex_mesh.py:3071`, the fixture patch at `scripts/agents/test_codex_mesh.py:927`. Keep the positive-grace tests at `test_codex_mesh.py` lines 10212-10314: an inherited 0 in the environment must not turn off their single-window assertions. Add child-process coverage and a fresh timing baseline for `direct/test_assign_launcher.py`. **Workers:** 1 writer + 1 tester. impl: `scripts/agents/codex_mesh.py`. test: `scripts/agents/test_codex_mesh.py`, `scripts/direct/test_assign_launcher.py`, through the shared fixture environment.
-
-#### Work Order
-
-**Goal:** a codex_mesh child process that a test starts uses the test's queue grace, so `direct/test_assign_launcher.py` no longer waits 3 s after each dispatch, and production keeps its 3 s grace.
-
-**Spec:**
-- `codex_mesh.py` reads the queue grace from the env var `CODEX_MESH_QUEUE_GRACE_SECS` at the point of use (`_more_work_coming`, about line 3071), through one small reader function. Unset or empty gives the default, 3.0, named once in the module where `QUEUE_GRACE_SECS` is now. A value that is not a finite number of 0 or more is an error that names the variable; it never falls back in silence.
-- `QUEUE_GRACE_SECS` stays only as the default's name; no code reads it as the live value, and no second copy of the default exists.
-- `MeshCommandFixture` (`test_codex_mesh.py` about line 927) sets `CODEX_MESH_QUEUE_GRACE_SECS=0` in `os.environ`, through its existing `patch.dict`, where it patches the constant now. A child process the test starts inherits it (`test_assign_launcher.py` passes `os.environ.copy()` at line 133).
-- The positive-grace tests (`test_codex_mesh.py` about lines 10212-10314, `SingleGraceWindow`) keep their single-window assertions. They set their own grace, so the fixture's inherited 0 does not turn them off.
-- New coverage: (a) a child process started under the fixture uses grace 0 (it fails on the old code, where the child uses 3.0); (b) unset gives 3.0; (c) an invalid value is refused with the variable's name.
-- Base: models-unit's F024 checkpoint 3b67af71 (origin/natedev-models) also changes `codex_mesh.py`. Before the checkpoint, the director proves a clean merge of this phase with it (`git merge-tree`) and sends models the diff of the two mesh files.
+- `queue_grace_secs()` in `scripts/agents/codex_mesh.py` reads `CODEX_MESH_QUEUE_GRACE_SECS` at each use in `_more_work_coming`. Unset or empty gives `QUEUE_GRACE_SECS` (3.0), the one default. A value that is not a finite number of 0 or more raises `SystemExit` with the variable's name; it never falls back in silence.
+- `MeshCommandFixture` sets `CODEX_MESH_QUEUE_GRACE_SECS=0` through its `patch.dict` and does not patch the constant. A codex_mesh child process that a test starts inherits the 0.
+- `direct/test_assign_launcher.py` takes 122 s wall, down from 326 s on natedev (43 tests). Production keeps its 3 s grace.
 
 **Files:**
-- `scripts/agents/codex_mesh.py` — the grace reader and its one use
-- `scripts/agents/test_codex_mesh.py` — the fixture's env var, the positive-grace tests, the new reader tests
-- `scripts/direct/test_assign_launcher.py` — the child-process grace test, if it fits there better than in the mesh module
+- `scripts/agents/codex_mesh.py` — `queue_grace_secs()` and its one use
+- `scripts/agents/test_codex_mesh.py` — the fixture's env var; `QueueGraceSettingsTests` (unset, empty, changed and invalid values); `MeshCommandTests.test_child_inherits_zero_queue_grace_without_waiting_for_a_frame`; the positive-grace test in `FollowEventRegressionTests` sets its own 0.05 grace
 
-**Workers:** 1 writer + 1 tester
-- `impl` — `scripts/agents/codex_mesh.py`
-- `test` — `scripts/agents/test_codex_mesh.py` and `scripts/direct/test_assign_launcher.py`, from this Spec alone
+**Gotchas:** a test that needs a positive grace sets the env var itself. Otherwise the fixture's inherited 0 turns the grace off.
 
-**State:** none
-
-**Constraints from prior phases:** Phase 6's agents.conf parse fix took `direct/test_assign_launcher.py` from 545 s to 300 s. The fresh baseline is the same module on 91080cc7, measured by the director before dispatch.
-
-**Acceptance gate:** `python3 -m unittest scripts.agents.test_codex_mesh` and `python3 -m unittest scripts.direct.test_assign_launcher` green from the worktree root, with the new child-process test failing on the old code; `basedpyright` on each slot's files `0 errors, 0 warnings, 0 notes`; the `test_assign_launcher` wall time against the 91080cc7 baseline goes in the checkpoint notice; `git merge-tree` of the phase with 3b67af71 has no conflict.
+**Ruled out:** a fixture patch of the module constant — a child process never sees it.
 
 ### Phase 7 — The assertion guard keeps the branch's own base after a merge of the merge branch  · status: done
 
