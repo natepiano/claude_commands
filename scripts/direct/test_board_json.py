@@ -485,7 +485,9 @@ class BoardJsonTests(unittest.TestCase):
         launch = pane_record.launch("unmarked", "show-id", str(self.root),
                                     {"CLAUDE_CONFIG_DIR": str(self.root / "account")}, ["claude"])
         launch["written_at"] = "2099-01-01T00:00:00+00:00"
-        pane_record.write("agents", launch)
+        # Replace the fixture's earlier staff-bound launch; write() would
+        # correctly retain that conversation's STAFF_ID in the new launch.
+        pane_record.save("agents", {launch["pane_id"]: launch})
 
         response, documents = self.generate("--session", "show-id")
 
