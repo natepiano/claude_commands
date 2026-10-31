@@ -32,11 +32,15 @@ from types import FrameType
 from typing import TYPE_CHECKING, IO, Literal, NamedTuple, NoReturn, NotRequired, TypedDict, cast, override
 
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 if TYPE_CHECKING:
     from scripts.lib import process_group
 else:
-    import process_group
+    process_group_path = Path(__file__).resolve().parents[1] / "lib" / "process_group.py"
+    process_group_spec = importlib.util.spec_from_file_location("_hana_shot_process_group", process_group_path)
+    if process_group_spec is None or process_group_spec.loader is None:
+        raise ImportError(f"cannot load process group helper at {process_group_path}")
+    process_group = importlib.util.module_from_spec(process_group_spec)
+    process_group_spec.loader.exec_module(process_group)
 
 REFUSED_PORT = 15702
 HOST = "127.0.0.1"

@@ -63,7 +63,7 @@ class StaffTests(StaffTestCase):
             with self.subTest(prefix=prefix, slot=slot):
                 result = subprocess.run(["bash", str(CHECKOUT / "scripts/direct/worker_name.sh"),
                                          str(self.root), slot, "impl", prefix],
-                                        capture_output=True, text=True, check=True, timeout=PROCESS_TIMEOUT)
+                                        capture_output=True, text=True, check=True, timeout=TEST_HANG_GUARD_SECS)
                 name = result.stdout.strip()
                 _ = staff.WorkerName.parse(name)
                 row = staff.ensure_worker(name, unit.id)
