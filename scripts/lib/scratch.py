@@ -67,7 +67,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.user_zone import user_zone  # noqa: E402
@@ -354,7 +354,7 @@ def busy_locks(path: Path, *, create: bool) -> Generator[bool]:
 def hand_over(path: Path, owner: str, task: str, *, run_dir: str = "", land_target: str = "") -> None:
     if not WORD.fullmatch(owner):
         raise ScratchError(f"{owner!r}: invalid owner unit")
-    _ = checked_task(task, False)
+    validate_phase_task(checked_task(task, False))
 
     def transferred(record: Registered | NotRegistered | UnreadableRecord) -> dict[str, object]:
         if not isinstance(record, Registered):
@@ -486,9 +486,58 @@ def checked_task(task: str, visible: bool) -> re.Match[str]:
     return match
 
 
+def registered_plan(unit: str) -> Path:
+    """Resolve the plan from the unit's staff parent and production record."""
+    from scripts.direct import phase_table
+    from scripts.production import proposals_table, staff, unit_lookup
+    if TYPE_CHECKING:
+        from scripts.production.production_units import Refusal
+    else:
+        from production_units import Refusal
+
+    try:
+        parent = unit_lookup.unit_parent(unit, record=staff.snapshot())
+        value = cast(object, json.loads(phase_table.show_production(Path(parent.doc))))
+    except (OSError, UnicodeError, ValueError, Refusal) as error:
+        raise ScratchError(f"{unit}: cannot resolve registered plan: {error}") from error
+    if not isinstance(value, dict):
+        raise ScratchError(f"{unit}: production plan records are not an object")
+    records = cast(dict[str, object], value)
+    plans = proposals_table.unit_plan_paths(records)
+    if unit not in plans:
+        record = records.get(unit)
+        cause = cast(dict[str, object], record).get("unavailable") if isinstance(record, dict) else None
+        raise ScratchError(f"{unit}: no registered plan in production {parent.doc}: "
+                           + (str(cause) if cause else "no Units row or plan"))
+    return plans[unit]
+
+
+def validate_phase_task(match: re.Match[str]) -> None:
+    """Validate a new phase assignment, without restricting legacy task cleanup."""
+    if match["kind"] != "phase":
+        return
+    from scripts.direct import plan_history
+
+    unit, separator, phase = match["name"].partition("/")
+    hint = "use a phase id from the unit's plan, gate:<id> or --until <when>"
+    if not separator or not phase:
+        raise ScratchError(f"{match[0]!r}: a phase task needs phase:<unit>/<phase>; {hint}")
+    try:
+        plan = registered_plan(unit)
+    except ScratchError as error:
+        raise ScratchError(f"{match[0]!r}: {error}; {hint}") from error
+    try:
+        phases = plan_history.plan_phases(plan)
+    except (OSError, UnicodeError) as error:
+        raise ScratchError(f"{unit}: cannot read registered plan {plan}: {error}; {hint}") from error
+    if not any(row["id"] == phase for row in phases):
+        raise ScratchError(f"{match[0]!r}: phase {phase!r} is not in registered plan {plan}; {hint}")
+
+
 def target(task: str, word: str, visible: bool) -> Path:
     """The new folder's path for the task; never one that exists."""
     match = checked_task(task, visible)
+    validate_phase_task(match)
     if word and not WORD.fullmatch(word):
         raise ScratchError(f"{word!r}: a name is letters, digits, - and _")
     if visible:
