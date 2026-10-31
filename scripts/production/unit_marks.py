@@ -16,7 +16,7 @@ from scripts.production.showrunners import canonical_slug
 from sessions import SessionRecord
 from place import HerdrPlace
 from pane_launch import RecordedLabels
-from production_units import Refusal as ProductionDocRefusal, cell_value, unit_table
+from scripts.production.session_labels import StaffLabels, showrunner_owner
 import unit_names
 if TYPE_CHECKING:
     from scripts.shutdown import pane_record
@@ -123,7 +123,7 @@ class MemberSources:
         if staff_id:
             row = record.by_id(staff.StaffId(staff_id))
             return MemberFound(row) if row is not None and row.kind == "showrunner" else NoSuchMember(selector)
-        row = record.by_path(showrunners.space_from_text(selector.slug, source.document))
+        row = showrunner_owner(record, selector.slug, source.document)
         return MemberFound(row) if row is not None and row.kind == "showrunner" else NoSuchMember(selector)
 
     def showrunner_members(self, record: staff.StaffSnapshot) -> dict[str, staff.StaffRow]:
@@ -279,7 +279,9 @@ def session_unit_marks(
     directors: dict[str, str] = {}
     known = {session["sessionId"] for session in records}
     proc = Path(environment.get("HERDR_PROC", "/proc"))
-    labels = RecordedLabels()
+    record = record if record is not None else staff.snapshot()
+    sources = member_sources()
+    labels = RecordedLabels(StaffLabels(record, sources.productions, sources.showrunner_members(record)))
     for session in records:
         try:
             # Herdr's Linux environment reader is private; keep this PID-only IO here.
@@ -292,9 +294,8 @@ def session_unit_marks(
         if owner in known and owner != session["sessionId"]:
             directors[session["sessionId"]] = owner
             continue
-        import herdr
-
-        values = labels.resolve(session["pid"], values, lambda: herdr.herdr_place_of(session["pid"]))
+        values = labels.resolve(session["pid"], values,
+            lambda: HerdrPlace(values.get("HERDR_SESSION", ""), values.get("HERDR_PANE_ID", "")))
         slug = values.get(PRODUCTION_MARK, "")
         unit = values.get(UNIT_MARK, "")
         staff_id = values.get("STAFF_ID", "")
@@ -306,7 +307,7 @@ def session_unit_marks(
                 staff_id=staff_id,
             )
             marked.append((slug, unit_mark))
-    return group_marked_units(marked, record=record), directors
+    return group_marked_units(marked, record=record, sources=sources), directors
 
 
 @dataclass(frozen=True)
@@ -321,47 +322,9 @@ class LaunchMembership:
         return cls(staff.snapshot(), member_sources())
 
     def environment(self, launch: pane_record.PaneLaunch, *, live_name: str = "") -> dict[str, str]:
-        environment = dict(launch["environment"])
-        identity = environment.get("STAFF_ID", "")
-        row = self.record.by_id(staff.StaffId(identity)) if identity else None
-        if identity and row is None:
-            return environment  # A missing owner id is never permission to reuse its name.
-        unit = environment.get("SHOWRUNNER_UNIT_ID", "")
-        production = environment.get("SHOWRUNNER_UNIT", "")
-        for slug, source in self.sources.productions.items():
-            if row is None and source.timer.target == f"session:{launch['session_id']}":
-                found = self.sources.member(ShowrunnerMember(slug), self.record)
-                if isinstance(found, MemberFound):
-                    row = found.row
-                    break
-        if row is None and unit and production:
-            found = self.sources.member(UnitMember(production, unit), self.record)
-            if isinstance(found, MemberFound):
-                row = found.row
-        if row is None and (unit or live_name):
-            found = unit_match(ObservedUnit(unit or live_name), self.record)
-            if isinstance(found, MemberFound):
-                row = found.row
-        if row is not None:
-            environment["STAFF_ID"] = row.id
-            if row.kind == "showrunner":
-                _ = environment.pop("SHOWRUNNER_UNIT", None)
-                _ = environment.pop("SHOWRUNNER_UNIT_ID", None)
-            elif row.kind == "unit":
-                parents = self.sources.showrunner_members(self.record)
-                slugs = [slug for slug, parent in parents.items() if parent.id == row.parent]
-                if len(slugs) == 1:
-                    environment["SHOWRUNNER_UNIT"] = slugs[0]
-                    source = self.sources.productions[slugs[0]]
-                    try:
-                        rows = unit_table(source.document.splitlines())
-                    except ProductionDocRefusal:
-                        return environment  # No declared id: retain the conversation's existing one.
-                    identifiers = [cell_value(cells["Unit"]) for cells in rows
-                                   if "Unit" in cells and unit_names.name(cell_value(cells["Unit"])) == row.name]
-                    if len(identifiers) == 1:
-                        environment["SHOWRUNNER_UNIT_ID"] = identifiers[0]
-        return environment
+        return StaffLabels(self.record, self.sources.productions,
+                           self.sources.showrunner_members(self.record)).environment(
+                               launch["environment"], launch["session_id"], live_name or launch["name"])
 
 
 def record_membership(launch: pane_record.PaneLaunch) -> pane_record.PaneLaunch:
@@ -393,8 +356,34 @@ def repair_marks() -> list[RepairedSessionLabels]:
     history = pane_record.launches()
     newest = {entry["session_id"]: entry["written_at"]
               for entry in sorted(history, key=lambda item: item["written_at"])}
-    running = {entry["sessionId"]: entry["name"] for entry in sessions.running_sessions()}
+    live = sessions.running_sessions()
+    running = {entry["sessionId"]: entry["name"] for entry in live}
     repaired: list[RepairedSessionLabels] = []
+    if live:
+        import herdr
+
+        by_pid = {entry["pid"]: entry for entry in live}
+        seen: set[str] = set()
+        for process in herdr.herdr_processes():
+            session = by_pid.get(process.pid)
+            if session is None or session["sessionId"] in seen:
+                continue
+            seen.add(session["sessionId"])
+            if pane_record.matching_launch(process.place, session["sessionId"]) is not None:
+                continue
+            try:
+                entry = pane_record.running_launch(session, process.place, process.cwd)
+            except (OSError, ValueError):
+                continue
+            entry["environment"] = membership.environment(entry, live_name=session["name"])
+            if not entry["environment"].get("STAFF_ID"):
+                continue
+            pane_record.write(process.place.session, entry)
+            newest[entry["session_id"]] = entry["written_at"]
+            repaired.append(RepairedSessionLabels(
+                f"{process.place.session}:{process.place.pane}:{entry['session_id']}",
+                tuple((key, value) for key, value in sorted(entry["environment"].items())
+                      if key in herdr.MEMBER_MARKS), ()))
     for path in sorted(pane_record.record_directory().glob("*.json")):
         with pane_record.locked(path.stem):
             entries = pane_record.read_strict(path.stem)
