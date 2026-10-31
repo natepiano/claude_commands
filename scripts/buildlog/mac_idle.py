@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from ..notify import push_texts
     from ..notify.push_catalog import mac_idle_reservation
     from . import mac_idle_alert
+    from ..lib.process_failure import failure_detail
     from ..lib.user_zone import user_zone
     from ..message.unit_labels import unit_labels_for
 else:
@@ -36,6 +37,7 @@ else:
     import push_texts
     from scripts.notify.push_catalog import mac_idle_reservation
     from scripts.buildlog import mac_idle_alert
+    from scripts.lib.process_failure import failure_detail
     from scripts.lib.user_zone import user_zone
     from scripts.message.unit_labels import unit_labels_for
 
@@ -277,7 +279,7 @@ def notify_showrunner(text: str, *, identity: OutageMessage | RepairMessage = RE
         sent = subprocess.run(command, capture_output=True, text=True, timeout=45, check=False)
         if sent.returncode != push_texts.SEND_RETRY_EXIT and sent.returncode in (0, 1):
             return True
-        reason = sent.stderr.strip() or sent.stdout.strip() or f"exit {sent.returncode}"
+        reason = failure_detail(sent)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         reason = str(error)
     print(f"Mac idle watch: showrunner message failed: {mac_idle_alert.display_field(reason)}", file=sys.stderr)
@@ -386,7 +388,7 @@ def push_outage(saved: mac_idle_alert.SavedAlert, now: float) -> bool:
         sent = subprocess.run(command, capture_output=True, text=True, timeout=settings.send_timeout_s, check=False)
         if sent.returncode != push_texts.SEND_RETRY_EXIT and sent.returncode == 0:
             return True
-        reason = sent.stderr.strip() or sent.stdout.strip() or f"exit {sent.returncode}"
+        reason = failure_detail(sent)
     except (OSError, subprocess.SubprocessError) as error:
         reason = str(error)
     print(f"Mac idle watch: phone push failed: {mac_idle_alert.display_field(reason)}", file=sys.stderr)
