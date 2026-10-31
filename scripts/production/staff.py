@@ -22,6 +22,7 @@ from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib import atomic_file  # noqa: E402
+from scripts.production import unit_names  # noqa: E402
 from scripts.shutdown import remote  # noqa: E402
 
 OWNER_MACHINE = "natedev"
@@ -467,6 +468,15 @@ def find(*, kind: Kind | None = None, parent: StaffId | None = None) -> list[Sta
     return snapshot().find(kind=kind, parent=parent)
 
 
+def unit_name_collisions(record: StaffSnapshot) -> dict[str, tuple[StaffRow, ...]]:
+    """Discover legacy duplicate unit names without making the record unreadable."""
+    grouped: dict[str, list[StaffRow]] = {}
+    for row in record.find(kind="unit"):
+        grouped.setdefault(unit_names.name_key(row.name), []).append(row)
+    return {name: tuple(sorted(members, key=lambda row: row.id))
+            for name, members in sorted(grouped.items()) if len(members) > 1}
+
+
 def _store(rows: list[StaffRow], pending: set[StaffId]) -> None:
     document: dict[str, object] = {"schema": 1, "rows": [row.to_json() for row in rows]}
     if pending:
@@ -489,6 +499,10 @@ def _record_transaction(edit: Callable[[list[StaffRow], set[StaffId]], _Result])
             pending = set(original.pending_retire)
             result = edit(proposed, pending)
             _validate(proposed)
+            original_units = {row.id: unit_names.name_key(row.name) for row in original.rows if row.kind == "unit"}
+            for name, members in unit_name_collisions(StaffSnapshot(tuple(proposed))).items():
+                if any(original_units.get(row.id) != name for row in members):
+                    raise StaffRefused(f"unit name already exists: {name}")
             proposed.sort(key=lambda row: row.id)
             if proposed == list(original.rows) and pending == set(original.pending_retire):
                 # A prior replace may have succeeded before its folder sync failed.
@@ -740,6 +754,8 @@ def _parser() -> argparse.ArgumentParser:
     _ = show.add_argument("--kind", choices=_KINDS)
     _ = show.add_argument("--under", help="parent staff id or path")
     _ = show.add_argument("--snapshot", action="store_true", help=argparse.SUPPRESS)
+    collisions = verbs.add_parser("unit-name-collisions", help="discover duplicate unit short names without writing")
+    _ = collisions.add_argument("--dry-run", action="store_true", required=True)
     get = verbs.add_parser("get", help="find a member by id or path")
     _ = get.add_argument("target")
     add = verbs.add_parser("ensure", help=argparse.SUPPRESS)
@@ -759,7 +775,7 @@ def _parser() -> argparse.ArgumentParser:
     defer_parser = verbs.add_parser("defer-retire", help=argparse.SUPPRESS)
     _ = defer_parser.add_argument("ids", nargs="*")
     pending_parser = verbs.add_parser("retire-pending", help=argparse.SUPPRESS)
-    for verb in (show, get, add, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
+    for verb in (show, collisions, get, add, rename_parser, move_parser, retire_parser, apply_parser, defer_parser, pending_parser):
         _ = verb.add_argument("--json", action="store_true")
     return parser
 
@@ -790,6 +806,19 @@ def _mutate(arguments: _Arguments) -> StaffRow | StaffSnapshot | tuple[StaffId, 
 
 
 def _main(arguments: _Arguments) -> int:
+    if arguments.verb == "unit-name-collisions":
+        record = snapshot()
+        collisions = unit_name_collisions(record)
+        if arguments.json:
+            print(json.dumps({name: [row.to_json() for row in members]
+                              for name, members in collisions.items()}, sort_keys=True))
+        else:
+            paths = _paths(list(record.rows))
+            for name, members in collisions.items():
+                print(f"collision {name}: " + ", ".join(f"{paths[row.id]} ({row.id})" for row in members))
+            if not collisions:
+                print("no unit name collisions")
+        return 0
     if arguments.verb == "move":
         if arguments.destination is not None:
             if arguments.parent is not None:

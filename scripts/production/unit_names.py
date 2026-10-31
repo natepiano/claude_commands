@@ -1,4 +1,4 @@
-"""The one naming rule for a production unit: its id, stem, branch and worktree.
+"""The one naming rule for a production unit: its id, short name, branch and worktree.
 
 `add_unit.py` names a new unit with it, and both renames name the destination with it, so a
 unit created, renamed or moved with its production always gets the same names.
@@ -19,7 +19,7 @@ def name(given: str) -> str:
     """The unit's name without its `-unit` suffix; a given id is not suffixed twice."""
     if not NAME.fullmatch(given):
         raise BadName("name must contain only letters, numbers, hyphens, or underscores")
-    return given[: -len("-unit")] if given.replace("_", "-").endswith("-unit") else given
+    return given[: -len("-unit")] if name_key(given).endswith("-unit") else given
 
 
 def unit_id(given: str) -> str:
@@ -27,19 +27,19 @@ def unit_id(given: str) -> str:
 
 
 def stem(unit: str) -> str:
-    """The branch and worktree stem of a unit id: its name with underscores as hyphens."""
-    return unit.removesuffix("-unit").replace("_", "-")
+    """The short name of a unit id, preserved verbatim for its branch and folder."""
+    return unit.removesuffix("-unit")
 
 
-def branch(slug: str, unit_stem: str) -> str:
-    """The slug names the branch, as it names the production; the merge branch may differ."""
-    return unit_stem if unit_stem.startswith(f"{slug}-") else f"{slug}-{unit_stem}"
+def branch(unit_stem: str) -> str:
+    """The globally unique short name; the production does not prefix it."""
+    return unit_stem
 
 
-def worktree(checkout: Path, unit_stem: str) -> Path:
-    return checkout.parent / branch(checkout.name.removesuffix("-trunk"), unit_stem)
+def worktree(unit_stem: str) -> Path:
+    return Path.home() / "worktrees" / unit_stem
 
 
-def swap_stem(value: str, old_stem: str, new_stem: str) -> str | None:
-    """A branch or worktree name with its trailing `-<old stem>` replaced, or None without one."""
-    return value[: -len(old_stem)] + new_stem if value.endswith(f"-{old_stem}") else None
+def name_key(short_name: str) -> str:
+    """Treat underscores and hyphens as one spelling without changing stored names."""
+    return short_name.replace("_", "-")

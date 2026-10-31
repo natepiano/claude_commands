@@ -4,7 +4,8 @@
 Usage: rename_unit.py plan|apply|verify <slug> <old> <new> [--scratch <showrunner state directory>]
 
 `<old>` is the unit's Units id, or its stem; `<new>` takes an id or a stem and becomes
-`<stem>-unit`, as add_unit names a unit. apply saves the request before it changes anything, pauses
+`<stem>-unit`, on branch `<stem>` in `~/worktrees/<stem>`. A same-name request repairs
+only mismatched names and paths; an already matching unit stays unchanged. apply saves the request before it changes anything, pauses
 the unit and its Codex workers through the shutdown path (`down`, then `now`), stops its runs'
 app-servers and keeps each paused worker's detached runs (it refuses while one works inside the
 worktree), merges the merge branch into the unit, moves the branch and
@@ -149,13 +150,19 @@ class UnitRename:
     kept: str = ""
     # The Claude session's name before the rename, which verify finds nowhere live afterwards.
     old_session: str = ""
-    # The id already is the new one, so only the session takes the new name: stop, record, relaunch, verify.
+    # The id already matches; branch, worktree, tab and session may still need repair.
     id_matches: bool = False
     staff_id: staff.StaffId | UnboundStaffMember = field(default_factory=UnboundStaffMember)
 
     @property
     def message(self) -> str:
+        if self.id_matches:
+            return f"chore({self.slug}): repair unit {self.new} names"
         return f"chore({self.slug}): rename unit {self.old} to {self.new}"
+
+    @property
+    def moves_git(self) -> bool:
+        return self.old_branch != self.new_branch or self.old_worktree != self.new_worktree
 
     def worktree(self) -> Path:
         """Where the unit's worktree is now: the git step moves it."""
@@ -166,14 +173,12 @@ REQUIRED = tuple(field.name for field in dataclasses.fields(UnitRename) if field
 LOCATION_FIELDS = ("doc", "checkout")
 
 
-def _swap(value: str, old_stem: str, new_stem: str, what: str) -> str:
-    swapped = unit_names.swap_stem(value, old_stem, new_stem)
-    if swapped is None:
-        raise RenameRefused(f"{what} {value} does not end with -{old_stem}")
-    return swapped
-
-
 def _production(slug: str) -> Production:
+    members = staff_sources.showrunner_members(staff.snapshot())
+    named = [current for current, row in members.items() if row.name == slug]
+    if len(named) > 1:
+        raise RenameRefused(f"{slug}: staff showrunner has more than one production")
+    slug = named[0] if named else showrunners.canonical_slug(slug)
     instance = showrunners.NOTIFIER_STATE_DIR / f"showrunner-{slug}"
     checked = showrunners.checked_doc(instance)
     if isinstance(checked, showrunners.NoCheckedDoc):
@@ -195,6 +200,7 @@ def _ids(old: str, new: str, units: list[str]) -> tuple[str, str]:
 
 def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     production = _production(slug)
+    slug = production.slug
     rows = _rows(production.doc)
     units = [production_units.cell_value(row.get("Unit", "")) for row in rows]
     given = old
@@ -206,8 +212,6 @@ def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
         raise RenameRefused(f"{' and '.join(sorted(RESERVED & {old, new}))} is known to code and keeps its name")
     id_matches = old == new
     old_session = _session_name(slug, old)
-    if id_matches and old_session in ("", unit_names.stem(new)):
-        raise RenameRefused(f"{old} already has that name")
     if new in units and not id_matches:
         raise RenameRefused(f"{new} is already in the Units table")
     matching = [row for row, unit in zip(rows, units, strict=True) if unit == old]
@@ -216,30 +220,31 @@ def _build(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
     row = matching[0]
     if production_units.plan_cell_is_retired(row.get("Plan", "")):
         raise RenameRefused(f"{old} is retired; its row is history")
-    old_branch = production_units.cell_value(row.get("Branch", ""))
+    recorded_branch = production_units.cell_value(row.get("Branch", ""))
     worktree = Path(production_units.cell_value(row.get("Worktree", ""))).expanduser()
-    old_stem, new_stem = unit_names.stem(old), unit_names.stem(new)
-    if new_stem == old_branch:
-        new_branch = old_branch
-    elif old_branch == unit_names.branch(slug, old_stem):
-        new_branch = unit_names.branch(slug, new_stem)
-    else:
-        new_branch = _swap(old_branch, old_stem, new_stem, "branch")
-    if new_stem == worktree.name:
-        new_worktree = worktree
-    elif worktree.name == unit_names.worktree(production.checkout, old_stem).name:
-        new_worktree = worktree.with_name(unit_names.worktree(production.checkout, new_stem).name)
-    else:
-        new_worktree = worktree.with_name(_swap(worktree.name, old_stem, new_stem, "worktree"))
+    new_stem = unit_names.stem(new)
+    new_branch = unit_names.branch(new_stem)
+    new_worktree = unit_names.worktree(new_stem)
+    if id_matches and (new_worktree / ".git").is_file():
+        worktree = new_worktree
     if not (worktree / ".git").is_file():
         # A Mac unit's worktree is on the Mac: version one renames natedev units only.
         raise RenameRefused(f"{old}: no linked worktree at {worktree} on this machine; a Mac unit is not renamed")
-    if git(worktree, "branch", "--show-current") != old_branch:
-        raise RenameRefused(f"{worktree} is not on {old_branch}")
-    return UnitRename(slug, old, new, str(production.doc), str(production.checkout), production.merge_branch,
+    old_branch = git(worktree, "branch", "--show-current")
+    if old_branch != recorded_branch and not id_matches:
+        raise RenameRefused(f"{worktree} is not on {recorded_branch}")
+    if not old_branch:
+        raise RenameRefused(f"{worktree} is not on a branch")
+    rename = UnitRename(slug, old, new, str(production.doc), str(production.checkout), production.merge_branch,
                       old_branch, new_branch, str(worktree), str(new_worktree),
                       git(worktree, "rev-parse", "HEAD"), str(scratch), old_session=old_session,
                       id_matches=id_matches)
+    doc_text = production.doc.read_text(encoding="utf-8")
+    if (id_matches and old_branch == new_branch and worktree == new_worktree
+            and old_session in ("", new_stem) and not _tab_failures(rename)
+            and _doc_text(rename, doc_text) == doc_text):
+        rename.step = len(STEPS)
+    return rename
 
 
 def _staff_id(slug: str, unit: str) -> staff.StaffId:
@@ -392,10 +397,15 @@ def _own_doc_edits(rename: UnitRename) -> bool:
 def _preflight(rename: UnitRename) -> None:
     """The read-only refusals of a fresh rename; a resumed one accepts what its own steps made."""
     checkout = Path(rename.checkout)
-    _check_checkout(rename)
-    if rename.id_matches:
-        check_stoppable(rename)
+    if rename.step == len(STEPS):
         return
+    _check_checkout(rename)
+    if not rename.id_matches:
+        record = staff.snapshot()
+        key = unit_names.name_key(unit_names.name(rename.new))
+        if key != unit_names.name_key(unit_names.name(rename.old)) and any(
+                unit_names.name_key(row.name) == key for row in record.find(kind="unit")):
+            raise staff.StaffRefused(f"unit name already exists: {key}")
     if rename.old_branch != rename.new_branch and (unit_move.branch_tip(checkout, rename.new_branch)
                                                   or unit_move.remote_tip(checkout, rename.new_branch)):
         raise RenameRefused(f"branch {rename.new_branch} already exists")
@@ -403,7 +413,7 @@ def _preflight(rename: UnitRename) -> None:
         raise RenameRefused(f"destination already exists: {rename.new_worktree}")
     if rename_state.unfinished(rename_state.production_journal(rename.slug)):
         raise RenameRefused(f"{rename.slug}: finish the production rename first")
-    if _is_style(rename):
+    if not rename.id_matches and _is_style(rename):
         try:
             with style_ledger.preview_ledger(_style_repository(rename)) as ledger:
                 _ = ledger.rename_unit(rename.old, rename.new)
@@ -526,6 +536,7 @@ def _move_git(rename: UnitRename, _save: Callable[[], None]) -> None:
     if rename.old_branch != rename.new_branch:
         unit_move.push_branch(checkout, rename.old_branch, rename.new_branch, rename.merged)
     if rename.old_worktree != rename.new_worktree:
+        Path(rename.new_worktree).parent.mkdir(parents=True, exist_ok=True)
         unit_move.move_worktree(checkout, rename.old_branch, rename.new_branch, Path(rename.old_worktree),
                                 Path(rename.new_worktree), rename.merged)
     elif rename.old_branch != rename.new_branch:
@@ -588,7 +599,7 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
         design_roles.rename_holder(rename.slug, rename.old, rename.new, rename.old_worktree, rename.new_worktree)
     except (OSError, ValueError, SystemExit) as error:
         raise RenameRefused(str(error)) from error
-    if _is_style(rename):
+    if not rename.id_matches and _is_style(rename):
         try:
             with style_ledger.open_ledger(_style_repository(rename)) as ledger:
                 _ = ledger.rename_unit(rename.old, rename.new)
@@ -596,7 +607,10 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
             raise RenameRefused(str(error)) from error
     # Free text in the live lists names the branch and the worktree too.
     paths = ((rename.old_branch, rename.new_branch), (rename.old_worktree, rename.new_worktree))
-    _ = rename_state.rename_scratch(rename.old, rename.new, Path(rename.scratch), paths)
+    if rename.id_matches:
+        _ = rename_state.reword_showrunner_lists(Path(rename.scratch) / "showrunner_state.json", paths)
+    else:
+        _ = rename_state.rename_scratch(rename.old, rename.new, Path(rename.scratch), paths)
     _ = rename_state.rename_outstanding(rename.slug, ((rename.old, rename.new), *paths))
     # Other productions' showrunners, such as the parent, can have the unit in their lists too.
     reworded, _ = _other_showrunner_states(rename)
@@ -605,21 +619,24 @@ def _move_state(rename: UnitRename, _save: Callable[[], None]) -> None:
         _ = rename_state.rename_outstanding(path.parent.parent.name, ((rename.old, rename.new), *paths))
     # The relaunched unit records its new pane at SessionStart; its old pane's entry would resume the old name.
     _ = pane_record.forget_unit(rename.old)
-    unit_move.move(PathMove(stall_watch.stretch_path(rename.slug, rename.old),
-                            stall_watch.stretch_path(rename.slug, rename.new)))
-    try:
-        _ = review_pool.rename_unit(rename.slug, rename.old, rename.new)
-    except review_pool.PoolError as error:
-        raise RenameRefused(str(error)) from error
+    if not rename.id_matches:
+        unit_move.move(PathMove(stall_watch.stretch_path(rename.slug, rename.old),
+                                stall_watch.stretch_path(rename.slug, rename.new)))
+    if not rename.id_matches:
+        try:
+            _ = review_pool.rename_unit(rename.slug, rename.old, rename.new)
+        except review_pool.PoolError as error:
+            raise RenameRefused(str(error)) from error
     old, new = Path(rename.old_worktree), Path(rename.new_worktree)
     run = unit_move.newest_run(old) or unit_move.newest_run(new)
     if run is not None:
         unit_move.move_run(run, old, new, rename.new_branch)
-    today = datetime.now(user_zone()).date()
-    for issue in _unit_proposals(rename, rename.old):
-        _ = proposal_issue.edit(issue.path, {"unit": rename.new}, today)
-    identity = phase_table.production_identity(read_production(Path(rename.doc)))
-    _ = phase_table.rename_unit(identity, rename.old, rename.new)
+    if not rename.id_matches:
+        today = datetime.now(user_zone()).date()
+        for issue in _unit_proposals(rename, rename.old):
+            _ = proposal_issue.edit(issue.path, {"unit": rename.new}, today)
+        identity = phase_table.production_identity(read_production(Path(rename.doc)))
+        _ = phase_table.rename_unit(identity, rename.old, rename.new)
 
 
 def _other_showrunner_states(rename: UnitRename) -> tuple[list[Path], list[Path]]:
@@ -874,10 +891,10 @@ def _host_names(rename: UnitRename) -> dict[str, str]:
     import herdr
 
     new_stem = unit_names.stem(rename.new)
-    olds = [unit_names.stem(rename.old), *([rename.old_session] if rename.old_session else [])]
-    return {herdr.generated_session_name(old_form): herdr.generated_session_name(new_form)
-            for old in olds for old_form, new_form in (
-                (old, new_stem), (unit_names.branch(rename.slug, old), unit_names.branch(rename.slug, new_stem)))}
+    olds = {unit_names.stem(rename.old), rename.old_branch,
+            *([rename.old_session] if rename.old_session else [])}
+    return {herdr.generated_session_name(old_form): herdr.generated_session_name(new_stem)
+            for old in olds for old_form in (old, f"{rename.slug}-{old}")}
 
 
 def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
@@ -952,7 +969,7 @@ def _git_failures(rename: UnitRename) -> list[str]:
     if rename.old_branch != rename.new_branch and (unit_move.branch_tip(checkout, rename.old_branch)
                                                   or unit_move.remote_tip(checkout, rename.old_branch)):
         failures.append(f"git: branch {rename.old_branch} still exists")
-    if unit_move.remote_tip(checkout, rename.new_branch) != unit_move.branch_tip(checkout, rename.new_branch):
+    if rename.moves_git and unit_move.remote_tip(checkout, rename.new_branch) != unit_move.branch_tip(checkout, rename.new_branch):
         failures.append(f"git: origin {rename.new_branch} is not at the local tip")
     if old != new and (unit_move.exists(old) or f"worktree {old}" in git(
             checkout, "worktree", "list", "--porcelain").splitlines()):
@@ -995,25 +1012,47 @@ def _doc_failures(rename: UnitRename) -> list[str]:
 def _state_failures(rename: UnitRename) -> list[str]:
     old, new = Path(rename.old_worktree), Path(rename.new_worktree)
     failures = [f"{directory / 'projects'}: transcripts still under {old}" for directory in unit_move.config_dirs()
-                if old != new and (directory / "projects" / unit_move.project_folder(str(old))).exists()]
-    if stall_watch.stretch_path(rename.slug, rename.old).exists():
+                if unit_move.project_folder(str(old)) != unit_move.project_folder(str(new))
+                and (directory / "projects" / unit_move.project_folder(str(old))).exists()]
+    if not rename.id_matches and stall_watch.stretch_path(rename.slug, rename.old).exists():
         failures.append(f"stall-watch: the stretch is still under {rename.old}")
     # Step 7 moves the newest run, the one run_state reads; older runs under the old path are history.
     if unit_move.newest_run(old) is not None and unit_move.newest_run(new) is None:
         failures.append(f"run records: the newest run still names {old}")
-    failures.extend(f"{issue.path}: proposal still names {rename.old}" for issue in _unit_proposals(rename, rename.old))
-    if _is_style(rename):
+    if not rename.id_matches:
+        failures.extend(f"{issue.path}: proposal still names {rename.old}" for issue in _unit_proposals(rename, rename.old))
+    if not rename.id_matches and _is_style(rename):
         with style_ledger.preview_ledger(_style_repository(rename)) as ledger:
             if ledger.ticket_open(rename.old) or ledger.queued_tickets(rename.old):
                 failures.append(f"style ledger: current tickets still name {rename.old}")
             if any(wait.unit == rename.old for wait in ledger.sync_waits()):
                 failures.append(f"style ledger: sync wait still names {rename.old}")
     identity = phase_table.production_identity(read_production(Path(rename.doc)))
-    failures.extend(f"{note}: phase note still names {rename.old}"
-                    for note in phase_table.owned_notes(identity, rename.old))
+    if not rename.id_matches:
+        failures.extend(f"{note}: phase note still names {rename.old}"
+                        for note in phase_table.owned_notes(identity, rename.old))
     from scripts.astra import design_roles
-    failures.extend(design_roles.rename_failures(rename.slug, rename.old, rename.old_worktree))
+    if not rename.id_matches:
+        failures.extend(design_roles.rename_failures(rename.slug, rename.old, rename.old_worktree))
     return failures
+
+
+def _tab_failures(rename: UnitRename) -> list[str]:
+    """The unit's own tab label agrees with its short name, including a same-name repair."""
+    import herdr
+
+    found = unit_lookup.marked_unit(rename.slug, rename.new)
+    expected = unit_names.stem(rename.new)
+    if found is None:
+        return [f"{rename.new}'s recorded host is named {host['session_name']}, not {expected}"
+                for saved in shutdown_records(rename.slug, (rename.new,))
+                if (host := saved["session"]["host"])["kind"] == "unit" and host["session_name"] != expected]
+    try:
+        panes = herdr.Herdr(found.place.session).panes()
+    except (herdr.HerdrFailure, OSError) as error:
+        return [f"herdr {found.place.session}: pane labels could not be read: {error}"]
+    return [f"{rename.new}'s tab is labelled {pane.get('label')}, not {expected}"
+            for pane in panes if pane["pane_id"] == found.place.pane and pane.get("label") != expected]
 
 
 def _session_failures(rename: UnitRename) -> list[str]:
@@ -1076,14 +1115,14 @@ def _sweep_roots(rename: UnitRename) -> unit_rename_sweep.Roots:
 
 def verify_failures(rename: UnitRename) -> list[str]:
     """Every live place holds the new names, and no unclassified file holds an old one."""
-    if rename.id_matches:
-        return _session_failures(rename)
     try:
+        old_names = tuple(old for old, new in (
+            (rename.old, rename.new), (rename.old_branch, rename.new_branch),
+            (rename.old_worktree, rename.new_worktree)) if old != new)
         return [*_doc_failures(rename), *_git_failures(rename), *_process_failures(rename), *_state_failures(rename),
-                *_session_failures(rename), *_control_failures(rename),
-                *unit_rename_sweep.sweep(tuple(old for old, new in (
-                    (rename.old, rename.new), (rename.old_branch, rename.new_branch),
-                    (rename.old_worktree, rename.new_worktree)) if old != new), _sweep_roots(rename))]
+                *_session_failures(rename), *_tab_failures(rename),
+                *([] if rename.id_matches else _control_failures(rename)),
+                *(unit_rename_sweep.sweep(old_names, _sweep_roots(rename)) if old_names else [])]
     except (shutdown_record.InvalidRecord, production_units.Refusal, style_ledger.LedgerError) as error:
         raise RenameRefused(f"verify could not read a place: {error}") from error
 
@@ -1127,6 +1166,12 @@ def _describe_claude(_: UnitRename) -> str:
 
 
 def _describe_doc(r: UnitRename) -> str:
+    if r.id_matches:
+        row = next(row for row in _rows(Path(r.doc)) if production_units.cell_value(row.get("Unit", "")) == r.old)
+        changes = [f"{column} {previous} -> {expected}" for column, expected in
+                   (("Branch", r.new_branch), ("Worktree", r.new_worktree))
+                   if (previous := production_units.cell_value(row.get(column, ""))) != expected]
+        return f"{r.merge_branch}: commit Units row repairs: {'; '.join(changes)}"
     return f"{r.merge_branch}: commit {r.message!r} (Units row, Hub files and open Gates unit cells, plan headers)"
 
 
@@ -1135,6 +1180,10 @@ def _describe_merge_rename(r: UnitRename) -> str:
 
 
 def _describe_state(r: UnitRename) -> str:
+    if r.id_matches:
+        changes = [f"{old} -> {new}" for old, new in
+                   ((r.old_branch, r.new_branch), (r.old_worktree, r.new_worktree)) if old != new]
+        return f"state: update branch and worktree references: {'; '.join(changes)}"
     return ("state: report scratch, stall-watch stretch, reviewer leases, run record, open proposals, "
             + f"phase notes: {r.old} -> {r.new}")
 
@@ -1145,19 +1194,27 @@ def _describe_retire(r: UnitRename) -> str:
 
 
 def _describe_record(r: UnitRename) -> str:
-    session = (f"Claude session {r.old_session} -> {unit_names.stem(r.new)}" if r.old_session
-               else "no Claude session to name")
+    session = (f"Claude session {r.old_session} -> {unit_names.stem(r.new)}"
+               if r.old_session and r.old_session != unit_names.stem(r.new)
+               else "Claude session already matches" if r.old_session else "no Claude session to name")
     if r.id_matches:
-        return f"shutdown record: {session}"
+        if not r.old_session and not shutdown_records(r.slug, (r.old,)):
+            return "already matches: no shutdown record to update"
+        paths = f"; paths {r.old_worktree} -> {r.new_worktree}" if r.old_worktree != r.new_worktree else ""
+        return f"shutdown record: {session}{paths}"
     return (f"shutdown record: unit {r.old} -> {r.new}, {session}, and the paths under its worktree, "
             + "each paused Codex worker's included, whose resume prompt names the new worktree")
 
 
 def _describe_relaunch(r: UnitRename) -> str:
+    if not r.session_id and not r.old_session and not shutdown_records(r.slug, (r.old, r.new)):
+        return "already matches: no shutdown record to relaunch"
     return f"relaunch {r.new} from its shutdown record in {r.new_worktree}"
 
 
 def _describe_verify(r: UnitRename) -> str:
+    if r.id_matches:
+        return f"verify: {r.new} has branch {r.new_branch}, worktree {r.new_worktree}, and matching tab and session names"
     return f"verify: every live place holds the new names, and nothing unclassified holds {r.old}"
 
 
@@ -1180,11 +1237,23 @@ STEPS = (
 NAME_STEPS: tuple[Callable[[UnitRename, Callable[[], None]], None], ...] = (stop_unit, _restart_record, _relaunch, _verify)
 
 
+def _runs_step(rename: UnitRename, step: Step) -> bool:
+    if rename.id_matches:
+        if step.run is _commit_doc:
+            text = Path(rename.doc).read_text(encoding="utf-8")
+            return bool(rename.doc_commit) or _doc_text(rename, text) != text or _own_doc_edits(rename)
+        if step.run is _move_claude:
+            return rename.old_worktree != rename.new_worktree
+        if step.run is _retire:
+            return rename.old_branch != rename.new_branch
+    return not rename.id_matches or rename.moves_git or step.run in NAME_STEPS
+
+
 def step_number(run: Callable[[UnitRename, Callable[[], None]], None]) -> int:
     return next(number for number, step in enumerate(STEPS, 1) if step.run is run)
 
 
-def _load(path: Path) -> UnitRename:
+def _load(path: Path, *, dry_run: bool = False) -> UnitRename:
     fields = unit_move.json_object(read_json(path))
     step = fields.get("step")
     id_matches = fields.get("id_matches", False)
@@ -1195,18 +1264,22 @@ def _load(path: Path) -> UnitRename:
         raise RenameRefused(f"{path}: invalid unit rename journal")
     # A showrunner checkout can move while the rename is open. Ignore legacy locations.
     production = _production(cast(str, fields["slug"]))
-    fields = rename_state.migrate_staff_ids(path, fields, {
-        "staff_id": tuple(staff_sources.UnitMember(production.slug, cast(str, fields[name]))
-                          for name in ("old", "new")),
-    })
-    if not isinstance(fields.get("staff_id"), str) or not fields["staff_id"]:
+    selectors = tuple(staff_sources.UnitMember(production.slug, cast(str, fields[name]))
+                      for name in ("old", "new"))
+    if not dry_run:
+        fields = rename_state.migrate_staff_ids(path, fields, {"staff_id": selectors})
+    if dry_run and "staff_id" not in fields:
+        identity = UnboundStaffMember()
+    elif isinstance(fields.get("staff_id"), str) and fields["staff_id"]:
+        identity = staff.StaffId(cast(str, fields["staff_id"]))
+    else:
         raise RenameRefused(f"{path}: invalid unit rename staff identity")
     fields.update(doc=str(production.doc), checkout=str(production.checkout))
     merged, doc_commit, unit_tip, account, session_id, kept, old_session = (cast(str, fields.get(name, ""))
                                                                             for name in PROGRESS)
     return UnitRename(*(cast(str, fields[name]) for name in REQUIRED), step=step, merged=merged,
                       doc_commit=doc_commit, unit_tip=unit_tip, account=account, session_id=session_id, kept=kept,
-                      old_session=old_session, id_matches=id_matches, staff_id=staff.StaffId(cast(str, fields["staff_id"])))
+                      old_session=old_session, id_matches=id_matches, staff_id=identity)
 
 
 def _save(path: Path, rename: UnitRename) -> None:
@@ -1219,18 +1292,31 @@ def _save(path: Path, rename: UnitRename) -> None:
                       "claimed": rename.step < step_number(_restart_record)})
 
 
-def _resumed(path: Path, old: str, new: str) -> UnitRename | None:
+def _resumed(path: Path, old: str, new: str, *, dry_run: bool = False) -> UnitRename | None:
     """The unfinished rename the journal holds, which must be this request; None without one."""
     if not path.exists():
         return None
-    recorded = _load(path)
+    fields = unit_move.json_object(read_json(path))
     try:
-        same = (recorded.old in (old, unit_names.unit_id(old)) or (old and old == recorded.old_session)) and unit_names.unit_id(new) == recorded.new
+        same = (fields.get("old") in (old, unit_names.unit_id(old)) or
+                (old and old == fields.get("old_session"))) and unit_names.unit_id(new) == fields.get("new")
     except unit_names.BadName:
         same = False
-    if not same:
-        if not rename_state.unfinished(path):
+    finished = fields.get("done") is True
+    if finished and (not same or fields.get("old") == fields.get("new")):
+        return None
+    record = staff.snapshot()
+    identity = fields.get("staff_id")
+    if isinstance(identity, str) and record.by_id(staff.StaffId(identity)) is None:
+        return None
+    if "staff_id" not in fields:
+        slug = path.parent.name
+        if not any(isinstance(staff_sources.member(staff_sources.UnitMember(slug, value), record),
+                              staff_sources.MemberFound)
+                   for name in ("old", "new") if isinstance(value := fields.get(name), str)):
             return None
+    recorded = _load(path, dry_run=dry_run)
+    if not same:
         raise RenameRefused(f"the unfinished rename is {recorded.old} to {recorded.new}; resume it first with "
                             + f"rename_unit.py apply {recorded.slug} {recorded.old} {recorded.new}")
     return recorded
@@ -1240,7 +1326,7 @@ def describe(rename: UnitRename) -> list[str]:
     """Every step, and which part of the request each changes or already matches."""
     lines: list[str] = []
     for number, step in enumerate(STEPS, 1):
-        if rename.id_matches and step.run not in NAME_STEPS:
+        if rename.step == len(STEPS) or not _runs_step(rename, step):
             lines.append(f"{number}. already matches: the id is {rename.new}, so nothing here changes")
             continue
         lines.append(f"{number}. {step.describe(rename)}{'  (done)' if number <= rename.step else ''}")
@@ -1248,8 +1334,8 @@ def describe(rename: UnitRename) -> list[str]:
 
 
 def plan(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
-    slug = showrunners.canonical_slug(slug)
-    recorded = _resumed(rename_state.unit_journal(slug), old, new)
+    slug = _production(slug).slug
+    recorded = _resumed(rename_state.unit_journal(slug), old, new, dry_run=True)
     if recorded is not None:
         return recorded
     rename = _build(slug, old, new, scratch)
@@ -1269,7 +1355,7 @@ def _rename_staff(rename: UnitRename) -> None:
 
 
 def _apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
-    slug = showrunners.canonical_slug(slug)
+    slug = _production(slug).slug
     path = rename_state.unit_journal(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     with unit_move.production_lock():
@@ -1279,6 +1365,11 @@ def _apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
         fresh = rename is None
         if rename is None:
             rename = _build(slug, old, new, scratch)
+            if rename.step == len(STEPS):
+                if rename_state.unfinished(path):
+                    path.unlink()
+                print("done; unchanged")
+                return rename
             with _merge_lock(rename):
                 _preflight(rename)
             rename.staff_id = _staff_id(rename.slug, rename.old)
@@ -1295,7 +1386,7 @@ def _apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
             print("done; unchanged")
         for number in range(rename.step + 1, len(STEPS) + 1):
             step = STEPS[number - 1]
-            if rename.id_matches and step.run not in NAME_STEPS:
+            if not _runs_step(rename, step):
                 rename.step = number
                 _save(path, rename)
                 continue
@@ -1320,7 +1411,7 @@ def _merge_lock(rename: UnitRename) -> AbstractContextManager[None]:
 
 def verify(slug: str, old: str, new: str) -> UnitRename:
     """Rerun the verify step of a rename that has reached it."""
-    slug = showrunners.canonical_slug(slug)
+    slug = _production(slug).slug
     path = rename_state.unit_journal(slug)
     if not path.exists():
         raise RenameRefused(f"{slug} has no unit rename to verify")

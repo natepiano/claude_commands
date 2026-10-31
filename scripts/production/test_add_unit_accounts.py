@@ -42,14 +42,14 @@ class AddUnitAccountsTests(AddUnitTestCase):
             with self.subTest(mode=mode):
                 result = self.cli("alpha", "--brief", "Add a feature", *mode)
                 self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
-                folder = self.root / "project-alpha"
+                folder = self.root / "home/worktrees/alpha"
                 self.assertIn(f"alpha-unit: Claude is not trusted in {folder} on claude2. Run: "
                               + f"cd {shlex.quote(str(self.checkout))} && "
                               + f"CLAUDE_CONFIG_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude2'))} "
                               + f"CLAUDE_CODE_REMOTE_MEMORY_DIR={shlex.quote(str(Path(self.env['HOME']) / '.claude'))} claude", result.stderr)
                 self.assert_no_launch_change(document, head)
                 self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
-                self.assertNotIn("build-followups-alpha", self.git("branch", "--list"))
+                self.assertNotIn("alpha", self.git("branch", "--list"))
 
     def test_trust_uses_launch_account_instead_of_callers_account(self) -> None:
         directory = self.prepare_unit_account("claude3")

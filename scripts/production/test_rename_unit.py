@@ -58,8 +58,8 @@ class UnitRenameTests(UnitRenameFixture):
         result = self.rename("plan")
         self.assert_ok(result)
         self.assertEqual(self.snapshot(), before)
-        self.assertIn(f"branch demo-alpha -> demo-gamma; worktree {self.rust / 'claude-demo-alpha'} -> "
-                      + str(self.rust / "claude-demo-gamma"), result.stdout)
+        self.assertIn(f"branch demo-alpha -> gamma; worktree {self.rust / 'claude-demo-alpha'} -> "
+                      + str(self.home / "worktrees/gamma"), result.stdout)
         self.assertIn("'chore(demo): rename unit alpha-unit to gamma-unit'", result.stdout)
 
     def test_apply_moves_every_place(self) -> None:
@@ -75,20 +75,20 @@ class UnitRenameTests(UnitRenameFixture):
                          {"w1:p3": {"session_id": "session-beta-unit", "written_at": "2026-10-30T09:00:00+00:00",
                                     "environment": {"SHOWRUNNER_UNIT_ID": "beta-unit"}}})
         self.assertEqual(json.loads((records / "work.json").read_text()), {})
-        new = self.rust / "claude-demo-gamma"
+        new = self.home / "worktrees/gamma"
         self.assertFalse((self.rust / "claude-demo-alpha").exists())
-        self.assertEqual(self.git("branch", "--show-current", cwd=new), "demo-gamma")
+        self.assertEqual(self.git("branch", "--show-current", cwd=new), "gamma")
         self.assertEqual(self.git("ls-remote", "--heads", "origin", "demo-alpha"), "")
         self.assertEqual(self.git("branch", "--list", "demo-alpha"), "")
-        unit_tip = self.git("rev-parse", "demo-gamma")
-        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/demo-gamma").split()[0], unit_tip)
+        unit_tip = self.git("rev-parse", "gamma")
+        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/gamma").split()[0], unit_tip)
         # The unit took the later merge-branch work and the rename commit.
         self.assertTrue((new / "NOTES.md").exists())
         self.assertEqual(self.git("show", "-s", "--format=%s", "demo"), "chore(demo): rename unit alpha-unit to gamma-unit")
-        _ = self.git("merge-base", "--is-ancestor", "demo", "demo-gamma")
+        _ = self.git("merge-base", "--is-ancestor", "demo", "gamma")
         self.assertEqual(self.git("rev-parse", "demo"), self.git("rev-parse", "origin/demo"))
         doc = self.doc.read_text()
-        self.assertIn(f"| gamma-unit | docs/plans/alpha.md | `{new}` | demo-gamma |", doc)
+        self.assertIn(f"| gamma-unit | docs/plans/alpha.md | `{new}` | gamma |", doc)
         self.assertIn("| `docs/alpha-unit.md` | gamma-unit | beta-unit (after gamma-unit Phase 2) |", doc)
         self.assertIn("| alpha-unit gate | beta-unit | gamma-unit Phase 2 | alpha-unit merges |", doc)
         self.assertIn("| old gate | alpha-unit | beta-unit | cleared 10-01 when alpha-unit merged |", doc)
@@ -105,7 +105,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.assertEqual(cast(dict[str, object], pool["reviewers"]["r2"]["lease"])["unit"], "mul_add-unit")
         started = cast(dict[str, object], json.loads((self.root / "history/runs/run-1.jsonl").read_text().splitlines()[0]))
         self.assertEqual((started["working_dir"], started["branch"], started["plan_doc"]),
-                         (str(new), "demo-gamma", f"{new}/docs/plans/alpha.md"))
+                         (str(new), "gamma", f"{new}/docs/plans/alpha.md"))
         recorder = cast(dict[str, object], json.loads((self.root / "sessions/s1/progress_history_state.json").read_text()))
         self.assertEqual((recorder["working_dir"], recorder["worktree"]), (str(new), new.name))
         self.assertIn('unit: "gamma-unit"', (self.root / "issues/mine.md").read_text())
@@ -140,7 +140,7 @@ class UnitRenameTests(UnitRenameFixture):
 
     def test_mul_add_naming_keeps_the_underscore_id(self) -> None:
         self.assert_ok(self.rename("apply", "mul_add-unit", "fma"))
-        self.assertIn(f"| fma-unit | docs/plans/mul-add.md | `{self.rust / 'claude-demo-fma'}` | demo-fma |",
+        self.assertIn(f"| fma-unit | docs/plans/mul-add.md | `{self.home / 'worktrees/fma'}` | fma |",
                       self.doc.read_text())
 
     def test_refusals(self) -> None:
@@ -163,7 +163,7 @@ class UnitRenameTests(UnitRenameFixture):
         self.assert_ok(self.rename("apply"))
         self.assertIn(str(old), older.read_text())
         newest = cast(dict[str, object], json.loads((self.root / "history/runs/run-1.jsonl").read_text().splitlines()[0]))
-        self.assertEqual(newest["working_dir"], str(self.rust / "claude-demo-gamma"))
+        self.assertEqual(newest["working_dir"], str(self.home / "worktrees/gamma"))
         self.assert_ok(self.rename("verify"))
 
     def test_untracked_logs_in_the_checkout_do_not_block_and_stay_out_of_the_commit(self) -> None:
@@ -194,12 +194,12 @@ class UnitRenameTests(UnitRenameFixture):
 
         self.assert_refused(self.rename("apply"), "gamma-unit is not running")
 
-        new = self.rust / "claude-demo-gamma"
+        new = self.home / "worktrees/gamma"
         self.assertEqual((new / "work.md").read_text(), "phase work\nmore, not committed\n")
         self.assertEqual((new / "draft.md").read_text(), "a new file\n")
         # The branch kept its tip: no merge went into work in progress.
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=new), checkpoint)
-        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/demo-gamma").split()[0], checkpoint)
+        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/gamma").split()[0], checkpoint)
         self.assertEqual(self.git("ls-remote", "--heads", "origin", "demo-alpha"), "")
         self.assertEqual(self.journal()["kept"], "phase 2 is open")
         self.assertIn("| gamma-unit | docs/plans/alpha.md |", self.doc.read_text())
@@ -213,7 +213,7 @@ class UnitRenameTests(UnitRenameFixture):
         tip = self.git("rev-parse", "HEAD", cwd=worktree)
         self.write(worktree / "draft.md", "a new file\n")
         self.assert_ok(self.rename("apply"))
-        new = self.rust / "claude-demo-gamma"
+        new = self.home / "worktrees/gamma"
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=new), tip)
         self.assertEqual((new / "draft.md").read_text(), "a new file\n")
         self.assertEqual(self.journal()["kept"], "the worktree has uncommitted work")

@@ -480,7 +480,7 @@ Split from 3f by the plan review (2026-10-30): the journal still guards work tha
 
 **Acceptance gate:** basedpyright 0/0 on changed files and callers; tests for a prefixed path, a transferred unit, and history whose row has retired; a per-directory test run for each tree; the status line's time stays under its current budget.
 
-### Phase 3d — Unit folder names  · status: todo
+### Phase 3d — Unit folder names  · status: done
 
 **Depends on:** Phase 3i
 

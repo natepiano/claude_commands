@@ -95,8 +95,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
                     self.assertEqual(self.repository_state(), repository)
                     self.assertEqual({path: path.read_bytes() for path in self.plan.parent.iterdir()
                                       if path.is_file()}, plans)
-                    self.assertFalse((self.root / "project-alpha").exists())
-                    self.assertEqual(self.git("branch", "--list", "build-followups-alpha"), "")
+                    self.assertFalse((self.root / "home/worktrees/alpha").exists())
+                    self.assertEqual(self.git("branch", "--list", "alpha"), "")
                     self.assertFalse((Path(self.env["HOME"]) / ".local/state/unit-launch").exists())
                     self.assertFalse(self.log.exists())
                     self.assertFalse(self.config.exists())
@@ -181,9 +181,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertIn(self.unit_row(), self.doc.read_text())
         self.assertEqual(self.git("log", "-1", "--format=%s", "build-followups"),
                          "production(build-followups): add unit alpha-unit (plan)")
-        self.assertEqual(self.git("rev-parse", "build-followups-alpha"),
+        self.assertEqual(self.git("rev-parse", "alpha"),
                          self.git("rev-parse", "build-followups"))
-        self.assertEqual((self.root / "project-alpha/docs/plans/given.md").read_bytes(), self.plan.read_bytes())
+        self.assertEqual((self.root / "home/worktrees/alpha/docs/plans/given.md").read_bytes(), self.plan.read_bytes())
 
     def test_server_start_timeout_exits_one_with_its_text_instead_of_a_traceback(self) -> None:
         timeout = subprocess.TimeoutExpired("fixture server start", 10)
@@ -213,13 +213,13 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
         self.assertEqual(
             result.stderr,
-            f"add_unit: unit trunk-unit Worktree is {str(recorded)!r}; expected {str(self.checkout)!r}\n",
+            f"add_unit: unit trunk-unit Worktree is {str(recorded)!r}; expected {str(self.root / "home/worktrees/trunk")!r}\n",
         )
         self.assert_no_launch_change(document, head)
 
     def test_standby_launch_records_state_without_writing_a_plan(self) -> None:
         _ = self.successful("alpha", "--standby", "--port", "8123", "--owns", "src/alpha", subprocess_cli=True)
-        worktree = self.root / "project-alpha"
+        worktree = self.root / "home/worktrees/alpha"
         self.assertIn(self.unit_row(plan="standby", port="8123", owns="src/alpha"),
                       self.doc.read_text())
         self.assertEqual(self.git("log", "-1", "--format=%s"),
@@ -237,7 +237,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
                   "~/.claude/scripts/production/showrunners.py address build-followups` prints (look it up "
                   "before each message: it changes when the showrunner restarts), on standby. "
                   f"Work only in your worktree {worktree}, "
-                  "branch build-followups-alpha. Do nothing until the showrunner sends you work.")
+                  "branch alpha. Do nothing until the showrunner sends you work.")
         self.assertIn(prompt, command)
         self.assert_director_flags("opus", "xhigh")
         self.assertRegex(self.log.read_text(),
@@ -287,14 +287,14 @@ class AddUnitLaunchTests(AddUnitTestCase):
                 self.assertEqual(self.git("rev-parse", "HEAD"), head)
                 self.assertFalse(self.config.exists())
                 self.assertFalse(self.log.exists())
-                self.assertFalse((self.root / "project-alpha").exists())
+                self.assertFalse((self.root / "home/worktrees/alpha").exists())
                 self.assertEqual(self.servers_started(), [])
 
     def test_plan_adds_row_commits_worktree_launches_and_records(self) -> None:
         pushed = self.git("--git-dir", str(self.origin), "rev-parse", "refs/heads/build-followups")
         result = self.successful("alpha", "--plan", "docs/plans/given.md", "--port", "8123",
                                  "--owns", "src/alpha")
-        worktree = self.root / "project-alpha"
+        worktree = self.root / "home/worktrees/alpha"
         row = self.unit_row(port="8123", owns="src/alpha")
         self.assertIn(row, self.doc.read_text())
         self.assertEqual(self.git("show", "--pretty=format:", "--name-only", "HEAD"),
@@ -307,10 +307,10 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(self.git("--git-dir", str(self.origin), "for-each-ref", "--format=%(refname)", "refs/heads"),
                          "refs/heads/build-followups")
         self.assertEqual(self.git("for-each-ref", "--format=%(refname) upstream=%(upstream)",
-                                  "refs/heads/build-followups-alpha"),
-                         "refs/heads/build-followups-alpha upstream=")
+                                  "refs/heads/alpha"),
+                         "refs/heads/alpha upstream=")
         self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD", cwd=worktree),
-                         "build-followups-alpha")
+                         "alpha")
         self.assertEqual(self.git("rev-parse", "HEAD", cwd=worktree),
                          self.git("rev-parse", "build-followups"))
         self.assertEqual(self.servers_started(), [["--user", "start", "herdr-agents.service"]])
@@ -350,7 +350,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.git("commit", "-am", "an older production doc")
         _ = self.git("push", "origin", "build-followups")
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--port", "8123")
-        self.assertIn(f"| alpha-unit | docs/plans/given.md | {self.root / 'project-alpha'} | build-followups-alpha "
+        self.assertIn(f"| alpha-unit | docs/plans/given.md | {self.root / 'home/worktrees/alpha'} | alpha "
                       + "| — | 8123 | — |", self.doc.read_text())
 
     def test_a_rerun_finds_the_unit_by_its_mark_after_its_tab_was_renamed(self) -> None:
@@ -371,8 +371,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertEqual(self.doc.read_text(), document)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertNotIn("add unit", self.git("log", "-1", "--format=%s"))
-        self.assertEqual(self.git("branch", "--show-current", cwd=self.root / "project-alpha"),
-                         "build-followups-alpha")
+        self.assertEqual(self.git("branch", "--show-current", cwd=self.root / "home/worktrees/alpha"),
+                         "alpha")
         self.assertEqual(len(self.servers_started()), 1)
         # Adding a unit registers nothing: the showrunner's update timer already names the doc.
         self.assertFalse(self.config.exists())
@@ -382,9 +382,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
         cases = (("Plan", self.prepared_row(plan="docs/plans/other.md"),
                   "docs/plans/other.md", "docs/plans/given.md"),
                  ("Branch", self.prepared_row(branch="other-branch"),
-                  "other-branch", "build-followups-alpha"),
+                  "other-branch", "alpha"),
                  ("Worktree", self.prepared_row(worktree=self.root / "other-worktree"),
-                  str(self.root / "other-worktree"), str(self.root / "project-alpha")))
+                  str(self.root / "other-worktree"), str(self.root / "home/worktrees/alpha")))
         for cell, row, actual, expected in cases:
             with self.subTest(cell=cell):
                 self.commit_prepared_row(row)
@@ -455,7 +455,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = berth.parent.mkdir(parents=True)
         _ = berth.write_text("", encoding="utf-8")
         _ = self.successful("alpha", "--plan", "docs/plans/given.md")
-        self.assertEqual(self.git("config", "branch.build-followups-alpha.cargoBerthTarget"),
+        self.assertEqual(self.git("config", "branch.alpha.cargoBerthTarget"),
                          "build-followups")
 
     def test_brief_commits_stub_with_verbatim_words_and_approval_prompt(self) -> None:
@@ -478,7 +478,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertIn("alpha-unit started: herdr session attach agents, workspace director, tab alpha", result.stdout)
         self.assert_director_flags("opus", "xhigh")
 
-    def test_branch_takes_the_slug_and_the_stub_sits_beside_the_production_doc(self) -> None:
+    def test_branch_uses_short_name_and_stub_sits_beside_the_production_doc(self) -> None:
         _ = self.git("checkout", "-b", "init/catalyst")
         self.doc = self.checkout / "docs/hana/tool-based-ui-production.md"
         _ = self.doc.parent.mkdir(parents=True)
@@ -486,10 +486,10 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.git("add", "docs/hana/tool-based-ui-production.md")
         _ = self.git("commit", "-m", "production under another merge branch")
         _ = self.successful("lfo", "--brief", "Add the LFO tool")
-        worktree = self.root / "project-lfo"
-        self.assertIn(self.unit_row("lfo", branch="tool-based-ui-lfo", worktree=worktree,
+        worktree = self.root / "home/worktrees/lfo"
+        self.assertIn(self.unit_row("lfo", branch="lfo", worktree=worktree,
                                     plan="docs/hana/tool-based-ui-lfo.md"), self.doc.read_text())
-        self.assertEqual(self.git("branch", "--show-current", cwd=worktree), "tool-based-ui-lfo")
+        self.assertEqual(self.git("branch", "--show-current", cwd=worktree), "lfo")
         self.assertEqual(set(self.git("show", "--pretty=format:", "--name-only", "HEAD").splitlines()),
                          {"docs/hana/tool-based-ui-production.md", "docs/hana/tool-based-ui-lfo.md"})
         self.assertFalse((self.checkout / "docs/plans/init").exists())
@@ -634,15 +634,15 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertNotEqual(self.git("rev-parse", "HEAD"), head)
         committed = self.git("show", "HEAD:docs/plans/build-followups-production.md")
         self.assertIn(self.unit_row(), committed)
-        self.assertIn(self.unit_row(), (self.root / "project-alpha/docs/plans/build-followups-production.md").read_text())
-        self.assertEqual((self.root / "project-alpha/docs/plans/given.md").read_bytes(), self.plan.read_bytes())
+        self.assertIn(self.unit_row(), (self.root / "home/worktrees/alpha/docs/plans/build-followups-production.md").read_text())
+        self.assertEqual((self.root / "home/worktrees/alpha/docs/plans/given.md").read_bytes(), self.plan.read_bytes())
         self.assertEqual(stub.read_bytes(), content)
         self.assertIn("added alpha-unit (plan)", self.log.read_text())
 
     def test_running_brief_refuses_plan_mode_before_any_write(self) -> None:
         stub = self.commit_brief_row()
-        worktree = self.root / "project-alpha"
-        _ = self.git("worktree", "add", "-b", "build-followups-alpha", str(worktree))
+        worktree = self.root / "home/worktrees/alpha"
+        _ = self.git("worktree", "add", "-b", "alpha", str(worktree))
         marker = worktree / "in-progress.txt"
         _ = marker.write_text("Work from the brief.\n", encoding="utf-8")
         _ = self.log.write_text("The brief is still running.\n", encoding="utf-8")
@@ -681,8 +681,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
 
     def test_brief_row_resume_with_missing_replacement_plan_refuses_before_any_write(self) -> None:
         stub = self.commit_brief_row()
-        worktree = self.root / "project-alpha"
-        _ = self.git("worktree", "add", "-b", "build-followups-alpha", str(worktree))
+        worktree = self.root / "home/worktrees/alpha"
+        _ = self.git("worktree", "add", "-b", "alpha", str(worktree))
         marker = worktree / "in-progress.txt"
         _ = marker.write_text("Keep the brief work.\n", encoding="utf-8")
         _ = self.log.write_text("The brief is stopped.\n", encoding="utf-8")
@@ -714,8 +714,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_brief_source_without_add_subject_uses_late_plan_in_existing_worktree(self) -> None:
         stub = self.commit_brief_row()
         _ = self.git("commit", "--amend", "-m", "prepare a brief unit")
-        worktree = self.root / "project-alpha"
-        _ = self.git("worktree", "add", "-b", "build-followups-alpha", str(worktree))
+        worktree = self.root / "home/worktrees/alpha"
+        _ = self.git("worktree", "add", "-b", "alpha", str(worktree))
         unit_tip = self.git("rev-parse", "HEAD", cwd=worktree)
         marker = worktree / "in-progress.txt"
         _ = marker.write_text("Keep the unit's work.\n", encoding="utf-8")
@@ -767,7 +767,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_existing_local_or_origin_branch_refuses_before_any_write(self) -> None:
         for location in ("local", "origin"):
             with self.subTest(location=location):
-                branch = "build-followups-alpha"
+                branch = "alpha"
                 if location == "local":
                     _ = self.git("branch", branch)
                 else:
@@ -782,8 +782,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
                 self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
 
     def test_occupied_worktree_refuses_before_row_commit_or_stub(self) -> None:
-        occupied = self.root / "project-alpha"
-        occupied.mkdir()
+        occupied = self.root / "home/worktrees/alpha"
+        occupied.mkdir(parents=True)
         _ = (occupied / "marker").write_text("keep", encoding="utf-8")
         original = self.doc.read_text()
         head = self.git("rev-parse", "HEAD")
@@ -795,9 +795,9 @@ class AddUnitLaunchTests(AddUnitTestCase):
         self.assertFalse((self.checkout / "docs/plans/build-followups-alpha.md").exists())
 
     def test_unrelated_repository_on_expected_branch_refuses_before_commit(self) -> None:
-        occupied = self.root / "project-alpha"
-        occupied.mkdir()
-        _ = self.git("init", "-b", "build-followups-alpha", cwd=occupied)
+        occupied = self.root / "home/worktrees/alpha"
+        occupied.mkdir(parents=True)
+        _ = self.git("init", "-b", "alpha", cwd=occupied)
         _ = self.doc.write_text(self.doc.read_text().replace(
             "## Gates", self.unit_row() + "\n\n## Gates"), encoding="utf-8")
         original = self.doc.read_text()
@@ -818,7 +818,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_remote_control_polling_reads_each_host_through_its_place(self) -> None:
         request = add_unit.UnitLaunch(
             production=production_units.read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
-            branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
+            branch="alpha", worktree=self.root / "home/worktrees/alpha", plan=add_unit.Standby(),
             port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.NewSession(),
             launch_kind=add_unit.NewWorkLaunch(), timeout=0,
         )
@@ -837,7 +837,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
     def test_remote_control_is_read_from_the_session_record_after_the_pane_line_scrolls_off(self) -> None:
         request = add_unit.UnitLaunch(
             production=production_units.read_production(self.doc), identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
-            branch="build-followups-alpha", worktree=self.root / "project-alpha", plan=add_unit.Standby(),
+            branch="alpha", worktree=self.root / "home/worktrees/alpha", plan=add_unit.Standby(),
             port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(), session=add_unit.NewSession(),
             launch_kind=add_unit.NewWorkLaunch(), timeout=0,
         )
@@ -883,10 +883,10 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.git("commit", "-m", "move checkout")
         _ = self.git("push", "origin", "build-followups")
         _ = self.successful("mul_add", "--plan", "docs/plans/given.md")
-        self.assertIn(self.unit_row("mul_add", branch="build-followups-mul-add",
-                                    worktree=self.root / "project-mul-add"), self.doc.read_text())
+        self.assertIn(self.unit_row("mul_add", branch="mul_add",
+                                    worktree=self.root / "home/worktrees/mul_add"), self.doc.read_text())
         self.assertEqual(self.git("rev-parse", "--abbrev-ref", "HEAD",
-                                  cwd=self.root / "project-mul-add"), "build-followups-mul-add")
+                                  cwd=self.root / "home/worktrees/mul_add"), "mul_add")
 
 
 if __name__ == "__main__":

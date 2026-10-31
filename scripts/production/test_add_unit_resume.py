@@ -86,8 +86,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertNotEqual(self.git("rev-parse", "build-followups"), old_head)
         self.assertEqual(self.git("log", "-1", "--format=%s", "build-followups"),
                          "production(build-followups): add unit alpha-unit (plan)")
-        self.assertTrue((self.root / "project-alpha").is_dir())
-        self.assertEqual(self.git("rev-parse", "build-followups-alpha"),
+        self.assertTrue((self.root / "home/worktrees/alpha").is_dir())
+        self.assertEqual(self.git("rev-parse", "alpha"),
                          self.git("rev-parse", "build-followups"))
         self.assertEqual(self.opened()[7], str(prior))
         arguments = self.agent_arguments()
@@ -157,7 +157,7 @@ class AddUnitResumeTests(AddUnitTestCase):
                                  + "to make it this unit, run add_unit with --attach session-123\n")
                 self.assert_no_launch_change(document, head)
                 self.assertEqual([row for row in self.herdr_calls() if row[2:4] != ["session", "list"]], [])
-                self.assertNotIn("build-followups-alpha", self.git("branch", "--list"))
+                self.assertNotIn("alpha", self.git("branch", "--list"))
         # Brief launches must refuse before their stub is written too.
         result = self.cli("alpha", "--brief", "Repair the unit", "--resume", "session-123", "--cwd", str(prior))
         self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
@@ -354,21 +354,21 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(prior))
         self.assertEqual(self.repository_state(), before)
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
-        self.assertFalse((self.root / "project-alpha").exists())
+        self.assertFalse((self.root / "home/worktrees/alpha").exists())
 
     def test_retired_permanent_resume_ignores_an_existing_branch_without_a_worktree(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()
         self.commit_prepared_row(self.unit_row(
             plan="(retired 2026-10-28, worktree removed, session session-123) permanent"))
-        _ = self.git("branch", "build-followups-alpha")
+        _ = self.git("branch", "alpha")
         before = self.repository_state()
 
         _ = self.successful("alpha", "--permanent", "--resume", "session-123", "--cwd", str(prior))
 
         self.assertEqual(self.opened()[self.opened().index("--cwd") + 1], str(prior))
         self.assertEqual(self.repository_state(), before)
-        self.assertFalse((self.root / "project-alpha").exists())
+        self.assertFalse((self.root / "home/worktrees/alpha").exists())
 
     def test_retired_as_built_plan_resumes_without_a_production_header(self) -> None:
         plan = "docs/as-built/alpha.md"
@@ -378,8 +378,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         _ = self.git("add", plan)
         self.commit_prepared_row(self.unit_row(
             plan=f"(retired 2026-10-28, worktree removed, session session-123) `{plan}` (run done)"))
-        worktree = self.root / "project-alpha"
-        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        worktree = self.root / "home/worktrees/alpha"
+        _ = self.git("worktree", "add", str(worktree), "-b", "alpha")
         document = self.doc.read_bytes()
 
         _ = self.successful("alpha", "--plan", plan, "--resume", "session-123", "--cwd", str(worktree))
@@ -397,8 +397,8 @@ class AddUnitResumeTests(AddUnitTestCase):
         _ = path.write_text("# Alpha as built\n", encoding="utf-8")
         _ = self.git("add", plan)
         self.commit_prepared_row(self.unit_row(plan=plan))
-        worktree = self.root / "project-alpha"
-        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        worktree = self.root / "home/worktrees/alpha"
+        _ = self.git("worktree", "add", str(worktree), "-b", "alpha")
         before = self.repository_state()
 
         _ = self.successful("alpha", "--plan", plan, "--resume", "session-123",
@@ -420,8 +420,8 @@ class AddUnitResumeTests(AddUnitTestCase):
     def test_retired_plan_resume_reuses_its_worktree_after_a_failed_launch(self) -> None:
         self.commit_prepared_row(self.unit_row(
             plan="(retired 2026-10-28, worktree removed, session session-123) docs/plans/given.md"))
-        worktree = self.root / "project-alpha"
-        _ = self.git("worktree", "add", str(worktree), "-b", "build-followups-alpha")
+        worktree = self.root / "home/worktrees/alpha"
+        _ = self.git("worktree", "add", str(worktree), "-b", "alpha")
         before = self.repository_state()
 
         _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--resume", "session-123",
@@ -474,7 +474,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         self.assert_director_flags("opus", "xhigh")
         command = self.opening_prompt()
         self.assertIn("You are now alpha-unit in production build-followups", command)
-        promoted_plan = self.root / "project-alpha/docs/plans/given.md"
+        promoted_plan = self.root / "home/worktrees/alpha/docs/plans/given.md"
         self.assertTrue(promoted_plan.exists())
         self.assertIn(f"Run /unit:direct {promoted_plan}", command)
 
@@ -507,7 +507,7 @@ class AddUnitResumeTests(AddUnitTestCase):
         _ = self.successful("alpha", "--plan", plan.as_posix(), "--check")
         self.assertEqual(self.repository_state(), initial)
         _ = self.successful("alpha", "--plan", plan.as_posix())
-        worktree = self.root / "project-alpha"
+        worktree = self.root / "home/worktrees/alpha"
         copied = worktree / plan
         self.assertEqual(copied.read_text(encoding="utf-8"), standing)
         self.assertEqual(self.git("check-ignore", "--", plan.as_posix(), cwd=worktree), plan.as_posix())

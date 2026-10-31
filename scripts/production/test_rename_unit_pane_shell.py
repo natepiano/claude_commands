@@ -19,7 +19,7 @@ class RenamePaneShellTests(UnitRenameFixture):
         self.assert_ok(self.rename('verify'))
         self.assertEqual(pane.close_calls(), [['--session','agents','pane','close','w1:p1']])
         self.assertEqual(sum(call.startswith('restart') for call in pane.stop_calls), 1)
-        self.assertTrue((self.rust / 'claude-demo-gamma').is_dir())
+        self.assertTrue((self.home / 'worktrees/gamma').is_dir())
         self.assertIn('| gamma-unit |', self.doc.read_text())
         self.assertIs(self.journal()['done'], True)
 

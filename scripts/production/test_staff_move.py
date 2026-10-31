@@ -294,7 +294,8 @@ class StaffMoveTests(StaffTestCase):
                       self.commands())
 
     def test_taken_unit_name_refuses_before_tab_move(self) -> None:
-        _ = staff.ensure("unit", name=self.unit.name, parent=self.destination.id)
+        _ = staff.ensure("unit", name="legacy-panes", parent=self.destination.id)
+        _ = self.staff_file.write_text(self.staff_file.read_text().replace('"name": "legacy-panes"', '"name": "panes"'))
         before = self.staff_file.read_bytes()
         with self.assertRaises(staff.StaffRefused):
             _ = staff_move.move_unit("sdlc", "models-unit", "target")

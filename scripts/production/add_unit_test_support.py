@@ -577,15 +577,15 @@ class AddUnitTestCase(ShutdownTestCase):
         if effort is None:
             self.assertNotIn("--effort", command)
 
-    def unit_row(self, name: str = "alpha", *, branch: str = "build-followups-alpha",
+    def unit_row(self, name: str = "alpha", *, branch: str = "alpha",
                  worktree: Path | None = None, plan: str = "docs/plans/given.md",
                  port: str = "—", owns: str = "—") -> str:
-        target = worktree or self.root / "project-alpha"
+        target = worktree or self.root / "home/worktrees/alpha"
         return f"| {name}-unit | {plan} | {target} | {branch} | {port} | {owns} |"
 
     def prepared_row(self, *, name: str = "alpha", plan: str = "docs/plans/given.md",
-                     worktree: Path | None = None, branch: str = "build-followups-alpha") -> str:
-        target = worktree or self.root / "project-alpha"
+                     worktree: Path | None = None, branch: str = "alpha") -> str:
+        target = worktree or self.root / "home/worktrees/alpha"
         return (f"| `{name}-unit` | `{plan}` (ready to launch) | `{target}` | "
                 f"`{branch}` | 8123 | `src/alpha` — assigned files |")
 
@@ -601,7 +601,7 @@ class AddUnitTestCase(ShutdownTestCase):
         self.assertEqual(self.git("rev-parse", "HEAD"), head)
         self.assertFalse(self.config.exists())
         self.assertFalse(self.log.exists())
-        self.assertFalse((self.root / "project-alpha").exists())
+        self.assertFalse((self.root / "home/worktrees/alpha").exists())
         self.assertEqual(self.servers_started(), [])
 
     def restore(self, name: str, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -636,7 +636,7 @@ class AddUnitTestCase(ShutdownTestCase):
             production=production_units.read_production(self.doc),
             identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
             branch="build-followups-alpha",
-            worktree=self.root / "project-alpha",
+            worktree=self.root / "home/worktrees/alpha",
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
             port=add_unit.OmittedCell(),
             owns=add_unit.OmittedCell(),
@@ -831,7 +831,7 @@ class AddUnitTestCase(ShutdownTestCase):
 
     def assert_named_unit_launch_and_restart(self, unit: str) -> None:
         self.doc = self.checkout / "docs/plans/sample-production.md"
-        row = self.unit_row(unit, branch="sample-" + unit, worktree=self.root / ("project-" + unit))
+        row = self.unit_row(unit, branch=unit, worktree=self.root / "home/worktrees" / unit)
         row = row.replace(f"| {unit}-unit |", f"| `{unit}` |")
         _ = self.doc.write_text(self.production_doc().replace("## Gates", row + "\n\n## Gates"), encoding="utf-8")
         _ = self.git("add", str(self.doc.relative_to(self.checkout)))
@@ -857,7 +857,7 @@ class AddUnitTestCase(ShutdownTestCase):
         request = add_unit.launch_request(argparse.Namespace(
             production=str(self.doc), name=unit, plan="docs/plans/given.md", brief=None,
             standby=False, permanent=False, port=None, owns=None, timeout=90.0, check=False,
-            resume="unit-session", cwd=str(self.root / ("project-" + unit)),
+            resume="unit-session", cwd=str(self.root / "home/worktrees" / unit),
             restart_note=str(note), session_name=unit, host_session="sample-" + unit, probe=False,
         ))
         self.assertEqual(request.unit, unit)

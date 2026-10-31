@@ -316,7 +316,7 @@ def record_shutdown(case: unittest.TestCase, pane: PaneShellFixture, path: Path,
             pane.slug, pane.unit, name = destination
             pane.place = herdr.HerdrPlace('restored', 'w2:p1')
             write(pane.environment, [HostedUnit(pane.place.session, pane.place.pane,
-                  {'SHOWRUNNER_UNIT':pane.slug, 'SHOWRUNNER_UNIT_ID':pane.unit})])
+                  {'SHOWRUNNER_UNIT':pane.slug, 'SHOWRUNNER_UNIT_ID':pane.unit}, label=name)])
             pane.shell = 991001
             pane.found = unit_lookup.MarkedUnit(pane.unit,
                 unit_lookup.LiveClaude(name, 'sid-alpha', '/fixture/socket', pane.shell), pane.place)

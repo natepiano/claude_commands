@@ -169,7 +169,7 @@ class RunProcessTests(unittest.TestCase):
             del self.processes[pid]
 
     def rename(self) -> rename_unit.UnitRename:
-        return rename_unit.UnitRename(SLUG, "alpha-unit", "gamma-unit", "", "", SLUG, "demo-alpha", "demo-gamma",
+        return rename_unit.UnitRename(SLUG, "alpha-unit", "gamma-unit", "", "", SLUG, "demo-alpha", "gamma",
                                       str(self.worktree), str(self.root / "claude-demo-gamma"), "", "")
 
     def stop(self) -> str:
@@ -334,7 +334,7 @@ class DeadServerWatcherTests(UnitRenameFixture):
         self.assertEqual(watcher.returncode, -15)
         self.assertIn(f"app-server watcher {watcher.pid} of dead server {server}", result.stdout)
         self.assertFalse(old.exists())
-        self.assertTrue((self.rust / "claude-demo-gamma").is_dir())
+        self.assertTrue((self.home / "worktrees/gamma").is_dir())
         self.assertTrue(self.journal()["done"])
 
 

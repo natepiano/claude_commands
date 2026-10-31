@@ -35,8 +35,8 @@ class AddUnitRerunTests(AddUnitTestCase):
         self.assertEqual(stopped.returncode, 1, stopped.stderr)
         marked = unit_lookup.MarkedUnit("alpha-unit", unit_lookup.LiveClaude("alpha", "session-123", "/fixture", 1234),
                                        herdr.HerdrPlace("agents", "w1:p1"))
-        unit = resume_unit.RetiredUnit(read_production(self.doc), "alpha-unit", self.root / "project-alpha",
-            "build-followups-alpha", "docs/plans/given.md", "session-123", True, resume_unit.RecordedStartFolder(prior))
+        unit = resume_unit.RetiredUnit(read_production(self.doc), "alpha-unit", self.root / "home/worktrees/alpha",
+            "alpha", "docs/plans/given.md", "session-123", True, resume_unit.RecordedStartFolder(prior))
         before = sum(row[2:4] == ["agent", "start"] for row in self.herdr_calls())
         output = io.StringIO()
 

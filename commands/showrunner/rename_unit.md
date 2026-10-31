@@ -5,10 +5,9 @@ argument-hint: "<old> <new>"
 
 # Rename unit
 
-Run from the showrunner session, at any time, also in the middle of a phase. `<old>` is the unit's id, its stem, or its Claude session's name. When the id already is `<new>`, only the session takes the new name: the plan shows the other steps as already matching.
-`<new>` can be an id or a stem, and it becomes `<stem>-unit`. A stem starting with `<slug>-`
-keeps that prefix once. If it equals the old branch or worktree folder name, that path stays:
-`names-unit` → `cargo-liner-style-names-unit` keeps `cargo-liner-style-names` for both.
+Run from the showrunner session, one unit at a time, at its phase boundary. `<old>` is the unit's id, stem, or Claude session name; `<new>` is an id or stem and becomes `<stem>-unit`. Short names are globally unique. The branch is `<stem>` and the worktree is `~/worktrees/<stem>`.
+
+A same-name request (`plan natedev style style`) repairs only mismatched folder, branch, tab and session names. When all four match, `apply` changes nothing. A rerun resumes an unfinished rename; a finished or stale journal does not block a new plan.
 The script lives at
 `~/.claude/scripts/production/rename_unit.py`. It finds the showrunner state in `STATE_DIR`:
 
@@ -25,7 +24,7 @@ The script lives at
    A running unit is not a refusal: apply stops it itself, at step 1. The stop is at once: it does
    not wait for the director or its Codex workers to go idle, and a worker in the middle of a turn
    pauses there. The unit's commits that are not merged move with the branch.
-2. Run `apply` once, in the background: one run does the whole rename, with no rerun. It waits for the
+2. Run `apply` in the background on the showrunner's word. It waits for the
    unit to stop (up to an hour), for a merge gate that is running, and for the relaunched unit to come
    up. It journals each step, so a rerun after a refusal resumes from the step that stopped. The steps are:
    1. stop the unit through the shutdown path (`down`, then `now`), then pause its runs' workers

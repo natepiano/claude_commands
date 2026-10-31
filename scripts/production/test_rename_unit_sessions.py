@@ -58,18 +58,18 @@ class UnitRenameSessionsTests(UnitRenameFixture):
         saved = self.record()
         session = cast(dict[str, object], saved["session"])
         host = cast(dict[str, object], session["host"])
-        new = self.rust / "claude-demo-gamma"
+        new = self.home / "worktrees/gamma"
         self.assertEqual((host["unit"], host["session_name"], session["name"], session["cwd"]),
-                         ("gamma-unit", "demo-gamma", "gamma", f"{new}/sub"))
+                         ("gamma-unit", "gamma", "gamma", f"{new}/sub"))
         self.assertEqual(cast(dict[str, object], host["plan"])["path"], f"{new}/docs/plans/alpha.md")
-        self.assertIn(f"you are now gamma-unit, in worktree {new} on branch demo-gamma, and your plan is at "
+        self.assertIn(f"you are now gamma-unit, in worktree {new} on branch gamma, and your plan is at "
                       + f"{new}/docs/plans/alpha.md", cast(str, saved["renamed"]))
         # Each paused Codex seat resumes its own thread in the new worktree, and its resume prompt says so.
         seat = cast(list[dict[str, object]], saved["codex_seats"])[0]
         self.assertEqual(cast(list[str], seat["launcher_command"])[5], str(new))
         self.assertEqual((self.root / "runs/r1/impl.resume-prompt.md").read_text(),
                          "Continue the task you were on.\nWhile you were paused the showrunner renamed your unit: "
-                         + f"your worktree is now {new} on branch demo-gamma. {self.rust / 'claude-demo-alpha'} no "
+                         + f"your worktree is now {new} on branch gamma. {self.rust / 'claude-demo-alpha'} no "
                          + f"longer exists; wherever your instructions name it, use {new}.\n")
 
     def test_a_session_with_its_own_name_takes_the_new_name(self) -> None:
@@ -84,14 +84,15 @@ class UnitRenameSessionsTests(UnitRenameFixture):
         planned = self.rename("plan", "builder-report", "alpha")
         self.assert_ok(planned)
         self.assertIn("Claude session builder-report -> alpha", planned.stdout)
-        self.assertIn("already matches: the id is alpha-unit", planned.stdout)
-        branches = self.git("branch", "--list")
-        doc = self.doc.read_text()
+        self.assertIn("branch demo-alpha -> alpha", planned.stdout)
+        self.assertIn(str(self.home / "worktrees/alpha"), planned.stdout)
         self.assert_refused(self.rename("apply", "builder-report", "alpha"), "alpha-unit is not running")
         session = cast(dict[str, object], self.record()["session"])
         self.assertEqual((session["name"], cast(dict[str, object], session["host"])["session_name"]),
-                         ("alpha", "demo-alpha"))
-        self.assertEqual((self.git("branch", "--list"), self.doc.read_text()), (branches, doc))
+                         ("alpha", "alpha"))
+        repaired = self.home / "worktrees/alpha"
+        self.assertEqual(self.git("branch", "--show-current", cwd=repaired), "alpha")
+        self.assertIn(f"`{repaired}` | alpha |", self.doc.read_text())
         # The relaunched unit keeps its mark alpha-unit, now under the new session name.
         _ = self.mark_live("alpha-unit", "sid-alpha")
         self.assert_ok(self.rename("apply", "builder-report", "alpha"))

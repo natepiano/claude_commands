@@ -318,8 +318,10 @@ def relative_plan(production: Production, raw: str) -> Path:
 
 def stub_plan(production: Production, branch: str) -> Path:
     """Name a brief's stub plan beside the production doc, relative to Showrunner checkout."""
+    stem = unit_names.name_key(branch)
+    filename = stem if stem.startswith(f"{production.slug}-") else f"{production.slug}-{stem}"
     try:
-        return production.doc.parent.relative_to(production.checkout) / f"{branch}.md"
+        return production.doc.parent.relative_to(production.checkout) / f"{filename}.md"
     except ValueError as error:
         raise Refusal("production doc must be inside Showrunner checkout") from error
 
@@ -337,9 +339,8 @@ def launch_request(args: argparse.Namespace) -> RequestedUnitLaunch:
     permanent = cast(bool, args.permanent)
     if sum((given_plan is not None, given_brief is not None, standby, permanent)) != 1:
         raise Refusal("give exactly one of --plan, --brief, --standby, or --permanent")
-    kebab = unit_names.stem(unit_names.unit_id(name))
-    branch = unit_names.branch(production.slug, kebab)
-    worktree = unit_names.worktree(production.checkout, kebab)
+    branch = unit_names.branch(name)
+    worktree = unit_names.worktree(name)
     plan: PlanGiven | BriefGiven | Standby
     if given_plan is not None:
         plan = PlanGiven(relative_plan(production, given_plan))
@@ -895,22 +896,12 @@ def attach_hint(request: UnitLaunch) -> str:
 
 
 def host_session_name(request: UnitLaunch) -> str:
-    """The destination name, limited to characters supported by named herdr sessions.
-
-    A new launch's name leads with the production slug, since every production may have a unit of
-    the same name (each had a review-unit). A restore keeps the name its session was recorded under
-    when that name leads with the slug; a record from before the slug led, such as `review`, would
-    take another production's live session of that name, so it gets the new launch's name instead.
-    """
+    """The unit's short name, or the recorded host name when restoring its session."""
     import herdr
 
-    slug = request.production.slug
     if isinstance(request.launch_kind, UnitRestoreLaunch):
-        recorded = herdr.generated_session_name(request.launch_kind.host_session)
-        if recorded.startswith(f"{slug}-"):
-            return recorded
-    name = request.identity.session
-    return herdr.generated_session_name(unit_names.branch(slug, name))
+        return herdr.generated_session_name(request.launch_kind.host_session)
+    return herdr.generated_session_name(request.identity.session)
 
 
 def launch_session(

@@ -22,6 +22,8 @@ restores print `<unit> restore launched: ` and the same place. Every unit is a t
 herdr session, `agents`.
 A name may be given with or without its `-unit` ending; `feature-log` and
 `feature-log-unit` both make unit `feature-log-unit`.
+Unit short names are unique across all productions; `feature-log` uses
+`~/worktrees/feature-log` and branch `feature-log`.
 An existing Units row is adopted; its Port and Owns values stand when omitted.
 Add `--check` to run preflight without launching or writing anything.
 An untrusted session folder refuses before any stub, Units row, or worktree is

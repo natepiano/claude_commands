@@ -212,7 +212,8 @@ def move_configs(old: str, new: str) -> None:
     """Move the transcript folders and copy the trust entry in every Claude config dir."""
     old_project, new_project = project_folder(old), project_folder(new)
     for directory in config_dirs():
-        move(PathMove(directory / "projects" / old_project, directory / "projects" / new_project))
+        if old_project != new_project:
+            move(PathMove(directory / "projects" / old_project, directory / "projects" / new_project))
         config = (Path.home() / ".claude.json" if directory == Path.home() / ".claude"
                   else directory / ".claude.json")
         if config.exists():

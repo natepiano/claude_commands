@@ -102,7 +102,7 @@ class UnitRenameStateTests(UnitRenameFixture):
                                              "question": "Does alpha-unit ship?"}]))
         self.assert_ok(self.rename("apply"))
         state = cast(dict[str, object], json.loads((self.root / "scratch/showrunner_state.json").read_text()))
-        self.assertEqual(state["next"], ["merge gamma-unit from demo-gamma", "keep the per-unit gate"])
+        self.assertEqual(state["next"], ["merge gamma-unit from gamma", "keep the per-unit gate"])
         self.assertEqual(state["open_for_user"], [{"text": "gamma-unit asks", "question": "Does gamma-unit ship?"}])
         self.assertEqual(cast(list[dict[str, str]], json.loads(outstanding.read_text()))[0]["text"], "gamma-unit asks")
         self.assert_ok(self.rename("verify"))
@@ -150,7 +150,7 @@ class UnitRenameStateTests(UnitRenameFixture):
 
     def test_busy_held_role_blocks_rename_state_then_retry_updates_live_routes(self) -> None:
         old = self.rust / "claude-demo-alpha"
-        new = self.rust / "claude-demo-gamma"
+        new = self.home / "worktrees/gamma"
         config = self.root / "design_roles.conf"
         self.write(config, "[ownership]\nhost=fixture-host\n")
         self.env.update({"DESIGN_ROLES_CONFIG": str(config), "DESIGN_ROLES_HOST": "fixture-host"})

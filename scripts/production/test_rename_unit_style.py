@@ -29,10 +29,12 @@ class UnitRenameStyleTests(UnitRenameFixture):
         result = self.rename("plan", "names-unit", "demo-names-unit")
         self.assert_ok(result)
         self.assertEqual(self.snapshot(), before)
-        self.assertIn(f"git: keep branch demo-names; keep worktree {worktree}", result.stdout)
-        self.assertNotIn(" -> ", next(line for line in result.stdout.splitlines() if "git:" in line))
+        destination = self.home / "worktrees/demo-names"
+        self.assertIn(f"git: keep branch demo-names; worktree {worktree} -> {destination}", result.stdout)
 
         self.assert_ok(self.rename("apply", "names-unit", "demo-names-unit"))
+        self.assertFalse(worktree.exists())
+        worktree = destination
         self.assertEqual(self.git("branch", "--show-current", cwd=worktree), "demo-names")
         self.assertEqual(self.git("show", "--format=%s", "--stat", "HEAD"),
                          "chore(demo): rename unit names-unit to demo-names-unit")
@@ -100,7 +102,7 @@ class UnitRenameStyleTests(UnitRenameFixture):
 
         self.assert_ok(result)
         self.assertIn(f"branch {slug}-names -> {slug}-words-names; worktree {worktree} -> "
-                      + str(self.rust / f"{slug}-words-names"), result.stdout)
+                      + str(self.home / f"worktrees/{slug}-words-names"), result.stdout)
         self.assertEqual(self.snapshot(), before)
 
     def test_restart_record_keeps_one_prefix_for_a_full_style_id(self) -> None:
@@ -133,7 +135,7 @@ class UnitRenameStyleTests(UnitRenameFixture):
             rename_unit._restart_record(rename, lambda: None)  # pyright: ignore[reportPrivateUsage]
 
         session = cast(dict[str, object], self.record()["session"])
-        self.assertEqual(cast(dict[str, object], session["host"])["session_name"], "demo-beta")
+        self.assertEqual(cast(dict[str, object], session["host"])["session_name"], "beta")
 
 
 if __name__ == "__main__":

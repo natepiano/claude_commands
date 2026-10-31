@@ -188,7 +188,8 @@ class UnitTransferTests(UnitTransferFixture):
 
     def test_taken_staff_name_refuses_before_sources_change(self) -> None:
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
-        _ = staff.ensure("unit", name="alpha", parent=parent.id)
+        _ = staff.ensure("unit", name="legacy-alpha", parent=parent.id)
+        _ = self.staff_file.write_text(self.staff_file.read_text().replace('"name": "legacy-alpha"', '"name": "alpha"'))
         before = final_files(self.root)
         failed = self.transfer("apply")
         self.assertEqual(failed.returncode, 2, failed.stderr)
@@ -201,7 +202,8 @@ class UnitTransferTests(UnitTransferFixture):
         self.add_transfer_unit("beta")
         third = self.add_destination("third")
         parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "third")
-        _ = staff.ensure("unit", name="beta", parent=parent.id)
+        _ = staff.ensure("unit", name="legacy-beta", parent=parent.id)
+        _ = self.staff_file.write_text(self.staff_file.read_text().replace('"name": "legacy-beta"', '"name": "beta"'))
         before = final_files(self.root)
         messages = self.messages()
         refused = self.transfer("apply", "beta-unit", third)

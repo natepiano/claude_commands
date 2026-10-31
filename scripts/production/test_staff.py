@@ -168,7 +168,8 @@ class StaffTests(StaffTestCase):
         self.assertNotEqual(first.id, second.id)
         self.assert_refused(lambda: staff.rename(other.id, unit.name))
         another_showrunner = staff.ensure("showrunner", name="natedev")
-        conflict = staff.ensure("unit", name="models", parent=another_showrunner.id)
+        conflict = staff.ensure("unit", name="legacy-models", parent=another_showrunner.id)
+        _ = self.staff_file.write_text(self.staff_file.read_text().replace('"name": "legacy-models"', '"name": "models"'))
         self.assert_refused(lambda: staff.move(conflict.id, showrunner.id))
         self.assert_refused(lambda: staff.rename(another_showrunner.id, showrunner.name))
         # Promotion needs both kinds to coexist briefly under the same short name.

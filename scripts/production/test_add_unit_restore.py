@@ -115,17 +115,17 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertNotIn("restore launched", output.getvalue())
         self.assertIn("restart-prompt-outcome: ", output.getvalue())
 
-    def test_each_production_names_its_unit_session_and_a_restore_keeps_the_recorded_name(self) -> None:
+    def test_short_name_hosts_ignore_production_and_restore_keeps_recorded_name(self) -> None:
         production = production_units.read_production(self.doc)
         request = add_unit.UnitLaunch(
             production=production, identity=add_unit.UnitIdentity("review-unit", "review"),
-            branch="build-followups-review", worktree=self.root / "project-review",
+            branch="build-followups-review", worktree=self.root / "home/worktrees/review",
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")), port=add_unit.OmittedCell(),
             owns=add_unit.OmittedCell(), session=add_unit.NewSession(), launch_kind=add_unit.NewWorkLaunch(),
             timeout=90)
         hana = dataclasses.replace(request, production=production._replace(slug="hana"))
-        self.assertEqual(add_unit.host_session_name(request), "build-followups-review")
-        self.assertEqual(add_unit.host_session_name(hana), "hana-review")
+        self.assertEqual(add_unit.host_session_name(request), "review")
+        self.assertEqual(add_unit.host_session_name(hana), "review")
         named = dataclasses.replace(request, identity=add_unit.UnitIdentity("review-unit", "build-followups-review"))
         self.assertEqual(add_unit.host_session_name(named), "build-followups-review")
         style = dataclasses.replace(request, production=production._replace(slug="cargo-liner-style"),
@@ -134,9 +134,9 @@ class AddUnitRestoreTests(AddUnitTestCase):
         restore = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "build-followups-review")
         self.assertEqual(add_unit.host_session_name(dataclasses.replace(request, launch_kind=restore)),
                          "build-followups-review")
-        # A record from before the slug led: its bare name may be another production's live session.
+        # A bare recorded host stays bare when its production changes.
         before = add_unit.UnitRestoreLaunch("session-123", self.root / "note", "review", "review")
-        self.assertEqual(add_unit.host_session_name(dataclasses.replace(hana, launch_kind=before)), "hana-review")
+        self.assertEqual(add_unit.host_session_name(dataclasses.replace(hana, launch_kind=before)), "review")
 
     def test_failed_unit_restore_closes_its_tab_after_agent_exit(self) -> None:
         prior = self.root / "prior-session"
@@ -149,7 +149,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             request = add_unit.UnitLaunch(
                 production=production_units.read_production(self.doc),
                 identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
-                branch="build-followups-alpha", worktree=self.root / "project-alpha",
+                branch="build-followups-alpha", worktree=self.root / "home/worktrees/alpha",
                 plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
                 port=add_unit.OmittedCell(), owns=add_unit.OmittedCell(),
                 session=add_unit.ResumedSession("session-123", prior),
@@ -209,7 +209,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(len(self.servers_started()), 1)
         self.assertEqual(len(self.recorded_prompts("session-123")), 1)
 
-    def test_restart_from_a_record_before_the_slug_led_skips_another_productions_live_session(self) -> None:
+    def test_restart_keeps_recorded_bare_name_beside_another_productions_live_session(self) -> None:
         self.commit_prepared_row(self.unit_row("review"))
         prior = self.root / "prior-session"
         prior.mkdir()
@@ -228,7 +228,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertIn("review-unit restore launched", result.stdout)
         self.assertEqual(len(self.servers_started()), 1)
         starts = [row for row in self.herdr_calls() if row[2:4] == ["agent", "start"]]
-        self.assertEqual([row[4] for row in starts], ["build-followups-review"])
+        self.assertEqual([row[4] for row in starts], ["review"])
 
     def test_restart_restore_marks_only_the_probe_pane_despite_inherited_marker(self) -> None:
         self.env["CLAUDE_PROBE_SESSION"] = "1"
@@ -331,7 +331,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
 
     def test_restore_in_a_cwd_other_than_the_row_worktree_launches_there(self) -> None:
         self.commit_prepared_row(self.unit_row())
-        worktree = self.root / "project-alpha"
+        worktree = self.root / "home/worktrees/alpha"
         recorded = self.root / "prior-session"
         _ = self.git("worktree", "add", str(recorded), "-b", "build-followups-alpha")
         before = self.repository_state()
@@ -346,7 +346,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
 
     def test_restore_in_the_row_worktree_on_another_branch_launches(self) -> None:
         self.commit_prepared_row(self.unit_row())
-        worktree = self.root / "project-alpha"
+        worktree = self.root / "home/worktrees/alpha"
         _ = self.git("worktree", "add", str(worktree), "-b", "other-branch")
         before = self.repository_state()
 
@@ -475,7 +475,7 @@ class AddUnitRestoreTests(AddUnitTestCase):
             production=production_units.read_production(self.doc),
             identity=add_unit.UnitIdentity("alpha-unit", "alpha"),
             branch="build-followups-alpha",
-            worktree=self.root / "project-alpha",
+            worktree=self.root / "home/worktrees/alpha",
             plan=add_unit.PlanGiven(Path("docs/plans/given.md")),
             port=add_unit.OmittedCell(),
             owns=add_unit.OmittedCell(),
@@ -899,8 +899,8 @@ class AddUnitRestoreTests(AddUnitTestCase):
         self.assertEqual(self.servers_started(), [])
 
     def test_exact_table_row_is_adopted_without_suffix_in_another_production(self) -> None:
-        row = self.unit_row("designers", branch="build-followups-designers",
-                            worktree=self.root / "project-designers").replace("| designers-unit |", "| `designers` |")
+        row = self.unit_row("designers", branch="designers",
+                            worktree=self.root / "home/worktrees/designers").replace("| designers-unit |", "| `designers` |")
         self.commit_prepared_row(row)
         request = add_unit.launch_request(argparse.Namespace(
             production=str(self.doc), name="designers", plan="docs/plans/given.md", brief=None,
