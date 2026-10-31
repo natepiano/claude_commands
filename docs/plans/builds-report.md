@@ -72,6 +72,7 @@ Do not wait for sdlc's exact keys. Print our definition, our number and sdlc's n
 - `queue_rows()` owns the one waiter order. `write_head_since()` writes `head_since` and runs under the admission lock.
 - `memory_gate.sh` keeps the cargo-token left and back times.
 - The tests of both sides stay. The suite runs 514 tests and they pass; basedpyright reads 0 errors, 0 warnings, 0 notes.
+- Later merge (builds at 2e272204): resources-unit Phase 26's `resolve_queue_order()` and builds' token wait (`token_left_at` on the waiter) replace the head-time and cargo-token gap recorder above. `write_head_since()`, `head_since` on the waiter and the token arguments of the check are gone, with the tests that checked them.
 
 **Files:**
 - `scripts/lint/memory_admit.py` — the admission reader, with `queue_rows()` and `write_head_since()`

@@ -9,7 +9,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -81,7 +81,7 @@ class RegistryRead:
     unreadable: tuple[Path, ...]
 
 
-def read_registry() -> RegistryRead:
+def read_registry(*, dependencies: Callable[[Path], None] | None = None) -> RegistryRead:
     """Keep unreadable directories and records visible to complete observers."""
     directory = sessions_dir()
     try:
@@ -92,7 +92,7 @@ def read_registry() -> RegistryRead:
     unreadable: list[Path] = []
     for path in paths:
         try:
-            observation = _read_observation(path)
+            observation = _read_observation(path, dependencies=dependencies)
         except FileNotFoundError:
             continue  # A session can remove its registry entry after the directory read.
         if isinstance(observation, UnreadableSessionRecord):
@@ -141,10 +141,12 @@ def parse_session(parsed: object) -> RegistryEntry:
     )
 
 
-def _read_observation(path: Path) -> RegistryObservation | UnreadableSessionRecord:
+def _read_observation(path: Path, *, dependencies: Callable[[Path], None] | None = None) -> RegistryObservation | UnreadableSessionRecord:
     """Read across a concurrent registry rewrite, without hiding persistent corruption."""
     for attempt in range(3):
         try:
+            if dependencies is not None:
+                dependencies(path)
             raw = cast(object, json.loads(path.read_text()))
             record = parse_session(raw)
             if not isinstance(record, UnreadableSessionRecord):

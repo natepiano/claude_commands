@@ -240,14 +240,28 @@ class PlannedEdits:
     constant_proofs: tuple[ConstantTargetProof, ...] = ()
 
 
+def require_edit_paths(repo: Path, files: tuple[bulk.FileRenames | ConstantFileEdit, ...]) -> None:
+    """Check filesystem destinations immediately before every initial or rebuilt write."""
+    for file in files:
+        target = repo / file.path
+        if target.is_symlink() or target.resolve() != target:
+            raise bulk.BulkRenameError("edit path is a symlink or resolves outside its workspace path: " + file.path)
+        if isinstance(file, ConstantFileEdit) and file.created and target.exists():
+            raise bulk.BulkRenameError("constant creation would overwrite an untracked file: " + file.path)
+
+
 class WorkspaceIntent(bulk.BatchIntent):
     """The shared batch journal, extended with exact bytes for newly created files."""
 
     def record_plan(self, plan: PlannedEdits) -> None:
         # BatchIntent's existing-file journal needs only path and edited bytes.
-        self.record_edits(tuple(bulk.FileRenames(file.path, file.original, file.edited, (), ())
-                                for file in plan.files if not isinstance(file, ConstantFileEdit) or not file.created))
         record = bulk.object_fields(cast(object, json.loads(self.path.read_text())))
+        existing = bulk.object_fields(record["files"])
+        current = self.file_edits(tuple(bulk.FileRenames(file.path, file.original, file.edited, (), ())
+                                       for file in plan.files if not isinstance(file, ConstantFileEdit) or not file.created))
+        excluded = set(existing) - current.keys()
+        record["files"] = {**existing, **current}
+        record["formatter_restored_paths"] = sorted(excluded)
         record["created_files"] = {file.path: file.edited.encode().hex() for file in plan.files
                                    if isinstance(file, ConstantFileEdit) and file.created}
         bulk.atomic_json(self.path, record)
@@ -290,10 +304,20 @@ class WorkspaceEdits:
     def __init__(self, repo: Path, base: str, files: tuple[bulk.FileRenames, ...]) -> None:
         self.repo: Path = repo
         self.base: str = base
-        self.files: dict[str, bulk.FileRenames | ConstantFileEdit] = {file.path: file for file in files}
-        self.dependencies: dict[str, frozenset[str]] = {path: file.dependencies | {path} for path, file in self.files.items()}
+        self.files: dict[str, bulk.FileRenames | ConstantFileEdit] = {}
+        self.dependencies: dict[str, frozenset[str]] = {}
         self.initial_untracked: set[str] = self.untracked()
         self.constant_proofs: tuple[ConstantTargetProof, ...] = ()
+        self.refused_files: set[str] = set()
+        self.excluded_paths: set[str] = set()
+        self.set_plan(PlannedEdits(files, ()))
+
+    def set_plan(self, plan: PlannedEdits) -> None:
+        self.excluded_paths.update(self.files.keys() - {file.path for file in plan.files})
+        self.excluded_paths.difference_update(file.path for file in plan.files)
+        self.files = {file.path: file for file in plan.files}
+        self.dependencies = {path: file.dependencies | {path} for path, file in self.files.items()}
+        self.constant_proofs = plan.constant_proofs
 
     def untracked(self) -> set[str]:
         return set(filter(None, git(self.repo, "ls-files", "--others", "--exclude-standard", "-z").split("\0")))
@@ -316,7 +340,27 @@ class WorkspaceEdits:
         for path in self.untracked() - self.initial_untracked:
             (self.repo / path).unlink()
 
+    def refuse_format_changes(self) -> dict[str, str]:
+        """Restore a failed rename's whole edit group before validating the survivors."""
+        refused: dict[str, str] = {}
+        for path, file in self.files.items():
+            if path in self.refused_files or not isinstance(file, bulk.FileRenames):
+                continue
+            target = self.repo / path
+            if target.is_symlink() or not target.is_file():
+                raise bulk.BulkRenameError(f"verification replaced {path}")
+            if bulk.file_edits_preserved(file, target.read_bytes().decode()):
+                continue
+            reason = f"post-format rename edit changed: {path}"
+            remove = dependent_files(self.dependencies, {path}) & self.files.keys()
+            self.restore(sorted(remove))
+            self.refused_files.update(remove)
+            refused.update((item.finding.finding_id, reason) for member in remove for item in self.files[member].kept)
+        return refused
+
     def guard(self, kept: set[str]) -> None:
+        # Retries may format restored paths again; they remain owned until the run ends.
+        self.restore(sorted(self.excluded_paths))
         changed = set(filter(None, git(self.repo, "diff", self.base, "--name-only", "-z").split("\0")))
         unrelated = (changed - kept) | (self.untracked() - self.initial_untracked - kept)
         if unrelated:
@@ -340,6 +384,57 @@ class WorkspaceEdits:
                                                      tuple(item.finding for item in proof.result.kept))
             if isinstance(checked, constants.ConstantsNotProved):
                 raise bulk.BulkRenameError("post-format constant proof failed: " + checked.reason)
+
+
+def reprove_rename_plan(workspace: WorkspaceEdits, kept: set[str],
+                        replan: Callable[[frozenset[str]], PlannedEdits],
+                        record: Callable[[PlannedEdits], None], times: dict[str, float]) -> dict[str, str]:
+    """Restore prior overlays and feed only survivors through the existing planner."""
+    survivors = frozenset(item.finding.finding_id for path in kept for item in workspace.files[path].kept)
+    workspace.restore(sorted(workspace.files))
+    started = time.monotonic()
+    plan = replan(survivors) if survivors else PlannedEdits((), ())
+    times["rename"] += time.monotonic() - started
+    require_edit_paths(workspace.repo, plan.files)
+    workspace.refused_files.clear()
+    workspace.set_plan(plan)
+    record(plan)
+    for file in plan.files:
+        _ = (workspace.repo / file.path).write_bytes(file.edited.encode())
+    return {item.finding_id: item.reason for item in plan.refusals}
+
+
+_NO_RESTORED_PATHS: frozenset[str] = frozenset()
+
+
+def format_rename_plan(workspace: WorkspaceEdits, runner: Runner, arguments: tuple[str, ...],
+                       replan: Callable[[frozenset[str]], PlannedEdits],
+                       record: Callable[[PlannedEdits], None], times: dict[str, float],
+                       restored_paths: frozenset[str] = _NO_RESTORED_PATHS) -> dict[str, str]:
+    """Drop only edit groups, then prove surviving findings on their rebuilt overlay.
+
+    Rebuilding all survivors through the original planner also covers a reader
+    whose destination-name references reappear in a rolled-back file. Resolution
+    answers are never reused. Each retry removes at least one finding.
+    """
+    refused: dict[str, str] = {}
+    workspace.excluded_paths.update(restored_paths)
+    while workspace.files:
+        started = time.monotonic()
+        formatted = runner(workspace.repo, arguments)
+        times["fmt"] += time.monotonic() - started
+        if formatted.code:
+            raise bulk.BulkRenameError("workspace format failed: " + formatted.stderr.strip())
+        # A package-wide formatter can revisit an excluded file on a retry.
+        workspace.restore(sorted(workspace.excluded_paths))
+        dropped = workspace.refuse_format_changes()
+        kept = set(workspace.files) - workspace.refused_files
+        workspace.guard(kept)
+        if not dropped:
+            return refused
+        refused.update(dropped)
+        refused.update(reprove_rename_plan(workspace, kept, replan, record, times))
+    return refused
 
 
 def plan_renames(repo: Path, ledger: ledger_api.Ledger, base: str, selected: Selection,
@@ -523,21 +618,22 @@ def available_constant_plan(plan: PlannedEdits, availability: PlanningFileAvaila
                               if not any(edit.path in removed for edit in proof.result.edits)))
 
 
-def diagnostic_files(repo: Path, result: CommandResult) -> set[str]:
-    paths: set[str] = set()
-    def spans(message: dict[str, object]) -> None:
+def diagnostic_failures(repo: Path, result: CommandResult) -> dict[str, str]:
+    """Retain the compiler cause alongside every diagnostic path, including expansions."""
+    paths: dict[str, str] = {}
+    def spans(message: dict[str, object], reason: str) -> None:
         for entry in bulk.object_list(message.get("spans", [])):
             span = bulk.object_fields(entry)
             name = str(span.get("file_name", ""))
             if name and not name.startswith("<"):
                 resolved = (repo / name).resolve()
                 if resolved.is_relative_to(repo):
-                    paths.add(resolved.relative_to(repo).as_posix())
+                    paths[resolved.relative_to(repo).as_posix()] = reason
             expansion = span.get("expansion")
             if isinstance(expansion, dict):
-                spans({"spans": [bulk.object_fields(cast(object, expansion)).get("span", {})]})
+                spans({"spans": [bulk.object_fields(cast(object, expansion)).get("span", {})]}, reason)
         for child in bulk.object_list(message.get("children", [])):
-            spans(bulk.object_fields(child))
+            spans(bulk.object_fields(child), reason)
     for line in (result.stdout + "\n" + result.stderr).splitlines():
         try:
             message = bulk.object_fields(cast(object, json.loads(line)))
@@ -546,13 +642,17 @@ def diagnostic_files(repo: Path, result: CommandResult) -> set[str]:
         if message.get("reason") == "compiler-message":
             message = bulk.object_fields(message.get("message"))
         if message.get("level") == "error":
-            spans(message)
+            detail = str(message.get("message", ""))
+            code = message.get("code")
+            label = str(bulk.object_fields(cast(object, code)).get("code", "")) if isinstance(code, dict) else ""
+            reason = "workspace diagnostics" + (": " + (label + ": " if label else "") + detail if detail else "")
+            spans(message, reason)
     return paths
 
 
 def validate(workspace: WorkspaceEdits, runner: Runner, times: dict[str, float],
-             loops: list[dict[str, object]]) -> tuple[set[str], dict[str, str]]:
-    kept = set(workspace.files)
+             loops: list[dict[str, object]], reprove_remaining: Callable[[set[str]], set[str]]) -> tuple[set[str], dict[str, str]]:
+    kept = set(workspace.files) - workspace.refused_files
     reverted: dict[str, str] = {}
     while True:
         started = time.monotonic()
@@ -564,16 +664,21 @@ def validate(workspace: WorkspaceEdits, runner: Runner, times: dict[str, float],
             failures = [result for result in results if result.code]
             if not failures:
                 return kept, reverted
-            errors: set[str] = set()
+            errors: dict[str, str] = {}
             for result in failures:
-                errors.update(diagnostic_files(workspace.repo, result))
-            remove = dependent_files(workspace.dependencies, errors) & kept
+                errors.update(diagnostic_failures(workspace.repo, result))
+            remove = dependent_files(workspace.dependencies, set(errors)) & kept
             loop.update(errors=sorted(errors), reverted=sorted(remove))
             if not remove:
                 raise bulk.BulkRenameError("validation errors remain but no new edited file can be reverted")
             workspace.restore(sorted(remove))
             kept -= remove
-            reverted.update((item.finding.finding_id, "workspace diagnostics") for path in remove for item in workspace.files[path].kept)
+            for path in remove:
+                causes = sorted({reason for error_path, reason in errors.items()
+                                 if path in dependent_files(workspace.dependencies, {error_path})})
+                reason = "; ".join(causes)
+                reverted.update((item.finding.finding_id, reason) for item in workspace.files[path].kept)
+            kept = reprove_remaining(kept)
         finally:
             seconds = time.monotonic() - started
             times["check_clippy"] += seconds
@@ -690,30 +795,50 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger,
     tree = ""
     status = "no edits"
     kept_findings: tuple[AppliedFinding, ...] = ()
+    def rollback_failure(reason: str) -> None:
+        nonlocal status, kept_findings, commit
+        status = reason
+        if git(repo, "rev-parse", "HEAD") != base:
+            _ = git(repo, "reset", "--hard", base)
+        workspace.rollback(intent)
+        for identity in owned:
+            if identity not in refused:
+                reverted[identity] = status
+        for ticket in tickets:
+            _ = ledger.bulk_release(ticket, {identity: reason for identity, reason in {**refused, **reverted}.items() if owned[identity] == ticket})
+            ledger.ticket_drop(ticket)
+        kept_findings = ()
+        commit = ""
+
     try:
         started = time.monotonic()
         availability = PlanningFileAvailability(repo, available)
-        with ExitStack() as stack:
-            if definition.family == "names":
+        def replan(identities: frozenset[str]) -> PlannedEdits:
+            survivors = Selection(tuple(finding for finding in selected.findings
+                                         if finding.finding_id in identities), ())
+            with ExitStack() as stack:
                 rename_server = stack.enter_context(bulk.RustAnalyzer(repo)) if isinstance(server, RenameService) else server
-                plan = plan_renames(repo, ledger, base, selected, rename_server, availability)
-            else:
-                plan = available_constant_plan(plan_constants(repo, ledger, base, selected), availability)
+                # Injected analyzers have the same lifetime across retries; clear
+                # their overlays after restoring the tree, before any new proof.
+                if not isinstance(server, RenameService):
+                    for path in tuple(rename_server.documents):
+                        if path.is_relative_to(repo):
+                            rename_server.open(path, (repo / path).read_text())
+                return plan_renames(repo, ledger, base, survivors, rename_server,
+                                    PlanningFileAvailability(repo, available))
+
+        if definition.family == "names":
+            plan = replan(frozenset(finding.finding_id for finding in selected.findings))
+        else:
+            plan = available_constant_plan(plan_constants(repo, ledger, base, selected), availability)
         refused.update((item.finding_id, item.reason) for item in plan.refusals)
         times["rename"] = time.monotonic() - started
         candidates = plan.files
-        workspace.files = {file.path: file for file in candidates}
-        workspace.dependencies = {file.path: file.dependencies | {file.path} for file in candidates}
-        workspace.constant_proofs = plan.constant_proofs
+        workspace.set_plan(plan)
         _ = require_base(repo, base_tree)
         for file in candidates:
             available(repo, file.path)
-        for file in candidates:
-            target = repo / file.path
-            if target.is_symlink() or target.resolve() != target:
-                raise bulk.BulkRenameError("edit path is a symlink or resolves outside its workspace path: " + file.path)
-            if isinstance(file, ConstantFileEdit) and file.created and target.exists():
-                raise bulk.BulkRenameError("constant creation would overwrite an untracked file: " + file.path)
+        require_edit_paths(repo, candidates)
         intent.record_plan(plan)
         for file in candidates:
             _ = (repo / file.path).write_bytes(file.edited.encode())
@@ -726,12 +851,28 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger,
             packages = sorted({member.package_name for member in members if member.directory in touched})
             if not packages:
                 raise bulk.BulkRenameError("changed files have no workspace package")
-            formatted = runner(repo, ("cargo", "+nightly", "fmt", *(arg for name in packages for arg in ("--package", name))))
-            times["fmt"] = time.monotonic() - started
-            if formatted.code:
-                raise bulk.BulkRenameError("workspace format failed: " + formatted.stderr.strip())
-            workspace.guard(kept)
-            kept, reverted = validate(workspace, runner, times, loops)
+            format_arguments = ("cargo", "+nightly", "fmt", *(arg for name in packages for arg in ("--package", name)))
+            if definition.family == "names":
+                refused.update(format_rename_plan(workspace, runner, format_arguments, replan, intent.record_plan, times))
+                kept = set(workspace.files)
+            else:
+                formatted = runner(repo, format_arguments)
+                times["fmt"] = time.monotonic() - started
+                if formatted.code:
+                    raise bulk.BulkRenameError("workspace format failed: " + formatted.stderr.strip())
+                workspace.guard(kept)
+            def reprove_remaining(paths: set[str]) -> set[str]:
+                if definition.family != "names":
+                    return paths
+                restored = frozenset(workspace.files.keys() - paths)
+                refused.update(reprove_rename_plan(workspace, paths, replan, intent.record_plan, times))
+                refused.update(format_rename_plan(workspace, runner, format_arguments, replan,
+                                                  intent.record_plan, times, restored))
+                return set(workspace.files)
+
+            if kept:
+                kept, diagnostics_refused = validate(workspace, runner, times, loops, reprove_remaining)
+                refused.update(diagnostics_refused)
         for ticket in tickets:
             _ = ledger.bulk_release(ticket, {identity: reason for identity, reason in {**refused, **reverted}.items() if owned[identity] == ticket})
         kept_findings = tuple(item for path in sorted(kept) for item in workspace.files[path].kept)
@@ -782,21 +923,13 @@ def run_rule(repo: Path, rule: str, base_tree: str, ledger: ledger_api.Ledger,
         for ticket in tickets:
             if not any(item.finding.finding_id in owned and owned[item.finding.finding_id] == ticket for item in kept_findings):
                 ledger.ticket_drop(ticket)
-    except (Exception, KeyboardInterrupt) as error:
-        if git(repo, "rev-parse", "HEAD") != base:
-            _ = git(repo, "reset", "--hard", base)
-        workspace.rollback(intent)
-        status = "batch aborted: " + str(error)
-        for identity in owned:
-            if identity not in refused:
-                reverted[identity] = status
-        for ticket in tickets:
-            _ = ledger.bulk_release(ticket, {identity: reason for identity, reason in {**refused, **reverted}.items() if owned[identity] == ticket})
-            ledger.ticket_drop(ticket)
-        kept_findings = ()
-        commit = ""
-        if isinstance(error, KeyboardInterrupt):
-            raise
+    except (bulk.BulkRenameError, OSError, UnicodeError) as error:
+        rollback_failure("batch refused: " + str(error))
+    except KeyboardInterrupt:
+        rollback_failure("batch interrupted")
+        raise
+    except Exception as error:
+        rollback_failure("tool defect: " + str(error))
     members = coverage_report.workspace(ledger, base)
     counts: Counter[tuple[str, str, str, str]] = Counter()
     for finding in selected.findings:
@@ -844,7 +977,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         with ledger_api.open_ledger(args.repo) as ledger:
             report = run_rule(args.repo, args.rule, args.base_tree, ledger)
             status = bulk.object_fields(cast(object, json.loads(report.read_text()))).get("status", "")
-            return 1 if (str(status).startswith(("tests failed:", "batch aborted:"))
+            return 1 if (str(status).startswith(("tests failed:", "batch refused:", "tool defect:"))
                          or "publication pending:" in str(status)) else 0
     except (bulk.BulkRenameError, ledger_api.LedgerError, OSError, subprocess.SubprocessError) as error:
         print(f"bulk workspace: {error}", file=sys.stderr)

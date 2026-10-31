@@ -310,6 +310,16 @@ class RefusalWatchTests(unittest.TestCase):
         self.assertEqual(accounts.login_renewal_attempts(),
                          {"claude2": accounts.LoginRenewalAttempt(NOW, accounts.LoginRenewed())})
 
+    def test_a_missing_login_token_uses_the_existing_renewal_path(self) -> None:
+        usage_store.save([agent_accounts.Report("Claude", email="main@example.invalid",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN)], NOW)
+        with patch.object(accounts, "renew_login", return_value=accounts.LoginRenewalFailed("usage still shows no login token")) as probe:
+            self.assertEqual(refusal_watch.renew_expired_logins(NOW, False),
+                ["claude2 login renewal failed: usage still shows no login token"])
+        probe.assert_called_once_with("claude2")
+        self.assertEqual(accounts.login_renewal_attempts()["claude2"].result,
+                         accounts.LoginRenewalFailed("usage still shows no login token"))
+
     def test_expired_login_wait_keeps_the_last_reading_time(self) -> None:
         _ = self.groups()
         self.next_entries(self.low_rule())

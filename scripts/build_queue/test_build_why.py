@@ -31,7 +31,7 @@ def gib(value: float) -> int:
     return int(value * GIB)
 
 
-class FinishedTokenGapTimes(TypedDict, total=False):
+class FinishedTokenGapTimes(TypedDict):
     token_left_at: float
     token_back_at: float
 
@@ -79,7 +79,7 @@ class BuildWhyTests(unittest.TestCase):
         self.head_path = self.waiter(500, "inspectors-fix", 11.8, 122)
         self.change_head(need_source="measured", need_runs=7, test_threads=8,
                          test_scope="filtered", package="hana_inspectors",
-                         filters=["test(one)", "test(two)"], holds_younger=True,
+                         filters=["test(one)", "test(two)"],
                          priority_since=NOW - 120)
         for number in range(16):
             _ = self.waiter(600 + number, f"younger-{number}", number + 1, 20 - number)
@@ -161,6 +161,17 @@ class BuildWhyTests(unittest.TestCase):
         self.assertNotIn("still leaves", final)
         result = gate.head_after_steps_end(gate.explain_queue(), (0,))
         self.assertIsInstance(result, gate.HeadAdmitsAfterEnd)
+
+    def test_order_rule_shows_the_queue_priority_from_its_snapshot(self) -> None:
+        from dataclasses import replace
+        reading = gate.locked_queue_read()
+        priority: gate.QueuePriority = {"unit": "resources", "why": "work", "set_at": NOW,
+            "set_by": "showrunner"}
+        reading = replace(reading, explanation=replace(reading.explanation, priority=priority))
+        facts = head_facts.read_head_facts(reading)
+        lines = build_why.render_explanation(reading.explanation, user_zone(), {}, facts)
+        order, = [line for line in lines if line.startswith("Order rule:")]
+        self.assertIn("queue priority: resources (the user's bump)", order)
 
     def test_override_free_memory_terms_add_up_to_its_printed_threshold(self) -> None:
         self.reset_running(available=23, need=12)
@@ -500,26 +511,16 @@ class BuildWhyTests(unittest.TestCase):
         self.reset_running(available=0, need=11.8)
         _ = self.running(800, "holder", "clippy", 1, 1, 3600)
         self.head_path = self.head_path.rename(self.directory / "500-500.waiting")
+        waiter = gate.read_waiter(self.head_path)
+        waiter["token_left_at"] = token_times["token_left_at"]
+        _ = self.head_path.write_text(json.dumps(waiter))
         with mock.patch.object(gate, "process_start_time", side_effect=str), \
-             mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "id-inspectors-fix", "CLAUDE_SESSION_NAME": "inspectors-fix"}):
+             mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "id-inspectors-fix", "CLAUDE_SESSION_NAME": "inspectors-fix",
+                                          "BUILDLOG_MEM_TOKEN_BACK_AT": str(token_times["token_back_at"])}):
             return gate.check(self.root / "meminfo", 500, "", ["cargo", "nextest"], NOW - 122 * 60,
                               now=datetime.fromtimestamp(at, UTC),
                               profile=gate.StepProfile("hana", "nextest", "inspectors-fix",
-                                                       gate.ExpectedPeak(gib(11.8), "measured", 7)),
-                              **token_times)
-
-    def test_admission_written_head_time_reaches_build_why_and_queue(self) -> None:
-        started_head = NOW - 125
-        result = self.check_waiting_head(started_head)
-        self.assertEqual(result.decision.state, "hold")
-        self.assertEqual(json.loads(self.head_path.read_text())["head_since"], started_head)
-        self.assertIn("Head for: 2 min (since 21:48:55)", self.output())
-        reading = gate.locked_queue_read()
-        facts = head_facts.read_head_facts(reading)
-        assert isinstance(facts, head_facts.HeadFacts)
-        text = head_facts.head_time_text(facts, user_zone(), short=True)
-        self.assertIn("head for 2 min", text)
-        self.assertNotIn("head for 122 min", text)
+                                                       gate.ExpectedPeak(gib(11.8), "measured", 7)))
 
     def test_admission_written_token_gap_matches_the_reader_and_both_commands(self) -> None:
         result = self.check_waiting_head(NOW, token_left_at=NOW - 200, token_back_at=NOW - 46)
@@ -540,15 +541,23 @@ class BuildWhyTests(unittest.TestCase):
     def test_four_head_facts_follow_first_in_line_in_the_specified_order(self) -> None:
         write_bumps(NOW, [bump_line(NOW - 1)])
         output = self.output()
-        prefixes = ("First in line:", "Head for:", "Bumps since it joined at",
+        prefixes = ("First in line:", "Bumps since it joined at",
                     "Order rule:", "Cargo token waits:")
         positions = [output.index(prefix) for prefix in prefixes]
         self.assertEqual(positions, sorted(positions))
-        self.assertEqual(self.line(output, "Head for:"), "Head for: unknown")
+        self.assertNotIn("Head for:", output)
         joined = datetime.fromtimestamp(NOW - 122 * 60, user_zone()).strftime("%H:%M:%S")
         self.assertEqual(self.line(output, "Bumps since it joined"),
                          f"Bumps since it joined at {joined}: 1")
         self.assertEqual(self.line(output, "Cargo token waits:"), "Cargo token waits: unknown")
+
+    def test_legacy_head_clock_does_not_replace_the_total_queue_wait(self) -> None:
+        self.change_head(head_state="head", head_since=NOW - 125)
+        output = self.output()
+        self.assertIn("waiting 122 min", output)
+        self.assertNotIn("Head for:", output)
+        self.assertNotIn("became first", output)
+        self.assertNotIn("head_since", output)
 
     def test_token_gaps_only_show_current_waiting_runs(self) -> None:
         since = NOW - 122 * 60
@@ -629,10 +638,13 @@ class BuildWhyTests(unittest.TestCase):
                 self.assertNotIn("may use", line)
 
     def test_backfill_and_position_bump_report_the_admission_deadlines(self) -> None:
-        self.change_head(priority_since=NOW - 630, bump_order=-1)
+        self.change_head(priority_since=NOW - 630)
+        priority: gate.QueuePriority = {"unit": "inspectors-fix", "why": "user work", "set_at": NOW - 630,
+            "set_by": "showrunner"}
+        _ = (self.directory / "queue_priority.json").write_text(json.dumps(priority))
         output = self.output()
         self.assertRegex(output, r"younger steps may start until 21:52.*1 min 30 s left")
-        self.assertIn("bumped by position at 21:40", output)
+        self.assertIn("queue priority: inspectors-fix (the user's bump)", output)
 
     def test_pressure_hold_and_recovery_spacing_are_explicit(self) -> None:
         _ = (self.root / "pressure").write_text("full avg10=11.00 avg60=0.00 avg300=0.00 total=0\n")

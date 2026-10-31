@@ -21,7 +21,7 @@ let queueWidthRefresh: QueueWidthRefresh = { kind: 'idle' };
 const PANES = { plugin: 'unit-board', key: 'panes' } as const;
 
 type Selection = { kind: 'board' } | { kind: 'unit'; production: string; unit: string };
-type OpenPane = { timer: Timer; cwd: string; session: string; busy: boolean; paths: RefreshPaths[]; selection: Selection };
+type OpenPane = { timer: Timer; session: string; busy: boolean; paths: RefreshPaths[]; selection: Selection };
 
 function boardCalls($: EngineInterface): BoardLoader {
   return {
@@ -79,7 +79,7 @@ const tick = async ($: EngineInterface, opened: Map<string, OpenPane>, id: strin
     const state = await readPane($, id);
     if (!state || !isOpen()) return;
     const regenerated = await refreshIfChanged({ stat: path => $.fs.stat(path) }, active.paths,
-      () => loadBoard(boardCalls($), active.cwd, active.session, isOpen, path => retainWatch(active, path)), async data => {
+      () => loadBoard(boardCalls($), active.session, isOpen, path => retainWatch(active, path)), async data => {
         const now = await $.clock.now() / 1000;
         if (!isOpen()) return;
         active.paths = snapshotPaths(data);
@@ -95,10 +95,10 @@ const tick = async ($: EngineInterface, opened: Map<string, OpenPane>, id: strin
     await put($, id, { kind: 'failed', reason: String(error) }, isOpen);
   } finally { active.busy = false; }
 };
-const startTimer = ($: EngineInterface, opened: Map<string, OpenPane>, id: string, cwd: string, session: string) => {
+const startTimer = ($: EngineInterface, opened: Map<string, OpenPane>, id: string, session: string) => {
   const previous = opened.get(id);
   previous?.timer.cancel();
-  opened.set(id, { cwd, session, busy: false, paths: previous?.paths ?? [], selection: previous?.selection ?? { kind: 'board' },
+  opened.set(id, { session, busy: false, paths: previous?.paths ?? [], selection: previous?.selection ?? { kind: 'board' },
     timer: $.clock.every(10_000, () => { void tick($, opened, id); }) });
 };
 const select = async ($: EngineInterface, opened: Map<string, OpenPane>, id: string, selection: Selection) => {
@@ -255,9 +255,9 @@ async function queueRun($: EngineInterface, args: string[], isOpen = () => true)
   const home = await $.env.get('HOME');
   if (!home || !isOpen()) throw new Error('Build queue could not be read.');
   const result = await $.process.run([`${home}/.claude/scripts/lib/py`,
-    `${home}/.claude/scripts/build_queue/build_queue.py`, ...args]);
+    `${home}/.claude/scripts/${args[0] === "priority" ? "lint/memory_admit.py" : "build_queue/build_queue.py"}`, ...args]);
   if (!isOpen()) throw new Error('Build queue could not be read.');
-  if (args[0] === 'bump' && result.exitCode === 3 && !result.isStdoutTruncated) {
+  if (args[0] === 'priority' && result.exitCode === 3 && !result.isStdoutTruncated) {
     const refusal = result.stdout.trim();
     if (/^build queue: [^\r\n]+$/.test(refusal)) return refusal;
   }
@@ -354,7 +354,7 @@ export const register: Register = on => {
     await $.command.register({ name: ACCOUNTS, description: 'Show the stored accounts pane' });
     const panes = await $.ui.panes();
     if (panes.some(pane => pane.id === PANE)) {
-      startTimer($, opened, PANE, e.cwd, await $.session.id());
+      startTimer($, opened, PANE, await $.session.id());
       const active = opened.get(PANE)!;
       const state = await readPane($, PANE);
       if (state?.kind === 'board' || state?.kind === 'unit') {
@@ -375,18 +375,17 @@ export const register: Register = on => {
       await $.ui.close({ id: PANE });
       return { text: 'Unit board closed.' };
     }
-    const cwd = await $.session.cwd();
     const session = await $.session.id();
     opened.get(PANE)?.timer.cancel();
     opened.delete(PANE);
     await $.ui.open({ id: PANE, title: 'Units', closeOnEscape: true });
-    startTimer($, opened, PANE, cwd, session);
+    startTimer($, opened, PANE, session);
     const active = opened.get(PANE)!;
     const isOpen = () => opened.get(PANE) === active;
     active.busy = true;
     await put($, PANE, { kind: 'loading' }, isOpen);
     try {
-      const data = await loadBoard(boardCalls($), cwd, session, isOpen, path => retainWatch(active, path));
+      const data = await loadBoard(boardCalls($), session, isOpen, path => retainWatch(active, path));
       if (isOpen()) {
         active.paths = snapshotPaths(data);
         active.selection = commandSelection(data, wanted);
@@ -413,11 +412,11 @@ export const register: Register = on => {
       return { text: 'Build queue closed.' };
     }
     if (/^bump(?:\s|$)/.test(wanted)) {
-      const selector = wanted.slice(4).trim();
+      const words = wanted.split(/\s+/);
+      if (words.length !== 2) return { text: 'build queue: use /build:queue bump <unit>' };
       let line: string;
       try {
-        if (!selector) throw new Error('Missing selector.');
-        const output = await queueRun($, ['bump', selector]);
+        const output = await queueRun($, ['priority', 'set', '--unit', words[1], '--why', "the user's bump"]);
         line = output.trim();
         if (!line || /[\r\n]/.test(line)) throw new Error('Invalid bump result.');
       } catch { return { text: 'Build queue could not be read.' }; }

@@ -1183,7 +1183,8 @@ def _run_auto_moves_locked(now: datetime, *, dry_run: bool = False,
         last_read = (target.weekly.at if isinstance(target, (refusals.FreshReading, refusals.StaleReading))
                      and isinstance(target.weekly, refusals.ReadingWindow) else NoTargetReading())
         target_usage = usage_store.load().get(usage_store.key("Claude", target_identity.login), {})
-        if usage_store.latest_read_outcome(target_usage) == agent_accounts.UsageReadOutcome.STALE_TOKEN:
+        if usage_store.latest_read_outcome(target_usage) in (agent_accounts.UsageReadOutcome.STALE_TOKEN,
+                                                          agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN):
             attempt = accounts.login_renewal_attempts().get(rule.to)
             reason = (TargetLoginRenewalFailed(attempt.result.detail)
                       if attempt is not None and isinstance(attempt.result, accounts.LoginRenewalFailed)
@@ -1252,7 +1253,8 @@ def renew_expired_logins(now: datetime, dry_run: bool) -> list[str]:
         if not isinstance(identity, agent_accounts.NumberedAccount):
             continue
         usage = stored.get(usage_store.key("Claude", identity.login), {})
-        if usage_store.latest_read_outcome(usage) != agent_accounts.UsageReadOutcome.STALE_TOKEN:
+        if usage_store.latest_read_outcome(usage) not in (agent_accounts.UsageReadOutcome.STALE_TOKEN,
+                                                       agent_accounts.UsageReadOutcome.NO_LOGIN_TOKEN):
             continue
         previous = attempts.get(named.label)
         if previous is not None and now - previous.at < timedelta(minutes=60):

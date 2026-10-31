@@ -348,7 +348,8 @@ def merge(stored: UsageReadings, reports: list[Report], checked_at: datetime) ->
     """
     changed = False
     for report in reports:
-        if report.usage_read_outcome == UsageReadOutcome.HELD or report.tool not in ("Claude", "Codex"):
+        if (report.usage_read_outcome in (UsageReadOutcome.HELD, UsageReadOutcome.CREDENTIALS_UNAVAILABLE)
+                or report.tool not in ("Claude", "Codex")):
             continue
         if report.tool == "Claude" and isinstance(report.usage_read_claim, UsageReadClaim):
             current = stored.get(key("Claude", report.email or ""), StoredUsage())

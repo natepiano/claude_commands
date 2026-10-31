@@ -2333,7 +2333,7 @@ def restore_server(name: str, timeout_ms: int, *,
     raise MacDesktopUnavailable()
 
 
-def shared_session() -> str:
+def shared_session(*, dependencies: Callable[[Path], None] | None = None) -> str:
     """The one herdr session every Claude session lives in, one workspace per production and one tab
     per Claude session: `agents`, or the name in `herdr/shared-session` under the config directory.
 
@@ -2341,6 +2341,8 @@ def shared_session() -> str:
     (user, 2026-10-26); `_require_shared` refuses any other name.
     """
     path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "herdr" / "shared-session"
+    if dependencies is not None:
+        dependencies(path)
     try:
         name = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
