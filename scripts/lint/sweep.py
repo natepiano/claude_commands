@@ -62,8 +62,8 @@ only when the first build ends, or never. Cargo's registry carries the same
 tag with no build tree. A folder made before a build with
 CARGO_CACHE_RUSTC_INFO=0 has neither and stays unseen. Orphaned files go first
 from every idle target. Then the least recently used idle target loses
-output, then by build-unit use within each target. Targets used within
-recent_minutes (60 by default) go last, whatever their location.
+output, then by build-unit use within each target. Recent targets are not
+held back. Each scan under the floor records its shortfall and idle targets.
 On 2026-10-08 the tag rule found 76 targets where
 .rustc_info.json alone found 41: 31 finished scratch targets carried only the
 tag, and one in its first build had reached 22 GiB unseen. A target's last use
@@ -171,10 +171,10 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, TypeGuard, TypedDict, cast, overload
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from process_failure import failure_detail
@@ -328,6 +328,7 @@ class Scan:
     links: dict[InodeKey, int] = field(default_factory=dict)
     groups: list[Group] = field(default_factory=list)
     orphans: list[Group] = field(default_factory=list)
+    target_bytes: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1170,6 +1171,14 @@ class ConfirmedDeletion:
 
 
 @dataclass(frozen=True)
+class UnconfirmedReclaim:
+    """Old names are gone, but their blocks may still belong to a renamed or linked inode."""
+
+    removed: int
+    paths: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class PendingUnlink:
     path: str
     device: int
@@ -1177,6 +1186,21 @@ class PendingUnlink:
     blocks: int
     links: int
     directory: bool
+
+
+@overload
+def removed_entry_account(entry: PendingUnlink, confirmed: Literal[True]) -> ConfirmedDeletion: ...
+
+
+@overload
+def removed_entry_account(entry: PendingUnlink, confirmed: Literal[False]) -> UnconfirmedReclaim: ...
+
+
+def removed_entry_account(entry: PendingUnlink, confirmed: bool) -> ConfirmedDeletion | UnconfirmedReclaim:
+    """Only a returned unlink of the last link proves reclaimed blocks."""
+    if not confirmed:
+        return UnconfirmedReclaim(1, (entry.path,))
+    return ConfirmedDeletion(entry.blocks if not entry.directory and entry.links == 1 else 0, 0, 1)
 
 
 @dataclass
@@ -1193,6 +1217,7 @@ class TrimTake:
     group_paths: list[str] = field(default_factory=list)
     stage: Literal["deleting", "publishing"] = "deleting"
     log_offset: int = 0
+    unconfirmed_paths: list[str] = field(default_factory=list)
 
     def save(self) -> None:
         write_text_atomic(trim_intent_path(self.target), json.dumps(asdict(self)) + "\n")
@@ -1211,31 +1236,37 @@ class TrimTake:
         self.at = time.time()
         self.save()
 
-    def confirm(self, account: ConfirmedDeletion) -> None:
-        self.bytes_freed += account.bytes
+    def confirm(self, account: ConfirmedDeletion | UnconfirmedReclaim) -> None:
+        if isinstance(account, ConfirmedDeletion):
+            self.bytes_freed += account.bytes
+            if account.removed:
+                self.at = time.time()
+        else:
+            self.unconfirmed_paths.extend(account.paths)
         self.removed += account.removed
-        if self.group_paths and not any(os.path.lexists(path) for path in self.group_paths):
+        if self.group_paths and all(
+                not os.path.lexists(path) or path in self.unconfirmed_paths for path in self.group_paths):
             self.remaining_groups = max(0, self.remaining_groups - 1)
         self.pending = []
         self.group_paths = []
-        self.at = time.time()
         self.save()
 
-    def recover(self) -> None:
-        """An interrupted group keeps its pre-unlink identities and link counts."""
-        if not self.group_paths:
-            return
-        missing: dict[InodeKey, list[PendingUnlink]] = {}
-        removed = 0
+    def recover(self) -> ConfirmedDeletion | UnconfirmedReclaim:
+        """A missing or replaced name proves removal, never reclaimed blocks."""
+        paths: list[str] = []
         for entry in self.pending:
             try:
-                _ = os.lstat(entry.path)
+                current = os.lstat(entry.path)
+                if (current.st_dev, current.st_ino) == (entry.device, entry.inode):
+                    continue
             except FileNotFoundError:
-                removed += 1
-                if not entry.directory:
-                    missing.setdefault((entry.device, entry.inode), []).append(entry)
-        freed = sum(entries[0].blocks for entries in missing.values() if len(entries) >= entries[0].links)
-        self.confirm(ConfirmedDeletion(freed, 0, removed))
+                pass
+            account = removed_entry_account(entry, False)
+            paths.extend(account.paths)
+        result = UnconfirmedReclaim(len(paths), tuple(paths)) if paths else ConfirmedDeletion(0, 0)
+        if self.group_paths:
+            self.confirm(result)
+        return result
 
     def publish(self) -> bool:
         """An append seen after a stop is the same row, not another trim."""
@@ -1245,12 +1276,7 @@ class TrimTake:
             return True
         if self.stage == "deleting":
             log_path = store.host_file(store.host_name(), self.at)
-            try:
-                with log_path.open("rb") as log:
-                    fcntl.flock(log, fcntl.LOCK_SH)
-                    self.log_offset = log.seek(0, os.SEEK_END)
-            except FileNotFoundError:
-                self.log_offset = 0
+            self.log_offset = store.read_last_whole_row_end(log_path)
             self.stage = "publishing"
             self.save()
         if not trim_row_recorded(self):
@@ -1277,12 +1303,19 @@ def read_trim_intent(path: Path) -> TrimTake:
     target, cause, stage = raw["target"], raw["cause"], raw["stage"]
     counts = [raw[name] for name in ("remaining_groups", "bytes_freed", "removed", "log_offset")]
     pending, group_paths, at = raw["pending"], raw["group_paths"], raw["at"]
+    unconfirmed = raw.get("unconfirmed_paths", [])
     if (not isinstance(target, str) or not os.path.isabs(target) or trim_intent_path(target) != path
             or cause not in ("budget take", "floor take") or stage not in ("deleting", "publishing")
             or not all(isinstance(value, int) and value >= 0 for value in counts) or not _finite_number(at)
             or not isinstance(pending, list) or not isinstance(group_paths, list)
+            or not isinstance(unconfirmed, list)
+            or not all(isinstance(value, str) for value in cast(list[object], unconfirmed))
             or not all(isinstance(value, str) for value in cast(list[object], group_paths))):
         raise ValueError(f"invalid trim intent: {path}")
+    try:
+        _ = store.utc_iso(float(at))
+    except (ValueError, OverflowError, OSError) as error:
+        raise ValueError(f"invalid trim intent time: {path}: {error}") from error
     entries: list[PendingUnlink] = []
     for entry in cast(list[object], pending):
         if not isinstance(entry, dict):
@@ -1297,21 +1330,36 @@ def read_trim_intent(path: Path) -> TrimTake:
                                      cast(int, numbers[2]), cast(int, numbers[3]), directory))
     return TrimTake(target, cause, cast(int, counts[0]),
                     float(at), cast(int, counts[1]), cast(int, counts[2]), entries,
-                    cast(list[str], group_paths), stage, cast(int, counts[3]))
+                    cast(list[str], group_paths), stage, cast(int, counts[3]), cast(list[str], unconfirmed))
+
+
+@dataclass(frozen=True)
+class DamagedTrimIntentSetAside:
+    path: Path
+
+
+def load_trim_for_recovery(path: Path) -> TrimTake | DamagedTrimIntentSetAside:
+    """Keep a bad intent for inspection without stopping the next take."""
+    try:
+        return read_trim_intent(path)
+    except (ValueError, KeyError, TypeError) as error:
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        destination = path.with_name(path.name + ".damaged-" + stamp)
+        number = 2
+        while destination.exists():
+            destination = path.with_name(path.name + ".damaged-" + stamp + f"-{number}")
+            number += 1
+        _ = path.rename(destination)
+        print(f"lint sweep: could not recover {path}: {error}; set aside as {destination}", file=sys.stderr)
+        return DamagedTrimIntentSetAside(destination)
 
 
 def build_log_rows(paths: Iterable[Path], start: int = 0) -> Iterator[dict[str, object]]:
     """One JSON-line reader for rebuild evidence and trim publication recovery."""
     for path in paths:
-        with path.open(encoding="utf-8") as handle:
+        with path.open("rb") as handle:
             fcntl.flock(handle, fcntl.LOCK_SH)
-            _ = handle.seek(start)
-            for line in handle:
-                if not line.endswith("\n"):
-                    continue
-                raw = cast(object, json.loads(line))
-                if isinstance(raw, dict):
-                    yield cast(dict[str, object], raw)
+            yield from store.whole_rows(handle, start)
 
 
 def trim_row_recorded(take: TrimTake) -> bool:
@@ -1341,11 +1389,12 @@ def recoverable_trim(target: str, cause: Literal["budget take", "floor take"], s
         take = TrimTake(target, cause, len(groups))
         recovered = True
         if path.exists():
-            unfinished = read_trim_intent(path)
-            unfinished.recover()
-            recovered = unfinished.publish()
-            if not recovered:
-                take = unfinished
+            unfinished = load_trim_for_recovery(path)
+            if not isinstance(unfinished, DamagedTrimIntentSetAside):
+                _ = unfinished.recover()
+                recovered = unfinished.publish()
+                if not recovered:
+                    take = unfinished
         active = dict(TRIM_TAKES.get())
         active.update({group.build_tree: take for group in groups})
         token = TRIM_TAKES.set(active)
@@ -1368,13 +1417,15 @@ def recover_pending_trims(locked_targets: Sequence[str] = ()) -> None:
             except BlockingIOError:
                 continue
             try:
-                take = read_trim_intent(path)
+                take = load_trim_for_recovery(path)
+                if isinstance(take, DamagedTrimIntentSetAside):
+                    continue
                 locks = (TargetLocksAcquired([]) if take.target in locked_targets
                          else lock_trees(build_trees(take.target)))
                 if isinstance(locks, TargetLockBusy):
                     continue
                 try:
-                    take.recover()
+                    _ = take.recover()
                     if not take.publish():
                         continue
                 finally:
@@ -1438,14 +1489,17 @@ def remove_entry_at(name: str, parent_fd: int, display_path: str) -> ConfirmedDe
                 if not os.path.samestat(before, os.lstat(name, dir_fd=parent_fd)):
                     raise OSError("directory changed before removal")
                 os.rmdir(name, dir_fd=parent_fd)
-                removed += 1
+                account = removed_entry_account(PendingUnlink(
+                    display_path, before.st_dev, before.st_ino, before.st_blocks * 512, before.st_nlink, True), True)
+                removed += account.removed
             finally:
                 os.close(directory_fd)
         else:
             os.unlink(name, dir_fd=parent_fd)
-            removed += 1
-            if before.st_nlink == 1:
-                freed = before.st_blocks * 512
+            account = removed_entry_account(PendingUnlink(
+                display_path, before.st_dev, before.st_ino, before.st_blocks * 512, before.st_nlink, False), True)
+            removed += account.removed
+            freed = account.bytes
     except FileNotFoundError:
         pass
     except OSError as error:
@@ -1588,12 +1642,15 @@ def scan_roots(roots: list[str], trees: list[str]) -> Scan:
 
 def scan_floor_roots(roots: list[str], trees: dict[str, list[str]]) -> Scan:
     """Scan independent targets with bounded IO concurrency and no cargo locks."""
-    if len(roots) <= 1:
-        return scan_roots(roots, [tree for root in roots for tree in trees[root]])
-
     def scan_target(root: str) -> Scan:
-        return scan_roots([root], trees[root])
+        scan = scan_roots([root], trees[root])
+        scan.target_bytes[root] = sum(scan.blocks.values())
+        return scan
 
+    if not roots:
+        return Scan()
+    if len(roots) == 1:
+        return scan_target(roots[0])
     combined = Scan()
     with ThreadPoolExecutor(max_workers=4) as workers:
         for scan in workers.map(scan_target, roots):
@@ -1602,6 +1659,7 @@ def scan_floor_roots(roots: list[str], trees: dict[str, list[str]]) -> Scan:
             combined.links.update(scan.links)
             combined.groups.extend(scan.groups)
             combined.orphans.extend(scan.orphans)
+            combined.target_bytes.update(scan.target_bytes)
     return combined
 
 
@@ -2273,7 +2331,6 @@ def hold_floor(
     dry_run: bool,
     roots: Sequence[str] = FLOOR_ROOTS,
     lock: str = FLOOR_LOCK,
-    recent_minutes: float = DEFAULT_RECENT_MINUTES,
 ) -> int:
     """Below the floor, take the shortfall from the least used idle targets."""
     if not dry_run:
@@ -2352,10 +2409,14 @@ def hold_floor(
         left, failures = total, 0
         chosen: list[tuple[Group, int]] = []
         if scanned_free < floor:
+            if not dry_run:
+                record.floor_scan(scanned_free, floor, [
+                    {"folder": root, "last_use": target_uses[root], "bytes": scan.target_bytes[root]}
+                    for root in sorted(idle, key=lambda root: (target_uses[root], root))
+                ], time.time())
             left, failures, chosen = shrink_floor(
                 scan, total, budget, dry_run, tree_targets, known_trees, busy,
                 lambda group: (
-                    float(target_uses[tree_targets[group.build_tree]] > planned_at - recent_minutes * 60),
                     target_uses[tree_targets[group.build_tree]],
                     *unit_age(group, planned_at),
                 ),
@@ -2728,6 +2789,9 @@ def read_rebuild_steps(root: Path) -> list[RebuildStep]:
 def clone_kind(folder: str) -> str:
     path = Path(folder)
     parts = path.parts
+    # A scratch HOME sits under /tmp, so its ~/rust worktrees are named before the /tmp groups.
+    if path.is_relative_to(Path.home() / "rust"):
+        return "~/rust worktrees"
     if path.is_relative_to("/tmp") or path.is_relative_to("/private/tmp"):
         # Older copies include gate57e, mergeclone and p34-merge-<sha>.
         if any(re.search(r"(?:^|[-_])(gate|merge)", part) for part in parts):
@@ -2742,8 +2806,6 @@ def clone_kind(folder: str) -> str:
                for part in parts):
             return "mktemp folders"
         return "other /tmp"
-    if path.is_relative_to(Path.home() / "rust"):
-        return "~/rust worktrees"
     return "other"
 
 
@@ -2853,7 +2915,7 @@ def main(argv: list[str]) -> int:
     if floor_only:
         status = tmp_sweep.run_if_due(dry_run) or status
     if floor is not None:
-        status = hold_floor(floor, dry_run, recent_minutes=recent_minutes) or status
+        status = hold_floor(floor, dry_run) or status
     return status
 
 
