@@ -2939,7 +2939,7 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 #### As-built
 
 - `scripts/lib/process_failure.failure_detail(result, *, lines=20)` returns the last `lines` lines of stderr and of stdout, each labelled (`stderr: …`, `stdout: …`), stderr first, an empty stream left out, and `exit <code>` when both are empty.
-- `ci_points.py` uses it in `required`, the validation step and the review watch; `merge_checkpoint.push_validate` uses it for its validate_and_push failure. `report()` joins the lines with `; `, so each step is still one line. A validation failure with no output now reads `exit <code>`, not `validation failed`.
+- `ci_points.py` uses it in `required` and the review watch; `merge_checkpoint.push_validate` uses it for its validate_and_push failure. `report()` joins the lines with `; `, so each step is still one line. Since Phase 101i, CI-point validation saves both streams in `<state dir>/ci_validation.log` and reports `step <label> failed; log <path>`, or `exit <code>, no step named; log <path>` without a failure marker.
 - 37 other copies of the old pattern remain; Phase 101e moves them.
 
 **Files:**
@@ -2955,7 +2955,7 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 - `validate_and_push.sh --validate-only` runs validation in the copy and makes at most one fix commit there. It does not push.
 - Publish runs under `merge_checkpoint.merge_lock`: it fetches the copy's `HEAD` into the production checkout, does a guarded `git merge --ff-only`, then runs `push_direct.sh --publish-only <sha>`, which prints `<sha> pushed` or `<sha> contained`.
 - The publish rule: if `origin/<merge branch>` contains the sha, the run passes and nothing is pushed. A fix commit is pushed only when it fast-forwards `origin/<merge branch>`. Otherwise the run fails with `merge branch moved during validation`. Nothing is ever force-pushed.
-- After the lock is released, `push_direct.sh --follow-published <sha> <state>` runs the hook, the CI-run lookup and the cancellation of older runs (`CANCEL_PRIOR` env). The validation report line follows the publish receipt. Failures keep `failure_detail`.
+- After the lock is released, `push_direct.sh --follow-published <sha> <state>` runs the hook, the CI-run lookup and the cancellation of older runs (`CANCEL_PRIOR` env). The successful validation report line follows the publish receipt. Command failures keep `failure_detail` except validation itself: its combined output stays in `<state dir>/ci_validation.log` after copy removal, and its failure line names the last failing step (or exit code when unnamed) and that log.
 
 **Files:**
 - `scripts/production/ci_points.py` — the fixed sha, the copy, publish under `merge_lock`, the report line.
@@ -3016,3 +3016,22 @@ Showrunner ruling 2026-10-31 06:29 EDT; user asked for the Mac fix at 06:30.
 User 2026-10-31 07:5x EDT: claude3 showed a red dot on the Mac board while signed in.
 
 **As-built:** launchd job `account-usage` (`/etc/nixos/modules/darwin/account-usage.nix`, every 120 s, at login, Aqua session) runs `agent_notes.py usage-only`, which reads usage and sends no alerts and changes no routing; a read that cannot reach credentials (signed-out CLI answer, exit 1 over ssh) records CREDENTIALS_UNAVAILABLE and keeps the last good outcome. Review: two lenses found F001 (signed-out exit 1 still stored ERROR); one fix round; closure approved.
+
+### Phase 101i — A failed CI point names its failing step and log  · status: done
+
+Showrunner defect 2026-10-31 09:3x EDT, reported by hana: a CI point's validation line opened with memory-wait lines and hid a killed nextest. Confirmed: a 25-line memory wait gives a 2.6 KB line whose first 2.3 KB are wait lines; the failing step and the kill are at its end, and no log is kept, because the output lived only in the temporary copy.
+
+**Depends on:** none.
+
+#### Work Order
+
+- `ci_points.ci_start` writes validation's whole output, stdout and stderr in order (`stderr=subprocess.STDOUT`), to `<state dir>/ci_validation.log`, replaced at each start. The log stays after the copy is removed, pass or fail.
+- On a failed validation the line reads `validation: failed — step <label> failed; log <path>`, where `<label>` is the last `!!! VALIDATION FAILED at step: <label> !!!` line in the log (`validate_ci.sh` `run_step`). With no such line: `validation: failed — exit <code>, no step named; log <path>`. No wait line and no output tail goes in the report line; the log holds them.
+- An `OSError` opening the log or starting the command is still a `PointFailure("validation", …)`.
+- Docs: Phase 101c and 101d text that says validation failures keep `failure_detail`, and any as-built or command doc that describes the validation line (`docs/as-built/merge-gate-and-test-speed.md`, `commands/showrunner/produce.md`, `commands/unit/ci.md`), match the new line.
+- Tests (`scripts/production/test_ci_points.py`): replace `test_validation_failure_names_the_failed_check_when_stderr_only_reports_memory_waits` with a stub that prints memory-wait lines to stderr, then a kill line and the `run_step` marker to stdout: the report names the step and the log path and holds no wait line; the log holds every line in order. Add the no-marker case. Add a passing run that still leaves the log.
+- Out of scope: `merge_checkpoint.push_validate` (`--quick`, runs in the checkout, no state dir).
+
+**Files:** `scripts/production/ci_points.py`, `scripts/production/test_ci_points.py`, the docs named above.
+
+**Checks:** `python3 -m unittest scripts.production.test_ci_points` from the repo root; basedpyright 0/0 on both files.
