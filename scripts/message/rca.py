@@ -50,6 +50,8 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import Literal, NamedTuple, TypedDict, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -59,7 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notify"))
 import push_texts  # noqa: E402
 import review  # noqa: E402
 import sessions  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import silence  # noqa: E402
 from user_zone import user_zone  # noqa: E402
 

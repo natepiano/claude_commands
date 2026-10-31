@@ -13,6 +13,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.lib.process_failure import failure_detail
 from production_units import Production, read_production
 from production_units import Refusal, cell_value
 from merge_checkpoint import CodeCheckpoint, MergeEntry, git, merge_branch_history
@@ -78,7 +81,7 @@ def command(step: str, *argv: str, cwd: Path | None = None) -> subprocess.Comple
 
 def required(result: subprocess.CompletedProcess[str], step: str) -> str:
     if result.returncode:
-        raise PointFailure(step, result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}")
+        raise PointFailure(step, failure_detail(result))
     return result.stdout.strip()
 
 
@@ -155,7 +158,7 @@ def ci_start(production: Production, state_dir: Path, no_ci: bool, cancel_prior:
         argv += ("--cancel-prior",)
     result = command("validation", *argv, cwd=production.checkout)
     if result.returncode:
-        raise PointFailure("validation", result.stderr.strip() or result.stdout.strip() or "validation failed")
+        raise PointFailure("validation", failure_detail(result))
     report("validation", "ok", "local validation passed")
     run = handoff(result.stdout)
     tip = branch_tip(production)
@@ -223,7 +226,7 @@ def review_watch(production: Production, state_dir: Path) -> WatchFirstAlert | W
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         watch_result = command("watch", sys.executable, str(review_script), "watch")
         if watch_result.returncode not in (0, 3):
-            raise PointFailure("watch", watch_result.stderr.strip() or watch_result.stdout.strip())
+            raise PointFailure("watch", failure_detail(watch_result))
         line = watch_result.stdout.strip()
         if watch_result.returncode != 3:
             return WatchBelowThreshold(line)

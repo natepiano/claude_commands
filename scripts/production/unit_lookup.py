@@ -15,16 +15,18 @@ from enum import Enum
 from pathlib import Path
 from typing import NamedTuple, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 MESSAGE = Path(__file__).resolve().parent.parent / "message"
 sys.path.insert(0, str(MESSAGE))
 sys.path.insert(0, str(MESSAGE.parent / "herdr"))
 sys.path.insert(0, str(MESSAGE.parents[1]))
 import herdr  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import sessions  # noqa: E402
 from herdr import HerdrPlace  # noqa: E402
 from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session  # noqa: E402
-from showrunners import canonical_slug  # noqa: E402
+from scripts.production.showrunners import canonical_slug  # noqa: E402
 from scripts.lib import unit_runs  # noqa: E402
 
 PRODUCTION_MARK = "SHOWRUNNER_UNIT"

@@ -89,10 +89,8 @@ class ProfileNotesPassTests(unittest.TestCase):
         )
         for module, attribute, value in paths:
             _ = self.enterContext(patch.object(module, attribute, value))
-        # Plain imports and package imports can refer to separate showrunner modules.
-        for module in (self.pass_.showrunners, import_module("showrunners")):
-            for attribute in ("CONFIG", "NOTIFIER_STATE_DIR", "SESSIONS_DIR", "SHOWRUNNER_STATE_DIR"):
-                _ = self.enterContext(patch.object(module, attribute, self.home / attribute))
+        for attribute in ("CONFIG", "NOTIFIER_STATE_DIR", "SESSIONS_DIR", "SHOWRUNNER_STATE_DIR"):
+            _ = self.enterContext(patch.object(self.pass_.showrunners, attribute, self.home / attribute))
         _ = self.enterContext(patch.object(import_module("scripts.message.process_table"), "PS", [str(self.bin / "ps")]))
         _ = (self.home / "showrunners.json").write_text(json.dumps({
             "threshold_percent": 2, "repeat_minutes": 30, "stall_minutes": 5,
