@@ -1061,7 +1061,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** a shared per-repository build folder for verify copies — its build lock serializes the copies.
 
-### Phase 35 — The hold wait line names the hold the session waits on  · status: todo
+### Phase 35 — The hold wait line names the hold the session waits on  · status: done
 **Depends on:** none.
 
 **Approved:** builds showrunner 2026-10-30, current add-on (wrong result, small), from natedev's check of change C44. Natedev closes C44 when this lands.
@@ -1085,7 +1085,8 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 - `scripts/build_targets/build_targets.py` — Spec 1-2.
 - `scripts/build_targets/test_build_targets.py` — Spec 3.
 - `docs/as-built/build-targets.md` — Spec 4.
-- If the fault also lives in `scripts/direct/verify.sh`, the change stays there (owner verify-unit; trial-merge against `origin/natedev-verify`) and the notice carries an also-touches line.
+
+`scripts/direct/verify.sh` prints no `is held by` line of its own (checked 2026-10-30), so the fix stays in `build_targets.py` and the notice needs no also-touches line.
 
 **Workers:** `1 writer + 1 tester`
 - `impl` — `build_targets.py` and the doc.
