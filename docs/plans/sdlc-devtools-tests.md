@@ -109,37 +109,23 @@ Known input for the inventory: `scripts/agents/test_codex_mesh.py` was killed at
 ### Phase 2c — The assertion guard pairs a moved Rust string continuation  · status: done
 **Depends on:** none
 
-#### Work Order
+#### As-built
 
-**Goal:** a Rust assertion that moves and changes indent, with a `\` line continuation inside a string, pairs with its old copy and is no finding.
-
-**Spec:**
-- Source: the sdlc showrunner, 2026-10-30, change-review row C437: in `~/rust/cargo-liner`, `assertion_guard.py --base e21d5b93^ --head e21d5b93` prints 74 blocking where the row says 73. "If the guard got better, correct the row; if wrong, fix the guard." The guard is wrong: the 74th item is `crates/cargo-tile/src/render.rs:14864 a_short_tree_asks_for_fewer_rows_than_a_long_one removed`. The commit moved that assertion to `render/tests/mod.rs:15961` with one less indent. Its tokens are the same; only the spaces after a `\` line continuation inside the message string changed (13 to 9).
-- **Cause.** `normalized()` (`scripts/direct/assertion_guard.py:140-148`, since db889600, phase 6b) keeps each literal span exactly as written, so whitespace inside a Rust string continuation counts. Rust drops a `\` + newline and all leading whitespace on the next line, so both strings have the same value.
-- **Fix at the cause.** Inside a non-raw Rust string literal (`"…"`, `b"…"`, `c"…"`), the comparison key removes each `\` + newline + the leading whitespace after it, which is Rust's own rule. An escaped backslash (`\\`) before a newline is no continuation. Raw strings (`r"…"`, `r#"…"#`) keep their text as written. Python literals keep their text as written. Every other part of the 6b literal-exact pairing stays as it is.
-- After the fix, the C437 command prints 73 blocking again, and the row stays as written.
+- `normalized(text: str, rust: bool) -> str` builds the comparison key. Inside a non-raw Rust string (`"…"`, `b"…"`, `c"…"`), `rust_string_key` drops each `\` + newline + the leading whitespace on the next line, which is Rust's own rule. A Rust assertion that moves and changes indent after a `\` continuation in its message pairs with its old copy and is no finding. A changed word after the `\` is still a finding.
+- `rust_string_key` reads escape pairs in order, so an escaped `\\` before a newline is no continuation. Raw strings (`r"…"`, `r#"…"#`, `br#"…"#`, `cr#"…"#`) and every Python literal keep their text as written.
+- The `rust` flag is `path.endswith(".rs")` of the file. `DiffLine.key`, `parse_assertion`, `comparison_operands`, `numeric_comparison` and `finding_identity` pass it. Every file uses the Rust lexer (`lexical_spans(text, True)`), as before; the flag decides only whether the continuation rule runs.
+- `RUST_LITERAL` reads the `c"…"` and `cr#"…"#` prefixes.
+- In `~/rust/cargo-liner`, `assertion_guard.py --base e21d5b93^ --head e21d5b93` prints `assertion guard: 73 blocking`, with the same 73 items as before. Change-review row C437 stays as written.
 
 **Files:**
-- `scripts/direct/assertion_guard.py` — the key rule
-- `scripts/direct/test_assertion_guard_strings.py` — regression tests
-- `scripts/direct/assertion_guard_test_support.py` — fixture additions, if needed
+- `scripts/direct/assertion_guard.py` — `rust_string_key`, the `rust` flag on `normalized` and its callers, the `c`/`cr` prefixes in `RUST_LITERAL`.
+- `scripts/direct/test_assertion_guard_strings.py` — tests for a moved continuation (`""`, `b`, `c`), a changed word, escaped backslashes, raw strings, and Python continuations and f-strings.
+- `scripts/direct/assertion_guard_test_support.py` — `move_rust_assertion_to_test_file`, which moves a test from `render.rs` to `render/tests/mod.rs` with a new indent.
 
-**Workers:** `1 writer + 1 tester`.
-- `impl` — `scripts/direct/assertion_guard.py`
-- `test` — `scripts/direct/test_assertion_guard_strings.py`, `scripts/direct/assertion_guard_test_support.py`
+**Gotchas:**
+- `numeric_comparison` passes the file's own flag. Python never gets to numeric pairing, because `numeric_constants` is set only for `.rs` files.
 
-**State:** none.
-
-**Constraints from prior phases:** every hang limit comes from `scripts/lib/test_hang_guard.py` (Phase 2).
-
-**Acceptance gate:**
-- A test through the real guard on a fixture repo: an assertion with a `\` continuation in its message moves to a new file with a new indent and less space after the `\`; the guard reports no finding for it. Without the fix, the test fails.
-- A test: the same move where the string's value changes (a word after the `\` differs) is still a finding.
-- A test: an escaped `\\` before a newline, and a raw string with `\` and a newline, keep their whitespace in the key.
-- `python3 -m unittest discover -s scripts/direct -p 'test_assertion_guard*.py'`: green.
-- In `~/rust/cargo-liner`, `python3 scripts/direct/assertion_guard.py --repo ~/rust/cargo-liner --base e21d5b93^ --head e21d5b93` from the worktree prints `assertion guard: 73 blocking`, and its other 73 items are the ones the current guard prints. The director runs this check.
-- basedpyright prints `0 errors, 0 warnings, 0 notes` on each slot's changed files.
-- The director runs the full merge gate (`--tests-only --full`) on the phase tree.
+**Ruled out:** the Python lexer for `.py` files in the key (it changes the 6b literal-exact pairing outside this rule); the continuation rule for Python literals.
 
 ### Phase 3 — Close-route closes a route made before its phase record  · status: done
 **Depends on:** none
