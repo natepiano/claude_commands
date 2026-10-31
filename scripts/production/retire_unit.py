@@ -203,19 +203,21 @@ def _git(unit: Unit, *arguments: str) -> subprocess.CompletedProcess[str]:
 
 
 def branch_refs(unit: Unit, *, read_only: bool = False) -> list[str]:
-    """The unit's branch here and on origin; a preview reads origin's tip without fetching."""
+    """The unit's branch here and on origin; a preview fetches objects without updating refs."""
     refs: list[str] = []
     if _git(unit, "show-ref", "--verify", "--quiet", f"refs/heads/{unit.branch}").returncode == 0:
         refs.append(f"refs/heads/{unit.branch}")
     remote = _git(unit, "ls-remote", "--exit-code", "--heads", "origin", unit.branch)
     if remote.returncode == 0:
+        tracking = f"refs/remotes/origin/{unit.branch}"
+        fetched = _git(unit, "fetch", *(("--no-write-fetch-head", "--refmap=",) if read_only else ()),
+                       "-q", "origin", f"refs/heads/{unit.branch}" if read_only
+                       else f"+refs/heads/{unit.branch}:{tracking}")
+        if fetched.returncode:
+            raise Refused(f"cannot read origin {unit.branch}: {failure(fetched)}")
         if read_only:
             refs.append(remote.stdout.split()[0])
         else:
-            tracking = f"refs/remotes/origin/{unit.branch}"
-            fetched = _git(unit, "fetch", "-q", "origin", f"+refs/heads/{unit.branch}:{tracking}")
-            if fetched.returncode:
-                raise Refused(f"cannot read origin {unit.branch}: {failure(fetched)}")
             refs.append(tracking)
     elif remote.returncode != 2:
         raise Refused(f"cannot read origin {unit.branch}: {failure(remote)}")
@@ -265,12 +267,13 @@ def plan_saved_branch(unit: Unit, saved: SavedBranch | NoSavedBranch = NO_SAVED_
         if remote.stdout.splitlines() == [f"{saved.tip}\t{saved.ref}"]:
             remote_tip = saved.tip
         else:
+            fetched = _git(unit, "fetch", *(("--no-write-fetch-head", "--refmap=",) if read_only else ()),
+                           "-q", "origin", saved.ref)
+            if fetched.returncode:
+                raise Refused(f"cannot read {saved.ref}: {failure(fetched)}")
             if read_only:
                 remote_ref = remote.stdout.split()[0]
             else:
-                fetched = _git(unit, "fetch", "-q", "origin", saved.ref)
-                if fetched.returncode:
-                    raise Refused(f"cannot read {saved.ref}: {failure(fetched)}")
                 remote_ref = "FETCH_HEAD"
             result = _git(unit, "rev-parse", "--verify", f"{remote_ref}^{{commit}}")
             if result.returncode:

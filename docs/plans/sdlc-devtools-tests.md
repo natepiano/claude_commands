@@ -436,7 +436,7 @@ Source: Phase 7e closure review (F002), moved here under the landing rule (model
 
 **Gotchas:** the retired note keeps its session id when ref or tip change; resume parses `, ref ..., tip ...` after the folder.
 
-### Phase 7j — The retire dry run names the saved ref  · status: todo
+### Phase 7j — The retire dry run names the saved ref  · status: done
 
 Source: Phase 7i live-proof dry run on tool-based-ui `assembly` (tip 5f9b7b22837a, not on init/catalyst): the dry run printed `would delete: branch` with no save line, and its `would mark:` note had no ref and tip.
 

@@ -348,6 +348,14 @@ class RetireUnitTests(unittest.TestCase):
         _ = git(checkout, "commit", "-q", "-m", "checkpoint(alpha): later work")
         return git(checkout, "rev-parse", "HEAD")
 
+    def clone_writer(self) -> Path:
+        writer = self.root / "late-writer"
+        _ = git(self.checkout, "clone", "-q", "--branch", "alpha-branch", str(self.root / "origin.git"), str(writer))
+        _ = git(writer, "config", "user.email", "test@example.invalid")
+        _ = git(writer, "config", "user.name", "test")
+        _ = git(writer, "config", "commit.gpgsign", "false")
+        return writer
+
     def interrupt_before_removal(self) -> None:
         with mock.patch.object(retire_unit, "remove", side_effect=OSError("stop before removal")):
             code, output = self.retire()
@@ -401,11 +409,7 @@ class RetireUnitTests(unittest.TestCase):
         ref, first_tip = self.unmerged_work()
         _ = git(self.worktree, "push", "-q", "origin", "alpha-branch")
         self.interrupt_before_removal()
-        writer = self.root / "late-writer"
-        _ = git(self.checkout, "clone", "-q", "--branch", "alpha-branch", str(self.root / "origin.git"), str(writer))
-        _ = git(writer, "config", "user.email", "test@example.invalid")
-        _ = git(writer, "config", "user.name", "test")
-        _ = git(writer, "config", "commit.gpgsign", "false")
+        writer = self.clone_writer()
         later_tip = self.commit_later_work(writer)
         _ = git(writer, "push", "-q", "origin", "alpha-branch")
         code, output = self.retire()
@@ -629,6 +633,67 @@ class RetireUnitTests(unittest.TestCase):
         self.assertEqual(len(mark), 1, output)
         self.assertIn(f", ref {ref}, tip {tip}", mark[0])
         self.assertIn(f"session {DIRECTOR}", mark[0])
+
+    def test_dry_run_saves_an_unfetched_origin_tip_without_changing_local_state(self) -> None:
+        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
+        ref = f"refs/retired/{row.id}"
+        _ = git(self.checkout, "fetch", "-q", "origin")
+        writer = self.clone_writer()
+        tip = self.commit_later_work(writer)
+        _ = git(writer, "push", "-q", "origin", "alpha-branch")
+        unseen = subprocess.run(["git", "-C", str(self.checkout), "cat-file", "-e", tip],
+                                capture_output=True)
+        self.assertNotEqual(unseen.returncode, 0)
+        fetch_head = self.checkout / ".git/FETCH_HEAD"
+        before = (git(self.checkout, "for-each-ref"), fetch_head.read_bytes(),
+                  fetch_head.stat().st_mtime_ns, self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns,
+                  git(self.worktree, "rev-parse", "HEAD"))
+
+        code, output = self.retire("--dry-run")
+
+        self.assertEqual(code, 0, output)
+        lines = output.splitlines()
+        save = f"would save: {tip} to origin {ref}"
+        self.assertIn(save, lines)
+        self.assertLess(lines.index(save), lines.index(f"would remove: worktree {self.worktree}"))
+        self.assertIn(f", ref {ref}, tip {tip}", output)
+        self.assertEqual((git(self.checkout, "for-each-ref"), fetch_head.read_bytes(),
+                          fetch_head.stat().st_mtime_ns, self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns,
+                          git(self.worktree, "rev-parse", "HEAD")), before)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        self.assertEqual(self.stops(), [])
+
+    def test_dry_run_and_retire_refuse_an_unfetched_divergent_retired_tip(self) -> None:
+        ref, tip = self.unmerged_work()
+        _ = git(self.checkout, "fetch", "-q", "origin")
+        writer = self.clone_writer()
+        divergent_tip = self.commit_later_work(writer)
+        _ = git(writer, "push", "-q", "origin", f"{divergent_tip}:{ref}")
+        unseen = subprocess.run(["git", "-C", str(self.checkout), "cat-file", "-e", divergent_tip],
+                                capture_output=True)
+        self.assertNotEqual(unseen.returncode, 0)
+        fetch_head = self.checkout / ".git/FETCH_HEAD"
+        before = (git(self.checkout, "for-each-ref"), fetch_head.read_bytes(),
+                  fetch_head.stat().st_mtime_ns, self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns)
+
+        dry_code, dry_output = self.retire("--dry-run")
+
+        self.assertEqual(dry_code, 1, dry_output)
+        refusal = "refused: alpha-branch: branch and retired ref diverge; keep both before retiring"
+        self.assertIn(refusal, dry_output.splitlines())
+        self.assertEqual((git(self.checkout, "for-each-ref"), fetch_head.read_bytes(),
+                          fetch_head.stat().st_mtime_ns, self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          self.staff.staff_file.read_bytes(), self.staff.staff_file.stat().st_mtime_ns), before)
+        real_code, real_output = self.retire()
+        self.assertEqual(real_code, 1, real_output)
+        self.assertIn(refusal, real_output.splitlines())
+        self.assertEqual(self.doc.read_bytes(), before[3])
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), f"{divergent_tip}\t{ref}")
+        self.assertEqual(self.stops(), [])
 
     def test_dry_run_refuses_a_divergent_retired_ref_like_a_real_retirement(self) -> None:
         ref, tip = self.unmerged_work()
