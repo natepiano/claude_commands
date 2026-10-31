@@ -1,4 +1,4 @@
-"""Claude shell launchers keep a caller account or select the showrunners account."""
+"""Shell launchers select the caller's Claude account or the mapped Codex workers home."""
 from __future__ import annotations
 
 from scripts.lib.test_agents_registry import write_registry
@@ -14,6 +14,8 @@ import unittest
 from unittest.mock import patch
 
 from scripts.accounts import accounts
+from scripts.lib.nix_env_test_support import NixFixture
+from scripts.whoami.account_test_support import write_codex_auth
 
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -23,6 +25,78 @@ class LaunchedClaude(TypedDict):
     config: str
     memory: str
     token: str
+
+
+class LaunchedCodex(TypedDict):
+    home: str
+    arguments: list[str]
+
+
+class CodexCliLauncherTests(NixFixture):
+    workers: Path = Path()
+    launched: Path = Path()
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        notes = self.root / "notes"
+        notes.mkdir()
+        login = "cli-workers@example.invalid"
+        _ = (notes / "codex1.md").write_text(f"---\nlogin: {login}\n---\n")
+        # The selected login can be held in a differently numbered home.
+        self.workers = self.home / ".codex7"
+        self.workers.mkdir()
+        write_codex_auth(self.workers, login)
+        selection = self.home / ".claude/config/accounts.json"
+        selection.parent.mkdir(parents=True)
+        _ = selection.write_text('{"workers": "codex1"}')
+        registry = write_registry(self.root / "agents.conf", {
+            "assignments": {"cli": "codex"},
+            "cli.codex": {"interactive": "gpt-test:high", "commit_prep": "gpt-test:high"},
+            "cli.options": {"codex_service_tier": "default"},
+            "codex.agents": {"gpt-test": "high"},
+        })
+        self.launched = self.root / "codex-start.json"
+        self.env.update(AGENT_NOTES_DIR=str(notes), AGENTS_CONFIG_FILE=str(registry),
+                        AGENTS_CONFIG_PUBLISH="0", CODEX_CATALOG_SYNC_STATE_FILE=str(registry),
+                        CODEX_CONFIG_FILE=str(self.root / "codex.toml"),
+                        CODEX_MODELS_CACHE_FILE=str(self.root / "models.json"),
+                        CODEX_START_LOG=str(self.launched))
+        self.script(self.bin / "codex", '''import json, os, sys
+from pathlib import Path
+_ = Path(os.environ["CODEX_START_LOG"]).write_text(json.dumps({
+    "home": os.environ.get("CODEX_HOME", ""), "arguments": sys.argv[1:]}))
+''')
+
+    def test_cli_repl_and_skill_use_the_workers_home_over_a_callers_home(self) -> None:
+        for arguments in ([], ["commit_prep", "noclippy"]):
+            for caller_home in ("", str(self.root / "other-codex-home")):
+                with self.subTest(arguments=arguments, caller_home=caller_home):
+                    environment = dict(self.env)
+                    if caller_home:
+                        environment["CODEX_HOME"] = caller_home
+                    result = subprocess.run(["bash", str(SCRIPTS / "cli_agent/cli_agent.sh"), *arguments],
+                                            env=environment, cwd=self.work, capture_output=True, text=True,
+                                            timeout=300, check=False)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    launched = cast(LaunchedCodex, json.loads(self.launched.read_text()))
+                    self.assertEqual(launched["home"], str(self.workers))
+                    expected = ["-m", "gpt-test", "-c", 'model_reasoning_effort="high"',
+                                "-c", 'service_tier="default"']
+                    if arguments:
+                        expected.append("commit_prep noclippy")
+                    self.assertEqual(launched["arguments"], expected)
+
+    def test_unavailable_workers_account_refuses_before_codex_starts(self) -> None:
+        (self.workers / "auth.json").unlink()
+        for arguments in ([], ["commit_prep", "noclippy"]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(["bash", str(SCRIPTS / "cli_agent/cli_agent.sh"), *arguments],
+                                        env={**self.env, "CODEX_HOME": str(self.workers)}, cwd=self.work,
+                                        capture_output=True, text=True, timeout=300, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("accounts: workers is on codex1", result.stderr)
+                self.assertFalse(self.launched.exists())
 
 
 class ClaudeLauncherTests(unittest.TestCase):

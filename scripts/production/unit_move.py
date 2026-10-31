@@ -15,7 +15,7 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, cast
+from typing import NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "direct"))
@@ -25,8 +25,7 @@ import tidy_wrapped  # noqa: E402
 import unit_lookup  # noqa: E402
 import herdr  # noqa: E402
 import pane_record  # noqa: E402
-if TYPE_CHECKING:
-    from scripts.shutdown import shutdown_record
+from scripts.lib.process_failure import failure_detail  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json  # noqa: E402
 
 BERTH_KEY = "cargoBerthTarget"
@@ -50,7 +49,7 @@ def git(checkout: Path, *arguments: str) -> str:
     result = subprocess.run(["git", "-C", str(checkout), *arguments], capture_output=True,
                             text=True, check=False)
     if result.returncode:
-        raise RenameRefused(f"git {' '.join(arguments)}: {result.stderr.strip() or result.stdout.strip()}")
+        raise RenameRefused(f"git {' '.join(arguments)}: {failure_detail(result)}")
     return result.stdout.rstrip("\n")
 
 
@@ -293,6 +292,37 @@ def processes_inside(worktree: Path) -> list[int]:
     return sorted(found)
 
 
+class UnitConversation(NamedTuple):
+    """The conversation and account saved at the unit's Claude launch."""
+    session_id: str
+    account: str
+
+
+class NoUnitConversation(NamedTuple):
+    """No launch entry identifies this unit's conversation."""
+
+
+def unit_conversation(found: unit_lookup.MarkedUnit | None, *, session_id: str = "") -> UnitConversation | NoUnitConversation:
+    """Use the live director's id, then its pane launch; retained launches survive a stop."""
+    from scripts.accounts import accounts
+
+    if found is not None and isinstance(found.claude, unit_lookup.LiveClaude):
+        session_id = found.claude.session_id
+    if not session_id:
+        return NoUnitConversation()
+    if found is not None:
+        entry = pane_record.read(found.place.session).get(found.place.pane)
+        if entry is not None and entry["session_id"] == session_id and entry["config_dir"]:
+            return UnitConversation(session_id, accounts.claude_config_label(Path(entry["config_dir"])))
+    try:
+        entry = pane_record.launch_for_session(session_id)
+    except ValueError as error:
+        raise RenameRefused(str(error)) from error
+    return (UnitConversation(session_id, accounts.claude_config_label(Path(entry["config_dir"])))
+            if entry is not None and entry["config_dir"] else NoUnitConversation())
+
+
+
 class UnitPane(NamedTuple):
     unit: str
     place: herdr.HerdrPlace
@@ -312,7 +342,7 @@ def unit_pane(found: unit_lookup.MarkedUnit | None, _production: str) -> UnitPan
     return UnitPane(found.unit, found.place, shell)
 
 
-def close_unit_pane(pane: UnitPane | None, _saved: shutdown_record.SessionShutdown) -> None:
+def close_unit_pane(pane: UnitPane | None) -> None:
     """Close the unit's exact session-qualified pane after the caller stops the unit."""
     if pane is None:
         return

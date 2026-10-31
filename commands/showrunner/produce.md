@@ -1109,38 +1109,16 @@ land a phase sooner. Each design check covers every view of the change at once
       checks and shots for both run on the combined tree.
 </CrossUnitChange>
 
+<StopResume>
+Stop a local session with `agents stop SESSION`. Resume it in its own tab with
+`agents resume SESSION --why "reason"`. Move one session or a group with
+`accounts.py move SESSION_OR_GROUP claudeN --why "reason"`; it stops all selected
+sessions, then resumes each on that account with one message to continue its work
+and its existing workers. See `commands/shutdown.md`.
+</StopResume>
+
 ---
 
-<PauseForMove>
-A message whose first line starts `Pause for move:` or `Pause for stop:` is the
-shutdown mover asking this session to stop so it can move or stop it. Act on it
-at once, in the turn it arrives:
-
-1. Stop mid-step and start nothing new: no merge, gate or launch that has not
-   begun. Leave uncommitted work in place.
-2. Append a `### STATE` block to your LOG, and stop any build you started or name
-   it in the line below. For a move, leave Codex workers running; the mover pauses
-   them after you exit. For a stop, if ready names a running Codex worker, retry
-   when its turn finishes; start no new turns.
-3. Run the `shutdown.py ready --where "<one line>"` command the message gives.
-4. End the turn.
-
-The session is resumed with that line, on the account the message names; continue
-from it. A unit of yours that vanished during a move is the mover's to bring back:
-do not restore it while its move is in progress.
-
-Before the mover stops one of your units, you get one line from `shutdown`:
-`<unit> is stopping: <why>; it comes back on <account> within minutes`, or that
-it stays stopped until the user restarts it. One more line follows:
-`<unit> is back on <account>`, or `<unit> did not come back: <reason>`. The user
-is told of a failure; you hold the unit's work until it is back.
-
-To move a session yourself, or stop one to change its account, run
-`/showrunner:move`: it pauses the session first and proves the account it comes
-back on. Never send `/exit` into a pane, run `shutdown.py now`, kill a Claude
-process or resume `claude` with a `CLAUDE_CONFIG_DIR` by hand; a hook refuses
-each in your session.
-</PauseForMove>
 
 ---
 

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import cast, override
 from unittest import mock
@@ -110,6 +111,37 @@ class ProductionTreeTests(StaffTestCase):
             "session_dir": session_dir or None, "worker": worker or None,
             "pid": None if worker else os.getpid(),
         }))
+
+    def test_transferred_live_unit_edge_uses_its_staff_parent_despite_the_old_launch_mark(self) -> None:
+        for slug in ("natedev", "sdlc"):
+            _ = self.production(slug)
+            _ = staff.ensure("showrunner", name=slug)
+        parent = staff_sources.member(staff_sources.ShowrunnerMember("sdlc"), staff.snapshot())
+        assert isinstance(parent, staff_sources.MemberFound)
+        row = staff.ensure("unit", name="one", parent=parent.row.id)
+        other_parent = staff.ensure("showrunner", name="other")
+        duplicate = staff.ensure("unit", name="legacy-one", parent=other_parent.id)
+        _ = self.write_document({"schema": 1, "rows": [
+            (replace(member, name="one") if member.id == duplicate.id else member).to_json()
+            for member in staff.snapshot().rows
+        ]})
+        self.pane("w1:p1", session_id=DIRECTOR, environment={
+            "STAFF_ID": row.id, "SHOWRUNNER_UNIT": "natedev", "SHOWRUNNER_UNIT_ID": "one",
+        })
+        with (mock.patch.object(production_tree, "running_sessions", return_value=[record(DIRECTOR)]),
+              mock.patch.object(unit_lookup, "observed_unit_marks", return_value=(
+                  ("natedev", replace(unit(DIRECTOR, "one"), staff_id=row.id)),
+              ))):
+            edges = production_tree.tree()
+        self.assertEqual(edges, [{"manager": "session-sdlc", "member": DIRECTOR, "role": "unit"}])
+
+    def test_complete_tree_with_child_productions_reads_one_staff_snapshot(self) -> None:
+        with (mock.patch.object(staff, "snapshot", wraps=staff.snapshot) as reads,
+              mock.patch.object(unit_lookup, "observed_unit_marks", return_value=()),
+              mock.patch.object(production_tree, "running_sessions", return_value=[record(RUNNER), record(CHILD_RUNNER)])):
+            edges = production_tree.tree()
+        self.assertIn({"manager": RUNNER, "member": CHILD_RUNNER, "role": "showrunner"}, edges)
+        self.assertEqual(reads.call_count, 1)
 
     def test_seed_and_json_follow_staff_moves_despite_stale_documents_and_parent_files(self) -> None:
         main, child, gone = (staff_sources.member(staff_sources.ShowrunnerMember(slug), staff.snapshot())

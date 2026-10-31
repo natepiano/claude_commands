@@ -40,6 +40,31 @@ from scripts.production import staff
 
 @final
 class AddUnitLaunchTests(AddUnitTestCase):
+    def test_adding_a_unit_name_another_production_holds_refuses_and_keeps_the_row(self) -> None:
+        old_doc = self.staff.production("old", "alpha-unit", workspace="original")
+        original = staff.ensure("showrunner", name="original")
+        old = staff.ensure("unit", name="alpha", parent=original.id)
+        production = production_units.read_production(self.doc)
+        before = staff.snapshot()
+        with self.assertRaisesRegex(staff.StaffRefused, "unit name already exists: alpha"):
+            _ = add_unit.ensure_staff_unit(production, "alpha-unit")
+        self.assertEqual(staff.by_id(old.id), old)
+        self.assertIn("alpha-unit", old_doc.read_text())
+        self.assertEqual(staff.snapshot(), before)
+        self.assertEqual([row for row in staff.find(kind="unit") if row.name == "alpha"], [old])
+
+    def test_new_launch_carries_the_ensured_staff_identity(self) -> None:
+        _ = self.successful("alpha", "--standby")
+        rows = [row for row in staff.find(kind="unit") if row.name == "alpha"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(self.pane_environment().get("STAFF_ID"), rows[0].id)
+
+    def test_resumed_launch_carries_the_ensured_staff_identity(self) -> None:
+        _ = self.successful("alpha", "--standby", "--resume", "session-123", "--cwd", str(self.checkout))
+        rows = [row for row in staff.find(kind="unit") if row.name == "alpha"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(self.pane_environment().get("STAFF_ID"), rows[0].id)
+
     def test_add_unit_rerun(self) -> None:
         original = add_unit.ensure_staff_unit
         for after in (False, True):
@@ -485,6 +510,8 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.doc.write_text(self.production_doc("init/catalyst"), encoding="utf-8")
         _ = self.git("add", "docs/hana/tool-based-ui-production.md")
         _ = self.git("commit", "-m", "production under another merge branch")
+        (self.staff.source_root / "notifier/showrunner-build-followups/conf").unlink()
+        self.staff.register_production("tool-based-ui", self.doc)
         _ = self.successful("lfo", "--brief", "Add the LFO tool")
         worktree = self.root / "home/worktrees/lfo"
         self.assertIn(self.unit_row("lfo", branch="lfo", worktree=worktree,
@@ -882,6 +909,7 @@ class AddUnitLaunchTests(AddUnitTestCase):
         _ = self.git("add", "docs/plans/build-followups-production.md")
         _ = self.git("commit", "-m", "move checkout")
         _ = self.git("push", "origin", "build-followups")
+        self.staff.register_production("build-followups", self.doc)
         _ = self.successful("mul_add", "--plan", "docs/plans/given.md")
         self.assertIn(self.unit_row("mul_add", branch="mul_add",
                                     worktree=self.root / "home/worktrees/mul_add"), self.doc.read_text())

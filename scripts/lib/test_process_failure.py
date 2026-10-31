@@ -1,12 +1,52 @@
 """Failed commands retain the cause from both captured output streams."""
 
+import ast
+import re
 import subprocess
+import tempfile
+from pathlib import Path
 import unittest
 
 from scripts.lib.process_failure import failure_detail
 
 
+def stream_fallback_copies(folder: Path) -> list[tuple[Path, int]]:
+    """Find failure expressions that discard one captured stream for the other."""
+    pattern = re.compile(r"^([A-Za-z_][A-Za-z_0-9.]*)\.(stderr|stdout)\.strip\(\) or "
+                         + r"\1\.(stderr|stdout)\.strip\(\)(?:$| or )")
+    hits: list[tuple[Path, int]] = []
+    for path in sorted(folder.rglob("*.py")):
+        if path.name.startswith("test_") or path.name == "process_failure.py":
+            continue
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+            if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+                matched = pattern.match(ast.unparse(node))
+                if matched and matched[2] != matched[3]:
+                    hits.append((path.relative_to(folder), node.lineno))
+    return hits
+
+
 class ProcessFailureTests(unittest.TestCase):
+    def test_callers_never_discard_a_failure_stream(self) -> None:
+        self.assertEqual(stream_fallback_copies(Path(__file__).resolve().parents[1]), [])
+
+    def test_scan_detects_either_fallback_order_and_ignores_output_conditions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            for first, second in (("stderr", "stdout"), ("stdout", "stderr")):
+                with self.subTest(first=first):
+                    _ = (folder / "caller.py").write_text(
+                        f"detail = result.{first}.strip() or result.{second}.strip()\n"
+                        + "if result.returncode or result.stdout.strip() or result.stderr.strip(): pass\n"
+                    )
+                    _ = (folder / "test_caller.py").write_text(
+                        "detail = result.stderr.strip() or result.stdout.strip()\n"
+                    )
+                    _ = (folder / "process_failure.py").write_text(
+                        "detail = result.stderr.strip() or result.stdout.strip()\n"
+                    )
+                    self.assertEqual(stream_fallback_copies(folder), [(Path("caller.py"), 1)])
+
     def test_both_streams_are_labelled_with_stderr_before_stdout(self) -> None:
         result = subprocess.CompletedProcess(
             ["validate"], 7, stdout="\ncheck failed\nassertion details\n",

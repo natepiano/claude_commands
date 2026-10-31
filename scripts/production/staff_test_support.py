@@ -111,15 +111,18 @@ def observe_operation_lock() -> None:
         return
     watched = Path(os.environ["STAFF_TEST_LOCK_TARGET"])
     original = fcntl.flock
+    reported = False
 
     def report_then_lock(lock_file: int | IOBase, operation: int) -> None:
-        if operation == fcntl.LOCK_EX and watched.exists():
+        nonlocal reported
+        if not reported and operation & fcntl.LOCK_EX and watched.exists():
             descriptor = lock_file if isinstance(lock_file, int) else lock_file.fileno()
             opened, target = os.fstat(descriptor), watched.stat()
             if (opened.st_dev, opened.st_ino) == (target.st_dev, target.st_ino):
                 with socket.socket(socket.AF_UNIX) as signal:
                     signal.connect(notice)
                     signal.sendall(b"operation")
+                reported = True
         original(lock_file, operation)
 
     _ = mock.patch("fcntl.flock", side_effect=report_then_lock).start()
@@ -272,7 +275,8 @@ class StaffTestCase(unittest.TestCase):
         self.write_json(self.staff_file, document)
         return self.staff_file.read_bytes()
 
-    def write_json(self, path: Path, value: object) -> None:
+    @staticmethod
+    def write_json(path: Path, value: object) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 

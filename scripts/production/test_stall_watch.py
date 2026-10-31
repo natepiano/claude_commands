@@ -31,6 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdr"))
 
 from scripts.lib.socket_test_support import short_socket_directory
+from scripts.production import staff
+from scripts.production.staff_test_support import isolated_staff_file, showrunner_relationship, unit_membership
 import fake_unit_host
 from fake_unit_host import HostedUnit
 import fake_herdr
@@ -118,6 +120,7 @@ class StallWatchTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(short_socket_directory()))
+        self.enterContext(isolated_staff_file(self.root / "staff.json", self.environment))
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.notifier = self.root / "notifier"
@@ -240,6 +243,12 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             "faults_to": "natedev", "always": ["natedev"],
         }))
         for session, units in runners.items():
+            parent = showrunner_relationship(session)
+            live_units = [unit for unit in units if "retired" not in self.plans.get(unit, "").lower()]
+            intended = {unit_membership(session, unit).id for unit in live_units}
+            for row in staff.snapshot().find(kind="unit", parent=parent.id):
+                if row.id not in intended:
+                    _ = staff.retire(row.id)
             # A showrunner is recorded by its update timer alone, addressed to its Claude session id.
             self.production(session, tuple(units), doc=self.root / f"{session}-production.md")
             rows = [f"| {unit} | {self.plans.get(unit, '`docs/plan.md`')} | /tmp/no-worktree-of-{unit} | {unit} | — | — |"
@@ -400,17 +409,20 @@ with open(os.environ['STALL_TEST_RCA_LOG'], 'a') as log:
             doc = self.root / f"{slug}-production.md"
             _ = doc.write_text("\n".join(("# Production", f"- **Production slug:** {slug}", "## Units",
                                "| Unit | Plan | Worktree |", "| --- | --- | --- |",
-                               f"| alpha | docs/alpha.md | {self.root / 'alpha'} |",
-                               f"| beta | docs/beta.md | {self.root / 'beta'} |", "")))
+                               f"| {slug}-alpha | docs/alpha.md | {self.root / (slug + '-alpha')} |",
+                               f"| {slug}-beta | docs/beta.md | {self.root / (slug + '-beta')} |", "")))
             runners.append(showrunners.Showrunner(session=slug, socket="/fixture.sock",
                             slug=slug, zone="UTC", doc=str(doc)))
-        marked = {name: lookup.MarkedUnit(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name))
-                  for name in ("alpha", "beta")}
+            for unit in (f"{slug}-alpha", f"{slug}-beta"):
+                _ = unit_membership(slug, unit)
+        marked = {slug: {name: lookup.MarkedUnit(name, lookup.ClaudeNotRunning(), lookup.Place("fixture", name))
+                         for name in (f"{slug}-alpha", f"{slug}-beta")}
+                  for slug in ("first", "second")}
         with (mock.patch.dict(os.environ, self.environment),
               mock.patch.object(stall_watch, "processes", return_value=[]),
               mock.patch.object(showrunners, "load_settings", return_value={}),
               mock.patch.object(showrunners, "registered_showrunners", return_value=runners),
-              mock.patch.object(lookup, "marked_units", return_value=marked),
+              mock.patch.object(lookup, "marked_units", side_effect=marked.__getitem__),
               mock.patch.object(lookup, "read_run_states", wraps=lookup.read_run_states) as reads,
               mock.patch.object(stall_watch, "forget", return_value=None) as forget,
               mock.patch.object(stall_watch, "send_all") as send):
