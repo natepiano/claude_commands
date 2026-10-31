@@ -1149,6 +1149,7 @@ if [[ -n "${CACHE_SESSION_DIR}" && ( "$CMD" == test || "$CMD" == lint ) ]]; then
 fi
 if [[ ${#MAC_ENV_NAMES[@]} -gt 0 || "$MAC_FETCH_GIVEN" == 1 ]]; then CACHE_DIR=""; fi
 RUN_LOG=""
+RUN_LOG_PIDS=()
 VERDICT_KEY=""
 VERDICT_TREE_KEY=""
 CLIPPY_FIX_LIMIT_REACHED=0
@@ -3103,6 +3104,27 @@ run_log_tee() {
     trap '' INT TERM HUP
     exec tee -i -a "$RUN_LOG"
 }
+
+start_run_log() {
+    exec > >(run_log_tee)
+    RUN_LOG_PIDS+=("$!")
+    exec 2> >(run_log_tee >&2)
+    RUN_LOG_PIDS+=("$!")
+}
+
+stop_interrupted_run_log() {
+    # A tee can block on its output even after every writer closed its input.
+    # Keep readers through cleanup to avoid SIGPIPE, then reap them explicitly:
+    # they intentionally ignore group signals and cannot depend on EOF alone.
+    [[ ${#RUN_LOG_PIDS[@]} -gt 0 ]] || return 0
+    set +x
+    exec >/dev/null 2>&1
+    local pid
+    for pid in "${RUN_LOG_PIDS[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
+    for pid in "${RUN_LOG_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+    RUN_LOG_PIDS=()
+}
+
 if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     # Taken now, after the token and hold waits: an edit made while this call
     # waited is part of the tree it runs on.
@@ -3111,7 +3133,7 @@ if [[ -n "${CACHE_DIR}" ]] && mkdir -p "${CACHE_DIR}"; then
     fi
     RUN_LOG="${CACHE_DIR}/run.$$.log"
     : > "${RUN_LOG}"
-    exec > >(run_log_tee) 2> >(run_log_tee >&2)
+    start_run_log
 fi
 
 ACTIVITY_ACTIVE=0
@@ -3195,6 +3217,7 @@ verify_interrupted() {
     fi
     verify_cleanup interrupted
     final_pass_finish "$EXIT_STATUS"
+    stop_interrupted_run_log
     exit "$EXIT_STATUS"
 }
 trap 'verify_interrupted 2' INT

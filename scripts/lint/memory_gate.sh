@@ -26,6 +26,12 @@ BUILD_TARGETS_SCRIPT="${BUILD_TARGETS_SCRIPT:-$(cd "$(dirname "${BASH_SOURCE[0]}
 BUILDLOG_MEM_ADMIT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/memory_admit.py"
 USER_ZONE_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../lib" && pwd)/user_zone.py"
 
+# Queue identity belongs to this caller, never to a parent process's wait.
+# Rejoining callers assign these after sourcing, around the one step that
+# left the queue. Do not export a completed wait to a child launch or gate.
+BUILDLOG_MEM_WAIT_SINCE="" BUILDLOG_MEM_WAIT_FIRST_FILE=""
+export -n BUILDLOG_MEM_WAIT_SINCE BUILDLOG_MEM_WAIT_FIRST_FILE
+
 # A rejoined wait reports its full age; a fresh wait retains the local
 # elapsed clock (also used by launch callers with no queue identity).
 buildlog_memory_wait_time() {

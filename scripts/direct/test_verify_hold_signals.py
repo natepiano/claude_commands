@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 import signal
+import subprocess
 import time
 import unittest
 from datetime import datetime, timedelta
@@ -12,6 +14,9 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
+from scripts.direct.shell_function_test_support import shell_functions
+from scripts.direct.verify_token_wait_test_support import VERIFY
+from scripts.direct.wait_for_test_state import wait_for_file
 from scripts.direct.verify_hold_wait_test_support import (
     VerifyHoldWaitFixture,
     WaitObservation,
@@ -56,6 +61,46 @@ class VerifyHoldWaitTests(VerifyHoldWaitFixture):
 
     def test_hup_to_run_group_ends_memory_wait_and_all_children(self) -> None:
         self.assert_group_stop_clears_memory_wait(signal.SIGHUP)
+
+    def test_hup_reaps_log_readers_when_the_output_pipe_is_full(self) -> None:
+        # Fill the consumer's pipe before starting verify's real log helpers.
+        # No consumer drains it until after shutdown, so EOF on tee's input
+        # cannot finish a pending output write.
+        read_fd, write_fd = os.pipe()
+        try:
+            capacity = fcntl.fcntl(write_fd, fcntl.F_GETPIPE_SZ)
+            _ = os.write(write_fd, b"x" * capacity)
+            log = self.fixture.root / "blocked-run.log"
+            harness = shell_functions(VERIFY, "run_log_tee", "start_run_log", "stop_interrupted_run_log") + r'''
+RUN_LOG=$1 RUN_LOG_PIDS=()
+trap 'stop_interrupted_run_log; exit 129' HUP
+exec 3>&2
+start_run_log
+printf '%8192s' x
+printf '%s\n' "${RUN_LOG_PIDS[*]}" >&3
+read -r command
+'''
+            with subprocess.Popen(["bash", "-c", harness, "test", str(log)],
+                                  stdin=subprocess.PIPE, stdout=write_fd,
+                                  stderr=subprocess.PIPE, start_new_session=True, text=True) as process:
+                try:
+                    assert process.stderr is not None
+                    reader_pids = cast(str, process.stderr.readline())
+                    readers = [int(pid) for pid in reader_pids.split()]
+                    self.assertEqual(len(readers), 2)
+                    wait_for_file(log)
+                    os.killpg(process.pid, signal.SIGHUP)
+                    self.assertEqual(process.wait(timeout=5), 129)
+                    self.assertTrue(all(not Path(f"/proc/{pid}").exists() for pid in readers))
+                finally:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    _ = process.communicate(timeout=5)
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
 
     def test_interrupted_verification_removes_its_registered_call(self) -> None:
         self.hold()
