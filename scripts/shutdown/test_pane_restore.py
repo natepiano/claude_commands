@@ -71,7 +71,6 @@ class PaneRestoreTests(unittest.TestCase):
         self.root = Path()
         self.config = Path()
         self.opened: list[tuple[str, str, str, str, dict[str, str]]] = []
-        self.owned: list[str] = []
         self.live: list[str] = []
 
     @override
@@ -90,7 +89,6 @@ class PaneRestoreTests(unittest.TestCase):
                         mock.patch.object(pane_record, "RECORD_DIR", self.root / "herdr-panes"),
                         mock.patch.object(pane_record, "PROC", self.root / "proc"),
                         mock.patch.dict(os.environ, {"HOME": str(self.root)}),
-                        mock.patch.object(pane_restore, "all_session_records", self.records),
                         mock.patch.object(sessions, "live_sessions", self.live_sessions),
                         mock.patch.object(sessions, "running_sessions", list),
                         mock.patch.object(herdr, "open_tab", self.open_tab)):
@@ -99,9 +97,6 @@ class PaneRestoreTests(unittest.TestCase):
 
     def live_sessions(self) -> list[dict[str, str]]:
         return [{"sessionId": session_id} for session_id in self.live]
-
-    def records(self) -> list[dict[str, dict[str, str]]]:
-        return [{"session": {"session_id": session_id}} for session_id in self.owned]
 
     def open_tab(self, name: str, space: str, title: str, cwd: str, environment: dict[str, str]) -> str:
         self.opened.append((name, space, title, cwd, environment))
@@ -140,6 +135,17 @@ class PaneRestoreTests(unittest.TestCase):
             "--settings", SETTINGS])])
         self.assertEqual(client.closed, ["w1:p2"])
 
+    def test_stale_shutdown_state_does_not_prevent_restoring_a_stopped_pane(self) -> None:
+        state = self.root / "shutdown/account/sessions"
+        state.mkdir(parents=True)
+        _ = (state / "sid-alpha.json").write_text('{"session":{"session_id":"sid-alpha"}}')
+        self.entry()
+        with mock.patch.dict(os.environ, {"SHUTDOWN_STATE_DIR": str(state.parents[1])}):
+            code, output = self.run_restore(self.restored())
+        self.assertEqual(code, 0, output)
+        self.assertEqual(len(self.opened), 1)
+        self.assertIn("resumed sid-alpha", output)
+
     def test_a_pane_is_left_as_it_is_for_each_reason_and_named(self) -> None:
         cases: list[tuple[dict[str, object], str, str]] = [
             ({"ended": True}, "sid-alpha", "closed by hand"),
@@ -155,10 +161,6 @@ class PaneRestoreTests(unittest.TestCase):
                 self.assertEqual((code, self.opened), (0, []))
                 self.assertIn(reason, output)
         self.entry()
-        self.owned.append("sid-alpha")
-        _, output = self.run_restore(self.restored())
-        self.assertIn("a shutdown record owns it", output)
-        self.owned.clear()
         self.live.append("sid-alpha")
         _, output = self.run_restore(self.restored())
         self.assertIn("it already runs", output)
@@ -197,7 +199,9 @@ class PaneRestoreTests(unittest.TestCase):
                 {"session_id": session_id, "reason": reason}), env=environment, capture_output=True, text=True,
                 check=False, timeout=60)
             self.assertEqual(ran.returncode, 0, ran.stderr)
-            self.assertEqual(pane_record.read("agents")["w1:p2"]["ended"], ended, (session_id, reason))
+            entry = pane_record.read("agents")["w1:p2"]
+            assert "ended" in entry
+            self.assertEqual(entry["ended"], ended, (session_id, reason))
 
 
 if __name__ == "__main__":

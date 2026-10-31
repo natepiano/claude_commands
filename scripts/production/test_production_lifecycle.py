@@ -491,6 +491,16 @@ class LifecycleTests(LifecycleFixture):
         self.assertIn("smoke-launch: ok", passed.stdout)
         self.assertEqual(self.git("rev-parse", "main", cwd=self.origin), tip)
 
+    def test_showrunner_instructions_explain_stop_resume_and_account_move(self) -> None:
+        commands = Path(__file__).parents[2] / "commands/showrunner"
+        for name in ("produce.md", "move.md"):
+            with self.subTest(command=name):
+                text = (commands / name).read_text(encoding="utf-8")
+                for command in ("agents stop", "agents resume", "accounts.py move"):
+                    self.assertIn(command, text)
+                self.assertIn("--why", text)
+                self.assertNotIn("<PauseForMove>", text)
+
     def test_produce_names_live_ci_and_smoke_steps(self) -> None:
         command = Path(__file__).parents[2] / "commands/showrunner/produce.md"
         text = command.read_text(encoding="utf-8")

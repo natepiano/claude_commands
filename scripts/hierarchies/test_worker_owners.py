@@ -601,9 +601,17 @@ class WorkerOwnersTest(unittest.TestCase):
         )
         self.assertEqual(result.classification, owners.WorkerClass.OwnerUnknown)
 
-    def test_lost_run_shutdown_record_restores_workers_after_director_account_restart(self) -> None:
+    def test_stale_shutdown_state_does_not_recover_a_missing_worker_owner(self) -> None:
+        self.write_json("shutdown/director.json", {
+            "session": {"session_id": "director-old", "name": "unit-director", "host": {"unit": "hierarchies"}},
+            "codex_seats": [{"seat": "lost-worker", "thread_id": "thread-lost", "run_dir": str(self.root / "unit/deleted")}],
+        })
+        recovered = owners.recover_sources(self.collect([self.director_entry("director-new"), self.unknown_entry()]))
+        self.assertEqual(recovered.workers[0].classification, owners.WorkerClass.OwnerUnknown)
+
+    def test_launcher_provenance_restores_workers_after_director_account_restart(self) -> None:
         deleted = str(self.root / "unit/deleted-run")
-        self.write_json("shutdown/old-account.json", {
+        self.write_json("unit/provenance/impl_worker_lost.json", {
             "session": {"session_id": "director-old", "name": "unit-director", "host": {"unit": "hierarchies"}},
             "codex_seats": [{"seat": "lost-worker", "thread_id": "thread-lost", "run_dir": deleted}],
         })
@@ -639,12 +647,12 @@ class WorkerOwnersTest(unittest.TestCase):
         self.assertTrue(any("launcher record" in item for item in recovered["thread-launcher"].evidence))
         self.assertTrue(any("message log" in item for item in recovered["thread-message"].evidence))
 
-    def test_old_run_director_record_uses_shutdown_unit_after_account_restart(self) -> None:
+    def test_old_run_director_uses_launcher_unit_after_account_restart(self) -> None:
         self.write_text("unit/run-one/director", "director-old\n")
         self.write_json("unit/run-one/mesh_roster.json", {
             "test-worker": {"thread_id": "thread-one", "status": "paused"},
         })
-        self.write_json("shutdown/old-account.json", {
+        self.write_json("unit/provenance/impl_worker_lost.json", {
             "session": {"session_id": "director-old", "name": "unit-director", "host": {"unit": "hierarchies"}},
             "workers": [{"name": "test-worker", "thread_id": "thread-one", "run_dir": str(self.root / "unit/run-one")}],
         })
@@ -1002,7 +1010,7 @@ class WorkerOwnersTest(unittest.TestCase):
 
     def test_freestanding_thread_with_cwd_recovers_deleted_run_owner(self) -> None:
         deleted = str(self.root / "unit/deleted-run")
-        self.write_json("shutdown/director.json", {
+        self.write_json("unit/provenance/impl_worker_lost.json", {
             "session": {"session_id": "director-old", "name": "unit-director", "host": {"unit": "hierarchies"}},
             "codex_seats": [{"thread_id": "thread-lost", "seat": "lost-worker", "run_dir": deleted}],
         })
@@ -1345,7 +1353,7 @@ class WorkerOwnersTest(unittest.TestCase):
         self.write_json("unit/gone/mesh_roster.json", {
             "gone": {"thread_id": "gone-thread", "status": "paused"},
         })
-        self.write_json("shutdown/lost-worker.json", {
+        self.write_json("unit/provenance/impl_worker_lost.json", {
             "session": {"session_id": "director-one", "name": "unit-director", "host": {"unit": "hierarchies"}},
             "codex_seats": [{"thread_id": "lost-thread", "seat": "lost", "run_dir": str(self.root / "unit/deleted")}],
         })

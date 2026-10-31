@@ -689,51 +689,6 @@
       "time": "2026-10-21T08:04:49.559420-04:00"
     }
   },
-  "shutdown.holdout": {
-    "typical": {
-      "objections": [
-        {
-          "quote": "pm-move-ghostty restart is blocked",
-          "rule": "reader-starts-cold"
-        },
-        {
-          "quote": "answer the open form",
-          "rule": "say-where-to-act"
-        },
-        {
-          "quote": "Answer the form (recommended): the session pauses, and the restart goes on.",
-          "rule": "every-choice-says-what-it-does"
-        },
-        {
-          "quote": "Reason: restart is blocked because pm-move-ghostty's claude session is showing a form and it can't proceed.",
-          "rule": "what-happened-why-what-you-do"
-        },
-        {
-          "quote": "pm-move-ghostty restart is blocked",
-          "rule": "title-names-the-stake"
-        },
-        {
-          "quote": "Session: pm-move-ghostty\nAction: On natedev, answer the form in the pm-move-ghostty session\nA restart is waiting because the pm-move-ghostty Claude session is showing a form. Until someone answers it, the restart cannot go on.\n\nAnswer the form (recommended): the session pauses, the restart goes on, and its work is kept.\n\nStop the session: it ends, and its uncommitted work stays. The restart goes on without it. In a terminal on natedev, run:\n\n~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/shutdown.py now claude4 --here --only d5b35898-290f-4b44-8e6f-6f2586c975a8",
-          "rule": "push-body-under-500"
-        }
-      ],
-      "reviewer": "user-spec: the user's four lines for a blocked shutdown (2026-10-14, via the showrunner) stay; the user asked 2026-10-19 (change review C9, via the showrunner) to reword the stop line as its own step that says what stopping does. After 3 review passes the choice lines are in the reviewer's own rewrite verbatim; the remaining objections target the user's title, Action and Reason (recorded, not applied).; reviewer: opus",
-      "sha256": "5008e6e201af4b9dfd13f17a825a7b4a9f53922048deee920bd423f94e86e3a6",
-      "time": "2026-10-19T16:08:52.114457-04:00"
-    }
-  },
-  "shutdown.holdout_unanswered": {
-    "long_session": {
-      "reviewer": "opus",
-      "sha256": "39d83183464c5b7c29393976fe486518e8ea078f018d71d15d55220ba5813890",
-      "time": "2026-10-16T19:15:42.586534-04:00"
-    },
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "39d83183464c5b7c29393976fe486518e8ea078f018d71d15d55220ba5813890",
-      "time": "2026-10-16T19:15:31.911755-04:00"
-    }
-  },
   "shutdown.manual_restart": {
     "long_session": {
       "reviewer": "opus",
@@ -804,18 +759,6 @@
       "reviewer": "opus",
       "sha256": "3b93542505b329db050aa3ae4e95cf4561d4ebf613678c8ddcc91cd5277be6eb",
       "time": "2026-10-26T20:04:20.684453-04:00"
-    }
-  },
-  "shutdown.stop_failed": {
-    "many_long_names": {
-      "reviewer": "opus",
-      "sha256": "8efd8b84f8e237ada5cdb202c25229645bd2526c2f2b7a298effbb256131dc9e",
-      "time": "2026-10-14T17:14:12.173899-04:00"
-    },
-    "typical": {
-      "reviewer": "opus",
-      "sha256": "8efd8b84f8e237ada5cdb202c25229645bd2526c2f2b7a298effbb256131dc9e",
-      "time": "2026-10-14T17:14:02.345122-04:00"
     }
   },
   "silence.auto_off": {

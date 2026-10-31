@@ -186,6 +186,46 @@ class DurableRolesTests(unittest.TestCase):
         self.assertEqual(len(list((self.root / "ownership/placements").glob("*.json"))), 1)
         self.assertEqual(len(list((self.root / "roles").glob("*/design.json"))), 1)
 
+    def test_unregistered_repository_refusal_names_the_register_command(self) -> None:
+        store = self.root / "ownership/repositories.json"
+        for contents in (None, "{}"):
+            if contents is None:
+                store.unlink()
+            else:
+                _ = store.write_text(contents)
+            for operation in ("open", "resolve", "checkout"):
+                for host in ("natedev", "macbook", ""):
+                    if operation == "open" and host != "natedev":
+                        continue
+                    with self.subTest(contents=contents, operation=operation, host=host):
+                        payload: dict[str, object] = {
+                            "repository_id": "fixture-repo", "document": "design.md",
+                            "old_checkout": str(self.repository), "new_checkout": str(self.root / "new-checkout"),
+                        }
+                        if host:
+                            payload["host"] = host
+                        with self.assertRaises(design_roles.RoleRefused) as refused:
+                            if operation == "open":
+                                _ = self.open_designer()
+                            else:
+                                _ = self.authority(operation, payload)
+                        self.assertEqual(str(refused.exception),
+                                         "repository fixture-repo is not registered; run design_roles.py register "
+                                         + f"--repository fixture-repo --host {host or '<host>'} "
+                                         + "--checkout <absolute path> --inventory-complete")
+        self.assertEqual(self.launches, [])
+
+    def test_malformed_repository_record_keeps_the_object_refusal(self) -> None:
+        store = self.root / "ownership/repositories.json"
+        records: tuple[object, ...] = ([], "invalid", 42, False)
+        for record in records:
+            _ = store.write_text(json.dumps({"fixture-repo": record}))
+            for operation in ("reserve", "resolve", "checkout"):
+                with self.subTest(record=record, operation=operation):
+                    with self.assertRaises(design_roles.RoleRefused) as refused:
+                        _ = self.authority(operation, {"repository_id": "fixture-repo", "host": "natedev"})
+                    self.assertEqual(str(refused.exception), "expected a JSON object")
+
     def test_registered_document_alias_reuses_the_original_pair(self) -> None:
         design = self.open_designer()
         _ = self.authority("alias", {"repository_id": "fixture-repo", "host": "natedev",

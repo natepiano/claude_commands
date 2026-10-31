@@ -122,7 +122,7 @@ def checked(child: Production, caller: str, ending: EndingTab = NO_ENDING_TAB, s
     `ending` identifies the unit's tab that closes before launch, or says no tab ends.
     `start_in` is the folder the session starts in, the child's checkout unless given.
     """
-    from scripts.accounts.accounts import NamedAccount, account_dir, trust_command
+    from scripts.accounts.accounts import NamedAccount, account_dir, claude_config_label, trust_command
     from scripts.herdr.herdr import Untrusted, UnreadableTrustFile, claude_trust
 
     if not caller:
@@ -138,10 +138,9 @@ def checked(child: Production, caller: str, ending: EndingTab = NO_ENDING_TAB, s
     if taken:
         raise Refusal(f"{child.slug} already has a running showrunner")
     folder = start_in or child.checkout
-    label = str(config_dir)
-    numbered = re.fullmatch(r"\.claude([0-9]+)", config_dir.name)
-    if numbered and config_dir == account_dir(f"claude{numbered.group(1)}"):
-        label = f"claude{numbered.group(1)}"
+    folder_label = claude_config_label(config_dir)
+    label = (folder_label if re.fullmatch(r"claude[0-9]+", folder_label)
+             and config_dir == account_dir(folder_label) else str(config_dir))
     selected = NamedAccount(label, config_dir)
     trust = claude_trust(folder, claude_json(config_dir))
     if isinstance(trust, UnreadableTrustFile):

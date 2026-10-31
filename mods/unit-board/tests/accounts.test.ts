@@ -5,7 +5,7 @@ import { register } from '../hooks/register';
 import { accountDisplay } from '../hooks/accounts';
 import { cellWidth } from '../hooks/geometry';
 import type { StoredAccountsStatus } from '../types/accounts';
-import { BOARD, CWD, DISCOVERY, drawnText, fixture, hostEngine, NOW, REGISTRY, RUN } from './kit';
+import { BOARD, CWD, DISCOVERY, drawnText, element, elements, fixture, hostEngine, NOW, REGISTRY, rowLines, RUN, styledText } from './kit';
 
 const HOME = '/test-home';
 const USAGE = `${HOME}/.local/state/agent-notes/usage.json`;
@@ -150,47 +150,6 @@ function legacyLoginFixture() {
   return { ...data, accounts: data.accounts.map(account => ({ ...account, login: address(account.label) })) };
 }
 
-function element(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === 'object' ? value as Record<string, unknown> : {};
-}
-function children(value: unknown): unknown[] {
-  if (Array.isArray(value)) return value;
-  const found = element(value).children;
-  return Array.isArray(found) ? found : found === undefined ? [] : [found];
-}
-/** Keep adjacent spans, indentation and blank rows so width checks measure actual drawn lines. */
-function rowLines(value: unknown): string[] {
-  if (typeof value === 'string' || typeof value === 'number') return String(value).split('\n');
-  if (Array.isArray(value)) return value.flatMap(rowLines);
-  const node = element(value);
-  const props = element(node.props);
-  const parts = children(value).map(rowLines).filter(lines => lines.length);
-  if (node.type === 'Text') return [parts.flat().join('')];
-  if (node.type !== 'Box') return parts.flat();
-  const top = Number(props.marginTop ?? props.marginY ?? props.margin ?? 0)
-    + Number(props.paddingTop ?? props.paddingY ?? props.padding ?? 0);
-  const bottom = Number(props.marginBottom ?? props.marginY ?? props.margin ?? 0)
-    + Number(props.paddingBottom ?? props.paddingY ?? props.padding ?? 0);
-  const lines = props.flexDirection === 'column'
-    ? parts.flatMap((rows, index) => [...Array<string>(index ? Number(props.rowGap ?? props.gap ?? 0) : 0).fill(''), ...rows])
-    : parts.length ? [parts.flat().join(' '.repeat(Number(props.columnGap ?? props.gap ?? 0)))] : [];
-  const indent = ' '.repeat(Number(props.paddingLeft ?? props.paddingX ?? props.padding ?? 0));
-  return [...Array<string>(top).fill(''), ...lines.map(line => indent + line), ...Array<string>(bottom).fill('')];
-}
-function elements(value: unknown): Record<string, unknown>[] {
-  if (Array.isArray(value)) return value.flatMap(elements);
-  if (typeof value !== 'object' || value === null) return [];
-  return [element(value), ...children(value).flatMap(elements)];
-}
-/** Follow inherited styles so an outer dim/color cannot hide a wrongly styled fact. */
-function styledText(value: unknown, color = 'default', bold = false): { text: string; color: string; bold: boolean }[] {
-  if (typeof value === 'string' || typeof value === 'number') return [{ text: String(value), color, bold }];
-  if (Array.isArray(value)) return value.flatMap(child => styledText(child, color, bold));
-  const props = element(element(value).props);
-  return children(value).flatMap(child => styledText(child,
-    typeof props.color === 'string' ? props.color : color,
-    typeof props.bold === 'boolean' ? props.bold : bold));
-}
 function textInColor(tree: unknown, color: string): string {
   return styledText(tree).filter(span => span.color === color).map(span => span.text).join('');
 }

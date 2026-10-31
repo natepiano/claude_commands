@@ -424,9 +424,6 @@ def message_ownership_records(record: JsonObject, source: str, directors: Sequen
 def load_provenance(roots: Sequence[Path], directors: Sequence[Director], problems: list[str],
                     routes: Sequence[OwnershipEvidence]) -> list[OwnershipEvidence]:
     found: list[OwnershipEvidence] = []
-    shutdown = Path(os.environ.get("SHUTDOWN_STATE_DIR", str(Path.home() / ".local/state/shutdown")))
-    for path in source_files(shutdown, "**/*.json", problems):
-        found.extend(provenance_records(read_object(path, problems), f"shutdown record {path}"))
     for root in roots:
         for path in source_files(root, "**/impl_worker_*.json", problems):
             owner = unit_runs.director(path.parent)

@@ -477,17 +477,17 @@ def send_to_address(address: str, key: str, text: str, *, recipient: str,
     return NoticeDelivery((f"told {recipient}",))
 
 
-def deliver(slug: str, key: str, text: str) -> NoticeDelivery:
+def deliver(slug: str, key: str, text: str, *, sender: str = "showrunners") -> NoticeDelivery:
     """Resolve a production's current address and report whether its notice failed."""
     address = current_address(slug)
     if not address:
         return NoticeDelivery((f"{slug} is not running: tell it when it starts",))
-    return send_to_address(address, key, text, recipient=slug)
+    return send_to_address(address, key, text, recipient=slug, sender=sender)
 
 
-def tell(slug: str, key: str, text: str) -> str:
+def tell(slug: str, key: str, text: str, *, sender: str = "showrunners") -> str:
     """Send one line and preserve the existing human-readable delivery report."""
-    return deliver(slug, key, text).lines[0]
+    return deliver(slug, key, text, sender=sender).lines[0]
 
 
 def tell_others(texts: dict[str, str], key: str) -> NoticeDelivery:

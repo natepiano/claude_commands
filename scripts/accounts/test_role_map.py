@@ -282,7 +282,7 @@ class RoleMapTests(unittest.TestCase):
             mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
 
         def identity(path: Path) -> agent_accounts.NumberedAccount:
-            label = path.name.removeprefix(".")
+            label = accounts.claude_config_label(path)
             return agent_accounts.NumberedAccount(label, path, label + "@example.invalid")
 
         reading = refusals.FreshReading(refusals.ReadingWindow(0,

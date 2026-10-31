@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import ClassVar, override
+from typing import ClassVar, NamedTuple, override
 from unittest.mock import patch
 
 from scripts.direct import assertion_guard
@@ -20,6 +20,11 @@ from scripts.production.cli_fixture import invoke_cli
 GUARD = Path(assertion_guard.__file__)
 # load 136 on natedev, 2026-10-29
 TEST_HANG_GUARD_SECS = 300
+
+class ComparisonBases(NamedTuple):
+    first: str
+    second: str
+
 
 class GitRepositoryFixture(unittest.TestCase):
     root: Path = Path()
@@ -78,6 +83,13 @@ class GitRepositoryFixture(unittest.TestCase):
         _ = self.save(path, before)
         self.commit_base()
         _ = self.save(path, after)
+
+    def change_against_bases(self, path: str, first: str, second: str, after: str) -> ComparisonBases:
+        self.change(path, first, second)
+        first_base = self.base
+        self.commit_base()
+        _ = self.save(path, after)
+        return ComparisonBases(first_base, self.base)
 
     def rust(self, assertion: str, name: str = "test_value") -> str:
         return f"#[test]\nfn {name}() {{\n    {assertion}\n}}\n"

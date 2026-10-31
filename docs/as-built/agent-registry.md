@@ -437,7 +437,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
   A `send` to a finished codex peer holds the message for its current roster
   thread. Only the unit director's `implement.sh --to <worker>` or
   `review.sh --to <worker>` (`codex_mesh.py follow`) starts its next turn,
-  which receives held messages after its dispatch prompt
+  which receives the held messages first and its dispatch prompt last
   (a held design role is the exception: `implement.sh --to` refuses it, and only `design_roles.py resume` gives it a turn) —
   `<PhaseMesh/>` in `docs/direct/write_prompt_contract.md` states this, and the register
   line's `reach=` field is what tells a peer which of the two it is addressing.
@@ -476,7 +476,7 @@ All four wrappers capture resolver stderr into their log (`agents_resolve "$TASK
 - **A finished codex worker holds messages for its next dispatch.** Its thread
   persists, and `send` holds messages until the unit director starts its next
   turn through `implement.sh --to` or `review.sh --to`. That turn receives them
-  after its dispatch prompt. A thread started `--resident` (ask_a_friend's friend) stays
+  first, and its dispatch prompt last. A thread started `--resident` (ask_a_friend's friend) stays
   `running` across turns, prints each reply as it lands, and ends only on
   `codex_mesh.py end`. `send` still refuses ended, missing and
   capacity-exhausted workers.

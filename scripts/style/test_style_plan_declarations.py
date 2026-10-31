@@ -89,7 +89,7 @@ class StylePlanTests(StylePlanFixture):
         _ = self.git("rm", "-q", second)
         self.commit_files({"crates/alpha/src/moved.rs": "pub struct Other {\n    old: u32,\n}\n"})
         self.assertNotIn("waived", self.refill_decisions())
-        self.assertEqual(self.ledger().ticket_open("names-unit")[0]["finding_ids"], [stays.finding_id])
+        self.assertEqual(set(self.ledger().ticket_open("names-unit")[0]["finding_ids"]), {stays.finding_id, moves.finding_id})
         followed, = self.ledger().proposal_findings(later)
         self.assertEqual((followed.finding_id, followed.path, followed.line), (moves.finding_id, "crates/alpha/src/moved.rs", 2))
 

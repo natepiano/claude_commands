@@ -37,34 +37,10 @@ relaunch alone accepts the journal's session already live under the new id. The
 steps:
 
 1. **Stop.** A running unit is not a refusal: plan lists this step, and apply stops the unit
-   through `shutdown.py down --only <session>`. The unit's id is `SHOWRUNNER_UNIT_ID` in the
-   environment of its Claude process in its herdr pane, set at launch, and a live process cannot
-   change it, so every rename is a relaunch. apply then waits for the stop (`_await_stopped`):
-   it reads the unit's shutdown record every `POLL_SECONDS` (1 s) and prints `stop: waiting —
-   <unit> is <progress>` on each change. It goes on when the record reads stopped, and refuses when
-   the record asks for a restart, reads something else, or was never written (`RECORD_WAIT_SECONDS`,
-   120 s). It exits 2 only past `STOP_WAIT_SECONDS` (`RENAME_UNIT_STOP_WAIT`, default 3600), and a
-   rerun resumes there, so a rename never waits for a person (user: "it is unacceptable that it
-   require my intervention"). Once the unit is stopped (or was not running),
-   `_stop_runs` ends what its runs leave in the worktree. First each run's live app-server (found
-   by the run's `mesh_server.json`) stops with its workers through `codex_mesh.py stop`, as
-   retire_unit does; a failed stop is printed and SIGTERM ends the server. Then SIGTERM goes to a
-   detached run's supervisor (`mesh_runs.py supervise`, found by its run record) with every process
-   of its session, an app-server's idle-stop watcher (found by the run folder in its arguments), and
-   an app-server still alive with its children, such as `codex-code-mode-host`. Each leads its own
-   session, so the shutdown path does not end it (2026-10-20: a lint run and a day-old watcher
-   refused the move; 2026-10-21: modules-unit's 8-hour app-server refused it).
-   `retire_unit.run_processes` finds them and `retire_unit.terminate` stops them.
-   A dead server's idle-stop shell can still be asleep with its cwd in the worktree.
-   The shared classifier checks the shell's `sh -c` arguments, the idle-stop script and the
-   resolved `codex_mesh.py` entry point. When `kill -0` reports its server pid gone, it admits
-   the watcher and its session children even if the run folder is missing or its history names
-   another worktree. SIGTERM goes only to the classified pids. A live server's watcher still
-   requires a run folder from `runs_of(worktree)`; unrelated processes still refuse the move.
-   Preflight uses the same classification so apply can stop these leftovers. One alive after
-   `TERM_WAIT_SECONDS` refuses, and a rerun resumes. Refused up front: the new id
-   already running, a Claude that cannot be read, and other processes inside the worktree of a unit
-   with no Claude to stop.
+   through `stop_resume.stop`. The unit's marks identify its director; cwd alone grants no stop authority.
+   The stop ends only Claude, then the rename step handles its owned runs and closes its own pane.
+   Legacy records remain readable until Phase 8, and the rename journal remains until Phase 9.
+
 2. **Merge.** `origin/<merge branch>` is merged into the unit in the old worktree. While the unit's
    work is in progress (`_in_progress`: an open phase in its run record, or `git status --porcelain`
    output), nothing is merged: a failed merge's `--abort` can lose uncommitted work. The journal's

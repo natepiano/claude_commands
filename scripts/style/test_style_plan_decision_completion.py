@@ -165,7 +165,7 @@ class StylePlanTests(StylePlanFixture):
         self.assertNotEqual(opened["id"], "names-unit-1")
         self.assertEqual(opened["finding_ids"], [finding.finding_id])
 
-    def test_refill_stops_after_its_first_ticket_with_the_same_phase_and_output(self) -> None:
+    def test_refill_fills_one_rule_across_decisions_and_keeps_each_exclusion(self) -> None:
         rule = self.rule("first-ticket")
         paths = {name: f"crates/alpha/src/{name}.rs" for name in
                  ("first", "ready", "judged_changed", "unsynced", "structure", "busy", "gone")}
@@ -189,20 +189,6 @@ class StylePlanTests(StylePlanFixture):
         outcomes = tuple(style_ledger.DeclarationNotRead(finding) for finding in (first_finding, *later))
         follow = style_proposals.FollowRun(style_ledger.DeclarationReading(self.tip, outcomes), (), ())
         rank = style_proposals.RankedWork({paths["structure"]: frozenset({"types"})})
-        baseline_output = io.StringIO()
-        with (mock.patch.object(style_proposals, "approved_decisions", return_value=tuple(decisions[:1])),
-              mock.patch.object(style_proposals, "run_follow", return_value=follow),
-              mock.patch.object(style_proposals, "ranked_work", return_value=rank),
-              mock.patch.object(style_proposals, "ranked_below_unit", return_value=False),
-              mock.patch.object(style_proposals, "proposal_command"), redirect_stdout(baseline_output)):
-            baseline = style_plan._select_phase(ledger, "names-unit", "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
-                                               self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions, style_plan.MainChanges(self.tip), family="names")
-        self.assertIsInstance(baseline, style_plan.PhaseWritten)
-        expected_phase = self.plan.read_bytes()
-        with closing(sqlite3.connect(ledger.database)) as connection, connection:
-            _ = connection.execute("UPDATE held_findings SET build_ticket=''")
-            _ = connection.execute("DELETE FROM tickets WHERE unit='names-unit'")
-        _ = self.plan.write_text(original)
         output = io.StringIO()
 
         with (mock.patch.object(style_proposals, "approved_decisions", return_value=tuple(decisions)),
@@ -223,21 +209,31 @@ class StylePlanTests(StylePlanFixture):
             result = style_plan._select_phase(ledger, "names-unit", "demo-style-names", self.plan, self.repo,  # pyright: ignore[reportPrivateUsage]
                                              self.doc, original, unit_plans.AllCrates(), busy, frozenset(), definitions, style_plan.MainChanges(self.tip), family="names")
         self.assertIsInstance(result, style_plan.PhaseWritten)
-        read_paths.assert_called_once_with(self.repo, self.tip, (paths["first"],))
-        self.assertEqual(self.plan.read_bytes(), expected_phase)
-        self.assertEqual(baseline_output.getvalue(), f"waiting names: {paths['structure']} has open types work\n")
-        self.assertEqual(output.getvalue(), baseline_output.getvalue())
-        self.assertEqual(ledger.ticket_open("names-unit")[0]["finding_ids"], [first_finding.finding_id])
-        self.assertEqual([(finding.state, finding.build_ticket) for issue in decisions[1:]
-                          for finding in ledger.proposal_findings(issue.path)],
-                         [(style_ledger.Filed(issue.path), style_ledger.NoBuildTicket()) for issue in decisions[1:]])
-        waive.assert_not_called()
-        close.assert_not_called()
+        self.assertEqual(read_paths.call_count, len(decisions))
+        self.assertIn(f"waiting names: {paths['structure']} has open types work\n", output.getvalue())
+        self.assertIn(f"{paths['busy']} busy", output.getvalue())
+        ticket, = ledger.ticket_open("names-unit")
+        selected = {first_finding.finding_id, later[0].finding_id, later[1].finding_id}
+        self.assertEqual(set(ticket["finding_ids"]), selected)
+        self.assertEqual(set(ticket["files"]), {paths["first"], paths["ready"], paths["judged_changed"]})
+        for finding in later:
+            row, = ledger.named_held((finding.finding_id,))
+            if row.finding_id in selected:
+                self.assertEqual(row.build_ticket, style_ledger.BuildTicket(ticket["id"]))
+            elif row.path == paths["gone"]:
+                self.assertIsInstance(row.state, style_ledger.Waived)
+            else:
+                self.assertEqual(row.build_ticket, style_ledger.NoBuildTicket())
+                self.assertIsInstance(row.state, style_ledger.Filed)
+        waive.assert_called_once()
+        close.assert_called_once()
         self.assertEqual(add.call_count, 1)
         self.assertEqual(assign.call_count, 1)
         self.assertEqual(write.call_count, 1)
-        command.assert_called_once_with("start", str(first))
+        self.assertEqual(command.call_count, 3)
+        self.assertIn(str(first), self.plan.read_text())
         renumber.assert_not_called()
+
 
 
 if __name__ == "__main__":

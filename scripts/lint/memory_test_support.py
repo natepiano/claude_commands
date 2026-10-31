@@ -1,7 +1,28 @@
 """Private memory readings for tests that use the admission gate."""
 
 import os
+import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..build_hold.override_guard import require_checkout
+else:
+    from scripts.build_hold.override_guard import require_checkout
+
+require_checkout(Path(__file__))
+
+
+def gate_isolation_environment(root: Path) -> dict[str, str]:
+    """Keep a gate subprocess outside the caller's holds and session records."""
+    return {
+        "BUILD_HOLD_DIR": str(root / "holders"),
+        "BUILD_HOLD_RELEASE_DIR": str(root / "release"),
+        "UNIT_ACTIVE_DIR": str(root / "active"),
+        "BUILDLOG_CALL_ID": "", "BUILDLOG_CALLER": "",
+        "BUILDLOG_HOLD_WAIT_FILE": "", "BUILDLOG_HOLD_WAITER_FILE": "",
+    }
 
 
 def fake_memory_readings(root: Path, *, available_kib: int = 67108864,
