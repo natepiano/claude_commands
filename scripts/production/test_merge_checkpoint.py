@@ -209,7 +209,9 @@ class MergeCheckpointTests(MergeCheckpointFixture):
         self.assertEqual(accepted.process.returncode, 0, accepted.process.stderr + accepted.process.stdout)
         self.assertIn("scope: ok", accepted.process.stdout)
     def test_a_code_checkpoint_removes_its_phases_scratch_folders(self) -> None:
-        with mock.patch.dict(os.environ, self.env):
+        plan = self.root / "scratch-plan.md"
+        _ = plan.write_text("### Phase 2 — Checkpoint\n\n### Phase 3 — Later work\n")
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(scratch, "registered_plan", return_value=plan):
             done = [scratch.new("phase:alpha-unit/2", word) for word in ("gate", "copy")]
             later = scratch.new("phase:alpha-unit/3")
         result = self.run_checkpoint(self.checkpoint())
