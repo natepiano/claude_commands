@@ -690,16 +690,16 @@ class WithdrawnFinding:
 
 @dataclass(frozen=True)
 class KeptForBuild:
-    """A finding the newer verdict would withdraw, kept because a ticket that is not final builds it."""
+    """A superseded finding retained by its build, including accepted checkpoints and merged work."""
 
     finding: HeldFinding
-    verdict: SupersedingJudgment
+    verdict: SupersedingJudgment | RuleBodyChanged
     ticket: str
 
 
 @dataclass(frozen=True)
 class Withdrawal:
-    """Findings withdrawn by changed rule bodies or newer judgments, and those an open build keeps."""
+    """Findings withdrawn by changed rule bodies or newer judgments, and those retained by their builds."""
 
     withdrawn: tuple[WithdrawnFinding, ...]
     kept: tuple[KeptForBuild, ...]
@@ -3486,6 +3486,56 @@ class Ledger:
             return tuple(FindingNotBuilt(finding.finding_id, NoAppliedCheck(finding.kind)) for finding in self.filed_build_findings(id))
         return self._ticket_transition(id, "merged")
 
+    @_ticket_operation("restore-checkpoint")
+    def ticket_restore_checkpoint(self, id: str) -> None:
+        """Restore a checkpoint and its proposal findings cancelled together by rule-body withdrawal.
+
+        The retained checkpoint proves the ticket reached checkpointed before dropped. Immutable finding
+        membership and matching transaction timestamps prove the findings were released by that cancellation.
+        Rule-body withdrawal rows distinguish withdrawn findings from other reasons for leaving a decision.
+        No coverage judgment or rule generation is restored; merge still owns the applied checks.
+        """
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            ticket = self._ticket(id)
+            if ticket["state"] != "dropped":
+                raise LedgerError(f"{id}: restore requires a dropped ticket")
+            if not ticket["checkpoint"]:
+                raise LedgerError(f"{id}: no recorded checkpoint to restore")
+            if ticket["kind"] != "proposal" or not ticket["finding_ids"]:
+                raise LedgerError(f"{id}: restore requires proposal findings")
+            if self._connection.execute("SELECT 1 FROM tickets WHERE unit=? AND state IN ('queued','assigned','checkpointed') LIMIT 1",
+                                        (ticket["unit"],)).fetchone():
+                raise LedgerError(f"{id}: cannot restore while its unit has open tickets")
+            decisions = self.ticket_proposals(id)
+            withdrawn = False
+            for finding_id in ticket["finding_ids"]:
+                finding = self._held(finding_id)
+                if finding.rule not in ticket["rules"] or finding.path not in ticket["files"]:
+                    raise LedgerError(f"{finding.finding_id}: not in the ticket's recorded files and rules")
+                if (not isinstance(finding.state, Filed | Withdrawn)
+                        or isinstance(finding.build_ticket, BuildTicket)):
+                    raise LedgerError(f"{finding.finding_id}: not released by the ticket's withdrawal")
+                if finding.state.proposal not in decisions:
+                    raise LedgerError(f"{finding.finding_id}: not in the ticket's recorded decisions")
+                stamp, judgment, duplicate, gone, built = cast(tuple[str, int, str, str, str], self._connection.execute(
+                    "SELECT updated_at,withdrawn_by,duplicate_of,declaration_gone_at,built_at FROM held_findings WHERE finding_id=?",
+                    (finding.finding_id,)).fetchone())
+                if stamp != ticket["updated_at"] or judgment or duplicate or gone or built:
+                    raise LedgerError(f"{finding.finding_id}: withdrawal does not match the ticket's cancellation")
+                if isinstance(finding.state, Withdrawn):
+                    if not isinstance(finding.state.by, RuleBodyChanged):
+                        raise LedgerError(f"{finding.finding_id}: no rule-body withdrawal proof")
+                    withdrawn = True
+            if not withdrawn:
+                raise LedgerError(f"{id}: no findings prove rule-body withdrawal")
+            now = _now()
+            _ = self._connection.executemany(
+                "UPDATE held_findings SET state='filed',build_ticket=?,updated_at=? WHERE finding_id=?",
+                [(id, now, finding_id) for finding_id in ticket["finding_ids"]])
+            _ = self._connection.execute("UPDATE tickets SET state='checkpointed',updated_at=? WHERE id=?", (now, id))
+            self._check_ticket_pipelines(ticket["unit"])
+
     def _style_branch_tip(self) -> tuple[str, str]:
         """The style branch the ledger syncs with and the full id of its tip; both empty when it names none."""
         rows = cast(list[tuple[str]], self._connection.execute("SELECT style_branch FROM sync WHERE id=1").fetchall())
@@ -4183,7 +4233,12 @@ class Ledger:
         kept: list[KeptForBuild] = []
         for finding, definition in self._withdrawal_candidates(definitions):
             if not rule_catalog.judged_text_unchanged(finding.rule_blob, definition):
-                withdrawn.append(WithdrawnFinding(finding, RuleBodyChanged(definition.blob)))
+                reason = RuleBodyChanged(definition.blob)
+                if (isinstance(finding.build_ticket, BuildTicket)
+                        and self._ticket(finding.build_ticket.ticket)["state"] in ("checkpointed", "merged")):
+                    kept.append(KeptForBuild(finding, reason, finding.build_ticket.ticket))
+                else:
+                    withdrawn.append(WithdrawnFinding(finding, reason))
                 continue
             if not self._connection.execute("SELECT 1 FROM sync WHERE id=1").fetchone():
                 continue
@@ -4192,7 +4247,7 @@ class Ledger:
                 continue
             if isinstance(finding.build_ticket, BuildTicket):
                 ticket = self._ticket(finding.build_ticket.ticket)
-                if ticket["state"] not in FINAL_TICKET_STATES:
+                if ticket["state"] != "dropped":
                     kept.append(KeptForBuild(finding, verdict, ticket["id"]))
                     continue
             withdrawn.append(WithdrawnFinding(finding, verdict))
@@ -4209,19 +4264,22 @@ class Ledger:
         return self._superseded(definitions)
 
     def _obsolete_tickets(self, definitions: Mapping[str, Rule], withdrawal: Withdrawal) -> tuple[TicketRecord, ...]:
-        """Cancel stale pins and dependent successors, including a build holding a withdrawn finding."""
+        """Cancel unfinished stale pins and dependent successors; accepted checkpoints stop cancellation."""
         rows = cast(list[tuple[str]], self._connection.execute(
-            "SELECT id FROM tickets WHERE state NOT IN ('merged','dropped') ORDER BY id").fetchall())
+            "SELECT id FROM tickets WHERE state IN ('queued','assigned') ORDER BY id").fetchall())
         tickets = tuple(self._ticket(row[0]) for row in rows)
+        cancellable = {ticket["id"] for ticket in tickets}
         obsolete = {ticket["id"] for ticket in tickets if any(
             (definition := definitions.get(base_rule(rule))) is not None
             and not rule_catalog.judged_text_unchanged(blob, definition)
             for rule, blob in ticket["rule_blobs"].items())}
         obsolete.update(item.finding.build_ticket.ticket for item in withdrawal.withdrawn
-                        if isinstance(item.verdict, RuleBodyChanged) and isinstance(item.finding.build_ticket, BuildTicket))
+                        if isinstance(item.verdict, RuleBodyChanged) and isinstance(item.finding.build_ticket, BuildTicket)
+                        and item.finding.build_ticket.ticket in cancellable)
         dependencies = cast(list[tuple[str, str]], self._connection.execute(
             "SELECT ticket,predecessor FROM ticket_predecessors").fetchall())
-        while successors := {ticket for ticket, predecessor in dependencies if predecessor in obsolete} - obsolete:
+        while successors := {ticket for ticket, predecessor in dependencies
+                             if predecessor in obsolete and ticket in cancellable} - obsolete:
             obsolete.update(successors)
         return tuple(ticket for ticket in tickets if ticket["id"] in obsolete)
 
@@ -4246,8 +4304,9 @@ class Ledger:
         return tuple(changes)
 
     def withdraw_superseded(self, definitions: Mapping[str, Rule]) -> Withdrawal:
-        """Withdraw all open old-body findings and cancel obsolete tickets in one transaction.
+        """Withdraw unfinished old-body findings and cancel obsolete tickets in one transaction.
 
+        Checkpointed tickets and their findings keep their accepted build despite later rule changes.
         Same-body findings retain the existing newer-judgment policy, including open-build protection.
         Source proofs run before the write lock; the transaction rechecks the plan before changing rows.
         Workers judge outside this transaction. Their hold/record writes check pins and ticket state under
@@ -6922,7 +6981,7 @@ def main() -> None:
         _ = command.add_argument("--repo", required=True)
     for name, actions in (
         ("unit", ("rename",)),
-        ("ticket", ("add", "assign", "checkpoint", "merge", "drop", "open", "yield")),
+        ("ticket", ("add", "assign", "checkpoint", "restore-checkpoint", "merge", "drop", "open", "yield")),
         ("handoff", ("add", "send", "reroute", "merged", "pending")),
         ("tip", ("seen", "done")),
         ("held", ("add", "replace", "file", "waive", "built", "list")),
@@ -7052,6 +7111,8 @@ def main() -> None:
                     ledger.ticket_assign(args.id, args.branch)
                 elif args.action == "checkpoint":
                     ledger.ticket_checkpoint(args.id, args.commit, args.session_dir, args.phase)
+                elif args.action == "restore-checkpoint":
+                    ledger.ticket_restore_checkpoint(args.id)
                 elif args.action == "merge":
                     for item in ledger.ticket_merge(args.id):
                         print(not_built_line(ledger.repo, item))
