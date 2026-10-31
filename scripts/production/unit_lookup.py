@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -144,15 +144,16 @@ class MemberSources:
         return found
 
 
-def member_sources() -> MemberSources:
-    session = herdr.shared_session()
+def member_sources(*, dependencies: Callable[[Path], None] | None = None) -> MemberSources:
+    session = herdr.shared_session(dependencies=dependencies)
     try:
-        launches = pane_record.read_strict(session)
+        launches = pane_record.read_strict(session, dependencies=dependencies)
     except OSError as error:
         raise staff.StaffUnreadable(f"{pane_record.record_path(session)}: {error}") from error
     except ValueError as error:
         raise staff.StaffUnreadable(str(error)) from error
-    sources = showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.SKIP)
+    sources = showrunners.read_sources(unreadable=showrunners.UnreadableTimerPolicy.SKIP,
+                                       dependencies=dependencies)
     return MemberSources({source.timer.slug: source for source in sources}, tuple(launches.values()))
 
 

@@ -30,7 +30,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,8 +75,10 @@ def record_path(session: str) -> Path:
     return RECORD_DIR / f"{session}.json"
 
 
-def _read_entries(session: str) -> dict[str, object]:
+def _read_entries(session: str, *, dependencies: Callable[[Path], None] | None = None) -> dict[str, object]:
     path = record_path(session)
+    if dependencies is not None:
+        dependencies(path)
     try:
         value = cast(object, json.loads(path.read_text(encoding="utf-8")))
     except FileNotFoundError:
@@ -88,9 +90,9 @@ def _read_entries(session: str) -> dict[str, object]:
     return cast(dict[str, object], value)
 
 
-def read_strict(session: str) -> dict[str, PaneLaunch]:
+def read_strict(session: str, *, dependencies: Callable[[Path], None] | None = None) -> dict[str, PaneLaunch]:
     """Read validated launch evidence; only an absent file means there are no entries."""
-    entries = _read_entries(session)
+    entries = _read_entries(session, dependencies=dependencies)
     for pane_id, value in entries.items():
         location = f"{record_path(session)}: pane {pane_id}"
         if not isinstance(value, dict):
