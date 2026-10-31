@@ -94,7 +94,7 @@ class StylePlanTests(StylePlanFixture):
         ticket = self.ledger().ticket_open("names-unit")[0]
         self.assertEqual((ticket["kind"], ticket["rules"], ticket["files"]), ("read", [read], [self.sources[0]]))
 
-    def test_names_waits_for_sync_not_structure_when_its_only_unblocked_file_is_busy(self) -> None:
+    def test_names_reads_blocking_structure_when_its_only_unblocked_file_is_busy(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         _ = self.rule("manifest", "tier: D\nfamily: modules\ninput_scope: manifest\n")
         _ = self.rule("read")
@@ -103,8 +103,10 @@ class StylePlanTests(StylePlanFixture):
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
 
         with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[0])):
-            self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
-        self.assertEqual(self.count_tickets(), 0)
+            self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket, = self.ledger().ticket_open("names-unit")
+        self.assertEqual((ticket["kind"], ticket["files"]),
+                         ("structure", ["crates/alpha/Cargo.toml", self.sources[1]]))
 
     def test_a_crate_cell_waits_for_every_structure_cell_in_its_crate_and_a_file_cell_for_its_own(self) -> None:
         def cell(path: str, tier: rules.Tier, crate: str = "crates/alpha") -> style_ledger.Cell:
@@ -118,21 +120,20 @@ class StylePlanTests(StylePlanFixture):
         self.assertTrue(style_plan.blocked_by_structure(file_cell, (other_file, own_file)))
         self.assertFalse(style_plan.blocked_by_structure(file_cell, (other_file, crate_structure, other_crate)))
 
-    def test_names_waits_for_structure_when_every_pending_names_file_is_closed(self) -> None:
+    def test_names_reads_structure_when_every_pending_names_file_is_closed(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         read = self.rule("read")
         self.sync()
         self.record(structure, self.sources[1], self.tip)
         self.record(read, self.sources[1], self.tip)
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
-        before = self.plan.read_bytes()
+        self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket, = self.ledger().ticket_open("names-unit")
+        self.assertEqual((ticket["kind"], ticket["family"], ticket["files"]),
+                         ("structure", "modules", [self.sources[0]]))
+        self.assertEqual(self.sync_wait_rows(), [])
 
-        self.assertEqual(self.run_next(), (3, "waiting for structure: crates/alpha\n", ""))
-        self.assertEqual(self.plan.read_bytes(), before)
-        self.assertEqual(self.count_tickets(), 0)
-        self.assertEqual([row[0] for row in self.sync_wait_rows()], ["names-unit"])
-
-    def test_names_waits_for_sync_when_an_open_names_file_is_busy_despite_other_closed_files(self) -> None:
+    def test_names_reads_structure_when_its_unblocked_names_file_is_busy(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
         _ = self.rule("read")
         self.sync()
@@ -140,8 +141,9 @@ class StylePlanTests(StylePlanFixture):
         _ = self.plan.write_text(self.plan_header().replace("## Phases", "**Pilot scope:** alpha\n\n## Phases"))
 
         with mock.patch.object(berth_board, "read_board", return_value=self.board(self.sources[1])):
-            self.assertEqual(self.run_next(), (3, "waiting for sync\n", ""))
-        self.assertEqual(self.count_tickets(), 0)
+            self.assertEqual(self.run_next(), (0, "phase written: names-unit-1\n", ""))
+        ticket, = self.ledger().ticket_open("names-unit")
+        self.assertEqual((ticket["kind"], ticket["files"]), ("structure", [self.sources[0]]))
 
     def test_modules_still_selects_only_pending_structure_files_when_names_can_refill(self) -> None:
         structure = self.rule("structure", "tier: D\nfamily: modules\ninput_scope: file\n")
