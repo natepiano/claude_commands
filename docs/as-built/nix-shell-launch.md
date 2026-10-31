@@ -10,7 +10,7 @@ restart through the supported shutdown path when idle.
 
 `scripts/lib/nix_env.py` uses only Python's standard library on Linux and macOS.
 `ensure(directory: Path, base_env: Mapping[str, str] = os.environ)` returns one
-of three frozen dataclasses:
+of three immutable named tuples:
 
 | Result | Meaning |
 | --- | --- |
@@ -38,6 +38,10 @@ and exits 0, or prints one `nix_env: ...` stderr line and exits 1.
 `nix_env.py exec <absolute program> [args...]` ensures its current directory and
 uses `os.execvpe` with that environment. A relative program is a usage error
 (exit 2), preventing a PATH wrapper from finding itself by a bare name.
+For `Loaded`, exec sets `NIX_ENV_ENVRC` to the resolved `.envrc` path; for
+`NoEnvrc`, it removes an inherited `NIX_ENV_ENVRC`. The `ensure` API and its
+JSON output keep their existing environment-diff behavior; only `exec` adds
+or clears this provenance marker.
 Launchers resolve Claude with `command -v` or the existing absolute-binary
 resolver before calling `exec`.
 
@@ -83,18 +87,20 @@ The existing `start_agent` APIs retain their signatures and prompt proof.
 `launch_prepared_agent` opens that directory without another direnv load.
 
 Before tool setup or record access, `verify.sh` repairs a missing nix shell.
-When `IN_NIX_SHELL` is empty or unset, it calls `nix_env.py ensure` for its current
-directory. The helper owns the nearest `.envrc` search, including ancestors.
-No `.envrc` means no notice or re-exec. A proved shell triggers one stderr
-notice and `exec` through the sibling `lib/py` and `nix_env.py exec` with the
-absolute script path, the same cwd and every original argument, including empty
-arguments. The `exec` helper proves the environment used by the new invocation;
-a refusal exits nonzero with its one `nix_env:` line before verification runs.
-A caller already in the nix shell takes the original path silently. An internal
-`VERIFY_NIX_ENV_REEXEC` marker refuses a re-run whose proof has disappeared,
-with one line instead of another re-exec, and is removed before tool setup.
+When `IN_NIX_SHELL` is empty or unset, it sets `VERIFY_NIX_ENV_REEXEC` and re-execs
+once through the sibling `lib/py -S` and `nix_env.py exec`, preserving the absolute
+script path, cwd and every original argument, including empty arguments. The
+helper owns the nearest `.envrc` search, including ancestors, and runs direnv
+export at most once. In the re-run, shell proof triggers one stderr notice;
+no `.envrc` means no direnv call or notice. A helper refusal exits nonzero with
+only its `nix_env:` line before verification runs. A caller already in the nix
+shell takes the original path silently. If the re-run loses shell proof while
+`NIX_ENV_ENVRC` still names the loaded file, it refuses with one line instead
+of another re-exec. The internal marker is removed before tool setup.
 The final command's exit status passes through. This also covers Codex workers
 whose shared mesh server cannot carry each worktree's environment.
+`user_clock` runs `user_zone.py` with `python3 -S`; that helper and `/zone` share
+the `stored_zone` configuration reader.
 
 Launch scan: `scripts/lib/test_claude_launch_scan.py` checks Python process calls
 whose argv starts Claude, Codex or `herdr agent start`, typed `start_agent`

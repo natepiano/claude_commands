@@ -14,6 +14,8 @@ from unittest import mock
 from collections.abc import Callable
 from contextlib import ExitStack
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.astra import design_roles
 from scripts.direct import workers
 from scripts.production import staff, staff_sources, staff_move
@@ -405,7 +407,7 @@ class UnitTransferTests(UnitTransferFixture):
 
     def test_a_stopped_unit_relaunches_using_its_receiving_staff_parent(self) -> None:
         from scripts.accounts import accounts
-        from account import Account
+        from scripts.whoami.account import Account
         import restart
         import shutdown_record
 

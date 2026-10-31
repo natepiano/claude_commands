@@ -22,10 +22,10 @@ SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS / "message"))
 from sessions import SessionRecord, UnreadableSessionRecord, live_session, read_session, sessions_dir  # noqa: E402
 
-sys.path.insert(0, str(SCRIPTS / "production"))
-from showrunners import registered_showrunners  # noqa: E402
-
 sys.path.insert(0, str(SCRIPTS.parent))
+sys.path.insert(0, str(SCRIPTS / "production"))
+from scripts.production.showrunners import registered_showrunners  # noqa: E402
+
 from scripts.shutdown import launch_permission  # noqa: E402
 from scripts.accounts import accounts  # noqa: E402
 from scripts.whoami import account  # noqa: E402

@@ -1,6 +1,11 @@
 """A provider refusal moves only its live owner, once, through safe shutdown."""
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.whoami.note_file import note_name
 
 from scripts.production import staff_sources
@@ -10,27 +15,25 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import tempfile
 import unittest
 from contextlib import AbstractContextManager, contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from collections.abc import Generator, Iterator, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone, tzinfo
-from pathlib import Path
 from importlib import import_module
 from typing import TYPE_CHECKING, Literal, Self, cast, final, override
 from unittest.mock import call, patch
 
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, moves, next_moves, refusal_watch, refusals, role_map
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.shutdown import stop_resume
-from scripts.production import showrunners
 from scripts.message import send as message_send
 from scripts.whoami import run_out
-import account
-import agent_accounts
-import usage_store
+from scripts.whoami import account
+from scripts.whoami import agent_accounts
+from scripts.whoami import usage_store
 import quota_alert
 
 send_no_room_notice = refusal_watch._notify_no_room  # pyright: ignore[reportPrivateUsage]
@@ -86,8 +89,8 @@ class RefusalWatchTests(unittest.TestCase):
     def setUp(self) -> None:
         _ = self.enterContext(patch.object(launch_permission, "launch_permission", return_value=launch_permission.AllowedByShutdownState()))
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {
-            "HOME": str(self.home), "PATH": os.defpath, "AGENT_NOTES_DIR": str(self.home / "notes"),
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {
+            "PATH": os.defpath, "AGENT_NOTES_DIR": str(self.home / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions"), "USER_ZONE": "America/New_York",
         }, clear=True)))
@@ -98,11 +101,6 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.enterContext(patch.object(run_out, "READINGS_LOG", self.home / "pace.jsonl"))
         (self.home / ".claude").mkdir()
         (self.home / "notifier").mkdir()
-        # Production scripts import the registry under both spellings, each with paths fixed at import.
-        for registry in (showrunners, import_module("showrunners")):
-            for field, value in (("NOTIFIER_STATE_DIR", self.home / "notifier"), ("SESSIONS_DIR", self.home / "sessions"),
-                                 ("SHOWRUNNER_STATE_DIR", self.home / "showrunner")):
-                _ = self.enterContext(patch.object(registry, field, value))
         _ = (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "main@example.invalid"}}))
         for label, login in (("claude1", SOURCE_LOGIN), ("claude2", "main@example.invalid"), ("claude3", TARGET_LOGIN)):
             self.assertEqual(accounts.setup(label), [])
@@ -2463,7 +2461,7 @@ class RefusalWatchTests(unittest.TestCase):
         _ = self.owner("unit", host="unit")
         _ = self.transcript("unit")
         original = accounts.move_sessions
-        def requested(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.Resumed | accounts.SessionMoveRefused, ...]:
+        def requested(ids: tuple[str, ...], target: str, *, why: str) -> tuple[stop_resume.Resumed | stop_resume.MoveHandedOff | accounts.SessionMoveRefused, ...]:
             self.assertEqual(stored_group_labels(path)["units"], target)
             return original(ids, target, why=why)
         with patch.object(accounts, "move_sessions", side_effect=requested):

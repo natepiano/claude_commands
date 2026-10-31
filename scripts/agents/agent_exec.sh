@@ -86,10 +86,10 @@ agents_exec_main() {
 
     case "$AGENT_FAMILY" in
         codex)
-            workers_home="$("$PY" - "$script_dir/../whoami" <<'PY'
+            workers_home="$("$PY" - "$script_dir/../.." <<'PY'
 import sys
 sys.path.insert(0, sys.argv[1])
-from agent_accounts import workers_home
+from scripts.whoami.agent_accounts import workers_home
 try:
     print(workers_home())
 except (OSError, ValueError) as error:

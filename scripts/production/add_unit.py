@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, NamedTuple, TypedDict, cast, override
 from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import staff, staff_sources
 
 SCRIPTS = Path(__file__).resolve().parents[1]
@@ -29,7 +30,7 @@ sys.path.insert(0, str(SCRIPTS / "shutdown"))
 
 import autocompact
 import rename_state
-import showrunners
+from scripts.production import showrunners
 import sessions
 import unit_lookup
 import unit_names

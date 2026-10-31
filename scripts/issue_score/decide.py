@@ -7,7 +7,7 @@ from typing import Literal
 
 from .client import Answer, ChoiceAnswer, ScoreAnswer, TypeSafeError
 from .questions import ERROR_TARGETS, EVIDENCE_ABSENT, EVIDENCE_PRESENT, GOAL_LABELS, SPLIT_PROBABILITY, THRESHOLDS, URGENCY_EVIDENCE
-from .questions import ReportOnly as ReportOnly, Supported as Supported, ThresholdOutcome as ThresholdOutcome, Unsupported as Unsupported
+from .questions import MinimumGap as MinimumGap, ReportOnly as ReportOnly, Supported as Supported, ThresholdOutcome as ThresholdOutcome, Unsupported as Unsupported
 
 
 @dataclass(frozen=True)
@@ -41,19 +41,33 @@ def select_threshold(field_name: str, points: Sequence[RiskPoint], *, complete: 
         return Unsupported("incomplete or non-tuning cohort; excluded from threshold selection")
     for point in sorted(points, key=lambda item: item.threshold):
         if point.coverage > 0 and point.error_rate <= ERROR_TARGETS[field_name] + 1e-12:
-            return Supported(point.threshold)
+            return MinimumGap(point.threshold) if isinstance(THRESHOLDS[field_name], MinimumGap) else Supported(point.threshold)
     return Unsupported()
 
 
 def is_sure(field_name: str, decision: FieldDecision, thresholds: Mapping[str, ThresholdOutcome] = THRESHOLDS) -> bool:
-    """Only supported fields and supported dependencies can be sure."""
+    """Apply the configured probability or gap gate after structural guards."""
     policy = thresholds[field_name]
-    if not isinstance(policy, Supported):
+    if not decision.structurally_eligible or decision.split:
         return False
-    if not decision.structurally_eligible or decision.split or decision.confidence < policy.threshold:
+    if isinstance(policy, Supported):
+        if decision.confidence < policy.threshold:
+            return False
+    elif isinstance(policy, MinimumGap):
+        if decision.origin == "area_fallback":
+            gap = decision.confidence - (1 - decision.confidence)
+        else:
+            probabilities = sorted(decision.probabilities.values(), reverse=True)
+            if not probabilities:
+                return False
+            gap = probabilities[0] - (probabilities[1] if len(probabilities) > 1 else 0.0)
+        if gap + 1e-12 < policy.gap:
+            return False
+    else:
         return False
     for name, confidence in decision.threshold_dependencies.items():
         dependency = thresholds[name]
+        # Dependencies carry confidence only, so a gap dependency cannot be certified.
         if not isinstance(dependency, Supported) or confidence < dependency.threshold:
             return False
     return True

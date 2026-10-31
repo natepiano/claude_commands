@@ -26,13 +26,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Literal, Never, Protocol, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.accounts import outage_alerts
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 for dependency in ("whoami", "message", "notify", "production", "hooks", "lib", "herdr"):
     sys.path.insert(0, str(SCRIPTS / dependency))
 
-from account import (  # noqa: E402
+from scripts.whoami.account import (  # noqa: E402
     Account,
     UnknownAccountName,
     UnreadableAccount,
@@ -731,7 +733,7 @@ HerdrDestination = RecordedHerdrPane | SharedHerdrTab
 def herdr_space(session: Session) -> str:
     """The shared session's workspace for a Claude session: its production's, else `ad-hoc`."""
     if session["kind"] == "showrunner":
-        from showrunners import herdr_space as production_space, production_slug
+        from scripts.production.showrunners import herdr_space as production_space, production_slug
         return production_space(production_slug(session["doc"]), session["doc"])
     return "ad-hoc"
 
@@ -809,7 +811,7 @@ def resume_command(session: Session, target: str, source_label: str = "", why: s
     """The stable manual move command printed before shutdown and at restart."""
     if not source_label:
         directory = Path(session.get("config_dir", str(Path.home() / ".claude")))
-        from account import claude_account
+        from scripts.whoami.account import claude_account
         identity = claude_account(directory)
         source_label = identity.label if identity is not None else str(directory)
     note = account_move_note(session, target, source_label, why, times=times)
@@ -1641,7 +1643,7 @@ def _target_config_dir(record: SessionShutdown) -> RecordedConfigDir | NoRecorde
 
 
 def _live_config_dir(record: SessionShutdown) -> ObservedConfigDir | LiveObservationUnavailable:
-    import account
+    from scripts.whoami import account
     live = next((item for item in sessions.live_sessions() if item["sessionId"] == record["session"]["session_id"]), None)
     if live is None:
         return LiveObservationUnavailable("not live")
@@ -2846,7 +2848,7 @@ def progress_line(action: str, name: str, detail: str = "") -> None:
 
 
 def _restore_workspace_names(records: Sequence[SessionShutdown]) -> frozenset[str]:
-    from showrunners import herdr_space as production_space
+    from scripts.production.showrunners import herdr_space as production_space
     names: set[str] = set()
     for saved in records:
         owner = saved["session"]

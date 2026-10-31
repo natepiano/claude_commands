@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import staff_sources
 import io
 import json
 import os
 import subprocess
-import sys
 import tempfile
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from contextlib import redirect_stderr, redirect_stdout
-from pathlib import Path
 from typing import cast, override
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from scripts.whoami.note_file import note_name
@@ -25,11 +27,10 @@ import inventory
 import shutdown_record
 import sessions
 import settle
-import showrunners
+from scripts.production import showrunners
 import launch_permission
-from importlib import import_module
-import account
-import agent_accounts
+from scripts.whoami import account
+from scripts.whoami import agent_accounts
 from scripts.accounts import accounts, refusals
 from scripts.accounts.move_test_support import FakeSessionMoves, MoveCall
 from scripts.shutdown import stop_resume
@@ -59,8 +60,7 @@ class AccountMoveTests(ShutdownTestCase):
             "NOTIFIER_STATE_DIR": str(self.root / "notifier"),
         })))
         del context
-        _ = self.enterContext(patch.object(import_module("showrunners"), "NOTIFIER_STATE_DIR", self.root / "notifier"))
-        _ = self.enterContext(patch.object(import_module("scripts.production.showrunners"), "NOTIFIER_STATE_DIR", self.root / "notifier"))
+        _ = self.enterContext(patch.object(showrunners, "NOTIFIER_STATE_DIR", self.root / "notifier"))
         _ = self.enterContext(patch.object(agent_accounts, "user_zone", return_value=timezone.utc))
         self.moves = FakeSessionMoves()
         _ = self.enterContext(patch.object(stop_resume, "move_sessions", side_effect=self.moves))
@@ -303,6 +303,15 @@ class AccountMoveTests(ShutdownTestCase):
         assert isinstance(result, accounts.MoveStarted)
         self.assertEqual(result.stdout.splitlines()[-1], "move-id: resumed on claude3 in w1:p1")
         self.assertEqual(result.returncode, 0)
+        self.assertEqual(shutdown_record.all_session_records(), [])
+
+    def test_handed_off_self_move_is_success_and_prints_moving_now(self) -> None:
+        with patch.object(stop_resume, "move_sessions", return_value=[stop_resume.MoveHandedOff("move-id")]):
+            result, output, error = self.cli()
+        self.assertEqual(result, 0)
+        self.assertEqual(error, "")
+        self.assertIn("move-id: moving now\n", output)
+        self.assertNotIn("not moved", output)
         self.assertEqual(shutdown_record.all_session_records(), [])
 
     def test_move_ignores_an_old_open_record_and_leaves_it_unchanged(self) -> None:

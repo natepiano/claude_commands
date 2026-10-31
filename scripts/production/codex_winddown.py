@@ -25,9 +25,11 @@ from pathlib import Path
 from typing import Final, Literal, cast
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import broadcast
 import process_table
-import showrunners
+from scripts.production import showrunners
 from live_units import live_unit_names
 from sessions import SessionRecord, live_sessions
 

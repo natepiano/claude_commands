@@ -6,8 +6,6 @@ from __future__ import annotations
 import json
 import sys
 import signal
-import dailies_render
-from cli_fixture import invoke_cli
 import os
 import subprocess
 import tempfile
@@ -19,6 +17,9 @@ from typing import ClassVar, TypedDict, cast, final, override
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import dailies_render
+from cli_fixture import invoke_cli
 from dailies_render import (NoLastReportedEta, StateClear, StateRefused,
                             check_render_state, last_report, load_state)
 
@@ -243,14 +244,16 @@ from pathlib import Path
 from types import ModuleType
 sys.path.insert(0, str(Path.cwd()))
 from cli_fixture import invoke_cli
-assert "showrunners" not in sys.modules
+assert "scripts.production.showrunners" not in sys.modules
 assert "dailies_render" not in sys.modules
 caller = Path.home()
 caller_path = sys.path.copy()
 command = ModuleType("fixture_command")
 command.__file__ = "fixture_command.py"
 def paths(home):
-    import dailies_render, showrunners, note_file
+    import dailies_render
+    from scripts.production import showrunners
+    from scripts.whoami import note_file
     assert dailies_render.CHART_CONF == home / ".local/state/showrunner/dailies.conf"
     assert note_file.notes_dir() == home / "rust/hanadocs/agents"
     assert dailies_render.READINGS_LOG == home / ".local/state/agent-notes/readings.jsonl"

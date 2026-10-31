@@ -317,7 +317,7 @@ def close_unit_pane(pane: UnitPane | None, _saved: shutdown_record.SessionShutdo
     if pane is None:
         return
     try:
-        _ = herdr.Herdr(pane.place.session).run("pane", "close", pane.place.pane)
+        herdr.Herdr(pane.place.session).close_pane(pane.place.pane)
     except (herdr.HerdrFailure, OSError, ValueError, subprocess.SubprocessError) as error:
         raise RenameRefused(f"{pane.unit}: pane close failed: {error}") from error
 

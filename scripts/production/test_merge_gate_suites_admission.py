@@ -6,14 +6,228 @@ from dataclasses import dataclass
 import unittest
 import io
 import os
+import json
 from pathlib import Path
 import subprocess
-from typing import final
+import time
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta, tzinfo
+from typing import cast, final, override
 from contextlib import redirect_stdout
 from unittest import mock
 from scripts.production import merge_gate
+from scripts.lint import memory_admit
 from scripts.production.merge_gate_test_support import gate_suites, wait_for_file
 from scripts.production.merge_gate_suites_test_support import GateSuitesFixture
+
+
+@final
+class SharedGateAdmissionTests(GateSuitesFixture):
+    def test_gate_behind_an_older_fitting_step_prints_its_reason(self) -> None:
+        pid, older_pid = os.getpid(), 999999
+        self.admission_directory.mkdir(parents=True, exist_ok=True)
+        older = self.admission_directory / "older.waiting"
+        self.write(older, json.dumps({"pid": older_pid, "start_time": "older", "need": 400 * (1 << 20),
+            "since": time.time() - 60, "session_id": "older-id", "session_name": "older-step", "step": "check"}))
+        processes = {pid: memory_admit.ProcessIdentity(1, "gate"), older_pid: memory_admit.ProcessIdentity(1, "older")}
+        environment = {**self.environment, "BUILDLOG_BUILD_BUDGET_GIB": "0.6", "BUILDLOG_PROC": str(self.root / "proc")}
+        output = io.StringIO()
+
+        def process_start(candidate: int) -> str:
+            return processes[candidate].start
+
+        def next_poll(_seconds: float) -> None:
+            older.unlink()
+
+        with mock.patch.dict(os.environ, environment), \
+             mock.patch.object(memory_admit, "process_table", return_value=processes), \
+             mock.patch.object(memory_admit, "process_start_time", side_effect=process_start), \
+             mock.patch.object(time, "sleep", side_effect=next_poll), redirect_stdout(output):
+            with merge_gate.gate_reservation(self.checkout, 512, self.state, merge_gate.BuildHoldWait()):
+                pass
+        self.assertIn("behind older step older-step", output.getvalue())
+        self.assert_gate_released()
+
+    def test_memory_wait_reports_changes_and_only_one_reminder_per_minute(self) -> None:
+        busy = self.occupy_memory_queue()
+        checks = memory_admit.check
+        # Changes in pressure readings alone must not produce a line per sample.
+        polls = ((0.0, 512, 0.0), (1.0, 512, 0.0), (59.0, 512, 0.0),
+                 (60.0, 512, 0.0), (61.0, 512, 11.0), (62.0, 512, 12.0),
+                 (63.0, 768, 12.0), (64.0, 768, 12.0))
+        index = 0
+        reported_at: list[float] = []
+        output = io.StringIO()
+        lines_seen = 0
+
+        def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], *, root: Path,
+                  profile: memory_admit.StepProfile | memory_admit.GateProfile) -> memory_admit.CheckResult:
+            result = checks(meminfo, pid, sidecar, argv, root=root, profile=profile)
+            if result.decision.state == "admit":
+                return result
+            _, need_mib, full = polls[index]
+            return replace(result, peak=memory_admit.ExpectedPeak(need_mib * (1 << 20), "fallback", 0),
+                           decision=replace(result.decision, pressure=(memory_admit.MemoryPressure(full)
+                                            if full else memory_admit.NO_PRESSURE_HOLD)))
+
+        def next_poll(_seconds: float) -> None:
+            nonlocal index, lines_seen
+            lines = output.getvalue().splitlines()
+            reported_at.extend([polls[index][0]] * (len(lines) - lines_seen))
+            lines_seen = len(lines)
+            index += 1
+            if index == len(polls):
+                busy.unlink()
+
+        with mock.patch.dict(os.environ, self.environment), \
+                mock.patch.object(memory_admit, "check", side_effect=check), \
+                mock.patch.object(time, "sleep", side_effect=next_poll), \
+                mock.patch.object(time, "monotonic", side_effect=lambda: polls[min(index, len(polls) - 1)][0]), \
+                redirect_stdout(output):
+            with merge_gate.gate_reservation(self.checkout, 512, self.state, merge_gate.BuildHoldWait()):
+                pass
+        self.assertEqual(reported_at, [0.0, 60.0, 61.0, 63.0], output.getvalue())
+        self.assertIn("memory pressure", output.getvalue())
+        self.assertIn("0.750 GiB needed", output.getvalue())
+        self.assert_gate_released()
+
+    @gate_suites("hooks")
+    def test_gate_waiting_past_profile_expiry_refreshes_without_losing_identity(self) -> None:
+        busy = self.occupy_memory_queue()
+        clock = datetime(2026, 10, 30, tzinfo=UTC)
+        profiles: list[memory_admit.GateProfile] = []
+        sleep = time.sleep
+
+        class AdmissionClock(datetime):
+            @classmethod
+            @override
+            def now(cls, tz: tzinfo | None = None) -> datetime:
+                return clock.astimezone(tz)
+
+        def short_sleep(seconds: float) -> None:
+            sleep(min(seconds, 0.01))
+
+        def observe(result: memory_admit.CheckResult) -> None:
+            nonlocal clock
+            self.assertIsInstance(result.profile, memory_admit.GateProfile)
+            profiles.append(cast(memory_admit.GateProfile, result.profile))
+            if len(profiles) == 1:
+                self.assertEqual(result.decision.state, "hold")
+                clock += timedelta(seconds=601)
+            elif len(profiles) == 2:
+                self.assertEqual(result.decision.state, "hold")
+                busy.unlink()
+
+        with self.observing_admission(observe), \
+                mock.patch.object(memory_admit, "datetime", AdmissionClock), \
+                mock.patch.object(memory_admit, "git_identity", side_effect=AssertionError("gate inferred cargo")), \
+                mock.patch.object(time, "sleep", side_effect=short_sleep):
+            result = self.run_gate("--tests-only", "--memory-cap-mib", "512")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(profiles), 3)
+        for profile in profiles:
+            self.assertIsInstance(profile, memory_admit.GateProfile)
+            self.assertEqual((profile.step, profile.worktree, profile.cap_bytes),
+                             ("merge-gate", str(self.checkout), 512 * 1024 * 1024))
+        self.assertEqual(profiles[-1].estimated_at, clock.timestamp())
+        self.assert_gate_released()
+
+    @gate_suites("hooks")
+    def test_stop_during_memory_wait_removes_the_live_parent_waiter(self) -> None:
+        busy = self.occupy_memory_queue()
+        held: list[Path] = []
+
+        def observe(result: memory_admit.CheckResult) -> None:
+            if result.decision.state == "hold":
+                waiter, = self.admission_directory.glob("*.waiting")
+                held.append(waiter)
+                raise KeyboardInterrupt("fixture stop during admission")
+
+        with self.observing_admission(observe):
+            result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(len(held), 1)
+        self.assertEqual(self.module_events(), [])
+        busy.unlink()
+        self.assert_gate_released()
+
+    @gate_suites("hooks")
+    def test_full_queue_holds_gate_until_the_running_charge_is_released(self) -> None:
+        busy = self.occupy_memory_queue()
+        decisions: list[str] = []
+
+        def observe(result: memory_admit.CheckResult) -> None:
+            decisions.append(result.decision.state)
+            if result.decision.state == "hold":
+                self.assertEqual(self.module_events(), [])
+                row, = self.admission_directory.glob("*.waiting")
+                waiter = cast(dict[str, object], json.loads(row.read_text()))
+                self.assertEqual(waiter["step"], "merge-gate")
+                busy.unlink()
+
+        with self.observing_admission(observe):
+            result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(decisions, ["hold", "admit"])
+        self.assert_all_modules_started()
+        self.assert_gate_released()
+
+    @gate_suites("hooks")
+    def test_first_gate_asks_for_its_cap_and_release_supplies_the_next_estimate(self) -> None:
+        estimates: list[memory_admit.GateEstimate] = []
+        reservations: list[Path] = []
+
+        def sample(roots: set[int]) -> dict[int, float]:
+            return {pid: 123.0 for pid in roots}
+
+        def observe(result: memory_admit.CheckResult) -> None:
+            self.assertEqual((result.repo, result.step), (str(Path.home() / ".claude"), "merge-gate"))
+            self.assertEqual(result.profile.worktree, str(self.checkout))
+            self.assertIsInstance(result.profile, memory_admit.GateProfile)
+            estimates.append(cast(memory_admit.GateProfile, result.profile).estimate)
+            if isinstance(result.reservation, memory_admit.Reserved):
+                reservations.append(result.reservation.path)
+
+        with self.observing_admission(observe), \
+                mock.patch.object(merge_gate, "process_memory_mib", side_effect=sample):
+            first = self.run_gate("--tests-only", "--memory-cap-mib", "512")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(len(reservations), 1)
+        self.assertIsInstance(estimates[0], memory_admit.NoGateHistory)
+        self.assertEqual(cast(memory_admit.NoGateHistory, estimates[0]).cap_bytes, 512 * 1024 * 1024)
+        self.assert_gate_released()
+        row, = self.gate_history()
+        self.assertEqual((row["step"], row["anon_peak_bytes"]), ("merge-gate", 123 * 1024 * 1024))
+        self.clear_gate_events()
+        with self.observing_admission(observe):
+            second = self.run_gate("--tests-only", "--memory-cap-mib", "512")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIsInstance(estimates[-1], memory_admit.MeasuredGatePeak)
+        self.assertEqual(cast(memory_admit.MeasuredGatePeak, estimates[-1]).bytes, 123 * 1024 * 1024)
+        self.assert_gate_released()
+
+    @gate_suites("hooks")
+    def test_failure_and_module_kill_release_the_gate_reservation(self) -> None:
+        check = memory_admit.check
+        for marker in ("red-hooks", "signal-hooks"):
+            with self.subTest(marker=marker):
+                self.clear_gate_events()
+                self.write(self.state / marker, "fail")
+                with mock.patch.object(memory_admit, "check", wraps=check) as checked:
+                    result = self.run_gate("--tests-only")
+                self.assertTrue(checked.called)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assert_gate_released()
+                (self.state / marker).unlink(missing_ok=True)
+
+    @gate_suites("hooks")
+    def test_admission_error_refuses_before_any_module_starts(self) -> None:
+        with mock.patch.object(memory_admit, "check", side_effect=OSError("fixture admission error")):
+            result = self.run_gate("--tests-only")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("fixture admission error", result.stderr.splitlines()[-1])
+        self.assertEqual(self.module_events(), [])
+        self.assert_gate_released()
 
 
 @final

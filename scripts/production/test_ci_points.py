@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import fcntl
-import ci_points
-from cli_fixture import invoke_cli
 import json
 import os
 import re
@@ -16,6 +14,10 @@ import textwrap
 import unittest
 from pathlib import Path
 from typing import cast, final, override
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ci_points
+from cli_fixture import invoke_cli
 
 
 # Script completion deadlines only bound hangs; startup can be slow under load.
@@ -282,6 +284,27 @@ class CiPointsTests(unittest.TestCase):
         self.assertEqual(skipped.returncode, 0, skipped.stdout + skipped.stderr)
         self.assertEqual(skipped.stdout.strip(), "ci start: ok — skipped: no CI")
         self.assertEqual(len((self.stub_state / "validate-calls").read_text().splitlines()), 2)
+
+    def test_validation_failure_names_the_failed_check_when_stderr_only_reports_memory_waits(self) -> None:
+        validate = self.bin / "validate_and_push.sh"
+        self.write(validate, "\n".join((
+            "#!/bin/sh",
+            "printf 'waiting for memory: 2 GiB available\\nwaiting for memory: 3 GiB available\\n' >&2",
+            "printf 'FAILED: quota formatter check\\n'",
+            "exit 7",
+            "",
+        )))
+        self.env["CI_POINTS_VALIDATE_SCRIPT"] = str(validate)
+
+        result = self.run_ci("ci", "start", "--state-dir", str(self.state))
+
+        self.assert_step(result, "validation", False)
+        self.assertEqual(result.stdout.strip(), (
+            "validation: failed — stderr: waiting for memory: 2 GiB available; "
+            + "waiting for memory: 3 GiB available; stdout: FAILED: quota formatter check"
+        ))
+        self.assertEqual(result.stderr, "")
+        self.assertFalse((self.state / "ci_run.json").exists())
 
     def test_collect_records_green_tip_and_resets_five_merge_interval(self) -> None:
         for number in range(1, 5):

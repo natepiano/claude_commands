@@ -30,24 +30,25 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, NotRequired, TypedDict, cast
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import codex_pacer
 import five_hour
-import note_file
-import session_table
-from session_table import SessionsSection, KeepSections, KEEP_SECTIONS
-from note_file import FIELD, Note, reset_time
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from scripts.whoami import note_file
+from scripts.whoami import session_table
+from scripts.whoami.session_table import SessionsSection, KeepSections, KEEP_SECTIONS
+from scripts.whoami.note_file import FIELD, Note, reset_time
 from scripts.accounts import next_moves, refusals, role_map
 from scripts.accounts.role_map import role_map_command
 from scripts.whoami.agent_accounts import KnownCodexAccount, UnknownCodexAccount, codex_account
-from agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, EASTERN, Report, UsageReadOutcome,
+from scripts.whoami.agent_accounts import (ClaudeAccountsInUse, CodexHomeSource, EASTERN, Report, UsageReadOutcome,
                             claude_on_disk, codex_email_on_disk, codex_home_display, codex_homes,
                             codex_report_in_use, live_reports, observe_workers_home as resolve_workers_home, NoWorkersHome)
 from quota_alert import (AgentNote, alert, blocked, current_session, refresh, CodexAlertPassReadings,
                          codex_alert_pass, RefusedAt, RefusalTimeUnknown,
                          StoppedWorkerCommand, StoppedCommandUnknown)
-from run_out import READINGS_LOG
-import usage_store
+from scripts.whoami.run_out import READINGS_LOG
+from scripts.whoami import usage_store
 from user_zone import user_zone
 
 
