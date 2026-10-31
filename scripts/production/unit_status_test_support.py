@@ -88,6 +88,8 @@ class UnitStatusFixture(unittest.TestCase):
         message = root / "scripts/message"
         message.mkdir()
         _ = shutil.copy2(SCRIPT.parents[1] / "message/sessions.py", message / "sessions.py")
+        (root / "config").mkdir()
+        _ = shutil.copy2(SCRIPT.parents[2] / "config/session_retries.toml", root / "config/session_retries.toml")
         _write_executable(message / "notifier.sh", 'print -r -- "$*" >> "$NOTIFIER_CALL_LOG"\nprint -r -- "$NOTIFIER_HEALTH_TEXT"\nexit "$NOTIFIER_HEALTH_EXIT"\n')
         hooks = root / "scripts/hooks"
         hooks.mkdir()
