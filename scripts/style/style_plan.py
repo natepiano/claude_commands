@@ -1429,7 +1429,8 @@ def _unit_tickets(family: rules.Family, cell: style_ledger.Cell) -> bool:
 
 
 def _refill_cells(ledger: style_ledger.Ledger, cells: tuple[style_ledger.Cell, ...], base: UnitBase, family: rules.Family,
-                  scope: PilotScope, waits: Mapping[str, style_proposals.RankWait]) -> RefillCells:
+                  scope: PilotScope, waits: Mapping[str, style_proposals.RankWait],
+                  definitions: Mapping[str, rules.Rule]) -> RefillCells:
     """Leave out unchanged held sites with open proposals, and find the unit's cells a ticket at its tip cannot change."""
     held = ledger.latest_held_judgments()
     findings: dict[tuple[str, str], list[style_ledger.HeldFinding]] = defaultdict(list)
@@ -1441,8 +1442,13 @@ def _refill_cells(ledger: style_ledger.Ledger, cells: tuple[style_ledger.Cell, .
     result: list[style_ledger.Cell] = []
     for cell in cells:
         key = (cell.rule, cell.path)
-        if cell.state in ("open", "stale") and key in held and findings[key]:
-            if all(isinstance(finding.state, style_ledger.Filed)
+        if (cell.state in ("open", "stale") and key in held and findings[key]
+                and not any(style_ledger.rule_changed_since_judged(finding, definitions) for finding in findings[key])):
+            judgment = ledger.newest_held_judgment(*key)
+            definition = definitions.get(cell.rule.removesuffix("#uncovered"))
+            current_text = (isinstance(judgment, style_ledger.NewestHeldJudgment) and definition is not None
+                            and rules.judged_text_unchanged(judgment.inputs.rule_blob, definition))
+            if current_text and all(isinstance(finding.state, style_ledger.Filed)
                    and frontmatter(finding.state.proposal).get("status") == ["open"]
                    for finding in findings[key]):
                 try:
@@ -1466,10 +1472,11 @@ def candidate_tickets(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles,
                       family: rules.Family, scope: PilotScope = _ALL_CRATES,
                       family_scopes: Mapping[rules.Family, PilotScope] = _ALL_FAMILY_SCOPES,
                       *, base: UnitBase, first_files: frozenset[str] = _NO_FIRST_FILES) -> tuple[TicketSelection, ...]:
+    definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
     cells = tuple(ledger.cells())
     waits = style_proposals.ranked_work(ledger, cells, family_scopes).waits(family)
     return _tickets_from(repo, ledger, busy, family, scope, family_scopes,
-                         _refill_cells(ledger, cells, base, family, scope, waits), first_files)
+                         _refill_cells(ledger, cells, base, family, scope, waits, definitions), first_files)
 
 
 def _tickets_from(repo: Path, ledger: style_ledger.Ledger, busy: BusyFiles, family: rules.Family, scope: PilotScope,
@@ -2494,7 +2501,7 @@ def _select_phase(
         return BuildableFindings(buildable, reason)
     if selection == FamilySelection.BORROW:
         return NoAvailableWork()
-    refill = _refill_cells(ledger, cells, base, family, scope, waits)
+    refill = _refill_cells(ledger, cells, base, family, scope, waits, definitions)
     candidates = _tickets_from(repo, ledger, busy, family, scope, scopes, refill, first_files)
     if not candidates:
         if isinstance(base, UnitBranchTip) and refill.judged_at_base:
@@ -2612,6 +2619,8 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
     if any("repair" in line.lower() and re.search(r"status:\s*todo", line) for line in original.splitlines() if line.startswith("### Phase ")):
         return RepairFirst()
     with style_ledger.open_ledger(repo) as ledger:
+        definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
+        _ = ledger.withdraw_superseded(definitions)
         style_proposals.complete(ledger)
         text, changes = discard_finished(ledger, original)
         if text != original:
@@ -2658,8 +2667,7 @@ def next_phase(unit: str, plan: Path, repo: Path) -> NextPhase:
                 return WaitingForMerge(predecessor.ticket_id, predecessor.commit, f"footprint unknown: {changes_on_main.reason}")
             ledger.wait_for_sync(unit)
             return WaitingForSync(0, f"touched set unknown: {changes_on_main.reason}")
-        # One catalog read serves both refill passes; it reads no shared state, so it runs before the lock.
-        definitions = {rule.rule_id: rule for rule in rules.load_rules(repo)}
+        # The catalog read above serves reconciliation and both refill passes.
         def select(busy: BusyFiles) -> PhaseWritten | NoAvailableWork | WaitingForStructure | MergeStyleBranchFirst | WaitingForSync | WaitingForMerge:
             try:
                 return select_family_work(ledger, unit, row.branch, plan, repo, doc, text, scope, busy, settings.first_files,

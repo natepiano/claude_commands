@@ -60,6 +60,21 @@ FINDING_REPLACEMENT_GUIDANCE = (
 )
 
 
+UNCOVERED_SUFFIX = "#uncovered"
+
+
+def base_rule(rule: str) -> str:
+    """Remove exactly one trailing uncovered-component suffix."""
+    return rule.removesuffix(UNCOVERED_SUFFIX)
+
+
+def base_rule_sql(reference: str) -> str:
+    """The same key for a trusted SQL column reference or named bind parameter."""
+    size = len(UNCOVERED_SUFFIX)
+    return (f"CASE WHEN substr({reference},-{size})='{UNCOVERED_SUFFIX}' "
+            + f"THEN substr({reference},1,length({reference})-{size}) ELSE {reference} END")
+
+
 class DeclaredInputScope(StrEnum):
     RULE = "rule"
     FILE = "file"
@@ -295,7 +310,14 @@ class DeclarationGone:
     commit: str
 
 
-WithdrawnBy = ExceptionVerdict | JudgedAgain | DuplicateOf | DeclarationGone
+@dataclass(frozen=True)
+class RuleBodyChanged:
+    """The finding's rule now has this canonical body; ordinary refill must judge it again."""
+
+    rule_blob: str
+
+
+WithdrawnBy = ExceptionVerdict | JudgedAgain | DuplicateOf | DeclarationGone | RuleBodyChanged
 
 
 def withdrawn_line(by: WithdrawnBy) -> str:
@@ -308,6 +330,8 @@ def withdrawn_line(by: WithdrawnBy) -> str:
             return f"duplicate of {by.finding_id}"
         case DeclarationGone():
             return f"declaration gone at {by.commit[:7]}"
+        case RuleBodyChanged():
+            return f"rule body changed to {by.rule_blob[:8]}"
 
 
 @dataclass(frozen=True)
@@ -617,7 +641,7 @@ class BulkRefusal:
 
 def rule_changed_since_judged(finding: HeldFinding, definitions: Mapping[str, Rule]) -> bool:
     """Whether the catalog has no rule for the finding, or the rule's text is not the text the finding was judged under."""
-    definition = definitions.get(finding.rule.removesuffix("#uncovered"))
+    definition = definitions.get(base_rule(finding.rule))
     return definition is None or not rule_catalog.judged_text_unchanged(finding.rule_blob, definition)
 
 
@@ -656,7 +680,7 @@ class SupersedingJudgment:
 @dataclass(frozen=True)
 class WithdrawnFinding:
     finding: HeldFinding
-    verdict: SupersedingJudgment
+    verdict: SupersedingJudgment | RuleBodyChanged
 
 
 @dataclass(frozen=True)
@@ -670,7 +694,7 @@ class KeptForBuild:
 
 @dataclass(frozen=True)
 class Withdrawal:
-    """The findings that a newer judgment under their rule's current text withdraws, and those an open build keeps."""
+    """Findings withdrawn by changed rule bodies or newer judgments, and those an open build keeps."""
 
     withdrawn: tuple[WithdrawnFinding, ...]
     kept: tuple[KeptForBuild, ...]
@@ -1601,6 +1625,17 @@ class Judgment:
 
 
 @dataclass(frozen=True)
+class RuleGenerationChange:
+    """One reconciled identity transition and fresh current-text evidence recorded before it."""
+
+    rule: str
+    previous_blob: str
+    generation: int
+    current_blob: str
+    fresh_judgments: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class UnseenTip:
     """No sync finished the tip."""
 
@@ -2064,6 +2099,42 @@ MIGRATIONS = {
             ticket TEXT PRIMARY KEY REFERENCES tickets(id), batch TEXT NOT NULL CHECK(batch <> '')
         );
     """,
+    # Rule changes withdraw without inventing a judgment row or rewriting historical pins.
+    29: """
+        CREATE TABLE IF NOT EXISTS rule_body_withdrawals (
+            finding_id TEXT PRIMARY KEY REFERENCES held_findings(finding_id), rule_blob TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS invalidated_held_judgments (
+            judgment_id INTEGER PRIMARY KEY REFERENCES judgments(id), recorded_at TEXT NOT NULL
+        );
+        CREATE VIEW IF NOT EXISTS active_judgments AS SELECT j.* FROM judgments j WHERE NOT EXISTS (
+            SELECT 1 FROM invalidated_held_judgments invalid
+            WHERE invalid.judgment_id=j.id AND invalid.recorded_at=j.recorded_at
+        );
+    """,
+    # Generations survive restoration and verdict updates. Removed rows remain deletion barriers.
+    30: f"""
+        ALTER TABLE judgments ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
+        CREATE TABLE rule_generations (
+            rule TEXT PRIMARY KEY, rule_blob TEXT NOT NULL, generation INTEGER NOT NULL
+        );
+        INSERT INTO rule_generations
+            WITH normalized AS (
+                SELECT {base_rule_sql('rule')} AS base_rule,rule_blob,recorded_at,id FROM judgments
+            ), ranked AS (
+                SELECT base_rule,rule_blob,
+                    row_number() OVER (PARTITION BY base_rule ORDER BY recorded_at DESC,id DESC) AS rank
+                FROM normalized
+            ) SELECT base_rule,rule_blob,0 FROM ranked WHERE rank=1;
+        UPDATE judgments SET generation=-1 WHERE verdict!='removed' AND {base_rule_sql('rule')} IN (
+            SELECT {base_rule_sql('j.rule')} FROM judgments j JOIN invalidated_held_judgments invalid
+            ON invalid.judgment_id=j.id AND invalid.recorded_at=j.recorded_at
+        );
+        DROP VIEW active_judgments;
+        CREATE VIEW active_judgments AS SELECT j.* FROM judgments j
+            LEFT JOIN rule_generations r ON r.rule={base_rule_sql('j.rule')}
+            WHERE j.verdict='removed' OR j.generation=coalesce(r.generation,0);
+    """,
 }
 
 
@@ -2161,6 +2232,7 @@ class Ledger:
         self._built_rename_evidence: dict[str, BuiltRenameEvidence] = {}
         self._site_rows_version: tuple[int, int] = (-1, -1)
         self._site_rows: dict[tuple[str, str], tuple[Judgment, ...]] = {}
+        self._inactive_site_holders: set[tuple[str, str]] = set()
         self._site_holding_rows: dict[tuple[str, str], list[tuple[str, Judgment]]] = {}
         self._site_rule_families: dict[str, str] = {}
         self._file_modules: dict[tuple[str, str], dict[str, RootedFileModule]] = {}
@@ -2364,19 +2436,25 @@ class Ledger:
         }
 
     def _check_pin(self, ticket: str, rule: str, rule_blob: str) -> str:
-        rows = cast(list[tuple[str]], self._connection.execute("SELECT rule_blobs FROM tickets WHERE id=?", (ticket,)).fetchall())
+        rows = cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT rule_blobs,state FROM tickets WHERE id=?", (ticket,)).fetchall())
         if rows:
             pins = cast(dict[str, str], json.loads(rows[0][0]))
+            if rows[0][1] in FINAL_TICKET_STATES:
+                raise LedgerError(f"{ticket}: cannot judge from {rows[0][1]}")
             if rule not in pins:
                 raise LedgerError(f"{ticket}: rule {rule} is outside the ticket")
+            definition = self._component_rule(rule)
             if rule_blob and rule_blob != pins[rule]:
-                definition = next(item for item in rule_catalog.load_rules(self.repo)
-                                  if item.rule_id == rule.removesuffix("#uncovered"))
                 if not rule_catalog.judged_text_unchanged(rule_blob, definition, compared_blob=pins[rule]):
                     raise LedgerError(f"{ticket}: rule blob for {rule} differs from ticket pin {pins[rule]}")
-            return rule_blob or pins[rule]
+            rule_blob = rule_blob or pins[rule]
+            if not rule_catalog.judged_text_unchanged(pins[rule], definition):
+                raise LedgerError(f"{ticket}: rule body changed for {rule}; ordinary refill must judge it again")
         if not rule_blob:
             raise LedgerError(f"{rule}: --rule-blob is required without a ledger ticket")
+        if not rule_catalog.judged_text_unchanged(rule_blob, self._component_rule(rule)):
+            raise LedgerError(f"{ticket}: rule body changed for {rule}; ordinary refill must judge it again")
         return rule_blob
 
     @_ticket_operation("add")
@@ -3113,9 +3191,12 @@ class Ledger:
                     raise ChangedBeforeLock(f"{id}: the ticket changed while it became {target}; rerun")
                 for verdict in (*(restamps.carried if isinstance(restamps, CheckpointRestamps) else ()), *carry.verdicts):
                     _ = self._connection.execute(
-                        'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope,read_files) '
-                        + 'SELECT rule,rule_blob,?,?,path,?,verdict,verdict_detail,ticket,worker,?,declared_scope,read_files FROM judgments WHERE id=? '
-                        + 'ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) DO NOTHING',
+                        'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope,read_files,generation) '
+                        + 'SELECT rule,rule_blob,?,?,path,?,verdict,verdict_detail,ticket,worker,?,declared_scope,read_files,generation FROM active_judgments WHERE id=? '
+                        + 'ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
+                        + 'DO UPDATE SET verdict=excluded.verdict,verdict_detail=excluded.verdict_detail,'
+                        + 'recorded_at=excluded.recorded_at,declared_scope=excluded.declared_scope,read_files=excluded.read_files,generation=excluded.generation '
+                        + 'WHERE judgments.generation!=excluded.generation',
                         (verdict.scope, verdict.fingerprint, checkpoint, datetime.now(timezone.utc).isoformat(), verdict.judgment_id),
                     )
                 for moved in carry.findings:
@@ -3222,7 +3303,7 @@ class Ledger:
         if not definitions:
             return BindingCarryForward()
         open_types = tuple(f for f in self.held_findings(AllHeldFindings())
-                           if isinstance(f.state, Unfiled | Filed) and f.rule.removesuffix("#uncovered") in definitions)
+                           if isinstance(f.state, Unfiled | Filed) and base_rule(f.rule) in definitions)
         verdicts: list[CarriedVerdict] = []
         moves: list[CarriedTypesFinding] = []
         for path in ticket["files"]:
@@ -3241,18 +3322,19 @@ class Ledger:
             proof = self._binding_proofs[key]
             if not proof.explained or not any(isinstance(check, AppliedInCode) for check in proof.checks.values()):
                 continue
-            rows = cast(list[tuple[int, str]], self._connection.execute(
-                'SELECT j.id,j.rule FROM judgments j WHERE j.path=? AND j.id=(SELECT newest.id FROM judgments newest '
+            rows = cast(list[tuple[int, str, str, str, str, Verdict, str, str, str, str]], self._connection.execute(
+                'SELECT j.id,j.rule,j.rule_blob,j.input_fingerprint,j."commit",j.verdict,j.input_scope,j.declared_scope,j.read_files,j.ticket FROM active_judgments j WHERE j.path=? AND j.id=(SELECT newest.id FROM active_judgments newest '
                 + 'WHERE newest.rule=j.rule AND newest.path=j.path ORDER BY newest.recorded_at DESC,newest.id DESC LIMIT 1)',
                 (path,),
             ).fetchall())
             blocked: set[str] = set()
-            for judgment_id, rule in rows:
-                definition = definitions.get(rule.removesuffix("#uncovered"))
+            for judgment_id, rule, blob, fingerprint, commit, verdict, scope, declared, reads, holder in rows:
+                definition = definitions.get(base_rule(rule))
                 if definition is None:
                     continue
-                judgments = self._judgments(rule, path)
-                judgment = judgments[0]
+                judgment = Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope),
+                                    DeclaredInputScope(declared), _read_files(reads), holder)
+                judgments = (judgment, *self._judgments(rule, path))
                 try:
                     if (not self._is_ancestor(judgment.commit, base.commit)
                             or judgment not in self._rows_after_removals(judgments, base.commit)):
@@ -3298,8 +3380,8 @@ class Ledger:
 
     def latest_ticket_judgments(self, ticket_id: str) -> tuple[TicketJudgment, ...]:
         rows = cast(list[tuple[int, str, str, str, Verdict, str, str]], self._connection.execute(
-            'SELECT j.id,j.rule,j.path,j."commit",j.verdict,j.declared_scope,j.read_files FROM judgments j WHERE j.ticket=? '
-            + 'AND j.id=(SELECT latest.id FROM judgments latest WHERE latest.ticket=j.ticket '
+            'SELECT j.id,j.rule,j.path,j."commit",j.verdict,j.declared_scope,j.read_files FROM active_judgments j WHERE j.ticket=? '
+            + 'AND j.id=(SELECT latest.id FROM active_judgments latest WHERE latest.ticket=j.ticket '
             + 'AND latest.rule=j.rule AND latest.path=j.path ORDER BY latest.recorded_at DESC,latest.id DESC LIMIT 1)',
             (ticket_id,),
         ).fetchall())
@@ -3361,7 +3443,7 @@ class Ledger:
         """
         cells = {(judgment.rule, judgment.path) for judgment in judgments}
         rows = cast(list[tuple[int, str, str, str, str]], self._connection.execute(
-            'SELECT id,ticket,rule,path,"commit" FROM judgments WHERE verdict=\'removed\'').fetchall())
+            'SELECT id,ticket,rule,path,"commit" FROM active_judgments WHERE verdict=\'removed\'').fetchall())
         return frozenset(row for row in rows if (row[2], row[3]) in cells)
 
     @_ticket_operation("merge")
@@ -3389,7 +3471,7 @@ class Ledger:
 
     @_ticket_operation("release")
     def release_held_reservation(self, id: str) -> HeldReservationRelease | None:
-        """Release the berth reservation the merged ticket's checkpoint kept; None when it keeps no record to release.
+        """Release the berth reservation a final ticket's checkpoint kept; None when it keeps no record to release.
 
         The style branch tip is the merged commit: a release berth made at a later commit of the unit's branch counts
         when that tip contains it. A confirmed release, or a record that holds no reservation, clears the run folder
@@ -3402,7 +3484,7 @@ class Ledger:
         state, session_dir, phase = rows[0]
         if not session_dir:
             return None
-        if state != "merged":
+        if state not in FINAL_TICKET_STATES:
             raise LedgerError(f"{id}: its reservation is released at ticket merge, not in state {state}")
         scripts = Path(__file__).resolve().parents[1]
         merged = self._style_branch_tip()[1]
@@ -3633,16 +3715,24 @@ class Ledger:
         finding_ids = (_finding_id(site), _finding_id((*site, *change)))
         with self._connection:
             _ = self._connection.execute("BEGIN IMMEDIATE")
-            rows = cast(list[tuple[str, str, str, str]], self._connection.execute(
-                "SELECT finding_id,kind,before,after FROM held_findings WHERE finding_id IN (?,?)", finding_ids,
-            ).fetchall())
-            changes = {row[0]: row[1:] for row in rows}
-            same = [finding_id for finding_id in finding_ids if changes.get(finding_id) == change]
-            # A ticket that holds an unfiled or filed finding again takes it over, so the finding is judged at that ticket's
-            # file.
+            _ = self._check_pin(ticket, rule, rule_blob)
             take_over = ("UPDATE held_findings SET ticket=?,updated_at=? WHERE finding_id=? AND state IN ('unfiled','filed') "
                          + "AND ticket!=?")
-            if same:
+            while True:
+                rows = cast(list[tuple[str, str, str, str, int]], self._connection.execute(
+                    "SELECT h.finding_id,h.kind,h.before,h.after,EXISTS "
+                    + "(SELECT 1 FROM rule_body_withdrawals w WHERE w.finding_id=h.finding_id AND h.state='withdrawn') "
+                    + "FROM held_findings h WHERE h.finding_id IN (?,?)", finding_ids,
+                ).fetchall())
+                changes = {row[0]: row[1:4] for row in rows}
+                same = [finding_id for finding_id in finding_ids if changes.get(finding_id) == change]
+                if not same:
+                    break
+                if any(row[0] == same[0] and row[4] for row in rows):
+                    # Preserve withdrawn history when a body returns; repeats follow the same replacement chain.
+                    finding_ids = (_finding_id((*site, *change, same[0])),
+                                   _finding_id((*site, *change, same[0], "replacement")))
+                    continue
                 _ = self._connection.execute(take_over, (ticket, _now(), same[0], ticket))
                 return self._held(same[0])
             # A followed finding keeps the id of its first site. A ticket that reads its new file holds the same change
@@ -3684,7 +3774,11 @@ class Ledger:
             case "built":
                 state = Built(Path(row[11]))
             case "withdrawn":
+                changed = cast(list[tuple[str]], self._connection.execute(
+                    "SELECT rule_blob FROM rule_body_withdrawals WHERE finding_id=?", (finding_id,),
+                ).fetchall())
                 state = Withdrawn(Path(row[11]) if row[11] else NoDecision(),
+                                  RuleBodyChanged(changed[0][0]) if changed else
                                   DuplicateOf(row[15]) if row[15] else DeclarationGone(row[20]) if row[20]
                                   else ExceptionVerdict(row[13]) if row[11] else JudgedAgain(row[13]))
             case "unfiled":
@@ -3934,7 +4028,7 @@ class Ledger:
 
     def newest_held_judgment(self, rule: str, path: str) -> NewestHeldJudgment | NoHeldJudgment:
         rows = cast(list[tuple[int, str, str, str, str, str, str, str, str, str, str]], self._connection.execute(
-            'SELECT id,rule,path,"commit",ticket,worker,rule_blob,input_scope,input_fingerprint,declared_scope,read_files FROM judgments '
+            'SELECT id,rule,path,"commit",ticket,worker,rule_blob,input_scope,input_fingerprint,declared_scope,read_files FROM active_judgments '
             + "WHERE rule=? AND path=? AND verdict='held' ORDER BY recorded_at DESC,id DESC LIMIT 1",
             (rule, path),
         ).fetchall())
@@ -3942,7 +4036,7 @@ class Ledger:
             return NoHeldJudgment()
         row = rows[0]
         newest = cast(tuple[int], self._connection.execute(
-            "SELECT id FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC LIMIT 1",
+            "SELECT id FROM active_judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC LIMIT 1",
             (rule, path),
         ).fetchone())[0]
         inputs = Judgment(row[6], row[8], row[3], "held", CellInputScope(row[7]), DeclaredInputScope(row[9]), _read_files(row[10]))
@@ -3978,42 +4072,30 @@ class Ledger:
             _ = self._connection.execute("UPDATE held_findings SET state='filed',proposal=?,updated_at=? WHERE finding_id=?", (str(proposal), _now(), finding_id))
 
     def _withdrawal_candidates(self, definitions: Mapping[str, Rule]) -> tuple[tuple[HeldFinding, Rule], ...]:
-        """Each unfiled finding, and each filed finding whose rule's current text is not the text it was judged under,
-        with its rule.
-
-        An unfiled finding that an open ticket holds is not read. Filing skips an unfiled one that this step leaves.
-        """
-        waiting = {finding.finding_id for finding in self.held_findings(UnfiledFindingsFromOpenTickets())}
-        changed: list[tuple[HeldFinding, Rule]] = []
-        for finding in (*self.held_findings(HeldFindingsInState("unfiled")),
-                        *self.held_findings(HeldFindingsInState("filed"))):
-            if finding.finding_id in waiting:
-                continue
-            definition = definitions.get(finding.rule.removesuffix("#uncovered"))
-            if definition is not None and (isinstance(finding.state, Unfiled) or not rule_catalog.judged_text_unchanged(finding.rule_blob, definition)):
-                changed.append((finding, definition))
-        return tuple(changed)
-
-    def _judged_under_changed_text(self, finding: HeldFinding, definition: Rule, tip: RepositoryTip) -> SupersedingJudgment | NotJudgedAgain:
-        """The newest judgment at the cell, when it is under the rule's current text and newer than the finding: an
-        exception for a filed finding, any verdict for an unfiled one."""
-        # followed_at holds a commit. updated_at uses the same UTC clock and format as recorded_at.
-        # After a follow, require a verdict after that row update. This can keep a finding judged before
-        # its move, or before a later row edit; keeping it is safer than closing its decision too soon.
-        # A removed row closes a cell whose file is gone; it is no verdict on code.
-        rows = cast(list[tuple[int, Verdict, str, str, str, str, str]], self._connection.execute(
-            "SELECT j.id,j.verdict,j.rule_blob,j.recorded_at,h.created_at,h.followed_at,h.updated_at FROM judgments j "
-            + "JOIN held_findings h ON h.finding_id=? WHERE j.rule=? AND j.path=? AND j.verdict!='removed' "
-            + "ORDER BY j.recorded_at DESC,j.id DESC",
-            (finding.finding_id, finding.rule, _finding_cell(definition, finding.path, tip)),
+        """Compare distinct open rule pins before hydrating changed bodies or candidates for newer judgments."""
+        pins = cast(list[tuple[str, str, int]], self._connection.execute(
+            "SELECT h.rule,h.rule_blob,MAX(h.state='unfiled' AND NOT EXISTS "
+            + "(SELECT 1 FROM tickets t WHERE t.id=h.ticket AND t.state IN ('assigned','checkpointed')) "
+            + "AND EXISTS (SELECT 1 FROM active_judgments j WHERE j.rule=h.rule AND j.ticket!=h.ticket "
+            + "AND j.verdict!='removed' AND j.recorded_at>CASE WHEN h.followed_at!='' THEN h.updated_at ELSE h.created_at END)) "
+            + "FROM held_findings h WHERE h.state IN ('unfiled','filed') GROUP BY h.rule,h.rule_blob"
         ).fetchall())
-        rows = [row for row in rows if rule_catalog.judged_text_unchanged(row[2], definition)
-                or rule_catalog.judged_text_unchanged(row[2], definition, compared_blob=finding.rule_blob)][:1]
-        withdraws = (rows and rule_catalog.judged_text_unchanged(rows[0][2], definition)
-                     and (isinstance(finding.state, Unfiled) or rows[0][1] == "exception")
-                     and rows[0][4] < rows[0][3]
-                     and (not rows[0][5] or rows[0][6] < rows[0][3]))
-        return SupersedingJudgment(rows[0][0], rows[0][1], rows[0][2]) if withdraws else NotJudgedAgain()
+        candidates: list[tuple[HeldFinding, Rule]] = []
+        for rule, blob, newer in pins:
+            definition = definitions.get(base_rule(rule))
+            if definition is None:
+                continue
+            changed = not rule_catalog.judged_text_unchanged(blob, definition)
+            if not changed and not newer:
+                continue
+            ids = cast(list[tuple[str]], self._connection.execute(
+                "SELECT h.finding_id FROM held_findings h WHERE h.rule=? AND h.rule_blob=? "
+                + "AND h.state IN ('unfiled','filed') AND (? OR (h.state='unfiled' AND NOT EXISTS "
+                + "(SELECT 1 FROM tickets t WHERE t.id=h.ticket AND t.state IN ('assigned','checkpointed')))) "
+                + "ORDER BY h.created_at,h.finding_id", (rule, blob, changed),
+            ).fetchall())
+            candidates.extend((self._held(id), definition) for (id,) in ids)
+        return tuple(candidates)
 
     def _judged_again_without(self, finding: HeldFinding, definition: Rule, tip: RepositoryTip) -> SupersedingJudgment | NotJudgedAgain:
         """The newest judgment at the cell under the finding's rule text, when another ticket recorded it after the
@@ -4025,14 +4107,14 @@ class Ledger:
         created, followed, updated = cast(tuple[str, str, str], self._connection.execute(
             "SELECT created_at,followed_at,updated_at FROM held_findings WHERE finding_id=?", (finding.finding_id,)).fetchone())
         candidates = cast(list[tuple[int, Verdict, str, str, str, str, str, str, str]], self._connection.execute(
-            'SELECT id,verdict,ticket,input_fingerprint,"commit",input_scope,declared_scope,read_files,rule_blob FROM judgments '
+            'SELECT id,verdict,ticket,input_fingerprint,"commit",input_scope,declared_scope,read_files,rule_blob FROM active_judgments '
             + "WHERE rule=? AND path=? AND verdict!='removed' AND recorded_at>? ORDER BY recorded_at DESC,id DESC",
             (finding.rule, cell, updated if followed else created),
         ).fetchall())
         rows = [row for row in candidates if rule_catalog.judged_text_unchanged(
             row[8], definition, compared_blob=finding.rule_blob)][:1]
         holder = {fingerprint for fingerprint, blob in cast(list[tuple[str, str]], self._connection.execute(
-            "SELECT input_fingerprint,rule_blob FROM judgments WHERE rule=? AND path=? AND ticket=?",
+            "SELECT input_fingerprint,rule_blob FROM active_judgments WHERE rule=? AND path=? AND ticket=?",
             (finding.rule, cell, finding.ticket),
         ).fetchall()) if rule_catalog.judged_text_unchanged(blob, definition, compared_blob=finding.rule_blob)}
         if not rows or rows[0][2] == finding.ticket:
@@ -4053,12 +4135,16 @@ class Ledger:
             current = False
         return SupersedingJudgment(judgment_id, verdict, blob) if current else NotJudgedAgain()
 
-    def _superseded(self, definitions: Mapping[str, Rule], tip: RepositoryTip) -> Withdrawal:
+    def _superseded(self, definitions: Mapping[str, Rule]) -> Withdrawal:
         withdrawn: list[WithdrawnFinding] = []
         kept: list[KeptForBuild] = []
         for finding, definition in self._withdrawal_candidates(definitions):
-            verdict = (self._judged_again_without(finding, definition, tip) if rule_catalog.judged_text_unchanged(finding.rule_blob, definition)
-                       else self._judged_under_changed_text(finding, definition, tip))
+            if not rule_catalog.judged_text_unchanged(finding.rule_blob, definition):
+                withdrawn.append(WithdrawnFinding(finding, RuleBodyChanged(definition.blob)))
+                continue
+            if not self._connection.execute("SELECT 1 FROM sync WHERE id=1").fetchone():
+                continue
+            verdict = self._judged_again_without(finding, definition, self._synced_tip())
             if isinstance(verdict, NotJudgedAgain):
                 continue
             if isinstance(finding.build_ticket, BuildTicket):
@@ -4072,41 +4158,92 @@ class Ledger:
     def superseded_findings(self, definitions: Mapping[str, Rule]) -> Withdrawal:
         """What withdraw_superseded withdraws and keeps; it writes nothing.
 
-        definitions maps each rule id to its current catalog rule. The synced tip loads only when there is an unfiled
-        finding, or a filed one whose rule text changed.
+        definitions maps each rule id to its current catalog rule. Only same-body findings need a synced tip;
+        rule-body withdrawals require no source reading.
         """
         if not self._withdrawal_candidates(definitions):
             return Withdrawal((), ())
-        return self._superseded(definitions, self._synced_tip())
+        return self._superseded(definitions)
+
+    def _obsolete_tickets(self, definitions: Mapping[str, Rule], withdrawal: Withdrawal) -> tuple[TicketRecord, ...]:
+        """Cancel stale pins and dependent successors, including a build holding a withdrawn finding."""
+        rows = cast(list[tuple[str]], self._connection.execute(
+            "SELECT id FROM tickets WHERE state NOT IN ('merged','dropped') ORDER BY id").fetchall())
+        tickets = tuple(self._ticket(row[0]) for row in rows)
+        obsolete = {ticket["id"] for ticket in tickets if any(
+            (definition := definitions.get(base_rule(rule))) is not None
+            and not rule_catalog.judged_text_unchanged(blob, definition)
+            for rule, blob in ticket["rule_blobs"].items())}
+        obsolete.update(item.finding.build_ticket.ticket for item in withdrawal.withdrawn
+                        if isinstance(item.verdict, RuleBodyChanged) and isinstance(item.finding.build_ticket, BuildTicket))
+        dependencies = cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT ticket,predecessor FROM ticket_predecessors").fetchall())
+        while successors := {ticket for ticket, predecessor in dependencies if predecessor in obsolete} - obsolete:
+            obsolete.update(successors)
+        return tuple(ticket for ticket in tickets if ticket["id"] in obsolete)
+
+    def _rule_generation_changes(self, definitions: Mapping[str, Rule]) -> tuple[RuleGenerationChange, ...]:
+        """Observed identity transitions, including restoration and catalog removal, without writing."""
+        rows = cast(list[tuple[str, str, int]], self._connection.execute(
+            "SELECT rule,rule_blob,generation FROM rule_generations ORDER BY rule").fetchall())
+        changes: list[RuleGenerationChange] = []
+        for rule, blob, generation in rows:
+            definition = definitions.get(rule)
+            if (definition is None and not blob) or (definition is not None and blob
+                    and rule_catalog.judged_text_unchanged(blob, definition)):
+                continue
+            # A worker can finish a current-text read before the planner reconciles it. Preserve that
+            # fresh evidence, never evidence from a previous generation of a restored body.
+            judgments = cast(list[tuple[int, str]], self._connection.execute(
+                f"SELECT id,rule_blob FROM active_judgments WHERE {base_rule_sql('rule')}=? "
+                + "AND verdict!='removed' ORDER BY id", (rule,)).fetchall())
+            fresh = tuple(id for id, pin in judgments
+                          if definition is not None and rule_catalog.judged_text_unchanged(pin, definition))
+            changes.append(RuleGenerationChange(rule, blob, generation, definition.blob if definition is not None else "", fresh))
+        return tuple(changes)
 
     def withdraw_superseded(self, definitions: Mapping[str, Rule]) -> Withdrawal:
-        """Withdraw each filed finding whose cell's newest judgment is an exception under its rule's current text,
-        and each unfiled finding whose cell's newest judgment is under that text: under a changed text any verdict,
-        under the same text one of another ticket, which did not hold the finding again.
+        """Withdraw all open old-body findings and cancel obsolete tickets in one transaction.
 
-        That judgment must come after the finding was created. For a followed finding it must also come after
-        its last row update, which is no earlier than its last follow. Judgments at other cells do not affect this check.
-
-        A finding that a ticket which is not final builds stays filed and is returned as kept. The plan comes
-        before the write lock; if the rows it read change before the lock, the withdrawal starts again.
+        Same-body findings retain the existing newer-judgment policy, including open-build protection.
+        Source proofs run before the write lock; the transaction rechecks the plan before changing rows.
+        Workers judge outside this transaction. Their hold/record writes check pins and ticket state under
+        their own write locks, so cancellation cannot race an old-body finding back into the ledger.
         """
-
         def attempt() -> Withdrawal:
-            if not self._withdrawal_candidates(definitions):
-                return Withdrawal((), ())
-            tip = self._synced_tip()
-            plan = self._superseded(definitions, tip)
-            if not plan.withdrawn:
+            plan = self._superseded(definitions)
+            cancelled = self._obsolete_tickets(definitions, plan)
+            generations = self._rule_generation_changes(definitions)
+            if not plan.withdrawn and not cancelled and not generations:
                 return plan
             with self._connection:
                 _ = self._connection.execute("BEGIN IMMEDIATE")
-                if self.synced_commit() != tip.commit or self._superseded(definitions, tip) != plan:
-                    raise ChangedBeforeLock("the findings or their judgments changed while they were withdrawn; rerun")
+                if (self._superseded(definitions) != plan
+                        or self._obsolete_tickets(definitions, plan) != cancelled
+                        or self._rule_generation_changes(definitions) != generations):
+                    raise ChangedBeforeLock("the findings or tickets changed while they were withdrawn; rerun")
                 now = _now()
+                # Drop builds and their dependent tickets before withdrawing their findings, atomically.
+                _ = self._connection.executemany("UPDATE tickets SET state='dropped',updated_at=? WHERE id=?",
+                                                 [(now, ticket["id"]) for ticket in cancelled])
                 _ = self._connection.executemany(
-                    "UPDATE held_findings SET state='withdrawn',withdrawn_by=?,updated_at=? WHERE finding_id=?",
-                    [(item.verdict.judgment_id, now, item.finding.finding_id) for item in plan.withdrawn],
-                )
+                    "UPDATE held_findings SET build_ticket='',updated_at=? WHERE build_ticket=? AND state='filed'",
+                    [(now, ticket["id"]) for ticket in cancelled])
+                _ = self._connection.executemany(
+                    "UPDATE rule_generations SET generation=?,rule_blob=? WHERE rule=?",
+                    [(change.generation + 1, change.current_blob, change.rule) for change in generations])
+                _ = self._connection.executemany(
+                    "UPDATE judgments SET generation=? WHERE id=?",
+                    [(change.generation + 1, id) for change in generations for id in change.fresh_judgments])
+                for item in plan.withdrawn:
+                    judgment = item.verdict.judgment_id if isinstance(item.verdict, SupersedingJudgment) else 0
+                    _ = self._connection.execute(
+                        "UPDATE held_findings SET state='withdrawn',withdrawn_by=?,build_ticket='',updated_at=? WHERE finding_id=?",
+                        (judgment, now, item.finding.finding_id))
+                    if isinstance(item.verdict, RuleBodyChanged):
+                        _ = self._connection.execute(
+                            "INSERT INTO rule_body_withdrawals VALUES (?,?) ON CONFLICT(finding_id) DO UPDATE SET rule_blob=excluded.rule_blob",
+                            (item.finding.finding_id, item.verdict.rule_blob))
             return plan
 
         return retry_on_change(attempt)
@@ -4843,9 +4980,12 @@ class Ledger:
                 self._site_rule_families[blob] = match[1]
         grouped: dict[tuple[str, str], list[Judgment]] = {}
         self._site_holding_rows.clear()
+        self._inactive_site_holders = set(cast(list[tuple[str, str]], self._connection.execute(
+            "SELECT DISTINCT j.rule,j.ticket FROM judgments j WHERE j.verdict!='removed' "
+            + "AND NOT EXISTS (SELECT 1 FROM active_judgments active WHERE active.id=j.id)").fetchall()))
         rows = cast(list[tuple[str, str, str, str, str, Verdict, str, str, str, str]], self._connection.execute(
             'SELECT rule,path,rule_blob,input_fingerprint,"commit",verdict,input_scope,declared_scope,read_files,ticket '
-            + 'FROM judgments ORDER BY recorded_at DESC,id DESC').fetchall())
+            + 'FROM active_judgments ORDER BY recorded_at DESC,id DESC').fetchall())
         for rule, path, blob, fingerprint, commit, verdict, scope, declared, reads, ticket in rows:
             judgment = Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope), DeclaredInputScope(declared), _read_files(reads), ticket)
             grouped.setdefault((rule, path), []).append(judgment)
@@ -4901,7 +5041,7 @@ class Ledger:
             "global:rust/crate-apis-expose-behavior.md", "global:rust/behavior-lives-in-its-most-cohesive-crate.md",
         }
         if not candidates:
-            return line_local and not contextual
+            return (finding.rule, finding.ticket) not in self._inactive_site_holders and line_local and not contextual
         longest = max(len(path) for path, _ in candidates)
         path, row = next((path, row) for path, row in candidates if len(path) == longest)
         if (not rule_catalog.judged_text_unchanged(row.rule_blob, self._component_rule(finding.rule),
@@ -4968,6 +5108,9 @@ class Ledger:
     def _finding_site(self, finding: HeldFinding, tip: RepositoryTip) -> SiteEvidence:
         if not isinstance(finding.state, (Unfiled, Filed)) or not finding.path.endswith(".rs"):
             return NeedsJudgment("not an open Rust finding")
+        if ((finding.rule, finding.ticket) in self._inactive_site_holders
+                and not self._site_holding_rows.get((finding.rule, finding.ticket))):
+            return NeedsJudgment("judgment belongs to an inactive rule generation")
         judged = self.judged_commit(finding)
         if isinstance(judged, NoJudgedCommit):
             return NeedsJudgment("no judged commit")
@@ -4984,7 +5127,7 @@ class Ledger:
             return NeedsJudgment("judgment crossed ancestry or removal boundary")
         before = self._tip(read)
         definition = next((rule for rule in self._catalog
-                           if rule.rule_id == finding.rule.removesuffix("#uncovered")), None)
+                           if rule.rule_id == base_rule(finding.rule)), None)
         family = self._site_rule_families.get(finding.rule_blob, "")
         if not family and definition is not None and rule_catalog.judged_text_unchanged(finding.rule_blob, definition):
             family = definition.family or ""
@@ -5683,7 +5826,7 @@ class Ledger:
         )
         for rule, path in sorted(cells):
             newest = cast(list[tuple[int, Verdict]], self._connection.execute(
-                "SELECT id,verdict FROM judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC LIMIT 1", (rule, path),
+                "SELECT id,verdict FROM active_judgments WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC LIMIT 1", (rule, path),
             ).fetchall())
             if newest and newest[0][1] == "waived":
                 _ = self._connection.execute("UPDATE judgments SET verdict='held',verdict_detail=?,recorded_at=? WHERE id=?",
@@ -5833,9 +5976,9 @@ class Ledger:
                     if result.returncode == 1:
                         self.ticket_drop(id)
                         changes.append(f"ticket {id}: assigned -> dropped")
-        # A merged ticket keeps its reservation record until a release is confirmed, so a failed release is retried here.
+        # Final tickets keep their reservation records until release is confirmed, also across cancellation or a crash.
         held = cast(list[tuple[str]], self._connection.execute(
-            "SELECT id FROM tickets WHERE state='merged' AND reservation_session_dir!='' ORDER BY id").fetchall())
+            "SELECT id FROM tickets WHERE state IN ('merged','dropped') AND reservation_session_dir!='' ORDER BY id").fetchall())
         for (id,) in held:
             with self.git_operation(f"ticket {id} reconcile"):
                 release = self.release_held_reservation(id)
@@ -5991,7 +6134,7 @@ class Ledger:
         return rule
 
     def _component_rule(self, rule_id: str) -> Rule:
-        definition = self._rule(rule_id.removesuffix("#uncovered"))
+        definition = self._rule(base_rule(rule_id))
         if rule_id.endswith("#uncovered"):
             if definition.tier != "B" or definition.candidates is None or definition.candidates.surface != "partial":
                 raise LedgerError(f"unknown rule {rule_id}")
@@ -6032,6 +6175,23 @@ class Ledger:
                 raise LedgerError(f"{rule}: {path} must name a crate, included Rust file or listed site")
         elif path not in tip.rust_files:
             raise LedgerError(f"{rule}: {path} is not an included Rust file")
+
+    @contextmanager
+    def _record_write(self, ticket: str, rule: str, path: str, rule_blob: str) -> Generator[int]:
+        """Publish any verdict only while its ticket, pin and generation remain valid."""
+        with self._connection:
+            _ = self._connection.execute("BEGIN IMMEDIATE")
+            _ = self._check_pin(ticket, rule, rule_blob)
+            if self._connection.execute(
+                "SELECT 1 FROM ticket_yields WHERE ticket=? AND path=?", (ticket, path),
+            ).fetchone():
+                raise LedgerError(f"{ticket}: {path} was yielded")
+            _ = self._connection.execute(
+                f"INSERT INTO rule_generations VALUES ({base_rule_sql(':rule')},:blob,0) ON CONFLICT(rule) DO NOTHING",
+                {"rule": rule, "blob": rule_blob})
+            generation = cast(tuple[int], self._connection.execute(
+                f"SELECT generation FROM rule_generations WHERE rule={base_rule_sql(':rule')}", {"rule": rule}).fetchone())[0]
+            yield generation
 
     def record(
         self, rule: str, path: str, commit: str, rule_blob: str, verdict: Verdict,
@@ -6083,8 +6243,7 @@ class Ledger:
                 scope = _comparison_scope(input_scope, scope)
         fingerprint = (_read_fingerprint(tip, path, read_files) if isinstance(read_files, ReadFiles)
                        else self._fingerprint(tip, scope, path))
-        with self._connection:
-            _ = self._connection.execute("BEGIN IMMEDIATE")
+        with self._record_write(ticket, rule, path, rule_blob) as generation:
             if verdict == "held":
                 findings = self._cell_findings(rule, path, tip.commit)
                 if not any(isinstance(finding.state, (Unfiled, Filed)) for finding in findings):
@@ -6093,17 +6252,13 @@ class Ledger:
                         f"{rule}: {path}: cannot record held without a live held finding.{inactive}\n"
                         + "A waived finding is the user's decision and does not make a cell held; "
                         + "hold a new finding with held add first, or record waived when only waived findings remain.")
-            if ticket and self._connection.execute(
-                "SELECT 1 FROM ticket_yields WHERE ticket=? AND path=?", (ticket, path),
-            ).fetchone():
-                raise LedgerError(f"{ticket}: {path} was yielded")
             _ = self._connection.execute(
-                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope,read_files) '
-                + 'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
-                + 'DO UPDATE SET verdict=excluded.verdict,verdict_detail=excluded.verdict_detail,recorded_at=excluded.recorded_at,declared_scope=excluded.declared_scope,read_files=excluded.read_files',
+                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope,read_files,generation) '
+                + 'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
+                + 'DO UPDATE SET verdict=excluded.verdict,verdict_detail=excluded.verdict_detail,recorded_at=excluded.recorded_at,declared_scope=excluded.declared_scope,read_files=excluded.read_files,generation=excluded.generation',
                 (rule, rule_blob, scope, fingerprint, path, tip.commit, verdict, detail, ticket, worker,
                  datetime.now(timezone.utc).isoformat(), input_scope,
-                 json.dumps(read_files.paths if isinstance(read_files, ReadFiles) else None)),
+                 json.dumps(read_files.paths if isinstance(read_files, ReadFiles) else None), generation),
             )
 
     def record_removed(
@@ -6152,25 +6307,22 @@ class Ledger:
         if len(removing) > 2:
             raise LedgerError(f"{path}: merge {deleting[:7]} deletes it, not a commit of {ticket_id}'s own")
         scope = _cell_scope(definition, path, self._tip(deleting))
-        with self._connection:
-            _ = self._connection.execute("BEGIN IMMEDIATE")
-            if self._connection.execute("SELECT 1 FROM ticket_yields WHERE ticket=? AND path=?", (ticket_id, path)).fetchone():
-                raise LedgerError(f"{ticket_id}: {path} was yielded")
+        with self._record_write(ticket_id, rule, path, rule_blob) as generation:
             _ = self._connection.execute(
-                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope,read_files) '
-                + 'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
-                + "DO UPDATE SET verdict=excluded.verdict,verdict_detail=excluded.verdict_detail,recorded_at=excluded.recorded_at",
+                'INSERT INTO judgments(rule,rule_blob,input_scope,input_fingerprint,path,"commit",verdict,verdict_detail,ticket,worker,recorded_at,declared_scope,read_files,generation) '
+                + 'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(rule,path,"commit",rule_blob,input_scope,input_fingerprint,ticket,worker) '
+                + "DO UPDATE SET verdict=excluded.verdict,verdict_detail=excluded.verdict_detail,recorded_at=excluded.recorded_at,generation=excluded.generation",
                 # A removed row has no inputs, so its fingerprint is empty and no tip matches it.
                 (rule, rule_blob, scope, "", path, deleting, "removed", detail, ticket_id, worker,
-                 datetime.now(timezone.utc).isoformat(), DeclaredInputScope.RULE, json.dumps(None)),
+                 datetime.now(timezone.utc).isoformat(), DeclaredInputScope.RULE, json.dumps(None), generation),
             )
         return removed_cell(ticket_id, rule, path, deleting)
 
     def latest_held_judgments(self) -> dict[tuple[str, str], str]:
         """Return judgment commits for cells whose latest verdict is held."""
         rows = cast(list[tuple[str, str, str]], self._connection.execute(
-            'SELECT j.rule,j.path,j."commit" FROM judgments j WHERE j.verdict=\'held\' '
-            + 'AND j.id=(SELECT latest.id FROM judgments latest WHERE latest.rule=j.rule AND latest.path=j.path '
+            'SELECT j.rule,j.path,j."commit" FROM active_judgments j WHERE j.verdict=\'held\' '
+            + 'AND j.id=(SELECT latest.id FROM active_judgments latest WHERE latest.rule=j.rule AND latest.path=j.path '
             + 'ORDER BY latest.recorded_at DESC,latest.id DESC LIMIT 1)',
         ).fetchall())
         return {(rule, path): commit for rule, path, commit in rows}
@@ -6194,7 +6346,7 @@ class Ledger:
 
     def _judgments(self, rule: str, path: str) -> tuple[Judgment, ...]:
         rows = cast(list[tuple[str, str, str, Verdict, str, str, str, str]], self._connection.execute(
-            'SELECT rule_blob,input_fingerprint,"commit",verdict,input_scope,declared_scope,read_files,ticket FROM judgments '
+            'SELECT rule_blob,input_fingerprint,"commit",verdict,input_scope,declared_scope,read_files,ticket FROM active_judgments '
             + "WHERE rule=? AND path=? ORDER BY recorded_at DESC,id DESC", (rule, path),
         ).fetchall())
         return tuple(Judgment(blob, fingerprint, commit, verdict, CellInputScope(scope), DeclaredInputScope(declared), _read_files(reads), ticket)
@@ -6240,7 +6392,11 @@ class Ledger:
         rows = self._rows_after_removals(self._judgments(rule.rule_id, path), tip.commit)
         scope = _cell_scope(rule, path, tip)
         pending = ""
-        judged = False
+        # Inactive generations remain history, but never supply coverage.
+        judged = not rows and self._connection.execute(
+            "SELECT 1 FROM judgments j WHERE j.rule=? AND j.path=? AND j.verdict!='removed' "
+            + "AND NOT EXISTS (SELECT 1 FROM active_judgments active WHERE active.id=j.id) LIMIT 1", (rule.rule_id, path),
+        ).fetchone() is not None
         declared = next((row.declared_scope for row in rows if row.verdict != "removed"), DeclaredInputScope.RULE)
         style_branch = self._style_branch()
         for row in rows:
@@ -6380,7 +6536,7 @@ class Ledger:
             elif not any(rule.rule_id == rule_id for rule in self._catalog):
                 raise LedgerError(f"unknown rule {rule_id}")
         for definition in self._catalog:
-            if rule_id is not None and definition.rule_id != rule_id.removesuffix("#uncovered"):
+            if rule_id is not None and definition.rule_id != base_rule(rule_id):
                 continue
             if definition.tier in ("E", "unclassified"):
                 continue
@@ -6431,7 +6587,7 @@ class Ledger:
         states: dict[str, Counter[CellState]] = {}
         held: Counter[str] = Counter()
         for cell, verdict in coverage:
-            rule_id = cell.rule.removesuffix("#uncovered")
+            rule_id = base_rule(cell.rule)
             if rule_id not in states:
                 states[rule_id] = Counter()
             states[rule_id][cell.state] += 1
@@ -6461,7 +6617,7 @@ class Ledger:
                 print(f"unclassified: {len(unclassified)} rules — pull nate_style")
             print("rule\tcurrent\tstale\topen\tawaiting merge\theld\tdone")
             for row in rows:
-                if rule and row.rule_id != rule.removesuffix("#uncovered"):
+                if rule and row.rule_id != base_rule(rule):
                     continue
                 counts = [str(count) for count in (row.current, row.stale, row.open, row.awaiting_merge, row.held)]
                 print("\t".join([row.rule_id, *counts, str(complete[row.rule_id]).lower()]))
@@ -6660,6 +6816,7 @@ def _held_json(finding: HeldFinding) -> dict[str, object]:
         by = finding.state.by
         result["withdrawn_by"] = by.judgment_id if isinstance(by, (ExceptionVerdict, JudgedAgain)) else 0
         result["duplicate_of"] = by.finding_id if isinstance(by, DuplicateOf) else ""
+        result["rule_changed_to"] = by.rule_blob if isinstance(by, RuleBodyChanged) else ""
     result["reading"] = reading_line(finding.state, finding.reading) if isinstance(finding.reading, ReadByPerson) else ""
     result["unwaived_by"] = finding.waive_undo.by if isinstance(finding.waive_undo, WaiveUndoneBy) else ""
     follow = finding.follow

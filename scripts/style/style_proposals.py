@@ -163,6 +163,8 @@ def issue_project(repo: Path, crate: str, vault: Path) -> IssueProject:
 class DecisionKey:
     rule: str
     crate: str
+    # Decisions retain their historical text. A new blob gets a new decision and fresh rule-policy approval;
+    # a human answer to the older text never silently approves the replacement.
     blob: str
 
 
@@ -1473,7 +1475,7 @@ def plan_withdrawal(ledger: style_ledger.Ledger, pending: Mapping[str, tuple[Pat
     issues = {issue for issue, _ in pending.values()}
     issues.update(finding.state.proposal for finding in ledger.held_findings(style_ledger.HeldFindingsInState("withdrawn"))
                   if isinstance(finding.state, style_ledger.Withdrawn) and isinstance(finding.state.proposal, Path)
-                  and isinstance(finding.state.by, (style_ledger.ExceptionVerdict, style_ledger.DeclarationGone)))
+                  and isinstance(finding.state.by, (style_ledger.ExceptionVerdict, style_ledger.DeclarationGone, style_ledger.RuleBodyChanged)))
     closes: list[EmptiedDecisionClose] = []
     refreshes: list[Path] = []
     for issue in sorted(issues):
@@ -1549,14 +1551,15 @@ def drop_duplicates(ledger: style_ledger.Ledger, *, dry_run: bool) -> tuple[Path
     return tuple(skipped)
 
 
-def superseded_line(finding: style_ledger.HeldFinding, verdict: style_ledger.SupersedingJudgment) -> str:
+def superseded_line(finding: style_ledger.HeldFinding, verdict: style_ledger.SupersedingJudgment | style_ledger.RuleBodyChanged) -> str:
+    if isinstance(verdict, style_ledger.RuleBodyChanged):
+        return f"{finding.finding_id} {finding.rule} {finding.path}:{finding.line}: {style_ledger.withdrawn_line(verdict)}"
     return (f"{finding.finding_id} {finding.rule} {finding.path}:{finding.line}: "
             + f"judgment {verdict.judgment_id} {verdict.verdict} under {verdict.rule_blob[:8]}")
 
 
 def run_withdrawal(writer: DecisionWriter, *, dry_run: bool) -> tuple[Path, ...]:
-    """Withdraw each filed finding that an exception under its rule's newer text supersedes, and each unfiled
-    finding whose cell that text judged again, then close or refresh the decisions of the filed ones.
+    """Apply the ledger's rule-body and newer-judgment withdrawal policy, then close or refresh filed decisions.
 
     Print one line per withdrawn and kept finding and per closed decision, then the totals. A dry run prints the
     same lines and writes nothing. A refresh keeps the parent that the decision names. A decision that cannot
@@ -1565,7 +1568,9 @@ def run_withdrawal(writer: DecisionWriter, *, dry_run: bool) -> tuple[Path, ...]
     ledger = writer.ledger
     withdrawal = (ledger.superseded_findings(writer.definitions) if dry_run
                   else ledger.withdraw_superseded(writer.definitions))
-    plan = plan_withdrawal(ledger, {item.finding.finding_id: (item.finding.state.proposal, style_ledger.ExceptionVerdict(item.verdict.judgment_id))
+    plan = plan_withdrawal(ledger, {item.finding.finding_id: (item.finding.state.proposal,
+                   item.verdict if isinstance(item.verdict, style_ledger.RuleBodyChanged)
+                   else style_ledger.ExceptionVerdict(item.verdict.judgment_id))
                                     for item in withdrawal.withdrawn if isinstance(item.finding.state, style_ledger.Filed)})
     for item in withdrawal.withdrawn:
         print(f"withdraw {superseded_line(item.finding, item.verdict)}")

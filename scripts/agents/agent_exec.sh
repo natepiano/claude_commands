@@ -86,16 +86,7 @@ agents_exec_main() {
 
     case "$AGENT_FAMILY" in
         codex)
-            workers_home="$("$PY" - "$script_dir/../.." <<'PY'
-import sys
-sys.path.insert(0, sys.argv[1])
-from scripts.whoami.agent_accounts import workers_home
-try:
-    print(workers_home())
-except (OSError, ValueError) as error:
-    sys.exit(str(error))
-PY
-            )"
+            workers_home="$(agents_workers_home)" || return 1
             family_args_line="$(agents_codex_args)"
             read -r -a family_args <<< "$family_args_line"
             command=(env "CODEX_HOME=$workers_home" codex exec "${family_args[@]}")
