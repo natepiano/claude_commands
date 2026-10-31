@@ -31,6 +31,7 @@ from fake_unit_host import HostedUnit
 from sessions import SessionRecord
 from unit_lookup import ClaudeNotRunning, ClaudeUnknown, LiveClaude, UnitState
 from scripts.production import staff
+from scripts.shutdown import remote
 from scripts.production.staff_test_support import isolated_staff_file, unit_membership, showrunner_relationship, StaffTestCase
 
 SCRIPT = Path(__file__).with_name("unit_lookup.py")
@@ -124,7 +125,7 @@ class UnitLookupTests(unittest.TestCase):
         self.assertEqual(found["panes-unit"].place, herdr.HerdrPlace("director", "w4:p1"))
         self.assertEqual(unit_lookup.marked_units("show"), {})
         observed = [(slug, pane.unit, pane.staff_id, pane.claude.session_id)
-                    for slug, pane in unit_lookup.observed_unit_marks()
+                    for slug, pane in unit_lookup.observed_staff_marks()
                     if isinstance(pane.claude, LiveClaude)]
         self.assertEqual(observed, [("show", "alpha-unit", row.id, "id-director")])
 
@@ -202,11 +203,11 @@ print(observed.row.id)
         assert not isinstance(session, sessions.UnreadableSessionRecord)
         with (mock.patch.object(staff, "snapshot", side_effect=AssertionError("second owner read")),
               mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("process scan"))):
-            found, directors = unit_lookup.session_unit_marks([session], self.environment, record=record)
+            found, directors = unit_lookup.session_staff_and_directors([session], self.environment, record=record)
         self.assertEqual(list(found.units["receiving"]), ["alpha-unit"])
         self.assertEqual(directors, {})
 
-    def test_staff_identity_alone_joins_a_pane_without_legacy_unit_marks(self) -> None:
+    def test_staff_identity_alone_joins_a_pane_without_legacy_staff_marks(self) -> None:
         row = unit_membership("receiving", "alpha-unit")
         fake_unit_host.write(self.environment, [HostedUnit("director", "w4:p1", {"STAFF_ID": row.id})])
         self.claude("director", "w4:p1")
@@ -216,7 +217,7 @@ print(observed.row.id)
 
     def test_restarted_unit_without_process_marks_uses_its_repaired_pane_record(self) -> None:
         from scripts.shutdown import pane_record
-        from scripts.production import unit_marks
+        from scripts.production import session_staff
         import session_pane
 
         owner = unit_membership("show", "alpha-unit")
@@ -234,11 +235,11 @@ print(observed.row.id)
         self.assertEqual(found["alpha-unit"].staff_id, owner.id)
         self.assertEqual(session_pane.record_place(record), herdr.HerdrPlace("agents", "w4:p1"))
         self.assertEqual(session_pane.session_place("same-conversation"), herdr.HerdrPlace("agents", "w4:p1"))
-        grouped, _ = unit_marks.session_unit_marks([record], self.environment)
+        grouped, _ = session_staff.session_staff_and_directors([record], self.environment)
         self.assertIsInstance(grouped.units["show"]["alpha-unit"].claude, LiveClaude)
 
     def test_live_staffed_session_without_any_launch_agrees_across_readers_and_worker_queue(self) -> None:
-        from scripts.production import unit_marks
+        from scripts.production import session_staff
         from scripts.message import unit_labels
         import session_pane
 
@@ -254,7 +255,7 @@ print(observed.row.id)
         self.assertIsInstance(found["alpha-unit"].claude, LiveClaude)
         self.assertEqual(found["alpha-unit"].staff_id, owner.id)
         self.assertEqual(session_pane.session_place("staffed-conversation"), herdr.HerdrPlace("agents", "w4:p1"))
-        grouped, _ = unit_marks.session_unit_marks([session], self.environment)
+        grouped, _ = session_staff.session_staff_and_directors([session], self.environment)
         self.assertEqual(grouped.units["show"]["alpha-unit"].staff_id, owner.id)
         run_root = self.root / "runs"
         run = run_root / "older-run"
@@ -271,7 +272,7 @@ print(observed.row.id)
         self.assertEqual(labels["worker-thread"], unit_labels.UnitLabels("fix", "show", "alpha"))
 
     def test_repair_creates_the_missing_live_launch_from_staff_and_rerun_writes_nothing(self) -> None:
-        from scripts.production import unit_marks
+        from scripts.production import session_staff
         from scripts.shutdown import pane_record
 
         owner = unit_membership("show", "alpha-unit")
@@ -279,7 +280,7 @@ print(observed.row.id)
         self.claude("alpha", "w4:p1", session_id="staffed-conversation")
         _ = (self.records / f"{os.getpid()}.json").write_bytes((self.records / "alpha-1.json").read_bytes())
         with mock.patch.object(pane_record, "PROC", self.root / "proc"):
-            changes = unit_marks.repair_marks()
+            changes = session_staff.repair_marks()
             self.assertEqual(len(changes), 1)
             entry = pane_record.read("agents")["w4:p1"]
             self.assertEqual(entry["session_id"], "staffed-conversation")
@@ -287,7 +288,48 @@ print(observed.row.id)
                 "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
             path = pane_record.record_path("agents")
             before = path.read_bytes(), path.stat().st_mtime_ns
-            self.assertEqual(unit_marks.repair_marks(), [])
+            self.assertEqual(session_staff.repair_marks(), [])
+            self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_folder_labels_reach_tab_sort_queue_and_repair_with_an_unrelated_session_name(self) -> None:
+        from scripts.production import session_staff
+        from scripts.message import unit_labels
+        from scripts.shutdown import pane_record
+
+        owner = unit_membership("show", "alpha-unit")
+        _ = staff.set_worktree(owner.id, staff.PresentWorktree(remote.local_machine(), self.root))
+        fake_unit_host.write(self.environment, [HostedUnit("agents", "w4:p1", {})])
+        self.claude("organon", "w4:p1", session_id="folder-conversation")
+        raw = cast(dict[str, object], json.loads((self.records / "organon-1.json").read_text()))
+        raw["cwd"] = str(self.root)
+        _ = (self.records / f"{os.getpid()}.json").write_text(json.dumps(raw))
+        session = sessions.read_session(self.records / f"{os.getpid()}.json")
+        assert not isinstance(session, sessions.UnreadableSessionRecord)
+        self.assertFalse((self.root / "pane-records/agents.json").exists())
+
+        # Tab sorting consumes the environments resolved by herdr_processes.
+        processes = herdr.herdr_processes()
+        classifier = herdr.UnitTabClassifier("agents", processes, staff.snapshot())
+        self.assertIsInstance(classifier.classify("show", "organon", ["w4:p1"]), herdr.UnitTab)
+        self.assertEqual(herdr.tab_order("show", ["show", "aaa-other", "organon"], [], {"organon"}), [0, 2, 1])
+        grouped, _ = session_staff.session_staff_and_directors([session], self.environment)
+        self.assertEqual(grouped.units["show"]["alpha-unit"].staff_id, owner.id)
+        registered = [{"slug": "show", "session": "runner", "socket": "", "zone": "UTC", "doc": "/unused"}]
+        with (mock.patch.object(unit_labels, "newest_sessions", return_value=[session]),
+              mock.patch.object(unit_labels, "registered_showrunners", return_value=registered),
+              mock.patch.object(herdr, "herdr_processes", side_effect=AssertionError("queue must read files only"))):
+            labels = unit_labels.unit_labels_for(["folder-conversation"], self.environment)
+        self.assertEqual(labels["folder-conversation"], unit_labels.UnitLabels("organon", "show", "alpha"))
+
+        with mock.patch.object(pane_record, "PROC", self.root / "proc"):
+            changes = session_staff.repair_marks()
+            self.assertEqual(len(changes), 1)
+            entry = pane_record.read("agents")["w4:p1"]
+            self.assertEqual(entry["environment"], {"STAFF_ID": owner.id,
+                "SHOWRUNNER_UNIT": "show", "SHOWRUNNER_UNIT_ID": "alpha-unit"})
+            path = pane_record.record_path("agents")
+            before = path.read_bytes(), path.stat().st_mtime_ns
+            self.assertEqual(session_staff.repair_marks(), [])
             self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def renamed_production(self) -> None:

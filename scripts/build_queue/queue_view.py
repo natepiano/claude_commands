@@ -142,6 +142,8 @@ def check_lines(checks: gate.HeadExplanation | gate.LineWaiter | gate.ReadingUna
 
 def reason_phrase(reason: gate.WaitReason, waiting: Sequence[gate.WaitingStep]) -> str:
     match reason:
+        case gate.EstimateExpired():
+            return "estimate expired"
         case gate.ReadingUnavailable():
             return "memory reading unavailable"
         case gate.MemoryPressure():
@@ -195,7 +197,9 @@ def head_status(model: QueueModel, budget: int) -> Line:
         result += (Span(" "), Span(countdown(head.order.deadline, model.reading.explanation.now),
                                    tone, until=head.order.deadline))
     reason = head.waiter.reason
-    if isinstance(reason, gate.ReadingUnavailable):
+    if isinstance(reason, gate.EstimateExpired):
+        result += (Span(" estimate expired", "error"),)
+    elif isinstance(reason, gate.ReadingUnavailable):
         result += (Span(" no reading", "error"),)
     elif isinstance(reason, gate.MemoryPressure) or isinstance(head.decision.pressure, gate.MemoryPressure):
         result += (Span(" pressure", "error"),)
