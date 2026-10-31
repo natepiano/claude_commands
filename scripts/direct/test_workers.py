@@ -21,7 +21,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable, Generator, Mapping
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import AbstractContextManager, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import BinaryIO, Literal, TextIO, cast, override
 from unittest.mock import patch
@@ -29,6 +29,8 @@ from unittest.mock import patch
 from scripts.agents import codex_mesh, test_codex_mesh as mesh_fixture
 from scripts.direct import progress_history, review_pool, workers
 from scripts.direct.recorder_fixture import invoke_recorder
+from scripts.message import sessions
+from scripts.production.staff_test_support import StaffTestCase, isolated_source_readers, showrunner_relationship
 
 
 SCRIPT = Path(__file__).with_name("workers.py")
@@ -104,6 +106,43 @@ def json_object(path: Path) -> dict[str, object]:
     if not isinstance(value, dict):
         raise AssertionError(f"expected an object in {path}")
     return cast(dict[str, object], value)
+
+
+class DirectorResolutionTests(StaffTestCase):
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        _ = showrunner_relationship("demo")
+        _ = self.enterContext(isolated_source_readers())
+        _ = self.enterContext(cast(AbstractContextManager[object], patch.dict(
+            os.environ, {"SHUTDOWN_STATE_DIR": str(self.root / "shutdown")},
+        )))
+
+    def test_live_unit_director_keeps_a_running_director_without_a_messaging_socket(self) -> None:
+        registry = self.session_record("director", "builders-unit")
+        run = self.worker_run("demo", "builders-unit", "director")
+        self.assertEqual(json_object(registry)["messagingSocketPath"], "")
+
+        self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector("director", os.getpid()))
+
+    def test_live_unit_director_prefers_the_newest_running_name_match(self) -> None:
+        older = self.session_record("older-director", "builders-unit")
+        newer = self.session_record("newer-director", "builders-unit")
+        record = json_object(newer)
+        record["updatedAt"] = 2
+        self.write_json(newer, record)
+        run = self.worker_run("demo", "builders-unit", "former-director")
+        self.write_json(self.root / "shutdown/account/history/restart.json", {"session": {
+            "session_id": "former-director", "name": "builders-unit", "run_dirs": [str(run)],
+            "host": {"kind": "unit", "unit": "builders-unit", "session_name": "builders-unit"},
+        }})
+        registry = sessions.read_registry()
+        entries = {item.record["sessionId"]: item for item in registry.entries}
+        # Present readable records in the older-first order that caused the defect.
+        with patch.object(sessions, "read_registry", return_value=sessions.RegistryRead(
+            (entries[older.stem], entries[newer.stem]), registry.unreadable,
+        )):
+            self.assertEqual(workers.live_unit_director(run), workers.LiveUnitDirector("newer-director", os.getpid()))
 
 
 class WorkerResolutionTests(mesh_fixture.MeshCommandFixture):
