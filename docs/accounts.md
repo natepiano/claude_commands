@@ -70,8 +70,10 @@ process with a time limit. `config/agent_notes.toml` owns their intervals and
 limits and is read on each run. A slow or failed part does not stop the other
 parts. Quota warnings and the pacer read after the notes part exits;
 the vault commit runs after the writers exit. A rerun skips completed parts
-until their next interval and retries failed parts. Completion times and the
-job lock live in `~/.local/state/agent-notes/job/`.
+until their next interval and retries failed parts.
+A part that leaves its note as it stands is logged as skipped and counts as
+completed for its interval; a source-command failure or timeout still fails
+the job. Completion times and the job lock live in `~/.local/state/agent-notes/job/`.
 
 Notes reuse usage reports for less than ten minutes, keeping their original
 reading times. Session tables and note session sections still refresh each notes
