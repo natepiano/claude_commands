@@ -68,8 +68,9 @@ Case E (resources-unit's compile-cache trial): clone builds with `CARGO_INCREMEN
 | tool-based-ui-demo (26 behind, 12 files) | 44.4 s | 13.43 | 451.5 s, 154 crates | 0.79 | −1.29 |
 | inspectors (22 behind, 26 ahead, 93 files) | 185.5 s | 21.71 | 498.0 s, 154 crates | 1.09 | +6.99 |
 
-- Rule 2 passes for the near source and fails for the far one. Both seeds compiled the same 154 crates (27% of A): the cause is the kind of step that last built the source, not commit distance. A target built only by nextest and clippy does not hold the dependencies `cargo build` needs.
-- Ordered seed rule: (1) a source whose last step kind matches the copy's step kind (build, test or lint); (2) of those, the source with the fewest changed files against the copy's commit; (3) no seed, a cold build, when no source passes (1) or the copy would take free space under 280 GiB.
+- Rule 2 (copy + build at most 50% of A) fails for both sources: 0.79 near, 1.09 far. Both seeds compiled the same 154 crates (27% of A). Neither source's last step was a plain build, so the step-kind cause is not proved.
+- Candidate ordered rule, not adopted: (1) a source whose last step kind matches the copy's step kind; (2) of those, the fewest changed files against the copy's commit; (3) otherwise a cold build. No seed may take free space under the host sweep floor, `sweep_free_floor_gib` in `config/lint.conf`.
+- Next case: a source whose last step kind matches the copy's kind (test, for gate and review copies), at a different commit. At most 50% of A and at most 5 GiB net adopts the candidate rule. Otherwise a seed comes only from the same commit (measured 9% of A), and every other commit builds cold. `copies.py` builds no other-commit seed path before that case reports.
 
 - **Target mode: seed, without `incremental/`, sources copied with `cp -a`** (builds showrunner, 2026-10-30). `copies.py` has this one mode and no option; it has no shared target mode.
 
