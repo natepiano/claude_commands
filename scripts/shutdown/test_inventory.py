@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import io
 import os
@@ -23,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.socket_test_support import short_socket_directory
 from scripts.production.staff_test_support import StaffTestCase, showrunner_relationship, unit_membership
 from test_support import ShutdownTestCase, linux_process_fixture
-from test_restart import entry, top_level
+from test_restart import entry, top_level, worker_session
 import shutdown_record
 import inventory
 import conversation_pause
@@ -35,7 +36,6 @@ from scripts.production import showrunners
 import unit_lookup
 import restart
 import shutdown
-import stop
 from fake_herdr import CommandResponse, herdr_listener
 from cli_fixture import ImmutableGitSeed, invoke_cli
 import fake_herdr
@@ -729,7 +729,8 @@ class InventoryTests(ShutdownTestCase):
         }
         self.write_executable(
             "ps",
-            """import json
+            """import copy
+import json
 import os
 import sys
 
@@ -1108,20 +1109,6 @@ elif "comm=" in joined:
         self.assertEqual(shutdown._host_text(unit["host"]), "unit shutdown-unit (herdr unit-herdr)")  # pyright: ignore[reportPrivateUsage]
         self.assertEqual(unit["host"].get("plan"), {"kind": "plan", "path": "docs/shutdown-plan.md"})
 
-    def test_herdr_host_cleanup_leaves_its_pane_and_server_running(self) -> None:
-        session = cast(inventory.TopLevelSession, next(
-            item for item in inventory.inventory(TARGET_LOGIN)["sessions"] if item["session_id"] == DESKTOP_ID
-        ))
-        session["host"] = inventory.HerdrHost(kind="herdr", herdr_session="writing", pane_id="w1:p1", presentation="detached")
-        with patch.object(stop, "_stop_unit_session") as cleanup, patch.object(stop, "_close_ghostty_window"):
-            issues = stop._stop_owner_resources(  # pyright: ignore[reportPrivateUsage]
-                session, kill=lambda _pid, _signal: self.fail("unexpected kill"), is_alive=lambda _pid: False,
-                codex_mesh=lambda _argv: self.fail("unexpected Codex stop"),
-                clock=datetime.now,
-                claim=stop.StopClaim(TARGET_LOGIN, DESKTOP_ID, "fixture", "fixture"),
-            )
-        self.assertEqual(issues, [])
-        cleanup.assert_not_called()
 
     def test_user_tmux_is_unknown_despite_inherited_herdr_environment(self) -> None:
         self.herdr_process(71_001, 1, ["/fixture/herdr", "--session", "outer", "server"], {})
@@ -2308,3 +2295,29 @@ class RecoveryInventoryTests(StaffTestCase):
 
 if __name__ == "__main__":
     _ = unittest.main()
+
+
+class FreshSessionTests(ShutdownTestCase):
+    def test_fresh_session_reports_owned_workers_and_preserves_the_recorded_identity(self) -> None:
+        owner = top_level('owner')
+        owner['pid'] = 101
+        worker = worker_session('worker', owner='owner')
+        unrelated = worker_session('other', owner='elsewhere')
+        observed = inventory.fresh_session(owner, inventory.Inventory(machine="natedev", login=TARGET_LOGIN, label="claude2", sessions=[owner, worker, unrelated], unattributed=[]))
+        self.assertEqual(observed, {'kind': 'matching session', 'session': owner, 'workers': [worker]})
+        changed = copy.deepcopy(owner)
+        changed['pid'] = 201
+        self.assertEqual(inventory.fresh_session(owner, inventory.Inventory(machine="natedev", login=TARGET_LOGIN, label="claude2", sessions=[changed], unattributed=[])), {'kind': 'session identity lost'})
+        self.assertEqual(owner['pid'], 101)
+
+
+    def test_fresh_session_rejects_any_resumed_occurrence_even_beside_the_recorded_process(self) -> None:
+        owner = top_level("owner")
+        owner["pid"] = 101
+        resumed = copy.deepcopy(owner)
+        resumed.update(pid=501, proc_start="200")
+        reports: tuple[list[inventory.Session], ...] = ([owner, resumed], [resumed, owner])
+        for rows in reports:
+            with self.subTest(pids=[row["pid"] for row in rows]):
+                self.assertEqual(inventory.fresh_session(owner, inventory.Inventory(machine="natedev", login=TARGET_LOGIN, label="claude2", sessions=rows, unattributed=[])),
+                                 {"kind": "session identity lost"})

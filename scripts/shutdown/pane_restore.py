@@ -5,8 +5,7 @@ each restored pane whose launch entry (`pane_record`) names a conversation, this
 it with the same title and the entry's account, resumes the conversation there, then closes the
 restored tab. herdr review, 2026-10-19: a pane's environment is set when it opens, never typed in.
 
-A pane is left as it is, and named, when its Claude was closed by hand, when a shutdown record owns
-its session (`shutdown.py up` brings it back), when the conversation already runs, when its launch flags are unknown, when the account
+A pane is left as it is, and named, when its Claude was closed by hand, when the conversation already runs, when its launch flags are unknown, when the account
 has no transcript of the conversation, or when the pane runs a program.
 
 Run: ~/.claude/scripts/lib/py ~/.claude/scripts/shutdown/pane_restore.py [--session NAME] [--dry-run]
@@ -29,7 +28,6 @@ import pane_record  # noqa: E402
 import sessions  # noqa: E402
 from scripts.shutdown.stop_resume import resume_arguments  # noqa: E402
 from scripts.whoami.account import named_account_environment  # noqa: E402
-from shutdown_record import all_session_records  # noqa: E402
 
 START_TIMEOUT_MS = 90_000
 SERVER_TIMEOUT_MS = 60_000
@@ -39,7 +37,7 @@ def _has_transcript(config_dir: Path, session_id: str) -> bool:
     return any(path.is_file() for path in (config_dir / "projects").glob(f"*/{session_id}.jsonl"))
 
 
-def skip_reason(pane: herdr.TabSession, entry: pane_record.PaneLaunch | None, owned: set[str], live: set[str]) -> str:
+def skip_reason(pane: herdr.TabSession, entry: pane_record.PaneLaunch | None, live: set[str]) -> str:
     """Why the pane stays as it is; empty when it is resumed."""
     if entry is None:
         return "no launch entry" if pane.session_id else ""
@@ -47,8 +45,6 @@ def skip_reason(pane: herdr.TabSession, entry: pane_record.PaneLaunch | None, ow
         return f"herdr has {pane.session_id}, the entry {entry['session_id']}"
     if entry.get("ended", False):
         return "its Claude was closed by hand"
-    if entry["session_id"] in owned:
-        return "a shutdown record owns it"
     if entry["session_id"] in live:
         return "it already runs"
     # Entries from before the field existed were written on Linux, where the flags are read.
@@ -75,12 +71,11 @@ def _resume(session: str, client: herdr.Herdr, pane: herdr.TabSession, entry: pa
 def restore(session: str, *, dry_run: bool) -> int:
     client = herdr.Herdr(session)
     entries = pane_record.read(session)
-    owned = {saved["session"]["session_id"] for saved in all_session_records()}
     live = {item["sessionId"] for item in [*sessions.live_sessions(), *sessions.running_sessions()]}
     failures = 0
     for pane in client.tab_sessions():
         entry = entries.get(pane.pane_id)
-        reason = skip_reason(pane, entry, owned, live)
+        reason = skip_reason(pane, entry, live)
         if entry is None or reason:
             if reason:
                 print(f"{pane.pane_id} {pane.label}: left as it is: {reason}")

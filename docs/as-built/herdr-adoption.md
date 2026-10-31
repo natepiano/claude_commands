@@ -23,7 +23,7 @@ Every showrunner, unit director and standalone Claude session runs as a tab of o
 | `scripts/production/fake_unit_host.py` | Production fixtures over the fake herdr CLI and a fake `/proc`. |
 | `scripts/message/roster.py` | Joins marked units and interactive Codex panes into the roster. |
 | `scripts/shutdown/session_types.py` | Host wire types, including the legacy tmux forms. |
-| `scripts/shutdown/inventory.py`, `stop.py`, `settle.py`, `restart.py` | Host detection, unit session stop, screen reads, herdr restarts. |
+| `scripts/shutdown/inventory.py`, `stop_resume.py`, `restart.py` | Host detection, unit session stop, screen reads, herdr restarts. |
 | `scripts/lib/detached.py` | Detached starts on the Mac (herdr server, shutdown conductor, Remote Control fixer). |
 
 Outside this repo, `/etc/nixos/modules/common/shell.nix` defines `herdr-claude` (runs `herdr_sessions.py start "$@"`) and the `hsa` alias. It also guards the `claude` alias with `HERDR_AGENT_PANE`. `/etc/nixos/modules/linux/memory.nix` puts `herdr` in earlyoom's `--avoid` list.
@@ -132,7 +132,7 @@ A Claude session started in a folder the account has not trusted stops at the tr
 
 The CLI takes `read|type|keys|where` and either `unit <slug> <unit>` or `session <id>` (`read` also takes `--lines N --joined --ansi`). A trust, permission or question prompt refuses typing with exit 4 and `blocked at a prompt; nothing typed`. A missing target exits 1, usage 2 and host failure 3.
 
-These all use this path: effort changes (`unit_effort.py`), promotion, relays and dailies in the showrunner commands, the stall watch (400 joined lines), unit status (`unit_status.sh`, 400 joined lines), shutdown screen checks (`settle._screen`, 60 lines), and the Remote Control fixer. `settle._screen` checks that the registry record at the unit's pid still has the session's `sessionId` before it resolves the pane; a mismatch is `ScreenUnreadable("session registry identity changed")`. The fixer (`remote_control.py`) resolves the newly registered pid's pane with `record_place`. It confirms process identity and idle state, then types `/remote-control` unless the pane already shows `/remote-control is active`.
+These all use this path: effort changes (`unit_effort.py`), promotion, relays and dailies in the showrunner commands, the stall watch (400 joined lines), unit status (`unit_status.sh`, 400 joined lines), shutdown screen checks (`restart_support._screen`, 60 lines), and the Remote Control fixer. `restart_support._screen` checks that the registry record at the unit's pid still has the session's `sessionId` before it resolves the pane; a mismatch is `ScreenUnreadable("session registry identity changed")`. The fixer (`remote_control.py`) resolves the newly registered pid's pane with `record_place`. It confirms process identity and idle state, then types `/remote-control` unless the pane already shows `/remote-control is active`.
 
 ### Unit lookup and marks
 
@@ -172,7 +172,7 @@ Before starting the agent, add_unit saves its exact opening, conversation id, ac
 - It prints `<unit> started: <attach_hint>` or `<unit> restore launched: <attach_hint>`, the unit's tab in its production's workspace.
 - Exit 1 on `AgentNotReady` (prints the screen), 2 on a refusal, 1 on other failures.
 
-`--attach <id> --cwd <dir>` accepts a running session with `--plan`, `--standby` or `--permanent`. It checks the row, worktree, trust and source account before requesting `shutdown.py down <account> --here --only <id>`, follows the request within shutdown's pause limit, and requires both a stopped record and no surviving process. It then writes the unit, resumes the same conversation once with unit marks, finishes the shutdown record through `clear_running_on_target`, and proves one new registered pid. Unknown liveness or account, an incomplete stop, a surviving old process, or an ambiguous final process count refuses; an incomplete stop prints its cancel command. Plain `--resume` refuses a running session and directs the caller to `--attach`.
+`--attach <id> --cwd <dir>` accepts a running session with `--plan`, `--standby` or `--permanent`. It checks the row, worktree, trust and source account, calls `stop_resume.stop`, and requires the old process to be gone. It then writes the unit, resumes the same conversation once with unit marks, checks prompt submission, and proves one new registered pid. Unknown liveness or account, a surviving old process, or an ambiguous final process count refuses. Plain `--resume` refuses a running session and directs the caller to `--attach`.
 
 **Lower showrunners.** `add_showrunner.launch(child, model, effort, resume, cwd, selected)` uses no marks. The pane gets `ENABLE_TOOL_SEARCH=true` and the account variables. Arguments are `--model --effort [--resume] --remote-control <slug> -n <slug> --settings '{"disableAgentView": true}'`. It runs `start_server(agents, 90_000)`, opens a tab titled `<slug>` in `herdr_space(<slug>, <doc>)` and sends the prompt `/showrunner:produce <doc>[ resume]`. `checked` refuses when a tab of the shared session already has the slug's title (`herdr_tab_open`). Exit 3 (`SESSION_NOT_READY`) on `AgentNotReady`. It prints `started <slug>: <attach_hint>`, then waits up to `ADD_SHOWRUNNER_WAIT_S` (180 s, poll 2 s) for the showrunner to appear before attaching it to the caller.
 
