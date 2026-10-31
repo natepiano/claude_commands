@@ -339,7 +339,10 @@ class _WorkerSources:
                     try:
                         parent = self.owner(UnitMember(path.parent.name, path.stem))
                     except ValueError:
-                        found = self.sources.member(ObservedUnit(path.stem), self.record)
+                        # An adhoc stem is a worktree name and digest; `.claude-<digest>` names no unit.
+                        observed = ObservedUnit(path.stem)
+                        found = (self.sources.member(observed, self.record)
+                                 if unit_names.NAME.fullmatch(path.stem) else NoSuchMember(observed))
                         if isinstance(found, MemberFound):
                             parent = WorkerOwner(f"staff:{found.row.id}", found.row)
                         elif isinstance(worker.ownership, workers.HeldBy):
