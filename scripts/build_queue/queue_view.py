@@ -143,7 +143,7 @@ def check_lines(checks: gate.HeadExplanation | gate.ReadingUnavailable | ChecksN
     elif budget.need > budget.budget:
         held += " (runs alone)"
     parts = [f"this step {free.need / gate.GIB:.1f}"]
-    for label, value in (("#1", free.head_need), ("earlyoom", free.reserve), ("promised not yet used", free.growth)):
+    for label, value in (("earlyoom", free.reserve), ("promised not yet used", free.growth)):
         amount = f"{value / gate.GIB:.1f}"
         if amount != "0.0":
             parts.append(f"{label} {amount}")
@@ -185,6 +185,8 @@ def reason_phrase(reason: gate.WaitReason) -> str:
             return "free memory"
         case gate.BehindHead():
             return "#1's turn"
+        case gate.BehindOlderFit():
+            return gate.older_fit_text(reason)
         case gate.ReadyForAdmission():
             return "starts at the next check"
         case gate.HeadAdmissionStatus():

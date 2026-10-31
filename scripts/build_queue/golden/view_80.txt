@@ -21,8 +21,8 @@ Waiting · moved-up steps (↑) go first, newest move first; then the longest wa
                       when held falls to 9.5
                       ✓ free memory 24.5 GiB; needs 20.5: this step 11.5 +
                       earlyoom 3.0 + promised not yet used 6.0
-         #2-#32: strict until 10:56:00 (9 min 48 s left): younger steps wait; 4
-         of 31 fit now
+         #2-#32: younger steps may use 9.5 GiB of the budget until 10:56 (9 min
+         48 s left); 4 of 31 fit now
    2 ↑27   6 min   ~3 min  nextest  11.5  cables · work-lead
    3      39 min   ~4 min  mend      7.6  hana-migration
    4      37 min   ~5 min  clippy    2.9  berth · cargo-liner-berth-parallel-im…

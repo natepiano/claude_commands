@@ -9,7 +9,7 @@ Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.
   Moved-up steps go first, then the longest wait. It joined 2nd of the steps waiting now.
 
 Waits on
-  ✗ #1's turn      strict until 10:56:00 (9 min 48 s left): younger steps wait
+  ✗ #1's turn      younger steps may use 9.5 GiB of the budget until 10:56 (9 min 48 s left)
 
 Likely start ~10:51: 4th in line at 44 steps an hour, an estimate.
   Each step moved up ahead of it adds about 1 min.

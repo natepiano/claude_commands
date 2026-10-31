@@ -58,7 +58,7 @@ class QueueCardTests(QueueFixtureTests):
         self.assertIn("joined 10:07, 2 min before it", text)
         self.assertIn("It joined 2nd of the steps waiting now.", text)
         self.assertIn("✗ #1's turn", text)
-        self.assertIn("strict until 10:56:00 (9 min 48 s left): younger steps wait", text)
+        self.assertIn("younger steps may use 9.5 GiB of the budget until 10:56 (9 min 48 s left)", text)
         self.assertNotIn("build budget", text)  # These per-step checks arrive in Part B.
         self.assertNotIn("free memory", text)
         self.assertIn("Likely start ~10:51: 4th in line at 44 steps an hour, an estimate.", text)

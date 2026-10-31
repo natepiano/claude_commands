@@ -136,7 +136,7 @@ class QueueViewTests(QueueFixtureTests):
 
     def test_strict_rest_is_said_once_after_the_head_checks(self) -> None:
         text = plain(queue_view.render_view(self.fixture.model(), 400))
-        rest = "#2-#32: strict until 10:56:00 (9 min 48 s left): younger steps wait; 4 of 31 fit now"
+        rest = "#2-#32: younger steps may use 9.5 GiB of the budget until 10:56 (9 min 48 s left); 4 of 31 fit now"
         self.assertEqual(text.count(rest), 1)
         self.assertLess(text.index("✓ free memory"), text.index(rest))
         self.assertLess(text.index(rest), text.index("  2 ↑27"))

@@ -131,17 +131,17 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
                 0, charged=reason.charged, budget=reason.budget, budget_passes=False)
         elif isinstance(reason, gate.NeedsMemory):
             decision = gate.AdmissionDecision("hold", reason.threshold, reason.growth, reason.reserve,
-                0, free_passes=False, head_need=reason.head_need)
+                0, free_passes=False)
         elif isinstance(reason, gate.MemoryPressure):
             decision = gate.AdmissionDecision("hold", step.need + view.reserve, view.promised,
                                                       view.reserve, 0, pressure=reason)
         elif isinstance(reason, gate.ReadingUnavailable):
             host = reason
         first = gate.HeadExplanation(step, gate.NeedSourceNotRecorded(), decision,
-            gate.BudgetCheck(decision.charged, step.need, decision.head_need, decision.budget,
-                decision.budget - step.need - decision.head_need, decision.budget_passes),
+            gate.BudgetCheck(decision.charged, step.need, decision.budget,
+                decision.budget - step.need, decision.budget_passes),
             gate.FreeCheck(view.available, step.need, decision.reserve, decision.promised,
-                decision.head_need, decision.threshold, decision.free_passes),
+                decision.threshold, decision.free_passes),
             order, False, gate.NoBump())
     explanation = gate.QueueExplanation(view.now, host, running,
         gate.QueueMemoryTotals(sum(step.charged for step in running), sum(step.measured for step in running), view.promised),
@@ -259,16 +259,16 @@ class QueueFixture(ExitStack):
             gate.HeadAdmissionStatus(decision, row["need"], int(24.5 * gate.GIB), order)
             if index == 0 else gate.BehindHead("work-lead", ordered[0][1]["since"], "id-work-lead"))
             for index, (_, row) in enumerate(ordered))
-        measured = gate.MeasuredMemory(int(5.1 * gate.GIB), ramp_promise=int(11.1 * gate.GIB))
+        measured = gate.MeasuredMemory(int(5.1 * gate.GIB), gate.RampPromise(int(11.1 * gate.GIB)))
         run = gate.RunningStep("id-widget", "widget-enhancements-title", "nextest", "/tmp/widget",
                                int(11.1 * gate.GIB), measured)
         running = gate.ExplainedRunningStep(run, NOW - 25, int(11.1 * gate.GIB),
             int(5.1 * gate.GIB), int(11.1 * gate.GIB), gate.RampPromise(int(11.1 * gate.GIB)))
         head = gate.HeadExplanation(waiting[0], gate.NeedSourceNotRecorded(), decision,
-            gate.BudgetCheck(int(11.1 * gate.GIB), int(11.5 * gate.GIB), 0, 21 * gate.GIB,
+            gate.BudgetCheck(int(11.1 * gate.GIB), int(11.5 * gate.GIB), 21 * gate.GIB,
                              int(9.5 * gate.GIB), False),
             gate.FreeCheck(int(24.5 * gate.GIB), int(11.5 * gate.GIB), 3 * gate.GIB,
-                           6 * gate.GIB, 0, int(20.5 * gate.GIB), True),
+                           6 * gate.GIB, int(20.5 * gate.GIB), True),
             order, True, gate.QueueBump(NOW - 12, True, False))
         followers = tuple(gate.LineWaiter(step, position in (8, 12, 18, 25))
                           for position, step in enumerate(waiting[1:], 2))

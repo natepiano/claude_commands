@@ -222,7 +222,10 @@ the log does not record that connection. Journal retention also limits the evide
 ### Copy records and lifetime
 
 `scratch.shared_build_folder(source)` returns `SharedBuildFolder(path,
-repo_identity)` for `copies.py` to set as `CARGO_BUILD_BUILD_DIR`. It calls
+repo_identity)`, a folder a caller can set as `CARGO_BUILD_BUILD_DIR`. No caller
+uses it: `copies.py` seeds each copy's own build folder, because the
+verify-copies measurement (2026-10-30, case D) spent 68.7 of 69.0 s waiting on
+the shared folder's build lock. A later resources phase removes it. It calls
 `memory_admit.git_identity` only when used. The repository key alone names the
 folder under `~/.cache/claude-builds` (`SCRATCH_SHARED_BUILD_ROOT` overrides the
 root); each use updates the folder's one `.lint-sweep-used` stamp. An unknown
