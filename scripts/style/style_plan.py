@@ -1062,8 +1062,10 @@ class ApprovedTicket:
 def approved_ticket(
     ledger: style_ledger.Ledger, ticket_id: str, origin: style_ledger.ApprovedProposal,
 ) -> ApprovedTicket:
-    """Read the ticket's decision; raise unless it is open, approved for the ticket's unit, and still holds the ticket's
-    filed findings. The gate and `widen` both read approval here."""
+    """Require open approval for each selected rule and the ticket's crate and filed findings.
+
+    Approval follows the findings when refill lends the work to another unit. The gate and `widen` both read it here.
+    """
     if not origin.finding_ids:
         raise style_ledger.LedgerError("proposal ticket " + made_before_decisions(ticket_id))
     by_id = {finding.finding_id: finding for issue in origin.issues for finding in ledger.proposal_findings(issue)}
@@ -1073,11 +1075,16 @@ def approved_ticket(
     if any(not isinstance(finding.state, style_ledger.Filed) or finding.state.proposal not in origin.issues
            or finding.build_ticket != style_ledger.BuildTicket(ticket_id) for finding in findings):
         raise style_ledger.LedgerError("proposal approval or filed findings changed")
+    crate = ledger.ticket_crate(ticket_id)
     for issue in origin.issues:
         decision = Issue(issue, frontmatter(issue))
         answer = decision_answer(decision)
+        selected_rules = {style_ledger.base_rule(finding.rule) for finding in findings
+                          if isinstance(finding.state, style_ledger.Filed) and finding.state.proposal == issue}
         if (decision.value("status") != "open" or not style_proposals.is_decision(decision)
-                or not isinstance(answer, ApprovedDecision) or answer.unit != origin.unit):
+                or not isinstance(answer, ApprovedDecision)
+                or selected_rules != {decision.value("style_rule")}
+                or decision.value("style_crate") != crate):
             raise style_ledger.LedgerError("proposal approval or filed findings changed")
     moves = approved_file_renames(findings)
     allowed = frozenset({finding.path for finding in findings} | {moved.new for moved in moves})
