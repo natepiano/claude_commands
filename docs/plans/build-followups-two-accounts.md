@@ -2899,7 +2899,7 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 
 **Ruled out:** Taking the expected text from the alert's formatter: the literal `resets at 14:20 PDT` stays so the test still catches a formatter defect.
 
-### Phase 101 — The account readout names a turned-off MCP server only where it differs from ~/.claude  · status: todo
+### Phase 101 — The account readout names a turned-off MCP server only where it differs from ~/.claude  · status: done
 
 **Depends on:** Phase 100 (order only; both edit `scripts/accounts/accounts.py`).
 
