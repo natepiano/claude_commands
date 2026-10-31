@@ -1108,7 +1108,7 @@ The replay and 24 h check scripts live in the run folder (`phases/15/`), not in 
 
 **Ruled out:** pruning `doc/` or `mend-wrapper/` inside a target that still has units; a path rule for session scratchpad clones (the order is by last use only); whole takes ahead of orphans (orphans also cost no rebuild).
 
-### Phase 38 — The floor_scan row shows takeable bytes and the reason for the rest  · status: todo
+### Phase 38 — The floor_scan row shows takeable bytes and the reason for the rest  · status: done
 **Depends on:** Phase 26 (`scripts/buildlog/record.py`, `scripts/buildlog/test_record.py`); Phase 37 (`scripts/lint/sweep.py`)
 
 **Approved:** builds showrunner 2026-10-31, part 4 of the floor pass-over work; it lands after Phase 26 because Phase 26 holds `record.py`.
