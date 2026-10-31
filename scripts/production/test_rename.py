@@ -96,7 +96,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
 
     def assert_journal_has_no_current_locations(self) -> None:
         journal = self.journal()
-        for key in ("checkout", "old_doc", "new_doc", "timer", "state", "stall", "review_pool"):
+        for key in ("checkout", "old_doc", "new_doc", "timer", "state", "stall"):
             self.assertNotIn(key, journal)
         self.assertEqual(journal["plans"], [f"docs/plans/{unit}.md" for unit in UNITS])
         self.assertNotIn(str(self.root), json.dumps(journal))
@@ -129,7 +129,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         journal.update(checkout=str(self.checkout), old_doc=str(self.doc), new_doc=str(self.new_doc),
                        plans=[str(path) for path in plan.plans], timer=move_record(plan.timer),
                        state=[move_record(move) for move in plan.state],
-                       stall=[move_record(move) for move in plan.stall], review_pool=move_record(plan.review_pool))
+                       stall=[move_record(move) for move in plan.stall])
         self.write(self.state / "new/rename.json", json.dumps(journal))
         self.move_showrunner_checkout()
         self.assert_success(self.run_rename("apply"))
@@ -261,12 +261,11 @@ class ProductionRenameTests(support.ProductionRenameFixture):
                      *(self.state / directory / f"{slug}.json"
                        for directory in ("review-paused", "outstanding") for slug in (OLD, NEW)),
                      self.state / "child/parent",
-                     *(self.stall_path(slug, unit) for unit in UNITS for slug in (OLD, NEW)),
-                     self.pool / "old", self.pool / "new"):
+                     *(self.stall_path(slug, unit) for unit in UNITS for slug in (OLD, NEW))):
             self.assertIn(str(path), result.stdout)
         self.assertIn(f"{self.state}/*/parent", result.stdout)
         steps = [int(line.split(".", 1)[0]) for line in result.stdout.splitlines()]
-        self.assertEqual(set(steps), set(range(1, 9)))
+        self.assertEqual(set(steps), set(range(1, 8)))
         self.assertEqual(steps, sorted(steps))
         self.assertIn("merge branch old -> new", result.stdout)
         self.assertIn("push origin new", result.stdout)
@@ -372,7 +371,7 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertTrue((self.notifier / "showrunner-old/conf").exists())
         self.assertFalse((self.notifier / "showrunner-new").exists())
         self.assert_success(self.run_rename("apply", source="ancient"))
-        self.assertEqual(self.completed_steps(), 9)
+        self.assertEqual(self.completed_steps(), 8)
         self.assertEqual(self.git("rev-parse", "new^"), base)
         self.assertEqual(self.git("status", "--porcelain"), "")
 
@@ -448,7 +447,6 @@ class ProductionRenameTests(support.ProductionRenameFixture):
         self.assertTrue(self.new_doc.exists())
         self.assertTrue((self.notifier / "showrunner-new/conf").exists())
         self.assertFalse((self.notifier / "showrunner-old").exists())
-        self.assertTrue((self.pool / "old/pool.json").exists())
         for unit in UNITS:
             self.assertTrue(self.stall_path(OLD, unit).exists())
             self.assertRegex(self.plan_path(unit).read_text(),

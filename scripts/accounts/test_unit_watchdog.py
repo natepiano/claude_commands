@@ -220,6 +220,63 @@ class UnitWatchdogTests(unittest.TestCase):
         failure = unit_watchdog._restart(source.label, source.session["session_id"], source.identity)  # pyright: ignore[reportPrivateUsage]
         return failure, self.commands
 
+    def test_killed_notice_pass_saves_first_outage_and_tells_only_the_rest_on_rerun(self) -> None:
+        for name in ("alpha", "beta", "gamma"):
+            _ = self.add_unit(name)
+        self.die("alpha", "beta", "gamma")
+        _ = self.pass_at(0)
+        _ = self.pass_at(2)
+
+        def interrupted(slug: str, key: str, text: str) -> str:
+            self.assertEqual(set(unit_watchdog._read_state()), {"beta", "gamma"})  # pyright: ignore[reportPrivateUsage]
+            _ = self.tell(slug, key, text)
+            raise SystemExit("notes pass killed")
+
+        with patch.object(showrunners, "tell", side_effect=interrupted):
+            with self.assertRaisesRegex(SystemExit, "notes pass killed"):
+                _ = self.pass_at(4)
+        self.assertEqual(len(self.notices), 1)
+        _ = self.pass_at(6)
+        self.assertEqual(len(self.notices), 3)
+        for name in ("alpha", "beta", "gamma"):
+            self.assertEqual(sum(f"{name} was down" in line for line in self.notices), 1)
+        self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(len(self.commands), 3)
+
+    def test_notice_budget_retains_remaining_outages_for_the_next_pass(self) -> None:
+        for name in ("alpha", "beta", "gamma"):
+            _ = self.add_unit(name)
+        self.die("alpha", "beta", "gamma")
+        _ = self.pass_at(0)
+        _ = self.pass_at(2)
+        config = self.home / "watchdog.toml"
+        _ = config.write_text("notices_per_pass = 2\n")
+        with patch.dict(os.environ, {"UNIT_WATCHDOG_CONFIG": str(config)}):
+            _ = self.pass_at(4)
+            self.assertEqual(len(self.notices), 2)
+            self.assertEqual(set(unit_watchdog._read_state()), {"gamma"})  # pyright: ignore[reportPrivateUsage]
+            _ = config.write_text("notices_per_pass = 1\n")
+            _ = self.pass_at(6)
+        self.assertEqual(len(self.notices), 3)
+        self.assertEqual(unit_watchdog._read_state(), {})  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(len(self.commands), 3)
+
+    def test_idle_rerun_sends_nothing_and_preserves_completed_state(self) -> None:
+        _ = self.add_unit("alpha")
+        self.die("alpha")
+        for minute in (0, 2, 4):
+            _ = self.pass_at(minute)
+        path = self.home / ".local/state/accounts/unit_watchdog.json"
+        saved, written = path.read_bytes(), path.stat().st_mtime_ns
+        with patch.object(showrunners, "tell") as told:
+            self.assertEqual(self.pass_at(6), [])
+            self.assertEqual(self.pass_at(8), [])
+        told.assert_not_called()
+        self.assertEqual(path.read_bytes(), saved)
+        self.assertEqual(path.stat().st_mtime_ns, written)
+        self.assertEqual(len(self.notices), 1)
+        self.assertEqual(len(self.commands), 1)
+
     @contextmanager
     def stop_process_leaves(self) -> Generator[None]:
         def tab(identity: str) -> herdr.TabSession:
@@ -297,6 +354,7 @@ class UnitWatchdogTests(unittest.TestCase):
         entry = pane_record.read("shared")["alpha"]
         self.assertFalse(entry.get("ended", False))
         self.assertEqual((entry["session_id"], entry["config_dir"]), ("alpha", str(config)))
+        self.assertEqual(entry["environment"]["SHOWRUNNER_UNIT_ID"], "alpha")
         self.die("alpha")
         for minute in (0, 2, 4):
             _ = self.pass_at(minute)

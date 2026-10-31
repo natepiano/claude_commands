@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from process_failure import failure_detail
 import nix_env as nix_env
 from place import HerdrPlace as HerdrPlace
+from pane_launch import MEMBER_MARKS as MEMBER_MARKS, UNIT_MARKS as UNIT_MARKS, RecordedLabels
 
 if TYPE_CHECKING:
     from scripts.production import staff
@@ -53,10 +54,6 @@ _AGENT_START_TIMEOUT_MINIMUM_MS = 3000
 _AGENT_START_TIMEOUT_MAXIMUM_MS = 300_000
 PROMPT_SETTLE_SECONDS = 10
 _PLATFORM = sys.platform
-# The marks that name a production unit. Only a unit's own launch sets them; a probe, or a herdr
-# server started from inside a unit, drops them so that the unit's lookup never finds a second session.
-UNIT_MARKS = ("SHOWRUNNER_UNIT", "SHOWRUNNER_UNIT_ID")
-MEMBER_MARKS = (*UNIT_MARKS, "STAFF_ID")
 NO_ENVIRONMENT_REMOVALS: frozenset[str] = frozenset()
 _NO_WORKSPACE_FILTER: frozenset[str] = frozenset()
 SHARED_SESSION = "agents"
@@ -3321,7 +3318,9 @@ def process_action() -> Generator[None]:
 
 def herdr_processes() -> list[HerdrProcess]:
     """Read current processes, or the snapshot held by an explicit scope."""
-    return [HerdrProcess(row.pid, row.place, dict(row.marks), row.command, row.working_directory)
+    labels = RecordedLabels()
+    return [HerdrProcess(row.pid, row.place, labels.resolve(row.pid, row.marks, lambda: row.place),
+                         row.command, row.working_directory)
             for row in _process_reader.get()()]
 
 
