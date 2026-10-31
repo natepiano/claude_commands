@@ -893,7 +893,23 @@ def _restart_record(rename: UnitRename, save: Callable[[], None]) -> None:
     save()
 
 
+def _old_tab_titles(rename: UnitRename) -> frozenset[str]:
+    """The unit's former display names, excluding its destination title."""
+    return frozenset({unit_names.stem(rename.old), rename.old, rename.old_branch, rename.old_session}
+                     - {"", unit_names.stem(rename.new)})
+
+
+def _rename_saved_layout(rename: UnitRename) -> None:
+    import herdr
+
+    # Replace the saved title before the launcher orders and records its new tab.
+    # merged_layout otherwise retains the absent old title for another 14 days.
+    herdr.rename_saved_tab(herdr.shared_session(), showrunners.herdr_space(rename.slug, rename.doc),
+                           _old_tab_titles(rename), unit_names.stem(rename.new))
+
+
 def _relaunch(rename: UnitRename, _save: Callable[[], None]) -> None:
+    _rename_saved_layout(rename)
     if rename.session_id:
         # Restart also resumes its own partial worker/timer restores on a retry.
         if _unit_records(rename):
@@ -1062,6 +1078,18 @@ def _control_failures(rename: UnitRename) -> list[str]:
     return [f"control: no {rename.merge_branch} subject names {rename.old}; the matcher is broken"]
 
 
+def _layout_failures(rename: UnitRename) -> list[str]:
+    """Tab titles can be just the stem, which the general id/branch/path sweep cannot match."""
+    import herdr
+
+    session = herdr.shared_session()
+    workspace = showrunners.herdr_space(rename.slug, rename.doc)
+    old_titles = _old_tab_titles(rename)
+    return [f"herdr {herdr.layout_path(session)}: {workspace} tab is still labelled {tab['name']}"
+            for space in herdr.saved_layout(session)["workspaces"] if space["name"] == workspace
+            for tab in space["tabs"] if tab["name"] in old_titles]
+
+
 def _sweep_roots(rename: UnitRename) -> unit_rename_sweep.Roots:
     state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
     scratch = Path(rename.scratch)
@@ -1077,10 +1105,10 @@ def _sweep_roots(rename: UnitRename) -> unit_rename_sweep.Roots:
 def verify_failures(rename: UnitRename) -> list[str]:
     """Every live place holds the new names, and no unclassified file holds an old one."""
     if rename.id_matches:
-        return _session_failures(rename)
+        return [*_session_failures(rename), *_layout_failures(rename)]
     try:
         return [*_doc_failures(rename), *_git_failures(rename), *_process_failures(rename), *_state_failures(rename),
-                *_session_failures(rename), *_control_failures(rename),
+                *_session_failures(rename), *_control_failures(rename), *_layout_failures(rename),
                 *unit_rename_sweep.sweep(tuple(old for old, new in (
                     (rename.old, rename.new), (rename.old_branch, rename.new_branch),
                     (rename.old_worktree, rename.new_worktree)) if old != new), _sweep_roots(rename))]
@@ -1300,6 +1328,10 @@ def apply(slug: str, old: str, new: str, scratch: Path) -> UnitRename:
                 if fresh:
                     path.unlink(missing_ok=True)
                 raise
+        if rename.step >= step_number(_relaunch):
+            # Older trees journaled relaunch before removing its saved old title.
+            # Reconcile that source without replaying the already completed restart.
+            _rename_saved_layout(rename)
         if rename.step == len(STEPS):
             print("done; unchanged")
         for number in range(rename.step + 1, len(STEPS) + 1):
