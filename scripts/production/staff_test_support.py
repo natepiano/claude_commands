@@ -289,13 +289,6 @@ class StaffTestCase(unittest.TestCase):
         self.write_json(self.staff_file, document)
         return self.staff_file.read_bytes()
 
-    def forget_rows(self, *identities: staff.StaffId) -> None:
-        """Model a missing legacy identity; production retirement deliberately keeps owners."""
-        record = staff.snapshot()
-        _ = self.write_document({"schema": 2,
-            "rows": [row.to_json() for row in record.rows if row.id not in identities],
-            "pending_retire": [identity for identity in record.pending_retire if identity not in identities]})
-
     def write_json(self, path: Path, value: object) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
@@ -369,25 +362,6 @@ class StaffTestCase(unittest.TestCase):
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {"SHOWRUNNERS_CONFIG": str(registry)})))
         return doc
 
-    def retired_fill_production(self, slug: str, *units: str, wrapped: bool = False) -> Path:
-        """Keep the live fill's repository, but replace its units with complete retired evidence."""
-        doc = self.fill_production(slug, *units)
-        repository = doc.parents[1]
-        text = doc.read_text()
-        for unit in units:
-            worktree = self.source_root / "worktrees" / unit
-            _ = self.fixture_git(repository, "worktree", "remove", str(worktree))
-            folder = self.root / "original" / unit
-            note = f"(retired 2026-10-31, worktree removed, session session-{unit}, folder {folder}) standby"
-            text = "\n".join(line.replace("`standby`", note) if line.startswith(f"| `{unit}` |") else line
-                             for line in text.splitlines()) + "\n"
-        if wrapped:
-            from scripts.production.tidy_wrapped import WRAPPED
-
-            text = f"{WRAPPED}\n{text}"
-        write_text_atomic(doc, text)
-        return doc
-
     def pane(self, pane_id: str, *, session_id: str, environment: dict[str, str], written_at: str = "2026-10-30T09:00:00+00:00") -> None:
         path = Path(os.environ["HERDR_PANE_RECORD_DIR"]) / "agents.json"
         entries = cast(dict[str, object], json.loads(path.read_text())) if path.exists() else {}
@@ -397,15 +371,6 @@ class StaffTestCase(unittest.TestCase):
             "flags_read": True, "ended": False, "written_at": written_at,
         }
         self.write_json(path, entries)
-
-    def session_transcript(self, session_id: str, folder: Path, *, home: Path | None = None) -> Path:
-        """Write one interactive transcript under its actual project directory."""
-        from scripts.production import unit_move
-
-        path = (home or Path.home()) / ".claude/projects" / unit_move.project_folder(str(folder)) / f"{session_id}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(path, json.dumps({"cwd": str(folder), "entrypoint": "cli"}) + "\n")
-        return path
 
     def session_record(self, session_id: str, name: str) -> Path:
         """A registry record tied to this test's real, private process identity."""

@@ -12,8 +12,7 @@ from typing import cast, final
 from unittest import mock
 from scripts.astra import design_roles
 from scripts.astra.design_role_test_support import write_empty_binding_record
-from scripts.production import staff, unit_config
-from scripts.production.rename_rerun_test_support import final_files
+from scripts.production import staff
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -24,47 +23,6 @@ from scripts.production.rename_unit_test_support import UnitRenameFixture, SCRIP
 
 @final
 class UnitRenameTests(UnitRenameFixture):
-    def test_worktree_rename_updates_a_removed_location_without_reactivating_its_row(self) -> None:
-        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
-        source, destination = self.rust / "claude-demo-alpha", self.rust / "claude-demo-gamma"
-        _ = staff.set_worktree(row.id, staff.RemovedWorktree("natedev", source))
-        self.assert_ok(self.rename("apply"))
-        retained = staff.by_id(row.id)
-        assert retained is not None
-        self.assertEqual((retained.id, retained.name, retained.parent, retained.worktree),
-                         (row.id, "gamma", row.parent, staff.RemovedWorktree("natedev", destination)))
-        before = final_files(self.root)
-        self.assert_ok(self.rename("apply"))
-        self.assertEqual(final_files(self.root), before)
-
-    def test_a_retry_after_git_move_sets_the_new_staff_path_and_keeps_config_bytes_and_identity(self) -> None:
-        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
-        source = self.rust / "claude-demo-alpha"
-        destination = self.rust / "claude-demo-gamma"
-        _ = staff.set_worktree(row.id, staff.PresentWorktree("natedev", source))
-        config = unit_config.UnitConfig(unit_config.PlanFile(Path("docs/plans/alpha.md")),
-                                        unit_config.AppPort(8123), ("nightly",))
-        unit_config.write(source, config)
-        data = (source / ".unit.toml").read_bytes()
-        with mock.patch.object(staff, "set_worktree", side_effect=OSError("stopped after folder move")):
-            interrupted = self.rename("apply")
-        self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout + interrupted.stderr)
-        self.assertFalse(source.exists())
-        self.assertTrue(destination.is_dir())
-        retained = staff.by_id(row.id)
-        assert retained is not None
-        self.assertEqual(retained.worktree, staff.PresentWorktree("natedev", source))
-        self.assert_ok(self.rename("apply"))
-        renamed = staff.by_id(row.id)
-        assert renamed is not None
-        self.assertEqual((renamed.name, renamed.parent, renamed.worktree),
-                         ("gamma", row.parent, staff.PresentWorktree("natedev", destination)))
-        self.assertEqual((destination / ".unit.toml").read_bytes(), data)
-        self.assertEqual(self.git("check-ignore", ".unit.toml", cwd=destination), ".unit.toml")
-        before = final_files(self.root)
-        self.assert_ok(self.rename("apply"))
-        self.assertEqual(final_files(self.root), before)
-
     def test_bad_unrelated_record_warns_once_across_move_and_verification(self) -> None:
         with mock.patch.dict(os.environ, self.env):
             bad = write_empty_binding_record(self.checkout, design_roles.UnitHolder('unrelated', 'other-unit'),

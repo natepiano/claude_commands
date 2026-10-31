@@ -39,17 +39,6 @@ from scripts.lib.atomic_file import write_text_atomic
 from scripts.message import sessions
 
 class AddShowrunnerTests(AddShowrunnerFixture):
-    def test_new_showrunner_and_missing_parent_are_admitted_with_their_live_docs(self) -> None:
-        self.starts("kid-session", registers="kid")
-        result = self.run_command("kid")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        child = staff.by_path("top/kid")
-        parent = staff.by_path("top")
-        assert child is not None and parent is not None
-        self.assertEqual(child.doc, staff.LiveDoc("natedev", self.doc("kid")))
-        self.assertEqual(parent.doc, staff.LiveDoc("natedev", self.doc("top")))
-        self.assertEqual(child.parent, parent.id)
-
     @override
     def setUp(self) -> None:
         super().setUp()

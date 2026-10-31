@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import fake_unit_host
 import production_lifecycle
-from scripts.production import showrunners, staff, unit_config
+from scripts.production import showrunners
 import unit_lookup
 import tidy_wrapped
 from scripts.production.cli_fixture import invoke_cli
@@ -221,17 +221,6 @@ class LifecycleFixture(unittest.TestCase):
         _ = self.git("worktree", "add", "-b", "alpha-branch", str(self.alpha), "production")
         _ = self.git("worktree", "add", "-b", "beta-branch", str(self.beta), "production")
         _ = self.git("push", "origin", "alpha-branch", "beta-branch")
-        runner = staff.ensure("showrunner", name="old-showrunner",
-                              doc=staff.LiveDoc("natedev", self.doc))
-        for name, worktree in (("alpha", self.alpha), ("beta", self.beta)):
-            row = staff.ensure("unit", name=name, parent=runner.id,
-                               worktree=staff.PresentWorktree("natedev", worktree))
-            unit_config.write(worktree, unit_config.UnitConfig(
-                unit_config.PlanFile(Path(f"docs/plans/{name}.md")), unit_config.NoAppPort(), ()))
-            self.staff.pane(f"fixture:{name}", session_id=name, environment={
-                "STAFF_ID": row.id, "SHOWRUNNER_UNIT": "example", "SHOWRUNNER_UNIT_ID": f"{name}-unit",
-            })
-            _ = self.staff.session_transcript(name, worktree, home=self.home)
         common_dir = Path(self.git("rev-parse", "--git-common-dir"))
         with (self.checkout / common_dir / "info/exclude").open("a", encoding="utf-8") as output:
             _ = output.write("production.log\n")

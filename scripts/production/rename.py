@@ -8,7 +8,7 @@ import shlex
 import sys
 from contextlib import contextmanager, nullcontext
 from collections.abc import Generator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict, cast
 
@@ -32,7 +32,6 @@ from rename_state import RenameRefused, read_json, write_json, write_text  # noq
 
 from scripts.astra import design_roles  # noqa: E402
 from scripts.production import staff, staff_sources
-from scripts.lib import git_exclude
 
 if TYPE_CHECKING:
     from scripts.shutdown import shutdown_record
@@ -103,17 +102,9 @@ def _push_unit_branch(plan: RenamePlan, record: dict[str, object]) -> None:
 
 
 def _move_unit_worktree(plan: RenamePlan, record: dict[str, object]) -> None:
-    member_id = staff.StaffId(_string(record, "staff_id"))
-    source = Path(_string(record, "old_worktree"))
-    destination = Path(_string(record, "new_worktree"))
-    git_exclude.require_untracked_ignored(source if source.exists() else destination,
-                                          ".unit.toml", planned_pattern="/.unit.toml")
     unit_move.move_worktree(plan.checkout, _string(record, "old_branch"), _string(record, "new_branch"),
                             Path(_string(record, "old_worktree")), Path(_string(record, "new_worktree")),
                             _string(record, "tip"))
-    worktree = Path(_string(record, "new_worktree"))
-    git_exclude.ensure_excluded(worktree, "/.unit.toml")
-    rename_unit.relocate_staff_worktree(member_id, worktree)
 
 
 def _move_unit_configs(record: dict[str, object]) -> None:
@@ -447,9 +438,6 @@ def _preflight(plan: RenamePlan) -> None:
 
 
 def _rename_doc(plan: RenamePlan) -> None:
-    row = staff.by_id(plan.staff_id)
-    if row is None or row.kind != "showrunner":
-        raise RenameRefused(f"{plan.staff_id}: no matching showrunner staff row")
     if plan.old_doc.exists():
         text = _formerly(plan.old_doc.read_text(encoding="utf-8"), plan.old)
         text = re.sub(r"(?m)^(- \*\*Showrunner session:\*\*)[^\n]*$", rf"\1 `{plan.new}`", text)
@@ -462,8 +450,6 @@ def _rename_doc(plan: RenamePlan) -> None:
         _ = unit_move.git(plan.checkout, "mv", "-f", "--", _relative(plan, plan.old_doc), _relative(plan, plan.new_doc))
     elif not plan.new_doc.exists():
         raise RenameRefused(f"production doc is missing: {plan.old_doc}")
-    if not isinstance(row.doc, staff.DocUnfilled):
-        _ = staff.set_doc(plan.staff_id, replace(row.doc, path=plan.new_doc))
 
 
 def _rewrite_plans(plan: RenamePlan) -> None:
@@ -903,7 +889,6 @@ def repair_workers(new: str, *, dry_run: bool = False) -> None:
 def unit(new: str, name: str) -> None:
     """Move one stopped unit, resuming recorded branch, worktree and configuration steps."""
     with _rename_journal(new) as (result, journal), design_roles.record_operation():
-        members = staff.initial_snapshot()
         row = _unit_row(result, name)
         records = _object(journal.get("unit_moves", {}))
         if name in records:
@@ -922,12 +907,6 @@ def unit(new: str, name: str) -> None:
             write_json(result.journal, journal)
         if "restore" not in record:
             record["restore"] = _stopped_restore(result, name)
-            write_json(result.journal, journal)
-        if "staff_id" not in record:
-            member = staff_sources.member(staff_sources.UnitMember(result.new, name), members)
-            if isinstance(member, staff_sources.NoSuchMember):
-                raise RenameRefused(f"{result.new}/{name}: no matching unit staff row")
-            record["staff_id"] = member.row.id
             write_json(result.journal, journal)
         restore = _saved_restore(record)
         if not record.get("restore_repointed", False):
@@ -1073,8 +1052,7 @@ def _main(argv: list[str]) -> int:
                 print(f"{result.old} is now {result.new}; " + (f"keep {result.merge_branch} until finish" if result.renames_branch else f"merge branch {result.merge_branch} kept"))
     except (staff.StaffRefused, staff.StaffNotFound, staff.StaffUnreadable):
         raise
-    except (RenameRefused, production_units.Refusal, tidy_wrapped.TidyRefused, WorkerUnavailable,
-            git_exclude.ExcludeRefused, OSError, UnicodeError) as error:
+    except (RenameRefused, production_units.Refusal, tidy_wrapped.TidyRefused, WorkerUnavailable, OSError, UnicodeError) as error:
         print(f"rename: {error}", file=sys.stderr)
         return 1
     return 0

@@ -21,20 +21,6 @@ from scripts.production import staff
 
 
 class ShowrunnerTreeTests(test_showrunners.ShowrunnerFixture):
-    def test_wrapped_showrunner_keeps_its_raw_parent_but_leaves_the_active_tree_despite_a_stale_timer(self) -> None:
-        self.showrunner("top", running=False)
-        self.showrunner("wrapped", running=False)
-        self.recorded_parent("wrapped", "top")
-        old = staff.snapshot().by_path("top/wrapped")
-        assert old is not None
-        _ = staff.set_doc(old.id, staff.WrappedDoc("natedev", self.root / "wrapped-production.md"))
-        record = staff.snapshot()
-        self.assertEqual(showrunner_tree.children_of("top", record=record), [])
-        self.assertEqual(showrunner_tree.parent_edges(record=record), {})
-        retained = record.by_id(old.id)
-        assert retained is not None
-        self.assertEqual(retained.parent, old.parent)
-
     def test_attach_retries_routing_notices_after_the_parent_was_saved(self) -> None:
         self.showrunner("top")
         self.showrunner("mid")

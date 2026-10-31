@@ -38,18 +38,6 @@ class LiveUnitsTests(unittest.TestCase):
     records: Path = Path()
     environment: dict[str, str] = {}
 
-    def test_retired_backfill_does_not_add_a_retained_removed_row_to_the_active_output(self) -> None:
-        self.write_doc(HEADER, "| live-unit | plan.md | /missing/live | live | — | — |")
-        self.hosts({})
-        before = self.run_script()
-        self.assertEqual(before.returncode, 0, before.stderr)
-        retired = unit_membership("show", "retired-unit")
-        _ = staff.set_worktree(retired.id, staff.RemovedWorktree("natedev", self.root / "retired"))
-        after = self.run_script()
-        self.assertEqual(after.returncode, 0, after.stderr)
-        self.assertEqual(after.stdout, before.stdout)
-        self.assertIsNotNone(staff.by_id(retired.id))
-
     @override
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))

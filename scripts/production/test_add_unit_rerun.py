@@ -17,7 +17,6 @@ import resume_unit
 import retire_unit
 import atomic_file
 from production_units import read_production
-from scripts.production import staff, unit_config
 
 
 def setUpModule() -> None:
@@ -25,34 +24,6 @@ def setUpModule() -> None:
 
 
 class AddUnitRerunTests(AddUnitTestCase):
-    def test_retry_after_config_publication_reuses_the_row_file_and_launch(self) -> None:
-        publish = unit_config.write
-
-        def interrupted(worktree: Path, config: unit_config.UnitConfig) -> None:
-            publish(worktree, config)
-            raise OSError("stopped after config publication")
-
-        arguments = ("alpha", "--plan", "docs/plans/given.md", "--port", "8123",
-                     "--responsibility", "nightly")
-        with patch.object(unit_config, "write", side_effect=interrupted):
-            stopped = self.cli(*arguments)
-        self.assertEqual(stopped.returncode, 1, stopped.stdout + stopped.stderr)
-        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
-        path = self.root / "project-alpha/.unit.toml"
-        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", path.parent))
-        before = path.read_bytes(), path.stat().st_mtime_ns
-        self.assertFalse(any(command[2:4] == ["agent", "start"] for command in self.herdr_calls()))
-        _ = self.successful(*arguments)
-        self.assertEqual(staff.by_id(row.id), row)
-        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
-        self.assertEqual(self.pane_environment()["STAFF_ID"], row.id)
-        calls = self.herdr_calls()
-        _ = self.successful(*arguments)
-        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
-        self.assertEqual(staff.by_id(row.id), row)
-        self.assertEqual([command for command in self.herdr_calls()[len(calls):]
-                          if command[2:4] in (["agent", "start"], ["pane", "close"], ["tab", "create"])], [])
-
     def test_retired_resume_finishes_the_live_sessions_pending_opening(self) -> None:
         prior = self.root / "prior-session"
         prior.mkdir()

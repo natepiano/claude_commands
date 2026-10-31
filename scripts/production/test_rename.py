@@ -20,37 +20,6 @@ from scripts.production.rename_test_support import CHECK_TIMER_HANDOFF, FAIL_GIT
 
 @final
 class ProductionRenameTests(support.ProductionRenameFixture):
-    def test_document_rename_updates_a_wrapped_location_without_reactivating_its_row(self) -> None:
-        row = self.production_row()
-        _ = staff.set_doc(row.id, staff.WrappedDoc("natedev", self.doc))
-        self.assert_success(self.run_rename("apply"))
-        retained = staff.by_id(row.id)
-        assert retained is not None
-        self.assertEqual((retained.id, retained.name, retained.parent, retained.doc),
-                         (row.id, NEW, row.parent, staff.WrappedDoc("natedev", self.new_doc)))
-        before = self.snapshot()
-        self.assert_success(self.run_rename("apply"))
-        self.assertEqual(self.snapshot(), before)
-
-    def test_retry_after_doc_move_updates_the_live_doc_on_the_same_staff_id(self) -> None:
-        row = self.production_row()
-        _ = staff.set_doc(row.id, staff.LiveDoc("natedev", self.doc))
-        with mock.patch.object(staff, "set_doc", side_effect=OSError("stopped after doc move")):
-            interrupted = self.run_rename("apply")
-        self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout + interrupted.stderr)
-        self.assertFalse(self.doc.exists())
-        self.assertTrue(self.new_doc.is_file())
-        retained = staff.by_id(row.id)
-        assert retained is not None
-        self.assertEqual(retained.doc, staff.LiveDoc("natedev", self.doc))
-        self.assert_success(self.run_rename("apply"))
-        renamed = staff.by_id(row.id)
-        assert renamed is not None
-        self.assertEqual(renamed.doc, staff.LiveDoc("natedev", self.new_doc))
-        before = self.snapshot()
-        self.assert_success(self.run_rename("apply"))
-        self.assertEqual(self.snapshot(), before)
-
     def production_row(self) -> staff.StaffRow:
         return next(row for row in staff.find(kind="showrunner") if row.name == OLD)
 

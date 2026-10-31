@@ -36,59 +36,10 @@ def setUpModule() -> None:
     configure_test_zone()
 
 
-from scripts.production import staff, unit_config
+from scripts.production import staff
 
 @final
 class AddUnitLaunchTests(AddUnitTestCase):
-    def test_an_existing_config_port_conflict_refuses_before_admission_or_launch(self) -> None:
-        worktree = self.root / "project-alpha"
-        _ = self.git("worktree", "add", "-b", "build-followups-alpha", str(worktree), "build-followups")
-        unit_config.write(worktree, unit_config.UnitConfig(
-            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.AppPort(8123), ()))
-        path = worktree / ".unit.toml"
-        before = path.read_bytes(), path.stat().st_mtime_ns, self.staff.staff_file.read_bytes(), self.doc.read_bytes()
-        result = self.cli("alpha", "--plan", "docs/plans/given.md", "--port", "8124")
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(str(path), result.stdout + result.stderr)
-        self.assertIn("port", result.stdout + result.stderr)
-        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns,
-                          self.staff.staff_file.read_bytes(), self.doc.read_bytes()), before)
-        self.assertFalse(any(command[2:4] == ["agent", "start"] for command in self.herdr_calls()))
-
-    def test_plan_launch_admits_its_real_worktree_and_writes_port_and_repeatable_responsibilities(self) -> None:
-        _ = self.successful("alpha", "--plan", "docs/plans/given.md", "--port", "8123",
-                            "--responsibility", "nightly", "--responsibility", "build-check")
-        row = next(row for row in staff.find(kind="unit") if row.name == "alpha")
-        worktree = self.root / "project-alpha"
-        self.assertEqual(row.worktree, staff.PresentWorktree("natedev", worktree))
-        self.assertEqual(unit_config.read(worktree), unit_config.UnitConfig(
-            unit_config.PlanFile(Path("docs/plans/given.md")), unit_config.AppPort(8123), ("nightly", "build-check")))
-        ignored = subprocess.run(["git", "-C", str(worktree), "check-ignore", "-q", ".unit.toml"], check=False)
-        self.assertEqual(ignored.returncode, 0)
-        tracked = subprocess.run(["git", "-C", str(worktree), "ls-files", "--error-unmatch", ".unit.toml"],
-                                 capture_output=True, check=False)
-        self.assertNotEqual(tracked.returncode, 0)
-        self.assertEqual(self.pane_environment()["STAFF_ID"], row.id)
-
-    def test_standby_launch_writes_the_standby_plan_in_its_unit_config(self) -> None:
-        _ = self.successful("alpha", "--standby")
-        self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
-            unit_config.StandbyPlan(), unit_config.NoAppPort(), ()))
-
-    def test_permanent_launch_writes_the_permanent_plan_in_its_unit_config(self) -> None:
-        _ = self.successful("alpha", "--permanent")
-        self.assertEqual(unit_config.read(self.root / "project-alpha"), unit_config.UnitConfig(
-            unit_config.PermanentPlan(), unit_config.NoAppPort(), ()))
-
-    def test_brief_launch_writes_its_existing_relative_stub_plan_in_the_unit_config(self) -> None:
-        _ = self.successful("alpha", "--brief", "Build the missing reader.")
-        config = unit_config.read(self.root / "project-alpha")
-        assert isinstance(config, unit_config.UnitConfig)
-        self.assertIsInstance(config.plan, unit_config.PlanFile)
-        assert isinstance(config.plan, unit_config.PlanFile)
-        self.assertFalse(config.plan.path.is_absolute())
-        self.assertTrue((self.checkout / config.plan.path).is_file())
-
     def test_adding_the_same_unit_name_to_another_production_creates_its_own_row(self) -> None:
         old_doc = self.staff.production("old", "alpha-unit", workspace="original")
         original = staff.ensure("showrunner", name="original")
