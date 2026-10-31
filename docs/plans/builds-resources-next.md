@@ -41,3 +41,8 @@
   - Why needed: Ctrl-C during `tmp_sweep.py --plan` prints a Python traceback, and a plan run prints 79,530 lines, so the plan cannot be read on screen
   - Completion condition: Ctrl-C ends with one line and exit 130; a plan run prints a short summary (counts and bytes per group) and the path of the full plan file; a test pins both
   - Revealed by: builds C617 (builds showrunner 2026-10-30: next)
+
+- [ ] **The user's typed queue bump works from any pane**
+  - Target: `mods/unit-board/hooks/register.tsx`, `mods/unit-board/tests/queue.test.ts`, the shared queue-priority writer and its tests, and `commands/build/queue.md`.
+  - Completion condition: typed `/build:queue bump <unit>` from any pane sets or replaces persistent priority through the existing writer, without a session-role check on the plugin route; tests cover a non-showrunner pane and replacement, while direct priority commands retain their existing caller checks.
+  - Revealed by: Phase 26; approved by builds in `S/next_items_pending.md`.
