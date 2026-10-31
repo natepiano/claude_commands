@@ -1119,7 +1119,7 @@ def verify_ticket(repo: Path, ticket_id: str) -> int:
         snapshot = style_footprint.worktree_commit(repo)
         tree = git(repo, "rev-parse", f"{snapshot}^{{tree}}").strip()
         sources = style_footprint.RevisionTree(repo, snapshot)
-        changed = git(repo, "diff", "--name-only", "--no-renames", "-z", ticket["base"], snapshot).split("\0")
+        changed = ledger.ticket_changed_paths(ticket, snapshot)
         if any(path.endswith((".rs", "Cargo.toml", "Cargo.lock")) and sources.crate(path) != ticket["crate"]
                for path in changed if path):
             raise style_ledger.LedgerError(f"{ticket_id}: verification crosses crate boundaries")
