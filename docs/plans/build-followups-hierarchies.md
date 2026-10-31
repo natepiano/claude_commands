@@ -239,6 +239,37 @@ Do we have a unit director that is dedicated to, I guess it's showrunners and pr
 - Reflog entries expire after 90 days. The local reflog starts 2026-10-30 08:30 EDT, so older windows follow the first parent.
 - `merge_receipts.jsonl` holds no Hana trunk receipts and starts 2026-10-29. It cannot replace the walk.
 
+### Phase 6d — A change-review verdict lands by its first word  · status: done
+**Depends on:** none.
+
+#### Work Order
+
+**Goal:** the change-review list lands a row when the user's verdict starts with `works` or `fine`, so a verdict such as "works: checked, no empty cwd" no longer prints "returns to its unit" (rows C636, C640, C644).
+
+**Hana link:** indirect. A wrong "returns to its unit" line sends checked Hana work back for no cause.
+
+**Spec:**
+- `lands()` in `scripts/production/change_review.py` decides by the verdict's start: after an optional leading `okay` or `ok` and an optional row id (`c17`), the next word must be `works` or `fine`. Case does not matter. Words later in the verdict do not change the result.
+- "okay c17 works" lands; "works: checked, no empty cwd" lands; "not works" returns to its unit. Any verdict that does not start that way returns to its unit.
+- Remove the whole-verdict failure-word scan (`_FAILS`) when nothing else uses it.
+- Only the printed land-or-return line changes; the row edits stay the same.
+- Update the `lands()` docstring and each doc that states the rule: `commands/change_review.md` (near line 117), `commands/showrunner/produce.md` (near line 671), and `docs/as-built/feature-log.md` where it states the rule.
+
+**Files:**
+- `scripts/production/change_review.py` — `lands()`, its regexes and docstring
+- `scripts/production/test_change_review.py` — the three forms beside the existing land test
+- `commands/change_review.md`, `commands/showrunner/produce.md`, `docs/as-built/feature-log.md` — the rule text
+
+**Workers:** `1 writer + 1 tester`
+- `impl` — `change_review.py` and the three docs
+- `test` — `test_change_review.py`: "okay c17 works" lands, "works: checked, no empty cwd" lands, "not works" returns; keep the existing land test's cases that still hold under the new rule
+
+**State:** none.
+
+**Constraints from prior phases:** Change-Review check commands use no shell pipe. `basedpyright` per slot must read `0 errors, 0 warnings, 0 notes`.
+
+**Acceptance gate:** the three forms and the existing land tests pass; `test_change_review.py` passes in full; per-slot `basedpyright` clean; merge gate green.
+
 ### Phase 6 — The four-week review: which waits slow Hana, which links helped, and which trial steps stay  · status: todo
 **Depends on:** Phase 6a's checkpoint (`compare`), Phase 6c's checkpoint (the Hana trunk walk), and the checkpoints of Phases 3, 4 and 5, and the three review records: the Phase 3 and Phase 5 re-runs, which the unit director runs on 2026-11-12 (two weeks after both merged into sdlc as 3c5dea67 on 2026-10-29) and records in the design doc under Steps 1 and 4 (the push-audit re-run also confirms that `measure.py` and `push_audit.py` agree; each re-run record holds the report's source-problem lines, because both reports exit 0 with source problems), Phase 12's checkpoint (merged before the 2026-11-12 re-run), Phase 15's checkpoint (`compare` prints through its `blocks`), and four weeks from the experiment start in design doc Step 2: the first day on which each holder producer (builds' `verify.sh`, models-unit's `codex_mesh.py`) has recorded a `NamedHolder`, read live from `progress_history.py waits`. At Phase 10's checkpoint (bece20e1) neither had, and Step 2 says `start not set`; the unit director sets the start and the review date when both have. Also models-unit's checkpoint that adds `codex_mesh.py end --cleanup-only` (routed from Phase 6a), merged into sdlc, and one `worker_owners.py end` run after that merge: until then every cleanup retry exits 2, so `end_cleanup_pending` counts the missing flag, not a held worker. The phase starts on the latest of these dates, never before.
 
