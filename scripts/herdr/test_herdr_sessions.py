@@ -104,7 +104,8 @@ class HerdrSessionsTests(unittest.TestCase):
                  for index, label in enumerate(tabs, 1)]
         _ = self.responses.write_text(json.dumps({
             "--session default session list --json": response,
-            "--session agents pane list": {"stdout": json.dumps({"result": {"panes": panes}}), "code": 0},
+            **{f"--session {name} pane list": {"stdout": json.dumps({"result": {"panes": panes}}), "code": 0}
+               for name in names},
         }))
 
     def process(self, pid: int, parent: int, argv: list[str], environment: dict[str, str]) -> None:
@@ -157,6 +158,33 @@ class HerdrSessionsTests(unittest.TestCase):
             return []
         return [cast(list[str], json.loads(line)) for line in self.log.read_text().splitlines()]
 
+    def test_list_prints_claude_name_after_the_pane_id_changes_on_move(self) -> None:
+        self.respond(["agents"], tabs=("fix-rounds",))
+        self.server(100, "agents")
+        self.process(11, 100, ["zsh"], {"HERDR_PANE_ID": "wM:pM"})
+        self.claude(12, 11, "fix-rounds", pane="wM:pM")
+        _ = unit_membership("sdlc", "fix-rounds")
+        replies = cast(dict[str, CommandResponse], json.loads(self.responses.read_text()))
+        replies["--session agents pane list"] = {"code": 0, "stdout": json.dumps({"result": {"panes": [
+            {"pane_id": "wM:pR", "workspace_id": "wM", "label": "fix-rounds"}]}})}
+        replies["--session agents pane process-info --pane wM:pR"] = {
+            "code": 0, "stdout": json.dumps({"result": {"process_info": {"shell_pid": 11}}})}
+        replies["--session agents workspace list"] = {"code": 0, "stdout": json.dumps({"result": {
+            "workspaces": [{"workspace_id": "wM", "label": "sdlc"}]}})}
+        _ = self.responses.write_text(json.dumps(replies))
+        self.assertEqual(self.call("list"), (0, "fix-rounds\tunit sdlc/fix-rounds\tfix-rounds\n", ""))
+
+    def test_list_batches_claude_place_reads_for_all_session_records(self) -> None:
+        self.respond(["agents"], tabs=("one", "two"))
+        self.server(100, "agents")
+        self.claude(101, 100, "first", pane="w1:p1")
+        self.claude(102, 100, "newest", pane="w1:p1", updated=2)
+        self.claude(103, 100, "second", pane="w1:p2")
+        with patch.object(herdr, "herdr_places", wraps=herdr.herdr_places) as places, patch.object(
+                herdr, "herdr_place_of", side_effect=AssertionError("list must use the batched place scan")):
+            self.assertEqual(self.call("list"), (0, "one\tstandalone\tnewest\ntwo\tstandalone\tsecond\n", ""))
+        self.assertEqual(places.call_count, 1)
+
     def test_list_prints_each_tab_of_the_shared_session_with_its_role_and_newest_live_claude_name(self) -> None:
         self.respond(["agents", "other"], tabs=("unit", "showrunner", "standalone", None))
         self.server(100, "agents")
@@ -180,7 +208,8 @@ class HerdrSessionsTests(unittest.TestCase):
                          + "showrunner\tshowrunner\tdirector\nstandalone\tstandalone\tsolo\n"
                          + "w1:p4\tstandalone\t\n")
         self.assertEqual(self.commands(), [["--session", "default", "session", "list", "--json"],
-                                           ["--session", "agents", "pane", "list"]])
+                                           ["--session", "agents", "pane", "list"],
+                                           ["--session", "other", "pane", "list"]])
 
     def test_unit_role_takes_precedence_over_showrunner(self) -> None:
         self.respond(["agents"], tabs=("unit",))
