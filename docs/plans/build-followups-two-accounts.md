@@ -1,5 +1,7 @@
 # Two accounts: showrunners on one Claude account, unit directors on another
 
+Current maintenance: snapshot-removal replaces the historical snapshot-timer wiring below with `agent-notes` (`scripts/maintenance/agent_notes_job.py`, runtime schedules and limits in `config/agent_notes.toml`). `herdr-upkeep` owns layout saves and detection-rule refreshes, using `config/herdr_upkeep.toml`. The desktop note and shutdown recovery snapshots are deleted. Historical phase notes below describe the earlier implementation.
+
 > Scheduler update (2026-10-31): the agent-notes job in
 > `scripts/maintenance/agent_notes_job.py` now owns notes, quota alerts, the
 > pacer, refusal moves, crash recovery, phase-note pruning, the hierarchy note
