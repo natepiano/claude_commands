@@ -525,6 +525,18 @@ class StaffTests(StaffTestCase):
         self.assertFalse(local_file.parent.exists())
         self.assertEqual(self.ssh_commands(), [["show", "--snapshot", "--json"]])
 
+    def test_explicit_staff_file_is_local_even_on_a_mac(self) -> None:
+        with mock.patch.dict(os.environ, {"STAFF_FILE": str(self.mac_file)}), mock.patch(
+            "scripts.shutdown.remote.other_machine", return_value="natedev",
+        ):
+            row = staff.ensure("showrunner", name="private")
+            self.assertEqual(staff.snapshot().rows, (row,))
+            self.assertTrue(self.mac_file.is_file())
+            self.assertEqual(staff.retire(row.id), row)
+            self.assertEqual(staff.snapshot().rows, ())
+        self.assertFalse(self.staff_file.exists())
+        self.assertEqual(self.ssh_log.read_text() if self.ssh_log.exists() else "", "")
+
     def test_remote_errors_keep_application_reasons_and_identify_ssh_failures(self) -> None:
         _ = self.tree()
         before = self.staff_file.read_bytes()
@@ -539,7 +551,7 @@ class StaffTests(StaffTestCase):
         with self.machine("mac"):
             for code, reason, expected in cases:
                 with self.subTest(code=code, reason=reason), mock.patch.dict(os.environ, {
-                    "STAFF_FILE": str(local_file), "STAFF_TEST_SSH_FAIL": "1",
+                    "STAFF_TEST_SSH_FAIL": "1",
                     "STAFF_TEST_SSH_EXIT": str(code), "STAFF_TEST_SSH_REASON": reason,
                 }):
                     with self.assertRaises(staff.StaffUnreadable) as raised:

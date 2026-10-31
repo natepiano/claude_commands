@@ -581,10 +581,24 @@ class ActionTest(unittest.TestCase):
         self.assertIn("| C77 | Fonts redraw | still the old font \\| x |", self.path.read_text(encoding="utf-8"))
         self.assertTrue(change_review.lands("Works: it does"))
         self.assertFalse(change_review.lands("not fine"))
-        for verdict in ("okay c17 works", "ok fine", "yes works", "Works: it does"):
+        for verdict in ("okay c17 works", "ok fine", "Works: it does", "OK C17 FINE: still checked"):
             self.assertTrue(change_review.lands(verdict), verdict)
-        for verdict in ("still pushes", "it works but still pushes", "no, broken", "doesn't work"):
+        for verdict in ("still pushes", "it works but still pushes", "no, broken", "doesn't work", "yes works",
+                        "worksheets", "finely", "c17 okay works"):
             self.assertFalse(change_review.lands(verdict), verdict)
+
+    def test_verdict_start_sets_the_printed_outcome_and_keeps_the_users_words(self) -> None:
+        for verdict, outcome in (("okay c17 works", "C76 landed"),
+                                 ("works: checked, no empty cwd", "C76 landed"),
+                                 ("not works", "C76 returns to its unit (merged 2026-10-14)")):
+            with self.subTest(verdict=verdict):
+                _ = self.path.write_text(LIST, encoding="utf-8")
+                self.assertEqual(run("verdict", "--production", DOC, "--list", str(self.path), "--row", "C76",
+                                     "--verdict", verdict), (0, outcome + "\n", ""))
+                text = self.path.read_text(encoding="utf-8")
+                self.assertNotIn("| C76 |", text.split("## Reviewed")[0])
+                self.assertIn(f"| C76 | Panels keep shields | {verdict} | {change_review.today().isoformat()} "
+                              + "| 2026-10-14 |\n| C70 |", text)
 
     def test_a_verdict_removes_the_rows_scratch_folders_either_way(self) -> None:
         demo = scratch.new("row:natedev-C1", "demo", visible=True)

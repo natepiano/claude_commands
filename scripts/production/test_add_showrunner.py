@@ -45,6 +45,17 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         super().setUp()
         _ = staff.ensure("showrunner", name="top")
 
+    def test_launch_passes_the_ensured_showrunner_staff_id_to_the_pane(self) -> None:
+        self.starts("kid-session", registers="kid")
+        result = self.run_command("kid")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = [row for row in staff.find(kind="showrunner") if row.name == "kid"]
+        self.assertEqual(len(rows), 1)
+        opened = self.opened()
+        environment = dict(opened[index + 1].split("=", 1)
+                           for index, value in enumerate(opened) if value == "--env")
+        self.assertEqual(environment.get("STAFF_ID"), rows[0].id)
+
     def test_existing_staff_parent_survives_a_stale_saved_parent_during_ensure(self) -> None:
         self.timer("kid", "kid-session")
         parent = staff.ensure("showrunner", name="other")
@@ -546,7 +557,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.herdr_overrides["--session default session list --json"] = CommandResponse(
             code=1, stdout="", stderr="fixture cannot list herdr sessions")
         result = self.run_command("kid")
-        self.refused(result, "herdr session list: fixture cannot list herdr sessions")
+        self.refused(result, "herdr session list: stderr: fixture cannot list herdr sessions")
         self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
 
     def test_child_opens_its_tab_in_a_shared_server_that_already_runs(self) -> None:

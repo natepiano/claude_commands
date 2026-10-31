@@ -924,13 +924,15 @@ def launch_session(
     target: str = "",
     model: str = "",
     autocompact_window: str = "",
+    staff_id: str = "",
 ) -> herdr.PromptSubmitOutcome:
     """Start Claude in a tab of the shared herdr session, carrying this unit's marks."""
     import herdr
     from scripts.accounts import accounts
     from scripts.whoami.account import named_account_environment
 
-    environment = {unit_lookup.PRODUCTION_MARK: request.production.slug,
+    row_id = staff_id or ensure_staff_unit(request.production, request.unit_id).id
+    environment = {"STAFF_ID": row_id, unit_lookup.PRODUCTION_MARK: request.production.slug,
                    unit_lookup.UNIT_MARK: request.identity.unit, "ENABLE_TOOL_SEARCH": "true"}
     if target:
         if target != selected.label:
@@ -1407,7 +1409,7 @@ def _main(argv: list[str]) -> int:
                 if isinstance(ready.plan_transition, BriefToPlanTransition):
                     raise Refusal(f"unit {request.identity.unit} runs its brief in session {marked_unit.unit.place.session}; "
                                   + f"end that session, then run {retry}")
-            _ = ensure_staff_unit(request.production, request.unit_id)
+            staff_row = ensure_staff_unit(request.production, request.unit_id)
             if isinstance(stopped_tab, MarkedUnitFound):
                 place = stopped_tab.unit.place
                 try:
@@ -1431,7 +1433,7 @@ def _main(argv: list[str]) -> int:
                     )
                 outcome = launch_session(request, ready.director, prompt, unit_account, target=unit_account.label
                                if isinstance(request.session, ResumedSession) else "", model=resume_model,
-                               autocompact_window=resume_autocompact)
+                               autocompact_window=resume_autocompact, staff_id=staff_row.id)
             elif opening_record(request.production, request.unit_id).exists():
                 recovered = finish_opening(request, marked_unit)
                 if not isinstance(recovered, NoPendingOpening):

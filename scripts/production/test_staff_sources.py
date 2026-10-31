@@ -22,6 +22,7 @@ import herdr
 from scripts.production import showrunners
 from scripts.lib.test_hang_guard import TEST_HANG_GUARD_SECS
 import showrunner_tree
+import production_units
 
 
 class StaffSourcesTests(StaffTestCase):
@@ -133,6 +134,139 @@ class StaffSourcesTests(StaffTestCase):
         record = staff.snapshot()
         self.assertEqual(staff_sources.member(staff_sources.UnitMember("sdlc", "models-unit"), record), staff_sources.MemberFound(unit))
         self.assertEqual(staff_sources.member(staff_sources.ShowrunnerMember("sdlc"), record), staff_sources.MemberFound(showrunner))
+
+    def test_legacy_member_follows_a_transfer_without_using_the_production_mark(self) -> None:
+        _original, unit, _worker = self.tree()
+        _ = self.production("sdlc", "models-unit")
+        _ = self.production("receiving")
+        receiving = staff.ensure("showrunner", name="receiving")
+        moved = staff.move(unit.id, receiving.id)
+        self.pane("w1:unit", session_id="unit-session", environment={
+            "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
+        })
+        record = staff.snapshot()
+        for slug in ("sdlc", "missing-source"):
+            with self.subTest(slug=slug):
+                self.assertEqual(staff_sources.member(staff_sources.UnitMember(slug, "models-unit"), record),
+                                 staff_sources.NoSuchMember(staff_sources.UnitMember(slug, "models-unit")))
+        self.assertEqual(staff_sources.member(staff_sources.UnitMember("receiving", "models-unit"), record),
+                         staff_sources.MemberFound(moved))
+        self.assertEqual(staff_sources.unit_parent("models-unit", "unit-session"),
+                         staff_sources.UnitProduction("receiving", str(self.source_root / "receiving-production.md")))
+
+    def test_production_member_rejects_a_moved_row_despite_its_old_id_bearing_launch(self) -> None:
+        _original, unit, _worker = self.tree()
+        _ = self.production("sdlc", "models-unit")
+        _ = self.production("receiving", workspace="control")
+        receiving = staff.ensure("showrunner", name="control")
+        moved = staff.move(unit.id, receiving.id)
+        self.pane("w1:unit", session_id="unit-session", environment={
+            "STAFF_ID": unit.id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
+        })
+        selector = staff_sources.UnitMember("sdlc", "models-unit")
+        self.assertEqual(staff_sources.member(selector, staff.snapshot()), staff_sources.NoSuchMember(selector))
+        self.assertEqual(staff_sources.unit_parent("models-unit", "unit-session"),
+                         staff_sources.UnitProduction("receiving", str(self.source_root / "receiving-production.md")))
+        self.assertEqual(staff.by_id(unit.id), moved)
+
+    def test_observed_id_bearing_pane_follows_its_current_parent(self) -> None:
+        _original, unit, _worker = self.tree()
+        _ = self.production("sdlc", "models-unit")
+        new_doc = self.production("receiving")
+        receiving = staff.ensure("showrunner", name="receiving")
+        moved = staff.move(unit.id, receiving.id)
+        self.pane("w1:unit", session_id="unit-session", environment={
+            "STAFF_ID": unit.id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
+        })
+        other = staff.ensure("showrunner", name="other")
+        _ = staff.ensure("unit", name="models", parent=other.id)
+        self.assertEqual(staff_sources.member(staff_sources.ObservedUnit("models-unit", unit.id), staff.snapshot()),
+                         staff_sources.MemberFound(moved))
+        self.assertEqual(staff_sources.unit_parent("models-unit", "unit-session"),
+                         staff_sources.UnitProduction("receiving", str(new_doc)))
+
+    def test_metadata_from_the_current_parent_wins_over_an_old_same_name_row(self) -> None:
+        _original, unit, _worker = self.tree()
+        old_doc = self.production("sdlc", "models-unit")
+        new_doc = self.production("receiving", "models-unit")
+        receiving = staff.ensure("showrunner", name="receiving")
+        _ = staff.move(unit.id, receiving.id)
+        new_text = new_doc.read_text().replace(str(self.source_root / "worktrees" / "models-unit"),
+                                              str(self.source_root / "current-worktree")).replace("active", "current-plan.md")
+        write_text_atomic(new_doc, new_text)
+        expected = production_units.unit_table(new_text.splitlines())[0]
+        actual = production_units.live_unit_table(new_text.splitlines(), "receiving")
+        self.assertEqual([(row["Worktree"], row["Plan"]) for row in actual],
+                         [(expected["Worktree"], expected["Plan"])])
+        self.assertNotEqual(expected["Worktree"], production_units.unit_table(old_doc.read_text().splitlines())[0]["Worktree"])
+
+    def test_competing_orphan_metadata_is_unavailable_instead_of_picking_a_document(self) -> None:
+        _original, unit, _worker = self.tree()
+        for slug in ("sdlc", "former"):
+            document = self.production(slug, "models-unit")
+            write_text_atomic(document, document.read_text().replace("active", f"{slug}-plan.md"))
+        new_doc = self.production("receiving")
+        receiving = staff.ensure("showrunner", name="receiving")
+        _ = staff.move(unit.id, receiving.id)
+        with redirect_stderr(io.StringIO()) as errors:
+            rows = production_units.live_unit_table(new_doc.read_text().splitlines(), "receiving")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(production_units.cell_value(rows[0]["Worktree"]), "—")
+        self.assertEqual(production_units.cell_value(rows[0]["Plan"]), "—")
+        self.assertRegex(errors.getvalue(), "(?i)models.*(ambiguous|unavailable)|(ambiguous|unavailable).*models")
+
+    def test_ambiguous_legacy_member_never_uses_the_mark_to_choose_a_row(self) -> None:
+        _ = self.production("sdlc", "models-unit")
+        _original, _unit, _worker = self.tree()
+        receiving = staff.ensure("showrunner", name="receiving")
+        _ = staff.ensure("unit", name="models", parent=receiving.id)
+        self.pane("w1:unit", session_id="unit-session", environment={
+            "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
+        })
+        selector = staff_sources.ObservedUnit("models-unit")
+        with self.assertRaisesRegex(staff.StaffUnreadable, "models.*no unique staff entry"):
+            _ = staff_sources.member(selector, staff.snapshot())
+
+    def test_mac_unit_parent_uses_one_owner_read_for_the_whole_resolution(self) -> None:
+        _original, unit, _worker = self.tree()
+        with self.machine("mac"):
+            _ = self.production("sdlc", "models-unit")
+            _ = self.production("receiving")
+            receiving = staff.ensure("showrunner", name="receiving")
+            _ = staff.move(unit.id, receiving.id)
+            self.pane("w1:unit", session_id="unit-session", environment={
+                "STAFF_ID": unit.id, "SHOWRUNNER_UNIT": "sdlc", "SHOWRUNNER_UNIT_ID": "models-unit",
+            })
+            before = len(self.ssh_commands())
+            parent = staff_sources.unit_parent("models-unit", "unit-session")
+            self.assertEqual(parent.slug, "receiving")
+            self.assertEqual(len(self.ssh_commands()) - before, 1)
+
+    def test_transferred_membership_keeps_worktree_and_plan_metadata_from_the_old_doc(self) -> None:
+        original, unit, _worker = self.tree()
+        old_doc = self.production("sdlc", "models-unit")
+        new_doc = self.production("receiving")
+        receiving = staff.ensure("showrunner", name="receiving")
+        _ = staff.move(unit.id, receiving.id)
+        record = staff.snapshot()
+        tables = production_units
+        old_lines, new_lines = old_doc.read_text().splitlines(), new_doc.read_text().splitlines()
+        with mock.patch.object(staff, "snapshot", side_effect=AssertionError("second owner read")):
+            old_rows = tables.live_unit_table(old_lines, "sdlc", record=record)
+            new_rows = tables.live_unit_table(new_lines, "receiving", record=record)
+            retired = tables.retired_units(old_lines, "sdlc", record=record)
+            old_marks = tables.ProductionMembers("sdlc", record=record)
+            new_marks = tables.ProductionMembers("receiving", record=record)
+            cells = tables.unit_table(old_lines)[0]
+            self.assertTrue(tables.unit_is_retired(cells, old_marks))
+            self.assertFalse(tables.unit_is_retired(cells, new_marks))
+        self.assertEqual(old_rows, [])
+        self.assertEqual(len(new_rows), 1)
+        self.assertEqual(tables.cell_value(new_rows[0]["Unit"]), "models-unit")
+        self.assertEqual(new_rows[0]["Worktree"], cells["Worktree"])
+        self.assertEqual(new_rows[0]["Plan"], cells["Plan"])
+        self.assertEqual(retired, {"models-unit"})
+        self.assertEqual(record.find(kind="unit", parent=original.id), [])
 
     def test_unit_parent_agrees_with_showrunner_members_after_transfer(self) -> None:
         original, unit, _worker = self.tree()
