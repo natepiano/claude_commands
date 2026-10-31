@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.production import staff, staff_sources
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -57,7 +58,7 @@ import add_unit  # noqa: E402
 import berth_board  # noqa: E402
 import production_units  # noqa: E402
 import progress_history  # noqa: E402
-import showrunners  # noqa: E402
+from scripts.production import showrunners  # noqa: E402
 import unit_lookup  # noqa: E402
 import unit_move  # noqa: E402
 import unit_names  # noqa: E402
@@ -68,10 +69,8 @@ if TYPE_CHECKING:
     from scripts.message import sessions
     from scripts.message.sessions import SessionRecord
     from scripts.shutdown import shutdown_record
-    from scripts.shutdown import settle as shutdown_settle
 else:
     import shutdown_record
-    import settle as shutdown_settle
     import sessions
     from sessions import SessionRecord
 
@@ -588,8 +587,7 @@ def stop_sessions(unit: Unit, found: Found, wait_minutes: float, known_ids: froz
     ids_found = [item["sessionId"] for item in targets]
     ids = [session_id for session_id in ids_found if session_id not in pending]
     if ids:
-        started = run([sys.executable, str(SHUTDOWN), "down", "--here", "--only", ",".join(ids),
-                       "--why", shutdown_settle.RETIRE_REASON])
+        started = run([sys.executable, str(SHUTDOWN), "down", "--here", "--only", ",".join(ids)])
         if started.returncode:
             return [f"{describe_session(item)}: shutdown down refused: {failure(started)}" for item in targets]
     deadline = time.monotonic() + wait_minutes * 60

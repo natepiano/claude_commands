@@ -25,7 +25,7 @@ cli_agent_print_status() {
 # cli_agent_run <skill...> — no args launches the agent's interactive REPL;
 # args are joined into one non-interactive skill invocation.
 cli_agent_run() {
-    local task invocation skill
+    local task invocation skill workers_home
     local -a agent_args=()
 
     if [[ $# -eq 0 ]]; then
@@ -49,11 +49,12 @@ cli_agent_run() {
 
     case "$AGENT_FAMILY" in
         codex)
+            workers_home="$(agents_workers_home)" || return 1
             read -r -a agent_args <<< "$(agents_codex_args)"
             if [[ -z "$invocation" ]]; then
-                exec codex "${agent_args[@]}"
+                exec env "CODEX_HOME=$workers_home" codex "${agent_args[@]}"
             fi
-            exec codex "${agent_args[@]}" "$invocation"
+            exec env "CODEX_HOME=$workers_home" codex "${agent_args[@]}" "$invocation"
             ;;
         claude)
             source "$CLI_AGENT_DIR/../agents/claude_account.sh"

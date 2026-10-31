@@ -17,14 +17,15 @@ from types import SimpleNamespace
 from typing import cast, override
 from unittest.mock import patch
 
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.accounts import accounts
 from scripts.production import add_showrunner
 import production_units
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
-import usage_store
+from scripts.whoami import usage_store
 import herdr as runtime
 from scripts.herdr import herdr
 from scripts.herdr.fake_herdr import CommandResponse
@@ -544,7 +545,7 @@ class AddShowrunnerTests(AddShowrunnerFixture):
         self.herdr_overrides["--session default session list --json"] = CommandResponse(
             code=1, stdout="", stderr="fixture cannot list herdr sessions")
         result = self.run_command("kid")
-        self.refused(result, "herdr session list: fixture cannot list herdr sessions")
+        self.refused(result, "herdr session list: stderr: fixture cannot list herdr sessions")
         self.assertEqual(self.herdr_calls(), [["--session", "default", "session", "list", "--json"]])
 
     def test_child_opens_its_tab_in_a_shared_server_that_already_runs(self) -> None:

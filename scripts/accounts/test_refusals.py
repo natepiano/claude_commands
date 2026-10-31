@@ -2,17 +2,20 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast, override
-from unittest.mock import patch
 
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, refusals
-import usage_store
+from scripts.whoami import usage_store
 
 
 WEEKLY_REFUSAL_WINDOW = refusals.KnownWindow("weekly")
@@ -26,7 +29,7 @@ class AccountRefusalTests(unittest.TestCase):
     @override
     def setUp(self) -> None:
         self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home)}, clear=True)))
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {}, clear=True)))
 
     def refusal(self, *, window: refusals.KnownWindow | refusals.UnknownWindow = WEEKLY_REFUSAL_WINDOW,
                 reset: refusals.KnownReset | refusals.NoResetKnown = UNKNOWN_REFUSAL_RESET,

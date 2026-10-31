@@ -14,12 +14,17 @@ from zoneinfo import ZoneInfo
 from typing import TYPE_CHECKING, cast, final, override
 from unittest import mock
 
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import change_review
 import footer_counts
 import next_item
 from production_units import Production
 import proposals_folder
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 from scripts.production import staff
 from change_review import Visible

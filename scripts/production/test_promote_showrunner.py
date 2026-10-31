@@ -16,11 +16,13 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import add_showrunner
 import promote_showrunner
-import showrunners
+from scripts.production import showrunners
 import showrunner_tree
 import unit_effort
 import unit_lookup

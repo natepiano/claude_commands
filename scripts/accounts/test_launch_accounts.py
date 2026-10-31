@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import cast, final, override
 from unittest.mock import patch
 
+from scripts.accounts.home_test_support import scratch_account_home
 from scripts.accounts import accounts, nix_env_fake as fixtures
 from scripts.lib.code_kind import is_test_code
 from scripts.shutdown import launch_permission
@@ -195,7 +196,7 @@ class ExecLaunchShellTests(unittest.TestCase):
         self.home.mkdir()
         self.loader = fixtures.fake_nix_loader()
         _ = cast(object, self.enterContext(patch.object(accounts, "import_module", side_effect=fixtures.imports_with_nix_loader(self.loader))))
-        _ = cast(object, self.enterContext(patch.dict(os.environ, {"HOME": str(self.home), "PATH": os.defpath,
+        _ = cast(object, self.enterContext(scratch_account_home(self.home, {"PATH": os.defpath,
             "KEEP": "base", "UNSET_BY_SHELL": "old", "AGENT_NOTES_DIR": str(self.home / "notes"),
             "SHUTDOWN_STATE_DIR": str(self.home / "shutdown"),
             "NOTIFIER_SESSIONS_DIR": str(self.home / "sessions")}, clear=True)))
@@ -455,7 +456,7 @@ def _resume_parts(session: Session, prompt: str):
 
     def test_shell_launches_without_any_account_selection_are_rejected(self) -> None:
         for path, source in (
-                ("fix/style-eval-review-all.sh", 'claude --print --dangerously-skip-permissions -- "$prompt" > "$log" 2>&1'),
+                ("fixtures/unresolved-launch.sh", 'claude --print --dangerously-skip-permissions -- "$prompt" > "$log" 2>&1'),
                 ("berth_fix/launch.sh", 'exec env -u CLAUDE_CODE_MESSAGING_SOCKET \\\n    claude -n "$session_name" --permission-mode auto /berth_fix\n'
                  + 'open_window claude -n "$session_name" /berth_fix'),
                 ("agents/agent_bg.sh", '"${CLAUDE_BIN}" "${launch_args[@]}"')):

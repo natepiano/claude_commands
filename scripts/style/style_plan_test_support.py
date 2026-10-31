@@ -53,6 +53,8 @@ class StylePlanFixture(unittest.TestCase):
 
     tip: str = ""
 
+    pending_judge_tickets: frozenset[str] = frozenset()
+
     sources: tuple[str, ...] = tuple(f"crates/{crate}/src/{name}.rs" for crate in ("alpha", "beta") for name in ("lib", "other"))
 
     template_repo: Path = Path()
@@ -106,6 +108,7 @@ class StylePlanFixture(unittest.TestCase):
         listed = mechanical_classes.classes()
         _ = self.enterContext(mock.patch.object(mechanical_classes, "classes", return_value=listed))
         self.root = self.fixture_root
+        self.pending_judge_tickets = frozenset()
         _ = self.enterContext(mock.patch.object(Path, "home", return_value=self.root))
         self.repo = self.root / "sample"
         self.style = self.root / "sample-style"
@@ -243,6 +246,7 @@ class StylePlanFixture(unittest.TestCase):
             ledger.set_tip(self.tip, "style/main")
 
     def candidates(self, family: rules.Family = "names", blocked: tuple[str, ...] = ()) -> tuple[style_plan.TicketSelection, ...]:
+        self.finish_judging()
         ledger = self.ledger()
         board = self.board(*blocked)
         busy = style_plan.busy_files(self.repo, self.doc, ledger, family + "-unit", board)
@@ -266,6 +270,7 @@ class StylePlanFixture(unittest.TestCase):
         _ = self.git("merge", "-q", "--ff-only", "style/main", cwd=self.unit)
 
     def run_next(self) -> tuple[int, str, str]:
+        self.finish_judging()
         output, errors = io.StringIO(), io.StringIO()
         with redirect_stdout(output), redirect_stderr(errors):
             code = style_plan.main(["next-phase", "--unit", "names-unit", "--plan", str(self.plan), "--repo", str(self.repo)])
@@ -409,9 +414,38 @@ class StylePlanFixture(unittest.TestCase):
             _ = self.git("merge", "--ff-only", "main", cwd=checkout)
         self.sync()
 
+    def finish_judging(self) -> None:
+        """Drop fixture judge tickets after their final writes and before selecting work."""
+        if not self.pending_judge_tickets:
+            return
+        ledger = self.ledger()
+        for ticket in sorted(self.pending_judge_tickets):
+            ledger.ticket_drop(ticket)
+            self.pending_judge_tickets -= {ticket}
+
+    def borrowing_decision(self, rule: str, family: rules.Family, path: str, count: int = 1) -> Path:
+        folder = self.root / "borrow-issues"
+        folder.mkdir(exist_ok=True)
+        issue = folder / (family + ".md")
+        blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
+        ledger = self.ledger()
+        judge = f"judge-{family}-1"
+        ledger.ticket_add(judge, f"judge-{family}", "read", family, "crates/alpha", [path], [rule])
+        ledger.ticket_assign(judge, "style/main")
+        _ = ledger.ticket_base(judge)
+        for index in range(count):
+            finding = ledger.hold(rule, path, 1, f"change {index}", "type", "u32", "u64", blob, judge)
+            ledger.file_held(finding.finding_id, issue)
+        self.pending_judge_tickets |= {judge}
+        _ = issue.write_text("---\nstatus: open\ntags: [proposal, style]\nplan: approved\n"
+                             + f"unit: {family}-unit\nstyle_rule: {rule}\nstyle_crate: crates/alpha\nstyle_rule_blob: {blob}\n---\n")
+        if "**Proposals:**" not in self.doc.read_text():
+            _ = self.doc.write_text(self.doc.read_text().replace("## Units", f"- **Proposals:** {folder}\n\n## Units"))
+        return issue
+
     def judged_findings(self, rule: str, sites: tuple[tuple[str, int, str], ...], *, kind: style_ledger.FindingKind = "type",
                         before: str = "before", after: str = "after") -> tuple[Path, tuple[style_ledger.HeldFinding, ...]]:
-        """Files findings at sites in an approved decision, judged by a dropped ticket that started at the tip.
+        """Files findings at sites in an approved decision, leaving its judge open for further writes.
 
         They are type findings unless named.
         """
@@ -420,12 +454,12 @@ class StylePlanFixture(unittest.TestCase):
         ledger.ticket_add("modules-unit-1", "modules-unit", "read", "names", "crates/alpha", sorted({site[0] for site in sites}), [rule])
         ledger.ticket_assign("modules-unit-1", "style/main")
         _ = ledger.ticket_base("modules-unit-1")
-        ledger.ticket_drop("modules-unit-1")
         blob = next(item.blob for item in rules.load_rules(self.repo) if item.rule_id == rule)
         findings = tuple(ledger.hold(rule, path, line, text, kind, before, after, blob, "modules-unit-1")
                          for path, line, text in sites)
         for finding in findings:
             ledger.file_held(finding.finding_id, issue)
+        self.pending_judge_tickets |= {"modules-unit-1"}
         return issue, findings
 
     def commit_files(self, files: dict[str, str | bytes]) -> None:

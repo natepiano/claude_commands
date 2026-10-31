@@ -21,6 +21,8 @@ import unittest
 from collections.abc import Callable
 from contextlib import closing, redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from typing import TypedDict, cast, final, override
 from unittest import mock
 
@@ -28,7 +30,7 @@ import style_sync
 import scratch
 import style_ledger
 import style_rules
-import showrunners
+from scripts.production import showrunners
 from scripts.direct import test_verify_lint_scope as verify_fixture
 
 
@@ -139,6 +141,9 @@ class StyleSyncTests(unittest.TestCase):
             "STYLE_HISTORY_NATE_STYLE_DIR": str(rule_root),
             "STYLE_LEDGER_STATE_DIR": str(self.root / "state"),
             "SCRATCH_HOLDS": str(self.root / "scratch-holds.json"),
+            "SCRATCH_ROOT": str(self.root / "scratch"),
+            "SCRATCH_COPIES_ROOT": str(self.root / "copies"),
+            "SCRATCH_VISIBLE_ROOT": str(self.root / "repro"),
         })))
         _ = self.enterContext(mock.patch.object(style_rules, "NATE_STYLE_DIR", rule_root))
         sender = self.root / "send.py"
@@ -350,7 +355,7 @@ class StyleSyncTests(unittest.TestCase):
         self.checkpoint_for_wake()
         self.waiting_units("names-unit", "types-unit")
         self.wake_sender("names-unit")
-        self.assertEqual(self.merge_for_wake(), (0, "style_ledger: wake names-unit: FAILED: unavailable\n", ""))
+        self.assertEqual(self.merge_for_wake(), (0, "style_ledger: wake names-unit: send.py: stdout: FAILED: unavailable\n", ""))
         self.assertEqual(self.remaining_waiters(), ["names-unit"])
         with style_ledger.open_ledger(self.repo) as ledger, closing(sqlite3.connect(ledger.database)) as connection:
             self.assertEqual(connection.execute("SELECT state FROM tickets WHERE id='modules-unit-1'").fetchone(), ("merged",))
@@ -453,7 +458,7 @@ class StyleSyncTests(unittest.TestCase):
         _ = (self.root / "send.py").write_text("print('FAILED: unavailable')\nraise SystemExit(3)\n")
         code, output = self.notice()
         self.assertEqual(code, 0)
-        self.assertEqual(output, "style_sync: notify: FAILED: unavailable\n")
+        self.assertEqual(output, "style_sync: notify: send.py: stdout: FAILED: unavailable\n")
 
     def test_notify_lookup_refusal_prints_one_prefix_and_keeps_the_merge_successful(self) -> None:
         with mock.patch.object(style_sync, "standing_style_production",
@@ -605,13 +610,25 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             _ = self.git("worktree", "add", "--detach", str(directory / "checkout"), self.tip)
         return directory
 
+    def test_shared_target_survives_task_end_and_reuses_artifacts(self) -> None:
+        common = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir"))
+        target = style_sync.lint_target(common)
+        code, output = self.run_lint('printf previous > target/artifact\n')
+        self.assertEqual(code, 0, output)
+        self.assertEqual(scratch.end("run:sample-style"), [])
+        self.assertTrue(target.is_dir())
+        self.assertEqual((target / "artifact").read_text(), "previous")
+        code, output = self.run_lint('[[ $(cat target/artifact) == previous ]] || exit 2\n')
+        self.assertEqual(code, 0, output)
+        self.assertEqual(list(self.lint_temp.iterdir()), [])
+
     def test_lint_links_a_warm_target_and_cleanup_keeps_it_until_the_production_ends(self) -> None:
-        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / "style-sync-target"
+        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / scratch.STYLE_TARGET_NAME
         code, output = self.run_lint('[[ -L target ]] || exit 2\nprintf warm > target/artifact\n')
         self.assertEqual(code, 0, output)
         self.assertEqual((target / "artifact").read_text(), "warm")
         self.assertEqual(list(self.lint_temp.iterdir()), [])
-        self.assertEqual(scratch.holds()[str(target)]["task"], "run:sample-style")
+        self.assertNotIn(str(target), scratch.holds())
         # A later checkout uses the same artifacts. No Cargo environment variable is overridden.
         with mock.patch.dict(os.environ, {"CARGO_TARGET_DIR": "inherited-value"}):
             code, output = self.run_lint(
@@ -619,12 +636,12 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
             )
         self.assertEqual(code, 0, output)
         self.assertEqual(list(self.lint_temp.iterdir()), [])
-        self.assertEqual(scratch.end("run:sample-style"), [target])
-        self.assertFalse(target.exists())
+        self.assertEqual(scratch.end("run:sample-style"), [])
+        self.assertTrue(target.exists())
         self.assertEqual(scratch.holds(), {})
 
     def test_a_missing_or_swept_target_runs_cold(self) -> None:
-        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / "style-sync-target"
+        target = Path(self.git("rev-parse", "--path-format=absolute", "--git-common-dir")) / scratch.STYLE_TARGET_NAME
         for state in ("missing", "swept"):
             with self.subTest(state=state):
                 self.assertFalse(target.exists())
@@ -643,7 +660,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         real_flock = fcntl.flock
 
         def first_sync() -> None:
-            with (target / "sync.lock").open("a") as lock:
+            with (target / scratch.STYLE_LOCK_NAME).open("a") as lock:
                 real_flock(lock, fcntl.LOCK_EX)
                 locked.set()
                 _ = attempted.wait(30)
@@ -669,7 +686,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         real_cleanup = style_sync.remove_lint_dir
 
         def assert_locked() -> None:
-            with (target / "sync.lock").open("a") as lock, self.assertRaises(BlockingIOError):
+            with (target / scratch.STYLE_LOCK_NAME).open("a") as lock, self.assertRaises(BlockingIOError):
                 real_flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
         def git(repo: Path, *arguments: str) -> str:
@@ -691,7 +708,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         self.assertTrue(attempted.is_set())
         self.assertEqual(list(self.lint_temp.iterdir()), [])
         # Cleanup has completed and the next sync can acquire the same lock.
-        with (target / "sync.lock").open("a") as lock:
+        with (target / scratch.STYLE_LOCK_NAME).open("a") as lock:
             real_flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_replacing_the_target_link_cannot_grant_successful_lint_coverage(self) -> None:
@@ -1161,7 +1178,7 @@ if arguments[:2] == ["+nightly", "fmt"] and "--version" not in arguments:
         for outcome, code in (("FAILED: unavailable", 3), ("relay error", 1)):
             with self.subTest(outcome=outcome):
                 self.handoff_sender(outcome, code)
-                self.assertEqual(self.send_handoff(checkpoint), (1, f"style_sync: hand-off: {outcome}\n"))
+                self.assertEqual(self.send_handoff(checkpoint), (1, f"style_sync: hand-off: send.py: stdout: {outcome}\n"))
                 self.assertEqual(self.handoff_rows()[0][:3], (checkpoint, "pending", ""))
 
     def test_resume_records_a_queued_notice_as_sent(self) -> None:
