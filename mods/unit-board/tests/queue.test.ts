@@ -284,13 +284,13 @@ describe('build queue pane', () => {
     const ui = await mount($);
     expect(drawnText(await ui.drawn())).toContain('Next? No. 3 steps are ahead');
     expect(fake.processes).toEqual([[...READ, '4']]);
-    expect(fake.writes.at(-1)).toEqual({ kind: 'queue', data, selector: '4' });
+    expect(fake.writes.at(-1)).toEqual({ kind: 'queue', data, selection: { kind: 'card', selector: '4' } });
     await fake.clock.advance(10_000);
     await $.session.start(start);
     expect(fake.processes).toEqual([[...READ, '4'], [...READ, '4'], [...READ, '4']]);
     await $.command.run(command());
     expect(fake.processes.at(-1)).toEqual(READ);
-    expect(fake.writes.at(-1)).toEqual({ kind: 'queue', data, selector: null });
+    expect(fake.writes.at(-1)).toEqual({ kind: 'queue', data, selection: { kind: 'view' } });
   });
 
   test('a session or folder selector stays one process argument', async ($, on) => {
@@ -602,7 +602,7 @@ describe('build queue pane', () => {
         expect(await run(services, command('bump unknown-worker'))).toEqual({ text: result === 'refusal' ? refusal : BUMP });
         expect(failures).toBe(failedWrites);
         if (failedWrites === 1) {
-          expect(state['build-queue']).toEqual({ kind: 'failed', reason: 'Build queue could not be read.', selector: null });
+          expect(state['build-queue']).toEqual({ kind: 'failed', reason: 'Build queue could not be read.', selection: { kind: 'view' } });
         }
       });
     }
@@ -844,8 +844,25 @@ test('a saved table pane without a selector resumes the whole queue', async () =
   host.panes.add('build-queue');
   await host.dispatch('session.start', start);
   expect(host.runs).toEqual([READ]);
-  expect(host.states.get('queuePanes')?.['build-queue']).toEqual({ kind: 'queue', data: snapshot(), selector: null });
+  expect(host.states.get('queuePanes')?.['build-queue']).toEqual({ kind: 'queue', data: snapshot(), selection: { kind: 'view' } });
 });
+
+for (const savedSelector of ['4', null] as const) {
+  test(`legacy saved selector ${savedSelector} converts once and survives refresh and reload`, async () => {
+    const host = tablePaneLifetimeHost();
+    const legacy = { kind: 'queue', data: snapshot(), selector: savedSelector };
+    host.states.set('queuePanes', { 'build-queue': legacy as unknown as QueuePaneState });
+    host.panes.add('build-queue');
+    await host.dispatch('session.start', start);
+    const selection = savedSelector === null ? { kind: 'view' } : { kind: 'card', selector: savedSelector };
+    expect(host.states.get('queuePanes')?.['build-queue']).toEqual({ kind: 'queue', data: snapshot(), selection });
+    await host.tick();
+    await host.dispatch('session.start', start);
+    const argv = savedSelector === null ? READ : [...READ, savedSelector];
+    expect(host.runs).toEqual([argv, argv, argv]);
+    expect(host.states.get('queuePanes')?.['build-queue']).toEqual({ kind: 'queue', data: snapshot(), selection });
+  });
+}
 
 test('a failed card read retains its selector through a fresh module reload', async ($, on) => {
   const host = tablePaneLifetimeHost();
@@ -872,7 +889,7 @@ test('a failed card read retains its selector through a fresh module reload', as
 
 test('an older reload cannot replace a card selected while its saved-state read is held', async () => {
   const host = tablePaneLifetimeHost();
-  host.states.set('queuePanes', { 'build-queue': { kind: 'queue', data: snapshot(), selector: null } });
+  host.states.set('queuePanes', { 'build-queue': { kind: 'queue', data: snapshot(), selection: { kind: 'view' } } });
   host.panes.add('build-queue');
   const held = host.pauseStateRead();
   const reloading = host.dispatch('session.start', start);
@@ -883,5 +900,5 @@ test('an older reload cannot replace a card selected while its saved-state read 
   await reloading;
   await host.tick();
   expect(host.runs).toEqual([[...READ, '4'], [...READ, '4']]);
-  expect(host.states.get('queuePanes')?.['build-queue']).toEqual({ kind: 'queue', data: snapshot(), selector: '4' });
+  expect(host.states.get('queuePanes')?.['build-queue']).toEqual({ kind: 'queue', data: snapshot(), selection: { kind: 'card', selector: '4' } });
 });

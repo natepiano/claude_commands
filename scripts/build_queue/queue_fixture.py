@@ -139,14 +139,20 @@ def queue_read_fixture(view: gate.QueueView) -> gate.QueueRead:
         elif isinstance(reason, gate.ReadingUnavailable):
             host = reason
         first = gate.HeadExplanation(step, gate.NeedSourceNotRecorded(), decision,
-            gate.BudgetCheck(decision.charged, step.need, decision.budget,
-                decision.budget - step.need, decision.budget_passes),
-            gate.FreeCheck(view.available, step.need, decision.reserve, decision.promised,
-                decision.threshold, decision.free_passes),
+            *gate.decision_checks(decision, step.need, view.available),
             order, False, gate.NoBump())
+    followers: list[gate.LineWaiter] = []
+    for step in view.waiting[1:]:
+        own = gate.decide(view.available, gate.UnknownHostTotal(), step.need, [],
+                          limits=gate.AdmissionLimits(21 * gate.GIB, view.reserve))
+        followers.append(gate.LineWaiter(step, own.state == "admit", own,
+                                         *gate.decision_checks(own, step.need, view.available)))
     explanation = gate.QueueExplanation(view.now, host, running,
         gate.QueueMemoryTotals(sum(step.charged for step in running), sum(step.measured for step in running), view.promised),
-        first, gate.WaitingLine((), 0, 0, 0, 0, view.now))
+        first, gate.WaitingLine(tuple(followers), len(followers), sum(row.fits_now for row in followers),
+            min((row.waiter.need for row in followers), default=0),
+            max((row.waiter.need for row in followers), default=0),
+            min((row.waiter.since for row in followers), default=view.now)))
     ordered: list[tuple[Path, gate.Waiter]] = [(Path(f"{step.pid}-{step.pid}.waiting"),
         {"pid": step.pid, "start_time": str(step.pid), "need": step.need, "since": step.since,
          "session_id": step.session_id, "session_name": step.session_name,
@@ -250,39 +256,12 @@ class QueueFixture(ExitStack):
                  for at in ended]
         write_lines(self.directory / "anon_peaks.jsonl", lines, tail=tail)
 
+    def inputs(self) -> gate.QueueInputs:
+        """Resolve the fixed 10:46 queue once, including raw pressure and limits."""
+        return gate.gather_queue_inputs(self.directory, gate.process_table(self.proc), NOW)
+
     def read(self) -> gate.QueueRead:
-        """The captured admission answer; render tests never recompute its checks."""
-        ordered = [(path, cast(gate.Waiter, json.loads(path.read_text()))) for path in self.paths]
-        decision = gate.AdmissionDecision("hold", int(20.5 * gate.GIB), 6 * gate.GIB,
-            3 * gate.GIB, int(5.1 * gate.GIB), gate.MemoryPressure(7.7),
-            int(11.1 * gate.GIB), 21 * gate.GIB, False, True)
-        order = gate.StrictUntil(NOW + 588)
-        waiting = tuple(gate.WaitingStep(row["pid"], row.get("session_id", ""),
-            row.get("session_name", ""), row.get("step", ""), row.get("folder", ""),
-            row["since"], row["need"],
-            gate.HeadAdmissionStatus(decision, row["need"], int(24.5 * gate.GIB), order)
-            if index == 0 else gate.BehindHead("work-lead", ordered[0][1]["since"], "id-work-lead"))
-            for index, (_, row) in enumerate(ordered))
-        measured = gate.MeasuredMemory(int(5.1 * gate.GIB), gate.RampPromise(int(11.1 * gate.GIB)))
-        run = gate.RunningStep("id-widget", "widget-enhancements-title", "nextest", "/tmp/widget",
-                               int(11.1 * gate.GIB), measured)
-        running = gate.ExplainedRunningStep(run, NOW - 25, int(11.1 * gate.GIB),
-            int(5.1 * gate.GIB), int(11.1 * gate.GIB), gate.RampPromise(int(11.1 * gate.GIB)))
-        head = gate.HeadExplanation(waiting[0], gate.NeedSourceNotRecorded(), decision,
-            gate.BudgetCheck(int(11.1 * gate.GIB), int(11.5 * gate.GIB), 21 * gate.GIB,
-                             int(9.5 * gate.GIB), False),
-            gate.FreeCheck(int(24.5 * gate.GIB), int(11.5 * gate.GIB), 3 * gate.GIB,
-                           6 * gate.GIB, int(20.5 * gate.GIB), True),
-            order, True, gate.QueueBump(NOW - 12, True, False))
-        followers = tuple(gate.LineWaiter(step, position in (8, 12, 18, 25))
-                          for position, step in enumerate(waiting[1:], 2))
-        explanation = gate.QueueExplanation(NOW,
-            gate.HostAvailable(int(24.5 * gate.GIB), 60 * gate.GIB, 3 * gate.GIB,
-                               21 * gate.GIB, gate.MemoryPressure(7.7)),
-            (running,), gate.QueueMemoryTotals(int(11.1 * gate.GIB), int(5.1 * gate.GIB), 6 * gate.GIB),
-            head, gate.WaitingLine(followers, 31, 4, gate.GIB, int(12.1 * gate.GIB), NOW - 39 * 60))
-        return gate.QueueRead(gate.QueueView(waiting, (run,), int(24.5 * gate.GIB),
-                                             6 * gate.GIB, 3 * gate.GIB, NOW), explanation, ordered)
+        return gate.queue_read_from(self.inputs())
 
     def model(self) -> queue_view.QueueModel:
         reading = self.read()

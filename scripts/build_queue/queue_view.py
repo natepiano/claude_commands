@@ -1,7 +1,7 @@
 """The compact queue view and the checks shared with one-step cards."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from typing import assert_never
@@ -26,20 +26,16 @@ class QueueModel:
         return head_facts.queue_moves(self.reading, self.facts)
 
 
-@dataclass(frozen=True)
-class ChecksNotRecorded:
-    """No admission checks are recorded for a step behind the head."""
-
-
-def step_checks(model: QueueModel, position: int) -> gate.HeadExplanation | gate.ReadingUnavailable | ChecksNotRecorded:
+def step_checks(model: QueueModel, position: int) -> gate.HeadExplanation | gate.LineWaiter | gate.ReadingUnavailable:
     explanation = model.reading.explanation
     if isinstance(explanation.host, gate.ReadingUnavailable):
         return explanation.host
-    reason = model.reading.view.waiting[position - 1].reason
-    if isinstance(reason, gate.ReadingUnavailable):
-        return reason
-    head = explanation.head
-    return head if position == 1 and isinstance(head, gate.HeadExplanation) else ChecksNotRecorded()
+    step = model.reading.view.waiting[position - 1]
+    if isinstance(step.reason, gate.ReadingUnavailable):
+        return step.reason
+    if position == 1 and isinstance(explanation.head, gate.HeadExplanation):
+        return explanation.head
+    return next(item for item in explanation.line.steps if item.waiter == step)
 
 
 def field(text: str) -> str:
@@ -123,12 +119,10 @@ def check_line(passes: bool, text: str) -> Line:
     return (Span("✓ " if passes else "✗ ", "success" if passes else "error"), Span(text))
 
 
-def check_lines(checks: gate.HeadExplanation | gate.ReadingUnavailable | ChecksNotRecorded,
+def check_lines(checks: gate.HeadExplanation | gate.LineWaiter | gate.ReadingUnavailable,
                 model: QueueModel, *, pressure_first: bool = True) -> list[Line]:
     if isinstance(checks, gate.ReadingUnavailable):
-        return [(Span(reason_phrase(checks)),)]
-    if isinstance(checks, ChecksNotRecorded):
-        return []
+        return [(Span(reason_phrase(checks, model.reading.view.waiting)),)]
     budget, free = checks.budget, checks.free
     held = f"{budget.charged / gate.GIB:.1f} of {budget.budget / gate.GIB:.1f} GiB held; needs {budget.need / gate.GIB:.1f}"
     if not budget.passes:
@@ -147,7 +141,7 @@ def check_lines(checks: gate.HeadExplanation | gate.ReadingUnavailable | ChecksN
     return [pressure, *memory] if pressure_first else [*memory, pressure]
 
 
-def reason_phrase(reason: gate.WaitReason) -> str:
+def reason_phrase(reason: gate.WaitReason, waiting: Sequence[gate.WaitingStep]) -> str:
     match reason:
         case gate.ReadingUnavailable():
             return "memory reading unavailable"
@@ -160,7 +154,9 @@ def reason_phrase(reason: gate.WaitReason) -> str:
         case gate.BehindHead():
             return "#1's turn"
         case gate.BehindOlderFit():
-            return gate.older_fit_text(reason)
+            place = next((place for place, step in enumerate(waiting, 1)
+                          if step.session_id == reason.older_session_id and step.since == reason.older_since), 0)
+            return f"behind #{place}, an older step that fits" if place else "behind an older step that fits"
         case gate.ReadyForAdmission():
             return "starts at the next check"
         case gate.HeadAdmissionStatus():
@@ -269,7 +265,8 @@ def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: s
     bar_column = fixed + show_width + unit_width
     budget_label = f"budget {budget:.1f}"
     lines: list[Line] = [
-        (Span(f"Build queue · {clock(model, explanation.now)}", "inactive"),), (),
+        (Span(f"Build queue · {clock(model, explanation.now)}",
+              "warning" if isinstance(model.reading.freshness, gate.StaleReading) else "inactive"),), (),
         (Span(" " * bar_column), *labels),
         (Span(pad_right(budget_label, bar_column), "inactive"), *budget_bar(budget, free, colour=colour)), (),
         (Span(pad_left("#", place_width) + " " + pad_right(cut_tail("showrunner", show_width), show_width) + " "

@@ -8,7 +8,7 @@ import { UnitView } from './unit';
 import { AccountsView } from './accounts';
 import type { StoredAccountsStatus } from '../types/accounts';
 import { QueueView } from './queue';
-import type { QueuePaneState, QueueLines } from '../types/queue';
+import type { QueuePaneState, QueueLines, QueueSelection } from '../types/queue';
 
 const PANE = 'unit-board';
 const ACCOUNTS = 'accounts-board';
@@ -280,12 +280,17 @@ function validQueueLines(value: unknown): value is QueueLines {
 }
 function normalizeQueueState(value: unknown): QueuePaneState {
   const saved = value && typeof value === 'object' ? value as Record<string, unknown> : {};
-  const selector = typeof saved.selector === 'string' ? saved.selector : null;
-  if (saved.kind === 'queue' && validQueueLines(saved.data)) return { kind: 'queue', data: saved.data, selector };
-  if (saved.kind === 'failed') return { kind: 'failed', reason: 'Build queue could not be read.', selector };
-  return { kind: 'loading', selector };
+  const raw = saved.selection && typeof saved.selection === 'object'
+    ? saved.selection as Record<string, unknown> : {};
+  const selection: QueueSelection = raw.kind === 'card' && typeof raw.selector === 'string'
+    ? { kind: 'card', selector: raw.selector }
+    : raw.kind === 'view' ? { kind: 'view' }
+    : typeof saved.selector === 'string' ? { kind: 'card', selector: saved.selector } : { kind: 'view' };
+  if (saved.kind === 'queue' && validQueueLines(saved.data)) return { kind: 'queue', data: saved.data, selection };
+  if (saved.kind === 'failed') return { kind: 'failed', reason: 'Build queue could not be read.', selection };
+  return { kind: 'loading', selection };
 }
-type QueueOpening = { kind: 'saved' } | { kind: 'view' } | { kind: 'card'; selector: string };
+type QueueOpening = { kind: 'saved' } | QueueSelection;
 function queuePaneCalls($: EngineInterface, opening: QueueOpening = { kind: 'saved' }): TablePaneCalls<QueueReady, void> {
   return {
     open: () => $.ui.open({ id: QUEUE, title: 'Build queue', closeOnEscape: true }),
@@ -295,7 +300,7 @@ function queuePaneCalls($: EngineInterface, opening: QueueOpening = { kind: 'sav
       const panes = (await $.state.get(QUEUE_PANES)).value ?? {};
       if (!isOpen()) return;
       const state: QueuePaneState = opening.kind === 'saved' ? normalizeQueueState(panes[QUEUE])
-        : { kind: 'loading', selector: opening.kind === 'card' ? opening.selector : null };
+        : { kind: 'loading', selection: opening };
       await $.state.set(QUEUE_PANES, { ...panes, [QUEUE]: state });
     },
     load: async (...[, isOpen]) => {
@@ -303,11 +308,11 @@ function queuePaneCalls($: EngineInterface, opening: QueueOpening = { kind: 'sav
       if (!isOpen()) throw new Error('Pane closed.');
       const args = ['--json', '--columns', String(queueColumns), '--you', await $.session.id()];
       if (!isOpen()) throw new Error('Pane closed.');
-      const selector = state.selector;
-      if (selector !== null) args.push(selector);
+      const selection = state.selection;
+      if (selection.kind === 'card') args.push(selection.selector);
       const data: unknown = JSON.parse(await queueRun($, args, isOpen));
       if (!validQueueLines(data)) throw new Error('Invalid queue lines.');
-      return { kind: 'queue', data, selector };
+      return { kind: 'queue', data, selection };
     },
     advance: async state => state,
     read: async () => normalizeQueueState((await $.state.get(QUEUE_PANES)).value?.[QUEUE]),
@@ -317,7 +322,7 @@ function queuePaneCalls($: EngineInterface, opening: QueueOpening = { kind: 'sav
       if (!isOpen()) return;
       const saved = normalizeQueueState(previous[QUEUE]);
       if (state.kind === 'loading' && saved.kind === 'loading') return;
-      const selected: QueuePaneState = state.kind === 'queue' ? state : { ...state, selector: saved.selector };
+      const selected: QueuePaneState = state.kind === 'queue' ? state : { ...state, selection: saved.selection };
       await $.state.set(QUEUE_PANES, { ...previous, [QUEUE]: selected });
     },
     drop: async isClosed => {

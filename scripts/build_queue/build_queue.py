@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import head_facts
-from scripts.build_queue.queue_lines import age as age, json_form, plain
+from scripts.build_queue.queue_lines import Span, age as age, json_form, plain
 from scripts.build_queue.queue_view import QueueModel, field as field, render_view, step_labels as step_labels
 from scripts.lint import memory_admit
 from scripts.lib.user_zone import user_zone
@@ -62,7 +62,13 @@ def main() -> int:
     try:
         if words and words[0] == "bump":
             memory_admit.bump_waiter(words[1], caller())
-        reading = memory_admit.locked_queue_read()
+        reading = memory_admit.queue_read()
+        if isinstance(reading, memory_admit.QueueBusy):
+            if arguments.json:
+                print(json.dumps(json_form([(Span("queue busy; try again"),)], arguments.columns, 0)))
+            else:
+                print("queue busy; try again")
+            return 0
         facts = head_facts.read_head_facts(reading) if words else memory_admit.NoWaiter()
         ids = [step.session_id for step in (*reading.view.running, *reading.view.waiting)]
         ids.extend(head_facts.session_ids(facts))

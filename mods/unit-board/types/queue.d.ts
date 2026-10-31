@@ -6,7 +6,9 @@ export interface QueueLines {
   lines: { text: string; tone?: Tone; bold?: boolean; background?: Tone; until?: number }[][];
 }
 
+export type QueueSelection = { kind: 'view' } | { kind: 'card'; selector: string };
+
 export type QueuePaneState =
-  | { kind: 'loading'; selector: string | null }
-  | { kind: 'queue'; data: QueueLines; selector: string | null }
-  | { kind: 'failed'; reason: string; selector: string | null };
+  | { kind: 'loading'; selection: QueueSelection }
+  | { kind: 'queue'; data: QueueLines; selection: QueueSelection }
+  | { kind: 'failed'; reason: string; selection: QueueSelection };

@@ -67,7 +67,7 @@ class QueueTests(unittest.TestCase):
 
     def invoke(self, reading: memory_admit.QueueRead, *arguments: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
-        with mock.patch.object(memory_admit, "locked_queue_read", return_value=reading) as read, \
+        with mock.patch.object(memory_admit, "queue_read", return_value=reading) as read, \
              mock.patch("sys.argv", ["build_queue.py", *arguments]), \
              redirect_stdout(output), redirect_stderr(errors):
             status = build_queue.main()
@@ -85,17 +85,59 @@ class QueueTests(unittest.TestCase):
         return "\n".join("".join(span["text"] for span in row) for row in data["lines"])
 
 
-    def test_older_fitting_step_reason_uses_the_shown_session_label(self) -> None:
-        waiting = memory_admit.WaitingStep(200, "younger", "young", "check", "/tmp/young", NOW - 60,
-            3 * GIB, memory_admit.BehindOlderFit("recorded-older", NOW - 120, "older-id"))
-        reading = queue_read_fixture(memory_admit.QueueView((waiting,), (), 20 * GIB, 0, 3 * GIB, NOW))
-        for labels, expected in (({"older-id": UnitLabels("shown-older")}, "shown-older"), ({}, "recorded-older")):
-            with self.subTest(labels=labels):
-                model = replace(self.model(reading), labels=labels)
-                line = plain([queue_card.order_check(model, 1)])
-                self.assertIn("behind older step " + expected, line)
-                self.assertTrue(any(span.tone == "error" and "✗" in span.text
-                                    for span in queue_card.order_check(model, 1)))
+    def test_older_fitting_step_reason_names_waiting_place_or_unmatched_fallback(self) -> None:
+        older = memory_admit.WaitingStep(100, "older-id", "recorded-older", "check", "/tmp/older",
+            NOW - 120, GIB, memory_admit.ReadyForAdmission())
+        younger = memory_admit.WaitingStep(200, "younger", "young", "check", "/tmp/young", NOW - 60,
+            3 * GIB, memory_admit.BehindOlderFit("recorded-older", older.since, older.session_id))
+        for steps, place, expected in (((older, younger), 2, "behind #1, an older step that fits"),
+                                       ((younger,), 1, "behind an older step that fits")):
+            for labels in ({"older-id": UnitLabels("shown-older")}, {}):
+                with self.subTest(steps=steps, labels=labels):
+                    reading = queue_read_fixture(memory_admit.QueueView(steps, (), 20 * GIB, 0, 3 * GIB, NOW))
+                    model = replace(self.model(reading), labels=labels)
+                    line = queue_card.order_check(model, place)
+                    self.assertIn(expected, plain([line]))
+                    self.assertTrue(any(span.tone == "error" and "✗" in span.text for span in line))
+
+    def test_busy_read_is_bounded_for_plain_card_and_pane_json(self) -> None:
+        directory = self.fixture.directory
+        for cache in ("missing", "corrupt"):
+            path = directory / "queue.json"
+            if cache == "corrupt":
+                _ = path.write_text("{")
+            else:
+                path.unlink(missing_ok=True)
+            for arguments in ([], ["4"], ["--json"]):
+                with self.subTest(cache=cache, arguments=arguments):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with (directory / "lock").open("a+") as lock, \
+                         mock.patch("sys.argv", ["build_queue.py", *arguments]), \
+                         redirect_stdout(output), redirect_stderr(errors):
+                        fcntl.flock(lock, fcntl.LOCK_EX)
+                        started = time.perf_counter()
+                        status = build_queue.main()
+                        elapsed = time.perf_counter() - started
+                    self.assertLess(elapsed, 1.0)
+                    self.assertEqual(status, 0)
+                    self.assertEqual(errors.getvalue(), "")
+                    if "--json" in arguments:
+                        data = cast(QueueLines, json.loads(output.getvalue()))
+                        self.assertEqual(self.snapshot_text(data), "queue busy; try again")
+                    else:
+                        self.assertEqual(output.getvalue(), "queue busy; try again\n")
+
+    def test_bump_leaves_snapshot_bytes_untouched(self) -> None:
+        _ = self.fixture.waiter(100, "head-id", "head")
+        inputs = self.fixture.inputs()
+        memory_admit.write_queue_snapshot(self.fixture.directory, inputs)
+        path = self.fixture.directory / "queue.json"
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        with mock.patch.object(memory_admit, "queue_read", side_effect=AssertionError("bump read snapshot")):
+            status, output, errors = self.bump_output("1")
+        self.assertEqual((status, output, errors),
+                         (3, "build queue: bump is off; nothing can move a waiting step\n", ""))
+        self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
 
     def test_bump_refuses_raw_selectors_without_moving_or_logging(self) -> None:
         first = self.fixture.waiter(100, "head-id", "head")
@@ -105,7 +147,7 @@ class QueueTests(unittest.TestCase):
         for selector in ("2", "worker-id", "worker", "/tmp/tree-200", "tree-200", "shared", "unknown"):
             with self.subTest(selector=selector):
                 with mock.patch.object(memory_admit, "bump_waiter", wraps=memory_admit.bump_waiter) as bump, \
-                     mock.patch.object(memory_admit, "locked_queue_read", side_effect=AssertionError("bump read the queue")), \
+                     mock.patch.object(memory_admit, "queue_read", side_effect=AssertionError("bump read the queue")), \
                      mock.patch.object(unit_labels, "unit_labels_for", side_effect=AssertionError("bump read labels")):
                     status, output, errors = self.bump_output(selector)
                 self.assertEqual(status, 3)
@@ -125,26 +167,26 @@ class QueueTests(unittest.TestCase):
         return status, output.getvalue(), errors.getvalue()
 
 
-    def test_cli_reports_admission_lock_timeout_with_status_two(self) -> None:
+    def test_cli_reports_busy_queue_on_stdout_with_status_zero(self) -> None:
         directory = self.root / "buildlog/admission"
         directory.mkdir(parents=True, exist_ok=True)
         errors = io.StringIO()
         output = io.StringIO()
         with (directory / "lock").open("a+") as lock, \
-             mock.patch.object(memory_admit, "QUEUE_LOCK_TIMEOUT_SECONDS", 0.03), \
+             mock.patch.object(memory_admit, "QUEUE_READ_LOCK_SECONDS", 0.03), \
              mock.patch("sys.argv", ["build_queue.py"]), \
              redirect_stderr(errors), redirect_stdout(output):
             fcntl.flock(lock, fcntl.LOCK_EX)
-            self.assertEqual(build_queue.main(), 2)
-        self.assertEqual(errors.getvalue(), "build queue: admission lock busy for 0.03 s; try again\n")
-        self.assertEqual(output.getvalue(), "")
+            self.assertEqual(build_queue.main(), 0)
+        self.assertEqual(errors.getvalue(), "")
+        self.assertEqual(output.getvalue(), "queue busy; try again\n")
 
     def test_queue_read_failures_exit_two_with_diagnostics_only_on_stderr(self) -> None:
         for error in (PermissionError(13, "Permission denied", "/private/admission/lock"),
                       ValueError("queue reading invalid")):
             with self.subTest(error=error):
                 output, errors = io.StringIO(), io.StringIO()
-                with mock.patch.object(memory_admit, "locked_queue_read", side_effect=error), \
+                with mock.patch.object(memory_admit, "queue_read", side_effect=error), \
                      mock.patch("sys.argv", ["build_queue.py"]), \
                      redirect_stdout(output), redirect_stderr(errors):
                     self.assertEqual(build_queue.main(), 2)
@@ -487,7 +529,7 @@ class QueueTests(unittest.TestCase):
                 return fixture.labels
             self.labels_read.side_effect = labels
             output = io.StringIO()
-            with mock.patch.object(memory_admit, "locked_queue_read", side_effect=read), \
+            with mock.patch.object(memory_admit, "queue_read", side_effect=read), \
                  mock.patch.object(roster, "roster", side_effect=AssertionError("no full roster")), \
                  mock.patch("sys.argv", ["build_queue.py"]), redirect_stdout(output):
                 self.assertEqual(build_queue.main(), 0)
@@ -589,7 +631,7 @@ class QueueTests(unittest.TestCase):
     def test_empty_queue_reads_once_without_subprocess_or_wait(self) -> None:
         reading = queue_read_fixture(memory_admit.QueueView((), (), 20 * GIB, 0, GIB, NOW))
         output = io.StringIO()
-        with mock.patch.object(memory_admit, "locked_queue_read", return_value=reading) as read, \
+        with mock.patch.object(memory_admit, "queue_read", return_value=reading) as read, \
              mock.patch("subprocess.run", side_effect=AssertionError("no subprocess")), \
              mock.patch("time.sleep", side_effect=AssertionError("no wait")), \
              mock.patch("sys.argv", ["build_queue.py"]), redirect_stdout(output):

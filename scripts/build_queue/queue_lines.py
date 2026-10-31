@@ -5,7 +5,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 import re
 from typing import Literal, NotRequired, TypedDict
-import unicodedata
+from scripts.lib.terminal_cells import terminal_width as terminal_width
 
 Tone = Literal["default", "success", "error", "warning", "inactive", "suggestion"]
 
@@ -38,11 +38,6 @@ class QueueLines(TypedDict):
 
 def age(since: float, now: float) -> int:
     return max(0, int((now - since) // 60))
-
-
-def terminal_width(text: str) -> int:
-    return sum(0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-               for char in text)
 
 
 def pad_left(text: str, cells: int) -> str:

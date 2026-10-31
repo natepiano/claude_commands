@@ -9,7 +9,10 @@ Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.
   Moved-up steps go first, then the longest wait. It joined 2nd of the steps waiting now.
 
 Waits on
-  ✗ #1's turn      younger steps may use 9.5 GiB of the budget until 10:56 (9 min 48 s left)
+  ✓ queue order
+  ✓ build budget: 11.1 of 21.0 GiB held; needs 2.9
+  ✓ free memory 24.5 GiB; needs 11.9: this step 2.9 + earlyoom 3.0 + promised not yet used 6.0
+  ✗ memory pressure: full avg10 7.7 now; starts below 5.0
 
 Likely start ~10:51: 4th in line at 44 steps an hour, an estimate.
   Each step moved up ahead of it adds about 1 min.

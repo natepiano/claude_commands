@@ -143,7 +143,7 @@ only I can bump
 
 **Ruled out:** JSON at 9x the plain text (sparse defaults keep it within 4x); a tone on a blank mark cell (blank cells join the next span); `⊘` for every strict head (a strict head with room lets younger steps start).
 
-### Phase 3 — /build:queue reads a lock-free snapshot and answers in under a second every time  · status: todo
+### Phase 3 — /build:queue reads a lock-free snapshot and answers in under a second every time  · status: done
 **Depends on:** Phase 2. Resources Phase 30 (`7106f93d`: the queue starts steps in queue order, and every bump is refused) is merged here at `c9d507f3`; merge `origin/builds` first.
 **Estimate:** about 3 h of worker time.
 

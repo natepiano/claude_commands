@@ -52,15 +52,15 @@ class QueueCardTests(QueueFixtureTests):
         self.assertNotIn("Next? No.", text)
         self.assertIn("#1    large nextest", text)
 
-    def test_fourth_card_counts_moves_and_join_order_without_inventing_checks(self) -> None:
+    def test_fourth_card_counts_moves_and_join_order_with_recorded_checks(self) -> None:
         text = plain(queue_card.render_card(self.fixture.model(), [4], 400))
         self.assertIn("Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.", text)
         self.assertIn("joined 10:07, 2 min before it", text)
         self.assertIn("It joined 2nd of the steps waiting now.", text)
-        self.assertIn("✗ #1's turn", text)
-        self.assertIn("younger steps may use 9.5 GiB of the budget until 10:56 (9 min 48 s left)", text)
-        self.assertNotIn("build budget", text)  # These per-step checks arrive in Part B.
-        self.assertNotIn("free memory", text)
+        self.assertIn("✓ queue order", text)
+        self.assertIn("✓ build budget: 11.1 of 21.0 GiB held; needs 2.9", text)
+        self.assertIn("✓ free memory 24.5 GiB; needs 11.9: this step 2.9 + earlyoom 3.0 + promised not yet used 6.0", text)
+        self.assertIn("✗ memory pressure: full avg10 7.7 now; starts below 5.0", text)
         self.assertIn("Likely start ~10:51: 4th in line at 44 steps an hour, an estimate.", text)
 
     def test_unrecorded_moved_step_that_joined_later_is_said_to_join_after_it(self) -> None:
@@ -97,6 +97,60 @@ class QueueCardTests(QueueFixtureTests):
         for selector in ("recorded-widget", step.folder, "widget"):
             with self.subTest(running_selector=selector):
                 self.assertEqual(plain(queue_card.render_selection(model, selector, 400)), expected)
+
+    def test_follower_card_prints_its_recorded_checks_without_recomputing_admission(self) -> None:
+        model = self.fixture.model()
+        follower = model.reading.explanation.line.steps[2]
+        self.assertEqual(follower.waiter, model.reading.view.waiting[3])
+        self.assertEqual(follower.budget.need, int(2.9 * gate.GIB))
+        self.assertEqual(follower.free.need, int(2.9 * gate.GIB))
+        from unittest import mock
+        with mock.patch.object(gate, "decide", side_effect=AssertionError("card recalculated admission")):
+            text = plain(queue_card.render_card(model, [4], 400))
+        self.assertIn("build budget: 11.1 of 21.0 GiB held; needs 2.9", text)
+        self.assertIn("free memory 24.5 GiB; needs 11.9", text)
+        self.assertIn("this step 2.9 + earlyoom 3.0 + promised not yet used 6.0", text)
+        self.assertIn("memory pressure: full avg10 7.7", text)
+
+    def test_unavailable_reading_or_follower_reason_never_prints_numeric_checks(self) -> None:
+        model = self.fixture.model()
+        fourth = model.reading.view.waiting[3]
+        for host, reason in ((gate.ReadingUnavailable(), fourth.reason),
+                             (model.reading.explanation.host, gate.ReadingUnavailable())):
+            with self.subTest(host=host, reason=reason):
+                waiting = (*model.reading.view.waiting[:3], replace(fourth, reason=reason),
+                           *model.reading.view.waiting[4:])
+                reading = replace(model.reading, view=replace(model.reading.view, waiting=waiting),
+                                  explanation=replace(model.reading.explanation, host=host))
+                text = plain(queue_card.render_card(replace(model, reading=reading), [4], 400))
+                self.assertIn("memory reading unavailable", text)
+                self.assertNotIn("build budget:", text)
+                self.assertNotIn("free memory", text)
+
+    def test_shown_name_match_wins_over_recorded_identity_and_numeric_place(self) -> None:
+        model = self.fixture.model()
+        first, fourth = model.reading.view.waiting[0], model.reading.view.waiting[3]
+        from scripts.message.unit_labels import UnitLabels
+        labels = {**model.labels, fourth.session_id: UnitLabels(first.session_name)}
+        self.assertEqual(queue_card.select_waiters(replace(model, labels=labels), first.session_name), [1, 2, 4])
+        labels = {**model.labels, fourth.session_id: UnitLabels("1")}
+        self.assertEqual(queue_card.select_waiters(replace(model, labels=labels), "1"), [4])
+
+    def test_older_fit_order_line_names_waiting_place_or_explicit_fallback(self) -> None:
+        model = self.fixture.model()
+        waiting = model.reading.view.waiting
+        older = waiting[2]
+        for reason, phrase in ((gate.BehindOlderFit("old-name", older.since, older.session_id),
+                                "behind #3, an older step that fits"),
+                               (gate.BehindOlderFit("old-name", older.since + 1, older.session_id),
+                                "behind an older step that fits")):
+            with self.subTest(reason=reason):
+                fourth = replace(waiting[3], reason=reason)
+                reading = replace(model.reading, view=replace(model.reading.view,
+                                  waiting=(*waiting[:3], fourth, *waiting[4:])))
+                line = queue_card.order_check(replace(model, reading=reading), 4)
+                self.assertEqual(plain([line]).split(), ("✗ queue order " + phrase).split())
+                self.assertEqual(line[0].tone, "error")
 
     def test_running_selector_prints_a_single_running_sentence(self) -> None:
         text = plain(queue_card.render_selection(self.fixture.model(), "id-widget", 400))

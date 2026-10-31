@@ -36,13 +36,6 @@ class StepAgeTests(unittest.TestCase):
 
 
 class CellWidthTests(unittest.TestCase):
-    def test_queue_marks_and_unicode_names_use_terminal_cells(self) -> None:
-        for text, cells in (("", 0), ("nextest", 7), ("■  1 ↑27", 8),
-                            ("界語", 4), ("ＡＢ", 4), ("e\u0301", 1),
-                            ("cafe\u0301 · 界", 9), ("🙂", 2)):
-            with self.subTest(text=text):
-                self.assertEqual(terminal_width(text), cells)
-
     def test_padding_aligns_columns_by_cells_and_keeps_overflow_intact(self) -> None:
         self.assertEqual(pad_left("界7", 6), "   界7")
         self.assertEqual(pad_right("界7", 6), "界7   ")

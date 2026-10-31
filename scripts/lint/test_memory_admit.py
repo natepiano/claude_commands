@@ -1371,7 +1371,8 @@ class MemoryQueueFixture(unittest.TestCase):
         _ = self.enterContext(patch.object(gate, "process_table", side_effect=table))
         def reading(pid: int, _start: str, _processes: dict[int, gate.ProcessIdentity],
                     _proc: Path) -> gate.MeasuredMemory | gate.GoneMemory:
-            return self.readings[pid]
+            # Newly admitted live processes have not allocated memory yet.
+            return self.readings.get(pid, gate.MeasuredMemory(0))
         _ = self.enterContext(patch.object(gate, "tree_memory", side_effect=reading))
 
     def waiter(self, pid: int, since: float, folder: str, name: str, need: float = 10.9) -> Path:
@@ -1382,6 +1383,8 @@ class MemoryQueueFixture(unittest.TestCase):
         return path
 
     def running(self, pid: int, need: float, age: float = 180) -> Path:
+        # Each reservation setup starts a live owner, including after an ended-owner case.
+        _ = self.processes.setdefault(pid, f"fixture-{pid}")
         row: gate.Reservation = {"pid": pid, "start_time": self.processes[pid], "need": int(need * GIB),
                                  "repo": "test", "step": "nextest", "worktree": "test", "sidecar": "",
                                  "admitted_at": store.utc_iso(NOW.timestamp() - age),
@@ -2293,6 +2296,30 @@ class AdmitHeadTests(MemoryQueueFixture):
         row["bump_order"] = -1
         _ = younger.write_text(json.dumps(row))
         return younger
+
+    def test_admit_head_publishes_override_and_snapshot_keeps_budget_and_pressure_outcomes(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        _ = self.running(100, 15, age=0)
+        _ = self.waiting_head()
+        self.assertIn("head-unit", self.set_head("head verified"))
+        path = self.root / "admission/queue.json"
+        self.assertTrue(path.exists())
+        baseline = gate.locked_queue_read()
+        self.assertEqual(gate.queue_read(), baseline)
+        head = baseline.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        self.assertFalse(head.decision.budget_passes)
+        self.assertEqual(head.decision.state, "admit")
+        self.assertIsInstance(baseline.explanation.override, dict)
+        _ = (self.root / "pressure").write_text("full avg10=11.00 avg60=0.00 avg300=0.00 total=0\n")
+        directory = gate.admission_dir(self.root)
+        gate.write_queue_snapshot(directory, gate.gather_queue_inputs(
+            directory, gate.process_table(self.root / "proc"), NOW.timestamp()))
+        held = gate.locked_queue_read()
+        self.assertEqual(gate.queue_read(), held)
+        assert isinstance(held.explanation.head, gate.HeadExplanation)
+        self.assertEqual(held.explanation.head.decision.state, "hold")
+        self.assertIsInstance(held.explanation.head.decision.pressure, gate.MemoryPressure)
 
     def test_showrunner_sets_one_record_for_the_current_head(self) -> None:
         path = self.waiting_head()
@@ -3975,12 +4002,7 @@ class QueueApiTests(MemoryQueueFixture):
             "NOTIFIER_SESSIONS_DIR": str(self.root / "sessions"),
         })))
         self.processes[500] = "third"
-        processes = {pid: gate.ProcessIdentity(1, start) for pid, start in self.processes.items()}
-        _ = self.enterContext(patch.object(gate, "process_table", return_value=processes))
         _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
-        def reading(pid: int, _start: str, _table: dict[int, gate.ProcessIdentity], _proc: Path) -> gate.MeasuredMemory | gate.GoneMemory:
-            return self.readings[pid]
-        _ = self.enterContext(patch.object(gate, "tree_memory", side_effect=reading))
         _ = self.meminfo.write_text(f"MemAvailable: {int(23.1 * GIB) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
 
     def queue(self) -> tuple[Path, Path, Path]:
@@ -5150,6 +5172,328 @@ class QueueExplanationTests(MemoryQueueFixture):
         path = gate.admission_dir(self.root) / f"{pid}.waiting"
         _ = path.write_text(json.dumps(row))
         return path
+
+    def snapshot_inputs(self) -> gate.QueueInputs:
+        directory = gate.admission_dir(self.root)
+        return gate.gather_queue_inputs(directory, gate.process_table(self.root / "proc"), NOW.timestamp())
+
+    def published_ledger(self, *, compiler: bool = False, legacy_reservation: bool = False
+                         ) -> gate.QueueSnapshot:
+        """Publish through check's exclusive exit, then read while admission is locked."""
+        self.enterContext(patch.dict(os.environ, fake_memory_readings(self.root)))
+        if compiler:
+            service = self.root / "builds.slice/sccache.service"
+            service.mkdir(parents=True)
+            _ = (service / "memory.stat").write_text(f"anon {2 * GIB}\nfile {10 * GIB}\n")
+        if legacy_reservation:
+            path = self.running(100, 6)
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            del row["test_threads"], row["call_id"]
+            _ = path.write_text(json.dumps(row))
+        result = self.check(need=2, free=0)
+        self.assertEqual(result.decision.state, "hold")
+        directory = gate.admission_dir(self.root)
+        snapshot = gate.read_queue_snapshot(directory)
+        if not isinstance(snapshot, gate.QueueSnapshot):
+            self.fail("check's published ledger did not decode as a queue snapshot")
+        with (directory / "lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            started = time.perf_counter()
+            reading = gate.queue_read()
+            self.assertLess(time.perf_counter() - started, 1.0)
+        self.assertIsInstance(reading, gate.QueueRead)
+        assert isinstance(reading, gate.QueueRead)
+        self.assertEqual(reading.freshness, gate.CurrentReading())
+        self.assertEqual(reading, gate.queue_read_from(snapshot.inputs))
+        return snapshot
+
+    def test_check_generated_need_source_survives_publication_without_a_lock(self) -> None:
+        snapshot = self.published_ledger()
+        self.assertEqual(len(snapshot.inputs.ordered), 1)
+        waiter = snapshot.inputs.ordered[0][1]
+        self.assertEqual((waiter["pid"], waiter.get("need_source"), waiter.get("need_runs")),
+                         (400, "measured", 5))
+
+    def test_active_compiler_memory_keeps_its_variant_in_a_lock_free_snapshot(self) -> None:
+        snapshot = self.published_ledger(compiler=True)
+        self.assertEqual(len(snapshot.inputs.running), 1)
+        compiler = snapshot.inputs.running[0]
+        self.assertIsInstance(compiler.measured, gate.CompilerServiceMemory)
+        assert isinstance(compiler.measured, gate.CompilerServiceMemory)
+        self.assertEqual((compiler.session_name, compiler.measured.bytes), ("sccache.service", 2 * GIB))
+        reading = gate.queue_read_from(snapshot.inputs)
+        assert isinstance(reading.explanation.head, gate.HeadExplanation)
+        self.assertEqual(reading.explanation.head.decision.measured, 2 * GIB)
+
+    def test_legacy_reservation_without_optional_fields_reads_from_the_published_snapshot(self) -> None:
+        snapshot = self.published_ledger(compiler=True, legacy_reservation=True)
+        self.assertEqual(len(snapshot.inputs.reservations), 1)
+        reservation = snapshot.inputs.reservations[0]
+        self.assertEqual((reservation["pid"], reservation["test_threads"], reservation["call_id"]),
+                         (100, None, None))
+        assert isinstance(snapshot.inputs.running[0].measured, gate.MeasuredMemory)
+        self.assertEqual((snapshot.inputs.running[0].promise, snapshot.inputs.running[0].measured.bytes),
+                         (6 * GIB, GIB))
+
+    def test_damaged_waiter_cannot_mask_a_section_error_or_break_repeated_cancel_and_release(self) -> None:
+        damaged = self.waiting(300, 12 * GIB, 20)
+        row = cast(dict[str, object], json.loads(damaged.read_text()))
+        del row["since"]
+        _ = damaged.write_text(json.dumps(row))
+        failure = RuntimeError("section's original failure")
+        with self.assertRaises(RuntimeError) as raised:
+            with gate.exclusive_queue(damaged.parent):
+                raise failure
+        self.assertIs(raised.exception, failure)
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                waiter = self.waiter(400, NOW.timestamp(), "/tmp/warmup", "warmup", need=2)
+                reservation = self.running(100, 6)
+                gate.cancel_waiter(400, root=self.root)
+                gate.release(reservation, 0, root=self.root)
+                self.assertFalse(waiter.exists())
+                self.assertFalse(reservation.exists())
+                reading = gate.queue_read()
+                assert isinstance(reading, gate.QueueRead)
+                self.assertEqual((reading.view.waiting, reading.view.running), ((), ()))
+
+    def test_snapshot_resolves_the_same_budget_and_reserve_as_admission(self) -> None:
+        for budget in ("21", "7.25", "invalid", "0", "nan"):
+            for total in (60 * GIB, 0):
+                with self.subTest(budget=budget, total=total), \
+                     patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": budget}):
+                    _ = self.meminfo.write_text(
+                        f"MemAvailable: {16 * GIB // 1024} kB\nMemTotal: {total // 1024} kB\n")
+                    with patch.object(gate, "resolve_admission_limits", wraps=gate.resolve_admission_limits) as resolve:
+                        inputs = self.snapshot_inputs()
+                        assert isinstance(inputs.host, gate.HostMemory)
+                        decision = gate.decide(inputs.host.available, inputs.host.total, GIB, [])
+                    self.assertEqual(resolve.call_args_list,
+                                     [mock.call(inputs.host.total), mock.call(inputs.host.total)])
+                    self.assertEqual(inputs.limits, gate.AdmissionLimits(decision.budget, decision.reserve))
+
+    def test_check_release_and_width_publish_the_changed_ledger(self) -> None:
+        self.readings[400] = gate.MeasuredMemory(GIB)
+        result = self.check(need=2, free=60)
+        self.assertEqual(result.decision.state, "admit")
+        assert isinstance(result.reservation, gate.Reserved)
+        path = result.reservation.path
+        snapshot = self.root / "admission/queue.json"
+        checked = snapshot.read_bytes()
+        self.assertEqual(gate.queue_read(), gate.locked_queue_read())
+        gate.set_width(path, 3, root=self.root)
+        changed = snapshot.read_bytes()
+        self.assertNotEqual(changed, checked)
+        self.assertIn('"test_threads":3', changed.decode())
+        self.assertEqual(gate.queue_read(), gate.locked_queue_read())
+        gate.release(path, 0, root=self.root)
+        self.assertNotEqual(snapshot.read_bytes(), changed)
+        self.assertEqual(gate.queue_read(), gate.locked_queue_read())
+        reading = gate.queue_read()
+        assert isinstance(reading, gate.QueueRead)
+        self.assertEqual(reading.view.running, ())
+
+    def test_failed_cache_publication_keeps_old_bytes_and_check_result(self) -> None:
+        directory = gate.admission_dir(self.root)
+        gate.write_queue_snapshot(directory, self.snapshot_inputs())
+        path = directory / "queue.json"
+        old = path.read_bytes()
+        for error in (OSError("cache denied"), ValueError("invalid cache input")):
+            with self.subTest(error=type(error).__name__), \
+                 patch.object(gate, "write_queue_snapshot", side_effect=error):
+                result = self.check(free=0)
+            self.assertEqual(result.decision.state, "hold")
+            self.assertTrue((directory / "400-warmup.waiting").exists())
+            self.assertEqual(path.read_bytes(), old)
+        with patch.object(os, "replace", side_effect=OSError("replace denied")):
+            with self.assertRaises(OSError):
+                gate.write_queue_snapshot(directory, self.snapshot_inputs())
+        self.assertEqual(path.read_bytes(), old)
+
+    def test_exclusive_exception_publishes_state_without_masking_the_error(self) -> None:
+        path = self.waiting(300, 12 * GIB, 20)
+        failure = RuntimeError("after ledger change")
+        with patch.object(gate, "live_waiters", side_effect=failure):
+            with self.assertRaises(RuntimeError) as raised:
+                _ = self.check(free=0)
+        self.assertIs(raised.exception, failure)
+        self.assertTrue(path.exists())
+        self.assertTrue((path.parent / "queue.json").exists())
+        self.assertEqual(gate.queue_read(), gate.locked_queue_read())
+
+    def test_snapshot_round_trip_matches_the_locked_read_with_running_memory_and_identity(self) -> None:
+        _ = self.running(100, 6, age=30)
+        _ = self.waiting(300, 12 * GIB, 20, bump_order=-1, priority_since=NOW.timestamp() - 120)
+        _ = self.waiting(400, GIB, 5)
+        inputs = self.snapshot_inputs()
+        directory = gate.admission_dir(self.root)
+        gate.write_queue_snapshot(directory, inputs)
+        expected = gate.locked_queue_read()
+        with patch.object(gate, "locked_queue_read", side_effect=AssertionError("fresh snapshot took lock")):
+            actual = gate.queue_read()
+        self.assertEqual(actual, expected)
+        self.assertEqual(actual, gate.queue_read_from(inputs))
+        raw = cast(dict[str, object], json.loads((directory / "queue.json").read_text()))
+        self.assertEqual((raw["v"], raw["written_at"]), (1, NOW.timestamp()))
+
+    def test_gather_reuses_supplied_memory_and_reads_only_missing_reservations(self) -> None:
+        first = self.running(100, 6)
+        second = self.running(200, 4)
+        supplied = gate.MeasuredMemory(7 * GIB)
+        with patch.object(gate, "reservation_memory", wraps=gate.reservation_memory) as read:
+            inputs = gate.gather_queue_inputs(gate.admission_dir(self.root),
+                gate.process_table(self.root / "proc"), NOW.timestamp(), {first: supplied})
+        self.assertEqual([call.args[0] for call in read.call_args_list], [second])
+        self.assertEqual([step.measured for step in inputs.running], [supplied, self.readings[200]])
+
+    def test_queue_read_from_uses_no_files_processes_or_reader_limits(self) -> None:
+        _ = self.running(100, 6)
+        _ = self.waiting(300, 12 * GIB, 20)
+        _ = self.waiting(400, GIB, 5)
+        inputs = self.snapshot_inputs()
+        expected = gate.queue_read_from(inputs)
+        with patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "1", "BUILDLOG_PROC": "/absent"}), \
+             patch.object(Path, "open", side_effect=AssertionError("pure read opened file")), \
+             patch.object(Path, "read_text", side_effect=AssertionError("pure read read file")), \
+             patch.object(gate, "process_table", side_effect=AssertionError("pure read scanned processes")), \
+             patch.object(gate, "read_pressure", side_effect=AssertionError("pure read measured pressure")), \
+             patch.object(gate, "read_recovery", side_effect=AssertionError("pure read read recovery")):
+            self.assertEqual(gate.queue_read_from(inputs), expected)
+        gate.write_queue_snapshot(gate.admission_dir(self.root), inputs)
+        with patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "1"}), \
+             patch.object(gate, "locked_queue_read", side_effect=AssertionError("fresh snapshot took lock")):
+            self.assertEqual(gate.queue_read(), expected)
+
+    def test_snapshot_age_boundary_and_invalid_cache_take_the_bounded_read(self) -> None:
+        _ = self.waiting(300, 12 * GIB, 20)
+        directory = gate.admission_dir(self.root)
+        inputs = self.snapshot_inputs()
+        expected = gate.queue_read_from(inputs)
+        for age in (0.0, 10.0, 10.1, -0.1):
+            with self.subTest(age=age):
+                gate.write_queue_snapshot(directory, inputs)
+                with patch.object(time, "time", return_value=NOW.timestamp() + age), \
+                     patch.object(gate, "locked_queue_read", return_value=expected) as locked:
+                    self.assertEqual(gate.queue_read(), expected)
+                if 0 <= age <= 10:
+                    locked.assert_not_called()
+                else:
+                    locked.assert_called_once_with(timeout=0.5)
+        path = directory / "queue.json"
+        gate.write_queue_snapshot(directory, inputs)
+        raw = cast(dict[str, object], json.loads(path.read_text()))
+        raw["v"] = 99
+        for content in (json.dumps(raw), "{", "{}", '{"v":1,"written_at":0,"inputs":[]}', None):
+            with self.subTest(content=content):
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _ = path.write_text(content)
+                with patch.object(gate, "locked_queue_read", return_value=expected) as locked:
+                    self.assertEqual(gate.queue_read(), expected)
+                locked.assert_called_once_with(timeout=0.5)
+
+    def test_held_lock_returns_stale_or_busy_in_under_one_second(self) -> None:
+        _ = self.waiting(300, 12 * GIB, 20)
+        inputs = self.snapshot_inputs()
+        directory = gate.admission_dir(self.root)
+        path = directory / "queue.json"
+        for cache in ("missing", "corrupt", "stale", "future"):
+            with self.subTest(cache=cache):
+                gate.write_queue_snapshot(directory, inputs)
+                if cache == "missing":
+                    path.unlink()
+                elif cache == "corrupt":
+                    _ = path.write_text("{")
+                at = NOW.timestamp() - 1 if cache == "future" else NOW.timestamp() + 11
+                with (directory / "lock").open("a+") as lock, patch.object(time, "time", return_value=at):
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    started = time.perf_counter()
+                    actual = gate.queue_read()
+                    elapsed = time.perf_counter() - started
+                self.assertLess(elapsed, 1.0)
+                if cache in ("stale", "future"):
+                    assert isinstance(actual, gate.QueueRead)
+                    self.assertEqual(actual.freshness, gate.StaleReading(NOW.timestamp()))
+                    self.assertEqual(actual.view, gate.queue_read_from(inputs).view)
+                else:
+                    self.assertIsInstance(actual, gate.QueueBusy)
+
+    def test_atomic_snapshot_replace_leaves_old_readable_until_complete_publication(self) -> None:
+        path = self.waiting(300, 12 * GIB, 20)
+        inputs = self.snapshot_inputs()
+        directory = gate.admission_dir(self.root)
+        gate.write_queue_snapshot(directory, inputs)
+        old = (directory / "queue.json").read_bytes()
+        row = cast(gate.Waiter, json.loads(path.read_text()))
+        row["need"] = 13 * GIB
+        _ = path.write_text(json.dumps(row))
+        newer = self.snapshot_inputs()
+        replace_file = os.replace
+        publications: list[bytes] = []
+        def publish(source: str | Path, destination: str | Path) -> None:
+            self.assertEqual(Path(source), directory / "queue.json.tmp")
+            self.assertEqual(Path(destination), directory / "queue.json")
+            self.assertEqual((directory / "queue.json").read_bytes(), old)
+            self.assertEqual(gate.queue_read(), gate.queue_read_from(inputs))
+            publications.append(Path(source).read_bytes())
+            replace_file(source, destination)
+        with patch.object(os, "replace", side_effect=publish):
+            gate.write_queue_snapshot(directory, newer)
+        self.assertEqual(len(publications), 1)
+        self.assertEqual((directory / "queue.json").read_bytes(), publications[0])
+        self.assertEqual(gate.queue_read(), gate.queue_read_from(newer))
+
+    def test_snapshot_keeps_raw_recovery_and_admits_only_one_when_start_is_due(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        _ = self.waiting(300, GIB, 20)
+        _ = self.waiting(400, GIB, 5)
+        directory = gate.admission_dir(self.root)
+        recovery = gate.RecoveryStarts(NOW.timestamp() + 120, NOW.timestamp())
+        gate.write_recovery(directory, recovery)
+        inputs = self.snapshot_inputs()
+        self.assertEqual(inputs.recovery, recovery)
+        gate.write_queue_snapshot(directory, inputs)
+        locked = gate.locked_queue_read()
+        self.assertEqual(gate.queue_read(), locked)
+        assert isinstance(locked.explanation.head, gate.HeadExplanation)
+        self.assertEqual(locked.explanation.head.decision.state, "admit")
+        self.assertEqual([row.decision.state for row in locked.explanation.line.steps], ["hold"])
+
+    def test_follower_walk_checks_keep_resource_fit_independent_of_earlier_waiter_charge(self) -> None:
+        _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        _ = self.waiting(300, 15 * GIB, 1)
+        _ = self.waiting(400, 10 * GIB, 0)
+        reading = gate.queue_read_from(self.snapshot_inputs())
+        head = reading.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        follower = reading.explanation.line.steps[0]
+        self.assertEqual(head.decision.state, "admit")
+        self.assertEqual(follower.decision.state, "hold")
+        self.assertTrue(follower.fits_now)
+        self.assertFalse(follower.budget.passes)
+        self.assertEqual(follower.budget.charged, 15 * GIB)
+        self.assertEqual(follower.budget.need, 10 * GIB)
+        self.assertEqual((follower.budget, follower.free),
+                         gate.decision_checks(follower.decision, 10 * GIB, 60 * GIB))
+        self.assertEqual((head.budget, head.free), gate.decision_checks(head.decision, 15 * GIB, 60 * GIB))
+
+    def test_waiter_and_running_identity_matching_and_place_boundaries(self) -> None:
+        _ = self.waiting(300, 12 * GIB, 20)
+        _ = self.waiting(400, GIB, 5)
+        view = gate.queue_read_from(self.snapshot_inputs()).view
+        for selector, places in (("1", [1]), ("2", [2]), ("0", []), ("3", []),
+                                 ("session-400", [2]), ("worker-400", [2]),
+                                 ("/tmp/tree-400", [2]), ("tree-400", [2]), ("missing", [])):
+            with self.subTest(selector=selector):
+                self.assertEqual(gate.match_waiters(selector, view), places)
+        waiter = view.waiting[1]
+        running = gate.RunningStep(waiter.session_id, waiter.session_name, waiter.step, waiter.folder,
+                                   waiter.need, gate.MeasuredMemory(GIB))
+        for step in (waiter, running):
+            for selector in ("session-400", "worker-400", "/tmp/tree-400", "tree-400"):
+                self.assertTrue(gate.step_matches(selector, step))
+            self.assertFalse(gate.step_matches("worker", step))
 
     def test_explain_matches_read_queue_and_admission_on_the_same_files(self) -> None:
         _ = self.running(100, 6, age=30)

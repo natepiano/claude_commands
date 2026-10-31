@@ -18,6 +18,26 @@ from scripts.lint.memory_test_support import fake_memory_readings
 
 
 class QueueViewTests(QueueFixtureTests):
+    def test_stale_snapshot_marks_only_the_original_header_time_as_warning(self) -> None:
+        model = self.fixture.budget_model()
+        current = queue_view.render_view(model, 100)
+        stale = replace(model, reading=replace(model.reading, freshness=gate.StaleReading(NOW - 11)))
+        lines = queue_view.render_view(stale, 100)
+        self.assertEqual(plain(lines), plain(current))
+        self.assertEqual(plain([lines[0]]), "Build queue · 10:46")
+        self.assertTrue(all(span.tone == "warning" for span in lines[0]))
+        self.assertTrue(all(span.tone == "inactive" for span in current[0]))
+        self.assertEqual(lines[1:], current[1:])
+
+    def test_older_fit_phrase_requires_both_recorded_identity_and_join_time(self) -> None:
+        waiting = self.fixture.model().reading.view.waiting
+        older = waiting[2]
+        reason = gate.BehindOlderFit(older.session_name, older.since, older.session_id)
+        self.assertEqual(queue_view.reason_phrase(reason, waiting), "behind #3, an older step that fits")
+        for changed in (replace(reason, older_since=older.since + 1),
+                        replace(reason, older_session_id="not-waiting")):
+            self.assertEqual(queue_view.reason_phrase(changed, waiting), "behind an older step that fits")
+
     def test_unrelated_bump_history_adds_at_most_ten_percent_to_render_time(self) -> None:
         model = self.fixture.model()
         steps = tuple(replace(model.reading.view.waiting[0], pid=pid,
@@ -180,13 +200,14 @@ class BudgetViewTests(QueueFixtureTests):
 
     def test_unreadable_meminfo_reports_no_reading_instead_of_low_memory(self) -> None:
         _ = fake_memory_readings(self.fixture.root, full_avg10=0.0)
+        model = self.fixture.budget_model()
         (self.fixture.root / "meminfo").unlink()
         reading = gate.locked_queue_read()
         head = reading.explanation.head
         assert isinstance(head, gate.HeadExplanation)
         self.assertIsInstance(head.waiter.reason, gate.ReadingUnavailable)
         self.assertFalse(head.free.passes)
-        model = replace(self.fixture.budget_model(), reading=reading)
+        model = replace(model, reading=reading)
         lines = queue_view.render_view(model, 100, colour=True)
         first = next(line for line in lines if plain([line]).lstrip().startswith("1 "))
         self.assertTrue(plain([first]).endswith("no reading"))

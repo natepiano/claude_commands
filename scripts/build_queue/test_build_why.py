@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 import io
+import fcntl
 import json
 import os
 import re
@@ -553,7 +554,7 @@ class BuildWhyTests(unittest.TestCase):
                           bump_line(NOW - 2, actor="actor-two", session="bumped-two")])
         with mock.patch.object(roster, "unit_labels_for", return_value={}) as labels, \
              mock.patch.object(roster, "roster", side_effect=AssertionError("no full roster")), \
-             mock.patch.object(gate, "locked_queue_read", wraps=gate.locked_queue_read) as reading, \
+             mock.patch.object(gate, "queue_read", wraps=gate.queue_read) as reading, \
              mock.patch.object(head_facts, "read_head_facts", wraps=head_facts.read_head_facts) as facts:
             output = self.output()
         labels.assert_called_once()
@@ -600,11 +601,30 @@ class BuildWhyTests(unittest.TestCase):
         self.assertIn("recovery", recovery)
         self.assertIn("21:51", recovery)
 
+    def test_missing_or_corrupt_snapshot_with_held_lock_answers_busy_in_under_a_second(self) -> None:
+        for content in (None, "{"):
+            with self.subTest(content=content):
+                path = self.directory / "queue.json"
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _ = path.write_text(content)
+                output, errors = io.StringIO(), io.StringIO()
+                with (self.directory / "lock").open("a+") as lock, \
+                     redirect_stdout(output), redirect_stderr(errors), mock.patch("sys.argv", ["build_why.py"]):
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    started = time.perf_counter()
+                    status = build_why.main()
+                    elapsed = time.perf_counter() - started
+                self.assertLess(elapsed, 1.0)
+                self.assertEqual((status, output.getvalue(), errors.getvalue()),
+                                 (0, "queue busy; try again\n", ""))
+
     def test_read_failure_is_one_fixed_line_with_exit_two(self) -> None:
         for error in (OSError("cannot read ledger"), ValueError("invalid ledger"), TimeoutError("lock busy")):
             with self.subTest(error=type(error).__name__):
                 output, errors = io.StringIO(), io.StringIO()
-                with mock.patch.object(gate, "locked_queue_read", side_effect=error), \
+                with mock.patch.object(gate, "queue_read", side_effect=error), \
                      redirect_stdout(output), redirect_stderr(errors), mock.patch("sys.argv", ["build_why.py"]):
                     result = build_why.main()
                 self.assertEqual(result, 2)

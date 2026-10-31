@@ -2,29 +2,19 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from pathlib import Path
 
 from scripts.build_queue import head_facts
 from scripts.build_queue.queue_lines import Line, Span, age, wrap
 from scripts.build_queue.queue_view import (QueueModel, check_line, check_lines, clock, estimate_minutes,
-    has_move_priority, is_moved, name_spans, name_text, shown_waiters, start_text, step_checks, step_labels, waiting_moves)
+    has_move_priority, is_moved, name_spans, name_text, shown_waiters, reason_phrase, start_text, step_checks, step_labels, waiting_moves)
 from scripts.lint import memory_admit as gate
-
-
-def matches_step(selector: str, step: gate.WaitingStep | gate.RunningStep) -> bool:
-    return selector in (step.session_id, step.session_name, step.folder, Path(step.folder).name)
 
 
 def select_waiters(model: QueueModel, selector: str) -> list[int]:
     shown = shown_waiters(selector, model.reading, model.labels)
     if shown:
         return shown
-    # No shown mark matched: read the selector as a place or a name.
-    if selector.isdecimal():
-        place = int(selector)
-        return [place] if 1 <= place <= len(model.reading.view.waiting) else []
-    return [place for place, step in enumerate(model.reading.view.waiting, 1)
-            if matches_step(selector, step)]
+    return gate.match_waiters(selector, model.reading.view)
 
 
 def ordinal(number: int) -> str:
@@ -34,8 +24,7 @@ def ordinal(number: int) -> str:
 def order_check(model: QueueModel, position: int) -> Line:
     reason = model.reading.view.waiting[position - 1].reason
     if isinstance(reason, gate.BehindOlderFit):
-        labels = model.labels.get(reason.older_session_id)
-        return check_line(False, "queue order      " + gate.older_fit_text(reason, labels.session if labels else ""))
+        return check_line(False, "queue order      " + reason_phrase(reason, model.reading.view.waiting))
     if isinstance(reason, gate.BehindHead) and isinstance(model.facts, head_facts.HeadFacts):
         return check_line(False, "#1's turn      " + head_facts.order_text(model.facts, model.zone, include_record=False))
     return check_line(True, "queue order")
@@ -105,7 +94,7 @@ def render_selection(model: QueueModel, selector: str, columns: int) -> list[Lin
     lines = render_card(model, matches, columns)
     for running in model.reading.explanation.running:
         step = running.step
-        if selector != step_labels(step, model.labels).session and not matches_step(selector, step):
+        if selector != step_labels(step, model.labels).session and not gate.step_matches(selector, step):
             continue
         if lines:
             lines.append(())
