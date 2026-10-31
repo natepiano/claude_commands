@@ -2882,27 +2882,22 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 
 ### Phase 100c — The five-hour alert test holds across daylight-saving  · status: done
 
-**Depends on:** none. Runs before Phase 101 (showrunner, 2026-10-30: its own checkpoint, ahead of 101).
+#### As-built
 
-#### Work Order
-
-**Goal:** `test_five_hour.WatchTests.test_a_low_window_retries_failed_relays_without_a_phone_hold` passes on every run date. Today `RESETS` (`scripts/whoami/test_five_hour.py:33`) is tomorrow at 21:20 UTC, and the test expects the literal `resets at 14:20 PDT`. From 2026-10-31 on, tomorrow falls after the US clock change on Nov 1, the alert prints `13:20 PST`, and the test fails. The alert code is right; the test reads the run date. Introduced at `d710107c`; the natedev showrunner assigned it to this unit, 2026-10-30.
-
-**Spec:**
-- The test keeps the literal expected text `resets at 14:20 PDT`, so it still catches a defect in the alert's time formatter. Do not take the expected text from the formatter (showrunner, 2026-10-30).
-- Fix the clock instead: a fixed "now" and a fixed reset instant on a date in PDT, so the run date does not matter. Where `five_hour` or `quota_alert` reads the real clock, inject the clock (a parameter or one module-level clock the test patches); do not patch `datetime` in each test.
-- Every other test in `scripts/whoami` that hard-codes a zone abbreviation or clock time for a reset computed from the current date gets the same fix. Search for `PDT`, `PST`, `EDT` and `EST`.
-- Prove it: the whoami suite passes with the machine date after 2026-11-01 (for example with `faketime`, or by patching the injected clock in a test).
-- `five_hour.watch` reads the real clock (`five_hour.py:187`), so the injection goes there. The fixture's reading times come from the same injected clock: `selected_codex_report` refuses readings whose times do not agree.
+- `five_hour.watch(reports, *, now: datetime | None = None, codex_readings=...)` resolves `now` once (the real UTC clock when absent) and passes it on; fixture reading times come from the same `now`, because `selected_codex_report` refuses readings whose times disagree.
+- `quota_alert.resolve_codex_readings(value, *, now)`, `ahead(resets, *, now)` and `low(notes, threshold, *, now)` take a required `now: datetime`; only the entry points `alert`, `refresh` and `_route_refusal` read the real clock, then pass it on.
+- Tests use fixed clocks: `test_five_hour.py` has one `NOW` of 2026-10-15 18:20 UTC with the reset at 21:20 UTC that day and keeps the literal `resets at 14:20 PDT`; `test_agent_notes.ResetTimeTests` passes one class-level fixed `now` to `ahead`; `test_quota_alert_claude` passes its `self.now` to `low`.
+- Alert text is unchanged. The whoami suite passes on any run date, also under faketime after the Nov 1 clock change.
 
 **Files:**
-- `scripts/whoami/five_hour.py` — clock injection.
-- `scripts/whoami/quota_alert.py` — clock injection, where it reads the real clock.
-- `scripts/whoami/test_five_hour.py` — fixed clock; plus any other `scripts/whoami/test_*.py` the search finds.
+- `scripts/whoami/five_hour.py` — `watch` with the injectable `now`.
+- `scripts/whoami/quota_alert.py` — helpers with a required `now`; entry points read the clock.
+- `scripts/whoami/test_five_hour.py` — fixed `NOW` and reset instant in PDT.
+- `scripts/whoami/test_agent_notes.py`, `scripts/whoami/test_quota_alert_claude.py` — fixed clock passed to `ahead` and `low`.
 
-**Workers:** 1 writer + 1 tester. `impl` owns `five_hour.py` and `quota_alert.py`; `test` owns `test_five_hour.py` and the other whoami tests the search finds.
+**Gotchas:** The checkpoint assertion guard reads an assert whose call gains an argument as removed when a class attribute is inserted above it; such a commit needs Assertion-Change lines.
 
-**Acceptance gate:** `python3 -m unittest discover -s scripts/whoami -p 'test_*.py'` passes; `basedpyright` on each changed file reads `0 errors, 0 warnings, 0 notes`; a run with the date set after 2026-11-01 passes.
+**Ruled out:** Taking the expected text from the alert's formatter: the literal `resets at 14:20 PDT` stays so the test still catches a formatter defect.
 
 ### Phase 101 — The account readout names a turned-off MCP server only where it differs from ~/.claude  · status: todo
 
