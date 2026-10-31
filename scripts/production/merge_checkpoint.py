@@ -855,18 +855,19 @@ def test_passed(command: list[str], result: subprocess.CompletedProcess[str]) ->
     return result.returncode in (0, 3) and clean is not None
 
 
-def undo_failed_push(production: Production, old_origin: str) -> None:
+def undo_failed_push(production: Production, old_origin: str, before_merge_tip: str) -> None:
     checkout = production.checkout
     if git(checkout, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
         _ = good(git(checkout, "merge", "--abort"), "push")
     remote = good(git(checkout, "ls-remote", "origin", f"refs/heads/{production.merge_branch}"), "push")
     if remote.split() and remote.split()[0] == old_origin:
-        _ = good(git(checkout, "reset", "--keep", old_origin), "push")
+        _ = good(git(checkout, "reset", "--keep", before_merge_tip), "push")
 
 
 def push_git(production: Production, may_undo: bool) -> str:
     checkout = production.checkout
     old_origin = good(git(checkout, "rev-parse", f"origin/{production.merge_branch}"), "push")
+    before_merge_tip = good(git(checkout, "rev-parse", "HEAD^1"), "push") if may_undo else ""
     try:
         _ = good(git(checkout, "fetch", "origin", "main"), "push")
         main = git(checkout, "rev-parse", "origin/main")
@@ -877,7 +878,7 @@ def push_git(production: Production, may_undo: bool) -> str:
         _ = good(git(checkout, "push", "origin", production.merge_branch), "push")
     except Stop:
         if may_undo:
-            undo_failed_push(production, old_origin)
+            undo_failed_push(production, old_origin, before_merge_tip)
         raise
     report("push", "ok", f"{production.merge_branch} pushed at {tip}")
     return tip
@@ -901,6 +902,7 @@ def push_validate(production: Production, fix_commit: str, may_undo: bool, cance
     if cancel_prior:
         command.append("--cancel-prior")
     old_origin = good(git(production.checkout, "rev-parse", f"origin/{production.merge_branch}"), "push")
+    before_merge_tip = good(git(production.checkout, "rev-parse", "HEAD^1"), "push") if may_undo else ""
     try:
         result = subprocess.run(command, cwd=production.checkout, capture_output=True, text=True, check=False)
         if result.returncode:
@@ -908,7 +910,7 @@ def push_validate(production: Production, fix_commit: str, may_undo: bool, cance
             raise Stop("push", "failed", detail, "repair the push failure and send a new checkpoint")
     except (Stop, OSError):
         if may_undo:
-            undo_failed_push(production, old_origin)
+            undo_failed_push(production, old_origin, before_merge_tip)
         raise
     tip = good(git(production.checkout, "rev-parse", "HEAD"), "push")
     report("push", "ok", f"validated and pushed {tip}")

@@ -160,6 +160,106 @@ class ResumeUnitTests(unittest.TestCase):
         self.assertEqual((self.staff.staff_file.read_bytes(), self.doc.read_bytes()), (data, document))
         self.assertEqual(len(self.calls), 1)
 
+    def saved_branch(self) -> tuple[str, str]:
+        ref = "refs/retired/fixture-unit"
+        _ = git(self.checkout, "checkout", "-q", "-b", "saved-work")
+        _ = (self.checkout / "unmerged.txt").write_text("keep this work\n")
+        _ = git(self.checkout, "add", "unmerged.txt")
+        _ = git(self.checkout, "commit", "-q", "-m", "unmerged unit work")
+        tip = git(self.checkout, "rev-parse", "HEAD")
+        _ = git(self.checkout, "push", "-q", "origin", f"HEAD:{ref}")
+        _ = git(self.checkout, "checkout", "-q", "main")
+        _ = git(self.checkout, "branch", "-D", "saved-work")
+        self.write_row(f"(retired 2026-10-20, worktree removed, session {DIRECTOR}, ref {ref}, tip {tip}) docs/plans/alpha.md")
+        _ = git(self.checkout, "add", self.doc.name)
+        _ = git(self.checkout, "commit", "-q", "-m", "record saved branch")
+        return ref, tip
+
+    def assert_saved_branch_resumed(self, ref: str, tip: str) -> None:
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.worktree, "branch", "--show-current"), "alpha-branch")
+        self.assertEqual((self.worktree / "unmerged.txt").read_text(), "keep this work\n")
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        self.assertNotIn("retired", self.row())
+        self.assertIn(DIRECTOR, self.calls[-1])
+
+    def test_resume_restores_the_saved_tip_and_session_and_rerun_writes_nothing(self) -> None:
+        ref, tip = self.saved_branch()
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assert_saved_branch_resumed(ref, tip)
+        before = (self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD"))
+        calls = self.calls.copy()
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD")), before)
+        self.assertEqual(self.calls, calls)
+
+    def test_resume_finishes_after_worktree_creation_before_saved_ref_deletion(self) -> None:
+        ref, tip = self.saved_branch()
+        def interrupted(argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+            if "push" in argv and (ref in argv or f":{ref}" in argv) and ("--delete" in argv or f":{ref}" in argv):
+                return subprocess.CompletedProcess(argv, 1, "", "stop before saved ref deletion")
+            return self.fake_run(argv, cwd)
+        with mock.patch.object(retire_unit, "run", side_effect=interrupted):
+            code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), f"{tip}\t{ref}")
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assert_saved_branch_resumed(ref, tip)
+
+    def launch_with_commit(self, argv: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+        result = self.fake_run(argv, cwd)
+        if argv[0] != "git":
+            _ = (self.worktree / "director-work.txt").write_text("new director work\n")
+            _ = git(self.worktree, "add", "director-work.txt")
+            _ = git(self.worktree, "commit", "-q", "-m", "checkpoint(alpha): resumed work")
+        return result
+
+    def test_resume_retry_keeps_the_directors_new_commit_after_ref_deletion(self) -> None:
+        ref, tip = self.saved_branch()
+        with mock.patch.object(retire_unit, "run", side_effect=self.launch_with_commit), mock.patch.object(
+                resume_unit, "unmark", side_effect=OSError("stop before unmark")):
+            code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertIn("stop before unmark", output)
+        later_tip = git(self.worktree, "rev-parse", "HEAD")
+        self.assertNotEqual(later_tip, tip)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD^"), tip)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        self.assertIn("retired", self.row())
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assert_saved_branch_resumed(ref, later_tip)
+        self.assertEqual((self.worktree / "director-work.txt").read_text(), "new director work\n")
+        before = (self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                  self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD"), self.calls.copy())
+        code, output = self.resume()
+        self.assertEqual(code, 0, output)
+        self.assertEqual((self.doc.read_bytes(), self.doc.stat().st_mtime_ns,
+                          self.staff.staff_file.read_bytes(), git(self.checkout, "rev-parse", "HEAD"), self.calls), before)
+
+    def test_resume_retry_refuses_a_divergent_branch_after_ref_deletion(self) -> None:
+        ref, tip = self.saved_branch()
+        with mock.patch.object(resume_unit, "unmark", side_effect=OSError("stop before unmark")):
+            code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(git(self.checkout, "ls-remote", "origin", ref), "")
+        _ = git(self.worktree, "checkout", "-q", "-B", "alpha-branch", f"{tip}^")
+        _ = self.launch_with_commit([sys.executable, "add_unit.py"])
+        divergent_tip = git(self.worktree, "rev-parse", "HEAD")
+        before, calls = self.doc.read_bytes(), self.calls.copy()
+        code, output = self.resume()
+        self.assertEqual(code, 1, output)
+        self.assertIn("expected saved tip", output)
+        self.assertEqual(self.doc.read_bytes(), before)
+        self.assertEqual(git(self.worktree, "rev-parse", "HEAD"), divergent_tip)
+        self.assertEqual(self.calls, calls)
+
     def test_retired_unit_receipt_cannot_complete_a_new_incarnation(self) -> None:
         code, output = self.resume()
         self.assertEqual(code, 0, output)

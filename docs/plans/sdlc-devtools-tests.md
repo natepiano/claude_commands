@@ -417,3 +417,40 @@ Source: Phase 7e closure review (F002), moved here under the landing rule (model
 **State:** none (a temporary tree only; no signal is sent, `os.killpg` stays patched).
 
 **Acceptance gate:** `python3 -m unittest discover -s scripts/lib -p test_process_group.py` passes on the real tree, and every planted case named in the Spec fails the guard.
+
+### Phase 7i — Retire keeps the work, and resume brings it back  · status: done
+**Depends on:** none (own files; the merge_checkpoint.py rollback hunk is staged apart from Phase 7d's hunks)
+
+Source: the sdlc showrunner, 2026-10-31, top priority ahead of Phase 7g. The user tests retire and resume on all 13 tool-based-ui units now. Today `retire_unit.py` refuses a branch with a commit the merge branch does not have, so a unit with unmerged work cannot retire, and the only copy of that work lives in its worktree. Four performance units also hit two more refusals: a berth release that exits 5 with "already has a final disposition", and a process inside the worktree that is not the unit's (the unit's own pane shell, as 01a187bd pid 2699111, or an orphan `while kill -0 …; sleep` watcher from a past run, parent 1). cargo-liner (via natedev) also found data loss in `merge_checkpoint.py:837`: a failed push rolls back with `reset --keep <old_origin>`, which drops commits that were on the merge branch before the merge but not on origin.
+
+Design (showrunner ruling): retire keeps the work, with no new flag and no second path.
+
+#### Work Order
+
+**Goal:** a unit with unmerged commits retires without loss, and resume gives back the same branch tip, session and worktree.
+
+**Spec:**
+1. Retire, branch with commits the merge branch does not have: push the branch tip to origin as `refs/retired/<staff id>`, confirm with `git ls-remote` that origin holds exactly that tip, and add the ref and tip to the retired note. Only then remove the branch and worktree as today. A failed or unconfirmed push refuses and removes nothing. Uncommitted work still refuses.
+2. Resume, retired note names a ref: fetch it, recreate the branch at that tip, make the worktree on that branch, confirm the worktree HEAD is that tip, then delete the origin ref. With no ref in the note, resume works as today.
+3. Reruns: a second retire or resume changes nothing and exits 0. A rerun after a stop at any step finishes the remaining steps (for example a pushed ref with no note, or a branch back with the ref not yet deleted).
+4. A berth reservation whose `cargo-berth release` exits 5 with "already has a final disposition" counts as released, not as left running.
+5. The unit's own pane shell (the pane the unit's mark names, `unit_move.unit_pane`) does not block retire.
+6. Another process inside the worktree: retire may end it only when it proves the process belongs to this worktree and its owner is dead: its environment names the retiring unit's recorded session id, no live process holds that session, and its pid and start time still match at the signal (through `scripts/lib/process_group.py`). Otherwise retire names it (pid, parent, command, start time) and refuses. Never match by name or pattern.
+7. `merge_checkpoint.py:837`: a failed push rolls back to the merge branch tip from before the merge, never to `old_origin`, so local commits not yet on origin stay.
+8. Docs and command text: `commands/showrunner/retire_unit.md`, `commands/showrunner/resume_unit.md`, both scripts' docstrings, and each as-built doc that describes retire or resume say what retire keeps and where.
+
+**Files:**
+- `scripts/production/retire_unit.py` — items 1, 3, 4, 5, 6
+- `scripts/production/resume_unit.py` — items 2, 3
+- `scripts/production/merge_checkpoint.py` — item 7, the rollback line only
+- `scripts/production/test_retire_unit.py`, `scripts/production/test_resume_unit.py` — regression tests
+- `scripts/production/test_merge_checkpoint.py` — the rollback regression test
+- `commands/showrunner/retire_unit.md`, `commands/showrunner/resume_unit.md`, `docs/as-built/showrunner-automation.md` — item 8
+
+**Workers:** 1 writer + 1 tester
+- `impl` — `retire_unit.py`, `resume_unit.py`, `merge_checkpoint.py`, the command text and docs
+- `test` — `test_retire_unit.py`, `test_resume_unit.py`, `test_merge_checkpoint.py`, from this Spec alone
+
+**State:** origin refs `refs/retired/<staff id>`, the Units row retired note, the unit worktree and branch (tests use temporary repositories and a temporary origin only).
+
+**Acceptance gate:** tests in temporary repositories show items 1-7, each rerun exiting 0 with no write. Live proof on tool-based-ui unit `assembly` (one tree, wip commit 5f9b7b2283 not on origin): note its tip and session; retire; rerun; resume; rerun; the branch tip is 5f9b7b2283, the session id is the same, and the worktree is back.

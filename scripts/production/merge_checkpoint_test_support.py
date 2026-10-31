@@ -419,6 +419,18 @@ class MergeCheckpointFixture(unittest.TestCase):
             _ = self.git("push", "origin", "alpha-branch", cwd=self.unit)
         return sha
 
+    def push_main_change(self, relative: str, content: str) -> str:
+        """Push an independent main fix through the fixture's private origin."""
+        writer = self.root / "main-fix-writer"
+        _ = self.git("clone", "-b", "main", str(self.origin), str(writer), cwd=self.root)
+        _ = self.git("config", "user.name", "Checkpoint Test", cwd=writer)
+        _ = self.git("config", "user.email", "checkpoint@example.invalid", cwd=writer)
+        self.write(writer, relative, content)
+        _ = self.git("add", relative, cwd=writer)
+        _ = self.git("commit", "-m", "independent main fix", cwd=writer)
+        _ = self.git("push", "origin", "main", cwd=writer)
+        return self.git("rev-parse", "HEAD", cwd=writer)
+
     def run_checkpoint(self, sha: str, *extra: str, phase: str = "2",
                        review: bool = True, trial: str = TRIAL,
                        delivers: str | None = DELIVERS, parallel: str | None = PARALLEL) -> MergeResult:
