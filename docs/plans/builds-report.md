@@ -414,29 +414,14 @@ including the details to make it clear
 
 ### Phase 10 — The Mac's hanadocs vault pulls by itself each hour  · status: done
 
-#### Work Order
+#### As-built
 
-**Goal:** the Mac's `~/rust/hanadocs` stays current with GitHub without a person, and a pull that stops reaches the user once per outage. It stopped on 2026-10-16 and fell 5531 commits behind because nothing on the Mac pulls.
-
-**Spec:**
-- Add a step to natedev's existing `buildlog hourly` job (`scripts/buildlog/cli.py` `hourly()`), in a new module `scripts/buildlog/vault_pull.py`. No new timer. Also add `buildlog vault` to run the step once by hand.
-- Transport from natedev, so the Mac needs no GitHub sign-in: `git -C /home/natepiano/rust/hanadocs push <peer>:rust/hanadocs refs/remotes/origin/main:refs/remotes/origin/main` (no force; natedev's `origin/main` is what GitHub holds), then one `ssh` to the peer with `sync.SSH_OPTIONS` and `sync.peer_name()`. Over that ssh, with `git -C rust/hanadocs` only (never `cd`): the branch is `main`, `status --porcelain --untracked-files=no` is empty, then `merge --ff-only refs/remotes/origin/main`. Never stash, reset, checkout or touch uncommitted or untracked files.
-- Stop causes, each a typed outcome: tracked files changed, not on `main`, history diverged (the push is not a fast-forward, or the merge refuses), an untracked file the merge would overwrite, and the Mac unreachable. The Mac sleeping is normal: unreachable is a stop only when the last good pull is more than 24 hours old.
-- One push per outage: a state file under `store.root()` keeps the last good pull time and the open outage (cause, since, alerted). The first hour of a stop sends one user push; later hours of the same outage send nothing; the next good pull closes the outage, so a new stop sends again. Mark it alerted only after `send.py` exits 0, so a failed send retries next hour. Send like `rust_release.send_release_text` does (`push_texts.user_send_argv` and `scripts/message/send.py`), with a new `push_catalog.py` text whose action names the fix for each cause.
-- Hourly prints one line per run: pulled N commits, current, or stopped with the cause.
+The hourly buildlog job runs `buildlog vault` after sync; no new timer and no nix change. natedev first pushes its own `refs/remotes/origin/main` to the same ref in the Mac's `~/rust/hanadocs` (no force), so the Mac needs no GitHub sign-in or warm gpg-agent of its own. One ssh then runs a script that uses `git -C rust/hanadocs` only: it requires branch main and no changed tracked files, checks that HEAD is an ancestor, counts the commits, and runs `merge --ff-only --no-overwrite-ignore`. Uncommitted, untracked and ignored files are never touched. The Mac login hides the remote exit status, so the outcome is one printed `VAULT_OUTCOME=` marker. Typed outcomes: pulled, current, tracked files changed, not on main, history diverged, untracked file would be overwritten, Mac unreachable, command failed. A stop sends one `vault.stopped` push per outage through `rust_release.send_release_text`; an unreachable Mac gets 24 h of grace from the last good pull. The command holds the sync contact lock and honors the sync pause. Output: `buildlog vault: pulled N commits`, `current`, or `stopped: <reason>`.
 
 **Files:**
-- `scripts/buildlog/vault_pull.py`
-- `scripts/buildlog/test_vault_pull.py`
-- `scripts/buildlog/cli.py`
-- `scripts/buildlog/test_sync.py`
-- `scripts/notify/push_catalog.py`
-- `scripts/notify/test_push_texts.py`
+- `scripts/buildlog/vault_pull.py` — the transport, outcomes, outage state (`vault_pull.json` under the store root) and alert.
+- `scripts/buildlog/cli.py` — the `vault` command and its place in the hourly tuple.
+- `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json` — the approved `vault.stopped` text with one example per cause.
+- `scripts/buildlog/test_vault_pull.py`, `scripts/buildlog/test_sync.py`, `scripts/notify/test_push_texts.py` — tests.
 
-**Workers:** impl3 writes `vault_pull.py`, `cli.py` and `push_catalog.py`; test3 writes the test files.
-
-**State:** one JSON file under `store.root()`: last good pull time and the open outage.
-
-**Acceptance gate:** `basedpyright` on each slot's files reads 0 errors, 0 warnings, 0 notes; `python3 -m unittest` of `test_vault_pull`, `test_sync` and `test_push_texts` passes, covering each stop cause, one push per outage, retry after a failed send, and a closed outage sending again. Live check by the director on natedev: `buildlog vault` moves the Mac's `rust/hanadocs` from its old HEAD to natedev's `origin/main` with a clean tree.
-
-**Constraints:** no worktree commit from workers; tests use fake `git`/`ssh` runners and never reach the Mac or the real vault; tests run with `env -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD`; never write the live build log; `/etc/nixos` and nix-darwin are not changed.
+**Gotchas:** never read a Mac outcome from the ssh exit code; print a marker. The alert flag is saved before the send and restored when the send fails, so a later save failure cannot repeat a push. The installed hourly job runs `~/.claude` main's copy, so hourly pulls start only after this reaches main. Live proof 2026-10-30: 9949620c to 1d21bb88 (9 commits), then 14 more with the final code, clean tree.
