@@ -35,6 +35,8 @@ from types import MappingProxyType, ModuleType
 from typing import Literal, cast, override
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 
 class DiscardedTextWrite(io.StringIO):
     @override
@@ -132,19 +134,17 @@ class NotesPass:
 
 
 def load_pass() -> NotesPass:
-    # Match agent_notes.py's script imports, including its shared module aliases.
-    root = Path(__file__).resolve().parents[2]
-    for folder in (root, root / "scripts/whoami"):
-        sys.path.insert(0, str(folder))
+    # Keep the timer modules on their existing sibling import names.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     notes = import_module("agent_notes")
     watch = import_module("scripts.accounts.refusal_watch")
     watchdog = import_module("scripts.accounts.unit_watchdog")
     return NotesPass(notes, import_module("scripts.accounts.accounts"), watch, watchdog,
-        import_module("quota_alert"), import_module("codex_pacer"), import_module("usage_store"),
+        import_module("quota_alert"), import_module("codex_pacer"), import_module("scripts.whoami.usage_store"),
         import_module("five_hour"), import_module("scripts.accounts.role_map"),
         import_module("scripts.accounts.moves"), import_module("scripts.accounts.next_moves"),
         import_module("scripts.accounts.refusals"), import_module("scripts.production.showrunners"),
-        import_module("run_out"), import_module("scripts.accounts.outage_alerts"),
+        import_module("scripts.whoami.run_out"), import_module("scripts.accounts.outage_alerts"),
         import_module("shutdown_record"), import_module("launch_permission"))
 
 
@@ -214,7 +214,7 @@ def patch_list(pass_: NotesPass) -> tuple[PassCallPatch, ...]:
         PassCallPatch(pass_.record, "restore_snapshot_agent_exited", "restores saved crash evidence", False),
         PassCallPatch(pass_.permission, "launch_permission", "runs launch-blocked which can release shutdown holds",
                        result(pass_.permission, "BlockedByShutdown", "profile: launch action suppressed")),
-        PassCallPatch(import_module("agent_accounts"), "codex_live",
+        PassCallPatch(import_module("scripts.whoami.agent_accounts"), "codex_live",
                        "starts a Codex server that can write its session index; uses copied timer reports", mode="codex"),
         PassCallPatch(q, "codex_live",
                        "imported Codex usage action; uses copied timer reports", mode="codex"),
@@ -421,8 +421,8 @@ def replacement(entry: PassCallPatch, measurements: Measurements) -> Callable[..
             async def cached() -> object:
                 home = args[0]
                 # This is an action boundary: do not start an app-server on a live home.
-                import usage_store
-                from agent_accounts import CodexHomeSource, Report
+                from scripts.whoami import usage_store
+                from scripts.whoami.agent_accounts import CodexHomeSource, Report
 
                 try:
                     saved = cast(dict[str, object], json.loads(usage_store.timer_file().read_text()))

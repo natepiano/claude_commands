@@ -245,27 +245,21 @@ if [[ "${1:-}" == final-pass || ( "${1:-}" == --session-dir && "${3:-}" == final
     exec "$PY" "$VERIFY_QUERY_DIR/final_pass.py" query "$VERIFY_QUERY_DIR/verify.sh" "$@"
 fi
 if [[ -n "${TMPDIR:-}" && ! -d "$TMPDIR" ]]; then mkdir -p -- "$TMPDIR"; fi
-# Ask the shared helper which envrc applies, before tool setup or record access.
-# With no envrc, ensure returns the unchanged env without invoking direnv.
-if [[ -z "${IN_NIX_SHELL:-}" ]]; then
-    if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" ]]; then
+# Load the environment once through the shared helper, before tool setup or records.
+if [[ -n "${VERIFY_NIX_ENV_REEXEC:-}" ]]; then
+    if [[ -n "${IN_NIX_SHELL:-}" ]]; then
+        printf '%s\n' 'verify.sh: not in the nix shell; re-running under nix_env.py exec' >&2
+    elif [[ -n "${NIX_ENV_ENVRC:-}" ]]; then
         printf '%s\n' 'verify.sh: nix_env.py re-exec still has no nix shell (IN_NIX_SHELL unset)' >&2
         exit 1
     fi
+elif [[ -z "${IN_NIX_SHELL:-}" ]]; then
     VERIFY_NIX_SCRIPT_DIR="${BASH_SOURCE[0]%/*}"
     [[ "$VERIFY_NIX_SCRIPT_DIR" != "${BASH_SOURCE[0]}" ]] || VERIFY_NIX_SCRIPT_DIR=.
     VERIFY_NIX_SCRIPT_DIR="$(cd -- "$VERIFY_NIX_SCRIPT_DIR" && pwd -P)"
-    VERIFY_NIX_ENV_JSON="$("$PY" \
-        "$VERIFY_NIX_SCRIPT_DIR/../lib/nix_env.py" ensure "$PWD")"
-    if VERIFY_PY_HELPER=NIX_ENV_PY "$PY" -c \
-        'import json, sys; sys.exit(0 if json.load(sys.stdin).get("IN_NIX_SHELL") else 1)' \
-        <<< "$VERIFY_NIX_ENV_JSON"; then
-        printf '%s\n' 'verify.sh: not in the nix shell; re-running under nix_env.py exec' >&2
-        export VERIFY_NIX_ENV_REEXEC=1
-        exec "$PY" "$VERIFY_NIX_SCRIPT_DIR/../lib/nix_env.py" \
-            exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
-    fi
-    unset VERIFY_NIX_ENV_JSON VERIFY_NIX_SCRIPT_DIR
+    export VERIFY_NIX_ENV_REEXEC=1
+    exec "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/py" -S "${VERIFY_NIX_SCRIPT_DIR%/*}/lib/nix_env.py" \
+        exec "$VERIFY_NIX_SCRIPT_DIR/${BASH_SOURCE[0]##*/}" "$@"
 fi
 unset VERIFY_NIX_ENV_REEXEC
 

@@ -2617,7 +2617,7 @@ class Ledger:
     def bulk_share_checkpoint(self, ids: Sequence[str]) -> None:
         """Persist one workspace proof group after every decision ticket reaches the same checkpoint.
 
-        This shares rename evidence, never approval or finding ownership. A partial checkpoint is recoverable:
+        This shares one family's workspace evidence, never approval or finding ownership. A partial checkpoint is recoverable:
         repeat the ordinary checkpoints, then this operation. No proof group exists until all have succeeded.
         """
         members = tuple(sorted(set(ids)))
@@ -2628,12 +2628,12 @@ class Ledger:
             tickets = tuple(self._ticket(id) for id in members)
             first = tickets[0]
             signature = (first["base"], first["branch"], first["checkpoint"], first["rules"])
-            if (not all(signature[:3]) or len(first["rules"]) != 1
-                    or any(ticket["kind"] != "proposal" or ticket["family"] != "names"
+            if (not all(signature[:3]) or len(first["rules"]) != 1 or first["family"] not in {"names", "values"}
+                    or any(ticket["kind"] != "proposal" or ticket["family"] != first["family"]
                            or ticket["crate"] != "." or ticket["state"] not in ("checkpointed", "merged")
                            or (ticket["base"], ticket["branch"], ticket["checkpoint"], ticket["rules"]) != signature
                            for ticket in tickets)):
-                raise LedgerError("workspace proof requires one rule, base, branch and checkpoint on names proposal tickets")
+                raise LedgerError("workspace proof requires one rule, base, branch and checkpoint on same-family names or values proposal tickets")
             existing = cast(list[tuple[str, str]], self._connection.execute(
                 "SELECT ticket,batch FROM bulk_workspace_tickets WHERE batch IN "
                 + "(SELECT batch FROM bulk_workspace_tickets WHERE ticket IN ("

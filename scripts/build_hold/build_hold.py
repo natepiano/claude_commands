@@ -42,6 +42,8 @@ SAFE = re.compile(r"[^A-Za-z0-9._-]")
 # Retry a failed session lookup before reporting an undelivered release notice.
 LOOKUP_TRIES = 3
 LOOKUP_RETRY_S = 1.0
+RELEASE_NOTICE = ("/build:hold: the build hold has been released. Start your builds and BRP launches now; "
+                  "their memory gate orders them. No answer is needed.")
 
 DeliveryOutcome = Literal["NotAttempted", "Delivered", "QueuedUnconfirmed", "RecipientGone", "DeliveryFailed"]
 
@@ -80,9 +82,60 @@ class NoCycle:
     pass
 
 
+class CycleReleaseNotices(TypedDict):
+    kind: Literal["cycle"]
+    cycle_id: str
+    recipients: dict[str, str]
+
+
+class BroadcastReleaseNotice(TypedDict):
+    kind: Literal["broadcast"]
+
+
+class ReleaseIntent(TypedDict):
+    holder_key: str
+    holder_name: str
+    holder_since: str
+    holder_directory: str
+    released_at: str
+    notices: CycleReleaseNotices | BroadcastReleaseNotice
+
+
+@dataclass(frozen=True)
+class NoReleaseIntent:
+    pass
+
+
+@dataclass(frozen=True)
+class RecordedRelease:
+    path: Path
+    intent: ReleaseIntent
+    state: Literal["pending", "completed"]
+
+
 @dataclass(frozen=True)
 class DamagedRecordSetAside:
     path: Path
+
+
+@dataclass(frozen=True)
+class ReleaseRecordsForChange:
+    records: list[RecordedRelease]
+    set_aside: list[DamagedRecordSetAside]
+
+
+@dataclass(frozen=True)
+class CycleNoticesToSend:
+    cycle: HoldCycle
+    entries: list[ReleaseEntry]
+
+
+class ReleaseNoticeReadError(ReleaseRecordReadError):
+    path: Path
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(reason)
+        self.path = path
 
 
 def release_record_error_line(error: ReleaseRecordReadError) -> str:
@@ -908,8 +961,14 @@ def cycle_path() -> Path | None:
 def read_cycle() -> HoldCycle | None:
     try:
         path = cycle_path()
-        if path is None:
-            return None
+    except (OSError, ValueError) as error:
+        raise ReleaseRecordReadError(str(error)) from error
+    return None if path is None else read_hold_cycle(path)
+
+
+def read_hold_cycle(path: Path) -> HoldCycle:
+    """Read current and retained cycles through the same validation boundary."""
+    try:
         record = cast(object, json.loads(path.read_text()))
         if not isinstance(record, dict):
             raise ValueError("invalid hold cycle: expected object")
@@ -965,6 +1024,18 @@ def read_cycle() -> HoldCycle | None:
         raise ReleaseRecordReadError(str(error)) from error
 
 
+def set_aside_damaged_record(path: Path) -> DamagedRecordSetAside:
+    """Preserve a damaged record under release.lock without replacing an earlier copy."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    destination = path.with_name(f"{path.name}.damaged-{timestamp}")
+    suffix = 2
+    while destination.exists() or destination.is_symlink():
+        destination = path.with_name(f"{path.name}.damaged-{timestamp}-{suffix}")
+        suffix += 1
+    _ = path.rename(destination)
+    return DamagedRecordSetAside(destination)
+
+
 def read_cycle_for_change() -> HoldCycle | NoCycle | DamagedRecordSetAside:
     """Read a cycle while release.lock is held, setting damage aside if found."""
     try:
@@ -977,16 +1048,10 @@ def read_cycle_for_change() -> HoldCycle | NoCycle | DamagedRecordSetAside:
         except (OSError, ValueError):
             path = None
         damaged = path if path is not None and (path.is_symlink() or path.exists()) else current
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        destination = damaged.with_name(f"{damaged.name}.damaged-{timestamp}")
-        suffix = 2
-        while destination.exists():
-            destination = damaged.with_name(f"{damaged.name}.damaged-{timestamp}-{suffix}")
-            suffix += 1
-        _ = damaged.rename(destination)
+        saved = set_aside_damaged_record(damaged)
         current.unlink(missing_ok=True)
-        print(f"release record could not be read ({error}); set aside as {destination}; this hold now releases every session at once", flush=True)
-        return DamagedRecordSetAside(destination)
+        print(f"release record {damaged} could not be read ({error}); set aside as {saved.path}; this hold now releases every session at once", flush=True)
+        return saved
 
 
 def save_cycle(cycle: HoldCycle) -> None:
@@ -995,6 +1060,261 @@ def save_cycle(cycle: HoldCycle) -> None:
     temporary = path.with_suffix(".tmp")
     _ = temporary.write_text(json.dumps(cycle, ensure_ascii=False) + "\n")
     os.replace(temporary, path)
+
+
+def read_release_intent(path: Path) -> ReleaseIntent | NoReleaseIntent:
+    try:
+        raw = cast(object, json.loads(path.read_text()))
+    except FileNotFoundError:
+        return NoReleaseIntent()
+    if not isinstance(raw, dict):
+        raise ValueError("invalid release intent: expected object")
+    fields = cast(dict[str, object], raw)
+    for field in ("holder_key", "holder_name", "holder_since", "holder_directory", "released_at"):
+        if not isinstance(fields.get(field), str) or not fields[field]:
+            raise ValueError(f"invalid release intent: {field}")
+    _ = aware_instant(cast(str, fields["holder_since"]))
+    _ = aware_instant(cast(str, fields["released_at"]))
+    notices = fields.get("notices")
+    if not isinstance(notices, dict):
+        raise ValueError("invalid release intent: notices")
+    notice_fields = cast(dict[str, object], notices)
+    if notice_fields.get("kind") == "cycle":
+        cycle_id, recipients = notice_fields.get("cycle_id"), notice_fields.get("recipients")
+        if not isinstance(cycle_id, str) or not re.fullmatch(r"[0-9a-f]{32}", cycle_id):
+            raise ValueError("invalid release intent: cycle ID")
+        if not isinstance(recipients, dict) or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in cast(dict[object, object], recipients).items()
+        ):
+            raise ValueError("invalid release intent: recipients")
+    elif notice_fields.get("kind") != "broadcast":
+        raise ValueError("invalid release intent: notice kind")
+    return cast(ReleaseIntent, cast(object, fields))
+
+
+def save_release_intent(intent: ReleaseIntent) -> None:
+    path = release_directory() / "pending-release.json"
+    temporary = path.with_suffix(".tmp")
+    _ = temporary.write_text(json.dumps(intent, ensure_ascii=False) + "\n")
+    retain_release_record(path)
+    os.replace(temporary, path)
+
+
+def retain_release_record(path: Path) -> None:
+    """Move a prior pending release out of the current slot without dropping its notices."""
+    if path.is_file():
+        destination = release_directory() / "releases" / uuid.uuid4().hex / path.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(path, destination)
+
+
+def complete_release_record(record: RecordedRelease) -> None:
+    """Keep the holder's latest release receipt after its notices are done."""
+    receipt = holder_path(release_directory() / "receipts", record.intent["holder_key"]) / "completed-release.json"
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    previous = read_release_intent(receipt)
+    if (isinstance(previous, NoReleaseIntent)
+            or aware_instant(previous["released_at"]) <= aware_instant(record.intent["released_at"])):
+        os.replace(record.path, receipt)
+    else:
+        # An older pending release can finish after a newer release for this holder.
+        record.path.unlink()
+    if record.path.parent.parent == release_directory() / "releases":
+        try:
+            record.path.parent.rmdir()
+        except OSError:
+            # A directory that still contains another record must stay.
+            pass
+
+
+def pending_release_paths() -> list[Path]:
+    return [release_directory() / "pending-release.json",
+            *sorted((release_directory() / "releases").glob("*/pending-release.json"))]
+
+
+def release_entries(cycle: HoldCycle, recipients: Mapping[str, str]) -> list[ReleaseEntry]:
+    """Use the first recorded entry for each session, as the sender has always done."""
+    first: dict[str, ReleaseEntry] = {}
+    for entry in cycle["entries"]:
+        _ = first.setdefault(entry["session_id"], entry)
+    return [first[session_id] if session_id in first else new_entry(session_id, name)
+            for session_id, name in recipients.items()]
+
+
+def release_notices(intent: ReleaseIntent) -> CycleNoticesToSend | BroadcastReleaseNotice:
+    """Read and select a release's unsent entries without changing its files or cycle."""
+    notices = intent["notices"]
+    if notices["kind"] == "broadcast":
+        return notices
+    path = release_directory() / notices["cycle_id"] / "cycle.json"
+    try:
+        cycle = read_hold_cycle(path)
+        if cycle["id"] != notices["cycle_id"]:
+            raise ValueError("release intent does not match its hold cycle")
+    except (OSError, ValueError) as error:
+        raise ReleaseNoticeReadError(path, str(error)) from error
+    return CycleNoticesToSend(cycle, [entry for entry in release_entries(cycle, notices["recipients"])
+                                      if entry["delivery"] in ("NotAttempted", "DeliveryFailed")])
+
+
+def pending_release_status_lines() -> list[str]:
+    """Name unfinished notices without locking, migrating or changing release state."""
+    lines: list[str] = []
+    for path in pending_release_paths():
+        try:
+            intent = read_release_intent(path)
+            if isinstance(intent, NoReleaseIntent):
+                continue
+            pending = release_notices(intent)
+            notices = intent["notices"]
+            unsent = (", ".join(notices["recipients"][entry["session_id"]] for entry in pending.entries) or "none"
+                      if isinstance(pending, CycleNoticesToSend) and notices["kind"] == "cycle"
+                      else "every session (broadcast)")
+        except (OSError, ValueError) as error:
+            if isinstance(error, ReleaseNoticeReadError):
+                path = error.path
+            lines.append(f"release pending: {path} could not be read: {error}; /build:hold release sets it aside")
+            continue
+        released = aware_instant(intent["released_at"]).astimezone(user_zone())
+        lines.append(f"release pending: {intent['holder_name']}, released {released:%H:%M %Z} - unsent: {unsent}; run /build:hold release to finish it")
+    return lines
+
+
+def recorded_releases() -> list[RecordedRelease]:
+    return release_records_for_change().records
+
+
+def release_records_for_change() -> ReleaseRecordsForChange:
+    """Read releases under the lock, preserving damaged pending records and continuing."""
+    # Migrate old receipts once; later releases read only one receipt per holder.
+    for path in [release_directory() / "completed-release.json",
+                 *sorted((release_directory() / "releases").glob("*/completed-release.json"))]:
+        intent = read_release_intent(path)
+        if not isinstance(intent, NoReleaseIntent):
+            complete_release_record(RecordedRelease(path, intent, "completed"))
+    records: list[RecordedRelease] = []
+    set_aside: list[DamagedRecordSetAside] = []
+    for state in ("pending", "completed"):
+        if state == "pending":
+            paths = pending_release_paths()
+        else:
+            paths = sorted((release_directory() / "receipts").glob("*/completed-release.json"))
+        for path in paths:
+            try:
+                intent = read_release_intent(path)
+            except (OSError, ValueError) as error:
+                if state != "pending":
+                    raise
+                saved = set_aside_damaged_record(path)
+                set_aside.append(saved)
+                print(f"release pending: {path} could not be read: {error}; set aside as {saved.path}", flush=True)
+                continue
+            if not isinstance(intent, NoReleaseIntent):
+                records.append(RecordedRelease(path, intent, state))
+    return ReleaseRecordsForChange(records, set_aside)
+
+
+def recorded_release_holder(directory: Path, given: str | None, *, resume: bool) -> HolderIdentity | NoReleaseIntent | DamagedRecordSetAside:
+    """Resolve a stopped or completed release without accepting an unrelated holder."""
+    with release_lock():
+        # A receipt for a former name must never shadow a live session-id hold.
+        if given is None and resume:
+            if has_holder_file(directory):
+                return NoReleaseIntent()
+        else:
+            try:
+                _ = held_key(directory, given)
+            except ValueError:
+                pass
+            else:
+                return NoReleaseIntent()
+        recovered = release_records_for_change()
+        for record in recovered.records:
+            intent = record.intent
+            if intent["holder_directory"] != str(directory.resolve()):
+                continue
+            if given is None and resume:
+                return HolderIdentity(intent["holder_key"], intent["holder_name"])
+            identity = holder_of(given)
+            no_former_names: list[str] = []
+            former = next((record["formerNames"] for record in live_sessions()
+                           if record["sessionId"] == identity.key), no_former_names)
+            candidates = (identity.key, identity.name, given or identity.name, *former)
+            if any(holder_path(directory, candidate).name == intent["holder_key"] for candidate in candidates):
+                return HolderIdentity(intent["holder_key"], intent["holder_name"])
+        if recovered.set_aside and not has_holder_file(directory):
+            for record in recovered.records:
+                if record.state == "pending" and record.intent["holder_directory"] == str(directory.resolve()):
+                    return HolderIdentity(record.intent["holder_key"], record.intent["holder_name"])
+            return recovered.set_aside[0]
+    return NoReleaseIntent()
+
+
+def finish_release_intent(intent: ReleaseIntent) -> str:
+    """Drain all unfinished releases for this holder directory under release.lock."""
+    directory = Path(intent["holder_directory"])
+    state = read_holders(directory)
+    if isinstance(state, ActiveHolders):
+        raise ValueError(resume_refusal(state.holders))
+    result = "released, builds may resume."
+    failures: list[str] = []
+    for record in recorded_releases():
+        if record.state == "pending" and record.intent["holder_directory"] == intent["holder_directory"]:
+            try:
+                result += finish_recorded_notices(record)
+            except Exception as error:
+                # A failed record must not stop notices for another release.
+                failures.append(f"{record.intent['holder_name']}: {error}")
+    if failures:
+        raise OSError(result + " Release notices remain pending: " + "; ".join(failures))
+    return result
+
+
+def finish_recorded_notices(record: RecordedRelease) -> str:
+    intent = record.intent
+    directory = Path(intent["holder_directory"])
+    try:
+        pending = release_notices(intent)
+    except ReleaseNoticeReadError as error:
+        # The intent still names its recipients. Preserve the damaged cycle and
+        # rebuild only that release's delivery state; an uncertain send can repeat.
+        # A stop after the rename leaves the intent, so a missing cycle also recovers.
+        if error.path.exists() or error.path.is_symlink():
+            saved = set_aside_damaged_record(error.path)
+            print(f"release pending: {error.path} could not be read: {error}; set aside as {saved.path}", flush=True)
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        save_cycle({"id": notices["cycle_id"], "opened_at": intent["holder_since"],
+                    "holders": {intent["holder_key"]: {"since": intent["holder_since"], "released_at": intent["released_at"]}},
+                    "recipients": dict(notices["recipients"]), "entries": [], "release_started_at": intent["released_at"]})
+        pending = release_notices(intent)
+    if not isinstance(pending, CycleNoticesToSend):
+        # The pending record is the broadcast entry. Keep it until the send returns.
+        send_release_broadcast()
+        result = " No hold cycle: broadcast this release to every session."
+    else:
+        cycle = pending.cycle
+        notices = intent["notices"]
+        assert notices["kind"] == "cycle"
+        changed = False
+        for session_id, name in notices["recipients"].items():
+            if session_id not in cycle["recipients"]:
+                cycle["recipients"][session_id] = name
+                changed = True
+        for key, instants in cycle["holders"].items():
+            if (holder_path(directory, key).name == intent["holder_key"] and not instants["released_at"]
+                    and aware_instant(instants["since"]) == aware_instant(intent["holder_since"])):
+                instants["released_at"] = intent["released_at"]
+                changed = True
+        if not cycle["release_started_at"]:
+            cycle["release_started_at"] = intent["released_at"]
+            changed = True
+        if changed:
+            save_cycle(cycle)
+        result = send_cycle_notices(cycle, pending.entries)
+    complete_release_record(record)
+    return result
 
 
 def open_cycle(now: datetime) -> HoldCycle:
@@ -1090,8 +1410,7 @@ def socket_for(session_id: str) -> RecipientLive | RecipientGone | RecipientLook
 def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | ReleaseQueued | ReleaseSendFailed:
     """Tell a recipient to start its builds; the memory gate orders them."""
     script = Path(__file__).resolve().parent.parent / "message" / "send.py"
-    notice = ("/build:hold: the build hold has been released. Start your builds and BRP launches now; "
-              f"their memory gate orders them. No answer is needed. Session {entry['session_id']}.")
+    notice = f"{RELEASE_NOTICE} Session {entry['session_id']}."
     try:
         result = subprocess.run([sys.executable, str(script), "--to", f"uds:{socket}", "--text", notice], capture_output=True, text=True)
     except OSError as error:
@@ -1101,6 +1420,14 @@ def send_release(entry: ReleaseEntry, socket: str) -> ReleaseDelivered | Release
     if result.returncode == 1:
         return ReleaseQueued()
     return ReleaseSendFailed(result.stderr.strip() or result.stdout.strip() or f"send.py exited {result.returncode}")
+
+
+def send_release_broadcast() -> None:
+    script = Path(__file__).resolve().parent.parent / "production" / "broadcast.py"
+    result = subprocess.run([sys.executable, str(script), "--from", "build-hold", "--all", RELEASE_NOTICE],
+                            capture_output=True, text=True)
+    if result.returncode:
+        raise OSError(result.stderr.strip() or result.stdout.strip() or "release broadcast failed")
 
 
 def entry_text(entry: ReleaseEntry) -> str:
@@ -1130,22 +1457,24 @@ def notify_release(cycle: HoldCycle) -> str:
 
 
 def notify_released_cycle(cycle: HoldCycle) -> str:
+    return send_cycle_notices(cycle, [entry for entry in release_entries(cycle, cycle["recipients"])
+                                     if entry["delivery"] == "NotAttempted"])
+
+
+def send_cycle_notices(cycle: HoldCycle, entries: Sequence[ReleaseEntry]) -> str:
     # The release lock prevents a same-session re-hold between this check and a send.
     if has_holder_file(holder_directory()):
         return ""
-    for session_id, name in cycle["recipients"].items():
+    for entry in entries:
         if has_holder_file(holder_directory()):
             break
-        entry = next((entry for entry in cycle["entries"] if entry["session_id"] == session_id), None)
-        if entry is None:
-            entry = new_entry(session_id, name)
+        if entry not in cycle["entries"]:
             cycle["entries"].append(entry)
-        if entry["delivery"] != "NotAttempted":
-            continue
-        # Save the attempt first: a stopped sender must not send a second notice.
-        entry["delivery"] = "DeliveryFailed"
+        entry["delivery"] = "NotAttempted"
+        # Save the pending entry before sending, and the outcome only after return.
+        # A stop at any point between these saves may cause a harmless second notice.
         save_cycle(cycle)
-        recipient = socket_for(session_id)
+        recipient = socket_for(entry["session_id"])
         if isinstance(recipient, RecipientGone):
             entry["delivery"] = "RecipientGone"
         elif isinstance(recipient, RecipientLive):
@@ -1154,6 +1483,10 @@ def notify_released_cycle(cycle: HoldCycle) -> str:
                 entry["delivery"] = "Delivered"
             elif isinstance(result, ReleaseQueued):
                 entry["delivery"] = "QueuedUnconfirmed"
+            else:
+                entry["delivery"] = "DeliveryFailed"
+        else:
+            entry["delivery"] = "DeliveryFailed"
         save_cycle(cycle)
     return not_reached_detail(cycle)
 
@@ -1163,6 +1496,17 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
     with release_lock():
         path = holder_path(directory, name)
         if not path.is_file():
+            for record in recorded_releases():
+                intent = record.intent
+                if (intent["holder_directory"] != str(directory.resolve())
+                        or intent["holder_key"] != path.name):
+                    continue
+                if record.state == "completed":
+                    if not has_holder_file(directory):
+                        detail = finish_release_intent(intent).removeprefix("released, builds may resume.")
+                        return "hold is already released." + detail
+                    return "hold is already released."
+                return finish_release_intent(intent)
             raise ValueError(f"{name} held nothing")
         cycle = read_cycle_for_change()
         if resume and not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
@@ -1170,6 +1514,16 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
             if holds:
                 raise ValueError(resume_refusal(holds))
         holder = read_holder(path)
+        state = read_holders(directory)
+        intent: ReleaseIntent | NoReleaseIntent = NoReleaseIntent()
+        if isinstance(state, ActiveHolders) and len(state.holders) == 1:
+            notices: CycleReleaseNotices | BroadcastReleaseNotice = {"kind": "broadcast"}
+            if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
+                notices = {"kind": "cycle", "cycle_id": cycle["id"], "recipients": dict(cycle["recipients"])}
+            intent = {"holder_key": holder.key, "holder_name": holder.name,
+                      "holder_since": holder.since.isoformat(), "holder_directory": str(directory.resolve()),
+                      "released_at": clock().isoformat(), "notices": notices}
+            save_release_intent(intent)
         result = release_hold(directory, holder)
         if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             for key, instants in cycle["holders"].items():
@@ -1179,14 +1533,17 @@ def release_cycle(directory: Path, name: str, *, resume: bool = False,
         if isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
             if result != "released, builds may resume.":
                 return result
-            return result + " No hold cycle: broadcast this release to every session."
+            if isinstance(intent, NoReleaseIntent):
+                raise ValueError("last holder has no release intent")
+            return finish_release_intent(intent)
         remaining = live_holds(cycle, directory)
         if remaining:
             return "released; still held by " + "; ".join(holder_text(other) for other in remaining)
-        result = "released, builds may resume."
         cycle["release_started_at"] = clock().isoformat()
         save_cycle(cycle)
-    return result + notify_release(cycle)
+        if isinstance(intent, NoReleaseIntent):
+            raise ValueError("last holder has no release intent")
+        return finish_release_intent(intent)
 
 
 def quiet_verdict(processes: Sequence[Process], user: str) -> Quiet | Busy:
@@ -1357,7 +1714,13 @@ def main(arguments: list[str]) -> int:
             given = cast(str | None, options.holder)
             resume_requested = cast(bool, options.resume)
             name: str | None = None
-            if given is None and resume_requested:
+            recorded = recorded_release_holder(holder_directory(), given, resume=resume_requested)
+            if isinstance(recorded, DamagedRecordSetAside):
+                print("released, builds may resume.")
+                return 0
+            if isinstance(recorded, HolderIdentity) and not holder_path(holder_directory(), recorded.key).is_file():
+                name = recorded.key
+            if name is None and given is None and resume_requested:
                 with release_lock():
                     cycle = read_cycle_for_change()
                     if not isinstance(cycle, (NoCycle, DamagedRecordSetAside)):
@@ -1405,6 +1768,8 @@ def main(arguments: list[str]) -> int:
                         for line in cycle_status_lines(cycle):
                             print(line)
                 print_hold_audit(holder_directory(), cast(Path, options.proc_root))
+            for line in pending_release_status_lines():
+                print(line)
     except (ValueError, OSError) as error:
         print(f"build_hold: {error}", file=sys.stderr)
         return 1

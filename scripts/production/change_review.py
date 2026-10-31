@@ -626,9 +626,10 @@ def pending(path: Path) -> list[dict[str, str]]:
 def scope_list(doc: Path) -> Path:
     """The list that takes the production's rows: the one its Change review line names, else its root's."""
     import showrunners
+    import showrunner_tree
 
     slug = slug_of(doc)
-    root = showrunners.root_of(slug)
+    root = showrunner_tree.root_of(slug)
     try:
         return production_list(str(doc))
     except ChangeReviewError:
@@ -651,9 +652,9 @@ class ScopedReviewEntry:
 
 def scope_lists(path: Path, doc: Path, below: bool = False) -> tuple[ProductionReviewList, ...]:
     """The current list and each scoped production's own earlier list, once per path."""
-    import showrunners
+    import showrunner_tree
 
-    lists = {path.absolute(): ProductionReviewList(path, showrunners.root_of(slug_of(doc)))}
+    lists = {path.absolute(): ProductionReviewList(path, showrunner_tree.root_of(slug_of(doc)))}
     for production in scope_docs(doc, below):
         slug = slug_of(production)
         earlier = list_file(slug)
@@ -717,10 +718,10 @@ def change_queue(path: Path, scope: Path | WholeReviewList, below: bool = False)
     """The same change rows and pin for /next and change_review show."""
     if isinstance(scope, WholeReviewList):
         return ChangeQueue(queue(path), row_entries(pending(path)))
-    import showrunners
+    import showrunner_tree
 
     slug = slug_of(scope)
-    name = queue(path) if slug == showrunners.root_of(slug) else f"{queue(path)}-{slug}"
+    name = queue(path) if slug == showrunner_tree.root_of(slug) else f"{queue(path)}-{slug}"
     return ChangeQueue(urgency.scope_queue(name, below), scope_entries(path, scope, below))
 
 
@@ -879,13 +880,13 @@ def trace(row: dict[str, str], tree: Tree) -> Path | str:
 
 def list_tree(path: Path, docs: Iterable[Path]) -> Tree:
     """The productions whose root keeps the list `path`, with every production below each root."""
-    import showrunners
+    import showrunner_tree
 
     owned: list[Path] = []
     for doc in docs:
         slug = slug_of(doc)
         try:
-            if showrunners.root_of(slug) != slug or list_path(doc) != path:
+            if showrunner_tree.root_of(slug) != slug or list_path(doc) != path:
                 continue
         except OSError:
             continue
@@ -1106,9 +1107,10 @@ def showrunner_of(doc: Path) -> str:
     name as it is now, never the production slug, so it is read only while that showrunner runs.
     """
     import showrunners
+    import showrunner_tree
 
     try:
-        root = showrunners.root_of(showrunners.canonical_slug(showrunners.production_slug(str(doc))))
+        root = showrunner_tree.root_of(showrunners.canonical_slug(showrunners.production_slug(str(doc))))
     except ValueError as error:
         raise ChangeReviewError(str(error)) from None
     name = showrunners.current_name(root)
@@ -1165,10 +1167,11 @@ def foreign_units(production: Path) -> set[str]:
     Empty when the productions cannot be read: drift then counts every checkpoint.
     """
     import showrunners
+    import showrunner_tree
 
     try:
         docs = list(showrunners.timer_docs().values())
-        root = showrunners.root_of(slug_of(production))
+        root = showrunner_tree.root_of(slug_of(production))
         top = next((doc for doc in docs if slug_of(doc) == root), production)
         return set(unit_branches(docs)) - set(unit_branches(owner_docs(top)))
     except (OSError, ValueError, Refusal):

@@ -14,6 +14,8 @@ from unittest import mock
 from collections.abc import Callable
 from contextlib import ExitStack
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from scripts.astra import design_roles
 from scripts.direct import workers
 from scripts.production import staff, staff_sources, staff_move
@@ -62,6 +64,29 @@ class UnitTransferTests(UnitTransferFixture):
         self.assertEqual(final_files(self.root), before)
         self.assertEqual(self.messages(), messages)
         self.assertEqual(fake_unit_host.calls(self.env), calls)
+
+    def test_plan_then_apply_finishes_source_updates_after_a_staff_move(self) -> None:
+        _ = self.running_unit()
+        row = next(row for row in staff.snapshot().find(kind="unit") if row.name == "alpha")
+        parent = next(row for row in staff.snapshot().find(kind="showrunner") if row.name == "other")
+        _ = staff_move.move_unit("demo", "alpha-unit", "other")
+        # The former pane launch can name a retired identity while the resumed
+        # receiving pane pins the current row. Only the target selector resolves it.
+        self.pane("w1:p1", session_id="former-session", environment={
+            "SHOWRUNNER_UNIT": "demo", "SHOWRUNNER_UNIT_ID": "alpha-unit", "STAFF_ID": "s00000000000",
+        })
+        self.pane("w2:p1", session_id="sid-alpha", environment={
+            "SHOWRUNNER_UNIT": "other", "SHOWRUNNER_UNIT_ID": "alpha-unit", "STAFF_ID": row.id,
+        })
+        before = self.staff_file.read_bytes()
+        planned = self.transfer("plan")
+        self.assert_ok(planned)
+        self.assertEqual(self.staff_file.read_bytes(), before)
+        self.assert_ok(self.transfer("apply"))
+        self.assertEqual(staff.snapshot().by_id(row.id), staff.StaffRow(row.id, "unit", row.name, parent.id))
+        self.assertNotIn("alpha-unit", (self.giving / "docs/plans/demo-production.md").read_text())
+        self.assertIn("alpha-unit", (self.receiving / "docs/plans/other-production.md").read_text())
+        self.assert_ok(self.transfer("verify"))
 
     def test_transfer_completes_when_the_receiving_showrunner_is_not_running(self) -> None:
         self.remove_showrunner_session("other-showrunner")
@@ -380,7 +405,7 @@ class UnitTransferTests(UnitTransferFixture):
 
     def test_a_stopped_unit_relaunches_using_its_receiving_staff_parent(self) -> None:
         from scripts.accounts import accounts
-        from account import Account
+        from scripts.whoami.account import Account
         import restart
         import shutdown_record
 
