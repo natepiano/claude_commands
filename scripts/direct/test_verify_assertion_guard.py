@@ -59,7 +59,7 @@ cargo() { printf '{"workspace_root":"%s"}\n' "$TEST_REPO"; }
         script += rulings_setup + "\ncase lint in\n    lint)\n" + case + "\nesac\n"
         environment = {**self.environment, "HOME": str(self.home), "PY": sys.executable, "TEST_REPO": str(self.repo),
                        "ASSERTION_GUARD_SCRIPT": str(VERIFY.with_name("assertion_guard.py"))}
-        for name in ("UNIT_SESSION_DIR", "UNIT_RUN_DIR", "WORKSPACE_ROOT"):
+        for name in ("UNIT_SESSION_DIR", "UNIT_RUN_DIR", "PLAN_DELEGATE_BOARD_DIR", "WORKSPACE_ROOT"):
             _ = environment.pop(name, None)
         if with_session:
             environment["UNIT_SESSION_DIR"] = str(self.session)

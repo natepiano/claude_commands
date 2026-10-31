@@ -57,7 +57,7 @@ The settings.json entry, one more SessionStart item:
   config sets `[session] resume_agents_on_restore = false`. Else herdr resumes each pane itself
   on the server's account, so `_clear_restored_workspaces` clears the layout, as for every other
   session.
-- `agents restart` selects sessions from shutdown records and recovery snapshots. It
+- `agents restart` selects sessions from shutdown records and saved pane launches. It
   starts or adopts the shared herdr server and restores each selected session in its
   own tab on its own account. It does not call `pane_restore.restore` for other panes.
 - A restore takes focus only when that launch created a window
@@ -91,3 +91,4 @@ Settings entry for the user, one more SessionEnd item:
 ## Still to come
 
 - Automatic boot restore is not installed on either machine.
+- Layout saving and detection-rule refresh run in `herdr-upkeep`.
