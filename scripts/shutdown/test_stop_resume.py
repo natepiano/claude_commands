@@ -26,6 +26,7 @@ from inventory import Inventory
 import shutdown
 import restart
 import restart_support
+import remote
 import shutdown_record
 from scripts.whoami.account import Account
 from test_pane_restore import FakeClient
@@ -372,7 +373,7 @@ class StopResumeTests(unittest.TestCase):
         self.launched.add("sid-alpha")
         live = sessions.SessionRecord(pid=456, sessionId="sid-alpha", name="alpha",
             messagingSocketPath="", updatedAt=1, tmux="", formerNames=[])
-        report = Inventory(machine=restart_support.local_machine(), login="claude3@fixture.invalid",
+        report = Inventory(machine=remote.local_machine(), login="claude3@fixture.invalid",
             label="claude3", sessions=[], unattributed=[])
         with (patch.object(sessions, "live_sessions", return_value=[live]),
               patch.object(shutdown, "listing", return_value=[]),

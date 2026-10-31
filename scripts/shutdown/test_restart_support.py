@@ -29,6 +29,7 @@ from user_action import ActionRequired
 from push_texts import RenderedPush, render, catalog
 import restart as restart_work
 import restart_support as settle
+import remote
 if TYPE_CHECKING:
     from ..notify import review
 else:
@@ -260,7 +261,7 @@ class RestartSupportTests(ShutdownTestCase):
             "not submitted", "Claude fixture\n❯ unsent opening prompt"))
         for live in (True, False):
             with self.subTest(live=live):
-                with (patch.object(settle, "local_machine", return_value="mac"),
+                with (patch.object(remote, "local_machine", return_value="mac"),
                       patch.object(restart_work, "clear_running_on_target", return_value=restart_work.TargetCheck(remaining=[saved], finished=[])),
                       patch.object(restart_work, "restart_failed_liveness", return_value=restart_work.SessionLive() if live else restart_work.SessionNotLive()),
                       patch.object(settle, "run_remote", return_value=(0, "[]")),

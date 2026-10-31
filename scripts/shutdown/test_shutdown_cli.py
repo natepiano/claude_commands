@@ -38,6 +38,7 @@ import sessions
 import remote_control
 import shutdown
 import restart_support
+import remote
 from push_texts import RenderedPush
 import restart as restart_work
 from scripts.whoami.account import Account, UnreadableAccount
@@ -263,7 +264,7 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
         _ = self.recovery("recoverable")
         with (patch.object(inventory, "snapshot_inventory", return_value=inventory.CompleteInventory(
                 "natedev", {}, {})), patch.object(restart_support, "record_time", return_value=JANUARY),
-              patch.object(restart_support, "local_machine", return_value="snapshot-host"),
+              patch.object(remote, "local_machine", return_value="snapshot-host"),
               redirect_stdout(io.StringIO())):
             self.assertEqual(shutdown.main(["snapshot"]), 0)
         saved = shutdown_store.read_snapshot(LOGIN)
@@ -732,16 +733,16 @@ class ShutdownLaunchCliTests(ShutdownTestCase):
                 peer = inventory.Inventory(machine=peer_machine, login=LOGIN, label=LABEL,
                                            sessions=[saved["session"]], unattributed=[])
 
-                def remote(arguments: list[str]) -> tuple[int, str]:
+                def read_peer(arguments: list[str]) -> tuple[int, str]:
                     if arguments == ["status", LOGIN, "--json", "--here"]:
                         return 0, json.dumps(peer)
                     self.assertEqual(arguments, ["records", "--json", "--here"])
                     return 0, json.dumps([saved])
 
-                with (patch.object(restart_support, "local_machine", return_value=local_machine),
+                with (patch.object(remote, "local_machine", return_value=local_machine),
                       patch.object(shutdown, "other_machine", return_value=peer_machine),
                       patch.object(shutdown, "inventory", return_value=local),
-                      patch.object(shutdown, "run_remote", side_effect=remote) as remote_read,
+                      patch.object(shutdown, "run_remote", side_effect=read_peer) as remote_read,
                       patch.object(shutdown, "named_claude_account", return_value=Account("claude", LOGIN, LABEL)),
                       patch.object(restart_work, "_owner_liveness",
                                    side_effect=AssertionError("peer liveness must come from its inventory")),

@@ -42,6 +42,7 @@ import inventory as inventory_work
 import shutdown_record as recovery_store
 from launch_permission import RELEASED_HOLD_PREFIX, LaunchPurpose, NewWorkLaunchPurpose, RecordedSessionRestoreLaunchPurpose
 from shutdown_record import InvalidRecord, SessionShutdown, ShutdownContinuation, AccountOpen, HoldReleased, RequestOrigin, ShutdownFound, lookup_session, release_finished_account_hold, all_account_holds, all_session_records, parse_account_holds, parse_session_records, session_records
+import remote
 from remote import other_machine, run_remote
 import restart_support
 import inventory as stop_work
@@ -442,7 +443,7 @@ def resolve_sessions(login: str, items: Iterable[str], *, here: bool = False, re
     requested = list(dict.fromkeys(items))
     if not requested or any(not item for item in requested):
         raise SessionSelectionError("--only needs a session id or exact name")
-    local_machine = restart_support.local_machine()
+    local_machine = remote.local_machine()
     local: dict[str, _SelectableSession] = {}
     for saved in session_records(login):
         owner = saved["session"]
@@ -537,7 +538,7 @@ def _snapshot() -> int:
 
 def _record_snapshot_outcome(outcome: recovery_store.SnapshotTaken | recovery_store.SnapshotFailed) -> None:
     try:
-        recovery_store.record_snapshot_attempt(outcome, restart_support.local_machine())
+        recovery_store.record_snapshot_attempt(outcome, remote.local_machine())
     except (InvalidRecord, OSError) as error:
         print(f"snapshot outcome not recorded: {error}", file=sys.stderr)
 
@@ -585,7 +586,7 @@ def _forget(text: str, account: str = "") -> int:
             print(f"shutdown: {error}", file=sys.stderr)
             return 2
     candidates: dict[tuple[str, str], ForgetCandidate] = {}
-    machine = restart_support.local_machine()
+    machine = remote.local_machine()
 
     def add(login: str, label: str, owner: Session) -> None:
         if account and account.casefold() != login.casefold():
@@ -654,7 +655,7 @@ def _unresolved_snapshot_status(login: str, only: tuple[str, ...] = ()) -> list[
 
 
 def _restart_failed_liveness(saved: SessionShutdown, observations: tuple[Inventory, ...] = ()) -> restart_work.SessionLive | restart_work.SessionNotLive | restart_work.SessionLivenessUnknown:
-    if saved["machine"].casefold() == restart_support.local_machine().casefold():
+    if saved["machine"].casefold() == remote.local_machine().casefold():
         return restart_work.restart_failed_liveness(saved)
     for report in observations:
         if report["machine"].casefold() == saved["machine"].casefold():
@@ -953,7 +954,7 @@ def _all_accounts(options: CommandLine) -> int:
                 print("\n".join(_snapshot_outcome_lines(_snapshot_status())))
                 print("\n".join(_unresolved_snapshot_lines(account.login, ids)))
             elif options.command == "status":
-                reports.append(RecoveryStatusInventory(machine=restart_support.local_machine(), login=account.login,
+                reports.append(RecoveryStatusInventory(machine=remote.local_machine(), login=account.login,
                     label=account.label, sessions=[], unattributed=[],
                     recovery=_unresolved_snapshot_status(account.login, ids), snapshot=_snapshot_status()))
             continue

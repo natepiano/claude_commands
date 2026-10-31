@@ -52,6 +52,7 @@ import herdr
 from fake_herdr import CommandResponse
 import conversation_pause
 import restart_support
+import remote
 from scripts.message import send as message_send
 import shutdown
 from scripts.whoami import account as account_reader
@@ -4288,7 +4289,7 @@ class RestartTests(ShutdownTestCase):
     def test_up_prints_a_machine_prefixed_failure_to_stdout(self) -> None:
         output = io.StringIO()
         errors = io.StringIO()
-        with patch.object(restart, '_up', side_effect=RuntimeError('restore broke')), patch.object(restart_support, 'local_machine', return_value='Mac'), redirect_stdout(output), redirect_stderr(errors):
+        with patch.object(restart, '_up', side_effect=RuntimeError('restore broke')), patch.object(remote, 'local_machine', return_value='Mac'), redirect_stdout(output), redirect_stderr(errors):
             self.assertEqual(restart.up(LOGIN), 1)
         self.assertEqual(output.getvalue(), 'Mac: restart failed: restore broke\n')
         self.assertEqual(errors.getvalue(), '')
@@ -4333,7 +4334,7 @@ class RestartTests(ShutdownTestCase):
                     failed_sessions=(restart.FailedSessionRestart("stuck", reason),))
                 with (patch.object(restart, "named_claude_account", return_value=self.account),
                       patch.object(restart, "_up", return_value=result),
-                      patch.object(restart_support, "local_machine", return_value="natedev"),
+                      patch.object(remote, "local_machine", return_value="natedev"),
                       patch.object(restart_support, "alert_user", side_effect=alert),
                       redirect_stdout(io.StringIO())):
                     _ = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
@@ -4361,7 +4362,7 @@ class RestartTests(ShutdownTestCase):
                 pushes.clear()
                 with (patch.object(restart, "named_claude_account", return_value=self.account),
                       patch.object(restart, "_up", return_value=result),
-                      patch.object(restart_support, "local_machine", return_value="natedev"),
+                      patch.object(remote, "local_machine", return_value="natedev"),
                       patch.object(restart_support, "alert_user", side_effect=alert),
                       redirect_stdout(io.StringIO())):
                     _ = restart.restart(restart.AccountNamed(LABEL), dry_run=False,
@@ -4388,7 +4389,7 @@ class RestartTests(ShutdownTestCase):
             failed_sessions=(restart.FailedSessionRestart("mover", reason, command),))
         with (patch.object(restart, "named_claude_account", return_value=self.account),
               patch.object(restart, "_up", return_value=result),
-              patch.object(restart_support, "local_machine", return_value="natedev"),
+              patch.object(remote, "local_machine", return_value="natedev"),
               patch.object(restart_support, "alert_user", return_value=True) as alert,
               redirect_stdout(io.StringIO())):
             _ = restart.restart(restart.AccountNamed(LABEL), dry_run=False,

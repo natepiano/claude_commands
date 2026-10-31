@@ -448,7 +448,7 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     from datetime import datetime, timezone
     import quota_alert
     from probe_session import PROBE_ENV
-    from remote import local_machine
+    import remote
 
     entry = pane_record.read(herdr.shared_session()).get(pane)
     entry = entry if entry and entry["session_id"] == identity else None
@@ -480,7 +480,7 @@ def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, reque
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"{identity}: could not tell showrunner: {error}")
     if environment.get(PROBE_ENV) != "1":
-        _ = quota_alert.tell_user(render("shutdown.restart_failed", account=account, machine=local_machine(),
+        _ = quota_alert.tell_user(render("shutdown.restart_failed", account=account, machine=remote.local_machine(),
                                         stopped=name, cause=cause))
     return cause
 
