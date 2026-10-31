@@ -25,7 +25,9 @@ from typing import TYPE_CHECKING, cast, override
 from unittest import mock
 
 from scripts.production import staff
-from scripts.production.staff_test_support import isolated_staff_file, unit_membership, showrunner_relationship, showrunner_launch
+from scripts.production.staff_test_support import (
+    isolated_staff_file, production_membership, unit_membership, showrunner_relationship, showrunner_launch,
+)
 from scripts.astra import design_roles
 from scripts.lib.socket_test_support import short_socket_directory
 
@@ -2331,6 +2333,12 @@ class CodexHolderLabelsTests(unittest.TestCase):
 
 
 class UnitLabelsTests(unittest.TestCase):
+    @override
+    def setUp(self) -> None:
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        _ = self.enterContext(isolated_staff_file(root / "staff.json", {}))
+        production_membership("cargo-liner-style", "cargo-liner-style-types-unit")
+
     def test_folder_name_joins_showrunner_and_unit(self) -> None:
         self.assertEqual(roster.UnitLabels("director", "hana", "lfo").folder_name(), "hana-lfo")
         self.assertEqual(roster.UnitLabels("director", "hana", "hanami").folder_name(), "hana-hanami")
