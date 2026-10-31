@@ -126,4 +126,4 @@ Steps on natedev, in order, after promotion:
 ## Still to come
 
 - The Mac: a launchd agent and the Mac desktop rule for herdr.
-- Last: retire `agent-sessions-snapshot.timer` after one real reboot restores every pane.
+- Retire `agent-sessions-snapshot.timer` through snapshot-removal Landing B. Its proof restarts one disposable probe and verifies a no-change rerun; it requires no reboot. Layout saving and detection-rule refresh run in `herdr-upkeep`.

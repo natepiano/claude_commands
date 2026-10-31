@@ -90,6 +90,7 @@ from scripts.lib import nix_env, unit_runs
 from scripts.lib.probe_session import PROBE_ENV
 from scripts.astra.design_roles import PhaseBoundDesigner, ReadOnlyReviewer, ThreadAccessPolicy
 from scripts.message import sessions, process_table
+from scripts.message import repeat_guard
 from scripts.whoami import account
 from scripts.usage import agents_log
 from scripts.whoami.agent_accounts import (
@@ -2280,7 +2281,12 @@ class WorkerEnded:
     reason: str
 
 
-HoldOutcome = HeldForLauncher | HeldForNextDispatch | NoLauncherAttached | WorkerEnded
+@dataclass(frozen=True)
+class RepeatHeld:
+    copies: int
+
+
+HoldOutcome = HeldForLauncher | HeldForNextDispatch | NoLauncherAttached | WorkerEnded | RepeatHeld
 
 
 @dataclass(frozen=True)
@@ -2288,22 +2294,31 @@ class MessageHandedOff:
     to_run: str
 
 
-def hold_message(session_dir: str, name: str, text: str, *, without_launcher: bool) -> HoldOutcome:
+def hold_message(session_dir: str, name: str, text: str, *, without_launcher: bool,
+                 sender: str = "codex-mesh", human: bool = False, repeat_checked: bool = False,
+                 guard_text: str = "") -> HoldOutcome:
     visited: set[str] = set()
     while session_dir not in visited:
         visited.add(session_dir)
         entry = _as_dict(_read_json_object(_session_path(session_dir, ROSTER_FILE)).get(name))
         target = _as_str(entry.get("adopted_to"))
         if not target:
-            held = _hold_owned_message(session_dir, name, text, without_launcher=without_launcher)
+            held = _hold_owned_message(session_dir, name, text, without_launcher=without_launcher,
+                sender=sender, human=human, repeat_checked=repeat_checked, guard_text=guard_text)
             if not isinstance(held, MessageHandedOff):
                 return held
             target = held.to_run
+        thread_id = _as_str(entry.get("thread_id"))
+        destination = _read_json_object(_session_path(target, ROSTER_FILE))
+        if thread_id and name not in destination:
+            name = next((candidate for candidate, value in destination.items()
+                         if _as_dict(value).get("thread_id") == thread_id), name)
         session_dir = target
     return WorkerEnded(f"{name}: adoption route contains a cycle")
 
 
-def _hold_owned_message(session_dir: str, name: str, text: str, *, without_launcher: bool) -> HoldOutcome | MessageHandedOff:
+def _hold_owned_message(session_dir: str, name: str, text: str, *, without_launcher: bool,
+                        sender: str, human: bool, repeat_checked: bool, guard_text: str) -> HoldOutcome | MessageHandedOff:
     """Add one message to a worker's held messages for the thread the roster names now.
 
     The roster is read under the pending lock, so a run that finished after an account move or a
@@ -2330,9 +2345,16 @@ def _hold_owned_message(session_dir: str, name: str, text: str, *, without_launc
         attached = status in LAUNCHER_ATTACHED_STATUSES and _pid_alive(launcher_pid) and not closed
         if not attached and not without_launcher:
             return NoLauncherAttached(thread_id, status)
+        receiver = repeat_guard.recipient_identity("", thread_id=thread_id)
+        if not repeat_checked:
+            decision = repeat_guard.transport_check(sender, receiver, guard_text or text, human=human)
+            if decision.held:
+                return RepeatHeld(decision.copies)
         messages = _pending_for_thread(handle, thread_id)
         messages.append(text)
         _write_pending(handle, thread_id, messages, accepting_messages=not closed)
+        if not repeat_checked:
+            repeat_guard.transport_result(sender, receiver, guard_text or text, "queued", human=human)
         return HeldForLauncher(thread_id) if attached else HeldForNextDispatch(thread_id)
 
 
@@ -5819,16 +5841,33 @@ def _end_unwatched_turn(
 
 
 def command_send(args: argparse.Namespace) -> int:
+    with repeat_guard.accounting_scope(owner=_attr(args, "no_accounting") is not True,
+                                       report=_attr(args, "report_recipient") is True):
+        return _command_send(args)
+
+
+def _command_send(args: argparse.Namespace) -> int:
     session_dir = _as_str(_attr(args, "session_dir"))
     target = _as_str(_attr(args, "to"))
+    text = _message_text(args)
+    guard_text = _as_str(_attr(args, "guard_text")) or text
     record = _lookup(session_dir, target)
     design_id = record.get("held_design_id")
     if design_id:
+        receiver = repeat_guard.recipient_identity("", thread_id=_as_str(record.get("thread_id")))
+        sender = _as_str(_attr(args, "sender")) or "codex-mesh"
+        if _attr(args, "repeat_checked") is not True:
+            decision = repeat_guard.transport_check(sender, receiver, guard_text, human=_attr(args, "human") is True)
+            if decision.held:
+                print(f"HELD: repeat guard: copy {decision.copies}")
+                return 4
         from scripts.astra import design_roles
         role = record.get("held_role")
         if role not in ("designer", "reviewer"):
             raise SystemExit("codex_mesh: unknown held role")
-        _ = design_roles.queue_message(design_id, role, _as_str(_attr(args, "source")) or "mesh send", _message_text(args))
+        _ = design_roles.queue_message(design_id, role, _as_str(_attr(args, "source")) or "mesh send", text)
+        if _attr(args, "repeat_checked") is not True:
+            repeat_guard.transport_result(sender, receiver, guard_text, "queued", human=_attr(args, "human") is True)
         print(f"queued for {target}; holder adds it to the next authorized assignment")
         return 0
     if record.get("status") == CAPACITY_EXHAUSTED:
@@ -5837,7 +5876,14 @@ def command_send(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    outcome = hold_message(session_dir, target, _message_text(args), without_launcher=True)
+    outcome = hold_message(session_dir, target, text, without_launcher=True,
+                           sender=_as_str(_attr(args, "sender")) or "codex-mesh",
+                           human=_attr(args, "human") is True,
+                           repeat_checked=_attr(args, "repeat_checked") is True,
+                           guard_text=guard_text)
+    if isinstance(outcome, RepeatHeld):
+        print(f"HELD: repeat guard: copy {outcome.copies}")
+        return 4
     if isinstance(outcome, WorkerEnded):
         print(f"codex_mesh: {outcome.reason}; message not delivered", file=sys.stderr)
         return 2
@@ -5869,6 +5915,11 @@ def command_steer(args: argparse.Namespace) -> int:
             raise SystemExit(
                 f"codex_mesh: {target} has no running turn to steer ({detail}); use `send`"
             )
+        receiver = repeat_guard.recipient_identity("", thread_id=_as_str(record.get("thread_id")))
+        decision = repeat_guard.transport_check("codex-mesh-steer", receiver, _message_text(args), human=_attr(args, "human") is True)
+        if decision.held:
+            print(f"HELD: repeat guard: copy {decision.copies}")
+            return 4
         client = Client(_worker_port(session_dir, record), f"steer-{os.getpid()}")
         message = _message_text(args)
         reply = client.call(
@@ -5906,6 +5957,7 @@ def command_steer(args: argparse.Namespace) -> int:
                     return 2
         _ = _require(reply, "turn/steer")
         client.close()
+        repeat_guard.transport_result("codex-mesh-steer", receiver, message, "sent", human=_attr(args, "human") is True)
         print(f"steered {target}")
         return 0
 
@@ -5922,7 +5974,11 @@ def command_interrupt(args: argparse.Namespace) -> int:
     message = _message_text(args)
     held = ""
     if message:
-        outcome = hold_message(session_dir, target, message, without_launcher=True)
+        outcome = hold_message(session_dir, target, message, without_launcher=True,
+            sender=_as_str(_attr(args, "sender")) or "codex-mesh", human=_attr(args, "human") is True)
+        if isinstance(outcome, RepeatHeld):
+            print(f"HELD: repeat guard: copy {outcome.copies}; nothing interrupted")
+            return 4
         if isinstance(outcome, WorkerEnded):
             print(f"codex_mesh: {outcome.reason}; nothing held or interrupted", file=sys.stderr)
             return 2
@@ -8988,6 +9044,12 @@ def main(argv: list[str] | None = None) -> int:
         "send", help="queue a message for a worker; without a launcher it waits for the next dispatch")
     _ = send.add_argument("--session-dir", required=True)
     _ = send.add_argument("--to", required=True)
+    _ = send.add_argument("--from", dest="sender", default="codex-mesh")
+    _ = send.add_argument("--human", action="store_true")
+    _ = send.add_argument("--no-accounting", action="store_true", help=argparse.SUPPRESS)
+    _ = send.add_argument("--report-recipient", action="store_true", help=argparse.SUPPRESS)
+    _ = send.add_argument("--guard-text", default="", help=argparse.SUPPRESS)
+    _ = send.add_argument("--repeat-checked", action="store_true", help=argparse.SUPPRESS)
     send_body = send.add_mutually_exclusive_group(required=True)
     _ = send_body.add_argument("--message")
     _ = send_body.add_argument("--message-file", help="read the message from this file")
@@ -8996,6 +9058,7 @@ def main(argv: list[str] | None = None) -> int:
     steer = subparsers.add_parser("steer", help="interrupt a worker's running turn")
     _ = steer.add_argument("--session-dir", required=True)
     _ = steer.add_argument("--to", required=True)
+    _ = steer.add_argument("--human", action="store_true")
     steer_body = steer.add_mutually_exclusive_group(required=True)
     _ = steer_body.add_argument("--message")
     _ = steer_body.add_argument("--message-file", help="read the message from this file")
@@ -9004,6 +9067,8 @@ def main(argv: list[str] | None = None) -> int:
     interrupt = subparsers.add_parser("interrupt", help="stop a worker's running turn, keeping the worker")
     _ = interrupt.add_argument("--session-dir", required=True)
     _ = interrupt.add_argument("--to", required=True)
+    _ = interrupt.add_argument("--human", action="store_true")
+    _ = interrupt.add_argument("--from", dest="sender", default="codex-mesh")
     interrupt_body = interrupt.add_mutually_exclusive_group()
     _ = interrupt_body.add_argument("--message", default="")
     _ = interrupt_body.add_argument("--message-file", help="read the message from this file")

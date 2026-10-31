@@ -482,6 +482,10 @@ class BoardJsonTests(unittest.TestCase):
 
     def test_timer_target_without_a_launch_staff_id_does_not_place_a_session(self) -> None:
         _ = self.production(running=False)
+        # This session has never had a staff identity. The normal writer keeps
+        # identities from earlier launches of the same conversation.
+        with pane_record.locked("agents"):
+            pane_record.save("agents", {})
         launch = pane_record.launch("unmarked", "show-id", str(self.root),
                                     {"CLAUDE_CONFIG_DIR": str(self.root / "account")}, ["claude"])
         launch["written_at"] = "2099-01-01T00:00:00+00:00"

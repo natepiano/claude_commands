@@ -33,7 +33,13 @@ Claude's `Edit|MultiEdit|Write` PostToolUse group runs basedpyright and fn-lengt
 
 ### Codex registration and trust
 
-`scripts/hooks/codex_hooks.py install|check` manages three handlers, each with its own tool matcher. Fn-length uses `PostToolUse` on `apply_patch` with a 10-second timeout. Berth uses `PreToolUse` on `apply_patch` with a 30-second timeout and runs `pre-tool-use-berth.py`. The scratch guard uses `PreToolUse` on `Bash` (Codex's name for a shell command, as in Claude Code) with a 10-second timeout and runs `pre-tool-use-scratch-guard.py`. Both `install` and `check` return 0 only when every handler is trusted and enabled. A trusted, enabled duplicate takes precedence over another matching entry.
+`scripts/hooks/codex_hooks.py install|check` manages six handlers. Fn-length uses `PostToolUse` on `apply_patch` with a 10-second timeout. Berth uses `PreToolUse` on `apply_patch` with a 30-second timeout and runs `pre-tool-use-berth.py`. The scratch guard and build-hold guard use `PreToolUse` on `Bash`, with 10-second timeouts. Codex uses `Bash` for shell commands, as Claude Code does. The guards run `pre-tool-use-scratch-guard.py` and `pre-tool-use-build-hold-guard.sh`.
+
+The `ste` and `ste-subagent` handlers run `session-start-ste.py` through the shared Python launcher, with 10-second timeouts. They use `SessionStart` and `SubagentStart`, respectively. Both use `matcher: "*"`. For `SessionStart`, the matcher filters the session source, including startup, resume, clear and compact. For `SubagentStart`, it filters the subagent type. The wildcard covers every source and type. See the [Codex hook reference](https://learn.chatgpt.com/docs/hooks).
+
+`session-start-ste.py` reads `config/simplified-technical-english.md` from its own checkout on each call. It prints the full text as `hookSpecificOutput.additionalContext`, with `hookEventName` set to the input event. Claude Code can use the same script for both events. A missing or unreadable file produces no output and exits 0. Invalid input also exits silently. The rule file is the single source; the hook does not copy its text into code.
+
+Both `install` and `check` return 0 only when every handler is trusted and enabled. A trusted, enabled duplicate takes precedence over another matching entry. Selection compares event, matcher, command and timeout. The two STE events share a command but retain separate trust identities. `hooks/list` reports their events as `sessionStart` and `subagentStart`. Registration in Claude's `settings.json` and installation into live Codex homes are separate deployment steps.
 
 `CodexHook(name, script, event, timeout)` defines a required handler. `LocatedHook` holds its definition, key, current hash, trust state and enabled state. `MissingHook` means no matching handler was listed from the managed configuration.
 
