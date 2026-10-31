@@ -4955,6 +4955,50 @@ class AccountsTests(unittest.TestCase):
         self.assertEqual(rows[1][2:], ("", *("unavailable",) * 2, "—", "—", "—*"))
         self.assertEqual(self.live_reads.call_count, 2)
 
+    def test_usage_only_selection_reads_local_accounts_without_repairs_or_sessions(self) -> None:
+        from scripts.message import sessions
+
+        self.login_directory("claude2", "desktop@example.invalid")
+        before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        with (patch.object(sessions, "live_sessions", side_effect=AssertionError("live session inventory")),
+              patch.object(accounts, "_shared_repair_problems", side_effect=AssertionError("shared link repair")),
+              patch.object(subprocess, "run", side_effect=AssertionError("external process"))):
+            selection = accounts.claude_account_selection(usage_only=True)
+        self.assertEqual([named.label for named in selection.named_accounts], ["claude2"])
+        self.assertEqual(selection.live_directories, ())
+        self.assertEqual(selection.live_logins, frozenset())
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
+
+    # Reserved fixtures model provider accounts in this status test.
+    @patch.object(accounts, "is_test_login", new=provider_fixture_login)
+    def test_a_refresh_without_session_credentials_keeps_a_good_reading_unstarred(self) -> None:
+        self.login_directory("claude2", "desktop@example.invalid")
+        at = datetime.now(timezone.utc) - timedelta(minutes=20)
+        usage_store.save([agent_accounts.Report("Claude", email="desktop@example.invalid",
+            source=agent_accounts.ClaudeDirectorySource(accounts.account_dir("claude2")),
+            quotas=[agent_accounts.Quota("Weekly", 25, at + timedelta(days=1))],
+            usage_read_outcome=agent_accounts.UsageReadOutcome.OK)], at)
+        before = usage_store.store_file().read_bytes()
+        self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude",
+            problem="Login credentials unavailable in this session",
+            usage_read_outcome=agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE)
+        code, output, error = self.run_cli("status")
+        self.assertEqual((code, error), (0, ""))
+        row = next(line for line in output.splitlines() if line.startswith("| ~/.claude2"))
+        self.assertIn("75%", row)
+        self.assertNotIn("*", row)
+        self.assertNotIn("the usage read failed", output)
+        self.assertNotIn("next try", output)
+        self.assertEqual(usage_store.store_file().read_bytes(), before)
+        code, document, error = self.run_cli("status", "--json")
+        self.assertEqual((code, error), (0, ""))
+        rows = cast(list[dict[str, object]], json.loads(document)["accounts"])
+        held = next(item for item in rows if item["label"] == "claude2")
+        self.assertIs(held["read_ok"], True)
+        self.assertEqual(held["weekly_left_percent"], 75)
+        self.assertEqual(usage_store.store_file().read_bytes(), before)
+        self.assertEqual(self.live_reads.call_count, 2)
+
     def test_login_renewal_uses_a_quiet_probe_and_keeps_the_new_reading(self) -> None:
         self.login_directory("claude2", "idle@example.invalid")
         self.live[accounts.account_dir("claude2")] = agent_accounts.Report("Claude",

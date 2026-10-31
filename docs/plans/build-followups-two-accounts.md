@@ -3010,3 +3010,14 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 Showrunner ruling 2026-10-31 06:29 EDT; user asked for the Mac fix at 06:30.
 
 **As-built:** home row compares the `~/.claude` project in both files; `mcp-repair <label> <server>` matches an account to `~/.claude` for one server (dated backup, atomic write, a missing file created 0600); `cutover-home` archives a same-login `~/.codex/auth.json` through its journal, undo restores it; status shows one row per login; credit readings older than ten minutes show as stale with their time, and status reads Codex credits live when they are stale; a credentials entry with no access token reads as `NO_LOGIN_TOKEN`: "no login token; start a session on it", never a retry; the expired-token step no longer promises a notes pass, which the Mac lacks. Review: two lenses, then one fix round (F001 missing-file repair, F002 no-token outcome), closure approved.
+
+### Phase 101h — The Mac refreshes its account readings  · status: done
+
+User 2026-10-31 07:5x EDT: claude3 shows a red dot on the Mac board while signed in. The board reads stored readings, and on the Mac nothing refreshes them; natedev refreshes them every 2 minutes from its `agent-sessions-snapshot` timer (`/etc/nixos/modules/linux/agent-sessions.nix`, which runs `whoami/agent_notes.py`).
+
+**Work Specification**
+
+1. **A Mac refresher.** Add a launchd user agent in `/etc/nixos/modules/darwin/` (the same repo as the Mac's `~/nixos`) that refreshes the account usage store every 2 minutes. It runs in the user's login session, so it reaches the keychain. `agent_notes.py` also runs quota alerts and the Codex pacer, which natedev owns: the Mac refresher must not send alerts or change routing. If no usage-only entry point exists, add one in one place and have both machines use it where that fits.
+2. **No false failure without credentials.** A read that cannot reach credentials (an ssh session has no keychain, so `claude auth status` says not logged in) must not store ERROR over a good reading or turn a dot red. Name that state as what it is.
+
+**As-built:** launchd job `account-usage` (`/etc/nixos/modules/darwin/account-usage.nix`, every 120 s, at login, Aqua session) runs `agent_notes.py usage-only`, which reads usage and sends no alerts and changes no routing; a read that cannot reach credentials (signed-out CLI answer, exit 1 over ssh) records CREDENTIALS_UNAVAILABLE and keeps the last good outcome. Review: two lenses found F001 (signed-out exit 1 still stored ERROR); one fix round; closure approved.

@@ -1662,11 +1662,11 @@ def multiple_accounts_configured() -> bool:
     return bool(_existing_named_accounts())
 
 
-def checked_named_accounts() -> list[NamedAccount]:
+def checked_named_accounts(*, allow_shared_repair: bool = True) -> list[NamedAccount]:
     """Every existing named account fit for a live reading or launch."""
     return [named for named in _existing_named_accounts()
             if isinstance(_inspect_account_directory(
-                named, _account_note(named.label), allow_shared_repair=True,
+                named, _account_note(named.label), allow_shared_repair=allow_shared_repair,
             ), AccountDirectoryReady)]
 
 
@@ -1744,8 +1744,8 @@ def claude_workers_account(label: str) -> NamedAccount:
     return NamedAccount(label, directory)
 
 
-def claude_account_selection() -> agent_accounts.ClaudeAccountsInUse:
-    """Freeze the default, readable directories and local live logins once per run."""
+def claude_account_selection(*, usage_only: bool = False) -> agent_accounts.ClaudeAccountsInUse:
+    """Freeze readable accounts; usage-only selection repairs no links and reads no sessions."""
     from scripts.message import sessions
 
     default = account_identity(main_config_dir())
@@ -1754,13 +1754,13 @@ def claude_account_selection() -> agent_accounts.ClaudeAccountsInUse:
                   if isinstance(default, (agent_accounts.NumberedAccount, agent_accounts.UnnotedLogin))
                   else account.ConfigOnlyHome())
     named_accounts: list[agent_accounts.CheckedNamedClaudeAccount] = []
-    for named in checked_named_accounts():
+    for named in checked_named_accounts(allow_shared_repair=not usage_only):
         identity = account_identity(named.dir)
         if isinstance(identity, agent_accounts.NumberedAccount):
             named_accounts.append(agent_accounts.CheckedNamedClaudeAccount(note_file.canonical_label(named.label), named.dir, identity))
     live_logins: set[str] = set()
     live_directories: dict[Path, None] = {}
-    for session in sessions.live_sessions():
+    for session in (() if usage_only else sessions.live_sessions()):
         identity = account.account_of(session["pid"], home_state=home_state)
         setting = account.process_account_directory(account.process_config_dir(session["pid"]), home_state=home_state)
         directory = setting.path if isinstance(setting, account.ConfiguredClaudeFolder) else None
@@ -4406,6 +4406,8 @@ def _read_failure_problem(row: StatusRow, zone: tzinfo,
             retry = (f"after {(row.attempted_at + timedelta(minutes=10)).astimezone(zone):%H:%M}"
                      if isinstance(row.attempted_at, datetime) else "in 2 min")
             cause, step = f"the usage service is busy; {previous}", f"next try {retry}"
+        case agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE:
+            cause, step = "login credentials unavailable in this session", "refresh from a logged-in desktop session"
         case agent_accounts.UsageReadOutcome.ERROR:
             cause, step = f"the usage read failed; {previous}", "next try in 2 min"
         case agent_accounts.UsageReadOutcome.OK | agent_accounts.UsageReadOutcome.HELD:
