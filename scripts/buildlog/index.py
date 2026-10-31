@@ -322,7 +322,7 @@ MAC_IDLE_COLUMNS: list[Column] = [
     ("package", "TEXT", "test package"),
     ("wait", "TEXT", "memory, build_hold, cargo_token or routing; backed by live wait evidence"),
     ("cause", "TEXT", "missing_temp_root, missing_leave_hook, retry_delayed, call_has_no_marker_hook or idle_with_waiter"),
-    ("action", "TEXT", "created_session_temp_root, retry_marker, message_builds_unit or message_pending (send retried; row stays once)"),
+    ("action", "TEXT", "created_session_temp_root, retry_marker, message_showrunner or message_pending (send retried; row stays once)"),
 ]
 
 QUEUE_BUMP_COLUMNS: list[Column] = [

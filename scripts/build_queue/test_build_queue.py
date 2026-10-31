@@ -8,6 +8,8 @@ import fcntl
 import io
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 import time
 import unittest
@@ -22,11 +24,14 @@ from scripts.build_queue.queue_fixture import (
 )
 from scripts.build_queue.queue_lines import QueueLines, Span, plain, terminal_width
 from scripts.buildlog import store
+from scripts.buildlog.mac_idle_test_support import NotificationGuardedTestCase, write_idle_alert
 from scripts.lint import memory_admit
 from scripts.message import roster, unit_labels
 from scripts.message.unit_labels import UnitLabels, unit_labels_for
 
 GIB = memory_admit.GIB
+
+
 
 
 class LabelReadMock(Protocol):
@@ -38,17 +43,20 @@ class LabelReadMock(Protocol):
     def reset_mock(self) -> None: ...
 
 
-class QueueTests(unittest.TestCase):
+class QueueTests(NotificationGuardedTestCase):
     fixture: QueueFixture = cast(QueueFixture, cast(object, None))
     root: Path = Path()
     labels_read: LabelReadMock = cast(LabelReadMock, cast(object, None))
 
     @override
     def setUp(self) -> None:
+        super().setUp()
         self.fixture = self.enterContext(QueueFixture(captured=False))
         self.root = self.fixture.root
         self.labels_read = cast(LabelReadMock, self.enterContext(mock.patch.object(unit_labels, "unit_labels_for", return_value={})))
-        self.enterContext(mock.patch.dict(os.environ, {"COLUMNS": "100"}))
+        self.enterContext(mock.patch.dict(os.environ, {
+            "COLUMNS": "100", "MAC_IDLE_STATE_DIR": str(self.root / "mac-idle"),
+        }))
 
     @staticmethod
     def entry(session: str, name: str) -> tuple[str, UnitLabels]:
@@ -65,7 +73,8 @@ class QueueTests(unittest.TestCase):
         model = self.model(queue_read_fixture(view))
         return plain(queue_view.check_lines(queue_view.step_checks(model, 1), model))
 
-    def invoke(self, reading: memory_admit.QueueRead, *arguments: str) -> tuple[int, str, str]:
+    def invoke(self, reading: memory_admit.QueueRead | memory_admit.QueueBusy,
+               *arguments: str) -> tuple[int, str, str]:
         output, errors = io.StringIO(), io.StringIO()
         with mock.patch.object(memory_admit, "queue_read", return_value=reading) as read, \
              mock.patch("sys.argv", ["build_queue.py", *arguments]), \
@@ -83,6 +92,71 @@ class QueueTests(unittest.TestCase):
     @staticmethod
     def snapshot_text(data: QueueLines) -> str:
         return "\n".join("".join(span["text"] for span in row) for row in data["lines"])
+
+
+    def test_queue_and_why_help_start_without_pythonpath(self) -> None:
+        environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+        environment["MAC_IDLE_STATE_DIR"] = str(self.root / "mac-idle")
+        for name in ("build_queue.py", "build_why.py"):
+            with self.subTest(script=name):
+                result = subprocess.run([sys.executable, str(Path(__file__).with_name(name)), "--help"],
+                    env=environment, capture_output=True, text=True, timeout=30, check=False)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_mac_idle_alert_precedes_queue_and_selection_in_text_and_json(self) -> None:
+        _ = write_idle_alert(self.root / "mac-idle", NOW)
+        reading = head_reading(now=NOW)
+        expected = ("MAC IDLE 10 min: 7 steps wait for the Mac. Blocked by research since "
+                    + time.strftime("%H:%M", time.gmtime(NOW - 600))
+                    + " (P15 F11 L0 run); /build:mac unblock clears it.")
+        with mock.patch.object(time, "time", return_value=NOW), \
+             mock.patch.object(build_queue, "user_zone", return_value=ZoneInfo("UTC")):
+            for arguments in ((), ("1",)):
+                with self.subTest(arguments=arguments):
+                    code, output, errors = self.invoke(reading, *arguments)
+                    self.assertEqual((code, errors), (0, ""))
+                    self.assertEqual(output.splitlines()[0], expected)
+                    data = self.snapshot(reading, *arguments)
+                    self.assertEqual(data["lines"][0], [{"text": expected, "tone": "error", "bold": True}])
+                    self.assertGreater(len(data["lines"]), 1)
+
+    def test_mac_idle_alert_precedes_busy_queue_in_text_and_json(self) -> None:
+        _ = write_idle_alert(self.root / "mac-idle", NOW)
+        with mock.patch.object(time, "time", return_value=NOW):
+            for arguments in ((), ("--json",)):
+                with self.subTest(arguments=arguments):
+                    code, output, errors = self.invoke(memory_admit.QueueBusy(), *arguments)
+                    self.assertEqual((code, errors), (0, ""))
+                    if arguments:
+                        data = cast(QueueLines, json.loads(output))
+                        first = data["lines"][0][0]
+                        self.assertTrue(first["text"].startswith("MAC IDLE 10 min: 7 steps"))
+                        self.assertEqual((first.get("tone"), first.get("bold")), ("error", True))
+                        self.assertEqual(data["lines"][1], [{"text": "queue busy; try again"}])
+                    else:
+                        self.assertTrue(output.splitlines()[0].startswith("MAC IDLE 10 min: 7 steps"))
+                        self.assertEqual(output.splitlines()[1], "queue busy; try again")
+
+    def test_stale_mac_reading_precedes_queue(self) -> None:
+        _ = write_idle_alert(self.root / "mac-idle", NOW, written_age=301)
+        with mock.patch.object(time, "time", return_value=NOW):
+            data = self.snapshot(head_reading(now=NOW))
+        first = data["lines"][0][0]
+        self.assertTrue(first["text"].startswith("MAC IDLE WATCH: no reading since "))
+        self.assertTrue(first["text"].endswith("; check buildlog-sample.timer."))
+        self.assertEqual(first.get("tone"), "error")
+
+    def test_alert_fixture_read_stays_local_and_finishes_under_50_ms(self) -> None:
+        from scripts.buildlog import mac_idle_alert
+
+        path = write_idle_alert(self.root / "mac-idle", NOW)
+        with mock.patch("subprocess.run", side_effect=AssertionError("alert read starts a process")):
+            started = time.perf_counter()
+            line = mac_idle_alert.alert_line(path, NOW, ZoneInfo("UTC"))
+            elapsed = time.perf_counter() - started
+        self.assertIsNotNone(line)
+        self.assertIn("Blocked by research", line or "")
+        self.assertLess(elapsed, 0.05)
 
 
     def test_older_fitting_step_reason_names_waiting_place_or_unmatched_fallback(self) -> None:

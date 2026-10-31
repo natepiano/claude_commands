@@ -20,7 +20,7 @@ import sys
 import tempfile
 import time
 import threading
-from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, TypeGuard, TypedDict, cast
 from urllib.parse import quote
 
 
@@ -32,6 +32,13 @@ import build_hold
 import offload
 import sweep
 from user_zone import user_zone
+
+
+if TYPE_CHECKING:
+    from ..buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, config_path, idle_config
+else:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from scripts.buildlog.mac_idle_alert import MacIdleConfig, MacIdleConfigError, config_path, idle_config
 
 
 MESSAGE_TIMEOUT_S = 30.0
@@ -59,6 +66,7 @@ class ClaimOwnerRecord(TypedDict):
     since: str
     holder_session: NotRequired[str]
     idle_since: NotRequired[str]
+    work_idle_since: NotRequired[str]
     copy: NotRequired[bool]
 
 
@@ -349,6 +357,7 @@ NO_EXPIRED_BLOCK_LIFT_FAILURE = NoExpiredBlockLiftFailure()
 class MacTestConfig:
     """Mac claim, block and CI settings."""
 
+    idle: MacIdleConfig
     ci_repo: str
     ci_variable: str
     ci_workflow: str
@@ -368,6 +377,7 @@ class MacActive:
     """The user's Mac processes seen by the activity check."""
 
     count: int
+    work: int
 
 
 @dataclass(frozen=True)
@@ -453,11 +463,6 @@ def state_paths() -> StatePaths:
     return StatePaths(Path(configured).expanduser())
 
 
-def config_path() -> Path:
-    configured = os.environ.get("MAC_TEST_CONFIG", "~/.claude/config/mac_test.conf")
-    return Path(configured).expanduser()
-
-
 def configured_number(values: dict[str, str], key: str, default: float) -> float:
     try:
         value = float(values.get(key, str(default)))
@@ -469,6 +474,7 @@ def configured_number(values: dict[str, str], key: str, default: float) -> float
 def read_config() -> MacTestConfig:
     values = sweep.config_values(str(config_path()))
     return MacTestConfig(
+        idle=idle_config(values),
         ci_repo=values.get("ci_repo", ""),
         ci_variable=values.get("ci_variable", "MACOS_CI"),
         ci_workflow=values.get("ci_workflow", "ci.yml"),
@@ -552,10 +558,14 @@ def read_run(path: Path) -> RunState:
         if not holder_session.strip():
             raise StateReadError(f"{path} has an invalid holder_session")
         record["holder_session"] = holder_session
-    if "idle_since" in values:
-        idle_since = values["idle_since"]
-        _ = aware_timestamp(idle_since, path, "idle_since")
-        record["idle_since"] = cast(str, idle_since)
+    for field in ("idle_since", "work_idle_since"):
+        if field in values:
+            idle_since = values[field]
+            _ = aware_timestamp(idle_since, path, field)
+            if field == "idle_since":
+                record["idle_since"] = cast(str, idle_since)
+            else:
+                record["work_idle_since"] = cast(str, idle_since)
     if "copy" in values:
         if values["copy"] is not True:
             raise StateReadError(f"{path} has an invalid copy")
@@ -1511,17 +1521,25 @@ def mac_activity_script() -> str:
 mirror_pids=$(select_leftovers) || exit 1
 process_records=$(ps -axww -o pid=,uid=,comm=) || exit 1
 activity_user=$(id -u) || exit 1
-executable_pids=$(printf '%s\n' "$process_records" | awk -v user="$activity_user" '
+executable_records=$(printf '%s\n' "$process_records" | awk -v user="$activity_user" '
     $2 == user {
         executable = $0
         sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", executable)
         name = executable
         sub(/^.*\//, "", name)
-        if (name == "cargo" || name == "rustc" || name == "cargo-nextest" || executable ~ /\/target\//)
-            print $1
+        compiler = name == "cargo" || name == "rustc" || name == "cargo-nextest"
+        if (compiler || executable ~ /\/target\//)
+            print $1, (!compiler && executable ~ /\/target\// && executable !~ /\/deps\//) ? "app" : "work"
     }') || exit 1
-active_count=$(printf '%s\n%s\n' "$mirror_pids" "$executable_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { count++ } END { print count+0 }') || exit 1
-printf 'active=%s\nrc=0\n' "$active_count"
+executable_pids=$(printf '%s\n' "$executable_records" | awk '{ print $1 }') || exit 1
+app_pids=$(printf '%s\n' "$executable_records" | awk '$2 == "app" { print $1 }') || exit 1
+active_pids=$(printf '%s\n%s\n' "$mirror_pids" "$executable_pids" | awk '/^[0-9]+$/ && !seen[$0]++ { print $0 }') || exit 1
+work_count=$(printf '%s\n' "$app_pids" '--active--' "$active_pids" | awk '
+    $0 == "--active--" { active=1; next }
+    /^[0-9]+$/ { if (!active) app[$0]=1; else if (!app[$0]) count++ }
+    END { print count+0 }') || exit 1
+active_count=$(printf '%s\n' "$active_pids" | awk '/^[0-9]+$/ { count++ } END { print count+0 }') || exit 1
+printf 'active=%s\nwork=%s\nrc=0\n' "$active_count" "$work_count"
 '''
 
 
@@ -1543,16 +1561,19 @@ def check_mac_activity(config: MacTestConfig, host: str) -> MacActivity:
         reason = " ".join(result.stderr.split()) or f"SSH exited {result.returncode}"
         return ActivityCheckFailed(reason)
     lines = result.stdout.splitlines()
-    if len(lines) != 2 or lines[1] != "rc=0" or not lines[0].startswith("active="):
+    if (len(lines) != 3 or lines[2] != "rc=0" or not lines[0].startswith("active=")
+            or not lines[1].startswith("work=")):
         return ActivityCheckFailed("the activity check answer could not be read")
-    count_text = lines[0].removeprefix("active=")
-    if not count_text.isascii() or not count_text.isdecimal():
+    counts = [lines[0].removeprefix("active="), lines[1].removeprefix("work=")]
+    if any(not text.isascii() or not text.isdecimal() for text in counts):
         return ActivityCheckFailed("the activity check answer could not be read")
     try:
-        count = int(count_text)
+        count, work = (int(text) for text in counts)
     except ValueError:
         return ActivityCheckFailed("the activity check answer could not be read")
-    return MacActive(count) if count else MacIdle()
+    if work > count:
+        return ActivityCheckFailed("the activity check work count exceeds its active count")
+    return MacActive(count, work) if count else MacIdle()
 
 
 def claim_idle_clause(run: RunRecord) -> str:
@@ -1607,15 +1628,27 @@ def watch_claim(
         if isinstance(activity, ActivityCheckFailed):
             print(f"Mac claim activity check failed: {activity.reason}", flush=True)
             return True
+        changed = False
+        if isinstance(activity, MacActive) and activity.work > 0:
+            if "work_idle_since" in current:
+                del current["work_idle_since"]
+                changed = True
+        elif "work_idle_since" not in current:
+            current["work_idle_since"] = timestamp(now)
+            changed = True
         if isinstance(activity, MacActive):
             if "idle_since" in current:
                 del current["idle_since"]
+                changed = True
+            if changed:
                 write_json(claim.path, current)
             return True
         if "idle_since" not in current:
             current["idle_since"] = timestamp(now)
             write_json(claim.path, current)
             return True
+        if changed:
+            write_json(claim.path, current)
         idle_since = aware_timestamp(current["idle_since"], claim.path, "idle_since")
         if now - idle_since < timedelta(minutes=config.claim_idle_minutes):
             return True
@@ -2464,7 +2497,11 @@ def main() -> int:
         return command_release(args, paths)
     if args.command == "free-now":
         return command_free_now(args, paths)
-    config = read_config()
+    try:
+        config = read_config()
+    except MacIdleConfigError as error:
+        print(f"mac_test: {error}", file=sys.stderr)
+        return 2
     if args.command == "block":
         return command_block(args, paths, config)
     if args.command == "unblock":

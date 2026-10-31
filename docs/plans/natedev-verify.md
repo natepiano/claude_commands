@@ -507,3 +507,335 @@ Checkpoint 404a4ea0 on `natedev-verify-cancel`.
 - `--fetch` is relative to the repository root (the mirror root); nextest runs each test in its package folder, so a fixture must write to that root-relative folder.
 
 **Ruled out:** forwarded names, values or the fetched folder in the build log; an order among Mac-only waiters; a natedev fallback for any Mac answer.
+
+### Phase 16 — Raise a red alert when the Mac takes no work while steps wait  · status: done
+
+**Origin:** builds showrunner, 2026-10-31 07:47 EDT, with the user's words: "you should have some kind of red alert that occurs when you have nothing running on the mac as is the case right now - it is a major failure when the mac is available and not taking work". Built on branch `natedev-verify-cancel`, worktree `/home/natepiano/worktrees/claude-build-followups-verify-cancel` (HEAD e6f8540f, Phase 14 shrink).
+
+**Depends on:** Phase 14 (same branch). Nothing else. This unit owns `scripts/buildlog/mac_idle.py` (production doc Units row). The two views belong to queue-unit (`/build:queue`, `/build:status`); this phase adds only the small read of the saved result there and names those paths in the checkpoint's also-touches line.
+
+#### Work Order
+
+**Source:** builds showrunner ruling, 2026-10-31 07:47 EDT (binding). Cause today: `mac_idle.watch_once` (`scripts/buildlog/mac_idle.py:257-337`) returns at lines 277-280 when a claim, `run.json` or `block.json` exists, and at 287-289 for a future `unreachable_until`. It reads only steps in `waiting_hold`/`waiting_mac`, never reaches the user, and `notify_director` (lines 220-246) sends only to the `builds-unit` director of production `build-followups` (line 235), which no longer directs. At 07:47 EDT research held a block (`~/.local/state/mac-test/block.json`, holder `research`, for `P15 F11 L0 run`), no natedev job ran on the Mac, and live `mac_allowed` test steps waited in `waiting_hold` on natedev (7 at 07:49). The watch saw nothing. From 07:50 to about 07:57 the second idle stretch was a live research claim with only a parked hana app on the Mac: no compile or test ran while 7 test runs waited. The claim watcher counts the app as Mac activity, so it wrote no `idle_since`.
+
+**Goal:** when no job from natedev runs on the Mac for 3 minutes and a step the Mac could run waits, `/build:queue` and `/build:status` show a red line at the top, the builds showrunner gets one message, and at 10 minutes the user gets one phone push per outage.
+
+**Spec:**
+
+1. **One check.** All of this is in `mac_idle.watch_once`. Add no second checker, timer or service. The `buildlog sample` pass on natedev already calls it every 60 s (`scripts/buildlog/cli.py:289-293`, `buildlog-sample.timer`); keep that caller and the non-blocking `watch.lock` (lines 260-264).
+2. **Mac work reading.** Replace the early returns at lines 268-289 with one function `mac_work(paths: MacIdlePaths, now: float) -> NatedevJobOnMac | MacIdle | MacUnreachable | MacStateUnreadable`. It reads local files only. It never reads the Mac's load, never runs ssh and never matches a process or command name.
+   - `NatedevJobOnMac`: a legacy `run.json` exists, or a claim file in `paths.mac_state / "claims"` is live and has no `work_idle_since` (Spec 12). A running app does not count as a job. Live is the claim rule of `mac_test.run_is_live`: a process-bound claim while `/proc/<pid>/stat` field 22 equals `proc_start`; a remote claim (`remote_host`) always. All claim files live on natedev, so every claim is a job sent from natedev.
+   - `MacIdle(cause, holder, detail)`, in this order: `blocked` when `block.json` exists (holder = the block's `holder`, detail = its `for`, also the block's `session`); `claim_idle` when every live claim has `work_idle_since` (the claim watcher writes it when the Mac has no build or test process, also while an app runs; holder = the claim's `holder_session` shown name, detail = its `what`); `free` when there is no block and no live claim.
+   - `MacUnreachable(until)`: `unreachable_until` holds a finite time later than `now`. It wins over `MacIdle`.
+   - `MacStateUnreadable(reason)`: the claims folder or a claim or block file cannot be read. Write it to the saved result; send nothing.
+3. **Idle interval.** `idle.json` keeps `since`. A `NatedevJobOnMac` reading removes it. The first idle reading writes `since = now`. A newer claims-folder mtime moves `since` forward, as lines 294-296 do now. The interval key of an outage is `int(since)`.
+4. **Waiting steps.** Count the steps the Mac could run with the recorded decision: `waiting_calls(paths, live)` (lines 179-207), which keeps only live step records with `runs_on` `MacAllowed` and state `waiting_hold` or `waiting_mac`. Steps in natedev's memory queue are `waiting_hold` (`buildlog_wait_for_memory`, `scripts/direct/verify.sh:2998-3036`), so they count. Leave out a call whose registered record has a `local_reason` (set by `mac_idle.py exclude` for `no_tests`, `off`, `repo`, `linux_only`, `local_flag`). A step that the Mac declined for a block is not excluded and counts. A `natedev_only` record never counts.
+5. **Saved result.** Each pass writes `<state>/alert.json` through `write_record` (atomic replace), also when nothing is wrong: `{"version": 1, "written": <now>, "state": "busy"|"idle"|"unreachable"|"unreadable", "since": <float or 0>, "waiting": <int>, "cause": "blocked"|"claim_idle"|"free"|"", "holder": <text>, "detail": <text>, "until": <float or 0>, "messaged": <bool>, "pushed": <bool>}`. `messaged` and `pushed` belong to the outage `since`; a new `since` sets both to false. The holder session's shown name is read once per outage with `scripts.message.unit_labels.unit_labels_for` and stored in `holder`; the views never resolve a name.
+6. **New module `scripts/buildlog/mac_idle_alert.py`** (stdlib, `scripts.buildlog.store` and `scripts.lib.user_zone` only; no subprocess). It is the one place for the path, the file form and the line text:
+   - `state_dir() -> Path`: `MAC_IDLE_STATE_DIR`, else `store.root().parent / "mac-idle"`. `mac_idle.watch_paths` (lines 42-50) uses it.
+   - `ALERT_SECONDS = 180`, `PUSH_SECONDS = 600`, `STALE_SECONDS = 300`; `mac_idle.IDLE_SECONDS` (line 28) becomes `ALERT_SECONDS`.
+   - `class SavedAlert(TypedDict)` with the fields of item 5; `read_alert(path: Path) -> SavedAlert | NoSavedAlert | UnreadableAlert` (validates every field at the JSON boundary).
+   - `alert_line(path: Path, now: float, zone: ZoneInfo) -> str | None`. `None` when the file is missing, `state` is `busy`, `waiting` is 0, or the Mac is idle for less than `ALERT_SECONDS`. Otherwise one line:
+     - idle: `MAC IDLE <minutes> min: <waiting> steps wait for the Mac. <cause text>.` with cause text `Blocked by <holder> since <HH:MM> (<detail>); /build:mac unblock clears it`, `Claim of <holder> (<detail>) runs no build or test on the Mac`, or `No block and no claim; the waiting steps do not take the Mac`.
+     - unreachable: `MAC UNREACHABLE until <HH:MM>: <waiting> steps wait for the Mac.` (a separate line, also before 3 minutes).
+     - unreadable: `MAC IDLE WATCH: Mac state unreadable: <reason>.`
+     - stale (`written` older than `STALE_SECONDS`): `MAC IDLE WATCH: no reading since <HH:MM>; check buildlog-sample.timer.`
+     Times are in the user's zone. Fields pass through `display_field`-style control-character removal.
+7. **The views (queue-unit paths).**
+   - `scripts/build_queue/build_queue.py` `main` (lines 62-85): after `lines` is built (both `render_view` and `render_selection`), when `alert_line(state_dir() / "alert.json", time.time(), user_zone())` returns text, insert `(Span(text, "error", bold=True),)` as line 0. Text and `--json` output both carry it; the pane shows tone `error` in red. The queue-busy branch (lines 66-71) also prints the line first.
+   - `scripts/build_targets/build_targets.py` `command_status` (lines 141-167): print the line before the target lines. Use ANSI bold red only when `sys.stdout.isatty()`; piped output stays plain. Import as `scripts.buildlog.mac_idle_alert` with the `TYPE_CHECKING` pattern of lines 54-57.
+   - The read is one small file read: no subprocess, no lock, no ssh.
+8. **Stage 1, 3 minutes: message the builds showrunner.** When `state` is `idle`, `waiting > 0` and `now - since >= ALERT_SECONDS` and not `messaged`: resolve the address with `[sys.executable, SCRIPTS / "production/showrunners.py", "address", "builds"]` (the same answer as `~/.claude/scripts/lib/py ~/.claude/scripts/production/showrunners.py address builds`, which prints `uds:<socket>`), then `send.py --to <address> --from "Mac idle watch" --key mac-idle-showrunner-<since> --text <alert line, then one line per waiting step: repo, kind, package, pid, wait from waiting_evidence>`. Exit 0 or 1 (queued) sets `messaged`. An empty address or a failed send leaves it false; the next pass tries again and prints one stderr line. Replace `notify_director` with `notify_showrunner(text: str) -> bool` and use it for the per-call repair messages too: action word `message_builds_unit` becomes `message_showrunner` (and `message_pending` stays). No unit, production or roster name is written in code.
+9. **Stage 2, 10 minutes: one phone push.** When still idle with `waiting > 0`, `now - since >= PUSH_SECONDS` and not `pushed`: send a registered push through `push_texts.render` and `push_texts.user_send_argv`, `--from "Mac idle watch"`, `--key mac-idle-<since>`.
+   - Cause `blocked`: text id `mac_idle.blocked`, need `blocked` (an emergency push: a block waits on a person to finish at the Mac and run `/build:mac unblock`), with `--clears-when "<SCRIPTS>/lib/py <SCRIPTS>/buildlog/mac_idle.py cleared --since <since>"`. Add `clears_when: str = ""` to `push_texts.user_send_argv` (`scripts/notify/push_texts.py:151-169`); it appends `--clears-when <text>`.
+   - Causes `claim_idle` and `free`: text id `mac_idle.stuck`, need `decision`, with `--repeat-minutes 1440`.
+   - Values: `minutes`, `waiting`, `holder`, `detail`, `since` (HH:MM, user zone) and `clears` (what clears it: `/build:mac unblock by <holder>`, `release of the idle claim <detail>`, or `the builds showrunner checks why the waiting steps do not take the Mac`).
+   - Exit 0 (SENT, SKIPPED, KEPT, REPLACED) sets `pushed`. HELD (4), FAILED (3) and REFUSED (2) leave it false and print one stderr line; the next pass tries again with the same key, so the user gets at most one push per outage.
+   - New `mac_idle.py cleared --since <float>`: exits 0 when `alert.json` has a `state` other than `idle`, a different `since`, or `waiting` 0; exits 1 otherwise and when the file is missing or stale. It reads only the saved result.
+10. **Push texts.** Add `PushText("mac_idle.blocked", ...)` (need `blocked`) and `PushText("mac_idle.stuck", ...)` (need `decision`) to `scripts/notify/push_catalog.py`, each with an action line and two examples from today's case (block by research with 7 steps; idle claim with 3 steps). Title under 45 characters, body under 500, no `@` (`test_push_texts.py`). Approve them with `review.py texts --approve` (`docs/as-built/message-clarity.md`, `push_texts_reviewed.json`). After 3 failed review rounds, send the drafts to the builds showrunner and record its answer with `--user-spec`.
+11. **Repairs keep their condition.** The per-call repair loop (lines 299-337: temp root, retry marker, message) runs only for `MacIdle` with cause `free`, as today with no block and no claim. A block or an idle claim gets the alert, not repairs.
+12. **Build or test work on a claim.** `mac_test.mac_activity_script()` (`scripts/mac_test/mac_test.py:1508`) also prints `work=<n>`: the processes it counts now, less those whose executable path contains `/target/` but not `/deps/` (an app; test binaries run from `target/<profile>/deps/`). `cargo`, `rustc` and `cargo-nextest` count as work. `MacActive` carries `work: int`. `claim_watch_pass` (lines 1568-1640) writes the optional claim key `work_idle_since` when `work` is 0 and removes it when `work` > 0, under the same `pid`/`proc_start`/`since` check as `idle_since`. `idle_since` and the 15-minute release keep their rule, so a parked app keeps its claim. `read_run` (line 555) accepts the new key. A failed activity check removes neither key.
+13. **Docs.** `docs/as-built/mac-test-offload.md` "The idle Mac watch" and `docs/as-built/build-targets.md:69-71` state the new trigger, the saved result, both stages and the showrunner address; `commands/build/queue.md` and `commands/build/status.md` name the top line and what clears it; `scripts/buildlog/index.py:325` column text names `message_showrunner`.
+
+**Files:**
+- `scripts/buildlog/mac_idle.py` — `mac_work`, the interval, the waiting count, `alert.json`, `notify_showrunner`, both stages, `cleared`
+- `scripts/buildlog/mac_idle_alert.py` — new: `state_dir`, the constants, `SavedAlert`, `read_alert`, `alert_line`
+- `scripts/buildlog/test_mac_idle.py` — the outage tests; replace `test_message_resolves_only_builds_unit_in_build_followups`
+- `scripts/buildlog/index.py` — action column text only (no schema change)
+- `scripts/mac_test/mac_test.py` — `work=` in `mac_activity_script`, `MacActive.work`, `work_idle_since` in `claim_watch_pass` and `read_run`
+- `scripts/mac_test/test_mac_test.py` — `work_idle_since` written with only an app process, removed with a test process; `idle_since` rule unchanged
+- `scripts/notify/push_texts.py` — `user_send_argv(clears_when=...)`
+- `scripts/notify/push_catalog.py` — `mac_idle.blocked`, `mac_idle.stuck`
+- `scripts/notify/push_texts_reviewed.json` — their approvals
+- `scripts/build_queue/build_queue.py` — the top line (queue-unit path, also-touches)
+- `scripts/build_queue/test_build_queue.py` — top line tests; `setUp` (line 51) sets `MAC_IDLE_STATE_DIR` to a private empty folder so the real alert never enters the goldens
+- `scripts/build_targets/build_targets.py` — the top line in `command_status` (queue-unit path, also-touches)
+- `scripts/build_targets/test_build_targets.py` — top line tests
+- `commands/build/queue.md` — the top line
+- `commands/build/status.md` — the top line
+- `docs/as-built/mac-test-offload.md` — the idle Mac watch section
+- `docs/as-built/build-targets.md` — idle watch lines
+
+**Workers:** 2 writers (no test lane: Python tests sit beside their modules).
+- `impl` — `scripts/buildlog/mac_idle.py`, `scripts/buildlog/test_mac_idle.py`, `scripts/buildlog/index.py`, `scripts/mac_test/mac_test.py`, `scripts/mac_test/test_mac_test.py`, `scripts/notify/push_texts.py`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, both as-built docs; hub: `scripts/buildlog/mac_idle_alert.py` (both views read it; `impl` writes it first, from Spec 6, and the other writer asks for any change).
+- `test` — opens as impl — `scripts/build_queue/build_queue.py`, `scripts/build_queue/test_build_queue.py`, `scripts/build_targets/build_targets.py`, `scripts/build_targets/test_build_targets.py`, `commands/build/queue.md`, `commands/build/status.md`; codes against the Spec 6 API and writes a fixture `alert.json` for its tests.
+
+**State:** `~/.local/state/mac-idle/alert.json` (rewritten each pass), `idle.json` (outage `since`), the `messaged`/`pushed` marks, the send keys `mac-idle-showrunner-<since>` and `mac-idle-<since>` in send.py state, and the `emergencies.json` record that `--clears-when` adds. A rerun of a pass with the same files sends nothing more and writes the same result.
+
+**Constraints from prior phases:**
+- Showrunner ruling (binding): one check in `mac_idle.py`; idle means no natedev job of ours on the Mac, never the Mac's load; a block counts as idle when no natedev job runs, and so does a claim whose Mac has no process; only a future `unreachable_until` is a separate "Mac unreachable" line; use the recorded `runs_on`, no name matching; the showrunner address comes from `showrunners.py address builds`, never a hard-coded unit name.
+- `mac_idle.py` today: `register`, `remove` and `exclude` (lines 340-357) are verify.sh's interface (`scripts/direct/verify.sh:1133-1134`, `1840-1851`, `1853-1878`); keep their arguments and output. `.cases` records and `record_case` rows (lines 249-254) stay one per cause per call.
+- The claim watcher (`mac_test.py claim_watch_pass`, lines 1568-1640) writes and removes `idle_since` from one ssh activity check per host every 60 s and releases a claim after 15 idle minutes; Spec 12 adds `work_idle_since` from the same check. `mac_idle.py` reads `work_idle_since` and runs no ssh of its own.
+- Phase 9: `verify.sh` starts no new Python; this phase does not change `verify.sh`.
+- Phase 14: a `--mac` step waits in `route_test_without_renewal` in state `waiting_mac`; it counts as a waiting step.
+- Memory rules: no second copy of the line text or the path (Spec 6 is the one place); a push that asks nothing is held by review, so both texts name an action; the 3 minutes and 10 minutes come from the user's ruling and live as named constants.
+- Build rules: fix every visible failure before a rerun; no rerun after a pass until the edits are done; while editing, run the quick unittest modules (`verify.sh check` for any Rust); lint (basedpyright) once, at the phase gate only.
+
+**Director rulings after review pass 1.**
+- Spec 6 is amended. The times are config, not constants: `[mac_idle]` keys `alert_seconds`, `push_seconds`, `stale_seconds`, `repeat_minutes` and `send_timeout_s` in `config/mac_test.conf`, read at use (user rule: no hard-coded config). Spec 8's 3 minutes and Spec 9's 10 minutes are the shipped defaults. No text, doc or message states a time as a fixed number; each renders from config or says "default". The import bound stays: the views (`build_queue.py`, `build_why.py`, `build_targets.py`) must start with `PYTHONPATH` unset, so the hub must not import `mac_test`. There is one reader for the `[mac_idle]` keys, in a module that the views and `mac_test` can both import; `mac_test` uses it and keeps no second copy.
+
+**Assertion changes (director rulings after review pass 1).** Each line below is approved: it follows Spec 8 (the notifier takes text and goes to the builds showrunner) or Spec 12 (`work` and `work_idle_since`). The change to `test_live_record_without_retry_registration_sends_one_message` is not approved: its substring checks no longer prove the package is empty. Fix round 1 restores an exact check of the rendered message.
+- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_unknown_cause_sends_once_for_the_call — old: send.assert_called_once_with(replace(call, wait_state=…), "idle_with_waiter") and actions ["message_builds_unit"] — new: send.assert_called_once_with(mac_idle.repair_message(replace(call, wait_state=…), "idle_with_waiter")) and actions ["message_showrunner"] — why: Spec 8 sends text to the showrunner.
+- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_message_resolves_only_builds_unit_in_build_followups — old: roster --json lookup, recipient session:builds, "verify.sh lint" in the body — new: replaced by test_message_resolves_builds_showrunner_address: exact showrunners.py address builds argv, the uds: recipient, the text passed through, no user recipient — why: Spec 8 resolves the showrunner address.
+- Assertion-Change: scripts/mac_test/test_mac_test.py::test_first_idle_pass_records_now_and_process_claim_uses_config_host — old: {**record, "idle_since": now} — new: adds "work_idle_since": now — why: Spec 12.
+- Assertion-Change: scripts/mac_test/test_mac_test.py::test_one_activity_check_per_host_serves_every_repository_claim — old: {**record, "idle_since": now} — new: adds "work_idle_since": now — why: Spec 12.
+- Assertion-Change: scripts/mac_test/test_mac_test.py::test_idle_release_removes_only_that_repository_claim — old: cargo-liner record with "idle_since" — new: adds "work_idle_since" — why: Spec 12.
+- Assertion-Change: scripts/mac_test/test_mac_test.py::test_activity_check_requires_readable_success_and_uses_one_bounded_ssh — old: ("active=0\nrc=0\n", MacIdle()), ("active=3\nrc=0\n", MacActive(3)) — new: answers add work=0 / work=3; the second expects MacActive(3, 3) — why: Spec 12.
+- Assertion-Change: scripts/mac_test/test_mac_test.py::test_active_pass_clears_idle_since_with_state_lock_released — old: MacActive(3) — new: MacActive(3, 3) — why: Spec 12.
+- Assertion-Change: scripts/mac_test/test_mac_test.py::test_idle_pass_before_fifteen_minutes_keeps_claim — old: fixture with idle_since only — new: fixture also has work_idle_since — why: Spec 12; fix round 1 adds a case for a claim with idle_since and no work_idle_since.
+- Assertion-Change: scripts/mac_test/test_mac_test.py::test_failed_activity_check_keeps_claim_and_idle_time — old: record without work_idle_since — new: record with work_idle_since, kept unchanged — why: Spec 12; the test now covers both keys.
+- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_live_record_without_retry_registration_sends_one_message — old: assertEqual((reported.kind, reported.repo, reported.package), ("doc", repo, "")) — new: assertIn(f"Repo {repo}", reported) and assertIn("verify.sh doc , pid 123", reported) — why: Spec 8 passes text; the exact "doc , pid" text still proves the package is empty (fix round 1 ruling).
+- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_dead_process_claim_is_free_and_remote_claim_is_always_live — old: assertEqual(mac_work(...), MacIdle("free")) — new: assertIsInstance(mac_work(...), FreeMac) — why: F011 makes a free Mac its own variant with no fields (fix round 1 ruling).
+- Assertion-Change: scripts/mac_test/test_offload_cleanup.py::MacActivityShellTests.test_activity_text_has_zero_for_only_shells_in_clones_under_sh_and_zsh — old: (0, "active=0\nrc=0\n", "") — new: (0, "active=0\nwork=0\nrc=0\n", "") — why: Spec 12 adds the work= line (fix round 1 ruling).
+- Assertion-Change: scripts/mac_test/test_offload_cleanup.py::MacActivityShellTests.test_activity_text_counts_each_matching_user_pid_once_under_sh_and_zsh — old: (0, "active=7\nrc=0\n", "") — new: (0, "active=7\nwork=5\nrc=0\n", "") — why: Spec 12; two app processes are active but not work (fix round 1 ruling).
+- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_notification_marks_survive_stop_after_delivery_before_return — old: self.assertEqual(send.call_count, 1) — new: self.assertEqual(delivered, [expected]) through check_interrupted_delivery — why: the list of delivered texts proves exactly one delivery and its text, which the call count did not (fix round 2 ruling, F016).
+- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_notification_marks_survive_stop_after_delivery_before_return — old: claim-based helper, delivered == [expected] — new: real send.send with a private acceptance file; acceptance count 1 at the cut, watcher mark False, count still 1 after two passes, final mark True — why: a claim does not prove delivery (fix round 3 ruling, F014).
+- Assertion-Change: scripts/buildlog/test_mac_idle.py::test_stop_before_transport_retries_and_delivers_once — old: claim-based helper, len(delivered)==0 then delivered == [expected] — new: real sender stopped before transport; count 0 and mark False, then count 1 across two passes and mark True — why: the sender owns delivery; no mocked claim counts as delivered (fix round 3 ruling, F014).
+- Assertion-Change: scripts/message/test_send.py::test_a_failed_send_does_not_clear_a_later_runs_window — old: the overlapping same-key send returns "sent"; log ["sent", "failed", "skipped"] — new: the overlapping send returns "retry"; a later send after the failed owner releases returns "sent"; log ["retry", "failed", "sent", "skipped"]; the final "skipped" is kept — why: per-key delivery exclusion forbids two transports of one key at once (fix round 3 ruling, F014).
+
+**Acceptance gate:**
+- Reproduce first, in `test_mac_idle.py`: `block.json` held by `research`, no claim (and a second case with one claim that has `idle_since`), 3 live `mac_allowed` test records in `waiting_hold`, one with a memory-queue admission file. On e6f8540f the watch writes nothing and sends nothing; after the change, the pass at 3 minutes writes `alert.json` (`idle`, `blocked`, holder `research`, `waiting` 3) and sends one message to the address that a stubbed `showrunners.py address builds` returns, and no push.
+- At 10 minutes: one push with `--text-id mac_idle.blocked --need blocked --key mac-idle-<since>` and the `--clears-when ... cleared --since <since>` command; later passes send nothing; a claim without `idle_since` ends the outage; the next outage uses a new key. Cause `claim_idle` and `free` push `mac_idle.stuck` with `--need decision`. A failed send or an empty address tries again on the next pass and never sends twice after success. No waiting step: no line, no message, no push. `natedev_only` and excluded records do not count.
+- Parked app (today's 07:50-07:57 case): a live claim with `work_idle_since` set and only an app process on the Mac, no block, 7 `mac_allowed` steps waiting gives cause `claim_idle`, a red line that names the claim's holder and its `what`, the showrunner message at 3 minutes and `mac_idle.stuck` at 10 minutes. In `test_mac_test.py`, an activity answer with only an app gives `work=0` and writes `work_idle_since`; a test binary under `target/debug/deps/` gives `work>0` and removes it.
+- A future `unreachable_until` gives the `MAC UNREACHABLE` line, no message and no push. `cleared --since` exits 0 and 1 as Spec 9 says.
+- View tests: `build_queue.py` text and `--json` put the line first with tone `error`; `build_targets.py status` prints it first; a missing file adds nothing; a stale file shows the stale line. `alert_line` on a fixture runs with `subprocess.run` patched to raise and returns in under 50 ms.
+- `scripts.buildlog.test_mac_idle`, `scripts.buildlog.test_index`, `scripts.build_queue.test_build_queue`, `scripts.build_queue.test_queue_view`, `scripts.build_targets.test_build_targets`, `scripts.notify.test_push_texts` and `scripts.notify.test_review` pass; basedpyright `0 errors, 0 warnings, 0 notes` on every changed Python file and its callers (`scripts/buildlog/cli.py`, the importers of `build_targets.py`, `push_texts.py` and `build_queue.py`).
+- Live proof on natedev: if a block with no natedev job still holds and steps wait, run the worktree's `mac_idle.py watch` with `MAC_IDLE_STATE_DIR` set to a scratch folder whose `idle.json` has `since` 200 s ago; it writes the alert and the builds showrunner gets the message; `build_queue.py` and `build_targets.py status` with that folder show the red line in under a second. Else the same run against a fixture state folder.
+- Merge gate `--tests-only` green on a tree merged with `origin/natedev`. The checkpoint notice names the also-touches paths (`scripts/build_queue/build_queue.py`, `scripts/build_targets/build_targets.py`, `commands/build/queue.md`, `commands/build/status.md`, owner queue-unit; `scripts/notify/push_texts.py`, `scripts/notify/push_catalog.py`, `scripts/notify/push_texts_reviewed.json`, owner per the production doc Units row).
+
+### Phase 17 — Move a step to the Mac when a short-term decline clears  · status: todo
+
+**Origin:** builds showrunner, 2026-10-31 ~07:57 EDT, accepted as current work: "The temporary-decline fix is current work: its own phase right after 16, beside it if the files allow. Record disk, unreachable, backoff and state declines as Mac-allowed with their Mac target, so a step moves when the cause clears. Permanent reasons stay natedev-only." At about 07:57, 4 live steps had the record `natedev_only disk`. Built on branch `natedev-verify-cancel`, worktree `/home/natepiano/worktrees/claude-build-followups-verify-cancel`, after Phase 16.
+
+**Depends on:** Phase 16, and it runs after Phase 16 on the same branch. It cannot run beside Phase 16: the files overlap. The cause is in `scripts/build_targets/build_targets.py` (`mac_target_eligibility`, `command_kind_eligible`), and its tests are in `scripts/build_targets/test_build_targets.py`. Phase 16 also edits both files (its `test` worker owns them; `command_status` and its tests), and it owns `docs/as-built/mac-test-offload.md` and `docs/as-built/build-targets.md`, which this phase also changes. `scripts/direct/verify.sh` is not a Phase 16 file. Start this phase when Phase 16's checkpoint is on the branch.
+
+#### Work Order
+
+**Source:** builds showrunner ruling, 2026-10-31 ~07:57 EDT (binding). Cause at e6f8540f:
+- `initialize_step_record` (`scripts/direct/verify.sh:1697-1773`) runs `build_targets.py eligible --kind` once. Its first line becomes the step's `runs_on` (`step_record.py write --runs-on`, lines 1741-1745).
+- `mac_target_eligibility` (`scripts/build_targets/build_targets.py:204-226`) excludes a Mac target for `backoff` (`offload.mac_step_eligibility`, `scripts/mac_test/offload.py:1586-1587`), `unreachable` (line 221, the ssh probe failed), `disk` (line 223, `free_gib` below `free_floor_gib`) and `state unreadable: <error>` (line 225). `command_kind_eligible` (lines 229-258) then answers `natedev_only <reason>` (line 252), the same answer as for a permanent reason.
+- A `natedev_only` step never sets `MAC_LEAVE_SETTINGS`. `route_test` (verify.sh:1953-1966) only records the decline of an `excluded` row, and the non-test path (1764-1772) reads only `eligible` rows. No leave hook exists, so the step stays on natedev after the cause clears.
+- A waiting `mac_allowed` step moves with no rerun. The memory queue leave hook (`scripts/lint/memory_gate.sh:319-320`, from `LINT_QUEUE_LEAVE_HOOK` in `run_local_test`, verify.sh:2155-2193) runs `mac_test.py claim-wait`; the step leaves its wait with status 75 and runs `try_mac_test` (2190). The hold wait passes `--leave-hook` (2416-2417, 2425-2428). The token wait runs the same hook (2695-2698). The routing loop tries each Mac again (1991-2061). `remember_mac_retry` (1853-1878) is the one retry rule: `no_tests`, `off`, `repo`, `linux_only` and `local_flag` remove the hook; `busy` and `blocked` try again on the next poll; every other result sets a deadline 180 s later.
+
+Start reasons, by class (evidence at e6f8540f):
+
+| Reason | Where it is decided | Class | Why |
+| --- | --- | --- | --- |
+| `backoff` | `offload.py:1586-1587`; `write_backoff` after a failed reach (`offload.py:1452`, `1613`) for `unreachable_backoff_s` (default 300, `offload.py:781-782`) | short-term | It has an end time. `mac_test.py free_now` (2070-2100) answers `backoff` until then. |
+| `unreachable` | `build_targets.py:220-221` | short-term | One ssh probe failed or timed out (`offload.py:1020-1040`). |
+| `disk` | `build_targets.py:222-223` | short-term | Free space comes back after a sweep. `claimed_run` probes again before each run (`offload.py:1450-1455`). |
+| `state unreadable: <error>` | `build_targets.py:224-225` | short-term | An `OSError`, `UnicodeError` or `ValueError` while the settings are read or the Mac is probed. |
+| `off` | `offload.py:1568-1569` | permanent | Offload is off in the settings. |
+| `repo` | `offload.py:1570-1575`, `1584-1585` | permanent | Unknown repository, no `linux_only.<repo>` key, or a workspace that cannot be read. |
+| `linux_only` | `offload.py:1577-1583` | permanent | The package or a workspace member is Linux only. |
+| `--local <why>` (`LocalRequired`) | `build_targets.py:211-212`, `244-245`; recorded as `local_flag` (verify.sh:1178-1181) | permanent | The caller asked for natedev. |
+| `makes natedev artifacts`, `full gate runs on natedev` | `build_targets.py:207-210`, `240-243` | permanent | The kind runs on natedev. |
+
+`blocked`, `busy`, `mac_busy`, `copy`, `lost`, `runner` and `no_tests` are Mac run results, never start reasons. This phase does not change how they are handled.
+
+**Goal:** a step that starts while the Mac declines for a short-term cause (`disk`, `unreachable`, `backoff`, unreadable state) is recorded `mac_allowed` with its Mac target, waits on natedev with the leave hooks set, and moves to the Mac when the cause clears, with no rerun. A permanent reason still gives `natedev_only`.
+
+**Spec:**
+
+1. **Reproduce first.** Write the Acceptance gate's first test before any code change, and see it fail on e6f8540f.
+2. **One classification, in `build_targets.py`.** Add `@dataclass(frozen=True) class RetryTarget` with `target: LocalTarget | SshTarget` and `reason: str`, beside `MacAllowed` (line 199). `mac_target_eligibility` (lines 204-226) returns `RetryTarget` for `IneligibleMacStep("backoff")`, for `unreachable` (line 221), for `disk` (line 223) and for `state unreadable: <error>` (line 225). Every other reason stays `ExcludedTarget`. The kind and `--local` rules (lines 207-212) return before the probe, so they never give `RetryTarget`.
+3. **The table row.** `print_eligible_target` (line 183) prints a `RetryTarget` as `<name>\tretry\t<reason>\t<settings>`. The row form is the interface between the two writers. `eligible` without `--kind` (`command_eligible`, `targets.target_eligibility`) does not probe and does not change.
+4. **The decision.** `command_kind_eligible` (lines 229-258) answers `mac_allowed` when a `macos` target is an `EligibleTarget` or a `RetryTarget`. Otherwise it answers `natedev_only <reason>` as today. A failed `read_targets` (lines 236-238) keeps `natedev_only state unreadable: <error>` with no table: there is no Mac target to record.
+5. **verify.sh reads the row.** No new Python start (Phase 9).
+   - The row check (1721) accepts `retry`. In `initialize_step_record`, a `retry` row with settings counts as a Mac target (1726-1735; it needs `mac_allowed`).
+   - New function `start_mac_retry <settings> <reason>`: it sets `MAC_LEAVE_SETTINGS`, `MAC_LEAVE_REASON` and a deadline 180 s from now with the clock rule of `remember_mac_retry` (1866-1871), prints once per call `verify.sh: the Mac declined at start (<reason>); waiting 180 s before each retry while natedev waits.` (sets `MAC_RETRY_NOTICE_SHOWN=1`), and calls `register_mac_wait <settings> <deadline>` (1840-1851). `remember_mac_retry` uses the same deadline code; keep one copy of it.
+   - `route_test`, first loop (1953-1966): for a `retry` row with settings and `-f "$MAC_RUNNER"`, set `BUILDLOG_MAC=declined`, `BUILDLOG_MAC_REASON` and `BUILDLOG_LOCAL_REASON` as an `excluded` row does now (1959-1964), so the build-log row stays the same. Then call `start_mac_retry`, and add the row to `retry_settings`, `retry_reasons` and `retry_after`, so the routing loop (1991-2061) tries it after the deadline. The selection loop (1968-1989) still tries only `eligible` rows at once.
+   - Non-test kinds (1764-1772): when no row is `eligible`, the first `retry` row with settings calls `start_mac_retry`. Do not set `BUILDLOG_MAC`: a compiling step goes to the Mac only under a hold, as now.
+   - `--mac` (`MAC_ONLY`, 1749-1762): refuse at once when no row is `eligible`, also when the answer is `mac_allowed`. Read the refusal word from `retry` rows and `excluded` rows (the case list at 1756). Text and exit 2 stay as now (`test_verify_mac_only.py:182`).
+   - After the deadline, the hooks run `free-now` or `claim-wait` and then `try_mac_test`. If the Mac declines again (`disk`, `unreachable`, `runner`), `remember_mac_retry` sets a new 180 s deadline, as now. Its permanent list (1855) does not change.
+6. **What stays.** `step_record.py` does not change: a `mac_allowed` record has no reason field (line 250). The `mac_idle.py register`, `exclude` and `remove` arguments do not change. `mac_test.py` does not change.
+7. **Docs.** `docs/as-built/mac-test-offload.md:7` names the `retry` row and the four short-term reasons. `docs/as-built/build-targets.md:60` and `:64-65` say that a `retry` row sets the leave settings and a 180 s deadline at the start.
+
+**Files:**
+- `scripts/build_targets/build_targets.py` — `RetryTarget`, `mac_target_eligibility`, `print_eligible_target`, `command_kind_eligible`
+- `scripts/build_targets/test_build_targets.py` — `StepKindEligibilityTests`: replace `test_off_backoff_and_disk_floor_refuse_mac_steps` (line 537 at e6f8540f), which asserts the old `natedev_only disk` and `natedev_only backoff` answers
+- `scripts/direct/verify.sh` — the `retry` row, `start_mac_retry`, `route_test`, the non-test path, the `--mac` refusal
+- `scripts/direct/test_verify_mac_start_decline.py` — new: the reproduce test, the permanent cases, the `--mac` case
+- `docs/as-built/mac-test-offload.md` — the decision point text
+- `docs/as-built/build-targets.md` — the routing and leave lines
+
+**Workers:** 2 writers (no test lane: Python tests sit beside their modules; shell tests are `scripts/direct/test_verify_*.py`). No hub file: the Spec 3 row form is the interface.
+- `impl` — `scripts/build_targets/build_targets.py`, `scripts/build_targets/test_build_targets.py`, `docs/as-built/mac-test-offload.md`, `docs/as-built/build-targets.md`.
+- `test` — opens as impl — `scripts/direct/verify.sh`, `scripts/direct/test_verify_mac_start_decline.py`; codes against the Spec 3 row form. Its tests use the real `build_targets.py`, so they pass only when `impl` is done.
+
+**State:** the step record `runs_on` in `~/.local/state/verify-steps/<call>.json` (now `mac_allowed` for a short-term decline) and the `mac_idle.py register` record with its retry deadline. Each is written once per call, as for an `eligible` row now. No new file, lock or mark. A rerun is a new call with a new record.
+
+**Constraints from prior phases:**
+- Phase 9: `verify.sh` starts no new Python. A `retry` row makes the one `mac_idle.py register` start that an `eligible` row makes now (1955-1957); add no other start.
+- Phase 16: its `waiting_calls` counts live `mac_allowed` records in `waiting_hold` or `waiting_mac` with no `local_reason`. After this phase, a step that waits on a short-term decline counts there. `mac_idle.py`, `mac_idle_alert.py` and `mac_test.py` are Phase 16 files; this phase does not change them.
+- `mac_test.py free_now` (2070-2100) answers `off`, `backoff`, `blocked`, `state`, `busy` or `free`; it never reads disk space or reach. The 180 s deadline covers `disk` and `unreachable`, and `claimed_run` probes again before a run (`offload.py:1450-1455`).
+- Phase 14: a `--mac` step waits only on `busy`; every other decline ends it (`check_mac_only_result`, verify.sh:1930-1935). A `retry` row keeps that.
+- `remember_mac_retry` and `mac_retry_hook` (1853-1898) are the one retry rule (`docs/as-built/build-targets.md:64`). A start decline uses the same 180 s deadline; add no second timer.
+- Delegation Context invariant: build-log rows keep `mac=declined` and `mac_reason=<word>` for these steps.
+- Build rules: fix every visible failure before a rerun; no rerun after a pass until the edits are done; while editing, run the quick test modules; lint once, at the phase gate only.
+
+**Acceptance gate:**
+- Reproduce first, in `test_verify_mac_start_decline.py` (the `VerifyMacOffloadFixture` family, with the real `build_targets.py`): settings `free_floor_gib=60`, the `ssh` stub answers `free_gib=1`, memory held. On e6f8540f the step record has `runs_on` `{"kind": "natedev_only", "reason": "disk"}`, and after the stub answers `free_gib=1000` and the clock passes 180 s, `free-now` is never asked and the runner gets no call: the test fails. After the change the record has `runs_on` `{"kind": "mac_allowed"}`; once the stub answers `free_gib=1000` and the clock passes the deadline, the step leaves the memory wait, the runner gets one call and natedev runs nothing. A second case does the same from the hold routing wait.
+- A permanent reason stays `natedev_only`: `linux_only.<repo>=sample` gives `natedev_only linux_only`, no `free-now` ask and no runner call; `--local` gives `natedev_only` with its reason. `--mac` with `free_gib=1` refuses at once with `the Mac is below its free-space floor`, exit 2, and nothing runs.
+- In `test_build_targets.py`: `disk`, `backoff`, `unreachable` (`probe_mac` gives `UNAVAILABLE_PROBE`) and `state unreadable` (`read_config` raises `OSError`) each answer `mac_allowed` with a `retry` row; `off`, `repo`, `linux_only`, `--local`, `build`, `example` and `final` still answer `natedev_only`; one `retry` Mac and one `off` Mac give `mac_allowed`.
+- `scripts.direct.test_verify_mac_start_decline`, `scripts.build_targets.test_build_targets`, `scripts.build_targets.test_targets`, `scripts.direct.test_verify_mac_only`, `scripts.direct.test_verify_mac_memory_excluded`, `scripts.direct.test_verify_mac_memory_retry`, `scripts.direct.test_verify_mac_memory_retry_clock`, `scripts.direct.test_verify_mac_retry_clock`, `scripts.direct.test_verify_mac_retry_hold`, `scripts.direct.test_verify_mac_routing`, `scripts.direct.test_verify_mac_wait_records`, `scripts.direct.test_verify_step_routes`, `scripts.direct.test_verify_checks_fail_closed` and `scripts.direct.test_verify_python_starts` pass.
+- basedpyright `0 errors, 0 warnings, 0 notes` on every changed Python file and its callers (`scripts/build_hold/hold_applies.py`, `scripts/direct/local_release_wait.py`, `scripts/production/merge_gate.py`); `bash -n scripts/direct/verify.sh`; `shellcheck scripts/direct/verify.sh` with no new findings.
+- Merge gate `--tests-only` green on a tree merged with `origin/natedev`. The checkpoint notice names the also-touches paths `scripts/build_targets/build_targets.py` and `scripts/build_targets/test_build_targets.py`, owner queue-unit.
+
+### Phase 18 — Make named, registered copies with copies.py  · status: todo
+
+**Origin:** builds showrunner, 2026-10-31 08:1x EDT, after the user asked: "when will we have the service that names and copies things correctly?". The showrunner's go: "If a phase can start now, start it." This phase and Phase 19 are Phase 3 ("The helper") of the copies plan `docs/plans/verify-copies.md` (branch `verify-copies`, tip bbf4dbae). This phase makes, lists, removes and hands over copies with an empty target. Phase 19 adds the seed target, the `verify.sh` busy lock and the live gate copy. Built on branch `verify-copies`, worktree `/home/natepiano/worktrees/claude-build-followups-verify-copies`.
+
+**Depends on:** nothing that is not on origin/main (5e08bd6e). The name join (report-unit, `UnitLabels.folder_name()`) and the copies lifetime (resources-unit Phase 21: copies root, `register_copy`, `hand_over`, `end_copy`, the `.git/info/exclude` entries) are there (Source). It shares no file with Phases 16 and 17.
+
+#### Work Order
+
+**Source:** copies plan `verify-copies.md`: Naming, Cleanup, Survey changes (Name and Source; of Target only mode `none`), the Phase 1 verdict, Phase 2 and the Phase 3 Spec; the builds showrunner's go, 2026-10-31 08:1x EDT (binding). The APIs, read on origin/main 5e08bd6e with `git -C ~/.claude show origin/main:<path>`:
+- `scripts/message/unit_labels.py:83-100`: `UnitLabels(session, showrunner, unit)` and `folder_name()`, which gives `<showrunner>-<unit>`, drops a unit name's leading showrunner name and drops a missing part (`—`). `:331-367`: `unit_labels_for(session_ids, environment) -> dict[str, UnitLabels]` reads files only; it returns `{}` on any error and has no key for an unknown session. `scripts/message/roster.py:103` re-exports it.
+- `scripts/build_hold/build_hold.py:345-368`: `owning_session(environment) -> OwningSession | NoOwningSession` (classes at `:53` and `:58`). It gives the unit director of `UNIT_RUN_DIR` first, then `CLAUDE_CODE_SESSION_ID`.
+- `scripts/lib/scratch.py`:
+  - `copies_root()` (`:155-157`): `SCRATCH_COPIES_ROOT`, else `<SCRATCH_ROOT parent>/copies`, which is `/tmp/claude/copies`. `copy_folder(path)` (`:160-168`): a copy is exactly `<root>/<pair>/<copy>`.
+  - `register_copy(path, *, task, owner_unit, source_path, source_commit, copy_commit, target_mode, seed_source, borrows_from, land_target="", run_dir="", phase_id="")` (`:210-225`) writes `<copy>/.scratch.json` through `update_record` (`:386-412`), the one record-write path. When `<copy>/.git` is a folder, `update_record` also adds `/.scratch.json` and `/.claude-busy` to the copy's `.git/info/exclude` (`exclude_copy_metadata`, `:188-207`). A second call keeps `created`.
+  - `fields_for_task` (`:368-383`): a `phase:<unit>/<phase>` task adds `run_dir` and `phase_id` (the phase id comes from the task); a `landed:` task adds `land_target`, default `origin/main`. `TASK` (`:85`) accepts `run:`, `phase:`, `gate:`, `until:`, `landed:` and `row:`; `task_or_default` (`:508`) gives `until:` 24 h.
+  - `hand_over(path, owner, task, *, run_dir="", land_target="")` (`:354-365`) is the function behind `scratch.py hand-over` (parser `:1060-1065`, handler `:1082-1086`). It keeps the path and writes owner and task in one atomic record write under `copy_lock`. The owner must match `WORD` (`:92`).
+  - `copy_paths()` (`:636-645`), `task_of` (`:623`), `renew` (`:779`), `lifetime` (`:753-757`).
+  - `end_copy(path, task, now, *, require_task=True)` (`:1001-1022`) writes end evidence, then removes the copy only when no `.claude-busy` lock is held, its lifetime is `Ended` (no open phase, no borrowing child, the land rule met; `record_lifetime`, `:648-745`) and `unsaved_work` (`:933-939`) is `None`. `repo_problem` (`:912-930`) counts uncommitted changes and untracked files, and, outside a linked worktree, a stash and local branches with commits on no remote.
+- `scripts/production/merge_checkpoint.py:1039-1050` `end_phase_scratch` ends task `phase:<Units-row unit>/<phase>` with `scratch.end` when a code checkpoint merges.
+
+**Goal:** `copies.py make` makes a copy of any git repository at `/tmp/claude/copies/<showrunner>-<unit>/<phase>-<purpose>`, with its own git and a full scratch record, and prints its path. `copies.py list`, `remove` and `hand-over` work on these copies. The target is empty: target mode `none`.
+
+**Spec:**
+
+1. **Commands.** New `scripts/copies/copies.py` (stdlib plus `scripts.lib.scratch`, `scripts.message.unit_labels` and `scripts.build_hold.build_hold`):
+   - `make --source <repo> [--commit <rev>] --phase <label> --purpose <word> [--suffix <word>] [--unit <unit>] [--branch <branch>] [--task <task>] [--run-dir <dir>] [--land-target <ref>] [--with-diff] [--new]` prints the copy path on one line.
+   - `list` prints one line per copy: path, task, owner unit, source path, source commit (12 characters), target mode, size (`du -sh`).
+   - `remove <path>` ends one copy through `scratch.end_copy`.
+   - `hand-over <path> --to <unit> --task <task> [--run-dir <dir>] [--land-target <ref>]` moves the cleanup owner.
+   - Python API `make_copy(...) -> Path`, with the arguments of `make`; the CLI calls it. A refusal raises `CopyError`; the CLI prints `copies: <reason>` to stderr and exits 2. Success exits 0.
+2. **Name.** Read the session with `build_hold.owning_session(os.environ)`; `NoOwningSession` refuses. Read the labels with `unit_labels_for([session id], os.environ)`; a missing key refuses with `no roster labels for this session`. A session id is never part of a name. The pair is `labels.folder_name()`. `--unit <unit>` (a showrunner makes a copy for another unit) uses `UnitLabels(labels.session, labels.showrunner, <unit without -unit>).folder_name()`. The phase label is a slug `[a-z0-9][a-z0-9-]*` (`54b`, `adhoc`, `sync-test`); a slash or any other character refuses. The purpose is one of `gate`, `review`, `merge`, `land`, `before`, `after`, `test`, `work`. `--suffix <word>` (`[a-z0-9]+`) gives `<phase>-<purpose>-<suffix>` (`34-before-beeece8b`). The folder is `scratch.copies_root() / <pair> / <name>`, made with one `os.mkdir` (the pair folder with `exist_ok`).
+3. **Same name.** When the folder exists and its record has the same source path and source commit, a non-empty `copy_commit` and no diff, `make` reuses it: it renews the record (`scratch.renew`), prints the path and changes nothing else. Another source or commit refuses and names `copies.py remove <path>`; `make` never builds into it. A record with an empty `copy_commit` refuses: another `make` fills it, or it stopped and needs `remove`. `--new` makes a parallel copy in the first free folder of `<name>`, `<name>-2`, `<name>-3`, …, each tried with `os.mkdir`.
+4. **Record first.** Right after `mkdir`, `make` calls `register_copy` with every field of Spec 7 and `copy_commit=""`. A stop at any later step so leaves a registered copy that `remove` ends. When the git step is done, `make` calls `register_copy` again with the copy commit.
+5. **Own git.**
+   - Git dir: `git -C <source> rev-parse --path-format=absolute --git-common-dir`. It is the `.git` folder of a plain repository, the main repository's git dir for a linked worktree (its `<source>/.git` is a file), and `<sibling>/.git` for a copy source. Commit: `git -C <source> rev-parse --verify <rev>^{commit}` (default `HEAD`).
+   - `git clone --shared --no-checkout --quiet <git dir> <copy>/.copies-stage`, move `<copy>/.copies-stage/.git` to `<copy>/.git`, remove the stage. `make` only reads the source and writes nothing into it (`review.sh` fails on a source change).
+   - `git -C <copy> rev-parse --absolute-git-dir` must equal `<copy>/.git`; else refuse. A copied `.git` pointer moves the real branch (memory `gate-copy-needs-own-git`).
+   - Origin: `git -C <copy> remote set-url origin <url>`, with `<url>` from `git -C <source> remote get-url origin`. A source with no origin refuses. The copy's `refs/remotes/origin/*` and `refs/remotes/origin/HEAD` are set equal to the source's (a fetch from the git dir, with `+refs/remotes/origin/*:refs/remotes/origin/*` and `--prune`, and `git symbolic-ref`), so the merge target ref is the source's (a stale `origin/HEAD` once gave the assertion guard 116 changes that were not the phase's).
+   - Checkout: `git -C <copy> checkout --quiet --detach <commit>`, then delete the copy's local branches, so `repo_problem` finds no unpushed branch. Purpose `work` needs `--branch <branch>` and runs `git -C <copy> switch --quiet -c <branch> <commit>` in place of the detached checkout. Unpushed source commits come with the copy through the alternates file.
+   - `~/.claude` guard: when `<url>` equals the origin URL of `~/.claude`, a commit that does not contain `b8ef1b37` (`git merge-base --is-ancestor`) refuses: an older tree's test deletes every session folder. The marker commit and the `~/.claude` path are module constants.
+   - Pruned objects: before a reuse (Spec 3), `git -C <copy> rev-list --objects --no-walk <copy commit>` must exit 0; else refuse loudly and name the record's `borrows_from`.
+6. **Diff.** `--with-diff` (only with the source's `HEAD`) applies `git -C <source> diff --binary HEAD` in the copy with `git apply --index`, copies in each untracked, not ignored file (`git -C <source> ls-files --others --exclude-standard -z`), and commits on the detached HEAD with `git -c user.name=copies.py -c user.email=copies@localhost commit --quiet --no-verify -m "copies: working-tree diff of <source> at <commit>, sha256 <hash>"`. The hash is the sha256 of the diff and of each untracked path and its bytes. The record keeps `source_commit` = the source's `HEAD` and `copy_commit` = the new commit: two different commits mean "HEAD + diff", and the commit message names the hash. The commit is on no branch, so `unsaved_work` does not keep the copy.
+7. **Record fields.** `register_copy(path, task=…, owner_unit=…, source_path=<absolute --source>, source_commit=…, copy_commit=…, target_mode="none", seed_source="", borrows_from=<git dir of Spec 5>, land_target=…, run_dir=…)`.
+   - `owner_unit`: the short unit label (`labels.unit`, or the `--unit` value); the showrunner label when the unit is `—`.
+   - `borrows_from` for a copy source is `<sibling>/.git`, the path that `record_lifetime` matches against a parent copy (`scratch.py:674-679`).
+   - Task: `--task` when given. Else purpose `work` or `land`: `landed:<owner unit>/<branch>` (needs `--branch`), with `land_target` from `--land-target`, default `origin/main`. The caller passes `origin/<merge branch>` when its unit is in a production; `copies.py` reads no production doc. Else the scratch default, `until:` 24 h.
+   - A `phase:<unit>/<phase>` task needs `--run-dir` (default `UNIT_RUN_DIR`), else refuse; scratch sets `phase_id` from the task. The task's unit is the Units-row unit name that `merge_checkpoint.py:1043` uses.
+   - Target mode in this phase is `none` for every source, hana too: no `target/`, no `CARGO_TARGET_DIR`, no seed. `make` writes nothing to `.git/info/exclude`; `update_record` adds the entries.
+8. **remove.** The path must be a copy (`copy_folder(path)` equals it); a path that does not exist prints `<path>: no copy` and exits 0. Read the record with `task_of` and call `end_copy(path, <record task>, time.time())`. True: print `removed <path>`, exit 0. False: print `copies: <path> kept: <reason>`, the reason from `scratch.lifetime(path)` or `unsaved_work(path)`, and exit 2. An empty pair folder stays for `tmp_sweep.py`.
+9. **list.** From `scratch.copy_paths()` and `task_of`, sorted by path. An unreadable record shows its reason in the line.
+10. **hand-over.** Call `scratch.hand_over(path, <to>, <task>, run_dir=…, land_target=…)`. It keeps the path; `copies.py` renames no folder and writes no record field itself. `--to` is a short unit label (`WORD`). A rerun with the same owner and task writes the same fields and exits 0.
+11. **Doc.** New `docs/as-built/frozen-copies.md`: the path form and name rules, the record fields with one example `.scratch.json`, the four commands with their exits, the task rules and mode `none`. One line says that Phase 19 adds the seed target and the busy lock.
+
+**Files:**
+- `scripts/copies/copies.py` — new: the CLI, `make_copy`, `CopyError`
+- `scripts/copies/test_copies.py` — new: the tests of the Acceptance gate
+- `docs/as-built/frozen-copies.md` — new: names, record, commands
+
+**Workers:** 1 writer + 1 tester, disjoint files (tests sit beside the module).
+- `impl` — `scripts/copies/copies.py`, `docs/as-built/frozen-copies.md`.
+- `test` — opens as impl — `scripts/copies/test_copies.py`; writes the tests against the Spec 1 commands and the `make_copy` API first, with a fake roster (patched `owning_session` and `unit_labels_for`), a fake source repository with a bare `origin`, and `SCRATCH_ROOT` and `SCRATCH_COPIES_ROOT` set to private temporary folders.
+
+**State:** each copy folder `/tmp/claude/copies/<pair>/<copy>`, its record `<copy>/.scratch.json`, and the `/.scratch.json` and `/.claude-busy` lines in its `.git/info/exclude` (written by `scratch.py`). No other file, lock or mark. A rerun of `make` with the same arguments reuses the copy (Spec 3); a rerun of `remove` or `hand-over` changes nothing and exits 0.
+
+**Constraints from prior phases:**
+- Copies plan Phase 1 verdict: target mode seed, without `incremental/`, sources copied with `cp -a`; no shared build-dir. This phase builds mode `none` only; Phase 19 adds the seed.
+- Copies plan Phase 2 (on origin/main): resources-unit Phase 21 owns the lifetime code, and this phase only calls `scratch.py`. report-unit owns `folder_name()`; the name join stays in `unit_labels.py`.
+- Copies plan Delegation Context invariants: a copy has its own git dir, never a copied `.git` pointer; its origin is the source's origin URL, not the source path; roster labels are the one name source.
+- Phase 9: `verify.sh` starts no new Python. This phase does not change `verify.sh`.
+- Memory rules: one place for each thing (the name join in `unit_labels.py`, the record write in `scratch.py`); lifecycle commands are safe to rerun.
+- Build rules: fix every visible failure before a rerun; no rerun after a pass until the edits are done; while editing, run the quick test modules; lint once, at the phase gate only.
+
+**Acceptance gate:**
+- `env -u PYTHONPATH -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD python3 -m unittest discover -s scripts/copies -p test_copies.py` passes. The tests:
+  - Fake roster: labels `hana` + `lfo` give `<root>/hana-lfo/54b-gate`; a showrunner alone gives `<root>/builds/…`; `--unit`, `--suffix` and `--new` (`-2`, `-3`) give their names; no owning session, no labels, a bad phase label or a bad purpose exit 2 and make no folder.
+  - Fake source repository with a bare origin and one unpushed commit: the copy has the commit; `rev-parse --absolute-git-dir` is `<copy>/.git`; `remote get-url origin` is the source's origin URL; `refs/remotes/origin/*` and `origin/HEAD` equal the source's; no local branch (a `work` copy has only its `--branch`); `git status --porcelain` in the copy is empty; the source's files, refs and status are the same after `make`.
+  - The linked-worktree `.git` case: a source made with `git worktree add` (its `.git` is a file) gives a copy whose `.git` is a folder, at the worktree's commit, with `borrows_from` the main repository's git dir.
+  - Record fields: `source_path`, `source_commit`, `copy_commit`, `target_mode` `none`, `seed_source` `""`, `borrows_from`, `owner_unit`, `task`; a `phase:` record also has `run_dir` and `phase_id`; a `work` copy has `landed:<unit>/<branch>` and `land_target` (`origin/main` by default, and a given one); `.git/info/exclude` holds `/.scratch.json` and `/.claude-busy`.
+  - `--with-diff`: `copy_commit` differs from `source_commit`, its tree has the tracked change and the untracked file but not the ignored file, its message names the hash, and `remove` still removes the copy.
+  - Same name and commit: reused, exit 0. Another commit: exit 2, nothing changed. Pruned borrowed objects: exit 2, the message names `borrows_from`. The `~/.claude` guard (patched constants): a commit without the marker exits 2.
+  - `hand-over` to another unit keeps the path and changes `owner_unit` and `task` in one record write; a rerun exits 0.
+  - `remove`: an `until:` copy goes, exit 0, and a rerun exits 0; a copy with an uncommitted change, a parent copy that a child borrows from, and a copy with a held `.claude-busy` lock are each kept with exit 2 and a reason.
+  - `list` shows each copy with task, owner, source, commit, mode `none` and size, and the reason of an unreadable record.
+- basedpyright `0 errors, 0 warnings, 0 notes` on `scripts/copies/copies.py` and `scripts/copies/test_copies.py`.
+- Live check on natedev, from the unit director's session, with no build: `copies.py make --source ~/rust/hana --phase 18 --purpose test` prints `/tmp/claude/copies/<showrunner>-<unit>/18-test` with the readable pair from the roster; `copies.py list` shows it with its `until:` task and mode `none`; `copies.py remove <path>` deletes it, and the path is gone.
+- Merge gate `--tests-only` green on a tree merged with `origin/natedev`.
+
+### Phase 19 — Seed a copy's target, hold a copy busy in verify.sh, and prove a live gate copy  · status: todo
+
+**Origin:** builds showrunner, 2026-10-31 08:1x EDT, after the user asked: "when will we have the service that names and copies things correctly?". It is the second part of Phase 3 ("The helper") of the copies plan `docs/plans/verify-copies.md` (branch `verify-copies`, tip bbf4dbae); Phase 18 is the first part. Built on branch `verify-copies`, worktree `/home/natepiano/worktrees/claude-build-followups-verify-copies`, after Phase 18.
+
+**Depends on:** seed3, the copies plan's next seed case ("Next case" under Decision), which runs when resources-unit Phase 37 (floor order: empty idle targets first) is on main. Its verdict sets the seed rule of Spec 1; refresh this Work Order with its numbers before the phase starts. Also Phase 18 (same branch), and efficiency-unit's `scripts/lib/nix_env.py` change (copies plan Phase 2) that trusts a copy's `.envrc` from its record. That change is not on origin/main 5e08bd6e: `trusted_envrc` (`nix_env.py:90-96`) trusts only `~/rust`, `~/worktrees`, `~/.claude*` (`trusted_root`, `:52-59`) and registered worktrees, so `verify.sh` in a copy fails with `direnv: .envrc is blocked`.
+
+#### Work Order
+
+**Source:** copies plan `verify-copies.md`: the Phase 1 verdict and the seed rerun (Decision), the candidate ordered seed rule, the Phase 3 Spec items on the seed and `verify.sh`, the Cleanup busy lock, Survey changes Target; the builds ruling of 2026-10-31 on seeds and the disk floor. The APIs on origin/main 5e08bd6e:
+- `scripts/lib/scratch.py:144-152` `mark_cargo_cache(target)` writes `CACHEDIR.TAG` and touches `.lint-sweep-used` (`USE_STAMP`, `:99`). `BUSY = ".claude-busy"` (`:96`). `copy_lock(path)` (`:227-254`) holds a shared `flock` on `<copy>/.claude-busy`; `busy_locks` (`:325-351`) is the readers' non-blocking exclusive try.
+- `scripts/lint/sweep.py:219` `LOCK_NAMES` (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`); `target_last_use` (`:1854-1860`) reads the stamp.
+- `scripts/direct/verify.sh:2624` `buildlog_wait_for_memory`.
+- `scripts/production/merge_checkpoint.py:1039-1050` `end_phase_scratch` ends `phase:<unit>/<phase>`.
+
+**Goal:** `copies.py make` fills a hana copy's target with a `cp -a` seed when the seed rule picks a source; a `verify.sh` run in a copy holds the copy busy from before its memory wait to its end; one live hana gate copy is made, built and removed by `merge_checkpoint.py`.
+
+**Spec:**
+
+1. **Seed rule.** Only for a source with a `Cargo.toml`. In order: (1) a registered copy of the same repository at the same commit whose target was built with the same `Cargo.lock` and toolchain (`rustc -vV`), the newest landed gate copy first (measured 9% of a cold build); (2) only if seed3 adopts the candidate rule: a source whose last step kind matches the copy's step kind (test, for gate and review copies), then the fewest changed files against the copy's commit; (3) else no seed, mode `none`. A before/after pair gets the same seed from the same base build. The seed caps at 5 GiB net over a cold build; the sweep floor (`sweep_free_floor_gib`, `config/lint.conf`) stays the only disk limit. Where the `Cargo.lock`, toolchain and step-kind facts are read comes from seed3's report.
+2. **Seed copy.** Hold the source target's three `LOCK_NAMES` files with `flock` for the whole copy. Copy the source tree with `cp -a` (less `.git` and `target/`), then `cp -a <source>/target <copy>/target` less `incremental/` (it cut no build time, Phase 1). Never hard-link (`cp -al` is refused): cargo writes outputs in place, and a hard-linked floor take frees nothing (`sweep.py:1446`) but still deletes the copy (`:1526`). Then run the Phase 18 git step with `git reset -q` before `git checkout --force --detach <commit>` and `git clean -fdq`, so unchanged files keep their times (a fresh checkout rebuilt 25 crates, Phase 1). Then `scratch.mark_cargo_cache(<copy>/target)`: `cp -a` keeps file times, so without a fresh stamp the floor has no use record before the first build (`sweep.py:1854-1860`) and can take the seed early. The record gets `target_mode` `seed` and `seed_source` = the source target path.
+3. **Busy lock in `verify.sh`.** In a tree under the copies root (`SCRATCH_COPIES_ROOT`, else `/tmp/claude/copies`, resolved in bash), open `<copy>/.claude-busy` (the copy folder is the first two levels under the root) on a file descriptor and take a shared `flock` before the first `buildlog_wait_for_memory` call (`verify.sh:2624`), so a queued run is busy too. Hold it until the run ends; it ends with the process, so a crash leaves no stale mark. No new Python start (Phase 9). Out of a copy, nothing changes.
+4. **Live gate copy.** In this phase: `copies.py make --source <hana worktree> --phase 19 --purpose gate --task phase:<unit>/19 --run-dir <run>`, seeded by the rule, built and tested with `verify.sh` in the copy, and removed by `end_phase_scratch` when this phase's checkpoint merges.
+5. **Doc.** `docs/as-built/frozen-copies.md` final form: the seed rule, the seed copy order and locks, the stamp, the busy lock, the live proof.
+
+**Files:**
+- `scripts/copies/copies.py` — the seed rule and the seed copy
+- `scripts/copies/test_copies.py` — the seed tests
+- `scripts/direct/verify.sh` — the busy lock
+- `scripts/direct/test_verify_copy_busy.py` — new: the busy lock tests
+- `docs/as-built/frozen-copies.md` — final form
+
+**Workers:** 2 writers, disjoint files (tests sit beside their modules).
+- `impl` — `scripts/copies/copies.py`, `scripts/copies/test_copies.py`, `docs/as-built/frozen-copies.md`.
+- `shell` — opens as impl — `scripts/direct/verify.sh`, `scripts/direct/test_verify_copy_busy.py`.
+
+**State:** a seed copy's `target/` (about 10.3 GiB for hana, Phase 1) with its `.lint-sweep-used` stamp; the record fields `target_mode` `seed` and `seed_source`; the shared lock on `<copy>/.claude-busy`, held by an open file descriptor. A rerun of `make` reuses a same-commit copy and copies no target again.
+
+**Constraints from prior phases:**
+- Phase 18: `copies.py`, its record and its commands. This phase adds only the target, the busy lock and the live proof.
+- Copies plan Phase 1 verdict: seed without `incremental/`, sources copied with `cp -a`; no shared build-dir. Risk 1: each live copy holds about 10.3 GiB, so copies end on time. Risk 2: the first edit after a `cp -a` seed takes 75.5 s.
+- Builds ruling 2026-10-31: the seed copies files and never hard-links them, and writes a fresh stamp at make; judge floor behavior against resources-unit Phase 37's order.
+- Phase 9: `verify.sh` starts no new Python.
+- Build rules: fix every visible failure before a rerun; no rerun after a pass until the edits are done; while editing, run the quick test modules; lint once, at the phase gate only.
+
+**Acceptance gate:**
+- `env -u PYTHONPATH -u PYTHONUNBUFFERED -u REFUSAL_WATCH_INVENTORY -u STAFF_OPERATION_FD python3 -m unittest discover -s scripts/copies -p test_copies.py` passes: a seed copy holds no hard link to its source (no file shares an inode with the source), has no `incremental/`, has a `.lint-sweep-used` stamp newer than the make start, and keeps the source's file times; while a test holds one source lock file exclusively, the seed copy waits; the seed rule picks per Spec 1 and falls back to `none`; the record has `target_mode` `seed` and `seed_source`.
+- `scripts.direct.test_verify_copy_busy`: a run in a copy under a test copies root holds a shared lock on `<copy>/.claude-busy` from before the memory wait (a non-blocking exclusive try fails while the run waits in the memory queue) to its end (the try succeeds after exit); a run outside the root makes no lock file. `scripts.direct.test_verify_python_starts` passes.
+- basedpyright `0 errors, 0 warnings, 0 notes` on every changed Python file and its callers; `bash -n scripts/direct/verify.sh`; `shellcheck scripts/direct/verify.sh` with no new findings.
+- Live: one hana gate copy with task `phase:<unit>/19`, seeded, built and tested with `verify.sh` in it, and removed by `merge_checkpoint.py` when this phase's checkpoint merges (its line `removed 1 folder(s) of phase:<unit>/19`).
+- Merge gate `--tests-only` green on a tree merged with `origin/natedev`.

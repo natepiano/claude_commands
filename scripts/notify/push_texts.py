@@ -16,6 +16,8 @@ from user_action import (ActionRequired, NoActionRequired, UserAction, Notificat
 
 Need = Literal["note", "decision", "blocked"]
 REVIEWED_FILE = Path(__file__).with_name("push_texts_reviewed.json")
+# A concurrent keyed sender has not confirmed delivery: callers must retry, never mark done.
+SEND_RETRY_EXIT = 5
 SEND_SCRIPT = Path(__file__).resolve().parents[1] / "message/send.py"
 # A unit id such as "types-unit": the whole value is one session name. The user knows it as "types".
 _UNIT_ID = re.compile(r"[A-Za-z0-9][\w-]*-unit")
@@ -149,13 +151,16 @@ def shown(entry: PushText) -> str:
 
 
 def user_send_argv(rendered: RenderedPush, *, sender: str = "", machine: str = "",
-                   priority: str = "", timeout: float = 0, key: str = "", self_clearing: bool = False) -> list[str]:
+                   priority: str = "", timeout: float = 0, key: str = "", self_clearing: bool = False,
+                   clears_when: str = "") -> list[str]:
     """The send.py argv; a `key` lets `send.py retire --to user --key KEY` stop a blocked push's repeats.
     `self_clearing`: the caller retires its own blocked push, so send.py needs no --clears-when."""
     command = [sys.executable, str(SEND_SCRIPT), "--to", "user", "--from", sender or rendered.sender,
                "--need", rendered.need, "--text-id", rendered.id]
     if key:
         command.extend(["--key", key])
+    if clears_when:
+        command.extend(["--clears-when", clears_when])
     if self_clearing:
         command.append("--self-clearing")
     for name, value in sorted(rendered.values.items()):

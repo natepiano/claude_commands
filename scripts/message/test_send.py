@@ -787,13 +787,15 @@ class SendTests(ShutdownTestCase):
             del message, timeout
             with (mock.patch.object(send, "now", return_value=started + timedelta(minutes=31)),
                   mock.patch.object(send, "relay", return_value=send.Result("sent", "later delivery"))):
-                self.assertEqual(send.send(options).outcome, "sent")
+                self.assertEqual(send.send(options).outcome, "retry")
             return send.Result("failed", "earlier delivery failed")
         with mock.patch.object(send, "now", return_value=started), mock.patch.object(send, "relay", overlap):
             self.assertEqual(send.send(options).outcome, "failed")
+        with mock.patch.object(send, "now", return_value=started + timedelta(minutes=31)):
+            self.assertEqual(send.send(options).outcome, "sent")
         with mock.patch.object(send, "now", return_value=started + timedelta(minutes=32)):
             self.assertEqual(send.send(options).outcome, "skipped")
-        self.assertEqual([entry["outcome"] for entry in self.log()], ["sent", "failed", "skipped"])
+        self.assertEqual([entry["outcome"] for entry in self.log()], ["retry", "failed", "sent", "skipped"])
 
     @staticmethod
     def emergency(*extra: str) -> list[str]:

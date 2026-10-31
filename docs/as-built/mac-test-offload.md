@@ -43,36 +43,95 @@ A claim from any caller (offload, `mac_run.sh`, a session following `/build:mac`
 ### The idle Mac watch — `scripts/buildlog/mac_idle.py`
 
 The existing `buildlog-sample.timer` runs `buildlog sample` on natedev every
-60 seconds. That command also runs the idle Mac check. It needs no new unit.
-The check starts a three-minute idle interval when it sees no claim. A claim
-in `claims/`, a legacy `run.json`, a Mac block, or a future `unreachable_until`
-stops it. A change to the claims folder resets the interval. The check reads
-these files and never changes a claim or a build hold.
+60 seconds by default. Its one idle check keeps the nonblocking `watch.lock`; it starts
+no service and makes no SSH or load query. A legacy `run.json` or a live claim
+without `work_idle_since` means a natedev job runs on the Mac. Otherwise a
+block, an idle claim, or no claim starts the idle interval. A newer claims
+folder mtime moves that interval forward. An active job removes it. A future
+`unreachable_until` is a separate unreachable reading; unreadable state gets
+a diagnostic and sends nothing.
 
-The check reads live step records with `runs_on=mac_allowed` and state `waiting_hold` or `waiting_mac`, for every eligible kind. The shared record reader validates the owner PID and process start. It uses the recorded decision rather than matching verify.sh command names or making another package decision. Permanent declines stay excluded for that call.
+Each pass atomically replaces `~/.local/state/mac-idle/alert.json`, including
+healthy readings. It holds the state, reading time, idle `since`, eligible
+waiting count, cause, holder, detail, reach-backoff deadline and the outage's
+`messaged`/`pushed` marks. `step_diagnostics.json` remembers ignored-record
+diagnostics so unchanged stale records do not print on every pass. The holder's shown session name is cached for the
+outage and refreshed if the reservation owner changes. `scripts/buildlog/mac_idle_alert.py` owns the path, validated file
+form and line text. Timing policy comes from the shared `mac_idle_alert.read_idle_config()`
+reader at use; `mac_test.read_config()` uses the same decoder without importing the
+Mac controller into a view. `/build:queue` and `/build:status` read that
+small file and put its red alert first. A stale reading names
+`buildlog-sample.timer`; views never query the Mac or resolve names.
 
-For a missing session temp folder, the check requires a session record whose
-PID and start time still match a live process. It then creates the folder
-under `/tmp/claude/session/`. For a missing leave hook or a pending retry
-deadline, it writes the call's `.retry` marker. The normal leave check reads
-that marker and bypasses the deadline, then checks `free-now`. Hold and
-memory waits also accept the call's exported marker hook when their normal
-hook is empty. Cargo-token waits use the same retry check. The original call
-removes the marker before its Mac attempt and keeps its own result and
-buildlog row. The watch starts no build step.
+The check counts live step records with `runs_on=mac_allowed` and state
+`waiting_hold` or `waiting_mac`, including memory waits. It uses the recorded
+decision, with PID and start-time validation, rather than process names or a
+new package decision. Registered `local_reason` declines (`no_tests`, `off`,
+`repo`, `linux_only`, `local_flag`) exclude that call; a block decline does not.
 
-An unknown cause sends one message per cause per call to the `builds-unit`
-director in production `build-followups`. The check resolves that address
-with `scripts/message/roster.py --json` and sends through `send.py`. A call
-started before marker support gets this message too. It sends no message to
-the user. A failed send stays pending for another pass; a queued send counts
-as accepted.
+The `[mac_idle]` section of `config/mac_test.conf` supplies the defaults `alert_seconds=180`,
+`push_seconds=600`, `stale_seconds=300`, `repeat_minutes=1440` and
+`send_timeout_s=180`. These control the first alert, the phone push, saved-reading
+freshness, the minimum outage-notification repeat window and the phone send timeout. `MAC_TEST_CONFIG`
+can override these values; omitted or invalid values use the shipped configuration.
+The reader ignores section headings, so these keys remain unique across the file.
+It reads shipped defaults only when an override is missing or invalid. A missing
+or invalid shipped key becomes a typed config error and a watch diagnostic, not
+a traceback.
+Changes take effect on the next read, including in the views.
 
-Buildlog index schema 21 includes `mac_idle`: one row per cause per call, with the
-wait, cause and action. The `.cases` record prevents one row on every pass.
-A pending send is retried without another row. `buildlog schema` lists the
-fields. `MAC_IDLE_STATE_DIR` and `SESSION_TEMP_ROOT` select private roots for
-tests; test claim, session, process and buildlog roots are private too.
+At the default three idle minutes with waiting work, the views show `MAC IDLE`, its cause
+and the number waiting. The check sends one message through `send.py` to the
+builds showrunner, resolved with `scripts/production/showrunners.py address
+builds`. The message lists each waiting step and its wait evidence. Queued
+messages count as accepted; failed address lookups and sends retry next pass.
+At the default ten minutes it sends one registered phone push per outage: a block uses
+`mac_idle.blocked` (`need=blocked`) and `/build:mac unblock`; an idle claim or
+free Mac uses `mac_idle.stuck` (`need=decision`, default repeat window 1440 minutes).
+The send keys include `int(since)`. The watch saves a delivery mark only after
+`send.py` accepts the message. For keyed sends the sender holds a separate
+advisory lock for each key and recipient across checking prior acceptance,
+transport and recording confirmed acceptance. It never holds the global state
+lock during delivery. A stop before acceptance releases that lock and leaves
+the next pass free to retry. Contention returns `RETRY` (exit 5), which neither
+stage counts as done. `QUEUED` means a recoverable copy exists.
+The showrunner send uses `--recipient-key showrunner:builds`, so changing the
+resolved socket does not change its repeat history. Other callers keep their
+existing address identity unless they provide a logical recipient key.
+A duplicate is allowed if the sender stops after transport acceptance but
+before recording it; retrying in this ambiguous gap favors delivery over loss.
+After confirmation, even a stop before the watch's mark does not resend.
+This recovery covers process termination (including SIGTERM, SIGKILL and
+stopping the session on the machine), not power loss; the state writes do not
+claim filesystem synchronization guarantees.
+Both stages pass `--repeat-minutes` so `send.py` skips a previously accepted
+key; the window is at least the configured `repeat_minutes` and grows to cover
+the outage plus `alert_seconds`, including a restart after a long interruption.
+Counting waiting steps reads their recorded
+PIDs; the full process scan for wait evidence and repairs runs only when an
+idle outage reaches `alert_seconds` and work waits. The block's emergency clear command is
+`mac_idle.py cleared --since <since>`: it reads only a fresh saved result and
+clears when the outage changes, ends, or has no waiting steps. Missing and
+stale readings never clear it. A running job ends the outage; a later idle
+interval gets new marks and keys. No waiting work means no idle alert or push.
+
+The existing claim watcher uses its one activity check per host to record
+`work_idle_since` when no build or test runs, even while an app stays open.
+Executables in `target/` outside `deps/` count as apps; Cargo, rustc,
+cargo-nextest and test binaries in `deps/` count as work. Any activity still
+clears `idle_since`, so a parked app keeps its claim and the unchanged
+default 15-minute release rule applies only when all activity stops. A failed check
+changes neither idle key.
+
+Repairs run only when the Mac is free of both blocks and live claims. A
+missing session temp folder needs a live session PID and start time before
+it is created under `/tmp/claude/session/`. Missing leave hooks and pending
+retry deadlines write `.retry` markers. Hold, memory and cargo-token waits
+keep the same marker behavior; the watch starts no build step. Other causes
+send per-call repair messages to the same builds showrunner. Buildlog schema
+21 keeps one `mac_idle` row per cause per call; `.cases` prevents duplicates
+and failed messages stay pending. The action is `message_showrunner`.
+`MAC_IDLE_STATE_DIR` and `SESSION_TEMP_ROOT` provide private test roots.
 
 ### Footer and dailies — `scripts/production/dailies_render.py`
 

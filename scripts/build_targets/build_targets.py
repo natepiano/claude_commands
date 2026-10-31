@@ -52,8 +52,10 @@ import build_hold
 import override_guard
 from user_zone import user_zone
 if TYPE_CHECKING:
+    from ..buildlog import mac_idle_alert
     from ..message import roster
 else:
+    from scripts.buildlog import mac_idle_alert
     from scripts.message import roster
 
 
@@ -86,8 +88,7 @@ def local_time(instant: datetime) -> str:
     return instant.astimezone(user_zone()).strftime("%H:%M %Z")
 
 
-def display_field(value: str) -> str:
-    return " ".join(value.split())
+display_field = mac_idle_alert.display_field
 
 
 def unit_label_suffix(state: RunningJob | Held, labels: Mapping[RunningJob | Held, roster.UnitLabels]) -> str:
@@ -162,6 +163,9 @@ def command_status(probe: bool = False) -> int:
     except Exception:
         identities = {}
     labels = {state: identities[session_id] for state, session_id in holders.items() if session_id in identities}
+    alert = mac_idle_alert.alert_line(mac_idle_alert.state_dir() / "alert.json", time.time(), user_zone())
+    if alert is not None:
+        print(f"\033[1;31m{alert}\033[0m" if sys.stdout.isatty() else alert)
     for name, state in states:
         print(format_state(name, state, labels))
     return 0

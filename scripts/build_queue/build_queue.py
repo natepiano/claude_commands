@@ -6,12 +6,14 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from scripts.build_queue import head_facts
 from scripts.build_queue.queue_lines import Span, age as age, json_form, plain
 from scripts.build_queue.queue_view import QueueModel, field as field, render_view, step_labels as step_labels
+from scripts.buildlog.mac_idle_alert import alert_line, state_dir
 from scripts.lint import memory_admit
 from scripts.lib.user_zone import user_zone
 from scripts.message import unit_labels
@@ -64,24 +66,26 @@ def main() -> int:
             memory_admit.bump_waiter(words[1], caller())
         reading = memory_admit.queue_read()
         if isinstance(reading, memory_admit.QueueBusy):
-            if arguments.json:
-                print(json.dumps(json_form([(Span("queue busy; try again"),)], arguments.columns, 0)))
-            else:
-                print("queue busy; try again")
-            return 0
-        facts = head_facts.read_head_facts(reading) if words else memory_admit.NoWaiter()
-        ids = [step.session_id for step in (*reading.view.running, *reading.view.waiting)]
-        ids.extend(head_facts.session_ids(facts))
-        labels = unit_labels.unit_labels_for(ids, os.environ)
-        pace = head_facts.read_pace(reading.explanation.now) if words else head_facts.PaceUnavailable()
-        model = QueueModel(reading, labels, facts, pace, user_zone())
-        if words:
-            from scripts.build_queue.queue_card import render_selection
-
-            lines = render_selection(model, words[0], arguments.columns)
+            lines = [(Span("queue busy; try again"),)]
+            as_of = 0
         else:
-            lines = render_view(model, arguments.columns, colour=arguments.json, you=arguments.you)
-        print(json.dumps(json_form(lines, arguments.columns, reading.explanation.now),
+            facts = head_facts.read_head_facts(reading) if words else memory_admit.NoWaiter()
+            ids = [step.session_id for step in (*reading.view.running, *reading.view.waiting)]
+            ids.extend(head_facts.session_ids(facts))
+            labels = unit_labels.unit_labels_for(ids, os.environ)
+            pace = head_facts.read_pace(reading.explanation.now) if words else head_facts.PaceUnavailable()
+            model = QueueModel(reading, labels, facts, pace, user_zone())
+            if words:
+                from scripts.build_queue.queue_card import render_selection
+
+                lines = render_selection(model, words[0], arguments.columns)
+            else:
+                lines = render_view(model, arguments.columns, colour=arguments.json, you=arguments.you)
+            as_of = reading.explanation.now
+        alert = alert_line(state_dir() / "alert.json", time.time(), user_zone())
+        if alert is not None:
+            lines.insert(0, (Span(alert, "error", bold=True),))
+        print(json.dumps(json_form(lines, arguments.columns, as_of),
                          ensure_ascii=False, separators=(",", ":")) if arguments.json else plain(lines))
     except memory_admit.BumpOff as error:
         print(f"build queue: {error}")
