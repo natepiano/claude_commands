@@ -144,6 +144,13 @@ class BuildWhyTests(unittest.TestCase):
             f"MemAvailable: {gib(available) // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
         self.change_head(need=gib(need))
 
+    def test_test_phase_charge_explains_the_mark_need_history_width_and_margin(self) -> None:
+        need = gate.TestPhaseNeed(2 * GIB, 7, 8, 12, "wider_unscaled", 1.5)
+        charge = gate.TestPhaseCharge(gib(3), gib(0.4), need, NOW - 60)
+        self.assertEqual(build_why.charge_text(charge, user_zone()),
+                         "tests since 21:50: peak so far 0.4 GiB, need 2.0 GiB "
+                         + "(wider_unscaled, p90 of 7 runs at width 12), × 1.5")
+
     def test_expired_head_explains_refresh_even_when_all_resource_checks_pass(self) -> None:
         self.reset_running(available=60, need=1)
         self.change_head(estimated_at=NOW - gate.HEAD_SECONDS)

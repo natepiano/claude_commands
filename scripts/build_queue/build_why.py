@@ -50,6 +50,11 @@ def charge_text(basis: gate.ChargeBasis, zone: ZoneInfo) -> str:
         return f"ramp promise: first {gate.RAMP_SECONDS // 60} min after admission"
     if isinstance(basis, gate.LifetimePromise):
         return "release build promise: holds until the step ends"
+    if isinstance(basis, gate.TestPhaseCharge):
+        need = basis.need
+        return (f"tests since {minute(basis.started_at, zone)}: peak so far {gib(basis.peak_so_far)}, "
+                f"need {gib(need.bytes)} ({need.form}, p90 of {need.runs} runs at width {need.recorded_width}), "
+                f"× {basis.need.margin:g}")
     if isinstance(basis, gate.PeakSoFar):
         text = f"compiling, peak so far {gib(basis.bytes)}"
         if isinstance(basis.peak_at, float):

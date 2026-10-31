@@ -19,14 +19,14 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Generator, Iterator, Mapping
+from collections.abc import Generator, Iterable, Iterator, Mapping
 from contextlib import redirect_stderr
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from typing import BinaryIO, Callable, Literal, NoReturn, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
+from typing import TYPE_CHECKING, BinaryIO, Callable, Literal, NoReturn, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
 from functools import lru_cache
 from itertools import chain
 from types import UnionType
@@ -43,6 +43,10 @@ from atomic_file import write_text_atomic
 from config_values import config_values
 
 
+if TYPE_CHECKING:
+    from ..buildlog import record as build_record
+
+
 class GitFacts(TypedDict):
     repo_path: str | None
     worktree: str | None
@@ -55,6 +59,12 @@ class StepParser(Protocol):
 
 
 class GitIdentityReader(Protocol):
+    TestPhaseRecord: type[build_record.TestPhaseRecord]
+    ObservedTestPhase: type[build_record.ObservedTestPhase]
+    UnobservedTestPhase: type[build_record.UnobservedTestPhase]
+
+    def read_test_phase(self, path: Path) -> build_record.TestPhaseRecord | build_record.NoTestPhaseRecord | build_record.UnreadableTestPhaseRecord: ...
+
     def git_directory(self, argv: list[str], cwd: str) -> str: ...
     def git_facts(self, directory: str) -> GitFacts: ...
     def queue_priority(self, action: Literal["set", "clear"], unit: str,
@@ -91,6 +101,7 @@ FALLBACK = 12 * GIB
 # 111 natedev filtered single-test runs with no recompilation in the 14 days
 # to 2026-10-29 had anon p90 0.671 GiB and p95 0.784 GiB.
 FILTERED_FLOOR = GIB
+FALLBACK_TEST_PHASE_MARGIN = 1.2
 # On natedev, isolated hana nextest scopes had p90 anon / memory.peak 61%;
 # clippy had 65%, so 0.65 covers the measured p90 process-memory share.
 ANON_SHARE = 0.65
@@ -211,6 +222,29 @@ class BasisNotRecorded:
     pass
 
 
+TestPhaseNeedForm = Literal["same_width", "wider_unscaled", "scaled_up"]
+
+
+@dataclass(frozen=True)
+class TestPhaseNeed:
+    bytes: int
+    runs: int
+    width: int
+    recorded_width: int
+    form: TestPhaseNeedForm
+    margin: float = FALLBACK_TEST_PHASE_MARGIN
+
+
+@dataclass(frozen=True)
+class NoTestPhaseNeed:
+    reason: Literal["no_width", "no_history", "not_recorded"]
+
+
+@dataclass(frozen=True)
+class NoTestPhaseFile:
+    pass
+
+
 @dataclass(frozen=True)
 class Completed:
     pass
@@ -253,6 +287,18 @@ class BroadTestSelection:
     pass
 
 
+class TestPhaseChargeUse(TypedDict):
+    bytes: int
+    selected_at: float
+    reservation_id: str
+    need: dict[str, object]
+
+
+@dataclass(frozen=True)
+class NoTestPhaseChargeUse:
+    pass
+
+
 class FinalizationIntent(TypedDict):
     reservation_id: str
     peak: int
@@ -260,6 +306,10 @@ class FinalizationIntent(TypedDict):
     outcome: Literal["completed", "failed", "killed", "owner_gone"]
     ended_at: str
     status: NotRequired[int]
+    test_phase_peak_bytes: NotRequired[int]
+    test_phase_started_at: NotRequired[float]
+    test_phase_need: NotRequired[dict[str, object]]
+    test_phase_charge_use: NotRequired[TestPhaseChargeUse]
 
 
 @dataclass(frozen=True)
@@ -292,6 +342,7 @@ class Reservation(TypedDict):
     scoped: NotRequired[bool]
     finalization: NotRequired[FinalizationIntent]
     queue_waiter: NotRequired[Waiter]
+    test_phase_need: NotRequired[dict[str, object]]
 
 
 @dataclass(frozen=True)
@@ -364,6 +415,20 @@ class PeakDecayed:
 
 
 @dataclass(frozen=True)
+class TestPhaseStarted:
+    started_at: float
+    peak_so_far: int
+    need: TestPhaseNeed
+
+
+@dataclass(frozen=True)
+class TestPhaseCharge:
+    bytes: int
+    peak_so_far: int
+    need: TestPhaseNeed
+    started_at: float
+
+@dataclass(frozen=True)
 class PeakFileUnreadable:
     bytes: int
 
@@ -378,8 +443,8 @@ class EndedCharge:
     bytes: int = 0
 
 
-ChargeBasis = PromiseNoReading | RampPromise | LifetimePromise | PeakSoFar | PeakDecayed | PeakFileUnreadable | UsingNow | EndedCharge
-PeakHistory = NoPeakRecorded | PeakSoFar | PeakDecayed | PeakFileUnreadable
+ChargeBasis = PromiseNoReading | RampPromise | LifetimePromise | PeakSoFar | PeakDecayed | PeakFileUnreadable | UsingNow | EndedCharge | TestPhaseCharge
+PeakHistory = NoPeakRecorded | PeakSoFar | PeakDecayed | PeakFileUnreadable | TestPhaseStarted
 
 
 @dataclass(frozen=True)
@@ -1441,6 +1506,22 @@ def build_budget_bytes() -> int:
     return FALLBACK_BUILD_BUDGET_BYTES
 
 
+def _test_phase_margin_value(raw: object) -> float:
+    """Validate configuration and stored margins at their shared boundary."""
+    if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+        return FALLBACK_TEST_PHASE_MARGIN
+    try:
+        value = float(raw)
+    except (ValueError, OverflowError):
+        return FALLBACK_TEST_PHASE_MARGIN
+    return value if math.isfinite(value) and value >= 1.0 else FALLBACK_TEST_PHASE_MARGIN
+
+
+def test_phase_margin() -> float:
+    """Read the live test-phase margin through the shared lint configuration."""
+    return _test_phase_margin_value(config_values(_lint_config_path()).get("test_phase_margin", ""))
+
+
 def resolve_admission_limits(total: int | UnknownHostTotal) -> AdmissionLimits:
     return AdmissionLimits(build_budget_bytes(), total * 5 // 100 if isinstance(total, int) else 0)
 
@@ -1451,8 +1532,8 @@ def decide(available: int, total: int | UnknownHostTotal, need: int, running: li
     """Apply the build budget, free-memory floor and pressure limit together."""
     promised = sum(growth_headroom(row) for row in running)
     measured = sum(row.bytes for row in running if isinstance(row, MeasuredMemory))
-    charged = sum(build_charge(row) for row in running)
     resolved = limits if isinstance(limits, AdmissionLimits) else resolve_admission_limits(total)
+    charged = sum(build_charge(row) for row in running)
     budget, reserve = resolved.budget, resolved.reserve
     threshold = need + promised + reserve
     fits_budget = charged + need <= budget or not has_running_step(running)
@@ -1476,7 +1557,11 @@ def charge_basis(memory: StepMemory) -> ChargeBasis:
         return PromiseNoReading(memory.bytes)
     if isinstance(memory, MeasuredMemory):
         peak = memory.peak_history
-        observed = replace(peak, bytes=memory.observed_peak) if isinstance(peak, PeakSoFar) else PeakSoFar(memory.observed_peak)
+        observed: ChargeBasis = replace(peak, bytes=memory.observed_peak) if isinstance(peak, PeakSoFar) else PeakSoFar(memory.observed_peak)
+        if isinstance(peak, TestPhaseStarted):
+            margin = peak.need.margin
+            observed = TestPhaseCharge(math.ceil(max(peak.peak_so_far, peak.need.bytes) * margin),
+                                       peak.peak_so_far, peak.need, peak.started_at)
         promise = memory.promise
         terms: tuple[ChargeBasis, ...] = (UsingNow(memory.bytes), observed,
                                          PeakFileUnreadable(memory.unknown_peak_promise))
@@ -1719,7 +1804,13 @@ def build_expected_peak(repository: Repository, shape: BuildShape | NoBuildShape
     return ExpectedPeak(min(uncapped, budget), "shape", count, basis)
 
 
-def need_basis_record(basis: NeedBasis | BasisNotRecorded) -> dict[str, object]:
+def _need_record(basis: NeedBasis | BasisNotRecorded | TestPhaseNeed | NoTestPhaseNeed) -> dict[str, object]:
+    if isinstance(basis, TestPhaseNeed):
+        return {"kind": "test_phase_need", "bytes": basis.bytes, "runs": basis.runs,
+                "width": basis.width, "recorded_width": basis.recorded_width, "form": basis.form,
+                "margin": basis.margin}
+    if isinstance(basis, NoTestPhaseNeed):
+        return {"kind": "no_test_phase_need", "reason": basis.reason}
     if isinstance(basis, (BasisNotRecorded, str)):
         return {"kind": basis if isinstance(basis, str) else "not_recorded"}
     cap: dict[str, object] = ({"kind": "budget", "uncapped": basis.cap.uncapped}
@@ -1737,12 +1828,23 @@ def need_basis_record(basis: NeedBasis | BasisNotRecorded) -> dict[str, object]:
             "floor": floor, "factor": factor, "cap": cap}
 
 
-def read_need_basis(raw: object) -> NeedBasis | BasisNotRecorded:
+def _read_need_record(raw: object) -> NeedBasis | BasisNotRecorded | TestPhaseNeed | NoTestPhaseNeed:
     """One boundary for cached estimates and queue explanations."""
     if not isinstance(raw, dict):
         return BasisNotRecorded()
     row = cast(dict[str, object], raw)
     kind = row.get("kind")
+    if kind == "no_test_phase_need" and row.get("reason") in ("no_width", "no_history", "not_recorded"):
+        return NoTestPhaseNeed(cast(Literal["no_width", "no_history", "not_recorded"], row["reason"]))
+    if kind == "test_phase_need":
+        numbers = [row.get(name) for name in ("bytes", "runs", "width", "recorded_width")]
+        if (all(type(number) is int and number > 0 for number in numbers)
+                and row.get("form") in ("same_width", "wider_unscaled", "scaled_up")):
+            margin = _test_phase_margin_value(row.get("margin"))
+            return TestPhaseNeed(cast(int, numbers[0]), cast(int, numbers[1]),
+                                 cast(int, numbers[2]), cast(int, numbers[3]),
+                                 cast(TestPhaseNeedForm, row["form"]), margin)
+        return BasisNotRecorded()
     if kind in ("measured", "buildlog", "pooled", "fallback"):
         return kind
     if kind not in ("shape_p90", "shape_largest", "shape_fallback"):
@@ -1789,6 +1891,90 @@ def read_need_basis(raw: object) -> NeedBasis | BasisNotRecorded:
     except (KeyError, TypeError, ValueError):
         pass
     return BasisNotRecorded()
+
+
+def need_basis_record(basis: NeedBasis | BasisNotRecorded) -> dict[str, object]:
+    return _need_record(basis)
+
+
+def read_need_basis(raw: object) -> NeedBasis | BasisNotRecorded:
+    value = _read_need_record(raw)
+    return BasisNotRecorded() if isinstance(value, (TestPhaseNeed, NoTestPhaseNeed)) else value
+
+
+def test_phase_need_record(need: TestPhaseNeed | NoTestPhaseNeed) -> dict[str, object]:
+    return _need_record(need)
+
+
+def read_test_phase_need(raw: object) -> TestPhaseNeed | NoTestPhaseNeed:
+    value = _read_need_record(raw)
+    return value if isinstance(value, (TestPhaseNeed, NoTestPhaseNeed)) else NoTestPhaseNeed("not_recorded")
+
+
+def test_phase_need_from_rows(rows: Iterable[Mapping[str, object]],
+                             row: Mapping[str, object], host: str, now: datetime) -> TestPhaseNeed | NoTestPhaseNeed:
+    """Choose narrow-family history at the closest usable width; read no external state."""
+    width = row.get("test_threads")
+    if type(width) is not int or width <= 0:
+        return NoTestPhaseNeed("no_width")
+    repository = row.get("repo_identity")
+    if not isinstance(repository, str) or not repository:
+        return NoTestPhaseNeed("no_history")
+    cutoff = now - timedelta(days=HISTORY_DAYS)
+    by_width: dict[int, list[int]] = {}
+    for item in rows:
+        if (item.get("host") != host or item.get("step") != "nextest"
+                or item.get("repo_identity") != repository
+                or item.get("test_scope", "full") != row.get("test_scope", "full")
+                or item.get("package", "") != row.get("package", "")
+                or sorted(history_arguments(item.get("filters"))) != sorted(history_arguments(row.get("filters")))):
+            continue
+        peak, recorded_width = item.get("test_phase_peak_bytes"), item.get("test_threads")
+        if type(peak) is not int or peak <= 0 or type(recorded_width) is not int or recorded_width <= 0:
+            continue
+        try:
+            ended = datetime.fromisoformat(str(item.get("ended_at", "")).replace("Z", "+00:00"))
+            if not cutoff <= ended < now:
+                continue
+        except (ValueError, TypeError):
+            continue
+        by_width.setdefault(recorded_width, []).append(peak)
+    if not by_width:
+        return NoTestPhaseNeed("no_history")
+    form: TestPhaseNeedForm
+    if width in by_width:
+        recorded_width, form = width, "same_width"
+    elif wider := [candidate for candidate in by_width if candidate > width]:
+        recorded_width, form = min(wider), "wider_unscaled"
+    else:
+        recorded_width, form = max(by_width), "scaled_up"
+    peaks = by_width[recorded_width]
+    need = percentile(peaks)
+    if form == "scaled_up":
+        need = (need * width + recorded_width - 1) // recorded_width
+    return TestPhaseNeed(max(FILTERED_FLOOR, need), len(peaks), width, recorded_width, form)
+
+
+def test_phase_need(row: Mapping[str, object], host: str, now: datetime, root: Path) -> TestPhaseNeed | NoTestPhaseNeed:
+    try:
+        need = test_phase_need_from_rows(anonymous_history_rows(root / "admission/anon_peaks.jsonl"), row, host, now)
+        return replace(need, margin=test_phase_margin()) if isinstance(need, TestPhaseNeed) else need
+    except OSError:
+        return NoTestPhaseNeed("no_history")
+
+
+def test_phase_path(row: Reservation) -> Path | NoTestPhaseFile:
+    sidecar = row["sidecar"]
+    return Path(sidecar.removesuffix(".cgroup") + ".test-phase.json") if sidecar.endswith(".cgroup") else NoTestPhaseFile()
+
+
+def observed_test_phase(row: Reservation) -> build_record.ObservedTestPhase | build_record.UnobservedTestPhase:
+    path = test_phase_path(row)
+    if isinstance(path, Path):
+        phase = record.read_test_phase(path)
+        if isinstance(phase, record.TestPhaseRecord) and isinstance(phase.window, record.ObservedTestPhase):
+            return phase.window
+    return record.UnobservedTestPhase()
 
 
 def history_arguments(raw: object) -> list[str]:
@@ -2196,6 +2382,11 @@ def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIde
             reading = tree_memory(row["pid"], row["start_time"], processes, proc)
     else:
         reading = tree_memory(row["pid"], row["start_time"], processes, proc)
+    return step_promise(row, now, reading)
+
+
+def step_promise(row: Reservation, now: datetime, reading: StepMemory) -> StepMemory:
+    """Apply the reservation lifetime promise at this instant."""
     if isinstance(reading, MeasuredMemory) and release_build(row):
         return replace(reading, promise=LifetimePromise(row["need"]))
     if isinstance(reading, MeasuredMemory) and now.timestamp() - _epoch(row["admitted_at"]) < RAMP_SECONDS:
@@ -2208,6 +2399,17 @@ def step_memory(row: Reservation, now: datetime, processes: dict[int, ProcessIde
 def release_build(row: Reservation) -> bool:
     shape = recorded_build_shape(row.get("shape"))
     return row.get("step") == "build" and isinstance(shape, BuildShape) and shape.profile == "release"
+
+
+def test_phase_history(row: Reservation, reading: StepMemory,
+                       phase: build_record.ObservedTestPhase | build_record.UnobservedTestPhase
+                       ) -> TestPhaseStarted | NoPeakRecorded:
+    """A measured step past its promise may use its frozen test-phase need."""
+    need = read_test_phase_need(row.get("test_phase_need"))
+    if (isinstance(reading, MeasuredMemory) and isinstance(reading.promise, NoPromise)
+            and isinstance(need, TestPhaseNeed) and isinstance(phase, record.ObservedTestPhase)):
+        return TestPhaseStarted(phase.started_at, phase.peak_bytes, need)
+    return NoPeakRecorded()
 
 
 def reservation_memory(path: Path, row: Reservation, now: datetime,
@@ -2223,6 +2425,9 @@ def reservation_memory(path: Path, row: Reservation, now: datetime,
         if isinstance(reading, MeasuredMemory):
             return replace(reading, unknown_peak_promise=row["need"], peak_history=PeakFileUnreadable(row["need"]))
         return reading
+    phase_history = test_phase_history(row, reading, observed_test_phase(row))
+    if isinstance(phase_history, TestPhaseStarted) and isinstance(reading, MeasuredMemory):
+        return replace(reading, peak_history=phase_history)
     last_near_peak_at = now.timestamp()  # Unknown times retain the peak charge.
     peak_at: float | PeakTimeUnknown = PeakTimeUnknown()
     peak_time: float | PeakTimeUnknown = PeakTimeUnknown()
@@ -2955,6 +3160,11 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         result = admission_pass(inputs, now.timestamp())
         own = next(row for row in result.rows if row.owner == waiter_owner(waiter))
         decision = own.decision
+        # Persist actual selected bases after the pure pass. Failure to record
+        # optional measurement evidence must never change admission.
+        for running_path, running_row in live:
+            record_test_phase_charge_use(running_path, running_row,
+                                         charge_basis(snapshot.memory[running_path]), now.timestamp())
         for mark in result.head_marks:
             if mark.path == mine:
                 waiter = mark.waiter
@@ -2979,29 +3189,50 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             write_text_atomic(mine, json.dumps(stored_waiter(waiter), separators=(",", ":")))
         if argv and decision.state == "admit":
             if start is not None:
-                path = directory / f"{pid}-{start}-{time.time_ns()}.reservation"
-                row: Reservation = {"pid": pid, "start_time": start, "need": peak.bytes,
-                                    "repo": repo, "step": step, "worktree": worktree,
-                                    "admitted_at": store.utc_iso(now.timestamp()), "sidecar": sidecar,
-                                    "test_threads": width,
-                                    "call_id": os.environ.get("BUILDLOG_CALL_ID") or None,
-                                    "reservation_id": uuid.uuid4().hex, "scoped": bool(sidecar)}
-                row["queue_waiter"] = stored_waiter(waiter)
-                row["test_scope"] = profile.scope
-                row["package"] = package
-                row["filters"] = list(filters)
-                if step == "build":
-                    row["shape"] = build_shape(argv).key
-                if isinstance(profile.repository, RepositoryIdentity):
-                    row["repo_identity"] = profile.repository.key
-                write_text_atomic(path, json.dumps(row, separators=(",", ":")))
+                existing = next((path for path, row in live
+                                 if step == "nextest" and row["pid"] == pid and row["start_time"] == start
+                                 and row["step"] == step and row["sidecar"] == sidecar
+                                 and row["need"] == peak.bytes), None)
+                if existing is not None:
+                    # A repeated admitted check reuses its grant, after the pass
+                    # has checked memory with every live reservation charged.
+                    path = existing
+                else:
+                    path = directory / f"{pid}-{start}-{time.time_ns()}.reservation"
+                    row: Reservation = {"pid": pid, "start_time": start, "need": peak.bytes,
+                                        "repo": repo, "step": step, "worktree": worktree,
+                                        "admitted_at": store.utc_iso(now.timestamp()), "sidecar": sidecar,
+                                        "test_threads": width,
+                                        "call_id": os.environ.get("BUILDLOG_CALL_ID") or None,
+                                        "reservation_id": uuid.uuid4().hex, "scoped": bool(sidecar)}
+                    row["queue_waiter"] = stored_waiter(waiter)
+                    row["test_scope"] = profile.scope
+                    row["package"] = package
+                    row["filters"] = list(filters)
+                    if step == "build":
+                        row["shape"] = build_shape(argv).key
+                    if isinstance(profile.repository, RepositoryIdentity):
+                        row["repo_identity"] = profile.repository.key
+                    write_text_atomic(path, json.dumps(row, separators=(",", ":")))
                 reservation = Reserved(path)
             else:
                 reservation = NotReserved("untracked")
             mine.unlink(missing_ok=True)
         head_reason = own.reason
-        return CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile,
-                           head_need, head_label, head_reason, blocker)
+        result_check = CheckResult(decision, peak, [row for _, row in live], reservation, repo, step, available, profile,
+                                   head_need, head_label, head_reason, blocker)
+    if step == "nextest" and isinstance(reservation, Reserved):
+        try:
+            admitted = read_reservation(reservation.path)
+            if "test_phase_need" not in admitted:
+                need = test_phase_need(admitted, store.host_name(), now, root)
+                update_reservation(reservation.path, {"test_phase_need": test_phase_need_record(need)}, root,
+                                   readings=snapshot)
+        except Exception:
+            # Admission is already committed. Optional charge evidence must not
+            # hide its reservation path or cause a second admission on retry.
+            return result_check
+    return result_check
 
 
 def commit_pass_effects(directory: Path, recovery: RecoverySpacing,
@@ -3382,7 +3613,8 @@ def queue_read_from(inputs: QueueInputs) -> QueueRead:
             reservation_index += 1
         explained.append(ExplainedRunningStep(step, admitted_at, step.promise,
                          reading.bytes if isinstance(reading, MeasuredMemory) else 0,
-                         build_charge(reading), charge_basis(reading)))
+                         build_charge(reading),
+                         charge_basis(reading)))
     head, totals = result.head, result.totals
     waiting: list[WaitingStep] = []
     first: HeadExplanation | NoWaiter = NoWaiter()
@@ -3539,7 +3771,9 @@ def parse_snapshot_value(value: object, schema: object) -> object:
 
 def write_queue_snapshot(directory: Path, inputs: QueueInputs) -> None:
     """Publish a cache atomically under LOCK_EX; durability is deliberately unnecessary."""
-    encoded = json.dumps({"v": 1, "written_at": time.time(), "inputs": snapshot_value(inputs)},
+    evidence = cast(dict[str, object], snapshot_value(inputs))
+    del evidence["limits"]  # Each reader resolves configuration at its own boundary.
+    encoded = json.dumps({"v": 2, "written_at": time.time(), "inputs": evidence},
                          separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     temporary = directory / "queue.json.tmp"
     try:
@@ -3555,10 +3789,18 @@ def read_queue_snapshot(directory: Path) -> QueueSnapshot | NoQueueSnapshot:
         if not isinstance(raw, dict):
             return NoQueueSnapshot()
         envelope = cast(dict[str, object], raw)
-        if type(envelope.get("v")) is not int or envelope["v"] != 1:
+        if type(envelope.get("v")) is not int or envelope["v"] != 2:
             return NoQueueSnapshot()
         written_at = cast(float, parse_snapshot_value(envelope["written_at"], float))
-        inputs = cast(QueueInputs, parse_snapshot_value(envelope["inputs"], QueueInputs))
+        evidence = envelope["inputs"]
+        if not isinstance(evidence, dict) or "limits" in evidence:
+            return NoQueueSnapshot()
+        evidence = cast(dict[str, object], evidence)
+        host = cast(HostMemory | ReadingUnavailable,
+                    parse_snapshot_value(evidence["host"], HostMemory | ReadingUnavailable))
+        limits = resolve_admission_limits(host.total if isinstance(host, HostMemory) else UnknownHostTotal())
+        inputs = cast(QueueInputs, parse_snapshot_value(
+            {**evidence, "limits": snapshot_value(limits)}, QueueInputs))
         if sum(not isinstance(step.measured, CompilerServiceMemory) for step in inputs.running) != len(inputs.reservations):
             return NoQueueSnapshot()
         return QueueSnapshot(written_at, inputs)
@@ -3595,11 +3837,13 @@ class QueueSnapshotReadings:
 
 
 @contextmanager
-def exclusive_queue(directory: Path) -> Generator[QueueSnapshotReadings]:
+def exclusive_queue(directory: Path, *,
+                    readings: QueueSnapshotReadings | ReadingNotTaken = READING_NOT_TAKEN) -> Generator[QueueSnapshotReadings]:
     """Every exclusive exit publishes the resulting ledger, including exceptional exits."""
     with (directory / "lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        readings = QueueSnapshotReadings(ProcessesNotRead(), {})
+        if isinstance(readings, ReadingNotTaken):
+            readings = QueueSnapshotReadings(ProcessesNotRead(), {})
         try:
             yield readings
         finally:
@@ -3754,6 +3998,50 @@ def cancel_waiter(pid: int, root: Path | None = None) -> None:
         (directory / f"{pid}-{start}.waiting").unlink(missing_ok=True)
 
 
+def test_phase_charge_use_path(path: Path) -> Path:
+    return path.with_suffix(".test-phase-charge.json")
+
+
+def record_test_phase_charge_use(path: Path, row: Reservation, basis: ChargeBasis, now: float) -> None:
+    """Save the first selected test-phase basis; caller owns the admission lock."""
+    reservation_id = row.get("reservation_id")
+    if not isinstance(basis, TestPhaseCharge) or not reservation_id:
+        return
+    try:
+        evidence_path = test_phase_charge_use_path(path)
+        if evidence_path.exists():
+            return
+        evidence: TestPhaseChargeUse = {
+            "bytes": basis.bytes, "selected_at": now,
+            "reservation_id": reservation_id, "need": test_phase_need_record(basis.need),
+        }
+        write_text_atomic(evidence_path, json.dumps(evidence, separators=(",", ":")))
+    except Exception:
+        # Evidence is optional: even an interrupted/failed write cannot hide
+        # the admitted caller's reservation or alter a hold decision.
+        pass
+
+
+def read_test_phase_charge_use(path: Path, reservation_id: str) -> TestPhaseChargeUse | NoTestPhaseChargeUse:
+    """Read saved decision evidence; absence never becomes inferred use."""
+    try:
+        raw = cast(object, json.loads(test_phase_charge_use_path(path).read_text()))
+        if not isinstance(raw, dict):
+            return NoTestPhaseChargeUse()
+        evidence = cast(dict[str, object], raw)
+        amount, selected_at = evidence.get("bytes"), evidence.get("selected_at")
+        need = read_test_phase_need(evidence.get("need"))
+        if (evidence.get("reservation_id") == reservation_id
+                and type(amount) is int and amount > 0
+                and isinstance(selected_at, (int, float)) and not isinstance(selected_at, bool)
+                and math.isfinite(selected_at) and isinstance(need, TestPhaseNeed)):
+            return {"bytes": amount, "selected_at": float(selected_at),
+                    "reservation_id": reservation_id, "need": test_phase_need_record(need)}
+    except (OSError, ValueError, TypeError):
+        pass
+    return NoTestPhaseChargeUse()
+
+
 def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, now: datetime,
                          status: int | OutcomeNotRecorded = OUTCOME_NOT_RECORDED) -> HistoryRecorded | NoHistoryRecorded:
     """Keep a scoped step's peak before removing its evidence; caller owns the lock."""
@@ -3773,6 +4061,15 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
         }
         if isinstance(status, int):
             intent["status"] = status
+        phase = observed_test_phase(row)
+        if isinstance(phase, record.ObservedTestPhase):
+            intent["test_phase_peak_bytes"] = phase.peak_bytes
+            intent["test_phase_started_at"] = phase.started_at
+        if "test_phase_need" in row:
+            intent["test_phase_need"] = test_phase_need_record(read_test_phase_need(row["test_phase_need"]))
+        charge_use = read_test_phase_charge_use(path, intent["reservation_id"])
+        if isinstance(charge_use, dict):
+            intent["test_phase_charge_use"] = charge_use
         row["finalization"] = intent
         write_text_atomic(path, json.dumps(row, separators=(",", ":")))
     intent = row["finalization"]
@@ -3797,8 +4094,12 @@ def finalize_reservation(path: Path, row: Reservation, outcome: FinalOutcome, no
                     history["status"] = intent["status"]
                 if "shape" in row:
                     history["shape"] = row["shape"]
+                for name in ("test_phase_peak_bytes", "test_phase_started_at", "test_phase_need", "test_phase_charge_use"):
+                    if name in intent:
+                        history[name] = cast(Mapping[str, object], intent)[name]
                 store.append_locked(handle, history)
         result = HistoryRecorded()
+    test_phase_charge_use_path(path).unlink(missing_ok=True)
     maximum.unlink(missing_ok=True)
     path.with_suffix(".wave").unlink(missing_ok=True)
     if row["sidecar"]:
@@ -3819,21 +4120,36 @@ def release(path: Path, status: int, root: Path | None = None) -> None:
         _ = finalize_reservation(path, row, outcome, datetime.now(UTC), status)
 
 
-def set_width(path: Path, width: int, root: Path | None = None) -> None:
-    """Record the test width a reserved step runs at, claimed after its admission."""
-    root = root if root is not None else store.root()
-    with exclusive_queue(admission_dir(root)):
+def update_reservation(path: Path, changes: dict[str, object], root: Path, *,
+                       readings: QueueSnapshotReadings | ReadingNotTaken = READING_NOT_TAKEN) -> None:
+    """Apply fields to the current reservation under the lock, or skip an ended step."""
+    if isinstance(readings, QueueSnapshotReadings):
+        # Reuse this check's host samples; refresh ledger and process state after
+        # reacquiring the lock, since another check may have changed them.
+        readings = replace(readings, processes=ProcessesNotRead(), memory={},
+                           recovery=READING_NOT_TAKEN, order=QUEUE_ORDER_NOT_RESOLVED)
+    with exclusive_queue(admission_dir(root), readings=readings):
         try:
-            row = cast(Reservation, json.loads(path.read_text()))
+            row = read_reservation(path)
         except (OSError, ValueError, TypeError):
             return
+        updated = {**row, **changes}
+        write_text_atomic(path, json.dumps(updated, separators=(",", ":")))
+
+
+def set_width(path: Path, width: int, root: Path | None = None) -> None:
+    """Estimate at the actual test width outside the lock, then publish both fields."""
+    root = root if root is not None else store.root()
+    try:
+        row = read_reservation(path)
+    except (OSError, ValueError, TypeError):
+        return
+    changes: dict[str, object] = {"test_threads": width}
+    if row["step"] == "nextest":
         row["test_threads"] = width
-        temporary = path.with_suffix(".reservation.tmp")
-        try:
-            _ = temporary.write_text(json.dumps(row, separators=(",", ":")))
-            os.replace(temporary, path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        need = test_phase_need(row, store.host_name(), datetime.now(UTC), root)
+        changes["test_phase_need"] = test_phase_need_record(need)
+    update_reservation(path, changes, root)
 
 
 def _epoch(instant: str) -> float:

@@ -373,7 +373,7 @@ No-copies rule (user, 2026-10-30): one place for each thing. A second copy of se
 - The phase lands as its own checkpoint, with no other admission change in it.
 - Change-Review line: the queue service and its client pass their in-process tests; no build uses them yet | in `~/.claude`, run `env -u PYTHONUNBUFFERED python3 -m unittest scripts.build_queue.test_admission_service scripts.build_queue.test_admission_client` | all tests pass, and a build's wait output is the same as before.
 
-### Phase 8 — A nextest step's charge falls to its test-phase need when its tests start  · status: todo
+### Phase 8 — A nextest step's charge falls to its test-phase need when its tests start  · status: done
 Moved from builds-resources Phase 15 (builds showrunner, 2026-10-31): one owner for admission changes in `memory_admit.py`.
 **Depends on:** resources Phase 33 (its one anonymous-history reader feeds Spec 2, and its finalizer retry carries Spec 4's saved evidence; the reader moved from this phase to resources Phase 33) and resources Phase 26 (same file, `memory_admit.py`; resources 33 → 26 → this phase land one after another); report-unit's Phase 4c (the test-phase file `$BUILDLOG_PEAK.test-phase.json`, `test_phase_peak_bytes`, `record.read_test_phase`), merged on `origin/builds` (`f88d8012`) and in this branch at `31c3ee3e`. Merge `origin/builds` first. Global order (resources numbering): Phases 21, 16, 25, 30, 28, 4, 24 and 32 are checkpointed; serial memory chain 31 → 33 → 26 → **15** (this phase) → 27 (Phase 9) → 20 → 11 → 17 → 18 → 19 → 8; 29 runs beside the chain, checkpoints after 33 (same file, `sweep.py`) and joins before 11.
 **Blocked by:** none; resources Phases 26 and 33 are on `origin/builds` and in this branch (d309bbed, c6e9b5af).

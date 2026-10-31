@@ -17,14 +17,14 @@ import tempfile
 import threading
 import time
 import unittest
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 from contextlib import closing, redirect_stdout
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO, Literal, Protocol, TextIO, cast, override
+from typing import IO, TYPE_CHECKING, BinaryIO, Literal, Protocol, TextIO, cast, override
 from unittest import mock
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
@@ -71,6 +71,14 @@ HISTORY_APPEND_STOPS: tuple[HistoryAppendStop, ...] = ("before newline", "inside
 def buildlog_rows(root: Path) -> list[dict[str, object]]:
     return [cast(dict[str, object], json.loads(line)) for path in root.glob("*/*.jsonl")
             for line in path.read_text().splitlines()]
+
+
+def write_history_rows(root: Path, rows: Iterable[dict[str, object]]) -> None:
+    """One anonymous-history writer for every estimate fixture."""
+    path = gate.admission_dir(root) / "anon_peaks.jsonl"
+    with path.open("a") as output:
+        for row in rows:
+            _ = output.write(json.dumps(row) + "\n")
 
 
 def assert_unfinished_history_ignored(test: unittest.TestCase, path: Path,
@@ -253,18 +261,17 @@ class HistoryTests(unittest.TestCase):
     def add_measured(self, count: int, *, host: str = "test-host", repo: str = "hana",
                      at: datetime = HISTORY_AT, test_threads: int | None = None,
                      start_gib: int = 1) -> None:
-        with (self.admission / "anon_peaks.jsonl").open("a") as out:
-            for index in range(count):
-                record: dict[str, object] = {
-                    "host": host,
-                    "repo": repo,
-                    "step": "nextest",
-                    "ended_at": store.utc_iso(at.timestamp()),
-                    "anon_peak_bytes": (start_gib + index) * GIB,
-                }
-                if test_threads is not None:
-                    record["test_threads"] = test_threads
-                _ = out.write(json.dumps(record) + "\n")
+        rows: list[dict[str, object]] = []
+        for index in range(count):
+            row: dict[str, object] = {
+                "host": host, "repo": repo, "step": "nextest",
+                "ended_at": store.utc_iso(at.timestamp()),
+                "anon_peak_bytes": (start_gib + index) * GIB,
+            }
+            if test_threads is not None:
+                row["test_threads"] = test_threads
+            rows.append(row)
+        write_history_rows(self.root, rows)
 
     def add_index(self, *, at: datetime = HISTORY_AT) -> None:
         with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
@@ -363,14 +370,12 @@ class FilteredPromiseTests(unittest.TestCase):
                 scope: gate.TestScope = "filtered", step: str = "nextest",
                 repository: gate.RepositoryIdentity = HANA, host: str = "test-host",
                 at: datetime = HISTORY_AT) -> None:
-        with (self.root / "admission/anon_peaks.jsonl").open("a") as output:
-            for peak in peaks:
-                _ = output.write(json.dumps({
-                    "host": host, "repo": repository.name, "repo_identity": repository.key,
-                    "step": step, "test_scope": scope, "package": package,
-                    "filters": list(filters), "anon_peak_bytes": peak,
-                    "ended_at": store.utc_iso(at.timestamp()),
-                }) + "\n")
+        write_history_rows(self.root, ({
+            "host": host, "repo": repository.name, "repo_identity": repository.key,
+            "step": step, "test_scope": scope, "package": package,
+            "filters": list(filters), "anon_peak_bytes": peak,
+            "ended_at": store.utc_iso(at.timestamp()),
+        } for peak in peaks))
 
     def promise(self, filters: tuple[str, ...] = ("native_rate",)) -> gate.ExpectedPeak:
         return gate.expected_peak(HANA, "nextest", self.host, NOW, self.root,
@@ -663,8 +668,7 @@ class FreshTestPromiseTests(unittest.TestCase):
         if scope == "filtered":
             selection = " | ".join(f"test({name})" for name in filters)
             expression += " & " + (selection if len(filters) == 1 else f"({selection})")
-        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db, \
-                (self.root / "admission/anon_peaks.jsonl").open("a") as output:
+        with closing(sqlite3.connect(self.root / "index.sqlite")) as db, db:
             for peak in peaks:
                 self.sample_id += 1
                 call = f"call-{self.sample_id}"
@@ -674,11 +678,11 @@ class FreshTestPromiseTests(unittest.TestCase):
                                 json.dumps(["cargo", "nextest", "run", "-E", expression]), call,
                                 "/another/history-worktree", "historical-key", status, tests_run, crates, 0))
                 if measured:
-                    _ = output.write(json.dumps({
+                    write_history_rows(self.root, [{
                         "host": host, "repo": "hana", "repo_identity": HANA.key, "step": "nextest",
                         "package": package, "test_scope": scope, "filters": list(filters),
                         "ended_at": timestamp, "anon_peak_bytes": peak, "call_id": call,
-                    }) + "\n")
+                    }])
 
     def previous_build(self, *, key: str = "current-key", worktree: str = "", package: str = "hana",
                        scope: gate.TestScope = "filtered", status: int = 0, tests_run: int = 1,
@@ -1046,12 +1050,12 @@ class RepositoryHistoryTests(unittest.TestCase):
         return repository
 
     def samples(self, repository: gate.RepositoryIdentity, gib: int, *, scope: gate.TestScope = "full") -> None:
-        with (self.admission / "anon_peaks.jsonl").open("a") as out:
-            for _ in range(5):
-                _ = out.write(json.dumps({"host": self.host, "repo": "repo", "step": "nextest",
-                                          "repo_identity": repository.key, "test_scope": scope,
-                                          "anon_peak_bytes": gib * GIB,
-                                          "ended_at": store.utc_iso(HISTORY_AT.timestamp())}) + "\n")
+        write_history_rows(self.root, ({
+            "host": self.host, "repo": "repo", "step": "nextest",
+            "repo_identity": repository.key, "test_scope": scope,
+            "anon_peak_bytes": gib * GIB,
+            "ended_at": store.utc_iso(HISTORY_AT.timestamp()),
+        } for _ in range(5)))
 
     def estimate(self, repository: gate.Repository, scope: gate.TestScope = "full") -> gate.ExpectedPeak:
         return gate.expected_peak(repository, "nextest", self.host, NOW, self.root, scope=scope)
@@ -1430,15 +1434,27 @@ class MemoryQueueFixture(unittest.TestCase):
         _ = path.write_text(json.dumps(row))
         return path
 
-    def running(self, pid: int, need: float, age: float = 180) -> Path:
+    def running(self, pid: int, need: float, age: float = 180, *, sidecar: str = "",
+                peak: float | None = None, test_phase: dict[str, object] | str | None = None,
+                fields: Mapping[str, object] | None = None) -> Path:
         # Each reservation setup starts a live owner, including after an ended-owner case.
         _ = self.processes.setdefault(pid, f"fixture-{pid}")
         row: gate.Reservation = {"pid": pid, "start_time": self.processes[pid], "need": int(need * GIB),
-                                 "repo": "test", "step": "nextest", "worktree": "test", "sidecar": "",
+                                 "repo": "test", "step": "nextest", "worktree": "test", "sidecar": sidecar,
                                  "admitted_at": store.utc_iso(NOW.timestamp() - age),
                                  "test_threads": None, "call_id": None}
         path = gate.admission_dir(self.root) / f"{pid}.reservation"
-        _ = path.write_text(json.dumps(row))
+        _ = path.write_text(json.dumps({**row, **(fields or {})}))
+        if sidecar:
+            _ = Path(sidecar).write_text(str(self.root / f"{pid}.scope"))
+        if peak is not None:
+            _ = path.with_suffix(".max").write_text(str(int(peak * GIB)))
+            _ = path.with_suffix(".wave").write_text(f"{int(peak * GIB)} {int(NOW.timestamp())}")
+        if test_phase is not None:
+            phase_path = gate.test_phase_path(row)
+            if not isinstance(phase_path, Path):
+                self.fail("a test-phase fixture needs a cgroup sidecar")
+            _ = phase_path.write_text(test_phase if isinstance(test_phase, str) else json.dumps(test_phase))
         return path
 
     def head(self, need: float = 10.9) -> Path:
@@ -1465,6 +1481,531 @@ class MemoryQueueFixture(unittest.TestCase):
         return output.getvalue().strip().split("|")
 
 
+
+
+class TestPhaseChargeTests(MemoryQueueFixture):
+    """The real reservation reader, estimator and finalizer share one private ledger."""
+
+    phase_need: gate.TestPhaseNeed = gate.TestPhaseNeed(2 * GIB, 10, 8, 8, "same_width")
+
+    @override
+    def setUp(self) -> None:
+        super().setUp()
+        self.enterContext(patch.dict(os.environ, {
+            **fake_memory_readings(self.root), "BUILDLOG_BUILD_BUDGET_GIB": "21",
+            "LINT_CONFIG_FILE": str(self.root / "lint.conf"),
+        }))
+        _ = self.enterContext(patch.object(store, "host_name", return_value="test-host"))
+        _ = self.enterContext(patch.object(time, "time", return_value=NOW.timestamp()))
+
+    def phase_fields(self, peak: int) -> dict[str, object]:
+        return {"test_phase_peak_bytes": peak, "test_phase_started_at": NOW_EPOCH - 30,
+                "repo_identity": HANA.key, "test_scope": "filtered", "package": "hana",
+                "filters": ["render", "native_rate"], "test_threads": 8, "call_id": "phase-call"}
+
+    def phase_step(self, *, peak: int = GIB * 2 // 5, recorded: bool = True) -> Path:
+        fields: dict[str, object] = {
+            "repo_identity": HANA.key, "test_scope": "filtered", "package": "hana",
+            "filters": ["native_rate", "render"], "test_threads": 8, "worktree": "hana-Δ",
+            "reservation_id": os.urandom(16).hex(),
+        }
+        if recorded:
+            fields["test_phase_need"] = gate.test_phase_need_record(self.phase_need)
+        self.readings[100] = gate.MeasuredMemory(GIB * 2 // 5)
+        return self.running(100, 11, sidecar=str(self.root / "100.cgroup"), peak=11,
+                            test_phase=self.phase_fields(peak), fields=fields)
+
+    def memory(self, path: Path, now: datetime = NOW) -> gate.StepMemory:
+        return gate.reservation_memory(path, gate.read_reservation(path), now,
+                                       gate.process_table(self.root / "proc"), self.root / "proc")
+
+    def phase_samples(self, peaks: list[int], *, width: int = 8,
+                      changes: Mapping[str, object] | None = None) -> None:
+        write_history_rows(self.root, ({
+            "host": "test-host", "repo": "hana", "repo_identity": HANA.key,
+            "step": "nextest", "test_scope": "filtered", "package": "hana",
+            "filters": ["render", "native_rate"], "test_threads": width,
+            "anon_peak_bytes": 11 * GIB, "test_phase_peak_bytes": peak,
+            "ended_at": store.utc_iso(HISTORY_AT.timestamp()), **(changes or {}),
+        } for peak in peaks))
+
+    def test_nextest_charge_falls_to_test_phase_need_at_mark(self) -> None:
+        path = self.phase_step()
+        phase = self.root / "100.test-phase.json"
+        phase.unlink()
+        self.assertEqual(self.check(need=12).decision.state, "hold")
+        _ = phase.write_text(json.dumps(self.phase_fields(GIB * 2 // 5)))
+        memory = self.memory(path)
+        self.assertEqual(gate.charge_basis(memory), gate.TestPhaseCharge(
+            math.ceil(2 * GIB * 1.2), GIB * 2 // 5, self.phase_need, NOW_EPOCH - 30))
+        self.assertEqual(self.check(need=12).decision.state, "admit")
+        self.assertTrue(phase.exists(), "admission must leave record.py's source intact")
+        self.assertEqual(int(path.with_suffix(".max").read_text()), 11 * GIB)
+
+    def test_test_phase_charge_follows_peak_so_far(self) -> None:
+        memory = self.memory(self.phase_step(peak=5 * GIB))
+        self.assertEqual(gate.build_charge(memory), 6 * GIB)
+        self.assertEqual(gate.growth_headroom(memory), 0, "test-phase history is no growth promise")
+
+    def test_configured_margin_is_frozen_when_the_test_phase_need_is_written(self) -> None:
+        path = self.phase_step(peak=5 * GIB, recorded=False)
+        self.phase_samples([2 * GIB])
+        config = self.root / "lint.conf"
+        for margin in (1.5, 1.25):
+            with self.subTest(margin=margin):
+                _ = config.write_text(f"[memory]\ntest_phase_margin={margin}\n")
+                need = gate.test_phase_need(gate.read_reservation(path), "test-host", NOW, self.root)
+                self.assertEqual(need, gate.TestPhaseNeed(2 * GIB, 1, 8, 8, "same_width", margin))
+                gate.update_reservation(path, {"test_phase_need": gate.test_phase_need_record(need)}, self.root)
+                _ = config.write_text("[memory]\ntest_phase_margin=2\n")
+                self.assertEqual(gate.build_charge(self.memory(path)), math.ceil(5 * GIB * margin))
+        self.readings[100] = gate.MeasuredMemory(GIB * 2 // 5)
+        _ = config.write_text("[memory]\ntest_phase_margin=1.5\n")
+        need = gate.test_phase_need(gate.read_reservation(path), "test-host", NOW, self.root)
+        gate.update_reservation(path, {"test_phase_need": gate.test_phase_need_record(need)}, self.root)
+        phase = gate.test_phase_path(gate.read_reservation(path))
+        assert isinstance(phase, Path)
+        _ = phase.write_text(json.dumps(self.phase_fields(GIB * 2 // 5)))
+        self.assertEqual(gate.build_charge(self.memory(path)), 3 * GIB)
+
+    def test_invalid_or_missing_margin_uses_the_named_fallback(self) -> None:
+        path = self.phase_step(recorded=False)
+        self.phase_samples([2 * GIB])
+        config = self.root / "lint.conf"
+        settings = (None, "[memory]\n", *(f"[memory]\ntest_phase_margin={value}\n"
+                    for value in ("", "bad", "0", "0.99", "-1", "nan", "inf", "1e999")))
+        for setting in settings:
+            with self.subTest(setting=setting):
+                if setting is None:
+                    config.unlink(missing_ok=True)
+                else:
+                    _ = config.write_text(setting)
+                need = gate.test_phase_need(gate.read_reservation(path), "test-host", NOW, self.root)
+                self.assertEqual(need, replace(self.phase_need, runs=1, margin=gate.FALLBACK_TEST_PHASE_MARGIN))
+                gate.update_reservation(path, {"test_phase_need": gate.test_phase_need_record(need)}, self.root)
+                self.assertEqual(gate.build_charge(self.memory(path)), math.ceil(2 * GIB * 1.2))
+
+    def test_unreadable_test_phase_history_keeps_the_compile_charge(self) -> None:
+        path = self.phase_step(recorded=False)
+        row = gate.read_reservation(path)
+        with patch.object(gate, "anonymous_history_rows", side_effect=PermissionError("history unreadable")):
+            need = gate.test_phase_need(row, "test-host", NOW, self.root)
+        self.assertEqual(need, gate.NoTestPhaseNeed("no_history"))
+        row["test_phase_need"] = gate.test_phase_need_record(need)
+        _ = path.write_text(json.dumps(row))
+        memory = self.memory(path)
+        self.assertIsInstance(gate.charge_basis(memory), gate.PeakSoFar)
+        self.assertEqual(gate.build_charge(memory), 11 * GIB)
+
+    def test_test_phase_charge_does_not_decay(self) -> None:
+        path = self.phase_step(peak=5 * GIB)
+        later = NOW + timedelta(seconds=gate.PEAK_DECAY_SECONDS + 1)
+        self.assertEqual(gate.charge_basis(self.memory(path, later)), gate.charge_basis(self.memory(path)))
+        self.assertEqual(gate.build_charge(self.memory(path, later)), 6 * GIB)
+
+    def test_no_history_keeps_compile_peak(self) -> None:
+        path = self.phase_step(recorded=False)
+        for stored in (False, True):
+            with self.subTest(stored_no_history=stored):
+                if stored:
+                    row = gate.read_reservation(path)
+                    row["test_phase_need"] = gate.test_phase_need_record(gate.NoTestPhaseNeed("no_history"))
+                    _ = path.write_text(json.dumps(row))
+                memory = self.memory(path)
+                self.assertIsInstance(gate.charge_basis(memory), gate.PeakSoFar)
+                self.assertEqual(gate.build_charge(memory), 11 * GIB)
+                later = NOW + timedelta(seconds=gate.PEAK_DECAY_SECONDS)
+                self.assertIsInstance(gate.charge_basis(self.memory(path, later)), gate.PeakDecayed)
+                self.assertEqual(gate.build_charge(self.memory(path, later)), GIB * 2 // 5)
+
+    def test_no_mark_keeps_today(self) -> None:
+        path = self.phase_step()
+        phase = self.root / "100.test-phase.json"
+        for contents in (None, "{}", "broken json"):
+            with self.subTest(contents=contents):
+                phase.unlink(missing_ok=True)
+                if contents is not None:
+                    _ = phase.write_text(contents)
+                self.assertIsInstance(gate.charge_basis(self.memory(path)), gate.PeakSoFar)
+                self.assertEqual(gate.build_charge(self.memory(path)), 11 * GIB)
+
+    def test_unreadable_compile_peak_keeps_the_existing_promise_before_the_mark(self) -> None:
+        path = self.phase_step()
+        _ = path.with_suffix(".max").write_text("unreadable peak")
+        self.assertEqual(gate.charge_basis(self.memory(path)), gate.PeakFileUnreadable(11 * GIB))
+
+    def test_test_phase_charge_keeps_current_usage_and_the_nextest_ramp(self) -> None:
+        path = self.phase_step()
+        self.readings[100] = gate.MeasuredMemory(7 * GIB)
+        self.assertEqual(gate.build_charge(self.memory(path)), 7 * GIB)
+        self.readings[100] = gate.MeasuredMemory(GIB // 2)
+        self.assertEqual(gate.charge_basis(self.memory(path, NOW - timedelta(seconds=120))),
+                         gate.RampPromise(11 * GIB))
+
+    def test_test_phase_path_uses_only_cgroup_sidecars(self) -> None:
+        path = self.phase_step()
+        row = gate.read_reservation(path)
+        self.assertEqual(gate.test_phase_path(row), self.root / "100.test-phase.json")
+        for sidecar in ("", str(self.root / "other.json")):
+            row["sidecar"] = sidecar
+            self.assertIsInstance(gate.test_phase_path(row), gate.NoTestPhaseFile)
+
+    def test_same_width_p90_precedes_other_widths_and_sorts_filters(self) -> None:
+        path = self.phase_step()
+        self.phase_samples([number * GIB for number in range(1, 11)])
+        self.phase_samples([20 * GIB], width=16)
+        self.phase_samples([15 * GIB], width=4)
+        self.assertEqual(gate.test_phase_need(gate.read_reservation(path), "test-host", NOW, self.root),
+                         gate.TestPhaseNeed(9 * GIB, 10, 8, 8, "same_width"))
+
+    def test_nearest_wider_history_is_not_scaled_down(self) -> None:
+        path = self.phase_step()
+        self.phase_samples([3 * GIB, 4 * GIB], width=12)
+        self.phase_samples([19 * GIB], width=16)
+        self.phase_samples([GIB], width=4)
+        self.assertEqual(gate.test_phase_need(gate.read_reservation(path), "test-host", NOW, self.root),
+                         gate.TestPhaseNeed(4 * GIB, 2, 8, 12, "wider_unscaled"))
+
+    def test_widest_narrower_history_scales_up_and_rounds_up(self) -> None:
+        path = self.phase_step()
+        self.phase_samples([GIB + 1], width=3)
+        self.phase_samples([10 * GIB], width=2)
+        self.assertEqual(gate.test_phase_need(gate.read_reservation(path), "test-host", NOW, self.root),
+                         gate.TestPhaseNeed(((GIB + 1) * 8 + 2) // 3, 1, 8, 3, "scaled_up"))
+
+    def test_test_phase_need_uses_the_filtered_floor(self) -> None:
+        path = self.phase_step()
+        self.phase_samples([GIB // 10])
+        self.assertEqual(gate.test_phase_need(gate.read_reservation(path), "test-host", NOW, self.root),
+                         gate.TestPhaseNeed(GIB, 1, 8, 8, "same_width"))
+
+    def test_test_phase_history_never_widens_the_family_or_time_window(self) -> None:
+        path = self.phase_step()
+        for changes in ({"filters": ["other"]}, {"package": "other"}, {"repo_identity": "other"},
+                        {"host": "other"}, {"step": "build"}, {"test_scope": "full"},
+                        {"ended_at": store.utc_iso((NOW - timedelta(days=gate.HISTORY_DAYS, seconds=1)).timestamp())},
+                        {"ended_at": store.utc_iso((NOW + timedelta(seconds=1)).timestamp())},
+                        {"test_phase_peak_bytes": 0}, {"test_phase_peak_bytes": True},
+                        {"test_phase_peak_bytes": "large"}):
+            with self.subTest(changes=changes):
+                self.phase_samples([10 * GIB], changes=changes)
+        row = gate.read_reservation(path)
+        self.assertEqual(gate.test_phase_need(row, "test-host", NOW, self.root), gate.NoTestPhaseNeed("no_history"))
+        row["test_threads"] = None
+        self.assertEqual(gate.test_phase_need(row, "test-host", NOW, self.root), gate.NoTestPhaseNeed("no_width"))
+
+    def test_test_phase_reader_uses_the_shared_whole_row_boundary(self) -> None:
+        path = self.phase_step()
+        self.phase_samples([2 * GIB])
+        with patch.object(gate, "anonymous_history_rows", wraps=gate.anonymous_history_rows) as reader:
+            self.assertEqual(gate.test_phase_need(gate.read_reservation(path), "test-host", NOW, self.root),
+                             gate.TestPhaseNeed(2 * GIB, 1, 8, 8, "same_width"))
+        self.assertEqual(reader.call_args_list[0].args, (self.root / "admission/anon_peaks.jsonl",))
+        assert_unfinished_history_ignored(self, self.root / "admission/anon_peaks.jsonl",
+            lambda: gate.test_phase_need(gate.read_reservation(path), "test-host", NOW, self.root))
+
+    def test_need_stored_outside_lock_and_on_width_change(self) -> None:
+        self.phase_samples([2 * GIB])
+        self.phase_samples([3 * GIB], width=16)
+        directory = gate.admission_dir(self.root)
+        _ = (directory / "lock").touch()
+        estimator = gate.test_phase_need
+        widths: list[object] = []
+
+        def unlocked(row: Mapping[str, object], host: str, now: datetime,
+                     root: Path) -> gate.TestPhaseNeed | gate.NoTestPhaseNeed:
+            with (directory / "lock").open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                widths.append(row.get("test_threads"))
+                return estimator(row, host, now, root)
+
+        _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        argv = ["cargo", "nextest", "run", "--test-threads", "8", "-E",
+                "package(hana) & (test(native_rate) | test(render))"]
+        profile = gate.StepProfile("hana", "nextest", "test", gate.ExpectedPeak(11 * GIB, "measured", 5),
+                                   HANA, "filtered")
+        with patch.object(gate, "test_phase_need", side_effect=unlocked), \
+             patch.object(gate, "datetime", wraps=datetime) as clock:
+            clock.configure_mock(**{"now.return_value": NOW})
+            result = gate.check(self.meminfo, 400, "", argv, root=self.root, now=NOW, profile=profile)
+            if not isinstance(result.reservation, gate.Reserved):
+                self.fail("fixture nextest must be admitted")
+            path = result.reservation.path
+            first = gate.read_reservation(path)
+            self.assertEqual(gate.read_test_phase_need(first.get("test_phase_need")),
+                             gate.TestPhaseNeed(2 * GIB, 1, 8, 8, "same_width"))
+            gate.set_width(path, 16, self.root)
+        updated = gate.read_reservation(path)
+        self.assertEqual(gate.read_test_phase_need(updated.get("test_phase_need")),
+                         gate.TestPhaseNeed(3 * GIB, 1, 16, 16, "same_width"))
+        self.assertEqual(updated["test_threads"], 16)
+        self.assertEqual(updated["need"], first["need"], "test phase must not replace the admission need")
+        self.assertEqual(widths, [8, 16])
+        path.unlink()
+        gate.set_width(path, 4, self.root)
+        self.assertFalse(path.exists(), "a width update must not resurrect an ended reservation")
+
+    def test_need_write_failure_preserves_admission_and_retry_identity(self) -> None:
+        for failure in (OSError("need write failed"), ValueError("need encoding failed")):
+            with self.subTest(failure=failure):
+                with patch.object(gate, "update_reservation", side_effect=failure):
+                    first = self.check(need=1, free=60)
+                self.assertEqual(first.decision.state, "admit")
+                if not isinstance(first.reservation, gate.Reserved):
+                    self.fail("a failed test-phase need write must preserve the admission")
+                reservations = list(gate.admission_dir(self.root).glob("*.reservation"))
+                self.assertEqual(reservations, [first.reservation.path])
+                retry = self.check(need=1, free=60)
+                self.assertEqual(retry.reservation, first.reservation)
+                self.assertEqual(list(gate.admission_dir(self.root).glob("*.reservation")), reservations)
+                first.reservation.path.unlink()
+
+    def test_frozen_limits_keep_snapshot_decisions_independent_of_config(self) -> None:
+        self.phase_need = replace(self.phase_need, margin=1.5)
+        path = self.phase_step()
+        _ = self.waiter(300, NOW_EPOCH - 1, "head", "head", need=18)
+        config = self.root / "lint.conf"
+        _ = config.write_text("[memory]\ntest_phase_margin=1.5\n")
+        readings = gate.QueueSnapshotReadings(gate.process_table(self.root / "proc"), {},
+            host=gate.HostMemory(60 * GIB, 60 * GIB), pressure=gate.NoPressureHold(),
+            recovery=gate.NoRecoverySpacing(), compilers=[])
+        inputs = gate.gather_queue_inputs(gate.admission_dir(self.root),
+            gate.process_table(self.root / "proc"), NOW_EPOCH, readings=readings)
+        before = gate.queue_read_from(inputs)
+        reason = before.view.waiting[0].reason
+        if not isinstance(reason, gate.HeadAdmissionStatus):
+            self.fail("the head must expose its admission decision")
+        self.assertEqual(reason.decision.state, "admit")
+        self.assertEqual(reason.decision.charged, 3 * GIB)
+        _ = config.write_text("[memory]\ntest_phase_margin=2\n")
+        gate.update_reservation(path, {"test_phase_need": gate.test_phase_need_record(
+            replace(self.phase_need, margin=2))}, self.root)
+        changed_inputs = gate.gather_queue_inputs(gate.admission_dir(self.root),
+            gate.process_table(self.root / "proc"), NOW_EPOCH, readings=readings)
+        self.assertEqual(changed_inputs.limits, inputs.limits)
+        with patch.object(gate, "config_values", side_effect=AssertionError("pure pass read config")):
+            self.assertEqual(gate.queue_read_from(inputs), before)
+            self.assertEqual(gate.admission_pass(inputs, NOW_EPOCH).rows[0].decision,
+                             reason.decision)
+            changed = gate.queue_read_from(changed_inputs)
+        changed_reason = changed.view.waiting[0].reason
+        if not isinstance(changed_reason, gate.HeadAdmissionStatus):
+            self.fail("the head must expose its changed admission decision")
+        self.assertEqual(changed_reason.decision.charged, 4 * GIB)
+        self.assertEqual(changed_reason.decision.state, "hold")
+        with patch.object(gate, "config_values", side_effect=AssertionError("pure pass read config")):
+            self.assertEqual(gate.admission_pass(changed_inputs, NOW_EPOCH).rows[0].decision,
+                             changed_reason.decision)
+
+    def test_estimate_codecs_keep_their_domains_and_missing_states(self) -> None:
+        bases: tuple[gate.NeedBasis | gate.BasisNotRecorded, ...] = (
+            "measured", "buildlog", "pooled", "fallback", gate.BasisNotRecorded(),
+            gate.ShapeP90(10, gate.FailedPeakFloor(4 * GIB, HISTORY_AT.isoformat()),
+                          gate.DevHeadroom(), gate.CappedAtBudget(25 * GIB)),
+            gate.ShapeLargest(2, factor=gate.ReleaseHeadroom()), gate.ShapeFallback())
+        for basis in bases:
+            with self.subTest(basis=basis):
+                encoded = gate.need_basis_record(basis)
+                self.assertEqual(gate.read_need_basis(encoded), basis)
+                self.assertEqual(gate.read_test_phase_need(encoded), gate.NoTestPhaseNeed("not_recorded"))
+        for need in (self.phase_need, replace(self.phase_need, margin=1.75), gate.NoTestPhaseNeed("no_width"),
+                     gate.NoTestPhaseNeed("no_history"), gate.NoTestPhaseNeed("not_recorded")):
+            with self.subTest(need=need):
+                encoded = gate.test_phase_need_record(need)
+                self.assertEqual(gate.read_test_phase_need(encoded), need)
+                self.assertEqual(gate.read_need_basis(encoded), gate.BasisNotRecorded())
+        legacy = gate.test_phase_need_record(replace(self.phase_need, margin=1.75))
+        del legacy["margin"]
+        self.assertEqual(gate.read_test_phase_need(legacy), self.phase_need)
+        row = gate.read_reservation(self.phase_step(recorded=False))
+        self.assertEqual(gate.read_test_phase_need(row.get("test_phase_need")), gate.NoTestPhaseNeed("not_recorded"))
+        self.assertEqual(gate.read_need_basis(row.get("need_basis")), gate.BasisNotRecorded())
+
+    def test_finalizer_records_test_phase_evidence_and_leaves_the_sampler_file(self) -> None:
+        self.phase_need = replace(self.phase_need, margin=1.5)
+        path = self.phase_step()
+        _ = self.select_charge()
+        gate.release(path, 0, self.root)
+        rows = list(gate.anonymous_history_rows(self.root / "admission/anon_peaks.jsonl"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["test_phase_peak_bytes"], rows[0]["test_phase_started_at"],
+                          gate.read_test_phase_need(rows[0]["test_phase_need"])),
+                         (GIB * 2 // 5, NOW_EPOCH - 30, self.phase_need))
+        self.assertEqual(gate.read_test_phase_need(self.charge_evidence(rows[0])["need"]), self.phase_need)
+        self.assertTrue((self.root / "100.test-phase.json").exists())
+
+    def select_charge(self, now: datetime = NOW) -> gate.CheckResult:
+        _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        result = gate.check(self.meminfo, 400, "", ["cargo", "nextest"], root=self.root, now=now,
+                            profile=gate.StepProfile("test", "nextest", "test", gate.ExpectedPeak(GIB, "measured", 5)))
+        self.assertEqual(result.decision.state, "admit")
+        if not isinstance(result.reservation, gate.Reserved):
+            self.fail("an admitted decision must return its reservation")
+        self.assertTrue(result.reservation.path.is_file())
+        gate.release(result.reservation.path, 0, self.root)
+        return result
+
+    def charge_evidence(self, row: Mapping[str, object]) -> dict[str, object]:
+        evidence = row.get("test_phase_charge_use")
+        if not isinstance(evidence, dict):
+            self.fail("a selected test-phase charge must carry its decision evidence")
+        return cast(dict[str, object], evidence)
+
+    def test_finalizer_keeps_the_margin_written_at_admission_after_config_changes(self) -> None:
+        config = self.root / "lint.conf"
+        _ = config.write_text("[memory]\ntest_phase_margin=1.2\n")
+        self.phase_samples([2 * GIB])
+        _ = self.meminfo.write_text(f"MemAvailable: {60 * GIB // 1024} kB\nMemTotal: {60 * GIB // 1024} kB\n")
+        sidecar = self.root / "100.cgroup"
+        profile = gate.StepProfile("hana", "nextest", "test", gate.ExpectedPeak(11 * GIB, "measured", 5),
+                                   HANA, "filtered")
+        argv = ["cargo", "nextest", "run", "--test-threads", "8", "-E",
+                "package(hana) & (test(native_rate) | test(render))"]
+        result = gate.check(self.meminfo, 100, str(sidecar), argv, root=self.root, now=NOW, profile=profile)
+        if not isinstance(result.reservation, gate.Reserved):
+            self.fail("the fixture step must be admitted")
+        path = result.reservation.path
+        row = gate.read_reservation(path)
+        need = gate.read_test_phase_need(row.get("test_phase_need"))
+        self.assertEqual(need, gate.TestPhaseNeed(2 * GIB, 1, 8, 8, "same_width", 1.2))
+        if not isinstance(need, gate.TestPhaseNeed):
+            self.fail("the admitted step needs its recorded test-phase estimate")
+        _ = sidecar.write_text(str(self.root / "100.scope"))
+        _ = path.with_suffix(".max").write_text(str(11 * GIB))
+        phase = gate.test_phase_path(row)
+        assert isinstance(phase, Path)
+        _ = phase.write_text(json.dumps(self.phase_fields(3 * GIB)))
+        past_ramp = NOW + timedelta(seconds=gate.RAMP_SECONDS + 1)
+        self.assertEqual(gate.charge_basis(self.memory(path, past_ramp)),
+                         gate.TestPhaseCharge(math.ceil(3 * GIB * 1.2), 3 * GIB, need, NOW_EPOCH - 30))
+        self.assertEqual(self.select_charge(past_ramp).decision.charged, math.ceil(3 * GIB * 1.2))
+        selected = cast(dict[str, object], json.loads(gate.test_phase_charge_use_path(path).read_text()))
+        _ = config.write_text("[memory]\ntest_phase_margin=2\n")
+        self.assertEqual(gate.build_charge(self.memory(path, past_ramp)), math.ceil(3 * GIB * 1.2))
+        _ = gate.finalize_reservation(path, gate.read_reservation(path), gate.Completed(), past_ramp, 0)
+        final = list(gate.anonymous_history_rows(self.root / "admission/anon_peaks.jsonl"))[-1]
+        self.assertEqual(gate.read_test_phase_need(final["test_phase_need"]), need)
+        evidence = self.charge_evidence(final)
+        self.assertEqual(evidence, selected)
+        self.assertEqual(gate.read_test_phase_need(evidence["need"]), need)
+        self.assertEqual(evidence["bytes"], math.ceil(3 * GIB * 1.2))
+        self.assertEqual(evidence["selected_at"], past_ramp.timestamp())
+        self.assertEqual(evidence["reservation_id"], final["reservation_id"])
+        self.assertGreater(cast(int, final["test_phase_peak_bytes"]), need.bytes * need.margin)
+
+    def test_real_check_records_the_first_selected_test_phase_charge_once(self) -> None:
+        path = self.phase_step(peak=3 * GIB)
+        before = path.read_bytes()
+        expected = math.ceil(3 * GIB * self.phase_need.margin)
+        self.assertEqual(self.select_charge().decision.charged, expected)
+        evidence_path = gate.test_phase_charge_use_path(path)
+        first = evidence_path.read_bytes()
+        evidence = cast(dict[str, object], json.loads(first))
+        self.assertEqual(evidence["bytes"], expected)
+        self.assertEqual(evidence["selected_at"], NOW_EPOCH)
+        row = gate.read_reservation(path)
+        assert "reservation_id" in row
+        self.assertEqual(evidence["reservation_id"], row["reservation_id"])
+        self.assertEqual(gate.read_test_phase_need(evidence["need"]), self.phase_need)
+        phase = gate.test_phase_path(gate.read_reservation(path))
+        assert isinstance(phase, Path)
+        _ = phase.write_text(json.dumps(self.phase_fields(5 * GIB)))
+        self.assertEqual(self.select_charge(NOW + timedelta(seconds=1)).decision.charged, 6 * GIB)
+        self.assertEqual(evidence_path.read_bytes(), first)
+        self.assertEqual(path.read_bytes(), before, "evidence must not rewrite the running reservation")
+        self.assertEqual(list(path.parent.glob("*.test-phase-charge.json")), [evidence_path])
+        gate.release(path, 0, self.root)
+        rows = list(gate.anonymous_history_rows(self.root / "admission/anon_peaks.jsonl"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(self.charge_evidence(rows[0]), evidence)
+        self.assertFalse(evidence_path.exists())
+
+    def test_ramp_death_cleaned_up_after_the_ramp_does_not_invent_charge_use(self) -> None:
+        path = self.phase_step(peak=3 * GIB)
+        gate.update_reservation(path, {"admitted_at": store.utc_iso(NOW_EPOCH - 30)}, self.root)
+        memory = self.memory(path)
+        if not isinstance(memory, gate.MeasuredMemory):
+            self.fail("the ramp fixture must have a measured reading")
+        self.assertEqual(memory.promise, gate.RampPromise(11 * GIB))
+        self.assertNotIsInstance(gate.charge_basis(memory), gate.TestPhaseCharge)
+        self.assertEqual(self.select_charge().decision.charged, 11 * GIB)
+        evidence_path = gate.test_phase_charge_use_path(path)
+        self.assertFalse(evidence_path.exists())
+        del self.processes[100]
+        _ = self.select_charge(NOW + timedelta(seconds=300))
+        self.assertFalse(path.exists())
+        rows = list(gate.anonymous_history_rows(self.root / "admission/anon_peaks.jsonl"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["outcome"], "owner_gone")
+        self.assertEqual(rows[0]["test_phase_peak_bytes"], 3 * GIB)
+        self.assertEqual(gate.read_test_phase_need(rows[0]["test_phase_need"]), self.phase_need)
+        self.assertNotIn("test_phase_charge_use", rows[0])
+        self.assertFalse(evidence_path.exists())
+
+    def test_failed_charge_evidence_write_keeps_the_admitted_result(self) -> None:
+        path = self.phase_step(peak=3 * GIB)
+        evidence_path = gate.test_phase_charge_use_path(path)
+        publish = write_text_atomic
+        writes: list[Path] = []
+        def fail_evidence(target: Path, content: str) -> None:
+            if target == evidence_path:
+                writes.append(target)
+                raise OSError("evidence disk unavailable")
+            publish(target, content)
+        before = path.read_bytes()
+        with patch.object(gate, "write_text_atomic", side_effect=fail_evidence):
+            result = self.select_charge()
+        self.assertEqual(writes, [evidence_path])
+        self.assertEqual(result.decision.charged, math.ceil(3 * GIB * self.phase_need.margin))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(list(path.parent.glob("*.reservation")), [path])
+        self.assertFalse(evidence_path.exists())
+
+    def test_old_sampler_history_keeps_the_stored_need_without_window_fields(self) -> None:
+        path = self.phase_step()
+        (self.root / "100.test-phase.json").unlink()
+        gate.release(path, 0, self.root)
+        rows = list(gate.anonymous_history_rows(self.root / "admission/anon_peaks.jsonl"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(gate.read_test_phase_need(rows[0]["test_phase_need"]), self.phase_need)
+        self.assertNotIn("test_phase_peak_bytes", rows[0])
+        self.assertNotIn("test_phase_started_at", rows[0])
+        self.assertNotIn("test_phase_charge_use", rows[0])
+
+    def test_finalization_retries_keep_saved_test_phase_evidence_after_the_file_is_gone(self) -> None:
+        history = self.root / "admission/anon_peaks.jsonl"
+        for failure in ("failed append", *HISTORY_APPEND_STOPS):
+            for retry in ("release", "owner gone"):
+                with self.subTest(failure=failure, retry=retry):
+                    self.phase_need = replace(self.phase_need, margin=1.5)
+                    path = self.phase_step()
+                    _ = self.select_charge()
+                    selected = gate.test_phase_charge_use_path(path).read_bytes()
+                    stop = (patch.object(store, "append_locked", side_effect=OSError("history unavailable"))
+                            if failure == "failed append" else stop_history_append(store, failure))
+                    with stop, self.assertRaises(OSError):
+                        gate.release(path, 137, self.root)
+                    self.assertTrue(path.exists())
+                    (self.root / "100.test-phase.json").unlink()
+                    gate.test_phase_charge_use_path(path).unlink()
+                    _ = (self.root / "lint.conf").write_text("[memory]\ntest_phase_margin=2\n")
+                    if retry == "release":
+                        gate.release(path, 0, self.root)
+                    else:
+                        del self.processes[100]
+                        probe = self.check(need=1)
+                        if isinstance(probe.reservation, gate.Reserved):
+                            probe.reservation.path.unlink()
+                    gate.release(path, 0, self.root)
+                    rows = list(gate.anonymous_history_rows(history))
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual((rows[0]["outcome"], rows[0]["test_phase_peak_bytes"],
+                                      rows[0]["test_phase_started_at"],
+                                      gate.read_test_phase_need(rows[0]["test_phase_need"])),
+                                     ("killed", GIB * 2 // 5, NOW_EPOCH - 30, self.phase_need))
+                    self.assertEqual(self.charge_evidence(rows[0]), cast(dict[str, object], json.loads(selected)))
+                    self.assertFalse(path.exists())
+                    history.unlink()
 
 
 class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
@@ -1976,8 +2517,7 @@ class BuildPromiseFixture(MemoryQueueFixture):
             row["shape"] = shape.key
         if outcome:
             row["outcome"] = outcome
-        with (gate.admission_dir(self.root) / "anon_peaks.jsonl").open("a") as stream:
-            _ = stream.write(json.dumps(row) + "\n")
+        write_history_rows(self.root, [row])
 
     def index_build(self, call_id: str, arguments: list[str]) -> None:
         with closing(sqlite3.connect(self.root / "index.sqlite")) as connection, connection:
@@ -3459,12 +3999,18 @@ class HostMemoryAdmissionTests(MemoryQueueFixture):
     def test_width_write_interruption_keeps_reservation_for_retry(self) -> None:
         reservation = self.running(100, 12)
         before = reservation.read_bytes()
-        write_text = Path.write_text
-        def stop(path: Path, data: str) -> int:
-            _ = write_text(path, data[:10])
-            raise RuntimeError("stopped during width write")
-        with patch.object(Path, "write_text", side_effect=None, autospec=True) as write:
-            write.side_effect = stop
+        open_descriptor = os.fdopen
+        @contextlib.contextmanager
+        def partial_write(descriptor: int, mode: str, *, encoding: str) -> Generator[IO[str]]:
+            with open_descriptor(descriptor, mode, encoding=encoding) as stream:
+                write = stream.write
+                def stop(data: str) -> int:
+                    _ = write(data[:10])
+                    stream.flush()
+                    raise RuntimeError("stopped during width write")
+                with patch.object(stream, "write", side_effect=stop):
+                    yield stream
+        with patch.object(os, "fdopen", side_effect=partial_write):
             with self.assertRaisesRegex(RuntimeError, "stopped during width write"):
                 gate.set_width(reservation, 8, self.root)
         self.assertEqual(reservation.read_bytes(), before)
@@ -6205,7 +6751,7 @@ class QueueExplanationTests(MemoryQueueFixture):
         self.assertEqual(actual, expected)
         self.assertEqual(actual, gate.queue_read_from(inputs))
         raw = cast(dict[str, object], json.loads((directory / "queue.json").read_text()))
-        self.assertEqual((raw["v"], raw["written_at"]), (1, NOW.timestamp()))
+        self.assertEqual((raw["v"], raw["written_at"]), (2, NOW.timestamp()))
 
     def test_gather_reuses_supplied_memory_and_reads_only_missing_reservations(self) -> None:
         first = self.running(100, 6)
@@ -6233,7 +6779,12 @@ class QueueExplanationTests(MemoryQueueFixture):
         gate.write_queue_snapshot(gate.admission_dir(self.root), inputs)
         with patch.dict(os.environ, {"BUILDLOG_BUILD_BUDGET_GIB": "1"}), \
              patch.object(gate, "locked_queue_read", side_effect=AssertionError("fresh snapshot took lock")):
-            self.assertEqual(gate.queue_read(), expected)
+            if not isinstance(inputs.host, gate.HostMemory):
+                self.fail("snapshot fixture must have a memory reading")
+            live_limits = gate.resolve_admission_limits(inputs.host.total)
+            live_expected = gate.queue_read_from(replace(inputs, limits=live_limits))
+            self.assertNotEqual(live_expected, expected)
+            self.assertEqual(gate.queue_read(), live_expected)
 
     def test_snapshot_age_boundary_and_invalid_cache_take_the_bounded_read(self) -> None:
         _ = self.waiting(300, 12 * GIB, 20)
