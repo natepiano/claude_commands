@@ -46,6 +46,7 @@ import unit_names  # noqa: E402
 from rename_state import RenameRefused, read_json, write_json, write_text  # noqa: E402
 from unit_move import PathMove, git  # noqa: E402
 from scripts.production import staff, staff_sources, staff_move
+from scripts.astra import design_roles
 
 POOL = Path(__file__).resolve().parent.parent / "direct" / "review_pool.py"
 
@@ -374,7 +375,6 @@ def _move_state(transfer: UnitTransfer, _save: Callable[[], None]) -> None:
     The unit's held design roles name the receiving production as holder, so they resume under it.
     The phase note follows on the unit's next refresh, and the giving showrunner's report state
     keeps its rows as history."""
-    from scripts.astra import design_roles
     from scripts.direct import workers
     workers.move_unit(transfer.from_slug, transfer.to_slug, transfer.unit,
                       runs=tuple(retire_unit.runs_of(Path(transfer.worktree_dir))))
@@ -468,7 +468,6 @@ def verify_failures(transfer: UnitTransfer) -> list[str]:
         failures.append(f"staff: {unit} is not under {transfer.to_slug}")
     if leased := _leased(transfer.from_slug, unit):
         failures.append(f"review pool {transfer.from_slug}: {', '.join(leased)} still leased to {unit}")
-    from scripts.astra import design_roles
     failures.extend(design_roles.holder_failures(design_roles.UnitHolder(transfer.from_slug, unit)))
     return failures
 
@@ -642,7 +641,7 @@ def plan(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer
 
 
 def apply(from_slug: str, unit: str, to_doc: Path, scratch: Path) -> UnitTransfer:
-    with staff.operation():
+    with staff.operation(), design_roles.record_operation():
         return _apply(from_slug, unit, to_doc, scratch)
 
 
