@@ -41,6 +41,18 @@ def default_columns() -> int:
 def main() -> int:
     import argparse
 
+    if len(sys.argv) > 1 and sys.argv[1] == "bump":
+        if len(sys.argv) != 3 or len(sys.argv[2].split()) != 1:
+            print("build queue: use /build:queue bump <unit>")
+            return 3
+        try:
+            memory_admit.run_priority(["set", "--unit", sys.argv[2], "--why", "the user's bump"])
+        except SystemExit as stopped:
+            return stopped.code if isinstance(stopped.code, int) else 1
+        except (OSError, ValueError) as error:
+            print(f"build queue: {error}", file=sys.stderr)
+            return 2
+        return 0
     parser = argparse.ArgumentParser(description=__doc__)
     _ = parser.add_argument("--json", action="store_true")
     _ = parser.add_argument("--columns", type=int)
@@ -55,13 +67,9 @@ def main() -> int:
     if arguments.columns < 1:
         parser.error("--columns must be positive")
     words = arguments.words
-    if len(words) > 1 and (len(words) != 2 or words[0] != "bump"):
-        parser.error("use one selector, or bump <selector>")
-    if words == ["bump"]:
-        parser.error("bump needs a selector")
+    if len(words) > 1:
+        parser.error("use one selector")
     try:
-        if words and words[0] == "bump":
-            memory_admit.bump_waiter(words[1], caller())
         reading = memory_admit.queue_read()
         if isinstance(reading, memory_admit.QueueBusy):
             if arguments.json:
@@ -83,9 +91,6 @@ def main() -> int:
             lines = render_view(model, arguments.columns, colour=arguments.json, you=arguments.you)
         print(json.dumps(json_form(lines, arguments.columns, reading.explanation.now),
                          ensure_ascii=False, separators=(",", ":")) if arguments.json else plain(lines))
-    except memory_admit.BumpOff as error:
-        print(f"build queue: {error}")
-        return 3
     except (OSError, ValueError) as error:
         print(f"build queue: {error}", file=sys.stderr)
         return 2

@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import argparse
 import fcntl
 from contextlib import AbstractContextManager, closing, contextmanager
 import importlib
 import io
 import json
 import math
+import mmap
 import os
 import re
 import signal
@@ -24,8 +26,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from typing import BinaryIO, Callable, Literal, NoReturn, NotRequired, Protocol, TypedDict, Union, cast, get_args, get_origin, get_type_hints, is_typeddict
+from typing import BinaryIO, Callable, Literal, NoReturn, NotRequired, Protocol, TypedDict, cast, get_args, get_origin, get_type_hints, is_typeddict
 from functools import lru_cache
+from itertools import chain
 from types import UnionType
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -54,6 +57,8 @@ class StepParser(Protocol):
 class GitIdentityReader(Protocol):
     def git_directory(self, argv: list[str], cwd: str) -> str: ...
     def git_facts(self, directory: str) -> GitFacts: ...
+    def queue_priority(self, action: Literal["set", "clear"], unit: str,
+                       why: str, set_by: str, at: float, *, transition_id: str = "") -> None: ...
     def head_admission(self, action: Literal["set", "admitted", "lapsed"], unit: str,
                        step: str, need: int, free: int, reserve: int, why: str,
                        set_by: str, at: float) -> None: ...
@@ -286,6 +291,7 @@ class Reservation(TypedDict):
     reservation_id: NotRequired[str]
     scoped: NotRequired[bool]
     finalization: NotRequired[FinalizationIntent]
+    queue_waiter: NotRequired[Waiter]
 
 
 @dataclass(frozen=True)
@@ -441,8 +447,8 @@ class Waiter(TypedDict):
     session_name: NotRequired[str]
     step: NotRequired[str]
     folder: NotRequired[str]
-    bump_order: NotRequired[int]
-    holds_younger: NotRequired[bool]
+    priority_rank: NotRequired[int]
+    token_left_at: NotRequired[float]
     priority_since: NotRequired[float]
     estimated_at: NotRequired[float]
     fresh_test: NotRequired[bool]
@@ -456,6 +462,199 @@ class Waiter(TypedDict):
     need_runs: NotRequired[int]
     need_basis: NotRequired[dict[str, object]]
     test_threads: NotRequired[int | None]
+
+
+class PriorityTransition(TypedDict):
+    id: str
+    action: Literal["set", "clear"]
+    at: float
+
+
+class QueuePriority(TypedDict):
+    unit: str
+    why: str
+    set_at: float
+    set_by: str
+    transition: NotRequired[PriorityTransition]
+
+
+@dataclass(frozen=True)
+class NoQueuePriority:
+    pass
+
+
+NO_QUEUE_PRIORITY = NoQueuePriority()
+
+
+class PriorityRefused(ValueError):
+    pass
+
+
+def queue_priority_path(directory: Path) -> Path:
+    return directory / "queue_priority.json"
+
+
+def load_queue_priority(directory: Path) -> QueuePriority | NoQueuePriority:
+    path = queue_priority_path(directory)
+    try:
+        value = cast(object, json.loads(path.read_text()))
+        if not isinstance(value, dict):
+            raise ValueError("priority is not an object")
+        row = cast(dict[str, object], value)
+        if (any(not isinstance(row.get(key), str) for key in ("unit", "why", "set_by"))
+                or any(not isinstance(number := row.get(key), (float, int))
+                       or isinstance(number, bool) or not math.isfinite(number) for key in ("set_at",))):
+            raise ValueError("invalid priority fields")
+        if "transition" in row:
+            transition = row["transition"]
+            if not isinstance(transition, dict):
+                raise ValueError("invalid priority transition")
+            fields = cast(dict[str, object], transition)
+            at = fields.get("at")
+            if (not isinstance(fields.get("id"), str) or not fields["id"]
+                    or fields.get("action") not in ("set", "clear")
+                    or not isinstance(at, (int, float)) or isinstance(at, bool) or not math.isfinite(at)):
+                raise ValueError("invalid priority transition")
+        return cast(QueuePriority, cast(object, row))
+    except FileNotFoundError:
+        return NO_QUEUE_PRIORITY
+    except (OSError, ValueError, TypeError, OverflowError):
+        print(f"memory admission: invalid queue priority {path}; ignored", file=sys.stderr)
+        return NO_QUEUE_PRIORITY
+
+
+def finish_priority_transition(directory: Path, priority: QueuePriority) -> None:
+    transition = priority.get("transition")
+    if transition is None:
+        return
+    record.queue_priority(transition["action"], priority["unit"], priority["why"],
+                          priority["set_by"], transition["at"], transition_id=transition["id"])
+    if transition["action"] == "set":
+        del priority["transition"]
+        write_text_atomic(queue_priority_path(directory), json.dumps(priority, separators=(",", ":")))
+    else:
+        queue_priority_path(directory).unlink(missing_ok=True)
+
+
+def begin_priority_transition(directory: Path, priority: QueuePriority,
+                              action: Literal["set", "clear"], at: float) -> None:
+    priority["transition"] = {"id": uuid.uuid4().hex, "action": action, "at": at}
+    write_text_atomic(queue_priority_path(directory), json.dumps(priority, separators=(",", ":")))
+    finish_priority_transition(directory, priority)
+
+
+def read_queue_priority(directory: Path, *, finish: bool = False) -> QueuePriority | NoQueuePriority:
+    priority = load_queue_priority(directory)
+    if isinstance(priority, NoQueuePriority):
+        return priority
+    transition = priority.get("transition")
+    if transition is not None:
+        if finish:
+            finish_priority_transition(directory, priority)
+        if transition["action"] == "clear":
+            return NO_QUEUE_PRIORITY
+    return priority
+
+
+def priority_set(unit: str, why: str) -> str:
+    actor = require_showrunner()
+    if not unit.strip():
+        raise PriorityRefused("unit is required")
+    directory = admission_dir(store.root())
+    with exclusive_queue(directory) as readings:
+        previous = read_queue_priority(directory, finish=True)
+        if (isinstance(previous, NoQueuePriority)
+                or (previous["unit"], previous["why"], previous["set_by"]) != (unit, why, actor)):
+            now = time.time()
+            priority: QueuePriority = {"unit": unit, "why": why, "set_at": now, "set_by": actor}
+            begin_priority_transition(directory, priority, "set", now)
+        processes = process_table(Path(os.environ.get("BUILDLOG_PROC", "/proc")))
+        readings.processes = processes
+        snapshot = gather_queue_inputs(directory, processes, time.time(), readings=readings)
+        place = next((place for place, (_, row) in enumerate(snapshot.ordered, 1)
+                      if row.get("priority_rank") == 0), 0)
+    result = f"first step now #{place}" if place else "no waiting step yet"
+    return f"queue priority set for {unit}: {result}"
+
+
+def priority_clear() -> str:
+    _ = require_showrunner()
+    directory = admission_dir(store.root())
+    with exclusive_queue(directory):
+        priority = read_queue_priority(directory, finish=True)
+        if not isinstance(priority, NoQueuePriority):
+            begin_priority_transition(directory, priority, "clear", time.time())
+    return "queue priority cleared"
+
+
+class PriorityArguments(argparse.Namespace):
+    command: str = ""
+    unit: str = ""
+    why: str = ""
+
+
+def run_priority(arguments: list[str]) -> None:
+    parser = argparse.ArgumentParser(prog="memory_admit.py priority")
+    commands = parser.add_subparsers(dest="command", required=True)
+    setting = commands.add_parser("set")
+    _ = setting.add_argument("--unit", required=True)
+    _ = setting.add_argument("--why", required=True)
+    _ = commands.add_parser("clear")
+    args = parser.parse_args(arguments, namespace=PriorityArguments())
+    try:
+        result = priority_set(args.unit, args.why) if args.command == "set" else priority_clear()
+    except AdmitHeadRefused:
+        if args.command != "set":
+            raise
+        print(f"build queue: type /build:queue bump {args.unit} in a showrunner pane")
+        raise SystemExit(3) from None
+    print(result)
+
+
+class UnitMembership(Protocol):
+    @property
+    def unit(self) -> str: ...
+
+
+class PriorityRoster(Protocol):
+    def unit_labels_for(self, session_ids: list[str], environment: Mapping[str, str]) -> Mapping[str, UnitMembership]: ...
+
+
+def priority_labels(session_ids: list[str]) -> Mapping[str, UnitMembership]:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    roster = cast(PriorityRoster, cast(object, importlib.import_module("scripts.message.roster")))
+    return roster.unit_labels_for(session_ids, os.environ)
+
+
+@dataclass(frozen=True)
+class QueueOrderContext:
+    priority: QueuePriority | NoQueuePriority
+    labels: Mapping[str, UnitMembership]
+
+
+@dataclass(frozen=True)
+class QueueOrderNotResolved:
+    pass
+
+
+QUEUE_ORDER_NOT_RESOLVED = QueueOrderNotResolved()
+
+
+def resolve_queue_order(directory: Path, rows: list[tuple[Path, Waiter]], *, finish: bool = False,
+                        readings: QueueSnapshotReadings | None = None) -> tuple[list[tuple[Path, Waiter]], QueuePriority | NoQueuePriority]:
+    context = readings.order if readings is not None else QUEUE_ORDER_NOT_RESOLVED
+    if isinstance(context, QueueOrderNotResolved):
+        priority = read_queue_priority(directory, finish=finish)
+        labels: Mapping[str, UnitMembership] = (priority_labels([row.get("session_id", "") for _, row in rows])
+                                                if not isinstance(priority, NoQueuePriority) else {})
+        context = QueueOrderContext(priority, labels)
+        if readings is not None:
+            readings.order = context
+    for _, row in rows:
+        label = context.labels.get(row.get("session_id", ""))
+        row["priority_rank"] = (0 if not isinstance(context.priority, NoQueuePriority)
+                                and label is not None and label.unit == context.priority["unit"] else 1)
+    return sorted(rows, key=lambda item: waiter_order(item[1])), context.priority
 
 
 class HeadAdmissionOverride(TypedDict):
@@ -544,7 +743,7 @@ def admit_head(why: str = "") -> str:
     actor = require_showrunner()
     directory = admission_dir(store.root())
     with exclusive_queue(directory):
-        ordered = sorted(live_waiters(directory), key=lambda item: waiter_order(item[1]))
+        ordered, _ = resolve_queue_order(directory, live_waiters(directory), finish=True)
         if not ordered:
             raise AdmitHeadRefused("nothing waits; no head to admit")
         path, row = ordered[0]
@@ -710,8 +909,7 @@ def head_wait_reason(decision: AdmissionDecision, need: int, available: int,
 
 
 def head_window(waiter: Waiter, now: float) -> BackfillUntil | StrictUntil:
-    if (not waiter.get("holds_younger", False) and waiter.get("bump_order", 0) >= 0
-            and now - waiter["since"] < HEAD_SECONDS):
+    if "priority_since" not in waiter and now - waiter["since"] < HEAD_SECONDS:
         return BackfillUntil(waiter["since"] + HEAD_SECONDS)
     start = waiter.get("priority_since", now)
     cycle = STRICT_SECONDS + BACKFILL_SECONDS
@@ -860,18 +1058,6 @@ class FreeCheck:
 
 
 @dataclass(frozen=True)
-class QueueBump:
-    priority_since: float
-    by_position: bool
-    holds_younger: bool
-
-
-@dataclass(frozen=True)
-class NoBump:
-    pass
-
-
-@dataclass(frozen=True)
 class HeadExplanation:
     waiter: WaitingStep
     need_source: RecordedNeed | NeedSourceNotRecorded
@@ -880,7 +1066,6 @@ class HeadExplanation:
     free: FreeCheck
     order: StrictUntil | BackfillUntil | WindowNotStarted
     has_priority: bool
-    bump: QueueBump | NoBump
 
 
 @dataclass(frozen=True)
@@ -938,6 +1123,7 @@ class QueueExplanation:
     reservations: tuple[Reservation, ...] = ()
     override: HeadAdmissionOverride | NoHeadAdmissionOverride = NoHeadAdmissionOverride()
     recovery: RecoverySpacing = NoRecoverySpacing()
+    priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
 
 
 @dataclass(frozen=True)
@@ -967,6 +1153,7 @@ class QueueInputs:
     limits: AdmissionLimits
     override: HeadAdmissionOverride | NoHeadAdmissionOverride
     now: float
+    priority: QueuePriority | NoQueuePriority = NO_QUEUE_PRIORITY
 
 
 @dataclass(frozen=True)
@@ -1134,10 +1321,6 @@ Blocker = ReservationBlocker | UnitBlocker | NoSingleBlocker
 
 class WaiterGone(FileNotFoundError):
     """The requested waiter has left the admission ledger."""
-
-
-class BumpOff(ValueError):
-    """Moving a waiting step is disabled."""
 
 
 def blocker_fields(blocker: Blocker) -> dict[str, str]:
@@ -2193,7 +2376,14 @@ def live_reservations(directory: Path) -> list[tuple[Path, Reservation]]:
 def read_waiter(path: Path) -> Waiter:
     """Validate persisted waiter fields with the same schema used by snapshots."""
     value = cast(object, json.loads(path.read_text()))
-    return cast(Waiter, parse_snapshot_value(value, Waiter))
+    return stored_waiter(cast(Waiter, parse_snapshot_value(value, Waiter)))
+
+
+def stored_waiter(row: Waiter) -> Waiter:
+    """Keep resolved queue order in the snapshot, never in a durable row."""
+    saved = row.copy()
+    _ = saved.pop("priority_rank", None)
+    return saved
 
 
 def live_waiters(directory: Path) -> list[tuple[Path, Waiter]]:
@@ -2226,20 +2416,19 @@ def waiter_label(row: Waiter) -> str:
 
 
 def waiter_order(row: Waiter) -> tuple[int, float, int]:
-    return row.get("bump_order", 0), row["since"], row["pid"]
+    return row.get("priority_rank", 1), row["since"], row["pid"]
 
 
 def head_priority(waiters: list[Waiter], available: int, total: int | UnknownHostTotal,
                   running: list[StepMemory], now: float, *,
                   limits: AdmissionLimits | ReadHostAdmissionLimits = READ_HOST_ADMISSION_LIMITS) -> HeadPriority | NoHeadPriority:
-    ordered = sorted(waiters, key=waiter_order)
+    ordered = waiters
     if not ordered:
         return NoHeadPriority()
     head = ordered[0]
-    if (head.get("holds_younger", False) or head.get("bump_order", 0) < 0
-            or now - head["since"] >= HEAD_SECONDS):
+    if "priority_since" in head or now - head["since"] >= HEAD_SECONDS:
         decision = decide(available, total, head["need"], running, limits=limits)
-        if (head.get("holds_younger", False) or decision.state == "admit"
+        if ("priority_since" in head or decision.state == "admit"
                 or available + decision.measured >= head["need"] + decision.reserve):
             return HeadPriority(head, head_window(head, now))
     return NoHeadPriority()
@@ -2266,7 +2455,7 @@ def snapshot_head_override(override: HeadAdmissionOverride | NoHeadAdmissionOver
                            ordered: list[tuple[Path, Waiter]]) -> HeadAdmissionOverride | NoHeadAdmissionOverride:
     if isinstance(override, NoHeadAdmissionOverride) or not ordered:
         return NoHeadAdmissionOverride()
-    path, row = min(ordered, key=lambda item: waiter_order(item[1]))
+    path, row = ordered[0]
     return override if head_override_matches(override, path, row) else NoHeadAdmissionOverride()
 
 
@@ -2308,7 +2497,7 @@ def admission_walk(available: int, total: int | UnknownHostTotal, ordered: list[
     admissions: list[WaiterAdmission] = []
     recovering = isinstance(recovery, RecoveryStarts) and now < recovery.ends_at
     marked_room = 0
-    for index, row in enumerate(sorted(ordered, key=waiter_order)):
+    for index, row in enumerate(ordered):
         decision = admission_for_waiter(available, total, row, promised, head, pressure,
                                         room_used + marked_room, override, index == 0, now, limits)
         if marked and ((decision.state == "admit" and (recovering or decide(
@@ -2478,6 +2667,96 @@ def test_scope(argv: list[str]) -> TestScope:
     return "full"
 
 
+def queue_times_backward(handle: BinaryIO) -> Generator[dict[str, object]]:
+    """Read complete queue events from the tail of an already locked file."""
+    if not handle.seek(0, os.SEEK_END):
+        return
+    with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as contents:
+        end = len(contents) - 1  # locked_append has repaired any unfinished tail.
+        while end > 0:
+            start = contents.rfind(b"\n", 0, end) + 1
+            try:
+                value = cast(object, json.loads(contents[start:end]))
+            except ValueError:
+                value = None
+            if isinstance(value, dict):
+                yield cast(dict[str, object], value)
+            end = start - 1
+
+
+def token_gap_recorded(rows: Iterator[dict[str, object]], event: dict[str, object]) -> bool:
+    """Stop the duplicate lookup before this token wait began."""
+    left = event.get("token_left_at")
+    if not isinstance(left, (int, float)):
+        return False
+    for row in rows:
+        at = row.get("at")
+        if isinstance(at, (int, float)) and at < left:
+            return False
+        if all(row.get(key) == event.get(key)
+               for key in ("kind", "pid", "start_time", "token_left_at")):
+            return True
+    return False
+
+
+def append_queue_time(directory: Path, event: dict[str, object], now: float) -> None:
+    """Append under the admission lock; a token gap can be retried after a stop."""
+    path = directory / "queue_times.jsonl"
+    with store.locked_append(path) as handle:
+        with closing(queue_times_backward(handle)) as rows:
+            last = next(rows, cast(dict[str, object], {}))
+            if event.get("kind") == "token_gap" and token_gap_recorded(chain((last,), rows), event):
+                return
+            last_at = last.get("at", now)
+            at = max(now, float(last_at)) if isinstance(last_at, (int, float)) else now
+        store.append_locked(handle, {**event, "at": at})
+        if os.fstat(handle.fileno()).st_size > 8 * 1024 * 1024:
+            cutoff = now - HISTORY_DAYS * 86400
+            kept = [row for row in store.whole_rows(handle, 0)
+                    if isinstance(stamp := row.get("at"), (float, int)) and stamp >= cutoff]
+            write_text_atomic(path, "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in kept))
+
+
+class TokenWaitIntent(TypedDict):
+    reservation: str
+    waiter: Waiter
+
+
+def finish_token_wait(path: Path) -> None:
+    """Finish one token-wait transaction under the admission lock."""
+    intent = cast(TokenWaitIntent, parse_snapshot_value(cast(object, json.loads(path.read_text())), TokenWaitIntent))
+    reservation = Path(intent["reservation"])
+    waiter = stored_waiter(intent["waiter"])
+    try:
+        row = read_reservation(reservation)
+    except FileNotFoundError:
+        pass
+    else:
+        _ = finalize_reservation(reservation, row, Completed(), datetime.now(UTC), 0)
+    if process_start_time(waiter["pid"]) == waiter["start_time"]:
+        target = path.parent / f"{waiter['pid']}-{waiter['start_time']}.waiting"
+        write_text_atomic(target, json.dumps(waiter, separators=(",", ":")))
+    path.unlink(missing_ok=True)
+
+
+def token_wait(path: Path, root: Path | None = None) -> None:
+    directory = admission_dir(root if root is not None else store.root())
+    with exclusive_queue(directory):
+        intent_path = path.with_suffix(".token-wait")
+        if not intent_path.exists():
+            try:
+                row = read_reservation(path)
+            except FileNotFoundError:
+                return
+            if "queue_waiter" not in row:
+                raise ValueError("reservation has no recorded queue place")
+            waiter = stored_waiter(row["queue_waiter"])
+            waiter["token_left_at"] = time.time()
+            intent: TokenWaitIntent = {"reservation": str(path), "waiter": waiter}
+            write_text_atomic(intent_path, json.dumps(intent, separators=(",", ":")))
+        finish_token_wait(intent_path)
+
+
 def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float = 0.0,
           root: Path | None = None, now: datetime | None = None,
           profile: InferFromArgv | StepProfile | GateProfile = INFER_FROM_ARGV) -> CheckResult:
@@ -2532,6 +2811,8 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
         snapshot.processes = processes
         live: list[tuple[Path, Reservation]] = []
         running: list[StepMemory] = []
+        for intent_path in directory.glob("*.token-wait"):
+            finish_token_wait(intent_path)
         for path, row in reservation_rows(directory):
             memory = reservation_memory(path, row, now, processes, proc)
             snapshot.memory[path] = memory
@@ -2574,12 +2855,13 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             waiter["repository_name"] = profile.repository.name
             waiter["legacy_name"] = profile.repository.legacy_name
         if previous is not None:
-            if "bump_order" in previous:
-                waiter["bump_order"] = previous["bump_order"]
-            if previous.get("holds_younger", False):
-                waiter["holds_younger"] = True
             if "priority_since" in previous:
                 waiter["priority_since"] = previous["priority_since"]
+            if "token_left_at" in previous:
+                waiter["token_left_at"] = previous["token_left_at"]
+        identity = waiter_identity(step, worktree)
+        waiter["session_id"], waiter["session_name"] = identity["session_id"], identity["session_name"]
+        waiter["step"], waiter["folder"] = identity["step"], profile.worktree if isinstance(profile, GateProfile) else identity["folder"]
         host = read_meminfo(meminfo)
         snapshot.host = host
         available, total = host.available, host.total
@@ -2606,17 +2888,25 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
             reserve = decide(available, total, 0, []).reserve
             end_head_override(directory, "lapsed", override, override["need"], available, reserve, now.timestamp())
             override = NoHeadAdmissionOverride()
-        candidates = sorted([row for path, row in waiting if path != mine] + ([waiter] if argv else []),
-                            key=waiter_order)
+        ordered, _ = resolve_queue_order(directory,
+            [(path, row) for path, row in waiting if path != mine] + ([(mine, waiter)] if argv else []),
+            finish=True, readings=snapshot)
+        if "token_left_at" in waiter and argv and os.environ.get("BUILDLOG_MEM_TOKEN_BACK_AT"):
+            back = float(os.environ["BUILDLOG_MEM_TOKEN_BACK_AT"])
+            append_queue_time(directory, {
+                "kind": "token_gap", "session_id": identity["session_id"], "step": step,
+                "pid": pid, "start_time": start or "", "token_left_at": waiter["token_left_at"],
+                "token_back_at": back}, now.timestamp())
+            del waiter["token_left_at"]
+            write_text_atomic(mine, json.dumps(stored_waiter(waiter), separators=(",", ":")))
+        candidates = [row for _, row in ordered]
         head = head_priority(candidates, available, total, running, now.timestamp())
         if isinstance(head, HeadPriority) and "priority_since" not in head.waiter:
-            head.waiter["holds_younger"] = True
             head.waiter["priority_since"] = now.timestamp()
             for head_path, head_row in waiting:
                 if head_path != mine and head_row is head.waiter:
-                    write_text_atomic(head_path, json.dumps(head_row, separators=(",", ":")))
-        override = snapshot_head_override(override,
-            [(path, row) for path, row in waiting if path != mine] + ([(mine, waiter)] if argv else []))
+                    write_text_atomic(head_path, json.dumps(stored_waiter(head_row), separators=(",", ":")))
+        override = snapshot_head_override(override, ordered)
         decision = queue_decision(available, total, waiter, candidates, running, head, pressure,
                                   recovery=recovery, now=now.timestamp(),
                                   room_used=head_room_used([row for _, row in live], running, head), override=override)
@@ -2634,18 +2924,12 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                                       available, total, pressure, now.timestamp(), processes, proc, recovery=recovery, override=override)
         reservation: Reserved | NotReserved = NotReserved("held" if argv else "launch")
         if argv and decision.state == "hold" and start is not None:
-            identity = waiter_identity(step, worktree)
-            waiter["session_id"], waiter["session_name"] = identity["session_id"], identity["session_name"]
-            waiter["step"], waiter["folder"] = identity["step"], identity["folder"]
-            if isinstance(profile, GateProfile):
-                waiter["folder"] = profile.worktree
-            write_text_atomic(mine, json.dumps(waiter, separators=(",", ":")))
+            write_text_atomic(mine, json.dumps(stored_waiter(waiter), separators=(",", ":")))
         if decision.state == "admit" and isinstance(recovery, RecoveryStarts):
             next_recovery = replace(recovery, next_start_at=now.timestamp() + RECOVERY_START_SECONDS)
             write_recovery(directory, next_recovery)
             snapshot.recovery = next_recovery
         if argv and decision.state == "admit":
-            mine.unlink(missing_ok=True)
             if start is not None:
                 path = directory / f"{pid}-{start}-{time.time_ns()}.reservation"
                 row: Reservation = {"pid": pid, "start_time": start, "need": peak.bytes,
@@ -2654,6 +2938,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                                     "test_threads": width,
                                     "call_id": os.environ.get("BUILDLOG_CALL_ID") or None,
                                     "reservation_id": uuid.uuid4().hex, "scoped": bool(sidecar)}
+                row["queue_waiter"] = stored_waiter(waiter)
                 row["test_scope"] = profile.scope
                 row["package"] = package
                 row["filters"] = list(filters)
@@ -2665,6 +2950,7 @@ def check(meminfo: Path, pid: int, sidecar: str, argv: list[str], since: float =
                 reservation = Reserved(path)
             else:
                 reservation = NotReserved("untracked")
+            mine.unlink(missing_ok=True)
             if not isinstance(waiter_override, NoHeadAdmissionOverride):
                 end_head_override(directory, "admitted", waiter_override, peak.bytes, available,
                                   decision.reserve, now.timestamp())
@@ -2834,7 +3120,9 @@ def blocker_snapshot(waiter_path: Path) -> Blocker:
     directory = waiter_path.parent
     proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
     processes = process_table(proc)
-    ordered = [(path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)]
+    now = time.time()
+    ordered, _ = resolve_queue_order(directory,
+        [(path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)])
     matching = [row for path, row in ordered if path == waiter_path]
     if not matching:
         if not waiter_path.exists():
@@ -2927,15 +3215,15 @@ def gather_queue_inputs(directory: Path, processes: dict[int, ProcessIdentity], 
     if isinstance(pressure, ReadingNotTaken):
         pressure = read_pressure(host if isinstance(host, HostMemory) else HostMemory(0, UnknownHostTotal()))
         readings.pressure = pressure
-    ordered = sorted(((path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)),
-                     key=lambda item: waiter_order(item[1]))
-    for _, row in ordered:
+    rows = [(path, cast(Waiter, cast(object, row))) for path, row in queue_rows(directory, "waiting", processes)]
+    for _, row in rows:
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
         row["session_id"], row["session_name"] = identity["session_id"], identity["session_name"]
         row["step"], row["folder"] = identity["step"], identity["folder"]
+    ordered, priority = resolve_queue_order(directory, rows, readings=readings)
     limits = resolve_admission_limits(host.total if isinstance(host, HostMemory) else UnknownHostTotal())
     return QueueInputs(ordered, tuple(running), tuple(reservations), host, pressure, recovery, limits,
-                       snapshot_head_override(read_head_override(directory), ordered), now)
+                       snapshot_head_override(read_head_override(directory), ordered), now, priority)
 
 
 class RecordedQueueIdentities:
@@ -3005,10 +3293,6 @@ def queue_read_from(inputs: QueueInputs) -> QueueRead:
                                       row.get("test_scope", "full"), row.get("package", ""),
                                       tuple(row.get("filters", [])), width if width is not None else WidthNotRecorded(),
                                       read_need_basis(row.get("need_basis")))
-            bump: QueueBump | NoBump = NoBump()
-            if row.get("bump_order", 0) < 0 or row.get("holds_younger", False):
-                bump = QueueBump(row.get("priority_since", row["since"]), row.get("bump_order", 0) < 0,
-                                 row.get("holds_younger", False))
             has_priority = isinstance(head, HeadPriority)
             order: StrictUntil | BackfillUntil | WindowNotStarted = WindowNotStarted()
             if (has_priority and "priority_since" in row
@@ -3018,7 +3302,7 @@ def queue_read_from(inputs: QueueInputs) -> QueueRead:
                     order = window
             first = HeadExplanation(step, source, own,
                 *decision_checks(own, step.need, available),
-                order, has_priority, bump)
+                order, has_priority)
         else:
             # Resource fit includes host pressure, independently of queue order.
             fit = decide(available, total, row["need"], memory, limits=limits)
@@ -3035,7 +3319,7 @@ def queue_read_from(inputs: QueueInputs) -> QueueRead:
                     min((item.waiter.need for item in line), default=0),
                     max((item.waiter.need for item in line), default=0),
                     min((item.waiter.since for item in line), default=now)),
-        tuple(row for _, row in ordered), tuple(reservations), override, recovery)
+        tuple(row for _, row in ordered), tuple(reservations), override, recovery, inputs.priority)
     return QueueRead(view, explanation, ordered)
 
 
@@ -3086,7 +3370,8 @@ def parse_snapshot_value(value: object, schema: object) -> object:
         return value
     if origin is NotRequired:
         return parse_snapshot_value(value, args[0])
-    if origin in (UnionType, Union):
+    # A union of Literal aliases still has typing.Union as its origin on 3.13.
+    if origin is UnionType or origin is get_origin(NeedSource):
         for variant in args:
             try:
                 return parse_snapshot_value(value, variant)
@@ -3195,6 +3480,7 @@ class QueueSnapshotReadings:
     pressure: Pressure | ReadingNotTaken = ReadingNotTaken()
     recovery: RecoverySpacing | ReadingNotTaken = ReadingNotTaken()
     compilers: list[StepMemory] | ReadingNotTaken = ReadingNotTaken()
+    order: QueueOrderContext | QueueOrderNotResolved = QUEUE_ORDER_NOT_RESOLVED
 
 
 @contextmanager
@@ -3276,10 +3562,6 @@ def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) 
         {"pid": step.pid, "start_time": "", "need": step.need, "since": step.since}
         for step in (head.waiter, *(row.waiter for row in explanation.line.steps))]
     waiter = ordered[0]
-    if not explanation.ordered and isinstance(head.bump, QueueBump):
-        waiter["priority_since"] = head.bump.priority_since
-        waiter["holds_younger"] = head.bump.holds_younger
-        waiter["bump_order"] = -1 if head.bump.by_position else 0
     priority = head_priority(ordered, available, total, remaining, explanation.now, limits=limits)
     remaining_reservations = [row for index, row in enumerate(explanation.reservations) if index not in indices]
     decision = queue_decision(available, total, waiter, ordered, remaining, priority, host.pressure,
@@ -3360,10 +3642,6 @@ def smallest_head_release(explanation: QueueExplanation) -> HeadAfterEnd:
         if isinstance(best, HeadRelease):
             return best
     return all_ended
-
-
-def bump_waiter(_selector: str, _actor: str) -> NoReturn:
-    raise BumpOff("bump is off; nothing can move a waiting step")
 
 
 def cancel_waiter(pid: int, root: Path | None = None) -> None:
@@ -3470,6 +3748,12 @@ def clean_field(value: str) -> str:
 
 def run_action() -> None:
     action = sys.argv[1]
+    if action == "priority":
+        run_priority(sys.argv[2:])
+        return
+    if action == "token-wait":
+        token_wait(Path(sys.argv[2]))
+        return
     if action == "admit-head":
         if len(sys.argv) != 2 and not (len(sys.argv) == 4 and sys.argv[2] == "--why"):
             raise AdmitHeadRefused('usage: memory_admit.py admit-head [--why "<text>"]')
@@ -3557,7 +3841,7 @@ def run_action() -> None:
 def main() -> None:
     try:
         run_action()
-    except (LiveMemoryReading, AdmitHeadRefused) as error:
+    except (LiveMemoryReading, AdmitHeadRefused, PriorityRefused) as error:
         print(str(error), file=sys.stderr)
         sys.exit(2)
 
