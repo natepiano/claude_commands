@@ -49,6 +49,20 @@ Each Claude group with no account has a note: `units: not configured; the role m
 
 Without `--stored`, a role map that cannot be fetched or read from cache refuses status with an error on stderr and exit 1, for both the table and JSON.
 
+On the Mac, the `account-usage` launchd user agent refreshes the usage store at
+login and every two minutes in the GUI login session, where the keychain is
+available. It runs `agent_notes.py usage-only`, which shares the notes timer's
+live read and save step. It writes no notes, sends no quota alerts and runs
+neither the Codex pacer nor account moves. Natedev still owns those actions.
+Install the scripts before activating `modules/darwin/account-usage.nix`.
+
+A process that cannot reach login credentials reports `credentials unavailable
+in this session`. This is not a failed usage read: it keeps the last good
+reading, its time and its outcome. An SSH read cannot turn a good account's
+Read cell into a failed attempt. With no previous reading, usage stays
+unavailable until a logged-in desktop refresh can read it. A readable credentials
+entry with no login token still asks for a session or manual login.
+
 The two-minute account-note timer reuses its last usage reports for less than ten minutes.
 It keeps the original reading times. Session tables, note session sections, the refusal
 watch and the unit watchdog still run on every timer pass. Weekly and five-hour warnings
@@ -346,7 +360,7 @@ An empty list does not read watch state. If that state cannot be read or parsed,
 
 `next hold GROUP N half-point|MINUTES [--expect PERCENT TARGET]` changes only that entry’s hold mode, preserving its identity and position. A different mode clears its started hold under the watch and log locks before writing the list; the same mode keeps it, so retrying after a lost Mac reply preserves elapsed time. Other entries keep their holds. With `--expect`, a shifted entry refuses without changing either the log or holds. Always run `next list` immediately before a guarded update and copy its percent and target: listed percentages read back exactly to their stored values on both machines. On refusal re-list, and never recreate an already-consumed entry. Do not undo a mode change with another `next hold`: its cleared elapsed hold cannot be restored. Install natedev and the Mac together before writing any half-point entry. Workers refuse both hold modes.
 
-Each refusal-watch pass first starts a quiet probe session on each local noted Claude account whose stored usage says its login expired. The probe has a 120 s limit. The pass reads usage again after a successful probe, then checks due moves. It tries each account at most once per hour and never starts a probe in a dry run. Probes run before the move log lock. If a probe fails, the blocked line says: "claude4's login expired, and a probe session on it failed (<detail>). Log in on claude4 by hand." Showrunners receive that line through the usual relay. An expired token or a credentials entry with no login token makes status ask you to start a session on that account. This step works on both machines; the Mac has no notes timer. After a failed probe, status shows the probe time and asks for a manual login.
+Each refusal-watch pass first starts a quiet probe session on each local noted Claude account whose stored usage says its login expired. The probe has a 120 s limit. The pass reads usage again after a successful probe, then checks due moves. It tries each account at most once per hour and never starts a probe in a dry run. Probes run before the move log lock. If a probe fails, the blocked line says: "claude4's login expired, and a probe session on it failed (<detail>). Log in on claude4 by hand." Showrunners receive that line through the usual relay. An expired token or a credentials entry with no login token makes status ask you to start a session on that account. This step works on both machines; the Mac usage refresher does not start renewal probes. After a failed probe, status shows the probe time and asks for a manual login.
 
 Account launches and renewal probes find Claude on PATH, then in `~/.local/bin`, and start its full path, including terminal relaunches; Codex account launches use the same search.
 
@@ -373,7 +387,7 @@ The watchdog submits each recovery to a detached user service and reads its resu
 
 Watcher inventories read the existing desktop snapshot. They never invoke the snapshot updater, which itself runs the notes timer. This prevents a recursive notes update and keeps `--dry-run` read-only.
 
-The argument-free notes timer checks local top-level sessions' last transcript entries for provider quota refusals. A refused unit or showrunner moves its whole group only when that group has no next entry; otherwise its head controls the account move. Owners outside either group move alone through the same stop-and-resume path, in their own local herdr tabs. The Mac has no timer.
+The argument-free notes timer checks local top-level sessions' last transcript entries for provider quota refusals. A refused unit or showrunner moves its whole group only when that group has no next entry; otherwise its head controls the account move. Owners outside either group move alone through the same stop-and-resume path, in their own local herdr tabs. The Mac usage refresher does not run this refusal check.
 
 Group membership uses the lightweight listing; absent registration targets are checked separately. Manual move previews are described above.
 

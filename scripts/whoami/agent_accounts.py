@@ -305,6 +305,7 @@ class UsageReadOutcome(str, Enum):
     OK = "ok"
     STALE_TOKEN = "stale_token"
     NO_LOGIN_TOKEN = "no_login_token"
+    CREDENTIALS_UNAVAILABLE = "credentials_unavailable"
     REFUSED_401 = "refused_401"
     RATE_LIMITED_429 = "rate_limited_429"
     ERROR = "error"
@@ -540,9 +541,14 @@ def command_json(*args: str, environment: dict[str, str] | None = None) -> objec
         result = subprocess.run(command, capture_output=True, text=True, timeout=15)
     else:
         result = subprocess.run(command, capture_output=True, text=True, timeout=15, env=environment)
-    if result.returncode:
+    # Claude reports a signed-out session as JSON with exit 1.
+    if result.returncode and (result.returncode != 1 or args != ("claude", "auth", "status")):
         raise RuntimeError("account command failed")
-    return cast(object, json.loads(result.stdout))
+    decoded = cast(object, json.loads(result.stdout))
+    if result.returncode and not (isinstance(decoded, dict)
+            and cast(dict[str, object], decoded).get("loggedIn") is False):
+        raise RuntimeError("account command failed")
+    return decoded
 
 
 def claude_config_dir() -> Path:
@@ -711,17 +717,24 @@ def codex_can_work(report: Report, now: datetime, credits: CodexCreditsSetting) 
 # --- Claude ------------------------------------------------------------------
 
 
+class ClaudeCredentialsUnavailable(RuntimeError):
+    """This process cannot read the account credentials in its session."""
+
+
 def claude_credentials(config_dir: Path | None = None) -> ClaudeCredentials:
     path = (claude_config_dir() if config_dir is None else config_dir) / ".credentials.json"
-    if path.exists():
-        return cast(ClaudeCredentials, json.loads(path.read_text()))
+    try:
+        if path.exists():
+            return cast(ClaudeCredentials, json.loads(path.read_text()))
+    except OSError as error:
+        raise ClaudeCredentialsUnavailable("usage credentials unavailable") from error
     if sys.platform == "darwin":
         try:
             return cast(ClaudeCredentials, command_json(
                 "security", "find-generic-password", "-s", claude_keychain_service(config_dir), "-w"))
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
-            raise RuntimeError("usage credentials unavailable") from error
-    raise RuntimeError("usage credentials unavailable")
+            raise ClaudeCredentialsUnavailable("usage credentials unavailable") from error
+    raise ClaudeCredentialsUnavailable("usage credentials unavailable")
 
 
 def claude_usage_quotas(usage: dict[str, object]) -> list[Quota]:
@@ -778,7 +791,8 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
         report.problem = "Account unavailable (claude auth status failed)"
         return report
     if not account.get("loggedIn"):
-        report.problem = "Not logged in"
+        report.usage_read_outcome = UsageReadOutcome.CREDENTIALS_UNAVAILABLE
+        report.problem = "Login credentials unavailable in this session"
         return report
     report.email = account.get("email")
     report.plan = account.get("subscriptionType") or account.get("authMethod")
@@ -830,6 +844,9 @@ def claude_live(config_dir: Path | None = None, *, use_disk_identity: bool = Fal
             report.usage_read_outcome = UsageReadOutcome.OK
         if not any(quota.label == "Weekly" for quota in report.quotas):
             report.quota_problem = "Weekly quota: unavailable"
+    except ClaudeCredentialsUnavailable:
+        report.usage_read_outcome = UsageReadOutcome.CREDENTIALS_UNAVAILABLE
+        report.quota_problem = "Weekly quota: not read (login credentials unavailable in this session)"
     except urllib.error.HTTPError as error:
         report.usage_read_outcome = (UsageReadOutcome.REFUSED_401 if error.code == 401 else
                                      UsageReadOutcome.RATE_LIMITED_429 if error.code == 429 else UsageReadOutcome.ERROR)

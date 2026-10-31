@@ -24,6 +24,7 @@ from typing import final, override
 from unittest.mock import patch
 
 from scripts.whoami import agent_accounts, usage_store
+from scripts.whoami.agent_accounts import command_json
 
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
@@ -110,6 +111,16 @@ class NamedKeychainCredentialsTests(unittest.TestCase):
             _ = agent_accounts.claude_credentials(folder)
         self.assertEqual([call[3] for call in self.keychain.calls], [folder_service(folder)])
 
+    def test_an_unreadable_credentials_file_names_session_access_without_leaking_its_error(self) -> None:
+        folder = self.home / ".claude2"
+        folder.mkdir()
+        _ = (folder / ".credentials.json").write_text("{}")
+        with patch.object(Path, "read_text", side_effect=PermissionError("synthetic private diagnostic")):
+            with self.assertRaisesRegex(agent_accounts.ClaudeCredentialsUnavailable,
+                                        "usage credentials unavailable"):
+                _ = agent_accounts.claude_credentials(folder)
+        self.assertEqual(self.keychain.calls, [])
+
     def test_empty_config_setting_reads_the_legacy_keychain_service(self) -> None:
         self.keychain.entries["Claude Code-credentials"] = json.dumps({
             "claudeAiOauth": {"accessToken": "synthetic-home-token"}})
@@ -126,6 +137,34 @@ class NamedKeychainCredentialsTests(unittest.TestCase):
             credentials = agent_accounts.claude_credentials()
         self.assertTrue(credentials.get("claudeAiOauth", {}).get("accessToken") == "synthetic-named-token")
         self.assertEqual([call[3] for call in self.keychain.calls], [service])
+
+    def test_inaccessible_session_credentials_preserve_the_last_good_reading(self) -> None:
+        folder = self.home / ".claude2"
+        login = "desktop@example.invalid"
+        at = datetime.now(timezone.utc)
+        usage_store.save([agent_accounts.Report("Claude", email=login,
+            source=agent_accounts.ClaudeDirectorySource(folder),
+            quotas=[agent_accounts.Quota("Weekly", 25, at + timedelta(days=1))],
+            usage_read_outcome=agent_accounts.UsageReadOutcome.OK)], at)
+        before = usage_store.store_file().read_bytes()
+        for logged_in in (False, True):
+            with (self.subTest(logged_in=logged_in),
+                patch.object(agent_accounts, "command_json", return_value={
+                    "loggedIn": logged_in, "email": login, "authMethod": "claude.ai"}),
+                patch.object(agent_accounts, "claude_credentials", side_effect=
+                    agent_accounts.ClaudeCredentialsUnavailable("usage credentials unavailable")),
+                patch.object(urllib.request, "urlopen", side_effect=AssertionError("usage request without credentials")),
+                patch.object(usage_store, "claim_read") as claim,
+            ):
+                report = agent_accounts.claude_live(folder)
+                self.assertEqual(report.usage_read_outcome, agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE)
+                self.assertIn("credentials unavailable in this session", report.problem or report.quota_problem or "")
+                report.last_known_login = agent_accounts.KnownUsageLogin(login)
+                usage_store.save([report], at + timedelta(minutes=2))
+                self.assertEqual(usage_store.store_file().read_bytes(), before)
+                claim.assert_not_called()
+        self.assertEqual(usage_store.latest_read_outcome(usage_store.load()[login]),
+                         agent_accounts.UsageReadOutcome.OK)
 
     def test_keychain_entry_without_a_login_token_never_sends_a_usage_request(self) -> None:
         folder = self.home / ".claude2"
@@ -180,6 +219,38 @@ class SharedUsageReadTests(unittest.TestCase):
     def response(self, _request: urllib.request.Request, *, timeout: int) -> io.BytesIO:
         self.assertEqual(timeout, 15)
         return io.BytesIO(b'{"seven_day":{"utilization":25,"resets_at":"2026-10-25T12:00:00Z"}}')
+
+    def test_signed_out_cli_exit_preserves_the_last_good_reading(self) -> None:
+        folder = self.home / ".claude2"
+        login = "shared@example.invalid"
+        usage_store.save([agent_accounts.Report("Claude", email=login,
+            source=agent_accounts.ClaudeDirectorySource(folder),
+            quotas=[agent_accounts.Quota("Weekly", 25, self.now + timedelta(days=1))],
+            usage_read_outcome=agent_accounts.UsageReadOutcome.OK)], self.now)
+        before = usage_store.store_file().read_bytes()
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir()
+        claude = bin_dir / "claude"
+        _ = claude.write_text('#!/bin/sh\n[ "$1 $2" = "auth status" ] || exit 9\n'
+                              + 'printf \'{"loggedIn":false}\\n\'\nexit 1\n')
+        claude.chmod(0o700)
+        with (patch.dict(os.environ, {"PATH": str(bin_dir)}),
+              patch.object(agent_accounts, "command_json", new=command_json),
+              patch.object(agent_accounts, "claude_credentials", side_effect=AssertionError("credentials read")),
+              patch.object(urllib.request, "urlopen", side_effect=AssertionError("usage request")),
+              patch.object(usage_store, "claim_read") as claim):
+            for config_dir in (None, folder):
+                with self.subTest(config_dir=config_dir):
+                    report = agent_accounts.claude_live(config_dir)
+                    self.assertEqual(report.usage_read_outcome,
+                                     agent_accounts.UsageReadOutcome.CREDENTIALS_UNAVAILABLE)
+                    self.assertEqual(report.problem, "Login credentials unavailable in this session")
+                    report.last_known_login = agent_accounts.KnownUsageLogin(login)
+                    usage_store.save([report], self.now + timedelta(minutes=2))
+                    self.assertEqual(usage_store.store_file().read_bytes(), before)
+            claim.assert_not_called()
+        self.assertEqual(usage_store.latest_read_outcome(usage_store.load()[login]),
+                         agent_accounts.UsageReadOutcome.OK)
 
     def test_the_http_call_does_not_hold_the_store_lock(self) -> None:
         def unlocked_response(request: urllib.request.Request, *, timeout: int) -> io.BytesIO:
