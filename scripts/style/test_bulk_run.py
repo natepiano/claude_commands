@@ -345,6 +345,12 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertNotIn(extra.finding_id, cast(dict[str, str], report['refusals']))
 
     def test_later_rename_is_proved_without_a_held_traits_overlay(self) -> None:
+        self.check_trait_overlay_rollback('planning')
+
+    def test_formatter_rollback_reproves_and_refuses_a_new_capture(self) -> None:
+        self.check_trait_overlay_rollback('formatting')
+
+    def check_trait_overlay_rollback(self, stage: str) -> None:
         source = ('struct Record;\n'
                   'trait Named { fn old(&self); }\n'
                   'impl Named for Record { fn old(&self) {} }\n'
@@ -411,10 +417,12 @@ class WorkspaceRunTests(CargoProjectTests):
                     answers.append(own if path == methods else trait)
             return tuple(answers)
 
-        reason = 'src/child.rs: another worktree holds the file'
+        reason = ('src/child.rs: another worktree holds the file' if stage == 'planning'
+                  else 'post-format rename edit changed: src/lib.rs')
+        self.runner.break_proof = stage == 'formatting'
 
         def available(_repo: Path, path: str) -> None:
-            if path == 'src/child.rs':
+            if stage == 'planning' and path == 'src/child.rs':
                 raise bulk.BulkRenameError(reason)
 
         with mock.patch.object(self.server, 'rename', side_effect=references), mock.patch.object(
@@ -426,7 +434,10 @@ class WorkspaceRunTests(CargoProjectTests):
         self.assertEqual(refusals[findings[0].finding_id], reason)
         self.assertIn("capture in an unedited file for 'old'", refusals[inherent.finding_id])
         self.assertTrue(checked_trees)
-        self.assertTrue(all('trait Named { fn old' in text for text in checked_trees))
+        if stage == 'planning':
+            self.assertTrue(all('trait Named { fn old' in text for text in checked_trees))
+        else:
+            self.assertTrue(any('trait Named { fn old' in text for text in checked_trees))
         self.assertEqual(root.read_text(), source)
         self.assertEqual(self.server.documents[root], source)
         self.assertEqual(methods.read_text(), methods_source)
@@ -477,7 +488,7 @@ class WorkspaceRunTests(CargoProjectTests):
         with mock.patch.object(self, 'available', side_effect=available):
             report = self.execute(ledger, definition)
         self.assertEqual((report['applied'], report['reverted']), (0, 2))
-        self.assertEqual(report['status'], 'batch aborted: ' + reason)
+        self.assertEqual(report['status'], 'batch refused: ' + reason)
         self.assertEqual(self.git('rev-parse', 'HEAD'), self.base)
         self.assertEqual(self.git('diff', self.base), '')
         self.assertFalse(self.runner.calls)
@@ -594,7 +605,7 @@ class WorkspaceRunTests(CargoProjectTests):
         path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, runner=fail_root,
                             available=lambda repo, path: None)
         report = bulk.object_fields(cast(object, json.loads(path.read_text())))
-        self.assertEqual((report['applied'], report['refused'], report['reverted']), (1, 1, 1))
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (1, 2, 0))
         self.assertFalse((self.repo / 'src/constants.rs').exists())
         self.assertEqual((self.repo / 'src/lib.rs').read_text(), 'mod worker;\n')
         self.assertIn('let first: usize = 42;', (self.repo / 'src/worker.rs').read_text())
@@ -912,8 +923,8 @@ class WorkspaceRunTests(CargoProjectTests):
         ledger, definition, findings = self.setup_findings()
         self.runner.error_file = "beta/src/lib.rs"
         report = self.execute(ledger, definition)
-        self.assertEqual((report["applied"], report["reverted"]), (1, 1))
-        self.assertEqual(report["reversions"], {findings[1].finding_id: "workspace diagnostics"})
+        self.assertEqual((report["applied"], report["refused"], report["reverted"]), (1, 1, 0))
+        self.assertEqual(report["refusals"], {findings[1].finding_id: "workspace diagnostics"})
         self.assertIn("let old", (self.repo / "beta/src/lib.rs").read_text())
         self.assertIn("let number", (self.repo / "src/lib.rs").read_text())
         self.assertEqual(sum(args[1] == "check" for _, args in self.runner.calls), 2)
@@ -930,7 +941,7 @@ class WorkspaceRunTests(CargoProjectTests):
             _ = (self.repo / file.path).write_text(file.edited)
         workspace.dependencies["src/lib.rs"] = frozenset(("src/lib.rs", "beta/src/lib.rs"))
         self.runner.error_file = "src/lib.rs"
-        kept, reverted = run.validate(workspace, self.runner, {"check_clippy": 0.0}, [])
+        kept, reverted = run.validate(workspace, self.runner, {"check_clippy": 0.0}, [], lambda paths: paths)
         self.assertFalse(kept)
         self.assertEqual(set(reverted), {"src/lib.rs", "beta/src/lib.rs"})
         self.assertEqual(self.git("status", "--porcelain"), "")
@@ -986,17 +997,360 @@ class WorkspaceRunTests(CargoProjectTests):
             _ = run.tested_tree_proof(self.repo, "0" * 40, self.runner, {})
         self.assertFalse(self.runner.calls)
 
-    def test_unrelated_formatter_changes_and_failed_post_format_proofs_abort_and_restore(self) -> None:
+    def test_unexpected_runner_failure_is_reported_as_a_tool_defect(self) -> None:
+        ledger, definition, _ = self.setup_findings()
+        self.addCleanup(ledger.close)
+
+        def defective_runner(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
+            _ = repo, arguments
+            raise RuntimeError('formatter adapter broke')
+
+        path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, self.server,
+                            defective_runner, available=self.available)
+        report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+        self.assertEqual(report['status'], 'tool defect: formatter adapter broke')
+        self.assertEqual(self.git('status', '--porcelain'), '')
+
+    def test_unrelated_formatter_changes_abort_and_restore(self) -> None:
         ledger, definition, _ = self.setup_findings()
         self.runner.unrelated = True
         report = self.execute(ledger, definition)
         self.assertIn("unrelated file", str(report["status"]))
         self.assertEqual(self.git("status", "--porcelain"), "")
-        self.runner.unrelated = False
+
+    def test_formatter_token_change_refuses_only_its_file_and_keeps_one_tested_commit(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        source = (self.repo / 'src/lib.rs').read_text()
         self.runner.break_proof = True
         report = self.execute(ledger, definition)
-        self.assertIn("post-format rename edit changed", str(report["status"]))
+        reason = 'post-format rename edit changed: src/lib.rs'
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (1, 1, 0))
+        self.assertEqual(report['refusals'], {findings[0].finding_id: reason})
+        self.assertEqual((self.repo / 'src/lib.rs').read_text(), source)
+        self.assertIn('let number', (self.repo / 'beta/src/lib.rs').read_text())
+        self.assertIsInstance(ledger.named_held((findings[0].finding_id,))[0].state, ledger_api.Filed)
+        self.assertTrue(any(item.reason == reason for ticket in cast(list[str], report['tickets'])
+                            for item in ledger.bulk_refusals(ticket)))
+        self.assertEqual(self.git('rev-list', '--count', f'{self.base}..HEAD'), '1')
+        self.assertEqual([args[2] for _, args in self.runner.calls if args[0] == 'bash'], ['final', 'lint', 'final-pass'])
         self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_formatter_failure_in_a_reference_restores_its_whole_rename_group(self) -> None:
+        ledger, definition, findings = self.setup_field_reference()
+        self.addCleanup(ledger.close)
+        originals = {path: (self.repo / path).read_text() for path in ('src/lib.rs', 'src/child.rs')}
+
+        def formatter(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
+            result = self.runner(repo, arguments)
+            if 'fmt' in arguments:
+                _ = (repo / 'src/child.rs').write_text('fn read() {}\n')
+            return result
+
+        path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, self.server, formatter,
+                            available=self.available)
+        report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (1, 1, 0))
+        self.assertEqual(report['refusals'], {findings[0].finding_id:
+                                             'post-format rename edit changed: src/child.rs'})
+        for name, original in originals.items():
+            self.assertEqual((self.repo / name).read_text(), original)
+        self.assertIn('let number', (self.repo / 'beta/src/lib.rs').read_text())
+
+    def test_formatter_rollback_reproves_and_keeps_an_independent_reader(self) -> None:
+        extra_path = self.repo / 'src/extra.rs'
+        extra_source = 'fn extra() { let other = 2; consume(other); }\n'
+        _ = extra_path.write_text(extra_source)
+        ledger, definition, findings = self.setup_field_reference('mod extra;\n')
+        self.addCleanup(ledger.close)
+        extra = self.approve_extra_rename(ledger, definition, 1, 'other', 'number', 'src/extra.rs')
+        self.server.edit = lambda text, offset, new: word_edits(text, 'other' if 'let other' in text else 'old', new)
+        named_held = ledger.named_held
+
+        def declaration_first(names: Iterable[str]) -> tuple[ledger_api.HeldFinding, ...]:
+            return tuple(sorted(named_held(names), key=lambda finding: finding.path != 'src/lib.rs'))
+
+        self.runner.break_proof = True
+        with mock.patch.object(ledger, 'named_held', side_effect=declaration_first), mock.patch.object(
+                run, 'plan_renames', wraps=run.plan_renames) as planner:
+            report = self.execute(ledger, definition)
+        self.assertEqual(planner.call_count, 2)
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (2, 1, 0))
+        self.assertEqual(report['refusals'], {findings[0].finding_id: 'post-format rename edit changed: src/lib.rs'})
+        self.assertNotIn(extra.finding_id, cast(dict[str, str], report['refusals']))
+        self.assertEqual(extra_path.read_text(), extra_source.replace('other', 'number'))
+        self.assertIn('let number', (self.repo / 'beta/src/lib.rs').read_text())
+
+    def check_formatter_retry_after_reproof_excludes_another_file(self, interrupted: bool) -> None:
+        extra = self.repo / 'src/extra.rs'
+        _ = extra.write_text('fn extra() { let old = 2; consume(old); }\n')
+        library = self.repo / 'src/lib.rs'
+        _ = library.write_text(library.read_text() + '\nmod extra;\n')
+        _ = self.git('add', '.')
+        _ = self.git('commit', '-qm', 'retry survivor fixture')
+        self.base, self.tree = self.git('rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD^{tree}')
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        _ = self.approve_extra_rename(ledger, definition, 1, 'old', 'number', 'src/extra.rs')
+        original = (self.repo / 'beta/src/lib.rs').read_text()
+        planner = run.plan_renames
+        passes = 0
+
+        def replan(repo: Path, store: ledger_api.Ledger, base: str, selected: run.Selection,
+                   server: bulk.RenameServer, availability: run.PlanningFileAvailability) -> run.PlannedEdits:
+            plan = planner(repo, store, base, selected, server, availability)
+            if passes:
+                # The remaining reader fails fresh resolution after the first edit is restored.
+                return run.PlannedEdits(tuple(file for file in plan.files if file.path != 'beta/src/lib.rs'),
+                                        (*plan.refusals, bulk.Refusal(findings[1].finding_id, 'reader no longer proved')))
+            return plan
+
+        def formatter(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
+            nonlocal passes
+            result = self.runner(repo, arguments)
+            if 'fmt' in arguments:
+                passes += 1
+                if passes == 1:
+                    _ = (repo / 'src/lib.rs').write_text('fn changed() {}\n')
+                else:
+                    _ = (repo / 'beta/src/lib.rs').write_text('\n' + original)
+                    if interrupted:
+                        os._exit(73)
+            return result
+
+        with mock.patch.object(run, 'plan_renames', side_effect=replan):
+            if interrupted:
+                stop_process(lambda: run.run_rule(self.repo, definition.rule_id, self.tree, ledger,
+                                                  self.server, formatter, available=self.available))
+            else:
+                path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger,
+                                    self.server, formatter, available=self.available)
+                report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+                self.assertEqual((report['applied'], report['refused'], report['reverted']), (1, 2, 0))
+                self.assertEqual(passes, 2)
+                self.assertIn('let number', extra.read_text())
+                self.assertEqual((self.repo / 'beta/src/lib.rs').read_text(), original)
+                self.assertEqual(self.git('status', '--porcelain'), '')
+                return
+        tickets = {ticket['id'] for ticket in ledger.proposal_tickets()
+                   if ticket['state'] not in ledger_api.FINAL_TICKET_STATES}
+        self.assertTrue(tickets)
+        self.assertEqual((self.repo / 'beta/src/lib.rs').read_text(), '\n' + original)
+        # Stop the recovered run at selection, so only recovery can restore the dirty files.
+        with mock.patch.object(run, 'select', return_value=run.Selection((), ())):
+            try:
+                report = self.execute(ledger, definition)
+            except bulk.BulkRenameError as error:
+                self.fail(f'recovery must restore the retry and release its tickets: {error}')
+        self.assertEqual(report['applied'], 0)
+        self.assertEqual(self.git('status', '--porcelain'), '')
+        self.assertTrue(all(ticket['state'] in ledger_api.FINAL_TICKET_STATES
+                            for ticket in ledger.proposal_tickets() if ticket['id'] in tickets))
+        self.assertTrue(all(isinstance(row.build_ticket, ledger_api.NoBuildTicket)
+                            for row in ledger.named_held(tuple(finding.finding_id for finding in findings))))
+
+    def test_formatter_retry_restores_paths_excluded_by_survivor_reproof(self) -> None:
+        self.check_formatter_retry_after_reproof_excludes_another_file(False)
+
+    def test_recovery_restores_a_formatter_retry_on_an_excluded_path_and_releases_tickets(self) -> None:
+        self.check_formatter_retry_after_reproof_excludes_another_file(True)
+
+    def test_recovery_refuses_content_changes_in_an_excluded_formatter_path(self) -> None:
+        files = tuple(bulk.FileRenames(path, (self.repo / path).read_text(),
+                                      (self.repo / path).read_text().replace('old', 'number'), (), ())
+                      for path in ('src/lib.rs', 'beta/src/lib.rs'))
+        intent = run.WorkspaceIntent(self.repo, 'retry recovery')
+        intent.begin(())
+        intent.record_plan(run.PlannedEdits(files, ()))
+        intent.record_plan(run.PlannedEdits(files[1:], ()))
+        _ = (self.repo / files[0].path).write_text('fn different_item() {}\n')
+        _ = (self.repo / files[1].path).write_text(files[1].edited)
+        with self.assertRaisesRegex(bulk.BulkRenameError, 'bytes do not match the recorded edit'):
+            _ = intent.recover()
+        self.assertEqual((self.repo / files[1].path).read_text(), files[1].edited)
+        self.assertEqual((self.repo / files[0].path).read_text(), 'fn different_item() {}\n')
+
+    def test_rebuilt_plan_rechecks_a_path_that_became_unavailable(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        held = False
+        reason = 'beta/src/lib.rs: another worktree holds the file'
+
+        def available(_repo: Path, path: str) -> None:
+            if held and path == 'beta/src/lib.rs':
+                raise bulk.BulkRenameError(reason)
+
+        def formatter(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
+            nonlocal held
+            result = self.runner(repo, arguments)
+            if 'fmt' in arguments:
+                held = True
+                _ = (repo / 'src/lib.rs').write_text('fn changed() {}\n')
+            return result
+
+        path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, self.server,
+                            formatter, available=available)
+        report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (0, 2, 0))
+        self.assertEqual(bulk.object_fields(report['refusals'])[findings[1].finding_id], reason)
+        self.assertEqual(self.git('status', '--porcelain'), '')
+
+    def test_lengthening_rename_reflow_keeps_identifier_token_positions(self) -> None:
+        source = ('fn run() {\n'
+                  '    let old = input.first_method().second_method().third_method().fourth_method().fifth_method();\n'
+                  '    consume(old);\n}\n')
+        _ = (self.repo / 'src/lib.rs').write_text(source)
+        _ = self.git('add', '.')
+        _ = self.git('commit', '-qm', 'long method chain')
+        self.base, self.tree = self.git('rev-parse', 'HEAD'), self.git('rev-parse', 'HEAD^{tree}')
+        ledger, definition, _ = self.setup_findings()
+        self.addCleanup(ledger.close)
+        planned = source.replace('old', 'number')
+
+        def formatter(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
+            result = self.runner(repo, arguments)
+            if 'fmt' in arguments:
+                # Model rustfmt's method-chain reflow; the scratch replay runs the real formatter.
+                formatted = planned.replace('input.', 'input\n        .').replace('().', '()\n        .')
+                _ = (repo / 'src/lib.rs').write_text(formatted)
+            return result
+
+        path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, self.server, formatter,
+                            available=self.available)
+        report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+        formatted = (self.repo / 'src/lib.rs').read_text()
+        self.assertNotEqual(formatted, planned)
+        self.assertIn('\n        .first_method()', formatted)
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (2, 0, 0))
+        self.assertTrue(bulk.file_edits_preserved(bulk.FileRenames('src/lib.rs', source, planned, (), ()), formatted))
+
+    def test_all_formatter_failures_leave_findings_filed_without_tests_or_a_commit(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+
+        def formatter(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
+            result = self.runner(repo, arguments)
+            if 'fmt' in arguments:
+                for name in ('src/lib.rs', 'beta/src/lib.rs'):
+                    _ = (repo / name).write_text('fn changed() {}\n')
+            return result
+
+        path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, self.server, formatter,
+                            available=self.available)
+        report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (0, 2, 0))
+        self.assertEqual(report['status'], 'no edits')
+        self.assertEqual(self.git('rev-parse', 'HEAD'), self.base)
+        self.assertEqual(self.git('status', '--porcelain'), '')
+        self.assertFalse(any(args[0] == 'bash' for _, args in self.runner.calls))
+        self.assertTrue(all(isinstance(row.state, ledger_api.Filed)
+                            for row in ledger.named_held(tuple(finding.finding_id for finding in findings))))
+
+    def test_formatter_wraps_plain_comment_text_at_the_same_token(self) -> None:
+        for marker in ('//', '///', '//!'):
+            with self.subTest(marker=marker):
+                before = f'{marker} Recorded `answers` keep the same text and attachment.\nfn run() {{}}\n'
+                after = f'{marker} Recorded `answers` keep the same text\n{marker} and attachment.\nfn run() {{}}\n'
+                file = bulk.FileRenames('src/lib.rs', before, before, (), ())
+                self.assertTrue(bulk.file_edits_preserved(file, after))
+                self.assertFalse(bulk.file_edits_preserved(file, after.replace('same', 'other')))
+                self.assertFalse(bulk.file_edits_preserved(file, 'fn run() {}\n' + after.split('fn run()')[0]))
+        before = '/// First paragraph.\n///\n/// Second paragraph.\nfn run() {}'
+        after = '/// First paragraph. Second paragraph.\nfn run() {}'
+        self.assertFalse(bulk.file_edits_preserved(bulk.FileRenames('src/lib.rs', before, before, (), ()), after))
+
+    def test_formatter_wraps_prose_starting_with_inline_code_without_changing_its_attachment(self) -> None:
+        before = ('// `tree.insert_into_hierarchy` inserts `root_item` under an existing parent workspace or as a\n'
+                  '// top-level peer; `regroup_members` reapplies `inline_dirs`.\nfn run() {}\n')
+        after = ('// `tree.insert_into_hierarchy` inserts `root_item` under an existing parent workspace or as\n'
+                 '// a top-level peer; `regroup_members` reapplies `inline_dirs`.\nfn run() {}\n')
+        file = bulk.FileRenames('src/lib.rs', before, before, (), ())
+        self.assertTrue(bulk.file_edits_preserved(file, after))
+        self.assertFalse(bulk.file_edits_preserved(file, after.replace('root_item', 'other')))
+        self.assertFalse(bulk.file_edits_preserved(file, 'fn run() {}\n' + after.split('fn run()')[0]))
+
+    def test_formatter_preserves_structured_comments_and_item_attachment(self) -> None:
+        for body in ('/// ```\n/// first\n/// second\n/// ```\n',
+                     '/// first  \n/// second\n', '/// - first\n/// - second\n',
+                     '/* first\nsecond */\n'):
+            with self.subTest(body=body):
+                before = body + 'fn first() {}\nfn second() {}\n'
+                file = bulk.FileRenames('src/lib.rs', before, before, (), ())
+                self.assertFalse(bulk.file_edits_preserved(file, 'fn first() {}\n' + body + 'fn second() {}\n'))
+                self.assertFalse(bulk.file_edits_preserved(file, before.replace('first\n', 'first second\n').replace('/// second\n', '')))
+
+    def test_formatter_preserves_line_comment_like_contents_inside_a_block_comment(self) -> None:
+        before = '/**\n// first\n// second\n*/\nfn run() {}\n'
+        file = bulk.FileRenames('src/lib.rs', before, before, (), ())
+        self.assertFalse(bulk.file_edits_preserved(file, '/**\n// first second\n*/\nfn run() {}\n'))
+        self.assertFalse(bulk.file_edits_preserved(file, '// first second\nfn run() {}\n'))
+
+    def test_formatter_preserves_backslash_hard_breaks_in_comment_paragraphs(self) -> None:
+        before = '/// first\\\n/// second\nfn run() {}\n'
+        file = bulk.FileRenames('src/lib.rs', before, before, (), ())
+        self.assertFalse(bulk.file_edits_preserved(file, before.replace('first\\\n/// second', 'first second')))
+        self.assertFalse(bulk.file_edits_preserved(file, before.replace('first\\\n/// second', 'first\\ second')))
+        plain = '// first\n// second\nfn run() {}\n'
+        self.assertTrue(bulk.file_edits_preserved(bulk.FileRenames('src/lib.rs', plain, plain, (), ()),
+                                                 '// first second\nfn run() {}\n'))
+
+    def test_compiler_failure_is_refused_with_its_cause_before_the_survivor_commit(self) -> None:
+        ledger, definition, findings = self.setup_findings()
+        self.addCleanup(ledger.close)
+        def diagnostic_runner(repo: Path, arguments: Sequence[str]) -> run.CommandResult:
+            result = self.runner(repo, arguments)
+            if (len(arguments) > 1 and arguments[1] in ('check', 'clippy')
+                    and 'let number' in (repo / 'src/lib.rs').read_text()):
+                return run.CommandResult(101, json.dumps({'reason': 'compiler-message', 'message': {
+                    'level': 'error', 'message': 'struct `Record` has no field named `number`',
+                    'code': {'code': 'E0560'}, 'spans': [{'file_name': 'src/lib.rs'}]}}))
+            return result
+        path = run.run_rule(self.repo, definition.rule_id, self.tree, ledger, self.server,
+                            diagnostic_runner, available=self.available)
+        report = bulk.object_fields(cast(object, json.loads(path.read_text())))
+        self.assertEqual((report['applied'], report['refused'], report['reverted']), (1, 1, 0))
+        refusals = bulk.object_fields(report['refusals'])
+        self.assertIn('E0560: struct `Record` has no field named `number`', str(refusals[findings[0].finding_id]))
+        self.assertIn('let old', self.git('show', 'HEAD:src/lib.rs'))
+        self.assertIn('let number', self.git('show', 'HEAD:beta/src/lib.rs'))
+        self.assertIsInstance(ledger.named_held((findings[0].finding_id,))[0].state, ledger_api.Filed)
+        self.assertEqual(sum(args[0] == 'bash' and args[2] == 'final' for _, args in self.runner.calls), 1)
+
+    def test_read_only_proof_dependencies_do_not_join_the_edit_group(self) -> None:
+        files = (bulk.FileRenames('src/lib.rs', '', '', (), (), proof_dependencies=frozenset({'src/other.rs'})),
+                 bulk.FileRenames('src/other.rs', '', '', (), ()))
+        workspace = run.WorkspaceEdits(self.repo, self.base, files)
+        self.assertEqual(run.dependent_files(workspace.dependencies, {'src/other.rs'}), {'src/other.rs'})
+
+    def test_formatter_comma_and_block_brace_changes_keep_identifiers_and_comments(self) -> None:
+        for before, after in (
+                ('fn run() { make(number) }', 'fn run() { { make(number,) } }'),
+                ('fn run() { Record { number } }', 'fn run() { Record { number, } }'),
+                ('fn run() { { number } }', 'fn run() { number }'),
+                ('fn run() { Record { number /* retained */, } }',
+                 'fn run() { Record { number, /* retained */ } }')):
+            with self.subTest(before=before):
+                file = bulk.FileRenames('src/lib.rs', before, before, (), ())
+                self.assertTrue(bulk.file_edits_preserved(file, after))
+                self.assertFalse(bulk.file_edits_preserved(file, after.replace('number', 'other')))
+                if 'retained' in after:
+                    self.assertFalse(bulk.file_edits_preserved(file, after.replace('retained', 'changed')))
+
+    def test_formatter_import_reordering_still_refuses(self) -> None:
+        before = 'pub(crate) use z::Z;\npub(crate) use a::A;\n'
+        after = 'pub(crate) use a::A;\npub(crate) use z::Z;\n'
+        self.assertFalse(bulk.file_edits_preserved(bulk.FileRenames('src/lib.rs', before, before, (), ()), after))
+
+    def test_formatter_proof_rejects_added_removed_changed_or_reordered_tokens(self) -> None:
+        # These proof tests belong to test_bulk_rename, kept here within this phase's file scope.
+        before = 'fn run() { let number = input.first().second(); consume(number); }\n'
+        file = bulk.FileRenames('src/lib.rs', before, before, (), ())
+        for changed in (before.replace('.second()', ''),
+                        before.replace('consume(number)', 'consume(other)'),
+                        before.replace('input.first().second()', 'input.second().first()')):
+            with self.subTest(changed=changed):
+                self.assertFalse(bulk.file_edits_preserved(file, changed))
+        self.assertFalse(bulk.file_edits_preserved(file, before + '// unexpected comment\n'))
 
 
     def test_verify_final_and_lint_both_must_pass_and_have_separate_times(self) -> None:

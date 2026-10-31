@@ -1406,9 +1406,9 @@ pub fn run(parameter: usize) -> usize {
         _ = (self.repo / "src/lib.rs").write_text(result.edited)
         workspace = bulk_run.WorkspaceEdits(self.repo, base, (result,))
         with mock.patch.dict(os.environ, {"RUSTFLAGS": "--cfg end_gate"}):
-            kept, reverted = bulk_run.validate(workspace, bulk_run.run_command, {"check_clippy": 0.0}, [])
+            kept, reverted = bulk_run.validate(workspace, bulk_run.run_command, {"check_clippy": 0.0}, [], lambda paths: paths)
         self.assertEqual(kept, set())
-        self.assertEqual(reverted, {"finding": "workspace diagnostics"})
+        self.assertEqual(reverted, {"finding": "workspace diagnostics: non_snake_case: variable `NUMBER` should have a snake case name"})
         self.assertEqual((self.repo / "src/lib.rs").read_text(), source)
 
     def test_real_clap_binary_keeps_requires_id_flag_help_and_usage(self) -> None:
