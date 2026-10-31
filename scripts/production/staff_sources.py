@@ -238,8 +238,7 @@ class _WorkerSources:
             if path.exists():
                 _problem(path, "session registry is unreadable")
         self.running: dict[str, sessions.SessionRecord] = {
-            item.record["sessionId"]: item.record for item in registry.entries
-            if sessions.running_session(item.record)
+            session["sessionId"]: session for session in workers.running_director_sessions(registry)
         }
         self._owners()
 

@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 if TYPE_CHECKING:
     from scripts.production import staff
     import unit_lookup
-    from scripts.message.sessions import SessionRecord
+    from scripts.message.sessions import RegistryRead, SessionRecord
     from scripts.direct.review_pool import Pool, ProductionPool, Reviewer
     from scripts.lib.names import JobKey
 
@@ -1497,11 +1497,24 @@ class NoLiveUnitDirector:
     """No current session matches the run's director or its recorded restart identity."""
 
 
+def running_director_sessions(registry: RegistryRead) -> list[SessionRecord]:
+    """Running director candidates, newest first, including sessions without sockets."""
+    from scripts.message import sessions
+
+    return sorted(
+        (item.record for item in registry.entries if sessions.running_session(item.record)),
+        key=lambda session: session["updatedAt"], reverse=True,
+    )
+
+
 def resolve_live_unit_director(
     run: Path, record: staff.StaffSnapshot, sources: unit_lookup.MemberSources,
     running: Sequence[SessionRecord], dependencies: Callable[[Path], None],
 ) -> LiveUnitDirector | NoLiveUnitDirector:
-    """Match a run's director or restart using the caller's record and source evidence."""
+    """Shutdown history carries the unit's stable host/name when a run's director file
+    still names the former session. Run markers and folders are not proof that the
+    director died.
+    """
     from scripts.lib import unit_runs
     import unit_lookup
     from scripts.shutdown.launch_permission import shutdown_state_root
@@ -1540,6 +1553,7 @@ def resolve_live_unit_director(
         for name in (previous.get("name"), host.get("session_name")):
             if isinstance(name, str) and name:
                 names.add(name)
+        # A restart may resume the original session id rather than create one.
         for session in running:
             if session["sessionId"] == previous.get("session_id"):
                 return LiveUnitDirector(session["sessionId"], session["pid"])
@@ -1558,7 +1572,7 @@ def live_unit_director(run: Path) -> LiveUnitDirector | NoLiveUnitDirector:
     dependencies = staff.RecordInputs()
     record = staff.initial_snapshot()
     registry = sessions.read_registry(dependencies=dependencies)
-    running = [item.record for item in registry.entries if sessions.running_session(item.record)]
+    running = running_director_sessions(registry)
     return resolve_live_unit_director(run, record, unit_lookup.member_sources(dependencies=dependencies),
                                       running, dependencies)
 
