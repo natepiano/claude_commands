@@ -133,10 +133,40 @@ Each command shows its script's output unchanged; each script answers in about a
 ### Build output retained by the sweep
 
 `scripts/lint/sweep.py` keeps the configured free-space floor (300 GiB on natedev).
-When free space is below the floor, it takes only the shortfall. After orphaned
-copies, it takes output from idle targets in last-use order, oldest first,
-across all locations. `/tmp` targets have no special priority. A target's last
+When free space is below the floor, it takes only the shortfall. Orphaned
+copies go first from any idle target. Then whole takes and build-unit batches
+share target last-use order, oldest first, across all locations. A whole take
+has no special priority over a target with build units. `/tmp` targets have no
+special priority. A target's last
 use is the newer of its `.lint-sweep-used` stamp and its build units' last uses.
+A target folder is disposable; keep nothing you need in it. An idle target with
+no build-unit groups is a whole take: its contents go through the same
+write-ahead trim intent, confirmed deletion account and `sweep_trim` publication
+as build units. Orphaned copies keep their first place even when their target
+has no build units; a whole take covers the remaining contents. The target
+folder and its lock files stay. A held `doc/.lock`, Cargo lock or style sync lock
+keeps the target. Before the first unlink, the target root is saved durably in
+`target-deletes.json`, so memory admission refuses a warm promise even if the
+take stops. Cargo markers go last, after every payload delete succeeds. If a
+payload delete fails, the markers keep the target discoverable for the retry. Without a use stamp or build units, the newest mtime of
+the target's top-level entries supplies its last use.
+
+Nested Cargo targets outside Cargo's build trees are separate targets, with
+their own last use, locks and busy checks. The outer scan and whole take leave
+them alone. One owner index per floor pass resolves each target once. Paths from
+`/proc` are already resolved by the kernel and need no further resolution. The
+index rejects paths outside every target root before checking parent folders,
+and remembers each distinct path's deepest owner for the pass. Build-tree paths
+from other sources are resolved once. Process checks read each pid's mappings
+once per check and reuse the index for every batch recheck, tree mapping and
+trim intent. Each batch still checks live processes, so a use that starts during
+the scan keeps its target. Paths and
+processes belong to the deepest target, and the byte
+totals count nested output once. A Cargo target inside a build tree belongs to
+the build unit that holds it, including its bytes and change checks. Linker temporary files named
+`.<name>-<hash>.<pid>` in `deps/` go with the unit whose hash they carry;
+copied-up output still goes with its unit.
+
 Build locks, live processes and build holds still keep their targets out of the sweep.
 Candidate and size scans hold no cargo locks. Up to four target scans run
 together; combined inode accounting counts shared blocks once. The floor takes one target's locks
@@ -146,6 +176,8 @@ File identity, size and mtime are checked before deletion; changed output stays.
 Removing a hard link in another target does not change this check.
 The pass stops when successful deletions cover
 the shortfall.
+A dry run takes no `floor.lock`, so it can plan while a real floor pass holds
+that lock and cannot block a real pass. Real passes still take it without waiting.
 
 The floor takes the least recently used idle target first, then orders build
 units within that target by use. Recent targets are not held back. After each
@@ -263,7 +295,7 @@ Scratch end rechecks the task under the removal lock. A hold on a copy's ancesto
 - The leftover check ends every process under the Mac's mirror root, for every repository, a person's shell or editor there included. ssh's exit status proves nothing (Tailscale SSH returns 0 whatever ran); only printed lines are read.
 - `MACOSX_DEPLOYMENT_TARGET` was unset because the remote command runs in a non-login ssh shell and the mirror is outside `~/rust`, so direnv never runs there; rustc then links for macOS 11.0. Below 12.0 the SDK records `@rpath/libswift_Concurrency.dylib` and a binary with no rpath aborts at load (exit 104). A changed value costs one rebuild on the Mac (a cold hana build measured 12 min 35 s); nothing in the mirror is deleted by hand.
 - Guard limits: a checkout or any other copy of the scripts accepts the variables, so a worker that runs a copy still passes a hold. Report-only programs and variables outside the list (`VERIFY_MAC_RUNNER`, `LINT_CONFIG_READER`, `MAC_TEST_SESSIONS`, `MAC_TEST_SEND`, the `BUILDLOG_HOLD_*` files) are not guarded. A shell caller started through a link outside `scripts/` looks for `override_guard.sh` beside the link and stops with status 2.
-- Tests: every fixture that can reach the hold wait needs temporary `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `UNIT_ACTIVE_DIR` and cleared `BUILDLOG_CALL_ID` and `BUILDLOG_CALLER`; one that reaches the installed scripts through the real `HOME` rewrites the live release record. Run the suites from a worktree, not inside `~/.claude`, where every case that sets a listed variable meets the refusal. A test that changes `cycle.json` mid-wait writes it whole under `release_lock()` (`change_cycle`), never with `Path.write_text`. A case that reaches a hold-event write sets a temporary `BUILDLOG_DIR` and waits for the detached recorder before checking that no further event was written. The full `scripts/direct` suite takes about 12.5 minutes and is the only check that a sibling import loads where tests import a module as `scripts.<dir>.<file>`.
+- Tests: every fixture that can reach the hold wait needs temporary `BUILD_HOLD_DIR`, `BUILD_HOLD_RELEASE_DIR` and `UNIT_ACTIVE_DIR` and cleared `BUILDLOG_CALL_ID` and `BUILDLOG_CALLER`; one that reaches the installed scripts through the real `HOME` rewrites the live release record. Shared test support and guarded suites call `override_guard.require_checkout(Path(__file__))` at import. From the installed scripts it raises one error: `<suite file>: this suite runs from a checkout, not from the installed scripts under <home>/.claude/scripts; run it from a worktree.` The home comes from the account database and links are followed. Run the suites from a worktree; the check does not skip tests. A test that changes `cycle.json` mid-wait writes it whole under `release_lock()` (`change_cycle`), never with `Path.write_text`. A case that reaches a hold-event write sets a temporary `BUILDLOG_DIR` and waits for the detached recorder before checking that no further event was written. The full `scripts/direct` suite takes about 12.5 minutes and is the only check that a sibling import loads where tests import a module as `scripts.<dir>.<file>`.
 - The test stand-in for `mac_run.sh` answers "not an ancestor" when the sha equals the clone head, where git answers "is an ancestor"; the bundle-path cases depend on that.
 
 ## Why

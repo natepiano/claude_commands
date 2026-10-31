@@ -5,13 +5,23 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import override
+from typing import TYPE_CHECKING, override
 
 import nextest_budget as budget
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..build_hold.override_guard import require_checkout
+else:
+    from scripts.build_hold.override_guard import require_checkout
+
+require_checkout(Path(__file__))
+
 
 INVOKE = Path(__file__).with_name("invoke.sh")
 HELPER = Path(__file__).with_name("nextest_budget.py")

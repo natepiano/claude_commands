@@ -21,8 +21,8 @@ class QueueCardTests(QueueFixtureTests):
     def test_first_card_answers_next_and_shares_all_head_checks(self) -> None:
         text = plain(queue_card.render_card(self.fixture.model(), [1], 400))
         self.assertIn("Next? Yes, it is first. It starts when the checks below pass.", text)
-        self.assertIn("✗ build budget: 11.1 of 21.0 GiB held; needs 11.5", text)
-        self.assertIn("✓ free memory 24.5 GiB; needs 20.5", text)
+        self.assertIn("✓ build budget: 11.1 of 21.0 GiB held; needs 7.6", text)
+        self.assertIn("✓ free memory 24.5 GiB; needs 16.6", text)
         self.assertIn("✗ memory pressure: full avg10 7.7", text)
         self.assertNotIn("/build:queue bump", text)
 
@@ -54,12 +54,12 @@ class QueueCardTests(QueueFixtureTests):
 
     def test_fourth_card_counts_moves_and_join_order_with_recorded_checks(self) -> None:
         text = plain(queue_card.render_card(self.fixture.model(), [4], 400))
-        self.assertIn("Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.", text)
-        self.assertIn("joined 10:07, 2 min before it", text)
-        self.assertIn("It joined 2nd of the steps waiting now.", text)
+        self.assertIn("Next? No. 3 steps are ahead of it: 3 moved up, 0 joined earlier.", text)
+        self.assertIn("joined 10:10, 3 min after it", text)
+        self.assertIn("It joined 1st of the steps waiting now.", text)
         self.assertIn("✓ queue order", text)
-        self.assertIn("✓ build budget: 11.1 of 21.0 GiB held; needs 2.9", text)
-        self.assertIn("✓ free memory 24.5 GiB; needs 11.9: this step 2.9 + earlyoom 3.0 + promised not yet used 6.0", text)
+        self.assertIn("✓ build budget: 11.1 of 21.0 GiB held; needs 7.6", text)
+        self.assertIn("✓ free memory 24.5 GiB; needs 16.6: this step 7.6 + earlyoom 3.0 + promised not yet used 6.0", text)
         self.assertIn("✗ memory pressure: full avg10 7.7 now; starts below 5.0", text)
         self.assertIn("Likely start ~10:51: 4th in line at 44 steps an hour, an estimate.", text)
 
@@ -69,21 +69,21 @@ class QueueCardTests(QueueFixtureTests):
         assert isinstance(facts, head_facts.HeadFacts)
         model = replace(model, facts=replace(facts, bump_records=()))
         text = plain(queue_card.render_card(model, [4], 400))
-        self.assertIn("#1 ↑  tool-based-ui · cables · work-lead nextest  joined 10:40, 30 min after it", text)
+        self.assertIn("#2 ↑  tool-based-ui · cables · work-lead nextest  joined 10:40, 32 min after it", text)
         self.assertNotIn("0 min before it", text)
 
     def test_session_selector_prints_each_step_as_a_card_with_a_blank_separator(self) -> None:
         text = plain(queue_card.render_selection(self.fixture.model(), "work-lead", 400))
         self.assertEqual(text.count(" of 32 ·"), 2)
-        self.assertIn("#1 of 32", text)
-        self.assertIn("\n\n#2 of 32", text)
+        self.assertIn("#2 of 32", text)
+        self.assertIn("\n\n#3 of 32", text)
         self.assertIn("Folder /tmp/work.", text)
         self.assertIn("Folder /tmp/measure-repair2.", text)
 
     def test_position_id_recorded_name_and_folder_select_the_same_step(self) -> None:
         model = self.fixture.model()
-        expected = plain(queue_card.render_card(model, [4], 100))
-        for selector in ("4", "id-cargo-liner-berth-parallel-impl", "cargo-liner-berth-parallel-impl",
+        expected = plain(queue_card.render_card(model, [5], 100))
+        for selector in ("5", "id-cargo-liner-berth-parallel-impl", "cargo-liner-berth-parallel-impl",
                          "/home/natepiano/rust/cargo-liner/repo", "repo"):
             with self.subTest(selector=selector):
                 self.assertEqual(plain(queue_card.render_selection(model, selector, 100)), expected)
@@ -100,13 +100,13 @@ class QueueCardTests(QueueFixtureTests):
 
     def test_follower_card_prints_its_recorded_checks_without_recomputing_admission(self) -> None:
         model = self.fixture.model()
-        follower = model.reading.explanation.line.steps[2]
-        self.assertEqual(follower.waiter, model.reading.view.waiting[3])
+        follower = model.reading.explanation.line.steps[3]
+        self.assertEqual(follower.waiter, model.reading.view.waiting[4])
         self.assertEqual(follower.budget.need, int(2.9 * gate.GIB))
         self.assertEqual(follower.free.need, int(2.9 * gate.GIB))
         from unittest import mock
         with mock.patch.object(gate, "decide", side_effect=AssertionError("card recalculated admission")):
-            text = plain(queue_card.render_card(model, [4], 400))
+            text = plain(queue_card.render_card(model, [5], 400))
         self.assertIn("build budget: 11.1 of 21.0 GiB held; needs 2.9", text)
         self.assertIn("free memory 24.5 GiB; needs 11.9", text)
         self.assertIn("this step 2.9 + earlyoom 3.0 + promised not yet used 6.0", text)
@@ -132,16 +132,16 @@ class QueueCardTests(QueueFixtureTests):
         first, fourth = model.reading.view.waiting[0], model.reading.view.waiting[3]
         from scripts.message.unit_labels import UnitLabels
         labels = {**model.labels, fourth.session_id: UnitLabels(first.session_name)}
-        self.assertEqual(queue_card.select_waiters(replace(model, labels=labels), first.session_name), [1, 2, 4])
+        self.assertEqual(queue_card.select_waiters(replace(model, labels=labels), first.session_name), [1, 4, 23])
         labels = {**model.labels, fourth.session_id: UnitLabels("1")}
-        self.assertEqual(queue_card.select_waiters(replace(model, labels=labels), "1"), [4])
+        self.assertEqual(queue_card.select_waiters(replace(model, labels=labels), "1"), [4, 23])
 
     def test_older_fit_order_line_names_waiting_place_or_explicit_fallback(self) -> None:
         model = self.fixture.model()
         waiting = model.reading.view.waiting
         older = waiting[2]
         for reason, phrase in ((gate.BehindOlderFit("old-name", older.since, older.session_id),
-                                "behind #3, an older step that fits"),
+                                "behind #2, an older step that fits"),
                                (gate.BehindOlderFit("old-name", older.since + 1, older.session_id),
                                 "behind an older step that fits")):
             with self.subTest(reason=reason):
@@ -164,7 +164,7 @@ class QueueCardTests(QueueFixtureTests):
 
     def test_rows_ahead_cap_at_five_and_report_the_remainder(self) -> None:
         text = plain(queue_card.render_card(self.fixture.model(), [9], 400))
-        self.assertIn("8 steps are ahead of it: 2 moved up, 6 joined earlier.", text)
+        self.assertIn("8 steps are ahead of it: 3 moved up, 5 joined earlier.", text)
         for place in range(1, 6):
             self.assertIn(f"\n  #{place} ", text)
         self.assertNotIn("\n  #6 ", text)
@@ -173,10 +173,10 @@ class QueueCardTests(QueueFixtureTests):
     def test_card_wraps_every_fact_instead_of_cutting_a_step_to_a_record(self) -> None:
         for columns in (30, 60, 100):
             with self.subTest(columns=columns):
-                lines = queue_card.render_card(self.fixture.model(), [4], columns)
+                lines = queue_card.render_card(self.fixture.model(), [5], columns)
                 text = " ".join(plain(lines).split())
                 self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
-                self.assertIn("Next? No. 3 steps are ahead of it: 2 moved up, 1 joined earlier.", text)
+                self.assertIn("Next? No. 4 steps are ahead of it: 3 moved up, 1 joined earlier.", text)
                 self.assertIn("Folder/home/natepiano/rust/cargo-liner/repo.", text.replace(" ", ""))
 
     def test_missing_pace_never_invents_a_likely_start(self) -> None:

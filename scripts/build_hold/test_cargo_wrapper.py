@@ -13,6 +13,11 @@ import tempfile
 import unittest
 from typing import override
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from override_guard import require_checkout
+
+require_checkout(Path(__file__))
+
 
 # Hang guards allow for load 136 on natedev (2026-10-29).
 TEST_HANG_GUARD_SECS = 300
