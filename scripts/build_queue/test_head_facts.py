@@ -34,6 +34,24 @@ def write_bumps_with_block_edge(line: bytes, split_at: int) -> None:
 
 
 class HeadFactsTests(AdmissionLogTests):
+    def test_head_token_history_uses_the_eligible_head_after_a_token_waiter(self) -> None:
+        reading = head_reading()
+        token = replace(reading.view.waiting[0], pid=456, session_id="token-session",
+                        since=NOW - 700, reason=gate.TokenWaitingWaiter(NOW - 20))
+        reading = with_waiting_process(reading, token, "456")
+        reading = replace(reading, view=replace(reading.view, waiting=(token, reading.view.waiting[0])),
+                          ordered=[reading.ordered[1], reading.ordered[0]])
+        write_token_gaps([
+            token_gap_line(NOW - 300, NOW - 290, session="token-session", pid=456, start_time="456"),
+            token_gap_line(NOW - 200, NOW - 46),
+        ])
+        facts = self.facts(reading)
+        if not isinstance(facts.token_waits, head_facts.RecordedTokenWaits):
+            self.fail("complete gap records must be readable")
+        self.assertEqual([wait.pid for wait in facts.token_waits.waits], [456, 123])
+        self.assertEqual([wait.pid for wait in facts.token_waits.head_waits], [123])
+        self.assertEqual(head_facts.cargo_token_text(facts), "cargo token waited 154 s")
+
     def facts(self, reading: gate.QueueRead) -> head_facts.HeadFacts:
         result = head_facts.read_head_facts(reading)
         self.assertIsInstance(result, head_facts.HeadFacts)

@@ -18,6 +18,30 @@ from scripts.lint.memory_test_support import fake_memory_readings
 
 
 class QueueViewTests(QueueFixtureTests):
+    def test_token_wait_keeps_place_one_and_head_status_moves_to_the_eligible_row(self) -> None:
+        inputs = self.fixture.inputs()
+        (token_path, token), (head_path, head) = inputs.ordered[:2]
+        inputs = replace(inputs, ordered=[
+            (token_path, {**token, "token_left_at": NOW - 10}),
+            (head_path, {**head, "priority_since": NOW - 42}),
+        ])
+        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(21 * gate.GIB, 3 * gate.GIB))
+        model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
+        self.assertEqual([step.pid for step in reading.view.waiting], [token["pid"], head["pid"]])
+        self.assertIsInstance(queue_view.step_checks(model, 1), gate.LineWaiter)
+        eligible = queue_view.step_checks(model, 2)
+        self.assertIsInstance(eligible, gate.HeadExplanation)
+        if isinstance(eligible, gate.HeadExplanation):
+            self.assertEqual(eligible.waiter.pid, head["pid"])
+        self.assertEqual(queue_view.reason_phrase(reading.view.waiting[0].reason, reading.view.waiting),
+                         "waiting for the cargo token")
+        self.assertIn("waiting for the cargo token", plain(queue_card.render_card(model, [1], 140)))
+        rows = waiting_rows(queue_view.render_view(model, 140))
+        self.assertEqual([int(row.split()[0]) for row in rows], [1, 2])
+        self.assertNotIn("↑", rows[0])
+        self.assertNotIn("⊘", rows[0])
+        self.assertIn("↑", rows[1])
+
     def test_expired_head_with_passing_checks_has_an_error_hold_at_sixty_cells(self) -> None:
         inputs = self.fixture.inputs()
         path, row = inputs.ordered[0]

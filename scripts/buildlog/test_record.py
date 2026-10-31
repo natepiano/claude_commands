@@ -18,7 +18,7 @@ import unittest
 from unittest import mock
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, override
+from typing import TYPE_CHECKING, BinaryIO, cast, override
 
 if TYPE_CHECKING:
     from ..lib.socket_test_support import short_socket_directory
@@ -229,6 +229,33 @@ class RecordTests(unittest.TestCase):
         self.assertEqual([row["action"] for row in rows], ["set", "clear"])
         self.assertEqual([row["id"] for row in rows], ["priority-set", "priority-clear"])
         self.assertTrue(all(row["at"] == store.utc_iso(START) for row in rows))
+
+    def test_priority_append_retries_from_its_saved_offset_without_reading_the_old_log(self) -> None:
+        path = store.host_file(store.host_name(), START)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        prefix = b"old month content is not JSON\n" * 128
+        _ = path.write_bytes(prefix)
+        append = store.append_locked
+
+        def stop_after_append(handle: BinaryIO, row: object) -> None:
+            append(handle, row)
+            raise OSError("fixture stopped after priority append")
+
+        with mock.patch.object(json, "loads", wraps=json.loads) as decoded:
+            with mock.patch.object(store, "append_locked", side_effect=stop_after_append), \
+                 self.assertRaises(OSError):
+                recorder.queue_priority("set", "resources", "finish work", "showrunner-id", START,
+                    transition_id="bounded-priority", start=len(prefix))
+            for attempt in range(2):
+                recorder.queue_priority("set", "resources", "finish work", "showrunner-id", START + attempt + 1,
+                    transition_id="bounded-priority", start=len(prefix))
+            self.assertNotIn(mock.call(prefix.splitlines(keepends=True)[0]), decoded.call_args_list)
+            self.assertNotIn(mock.call(prefix.splitlines(keepends=True)[0].decode()), decoded.call_args_list)
+        contents = path.read_bytes()
+        self.assertEqual(contents[:len(prefix)], prefix)
+        row, = [cast(Record, json.loads(line)) for line in contents[len(prefix):].splitlines()]
+        self.assertEqual((row["id"], row["action"], row["unit"], row["at"]),
+                         ("bounded-priority", "set", "resources", store.utc_iso(START)))
 
     def handoff(self) -> Path:
         path = self.base / "handoff.log"

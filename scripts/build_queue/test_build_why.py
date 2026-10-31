@@ -545,6 +545,25 @@ class BuildWhyTests(unittest.TestCase):
             path.unlink()
         self.assertTrue(self.output().rstrip().endswith("Nothing waits."))
 
+    def test_all_token_waiters_remain_waiting_in_the_snapshot_and_explanation(self) -> None:
+        paths = sorted(self.directory.glob("*.waiting"))
+        for path in paths:
+            row = cast(dict[str, object], json.loads(path.read_text()))
+            row["token_left_at"] = NOW - 10
+            _ = path.write_text(json.dumps(row))
+        inputs = gate.gather_queue_inputs(self.directory, gate.process_table(self.proc), NOW)
+        gate.write_queue_snapshot(self.directory, inputs)
+        with mock.patch.object(gate, "locked_queue_read", side_effect=AssertionError("fresh snapshot took lock")):
+            reading = gate.queue_read()
+            if isinstance(reading, gate.QueueBusy):
+                self.fail("the published token-wait snapshot must be readable")
+            self.assertEqual(len(reading.view.waiting), len(paths))
+            self.assertTrue(all(isinstance(step.reason, gate.TokenWaitingWaiter) for step in reading.view.waiting))
+            self.assertIsInstance(reading.explanation.head, gate.TokenWaitersOnly)
+            text = self.output()
+        self.assertNotIn("Nothing waits.", text)
+        self.assertIn("waiting for the cargo token", text)
+
     def check_waiting_head(self, at: float, **token_times: Unpack[FinishedTokenGapTimes]) -> gate.CheckResult:
         self.reset_running(available=0, need=11.8)
         _ = self.running(800, "holder", "clippy", 1, 1, 3600)

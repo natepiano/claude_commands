@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from scripts.build_queue import head_facts
 from scripts.build_queue.queue_lines import Line, Span, age, wrap
 from scripts.build_queue.queue_view import (QueueModel, check_line, check_lines, clock, estimate_minutes,
-    has_move_priority, is_moved, name_spans, name_text, shown_waiters, reason_phrase, start_text, step_checks, step_labels, waiting_moves)
+    eligible_head_position, has_move_priority, is_moved, name_spans, name_text, shown_waiters, reason_phrase, start_text, step_checks, step_labels, waiting_moves)
 from scripts.lint import memory_admit as gate
 
 
@@ -23,10 +23,12 @@ def ordinal(number: int) -> str:
 
 def order_check(model: QueueModel, position: int) -> Line:
     reason = model.reading.view.waiting[position - 1].reason
+    if isinstance(reason, gate.TokenWaitingWaiter):
+        return check_line(False, reason_phrase(reason, model.reading.view.waiting))
     if isinstance(reason, gate.BehindOlderFit):
         return check_line(False, "queue order      " + reason_phrase(reason, model.reading.view.waiting))
     if isinstance(reason, gate.BehindHead) and isinstance(model.facts, head_facts.HeadFacts):
-        return check_line(False, "#1's turn      " + head_facts.order_text(model.facts, model.zone))
+        return check_line(False, f"#{eligible_head_position(model.reading.view.waiting)}'s turn      " + head_facts.order_text(model.facts, model.zone))
     return check_line(True, "queue order")
 
 
@@ -50,10 +52,12 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
             add((Span(priority),))
         add()
         checks = step_checks(model, position)
-        if (isinstance(step.reason, gate.ReadyForAdmission)
+        if isinstance(step.reason, gate.TokenWaitingWaiter):
+            add((Span("Next? No. It is waiting for the cargo token.", bold=True),))
+        elif (isinstance(step.reason, gate.ReadyForAdmission)
                 or isinstance(checks, gate.HeadExplanation) and checks.decision.state == "admit"):
             add((Span("Next? Yes. It starts at the next check.", bold=True),))
-        elif position == 1:
+        elif isinstance(checks, gate.HeadExplanation):
             add((Span("Next? Yes, it is first. It starts when the checks below pass.", bold=True),))
         else:
             moved = sum(has_move_priority(model, place) for place in range(1, position))

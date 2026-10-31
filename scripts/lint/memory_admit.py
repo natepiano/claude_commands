@@ -68,7 +68,7 @@ class GitIdentityReader(Protocol):
     def git_directory(self, argv: list[str], cwd: str) -> str: ...
     def git_facts(self, directory: str) -> GitFacts: ...
     def queue_priority(self, action: Literal["set", "clear"], unit: str,
-                       why: str, set_by: str, at: float, *, transition_id: str = "") -> None: ...
+                       why: str, set_by: str, at: float, *, transition_id: str = "", start: int = 0) -> None: ...
     def head_admission(self, action: Literal["set", "admitted", "lapsed"], unit: str,
                        step: str, need: int, free: int, reserve: int, why: str,
                        set_by: str, at: float) -> None: ...
@@ -76,6 +76,7 @@ class GitIdentityReader(Protocol):
 
 class BuildLogStore(Protocol):
     INDEX_NAME: str
+    UNKNOWN_IDENTITY: str
 
     def root(self) -> Path: ...
     def host_name(self) -> str: ...
@@ -84,6 +85,7 @@ class BuildLogStore(Protocol):
     def locked_append(self, path: Path) -> AbstractContextManager[BinaryIO]: ...
     def append_locked(self, handle: BinaryIO, record: object) -> None: ...
     def whole_rows(self, handle: BinaryIO, start: int) -> Iterator[dict[str, object]]: ...
+    def read_last_whole_row_end(self, path: Path) -> int: ...
     def host_file(self, host: str, epoch: float) -> Path: ...
 
 
@@ -529,10 +531,36 @@ class Waiter(TypedDict):
     test_threads: NotRequired[int | None]
 
 
+@dataclass(frozen=True)
+class QueuedWaiter:
+    waiter: Waiter
+
+
+@dataclass(frozen=True)
+class TokenWaitingWaiter:
+    left_at: float
+
+
+def waiter_state(row: Waiter) -> QueuedWaiter | TokenWaitingWaiter:
+    """Decode the durable token-wait marker at the policy boundary."""
+    if "token_left_at" in row:
+        return TokenWaitingWaiter(row["token_left_at"])
+    return QueuedWaiter(row)
+
+
+def first_queued_waiter(rows: Iterable[Waiter]) -> QueuedWaiter | NoWaiter:
+    for row in rows:
+        state = waiter_state(row)
+        if isinstance(state, QueuedWaiter):
+            return state
+    return NoWaiter()
+
+
 class PriorityTransition(TypedDict):
     id: str
     action: Literal["set", "clear"]
     at: float
+    month_row_end: NotRequired[int]
 
 
 class QueuePriority(TypedDict):
@@ -580,6 +608,10 @@ def load_queue_priority(directory: Path) -> QueuePriority | NoQueuePriority:
                     or fields.get("action") not in ("set", "clear")
                     or not isinstance(at, (int, float)) or isinstance(at, bool) or not math.isfinite(at)):
                 raise ValueError("invalid priority transition")
+            if "month_row_end" in fields:
+                boundary = fields["month_row_end"]
+                if not isinstance(boundary, int) or isinstance(boundary, bool) or boundary < 0:
+                    raise ValueError("invalid priority transition row boundary")
         return cast(QueuePriority, cast(object, row))
     except FileNotFoundError:
         return NO_QUEUE_PRIORITY
@@ -593,7 +625,8 @@ def finish_priority_transition(directory: Path, priority: QueuePriority) -> None
     if transition is None:
         return
     record.queue_priority(transition["action"], priority["unit"], priority["why"],
-                          priority["set_by"], transition["at"], transition_id=transition["id"])
+                          priority["set_by"], transition["at"], transition_id=transition["id"],
+                          start=transition.get("month_row_end", 0))
     if transition["action"] == "set":
         del priority["transition"]
         write_text_atomic(queue_priority_path(directory), json.dumps(priority, separators=(",", ":")))
@@ -603,7 +636,9 @@ def finish_priority_transition(directory: Path, priority: QueuePriority) -> None
 
 def begin_priority_transition(directory: Path, priority: QueuePriority,
                               action: Literal["set", "clear"], at: float) -> None:
-    priority["transition"] = {"id": uuid.uuid4().hex, "action": action, "at": at}
+    month_file = store.host_file(store.host_name(), at)
+    priority["transition"] = {"id": uuid.uuid4().hex, "action": action, "at": at,
+                              "month_row_end": store.read_last_whole_row_end(month_file)}
     write_text_atomic(queue_priority_path(directory), json.dumps(priority, separators=(",", ":")))
     finish_priority_transition(directory, priority)
 
@@ -809,9 +844,11 @@ def admit_head(why: str = "") -> str:
     directory = admission_dir(store.root())
     with exclusive_queue(directory):
         ordered, _ = resolve_queue_order(directory, live_waiters(directory), finish=True)
-        if not ordered:
+        candidate = first_queued_waiter(row for _, row in ordered)
+        if isinstance(candidate, NoWaiter):
             raise AdmitHeadRefused("nothing waits; no head to admit")
-        path, row = ordered[0]
+        row = candidate.waiter
+        path = next(path for path, other in ordered if other is row)
         proc = Path(os.environ.get("BUILDLOG_PROC", "/proc"))
         identities = QueueIdentityReader(process_table(proc), proc)
         identity = identities.identity(row["pid"], cast(dict[str, object], cast(object, row)))
@@ -974,7 +1011,7 @@ def estimate_expired(waiter: Waiter, now: float) -> bool:
     return now - waiter.get("estimated_at", now) >= HEAD_SECONDS
 
 
-WaitReason = EstimateExpired | NeedsBuildBudget | NeedsMemory | BehindHead | BehindOlderFit | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure
+WaitReason = EstimateExpired | NeedsBuildBudget | NeedsMemory | BehindHead | BehindOlderFit | HeadAdmissionStatus | ReadyForAdmission | ReadingUnavailable | MemoryPressure | TokenWaitingWaiter
 
 
 def head_wait_reason(decision: AdmissionDecision, need: int, available: int,
@@ -1148,6 +1185,11 @@ class NoWaiter:
 
 
 @dataclass(frozen=True)
+class TokenWaitersOnly:
+    """Rows retain their places, but all are waiting for the cargo token."""
+
+
+@dataclass(frozen=True)
 class LineWaiter:
     waiter: WaitingStep
     fits_now: bool
@@ -1191,7 +1233,7 @@ class QueueExplanation:
     host: HostAvailable | ReadingUnavailable
     running: tuple[ExplainedRunningStep, ...]
     totals: QueueMemoryTotals
-    head: HeadExplanation | NoWaiter
+    head: HeadExplanation | TokenWaitersOnly | NoWaiter
     line: WaitingLine
     decided_from: QueueInputs
     limits: AdmissionLimits
@@ -1323,7 +1365,7 @@ class HeadStillHeld:
 
 
 HeadRelease = HeadAdmitsAfterEnd | HeadStartsAt
-HeadAfterEnd = HeadRelease | HeadStillHeld | EstimateExpired | NoWaiter | ReadingUnavailable
+HeadAfterEnd = HeadRelease | HeadStillHeld | EstimateExpired | TokenWaitersOnly | NoWaiter | ReadingUnavailable
 
 
 @dataclass(frozen=True)
@@ -2707,10 +2749,10 @@ def waiter_order(row: Waiter) -> tuple[int, float, int]:
 def head_priority(waiters: list[Waiter], available: int, total: int | UnknownHostTotal,
                   running: list[StepMemory], now: float, *,
                   limits: AdmissionLimits | ReadHostAdmissionLimits = READ_HOST_ADMISSION_LIMITS) -> HeadPriority | NoHeadPriority:
-    ordered = waiters
-    if not ordered:
+    candidate = first_queued_waiter(waiters)
+    if isinstance(candidate, NoWaiter):
         return NoHeadPriority()
-    head = ordered[0]
+    head = candidate.waiter
     if "priority_since" in head or now - head["since"] >= HEAD_SECONDS:
         decision = decide(available, total, head["need"], running, limits=limits)
         if ("priority_since" in head or decision.state == "admit"
@@ -2723,6 +2765,7 @@ def head_priority(waiters: list[Waiter], available: int, total: int | UnknownHos
 class WaiterAdmission:
     waiter: Waiter
     decision: AdmissionDecision
+    state: QueuedWaiter | TokenWaitingWaiter
 
 
 def head_room_used(reservations: list[Reservation], memory: list[StepMemory],
@@ -2738,9 +2781,11 @@ def head_room_used(reservations: list[Reservation], memory: list[StepMemory],
 
 def snapshot_head_override(override: HeadAdmissionOverride | NoHeadAdmissionOverride,
                            ordered: list[tuple[Path, Waiter]]) -> HeadAdmissionOverride | NoHeadAdmissionOverride:
-    if isinstance(override, NoHeadAdmissionOverride) or not ordered:
+    candidate = first_queued_waiter(row for _, row in ordered)
+    if isinstance(override, NoHeadAdmissionOverride) or isinstance(candidate, NoWaiter):
         return NoHeadAdmissionOverride()
-    path, row = ordered[0]
+    row = candidate.waiter
+    path = next(path for path, other in ordered if other is row)
     return override if head_override_matches(override, path, row) else NoHeadAdmissionOverride()
 
 
@@ -2782,21 +2827,29 @@ def admission_walk(available: int, total: int | UnknownHostTotal, ordered: list[
     admissions: list[WaiterAdmission] = []
     recovering = isinstance(recovery, RecoveryStarts) and now < recovery.ends_at
     marked_room = 0
-    for index, row in enumerate(ordered):
+    candidate = first_queued_waiter(ordered)
+    for row in ordered:
+        state = waiter_state(row)
+        if isinstance(state, TokenWaitingWaiter):
+            decision = replace(decide(available, total, row["need"], running,
+                                      pressure=pressure, limits=limits), state="hold")
+            admissions.append(WaiterAdmission(row, decision, state))
+            continue
+        first = isinstance(candidate, QueuedWaiter) and candidate.waiter is row
         decision = admission_for_waiter(available, total, row, promised, head, pressure,
-                                        room_used + marked_room, override, index == 0, now, limits)
+                                        room_used + marked_room, override, first, now, limits)
         if marked and ((decision.state == "admit" and (recovering or decide(
                            available, total, row["need"],
                            [*running, *(PromisedMemory(waiter["need"]) for waiter in marked)],
                            pressure=pressure, limits=limits).state == "hold"))
                        or (decision.state == "hold" and admission_for_waiter(
                            available, total, row, running, head, pressure, room_used,
-                           override, index == 0, now, limits).state == "admit")):
+                           override, first, now, limits).state == "admit")):
             decision = replace(decision, state="hold", order_hold=HeldBehindOlderFit(marked[0]))
         expired = estimate_expired(row, now)
         if expired:
             decision = replace(decision, state="hold")
-        admissions.append(WaiterAdmission(row, decision))
+        admissions.append(WaiterAdmission(row, decision, state))
         if decision.state == "admit" or expired:
             marked.append(row)
             if not (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
@@ -2852,6 +2905,12 @@ def git_identity(argv: list[str], cwd: str) -> tuple[Repository, str]:
     if roots:
         return RepositoryIdentity("git-root:" + roots[0], Path(facts["repo_path"] or cwd).name), worktree
     return UnknownRepository(), worktree
+
+
+def recorded_repository_key(argv: list[str], cwd: str) -> str:
+    """Encode admission's repository identity at the build-log boundary."""
+    repository, _ = git_identity(argv, cwd)
+    return repository.key if isinstance(repository, RepositoryIdentity) else store.UNKNOWN_IDENTITY
 
 
 def filter_expressions(argv: list[str]) -> list[str]:
@@ -3366,6 +3425,7 @@ def waiter_owner(row: Waiter) -> str:
 def admission_pass(inputs: QueueInputs, now: float, limits: AdmissionLimits) -> PassResult:
     """Decide one frozen scenario, proposing ledger changes without committing any."""
     ordered = sorted(((path, row.copy()) for path, row in inputs.ordered), key=lambda item: waiter_order(item[1]))
+    candidate = first_queued_waiter(row for _, row in ordered)
     memory = [step.measured for step in inputs.running]
     host = inputs.host if isinstance(inputs.host, HostMemory) else HostMemory(0, UnknownHostTotal())
     available, total = host.available, host.total
@@ -3392,14 +3452,17 @@ def admission_pass(inputs: QueueInputs, now: float, limits: AdmissionLimits) -> 
     rows: list[PassRow] = []
     endings: tuple[PassResult, ...] = ()
     rank = 0
-    for index, entry in enumerate(admissions):
+    for entry in admissions:
         row, decision = entry.waiter, entry.decision
-        if isinstance(inputs.host, ReadingUnavailable):
+        first = isinstance(candidate, QueuedWaiter) and candidate.waiter is row
+        if isinstance(entry.state, TokenWaitingWaiter):
+            reason: WaitReason = entry.state
+        elif isinstance(inputs.host, ReadingUnavailable):
             decision = replace(decision, state="hold")
-            reason: WaitReason = ReadingUnavailable()
+            reason = ReadingUnavailable()
         elif estimate_expired(row, now):
             reason = EstimateExpired(row.get("estimated_at", now))
-        elif index == 0:
+        elif first:
             reason = head_wait_reason(decision, row["need"], available, row, now)
         else:
             reason = queue_wait_reason(decision, row["need"], available, RecordedQueueIdentities())
@@ -3408,13 +3471,14 @@ def admission_pass(inputs: QueueInputs, now: float, limits: AdmissionLimits) -> 
             rank += 1
             admitted_recovery = (replace(recovery, next_start_at=now + RECOVERY_START_SECONDS)
                                  if isinstance(recovery, RecoveryStarts) else recovery)
-            admitted_override = (OverrideEnded(override, "admitted") if index == 0
+            admitted_override = (OverrideEnded(override, "admitted") if first
                                  and not isinstance(override, NoHeadAdmissionOverride) else outcome)
             proposal = ProposedAdmission(rank, admitted_recovery, admitted_override)
         owner = waiter_owner(row)
         blocker: BlockingIndex | NoSingleBlocker | BlockerNotRequested = BlockerNotRequested()
         if owner in inputs.blockers_for:
-            if decision.state == "hold" and not isinstance(inputs.host, ReadingUnavailable):
+            if (decision.state == "hold" and not isinstance(inputs.host, ReadingUnavailable)
+                    and isinstance(entry.state, QueuedWaiter)):
                 if not endings:
                     endings = tuple(admission_pass(inputs_after_steps_end(inputs, frozenset((ended,))), now, limits)
                                     for ended in range(len(inputs.running)))
@@ -3592,6 +3656,7 @@ def decision_checks(decision: AdmissionDecision, need: int, available: int) -> t
 def queue_read_from(inputs: QueueInputs, limits: AdmissionLimits) -> QueueRead:
     """Apply admission to resolved evidence, with no file, process or environment reads."""
     ordered = sorted(inputs.ordered, key=lambda item: waiter_order(item[1]))
+    candidate = first_queued_waiter(row for _, row in ordered)
     running, reservations, now = inputs.running, inputs.reservations, inputs.now
     memory = [step.measured for step in running]
     identities = RecordedQueueIdentities()
@@ -3616,7 +3681,7 @@ def queue_read_from(inputs: QueueInputs, limits: AdmissionLimits) -> QueueRead:
                          charge_basis(reading)))
     head, totals = result.head, result.totals
     waiting: list[WaitingStep] = []
-    first: HeadExplanation | NoWaiter = NoWaiter()
+    first: HeadExplanation | TokenWaitersOnly | NoWaiter = NoWaiter()
     line: list[LineWaiter] = []
     for (_, row), admission in zip(ordered, result.rows, strict=True):
         own = admission.decision
@@ -3625,7 +3690,7 @@ def queue_read_from(inputs: QueueInputs, limits: AdmissionLimits) -> QueueRead:
         step = WaitingStep(row["pid"], identity["session_id"], identity["session_name"], identity["step"],
                            identity["folder"], row["since"], row["need"], reason)
         waiting.append(step)
-        if row is ordered[0][1]:
+        if isinstance(candidate, QueuedWaiter) and row is candidate.waiter:
             width = row.get("test_threads")
             source: RecordedNeed | NeedSourceNotRecorded = NeedSourceNotRecorded()
             if "need_source" in row:
@@ -3646,9 +3711,12 @@ def queue_read_from(inputs: QueueInputs, limits: AdmissionLimits) -> QueueRead:
         else:
             # Resource fit includes host pressure, independently of queue order.
             fit = decide(available, total, row["need"], memory, limits=limits)
-            line.append(LineWaiter(step, not unavailable and not isinstance(pressure, MemoryPressure)
+            line.append(LineWaiter(step, isinstance(waiter_state(row), QueuedWaiter)
+                                   and not unavailable and not isinstance(pressure, MemoryPressure)
                                    and fit.budget_passes and fit.free_passes, own,
                                    *decision_checks(own, step.need, available)))
+    if waiting and isinstance(first, NoWaiter):
+        first = TokenWaitersOnly()
     view = QueueView(tuple(waiting), tuple(running), available, totals.promised, totals.reserve, now)
     host_reading = (ReadingUnavailable() if unavailable else
                     HostAvailable(available, total,
@@ -3904,14 +3972,19 @@ def explain_queue() -> QueueExplanation:
 def head_after_steps_end(explanation: QueueExplanation, ended: tuple[int, ...]) -> HeadAfterEnd:
     """Reapply admission to this snapshot after the named running rows end; read no files."""
     host, head = explanation.host, explanation.head
-    if isinstance(head, NoWaiter):
+    if isinstance(head, (NoWaiter, TokenWaitersOnly)):
         return head
     if isinstance(host, ReadingUnavailable):
         return host
     indices = frozenset(ended)
     released = [row for index, row in enumerate(explanation.running) if index in indices]
     inputs = inputs_after_steps_end(explanation.decided_from, indices)
-    row = admission_pass(inputs, explanation.now, explanation.limits).rows[0]
+    candidate = first_queued_waiter(row for _, row in inputs.ordered)
+    if isinstance(candidate, NoWaiter):
+        return candidate
+    owner = waiter_owner(candidate.waiter)
+    row = next(row for row in admission_pass(inputs, explanation.now, explanation.limits).rows
+               if row.owner == owner)
     if isinstance(row.reason, EstimateExpired):
         return row.reason
     decision = row.decision

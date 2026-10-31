@@ -56,6 +56,7 @@ from __future__ import annotations
 import gzip
 import fcntl
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -68,7 +69,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NamedTuple, NotRequired, Protocol, TypedDict, cast
 
 if __package__:
     from . import cgroup_capture, store
@@ -77,10 +78,19 @@ else:
     import store
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lint"))
-import memory_admit
 
 if TYPE_CHECKING:
     import sample
+
+
+class AdmissionMetadata(Protocol):
+    def test_threads(self, argv: list[str]) -> int | None: ...
+    def recorded_repository_key(self, argv: list[str], cwd: str) -> str: ...
+
+
+def admission_metadata() -> AdmissionMetadata:
+    """Load admission only when recording needs its metadata, after initialization."""
+    return cast(AdmissionMetadata, cast(object, importlib.import_module("memory_admit")))
 
 RECORD_VERSION = 1
 TARGET_DIR_UNSET = "unset"
@@ -554,7 +564,7 @@ def test_phase_context(reservation: Path, argv: list[str]) -> dict[str, object]:
     width_argv = argv
     if "NEXTEST_TEST_THREADS" in os.environ:
         width_argv = [*argv, "--test-threads", os.environ["NEXTEST_TEST_THREADS"]]
-    context = _test_phase_context({**fields, "test_threads": memory_admit.test_threads(width_argv)})
+    context = _test_phase_context({**fields, "test_threads": admission_metadata().test_threads(width_argv)})
     return {
         **context,
         # Admission has no entry-charge record (bytes, cutoff, form, widths).
@@ -810,7 +820,7 @@ def step(args: list[str]) -> None:
             return
         tty = tty_text == "1"
         directory = git_directory(argv, cwd)
-        repository = memory_admit.git_identity(argv, cwd)[0]
+        repository_key = admission_metadata().recorded_repository_key(argv, cwd)
         tree = tree_facts(os.environ.get("BUILDLOG_TREE_START"), treekey.tree_key(directory))
         step_caller = caller(tty)
         sent_key = sent_tree_key()
@@ -846,7 +856,7 @@ def step(args: list[str]) -> None:
             "cwd": cwd,
             "target_dir": str((Path(cwd) / os.environ["CARGO_TARGET_DIR"]).resolve())
                           if "CARGO_TARGET_DIR" in os.environ else TARGET_DIR_UNSET,
-            "repo_identity": repository.key if isinstance(repository, memory_admit.RepositoryIdentity) else store.UNKNOWN_IDENTITY,
+            "repo_identity": repository_key,
             **git_facts(directory),
             **tree,
             # A reusable test build needs verify's Cargo inputs as well as
@@ -1006,13 +1016,13 @@ def head_admission(action: Literal["set", "admitted", "lapsed"], unit: str, step
 
 
 def queue_priority(action: Literal["set", "clear"], unit: str,
-                   why: str, set_by: str, at: float, *, transition_id: str = "") -> None:
+                   why: str, set_by: str, at: float, *, transition_id: str = "", start: int = 0) -> None:
     host = store.host_name()
     _ = append_row_once(store.host_file(host, at), {
         "kind": "queue_priority", "v": RECORD_VERSION,
         "id": transition_id or f"{host}-{time.time_ns()}", "host": host, "at": store.utc_iso(at),
         "action": action, "unit": unit, "why": why, "set_by": set_by,
-    })
+    }, start)
 
 
 class IdleFloorTarget(TypedDict):

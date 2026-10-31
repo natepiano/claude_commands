@@ -1179,7 +1179,7 @@ Tests: `scripts/lint/test_memory_admit.py`: a large dev build with 1 to 9 earlie
 
 **Ruled out:** A second unit-plan registry; semantic validation on legacy update/end paths.
 
-### Phase 41 — A queue priority change reads only the new end of the build log, and a step waiting for the cargo token holds no place at the head  · status: todo
+### Phase 41 — A queue priority change reads only the new end of the build log, and a step waiting for the cargo token holds no place at the head  · status: done
 **Depends on:** Phase 38 (`scripts/buildlog/record.py` is in Phase 38's files until its checkpoint); queue-unit Phase 4 (`origin/builds-queue` d309bbed, its one decision pass holds the head rule): merge it before any edit.
 
 **Approved:** item 7 of the production rules: defects in Phase 26's own change, found by its cold review after the merge. Builds showrunner 2026-10-31: land defects 1 and 2 first, as their own small checkpoint, not behind the smaller fixes (Phase 42); build defect 2 on queue's Phase 4 and tell queue-unit what changes there.

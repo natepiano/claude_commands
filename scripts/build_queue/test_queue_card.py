@@ -4,13 +4,34 @@ from __future__ import annotations
 from dataclasses import replace
 import unittest
 
-from scripts.build_queue import head_facts, queue_card
+from scripts.build_queue import head_facts, queue_card, queue_view
 from scripts.build_queue.queue_fixture import GOLDEN, NOW, QueueFixtureTests, queue_read_fixture
 from scripts.build_queue.queue_lines import plain, terminal_width
 from scripts.lint import memory_admit as gate
 
 
 class QueueCardTests(QueueFixtureTests):
+    def test_follower_names_the_eligible_heads_place_after_a_token_waiter(self) -> None:
+        inputs = self.fixture.inputs()
+        (token_path, token), (head_path, head), (follower_path, follower) = inputs.ordered[:3]
+        inputs = replace(inputs,
+            host=gate.HostMemory(14 * gate.GIB, 60 * gate.GIB), pressure=gate.NoPressureHold(),
+            running=(replace(inputs.running[0], promise=gate.GIB, measured=gate.MeasuredMemory(gate.GIB)),),
+            reservations=({**inputs.reservations[0], "need": gate.GIB},), ordered=[
+                (token_path, {**token, "token_left_at": NOW - 10}),
+                (head_path, {**head, "need": 21 * gate.GIB, "priority_since": NOW - 60}),
+                (follower_path, {**follower, "need": 10 * gate.GIB}),
+            ])
+        reading = gate.queue_read_from(inputs, gate.AdmissionLimits(21 * gate.GIB, 3 * gate.GIB))
+        self.assertEqual([step.pid for step in reading.view.waiting], [token["pid"], head["pid"], follower["pid"]])
+        self.assertIsInstance(reading.view.waiting[2].reason, gate.BehindHead)
+        self.assertEqual(queue_view.reason_phrase(reading.view.waiting[2].reason, reading.view.waiting), "#2's turn")
+        model = replace(self.fixture.model(), reading=reading, facts=head_facts.read_head_facts(reading))
+        text = plain(queue_card.render_card(model, [3], 400))
+        self.assertIn("#2's turn", text)
+        self.assertNotIn("#1's turn", text)
+        self.assertIn("younger steps wait", text)
+
     def test_expired_follower_prints_estimate_before_its_own_resource_checks(self) -> None:
         inputs = self.fixture.inputs()
         path, row = inputs.ordered[1]

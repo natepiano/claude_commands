@@ -2049,6 +2049,59 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
                                               "--why", "user's work")
         self.assertEqual(status, 0, output + errors)
 
+    def test_priority_cleanup_uses_the_saved_log_end_and_records_a_stopped_set_once(self) -> None:
+        month = store.host_file(store.host_name(), self.clock)
+        month.parent.mkdir(parents=True, exist_ok=True)
+        prefix = b"earlier month rows are not JSON\n" * 128
+        _ = month.write_bytes(prefix)
+        with patch.object(json, "loads", wraps=json.loads) as decoded:
+            with patch.object(gate.record, "queue_priority", side_effect=KeyboardInterrupt("fixture stopped before append")), \
+                 self.assertRaises(KeyboardInterrupt):
+                self.set_priority()
+            path = gate.admission_dir(self.root) / "queue_priority.json"
+            saved = cast(dict[str, object], json.loads(path.read_text()))
+            transition = cast(dict[str, object], saved["transition"])
+            self.assertEqual(transition["month_row_end"], len(prefix))
+            for attempt in range(2):
+                self.clock += attempt + 1
+                self.assertEqual(self.poll(400, free=0).decision.state, "hold")
+            self.assertNotIn(mock.call(prefix.splitlines(keepends=True)[0]), decoded.call_args_list)
+            self.assertNotIn(mock.call(prefix.splitlines(keepends=True)[0].decode()), decoded.call_args_list)
+        self.assertNotIn("transition", cast(dict[str, object], json.loads(path.read_text())))
+        contents = month.read_bytes()
+        self.assertEqual(contents[:len(prefix)], prefix)
+        rows = [cast(dict[str, object], json.loads(line)) for line in contents[len(prefix):].splitlines()]
+        priority, = [row for row in rows if row.get("kind") == "queue_priority"]
+        self.assertEqual((priority["id"], priority["action"], priority["unit"], priority["at"]),
+                         (transition["id"], "set", "chosen", store.utc_iso(self.clock - 3)))
+
+    def test_token_waiter_keeps_order_without_holding_the_strict_head_or_memory(self) -> None:
+        path = self.waiter(300, self.clock - 1200, str(self.root / "token-wait"), "token-wait", 12)
+        waiting = cast(gate.Waiter, json.loads(path.read_text()))
+        waiting["priority_since"] = self.clock - 1
+        waiting["token_left_at"] = self.clock
+        _ = path.write_text(json.dumps(waiting))
+        _ = self.running(100, 1, age=30)
+        younger_path = self.waiter(400, self.clock - 60, str(self.root / "token-holder"), "token-holder", 11.5)
+        younger = cast(gate.Waiter, json.loads(younger_path.read_text()))
+        self.assertIsInstance(gate.head_priority([waiting, younger], 60 * GIB, 60 * GIB,
+                                               [gate.MeasuredMemory(GIB)], self.clock), gate.NoHeadPriority)
+        result = self.poll(400, need=11.5)
+        self.assertEqual(result.decision.state, "admit")
+        self.assertIsInstance(result.reservation, gate.Reserved)
+        self.assertEqual(cast(gate.Waiter, json.loads(path.read_text())), waiting)
+        if isinstance(result.reservation, gate.Reserved):
+            result.reservation.path.unlink()
+        with patch.dict(os.environ, {"BUILDLOG_MEM_TOKEN_BACK_AT": str(self.clock)}):
+            returned = self.poll(300, free=0)
+        self.assertEqual(returned.decision.state, "hold")
+        queued = cast(gate.Waiter, json.loads(path.read_text()))
+        self.assertNotIn("token_left_at", queued)
+        self.assertEqual((queued["since"], queued.get("priority_since")),
+                         (waiting["since"], waiting["priority_since"]))
+        self.assertIsInstance(gate.head_priority([queued, younger], 60 * GIB, 60 * GIB,
+                                               [gate.MeasuredMemory(GIB)], self.clock), gate.HeadPriority)
+
     def label(self, pid: int, unit: str) -> None:
         self.labels[f"session-{pid}"] = UnitLabels(f"worker-{pid}", "builds", unit)
 
@@ -2214,9 +2267,9 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
                                 publish(target, content)
 
                         def log(event: Literal["set", "clear"], unit: str,
-                                why: str, actor: str, stamp: float, *, transition_id: str = "") -> None:
+                                why: str, actor: str, stamp: float, *, transition_id: str = "", start: int = 0) -> None:
                             def commit() -> None:
-                                append(event, unit, why, actor, stamp, transition_id=transition_id)
+                                append(event, unit, why, actor, stamp, transition_id=transition_id, start=start)
                             if stage == "append" and event == ("set" if action == "replace" else action):
                                 stop_around(commit)
                             else:
@@ -2387,15 +2440,20 @@ class QueuePriorityAndTokenWaitTests(MemoryQueueFixture):
         _ = self.waiter(400, self.clock - 60, str(self.root / "younger"), "younger", 4)
         view = gate.queue_view()
         self.assertEqual([step.pid for step in view.waiting], [300, 400])
-        self.assertIsInstance(cast(gate.HeadAdmissionStatus, view.waiting[0].reason).backfill, gate.BackfillUntil)
+        self.assertIsInstance(view.waiting[0].reason, gate.TokenWaitingWaiter)
         younger = self.poll(400, need=4)
         self.assertEqual(younger.decision.state, "admit")
         if isinstance(younger.reservation, gate.Reserved):
             younger.reservation.path.unlink()
         self.clock += 120
-        held = self.poll(400, need=10)
-        self.assertEqual(held.decision.state, "hold")
-        self.assertIsInstance(gate.queue_view().waiting[1].reason, gate.BehindHead)
+        younger = self.poll(400, need=10)
+        self.assertEqual(younger.decision.state, "admit")
+        self.assertIsInstance(younger.reservation, gate.Reserved)
+        view = gate.queue_view()
+        self.assertEqual([step.pid for step in view.waiting], [300])
+        self.assertIsInstance(view.waiting[0].reason, gate.TokenWaitingWaiter)
+        if isinstance(younger.reservation, gate.Reserved):
+            younger.reservation.path.unlink()
         (self.root / "admission/100.reservation").unlink()
         with patch.dict(os.environ, {"BUILDLOG_MEM_TOKEN_BACK_AT": str(self.clock)}):
             admitted = self.poll(300)

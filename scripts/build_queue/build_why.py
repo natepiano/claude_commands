@@ -180,6 +180,8 @@ def release_text(explanation: gate.QueueExplanation,
         text = "all running steps ending still leaves " + ", ".join(release.causes) + " holding the head"
     elif isinstance(release, gate.ReadingUnavailable):
         text = "admission memory reading unavailable"
+    elif isinstance(release, gate.TokenWaitersOnly):
+        text = "all waiting steps are waiting for the cargo token"
     else:
         text = "nothing waits"
     head = explanation.head
@@ -191,7 +193,7 @@ def release_text(explanation: gate.QueueExplanation,
 
 def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
                        labels: Mapping[str, unit_labels.UnitLabels],
-                       facts: head_facts.HeadFacts | gate.NoWaiter) -> list[str]:
+                       facts: head_facts.HeadFacts | gate.TokenWaitersOnly | gate.NoWaiter) -> list[str]:
     host = explanation.host
     if isinstance(host, gate.ReadingUnavailable):
         raise ValueError("host memory unavailable")
@@ -222,7 +224,9 @@ def render_explanation(explanation: gate.QueueExplanation, zone: ZoneInfo,
         lines.append("None.")
     lines.append(f"Total: charged {gib(explanation.totals.charged)}, using {gib(explanation.totals.measured)}")
     head = explanation.head
-    if isinstance(head, gate.NoWaiter) or isinstance(facts, gate.NoWaiter):
+    if isinstance(head, gate.TokenWaitersOnly):
+        return [*lines, "", "All waiting steps are waiting for the cargo token."]
+    if not isinstance(head, gate.HeadExplanation) or not isinstance(facts, head_facts.HeadFacts):
         return [*lines, "", "Nothing waits."]
     identity = build_queue.step_labels(head.waiter, labels)
     lines.extend(("", f"First in line: {identity.showrunner} / {identity.unit} / {identity.session}, "
