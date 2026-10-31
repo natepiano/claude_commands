@@ -100,6 +100,8 @@ def stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
     """Stop on purpose; retain its launch for an explicit resume, not crash recovery."""
     _record_launches([session])
     result = _stop(session)
+    if isinstance(result, (Stopped, NotRunning)):
+        _retire_prompt(result.session_id)
     if isinstance(result, Stopped):
         try:
             owner = herdr.shared_session()
@@ -109,6 +111,16 @@ def stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
         except (OSError, ValueError) as error:
             return StopFailed(result.session_id, f"Claude stopped, but its intentional stop could not be saved: {error}")
     return result
+
+
+def _retire_prompt(session_id: str) -> None:
+    """Publish only the session id and stop time; any failure is separate from stop or move."""
+    try:
+        from scripts.production.stall_watch import retire_session_prompt
+
+        retire_session_prompt(session_id)
+    except Exception as error:
+        print(f"{session_id}: prompt cancellation: {error}", file=sys.stderr)
 
 
 def _stop(session: str) -> Stopped | NotRunning | StopFailed | SessionNotFound:
@@ -490,7 +502,10 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
         stopped: list[Stopped | NotRunning | StopFailed | SessionNotFound | ClaudeUp] = []
         for session, future in zip(selected, stops):
             try:
-                stopped.append(future.result())
+                result = future.result()
+                if isinstance(result, (Stopped, NotRunning)):
+                    _retire_prompt(result.session_id)
+                stopped.append(result)
             except Exception as error:
                 stopped.append(StopFailed(session, str(error)))
         def resume_moved(identity: str) -> ClaudeUp | ResumeFailed | SessionNotFound:

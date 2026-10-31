@@ -14,6 +14,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from contextlib import closing
 from datetime import datetime, timezone
+from dataclasses import replace
 from typing import cast, final
 from unittest import mock
 import rules
@@ -29,6 +30,170 @@ from ledger_test_support import (remove_generation_schema, LedgerTestCase, Ledge
 
 @final
 class StyleLedgerTicketsTests(LedgerTestCase):
+    def refusal_ticket(self, *, secondary: bool = False) -> tuple[style_ledger.Ledger, Path, tuple[str, ...]]:
+        """An assigned approved ticket with three findings, optionally from two decisions."""
+        ledger, issue = self.widen_ticket()
+        ledger.ticket_drop("names-1")
+        ledger.set_tip(self.initial_tip, "main")
+        first = ledger.proposal_findings(issue)[0]
+        extra = ledger.hold(first.rule, first.path, 22, "another binding", "rename", "another", "fresh_name",
+                            first.rule_blob, "outside")
+        ledger.file_held(extra.finding_id, issue)
+        findings = ledger.proposal_findings(issue)
+        ids = tuple(finding.finding_id for finding in findings)
+        decisions: tuple[Path, ...] = ()
+        if secondary:
+            other = self.root / "secondary.md"
+            _ = other.write_text(issue.read_text())
+            with closing(sqlite3.connect(ledger.database)) as connection, connection:
+                _ = connection.execute("UPDATE held_findings SET proposal=? WHERE finding_id=?", (str(other), ids[1]))
+            decisions = (other,)
+        ledger.ticket_add("names-2", "names", "proposal", "names", "crates/alpha", list(self.sources[:2]),
+                          [findings[0].rule], proposal=str(issue), proposals=decisions, finding_ids=ids)
+        ledger.ticket_assign("names-2", "main")
+        return ledger, issue, ids
+
+    def test_ticket_refuse_keeps_other_findings_and_the_approved_gate_in_both_active_states(self) -> None:
+        ledger, issue, ids = self.refusal_ticket()
+        with closing(sqlite3.connect(ledger.database)) as connection, closing(sqlite3.connect(":memory:")) as pristine:
+            connection.backup(pristine)
+            for state in ("assigned", "checkpointed"):
+                with self.subTest(state=state):
+                    if state == "checkpointed":
+                        ledger.ticket_checkpoint("names-2", self.initial_tip)
+                    before = ledger.ticket_open("names")[0]
+                    # All membership/ownership writes remain in the existing release operation.
+                    with mock.patch.object(style_ledger.Ledger, "bulk_release", autospec=True,
+                                           side_effect=style_ledger.Ledger.bulk_release) as release:
+                        result = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0],
+                                          "--by", "Nate", "--reason", "would shadow an enclosing binding")
+                    release.assert_called_once()
+                    self.assertEqual(len(result.stdout.splitlines()), 1)
+                    origin = ledger.ticket_origin("names-2")
+                    self.assertIsInstance(origin, style_ledger.ApprovedProposal)
+                    assert isinstance(origin, style_ledger.ApprovedProposal)
+                    approved = style_plan.approved_ticket(ledger, "names-2", origin)
+                    self.assertEqual({finding.finding_id for finding in approved.findings}, set(ids[1:]))
+                    released, = ledger.named_held((ids[0],))
+                    self.assertEqual((released.state, released.build_ticket),
+                                     (style_ledger.Filed(issue), style_ledger.NoBuildTicket()))
+                    row, = ledger.bulk_refusals("names-2")
+                    self.assertEqual((row.finding_id, row.reason), (ids[0], "would shadow an enclosing binding"))
+                    after = ledger.ticket_open("names")[0]
+                    self.assertEqual((after["state"], after["checkpoint"], after["base"], after["files"], after["rules"]),
+                                     (before["state"], before["checkpoint"], before["base"], before["files"], before["rules"]))
+                    pristine.backup(connection)
+
+    def test_ticket_refuse_removes_an_already_waived_finding_and_the_gate_passes(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        ledger.waive_held(ids[0], style_ledger.WaiveByPerson("Nate"))
+        waived, = ledger.named_held((ids[0],))
+        _ = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0],
+                     "--by", "Nate", "--reason", "would shadow")
+        released, = ledger.named_held((ids[0],))
+        self.assertEqual(released, replace(waived, build_ticket=style_ledger.NoBuildTicket()))
+        origin = ledger.ticket_origin("names-2")
+        assert isinstance(origin, style_ledger.ApprovedProposal)
+        self.assertEqual({finding.finding_id for finding in style_plan.approved_ticket(ledger, "names-2", origin).findings},
+                         set(ids[1:]))
+
+    def test_ticket_refuse_releases_multiple_named_findings_in_one_request(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        _ = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0], "--finding", ids[1],
+                     "--by", "Nate", "--reason", "would shadow")
+        origin = ledger.ticket_origin("names-2")
+        assert isinstance(origin, style_ledger.ApprovedProposal)
+        self.assertEqual(origin.finding_ids, (ids[2],))
+        self.assertEqual({row.finding_id for row in ledger.bulk_refusals("names-2")}, set(ids[:2]))
+        self.assertEqual(len(style_plan.approved_ticket(ledger, "names-2", origin).findings), 1)
+
+    def test_ticket_refuse_rejects_unknown_and_foreign_ids_before_any_write(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        finding, = ledger.named_held(ids[:1])
+        foreign = ledger.hold(finding.rule, self.sources[2], 1, "other finding", "rename", "old", "new",
+                              finding.rule_blob, "outside")
+        for identity, message in (("unknown", "unknown held finding"), (foreign.finding_id, "does not belong to ticket")):
+            with self.subTest(finding=identity):
+                before = self.ledger_contents(ledger)
+                result = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0], "--finding", identity,
+                                  "--by", "Nate", "--reason", "would shadow", success=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_preserves_every_contributing_issue_rule(self) -> None:
+        ledger, _, ids = self.refusal_ticket(secondary=True)
+        # Either primary or secondary losing its last finding must refuse the whole request.
+        for removing in ((ids[0], ids[2]), (ids[1],)):
+            with self.subTest(findings=removing):
+                finding, = ledger.named_held(removing[:1])
+                assert isinstance(finding.state, style_ledger.Filed)
+                before = self.ledger_contents(ledger)
+                arguments = [part for identity in removing for part in ("--finding", identity)]
+                result = self.cli("ticket", "refuse", "--id", "names-2", *arguments,
+                                  "--by", "Nate", "--reason", "would shadow", success=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"issue {finding.state.proposal} without a finding of its rule", result.stderr)
+                self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_requires_a_kept_finding_of_the_issue_rule(self) -> None:
+        ledger, issue, ids = self.refusal_ticket()
+        _ = issue.write_text(issue.read_text().replace("style_rule:", "style_rule: unrelated\nprevious_rule:"))
+        before = self.ledger_contents(ledger)
+        result = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0],
+                          "--by", "Nate", "--reason", "would shadow", success=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(f"issue {issue} without a finding of its rule unrelated", result.stderr)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_requires_named_findings_a_person_and_a_nonempty_reason(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        required = {"--finding": ids[0], "--by": "Nate", "--reason": "would shadow"}
+        for missing in required:
+            with self.subTest(missing=missing):
+                before = self.ledger_contents(ledger)
+                arguments = [part for flag, value in required.items() if flag != missing for part in (flag, value)]
+                result = self.cli("ticket", "refuse", "--id", "names-2", *arguments, success=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(f"the following arguments are required: {missing}", result.stderr)
+                self.assertEqual(self.ledger_contents(ledger), before)
+        for flag in ("--by", "--reason"):
+            for value in ("", " \t "):
+                with self.subTest(flag=flag, value=value):
+                    before = self.ledger_contents(ledger)
+                    arguments = [part for key, text in required.items() for part in (key, value if key == flag else text)]
+                    result = self.cli("ticket", "refuse", "--id", "names-2", *arguments, success=False)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("requires a non-empty --by and --reason", result.stderr)
+                    self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_rerun_is_one_line_and_changes_no_records(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        arguments = ("ticket", "refuse", "--id", "names-2", "--finding", ids[0], "--finding", ids[0],
+                     "--by", "Nate", "--reason", "would shadow")
+        first = self.cli(*arguments)
+        before = self.ledger_contents(ledger)
+        repeated = self.cli(*arguments)
+        self.assertEqual(repeated.stdout, first.stdout)
+        self.assertEqual(len(repeated.stdout.splitlines()), 1)
+        self.assertEqual(self.ledger_contents(ledger), before)
+
+    def test_ticket_refuse_rejects_tickets_that_cannot_hold_unmerged_edits(self) -> None:
+        ledger, _, ids = self.refusal_ticket()
+        with closing(sqlite3.connect(ledger.database)) as connection, closing(sqlite3.connect(":memory:")) as pristine:
+            connection.backup(pristine)
+            for state in ("queued", "merged", "dropped"):
+                with self.subTest(state=state):
+                    _ = connection.execute("UPDATE tickets SET state=? WHERE id='names-2'", (state,))
+                    connection.commit()
+                    before = self.ledger_contents(ledger)
+                    result = self.cli("ticket", "refuse", "--id", "names-2", "--finding", ids[0],
+                                      "--by", "Nate", "--reason", "would shadow", success=False)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("refusal requires an assigned or checkpointed proposal ticket", result.stderr)
+                    self.assertEqual(self.ledger_contents(ledger), before)
+                    pristine.backup(connection)
+
     def test_restored_restructure_findings_keep_their_merged_owner_after_rule_changes(self) -> None:
         ledger, _, issue, ids, checkpoint = self.withdrawn_checkpointed_ticket()
         # The incident's durable records contain restructure findings with no automatic applied check.

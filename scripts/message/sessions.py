@@ -36,6 +36,8 @@ class SessionRecord(TypedDict):
     # How Claude was started: "cli" for an interactive session, "sdk-cli" for a `claude -p` run.
     # Older records and callers may omit it; read_session normalizes absence to empty.
     entrypoint: NotRequired[str]
+    # The conversation's folder, for the exact staff-worktree join. Older records may omit it.
+    cwd: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,7 @@ def parse_session(parsed: object) -> RegistryEntry:
     tmux = data.get("tmux")
     former = data.get("formerNames")
     entrypoint = data.get("entrypoint")
+    cwd = data.get("cwd")
     if (
         not isinstance(pid, int)
         or isinstance(pid, bool)
@@ -172,6 +175,7 @@ def parse_session(parsed: object) -> RegistryEntry:
         formerNames=[name for name in cast(list[object], former) if isinstance(name, str)]
         if isinstance(former, list) else [],
         entrypoint=entrypoint if isinstance(entrypoint, str) else "",
+        cwd=cwd if isinstance(cwd, str) else "",
     )
 
 
