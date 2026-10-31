@@ -9,6 +9,7 @@ from unittest import mock
 from scripts.production import staff
 from scripts.production import fake_unit_host
 from scripts.production.rename_test_support import legacy_staff_journal
+from scripts.production.rename_rerun_test_support import saved_fixture
 from scripts.production.rename_unit_test_support import SLUG, UnitRenameFixture
 
 
@@ -92,6 +93,36 @@ class UnitRenameRepairTests(UnitRenameFixture):
         before = self.snapshot()
         self.assert_ok(self.rename("plan", "mul_add", "multiply"))
         self.assertEqual(self.snapshot(), before)
+
+    def test_retired_journal_does_not_block_another_units_plan_apply_or_verify(self) -> None:
+        self.assert_ok(self.rename("apply"))
+        path = self.state / SLUG / "rename_unit.json"
+        retired_id = staff.StaffId(cast(str, self.journal()["staff_id"]))
+        _ = staff.retire(retired_id)
+        self.assertIsNone(staff.snapshot().by_id(retired_id))
+        successor = next(row for row in staff.snapshot().find(kind="unit") if row.name == "mul_add")
+        with saved_fixture(self.root) as restore:
+            for done in (True, False):
+                for legacy in (True, False):
+                    with self.subTest(done=done, legacy=legacy):
+                        restore()
+                        saved = self.journal()
+                        saved["done"] = done
+                        self.write(path, json.dumps(saved))
+                        if legacy:
+                            legacy_staff_journal(path)
+                        before = self.snapshot()
+                        self.assert_ok(self.rename("plan", "mul_add", "multiply"))
+                        self.assertEqual(self.snapshot(), before)
+                        self.assert_ok(self.rename("apply", "mul_add", "multiply"))
+                        self.assert_ok(self.rename("verify", "mul_add", "multiply"))
+                        self.assertIs(self.journal()["done"], True)
+                        self.assertEqual(self.journal()["staff_id"], successor.id)
+                        renamed = staff.snapshot().by_id(successor.id)
+                        self.assertIsNotNone(renamed)
+                        assert renamed is not None
+                        self.assertEqual(renamed.name, "multiply")
+                        self.assertEqual(renamed.parent, successor.parent)
 
     def test_matching_legacy_journal_plan_does_not_migrate_on_disk(self) -> None:
         self.assert_refused(self.rename("apply", refuse="push origin demo:refs/heads/demo"), "simulated failure")
