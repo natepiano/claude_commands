@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import io
 import re
+import sqlite3
 import sys
 import unittest
 from collections.abc import Mapping
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from pathlib import Path
 from typing import final
 from unittest import mock
@@ -26,6 +27,57 @@ from style_plan_test_support import StylePlanFixture
 
 @final
 class StylePlanTests(StylePlanFixture):
+    def borrowed_proposal_ticket(self) -> tuple[style_ledger.Ledger, Path, style_ledger.TicketRecord]:
+        """Refill lends names-unit an approved values decision without rewriting the approval."""
+        values = self.borrowing_family("values")
+        self.sync()
+        for path in self.sources:
+            self.record(values, path, self.tip)
+        issue = self.borrowing_decision(values, "values", self.sources[0])
+        approval = issue.read_bytes()
+        with mock.patch.object(style_proposals, "proposal_command"):
+            self.assertEqual(self.run_next()[0], 0)
+        ledger = self.ledger()
+        ticket, = ledger.ticket_open("names-unit")
+        self.assertEqual((ticket["family"], ticket["proposal"]), ("values", str(issue)))
+        self.assertEqual(issue.read_bytes(), approval)
+        return ledger, issue, ticket
+
+    def test_borrowed_proposal_refuses_approval_for_an_unrelated_rule(self) -> None:
+        _, issue, ticket = self.borrowed_proposal_ticket()
+        _ = issue.write_text(issue.read_text().replace(f"style_rule: {ticket['rules'][0]}",
+                                                     "style_rule: global:rust/unrelated.md"))
+        self.assertEqual(self.reference_gate(ticket["id"]),
+                         (1, "review: proposal approval or filed findings changed\n"))
+
+    def test_borrowed_proposal_refuses_approval_for_an_unrelated_crate(self) -> None:
+        _, issue, ticket = self.borrowed_proposal_ticket()
+        _ = issue.write_text(issue.read_text().replace("style_crate: crates/alpha", "style_crate: crates/beta"))
+        self.assertEqual(self.reference_gate(ticket["id"]),
+                         (1, "review: proposal approval or filed findings changed\n"))
+
+    def test_borrowed_proposal_keeps_its_approval_through_gate_checkpoint_and_merge(self) -> None:
+        ledger, issue, ticket = self.borrowed_proposal_ticket()
+        approval = issue.read_bytes()
+        self.assertEqual(self.reference_gate(ticket["id"]), (0, "approved proposal\n"))
+        # A moved finding is still refused, regardless of which unit took the approved work.
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET proposal=? WHERE finding_id=?",
+                                   (str(self.root / "another-decision.md"), ticket["finding_ids"][0]))
+        self.assertEqual(self.reference_gate(ticket["id"]), (1, "review: proposal ticket findings changed\n"))
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("UPDATE held_findings SET proposal=? WHERE finding_id=?",
+                                   (str(issue), ticket["finding_ids"][0]))
+        self.write(self.sources[0], "pub fn changed() {}\n")
+        self.assertEqual(self.reference_gate(ticket["id"]), (0, "approved proposal\n"))
+        checkpoint = self.commit()
+        ledger.ticket_checkpoint(ticket["id"], checkpoint)
+        self.assertEqual(ledger.ticket_open("names-unit")[0]["state"], "checkpointed")
+        ledger.set_tip(checkpoint, "main")
+        _ = ledger.ticket_merge(ticket["id"])
+        self.assertEqual(ledger.ticket_open("names-unit"), ())
+        self.assertEqual(issue.read_bytes(), approval)
+
     def borrowing_family(self, family: rules.Family) -> str:
         worktree = self.root / family
         _ = self.git("worktree", "add", "-q", "-b", f"demo-style-{family}", str(worktree))
