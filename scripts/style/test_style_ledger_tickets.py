@@ -29,6 +29,26 @@ from ledger_test_support import (remove_generation_schema, LedgerTestCase, Ledge
 
 @final
 class StyleLedgerTicketsTests(LedgerTestCase):
+    def test_proposal_migration_preserves_generations_and_backfills_legacy_decisions(self) -> None:
+        ledger, rule, finding = self.site_fixture()
+        issue = self.root / "decision.md"
+        ledger.ticket_add("legacy-1", "legacy", "proposal", "names", "crates/alpha", [finding.path], [rule],
+                          proposal=str(issue), finding_ids=(finding.finding_id,))
+        with closing(sqlite3.connect(ledger.database)) as connection, connection:
+            _ = connection.execute("DROP TABLE ticket_proposals")
+            _ = connection.execute("UPDATE schema_version SET version=30")
+            generations = connection.execute("SELECT * FROM rule_generations").fetchall()
+            judgments = connection.execute("SELECT * FROM active_judgments").fetchall()
+        for _ in range(2):
+            with style_ledger.Ledger(self.repo, ledger.database) as upgraded:
+                self.assertEqual(upgraded.ticket_proposals("legacy-1"), (issue,))
+                self.assertEqual(upgraded.ticket_proposals("judge-1"), ())
+        with closing(sqlite3.connect(ledger.database)) as connection:
+            self.assertEqual(connection.execute("SELECT version FROM schema_version").fetchone(), (31,))
+            self.assertEqual(connection.execute("SELECT * FROM ticket_proposals").fetchall(), [("legacy-1", str(issue))])
+            self.assertEqual(connection.execute("SELECT * FROM rule_generations").fetchall(), generations)
+            self.assertEqual(connection.execute("SELECT * FROM active_judgments").fetchall(), judgments)
+
     def test_cancelled_checkpoint_reservation_is_retried_after_reopening(self) -> None:
         session = self.held_reservation("modules-unit-1")
         self.checkpointed_structure_ticket("modules-unit-1", "--session-dir", str(session), "--phase", "7")

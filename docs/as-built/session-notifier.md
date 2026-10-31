@@ -33,7 +33,7 @@ The session notifier sends a message to a live Claude session on a schedule: the
 
 | `scripts/production/production_lifecycle.py` | `wrap` removes the showrunner instance. |
 
-| `scripts/shutdown/settle.py`, `scripts/shutdown/restart.py` | `/shutdown` runs `stop` on each enabled instance targeting a session it stops; `/shutdown cancel` and `/shutdown restart` run `start` on those. Never `remove`. |
+| `scripts/shutdown/restart.py`, `restart_support.py` | Legacy record-driven restart restores the recorded notifier state. The shared session stop leaves notifier state unchanged. |
 
 | `commands/showrunner/{produce,dailies,interval}.md` | Call those commands; `/showrunner:report_interval` retimes the showrunner instance. |
 

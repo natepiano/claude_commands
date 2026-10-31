@@ -113,7 +113,7 @@ class TestPhasePeakTests(unittest.TestCase):
             "sidecar": str(timeline.files.scope_path), "test_threads": width,
             "repo_identity": "original-repository", "test_scope": "filtered" if filtered else "full",
             "package": "hana" if filtered else "", "filters": ["one", "two"] if filtered else [],
-            "call_id": "original-phase-call",
+            "call_id": "original-phase-call", "admitted_at": "2026-10-02T12:00:00Z",
         }
         _ = path.write_text(json.dumps(fields))
         return path
