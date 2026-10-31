@@ -2880,7 +2880,7 @@ A rerun of a stopped `accounts.py setup`, group move or five-hour wait finishes 
 - `pyrightconfig.json` environments need `.` in `extraPaths` for `scripts.production.*` imports.
 - The style suite needs the real HOME (`~/rust/nate_style`); a scratch HOME gives `setUpClass` errors that are not code defects.
 
-### Phase 100c — The five-hour alert test holds across daylight-saving  · status: todo
+### Phase 100c — The five-hour alert test holds across daylight-saving  · status: done
 
 **Depends on:** none. Runs before Phase 101 (showrunner, 2026-10-30: its own checkpoint, ahead of 101).
 
