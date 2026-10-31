@@ -1,7 +1,6 @@
 """The compact queue view and the checks shared with one-step cards."""
 from __future__ import annotations
 
-from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
@@ -9,7 +8,7 @@ from typing import assert_never
 from zoneinfo import ZoneInfo
 
 from scripts.build_queue import head_facts
-from scripts.build_queue.queue_lines import Line, Span, age, clip, pad_left, pad_right, plain, trim_right, wrap
+from scripts.build_queue.queue_lines import Line, Span, age, clip, cut_tail, pad_left, pad_right, plain, terminal_width
 from scripts.lint import memory_admit as gate
 from scripts.message.unit_labels import UnitLabels
 
@@ -29,11 +28,10 @@ class QueueModel:
 
 @dataclass(frozen=True)
 class ChecksNotRecorded:
-    """Part A has no admission checks for a step behind the head."""
+    """No admission checks are recorded for a step behind the head."""
 
 
 def step_checks(model: QueueModel, position: int) -> gate.HeadExplanation | gate.ReadingUnavailable | ChecksNotRecorded:
-    # Part B plugs the admission-owned LineWaiter checks in here.
     explanation = model.reading.explanation
     if isinstance(explanation.host, gate.ReadingUnavailable):
         return explanation.host
@@ -110,11 +108,6 @@ def has_move_priority(model: QueueModel, position: int) -> bool:
     return model.reading.ordered[position - 1][1].get("bump_order", 0) < 0
 
 
-def move_mark(model: QueueModel, position: int) -> str:
-    records = waiting_moves(model, position)
-    return f"↑{records[0].old_position}" if records else "↑" if is_moved(model, position) else ""
-
-
 def pressure_check(pressure: gate.Pressure, model: QueueModel) -> tuple[bool, str]:
     if isinstance(pressure, gate.NoPressureHold):
         return True, "memory pressure: no hold"
@@ -154,25 +147,6 @@ def check_lines(checks: gate.HeadExplanation | gate.ReadingUnavailable | ChecksN
     return [pressure, *memory] if pressure_first else [*memory, pressure]
 
 
-def head_state(model: QueueModel) -> str:
-    explanation = model.reading.explanation
-    if isinstance(explanation.host, gate.ReadingUnavailable):
-        return "memory reading unavailable"
-    head = explanation.head
-    if isinstance(head, gate.NoWaiter):
-        return "nothing waits"
-    if head.decision.state == "admit":
-        return "#1 starts at the next check"
-    causes: list[str] = []
-    if isinstance(head.decision.pressure, gate.MemoryPressure):
-        causes.append("recovery spacing" if head.decision.pressure.next_start_at else "memory pressure")
-    if not head.budget.passes:
-        causes.append("budget")
-    if not head.free.passes:
-        causes.append("free memory")
-    return "#1 waits on " + ", ".join(causes)
-
-
 def reason_phrase(reason: gate.WaitReason) -> str:
     match reason:
         case gate.ReadingUnavailable():
@@ -195,129 +169,123 @@ def reason_phrase(reason: gate.WaitReason) -> str:
             assert_never(reason)
 
 
-def place_runs(places: list[int]) -> str:
-    runs: list[str] = []
-    start = end = 0
-    for place in places:
-        if runs and place == end + 1:
-            end = place
-            runs[-1] = f"#{start}-#{end}"
-        else:
-            start = end = place
-            runs.append(f"#{place}")
-    return " ".join(runs)
+def bar_eighths(gib: float, budget: float) -> int:
+    """Round to the nearest eighth on the shared one-cell-per-GiB scale."""
+    return int(max(0.0, min(gib, budget)) * 8 + 0.5)
 
 
-def rest_lines(model: QueueModel) -> list[Line]:
-    count = len(model.reading.view.waiting)
-    if count < 2:
-        return []
-    facts = model.facts
-    if isinstance(facts, head_facts.HeadFacts) and facts.has_priority and isinstance(facts.order, gate.StrictUntil):
-        line = model.reading.explanation.line
-        return [(Span(f"#2-#{count}: {head_facts.order_text(facts, model.zone, include_record=False)}; {line.fitting} of {line.count} fit now"),)]
-    groups: dict[str, list[int]] = {}
-    for position, step in enumerate(model.reading.view.waiting[1:], 2):
-        groups.setdefault(reason_phrase(step.reason), []).append(position)
-    return [(Span(place_runs(places) + ": " + phrase),) for phrase, places in groups.items()]
+def size_bar(gib: float, budget: float) -> str:
+    eighths = bar_eighths(gib, budget)
+    whole, fraction = divmod(eighths, 8)
+    return "█" * whole + ("▏▎▍▌▋▊▉"[fraction - 1] if fraction else "")
 
 
-def move_lines(model: QueueModel) -> list[Line]:
-    # Identity differs across steps; a move list is its actor/time/old-place history.
-    groups: dict[tuple[tuple[float, str, int], ...], tuple[tuple[head_facts.BumpRecord, ...], list[str]]] = {}
-
-    def add_move(records: tuple[head_facts.BumpRecord, ...], place: str) -> None:
-        if not records:
-            return
-        key = tuple((record.at, record.actor, record.old_position) for record in records)
-        if key in groups:
-            groups[key][1].append(place)
-        else:
-            groups[key] = records, [place]
-
-    for position in range(1, len(model.reading.view.waiting) + 1):
-        add_move(waiting_moves(model, position), f"#{position}")
-    for running, records in zip(model.reading.explanation.running, model.moves.running):
-        add_move(records, "running " + running.step.step)
-    ordered = sorted(groups.values(), key=lambda item: -item[0][-1].at)
-    lines = [(Span("  ↑ " + " ".join(places) + " moved up: "
-                   + head_facts.move_text(records, model.zone, model.labels), "warning"),)
-             for records, places in ordered[:5]]
-    remaining = sum(len(item[1]) for item in ordered[5:])
-    if remaining:
-        lines.append((Span(f"  and {remaining} more moved-up steps", "warning"),))
-    return lines
+def countdown(until: float, now: float) -> str:
+    minutes, seconds = divmod(max(0, int(until - now)), 60)
+    return f"{minutes}:{seconds:02d}"
 
 
-def step_row(prefix: Line, step: gate.WaitingStep | gate.RunningStep, model: QueueModel, columns: int) -> Line:
-    return trim_right(clip((*prefix, *name_spans(step, model.labels, production=columns >= 100)), columns))
+def head_status(model: QueueModel, budget: int) -> Line:
+    head = model.reading.explanation.head
+    if isinstance(head, gate.NoWaiter):
+        return ()
+    recorded = bool(model.reading.ordered and "priority_since" in model.reading.ordered[0][1])
+    strict = head.has_priority and (not recorded or isinstance(head.order, gate.StrictUntil))
+    room = gate.strict_room(budget, head.waiter.need)
+    allows_room = strict and recorded and isinstance(head.order, gate.StrictUntil) and room > 0
+    tone = "error" if strict and not allows_room else "success"
+    state = f" ↑ ≤{room / gate.GIB:.1f}" if allows_room else " ⊘" if strict else " ↑"
+    result = (Span(state, tone),)
+    if recorded and not isinstance(head.order, gate.WindowNotStarted):
+        result += (Span(" "), Span(countdown(head.order.deadline, model.reading.explanation.now),
+                                   tone, until=head.order.deadline))
+    reason = head.waiter.reason
+    if isinstance(reason, gate.ReadingUnavailable):
+        result += (Span(" no reading", "error"),)
+    elif isinstance(reason, gate.MemoryPressure) or isinstance(head.decision.pressure, gate.MemoryPressure):
+        result += (Span(" pressure", "error"),)
+    elif (isinstance(reason, gate.NeedsMemory)
+          or isinstance(reason, gate.HeadAdmissionStatus) and not reason.decision.free_passes):
+        result += (Span(" low memory", "error"),)
+    return result
 
 
-def render_view(model: QueueModel, columns: int) -> list[Line]:
-    reading = model.reading
-    running = reading.explanation.running
-    waiting = reading.view.waiting
-    now = reading.explanation.now
-    lines: list[Line] = []
+def budget_bar(budget: float, free: float, *, colour: bool) -> Line:
+    total_eighths = bar_eighths(budget, budget)
+    free_eighths = bar_eighths(free, budget)
+    width = (total_eighths + 7) // 8
+    if not colour:
+        free_cells = width if free_eighths == total_eighths else min(width, (free_eighths + 4) // 8)
+        return (Span("░" * free_cells, "success"), Span("█" * (width - free_cells), "suggestion"))
+    green = size_bar(free_eighths / 8, budget)
+    whole = len(green.rstrip("▏▎▍▌▋▊▉"))
+    boundary = green[whole:]
+    result = (Span("█" * whole, "success"),)
+    if boundary:
+        result += (Span(boundary, "success", background="suggestion" if free_eighths < total_eighths else "default"),)
+    remaining = max(0, total_eighths - len(green) * 8)
+    return (*result, Span(size_bar(remaining / 8, budget), "suggestion"))
 
-    def add(line: Line = (), indent: int = 2) -> None:
-        lines.extend(wrap(line, columns, indent))
 
-    add((Span(f"Build queue {clock(model, now, seconds=True)} · {len(running)} running · {len(waiting)} waiting · "
-              + head_state(model), bold=True),))
-    counts = Counter("other" if (name := field(step_labels(step, model.labels).showrunner)) in ("—", "") else name
-                     for step in waiting)
-    productions = " · ".join(f"{name} {count}" for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])))
-    add((Span("Waiting by production: " + (productions or "none")),))
-    add()
-    add((Span("Running", bold=True),))
-    add((Span("             ran    using  step      held  " + ("production · " if columns >= 100 else "") + "unit · session"),))
-    for step, records in zip(running, model.moves.running):
-        mark = f"↑{records[0].old_position}" if records else ""
-        ran = "—" if isinstance(step.admitted_at, gate.AdmissionTimeNotRecorded) else f"{age(step.admitted_at, now)} min"
-        using = f"{step.measured / gate.GIB:.1f}" if isinstance(step.step.measured, gate.MeasuredMemory) else "—"
-        prefix = (Span("● ", "success"), Span(pad_left(mark, 5), "warning" if mark else "default"), Span(pad_left(ran, 8)),
-                  Span(pad_left(using, 9) + "  " + pad_right(field(step.step.step), 7) + pad_left(f"{step.charged / gate.GIB:.1f}", 6) + "  "))
-        lines.append(step_row(prefix, step.step, model, columns))
-    if not running:
-        add((Span("  none", "inactive"),))
-    add()
-    add((Span("Waiting · moved-up steps (↑) go first, newest move first; then the longest wait first."),))
-    add((Span("          A long wait alone does not make a step next."),), 10)
-    for line in move_lines(model):
-        add(line, 4)
-    add()
-    starts = "  starts" if columns >= 80 else ""
+def render_view(model: QueueModel, columns: int, *, colour: bool = False, you: str = "") -> list[Line]:
+    explanation = model.reading.explanation
+    head, host = explanation.head, explanation.host
+    budget_bytes = (host.budget if isinstance(host, gate.HostAvailable) else
+                    head.budget.budget if isinstance(head, gate.HeadExplanation) else gate.BUILD_BUDGET_BYTES)
+    budget = budget_bytes / gate.GIB
+    taken = explanation.totals.charged / gate.GIB
+    free = max(0.0, budget - taken)
+    waiting = model.reading.view.waiting
+    identities = [step_labels(step, model.labels) for step in waiting]
+    names = [(field(identity.showrunner) or "—",
+              field(identity.unit).removeprefix(field(identity.showrunner) + "-") or "—") for identity in identities]
+    bars = [size_bar(step.need / gate.GIB, budget) for step in waiting]
+    status = head_status(model, budget_bytes)
+    labels: Line = (Span(f"free {free:.1f}", "success"), Span(" │ ", "inactive"),
+                    Span(f"taken {taken:.1f}", "suggestion"))
     place_width = max(2, len(str(len(waiting))))
-    add((Span(f"  {pad_left('#', place_width)}      waited{starts}  step     needs  " + ("production · " if columns >= 100 else "") + "unit · session"),))
-    for position, step in enumerate(waiting, 1):
-        waited = age(step.since, now)
-        mark = move_mark(model, position)
-        prefix = (Span("■ " if position == 1 else "  ", "error" if position == 1 else "default"),
-                  Span(pad_left(str(position), place_width) + " "), Span(pad_right(mark, 4), "warning" if mark else "default"),
-                  Span(pad_left(f"{waited} min", 7), "warning" if waited >= 30 else "default"))
-        if columns >= 80:
-            prefix += (Span(pad_left(start_text(model, position), 9)),)
-        prefix += (Span("  " + pad_right(field(step.step), 7) + pad_left(f"{step.need / gate.GIB:.1f}", 6) + "  "),)
-        lines.append(step_row(prefix, step, model, columns))
-        if position == 1:
-            checks = step_checks(model, 1)
-            for index, check in enumerate(check_lines(checks, model)):
-                add((Span("         #1 waits on  " if index == 0 else "                      "), *check), 22)
-            if isinstance(model.facts, head_facts.HeadFacts):
-                if isinstance(model.facts.head_time, head_facts.RecordedHeadTime):
-                    add((Span("         " + head_facts.head_time_text(model.facts, model.zone)),), 9)
-                token = head_facts.head_token_text(model.facts, model.zone)
-                if token:
-                    add((Span("         " + token),), 9)
-            for line in rest_lines(model):
-                add((Span("         "), *line), 9)
-    if not waiting:
-        add((Span("  none", "inactive"),))
-    add()
-    if isinstance(model.pace, head_facts.RecordedPace) and model.pace.steps:
-        add((Span(f"Memory in GiB. starts: an estimate at the last hour's pace, {model.pace.steps} steps an hour."),))
-    else:
-        add((Span("Memory in GiB. starts: no step ended in the last hour."),))
-    add((Span("One step: /build:queue 4 (or a session name or folder)"),))
-    return lines
+    minutes_width = max(3, max((len(str(age(step.since, explanation.now))) for step in waiting), default=0))
+    # All rows share these widths, including when the head's state needs more room.
+    fixed = place_width + 1 + 1 + 1 + 7 + 1 + minutes_width + 1
+    tail = max(terminal_width(plain([labels])), (bar_eighths(budget, budget) + 7) // 8,
+               max((len(bar) + len(f" {step.need / gate.GIB:.1f}") +
+                    (terminal_width(plain([status])) if index == 0 else 0)
+                    for index, (step, bar) in enumerate(zip(waiting, bars))), default=0))
+    show_width, unit_width = 12, 10
+    room = columns - fixed - tail
+    if columns > 60:
+        longest_show = max((terminal_width(show) for show, _ in names), default=12)
+        longest_unit = max((terminal_width(unit) for _, unit in names), default=10)
+        while show_width + unit_width < room and (show_width < longest_show or unit_width < longest_unit):
+            if show_width < longest_show:
+                show_width += 1
+            if show_width + unit_width < room and unit_width < longest_unit:
+                unit_width += 1
+    while show_width + unit_width > room and (show_width > 3 or unit_width > 3):
+        if show_width > 3:
+            show_width -= 1
+        if show_width + unit_width > room and unit_width > 3:
+            unit_width -= 1
+    bar_column = fixed + show_width + unit_width
+    budget_label = f"budget {budget:.1f}"
+    lines: list[Line] = [
+        (Span(f"Build queue · {clock(model, explanation.now)}", "inactive"),), (),
+        (Span(" " * bar_column), *labels),
+        (Span(pad_right(budget_label, bar_column), "inactive"), *budget_bar(budget, free, colour=colour)), (),
+        (Span(pad_left("#", place_width) + " " + pad_right(cut_tail("showrunner", show_width), show_width) + " "
+              + pad_right(cut_tail("unit", unit_width), unit_width) + " " + pad_right("step", 7) + " "
+              + pad_left("min", minutes_width) + " need", "inactive"),),
+    ]
+    for index, (step, (show, unit), bar) in enumerate(zip(waiting, names, bars)):
+        tone = "warning" if index == 0 else "inactive"
+        row: Line = (
+            Span(pad_left(str(index + 1), place_width), tone),
+            Span("▸", "suggestion") if you and step.session_id == you else Span(" "),
+            Span(pad_right(cut_tail(show, show_width), show_width) + " "),
+            Span(pad_right(cut_tail(unit, unit_width), unit_width) + " ", "suggestion"),
+            Span(pad_right(cut_tail(field(step.step), 7), 7) + " "),
+            Span(pad_left(str(age(step.since, explanation.now)), minutes_width) + " ", "inactive"),
+            Span(bar, "warning"), Span(f" {step.need / gate.GIB:.1f}", tone),
+        )
+        lines.append((*row, *status) if index == 0 else row)
+    return [clip(line, columns) for line in lines]

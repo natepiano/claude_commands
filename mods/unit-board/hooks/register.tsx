@@ -269,10 +269,14 @@ type QueueReady = Extract<QueuePaneState, { kind: 'queue' }>;
 function validQueueLines(value: unknown): value is QueueLines {
   if (!value || typeof value !== 'object') return false;
   const data = value as QueueLines;
-  const tones = ['default', 'success', 'error', 'warning', 'inactive'];
+  const tones = ['default', 'success', 'error', 'warning', 'inactive', 'suggestion'];
   return Number.isInteger(data.columns) && data.columns > 0 && Number.isFinite(data.as_of)
     && Array.isArray(data.lines) && data.lines.every(line => Array.isArray(line) && line.every(
-      part => part && typeof part.text === 'string' && tones.includes(part.tone) && typeof part.bold === 'boolean'));
+      part => part && typeof part.text === 'string'
+        && (part.tone === undefined || tones.includes(part.tone))
+        && (part.bold === undefined || typeof part.bold === 'boolean')
+        && (part.background === undefined || tones.includes(part.background))
+        && (part.until === undefined || Number.isFinite(part.until))));
 }
 function normalizeQueueState(value: unknown): QueuePaneState {
   const saved = value && typeof value === 'object' ? value as Record<string, unknown> : {};
@@ -297,7 +301,8 @@ function queuePaneCalls($: EngineInterface, opening: QueueOpening = { kind: 'sav
     load: async (...[, isOpen]) => {
       const state = normalizeQueueState((await $.state.get(QUEUE_PANES)).value?.[QUEUE]);
       if (!isOpen()) throw new Error('Pane closed.');
-      const args = ['--json', '--columns', String(queueColumns)];
+      const args = ['--json', '--columns', String(queueColumns), '--you', await $.session.id()];
+      if (!isOpen()) throw new Error('Pane closed.');
       const selector = state.selector;
       if (selector !== null) args.push(selector);
       const data: unknown = JSON.parse(await queueRun($, args, isOpen));
@@ -327,6 +332,14 @@ function queuePaneCalls($: EngineInterface, opening: QueueOpening = { kind: 'sav
 
 export const register: Register = on => {
   const opened = new Map<string, OpenPane>();
+  type CountdownRedraw = { kind: 'idle' } | { kind: 'ticking'; timer: Timer };
+  let countdownRedraw: CountdownRedraw = { kind: 'idle' };
+  let countdownGeneration = 0;
+  const stopCountdown = () => {
+    countdownGeneration++;
+    if (countdownRedraw.kind === 'ticking') countdownRedraw.timer.cancel();
+    countdownRedraw = { kind: 'idle' };
+  };
   const accounts = tablePane<AccountsReady, AccountsZone>({ failure: 'Stored accounts status could not be read.', refresh: 'changed' });
   const queue = tablePane<QueueReady, void>({ failure: 'Build queue could not be read.', refresh: 'always' });
 
@@ -390,6 +403,7 @@ export const register: Register = on => {
   on('command.run', { command: 'build:queue' }, async ($, e) => {
     const wanted = e.args.trim();
     if (wanted === 'close') {
+      stopCountdown();
       await $.ui.close({ id: QUEUE });
       return { text: 'Build queue closed.' };
     }
@@ -418,7 +432,10 @@ export const register: Register = on => {
   on('ui.close', async ($, e, next) => {
     if (e.id === PANE) await stop($, opened, e.id);
     if (e.id === ACCOUNTS) await accounts.stop(accountsPaneCalls($));
-    if (e.id === QUEUE) await queue.stop(queuePaneCalls($));
+    if (e.id === QUEUE) {
+      stopCountdown();
+      await queue.stop(queuePaneCalls($));
+    }
     return next(e);
   });
   on('ui.render', { component: 'Pane', requestId: ACCOUNTS }, async ($, e) => {
@@ -430,18 +447,28 @@ export const register: Register = on => {
     return AccountsView(elements, e.props.bodyColumns, state.data, state.zone, state.now);
   });
   on('ui.render', { component: 'Pane', requestId: QUEUE }, async ($, e) => {
+    const generation = countdownGeneration;
     queueColumns = Math.max(1, Math.floor(e.props.bodyColumns));
     const state = normalizeQueueState((await $.state.get(QUEUE_PANES)).value?.[QUEUE]);
     const elements = $.ui.resolve(e);
     const { Text } = elements;
-    if (state.kind === 'loading') return <Text color="inactive">Loading build queue…</Text>;
-    if (state.kind === 'failed') return <Text color="error">{state.reason}</Text>;
+    if (state.kind !== 'queue') {
+      stopCountdown();
+      return state.kind === 'loading' ? <Text color="inactive">Loading build queue…</Text>
+        : <Text color="error">{state.reason}</Text>;
+    }
+    const now = await $.clock.now() / 1000;
+    if (state.data.lines.some(line => line.some(part => part.until !== undefined && part.until > now))) {
+      if ((await $.ui.panes()).some(pane => pane.id === QUEUE)
+        && generation === countdownGeneration && countdownRedraw.kind === 'idle') countdownRedraw = { kind: 'ticking',
+        timer: $.clock.every(1000, () => $.ui.invalidate('ui.render')) };
+    } else stopCountdown();
     if (queueColumns !== state.data.columns
       && (queueWidthRefresh.kind === 'idle' || queueWidthRefresh.columns !== queueColumns)) {
       queueWidthRefresh = { kind: 'requested', columns: queueColumns };
       void queue.refresh(queuePaneCalls($), true);
     } else if (queueColumns === state.data.columns) queueWidthRefresh = { kind: 'idle' };
-    return QueueView(elements, queueColumns, state.data);
+    return QueueView(elements, queueColumns, state.data, now);
   });
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const state = await readPane($, PANE);

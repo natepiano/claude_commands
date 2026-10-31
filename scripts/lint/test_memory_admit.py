@@ -3669,6 +3669,28 @@ class StrictHeadRoomTests(MemoryQueueFixture):
         self.readings[pid] = gate.MeasuredMemory(0)
         return self.check(pid=pid, need=need, free=60)
 
+    def test_strict_room_matches_decision_room_and_window_clause(self) -> None:
+        for need, expected_room, text in (
+                (7, 14, "younger steps may use 14.0 GiB of the budget until 18:10"),
+                (21, 0, "younger steps wait until 18:10"),
+                (22, -1, "younger steps wait until 18:10")):
+            with self.subTest(head_need=need):
+                head: gate.Waiter = {"pid": 300, "start_time": "300", "need": need * GIB,
+                    "since": 0, "priority_since": NOW.timestamp(), "holds_younger": True}
+                younger: gate.Waiter = {"pid": 400, "start_time": "400", "need": GIB, "since": 1}
+                window = gate.StrictUntil(NOW.timestamp() + 600)
+                decision = gate.queue_decision(60 * GIB, 60 * GIB, younger, [head, younger], [],
+                    gate.HeadPriority(head, window), gate.NoPressureHold(),
+                    recovery=gate.NoRecoverySpacing(), now=NOW.timestamp())
+                self.assertEqual(gate.strict_room(21 * GIB, need * GIB), expected_room * GIB)
+                self.assertIsInstance(decision.head_room, gate.HeadRoom)
+                room = cast(gate.HeadRoom, decision.head_room)
+                self.assertEqual((room.head_need, room.used, room.room, room.passes),
+                                 (need * GIB, 0, expected_room * GIB, need == 7))
+                self.assertEqual(decision.state, "admit" if need == 7 else "hold")
+                self.assertEqual(gate.window_clause(window, 21 * GIB, need * GIB,
+                                                   ZoneInfo("America/New_York")), text)
+
     def test_fitting_strict_head_keeps_its_place_when_younger_polls_first(self) -> None:
         for need, free in ((4, 60), (5, 60), (4, 11)):
             with self.subTest(need=need, free=free):
@@ -4130,7 +4152,7 @@ class QueueApiTests(MemoryQueueFixture):
                 with self.assertRaises(gate.BumpOff) as refused:
                     gate.bump_waiter(selector, "actor")
                 self.assertEqual(str(refused.exception),
-                                 "only the user can bump; bump is off until /showrunner:bump sets queue priority")
+                                 "bump is off; nothing can move a waiting step")
             self.assertEqual({path: path.read_bytes() for path in paths}, before)
             self.assertEqual(gate.queue_view(), original)
             self.assertEqual(buildlog_rows(self.root), [])
@@ -5198,6 +5220,39 @@ class QueueExplanationTests(MemoryQueueFixture):
                          [(6 * GIB, GIB, 6 * GIB, NOW.timestamp() - 30),
                           (4 * GIB, 2 * GIB, 4 * GIB, NOW.timestamp() - 30)])
         self.assertTrue(all(isinstance(step.basis, gate.RampPromise) for step in explanation.running))
+
+    def test_old_head_without_priority_never_reports_a_moving_window(self) -> None:
+        path = self.waiting(300, 15 * GIB, 20)
+        before = path.read_bytes()
+        for now in (NOW.timestamp(), NOW.timestamp() + 60):
+            with self.subTest(now=now), patch.object(time, "time", return_value=now):
+                reading = gate.locked_queue_read()
+                head = reading.explanation.head
+                self.assertIsInstance(head, gate.HeadExplanation)
+                assert isinstance(head, gate.HeadExplanation)
+                self.assertFalse(head.has_priority)
+                self.assertIsInstance(head.order, gate.WindowNotStarted)
+                self.assertEqual(head.decision.state, "hold")
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_recorded_priority_retains_its_fixed_strict_end(self) -> None:
+        _ = self.waiting(300, 12 * GIB, 20, bump_order=-1, priority_since=NOW.timestamp() - 60)
+        head = gate.explain_queue().head
+        assert isinstance(head, gate.HeadExplanation)
+        self.assertTrue(head.has_priority)
+        self.assertEqual(head.order, gate.StrictUntil(NOW.timestamp() + 540))
+
+    def test_host_pressure_prevents_every_follower_from_counting_as_fitting(self) -> None:
+        _ = self.waiting(300, 20 * GIB, 20)
+        _ = self.waiting(400, GIB, 1)
+        for full in (0, 11):
+            with self.subTest(full=full):
+                _ = (self.root / "pressure").write_text(
+                    f"full avg10={full}.00 avg60=0.00 avg300=0.00 total=0\n")
+                explanation = gate.explain_queue()
+                self.assertEqual(len(explanation.line.steps), 1)
+                self.assertEqual(explanation.line.steps[0].fits_now, full == 0)
+                self.assertEqual(explanation.line.fitting, 1 if full == 0 else 0)
 
     def test_old_waiter_without_source_has_an_explicit_unrecorded_variant(self) -> None:
         path = self.waiting(300, 12 * GIB, 20)

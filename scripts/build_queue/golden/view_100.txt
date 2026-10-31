@@ -1,56 +1,38 @@
-Build queue 10:46:12 · 1 running · 32 waiting · #1 waits on memory pressure, budget
-Waiting by production: tool-based-ui 19 · cargo-liner 6 · performance 4 · cargo-liner-style 3
+Build queue · 10:46
 
-Running
-             ran    using  step      held  production · unit · session
-●   ↑29   0 min      5.1  nextest  11.1  tool-based-ui · widget · widget-enhancements-title
+                                                   free 4.4 │ taken 16.6
+budget 21.0                                        ░░░░█████████████████
 
-Waiting · moved-up steps (↑) go first, newest move first; then the longest wait first.
-          A long wait alone does not make a step next.
-  ↑ #1 moved up: from #27 by work-lead at 10:40; from #1 by work-lead at 10:46
-  ↑ running nextest moved up: from #29 by widget at 10:43
-  ↑ #2 moved up: from #27 by work-lead at 10:40
-
-   #      waited  starts  step     needs  production · unit · session
-■  1 ↑27   6 min   ~1 min  nextest  11.5  tool-based-ui · cables · work-lead
-         #1 waits on  ✗ memory pressure: full avg10 7.7 now; starts below 5.0
-                      ✗ build budget: 11.1 of 21.0 GiB held; needs 11.5; starts when held falls to
-                      9.5
-                      ✓ free memory 24.5 GiB; needs 20.5: this step 11.5 + earlyoom 3.0 + promised
-                      not yet used 6.0
-         #2-#32: younger steps may use 9.5 GiB of the budget until 10:56 (9 min 48 s left); 4 of 31
-         fit now
-   2 ↑27   6 min   ~3 min  nextest  11.5  tool-based-ui · cables · work-lead
-   3      39 min   ~4 min  mend      7.6  tool-based-ui · hana-migration
-   4      37 min   ~5 min  clippy    2.9  cargo-liner · berth · cargo-liner-berth-parallel-impl
-   5      36 min   ~7 min  mend      7.6  tool-based-ui · cables · work-pan
-   6      35 min   ~8 min  nextest  10.8  tool-based-ui · lfo · hana_catalyst-lfo-impl6
-   7      35 min  ~10 min  doc       3.5  cargo-liner-style · cargo-liner-style-modules
-   8      33 min  ~11 min  nextest   1.8  cargo-liner-style
-   9      32 min  ~12 min  mend      7.6  performance · metrics-gathering · tool-based-ui-frame-tim…
-  10      31 min  ~14 min  clippy    6.8  tool-based-ui · hana
-  11      31 min  ~15 min  doc       3.5  cargo-liner-style · cargo-liner-style-types
-  12      30 min  ~16 min  nextest   1.0  tool-based-ui · geometry-material · organon-w89
-  13      30 min  ~18 min  doc       4.4  tool-based-ui · trunk · tool-based-ui-trunk-portal
-  14      30 min  ~19 min  clippy    3.0  cargo-liner · handler
-  15      27 min  ~20 min  clippy    6.8  tool-based-ui · demo · tool-based-ui-demo-impl
-  16      24 min  ~22 min  doc       4.4  tool-based-ui · trunk · tool-based-ui-trunk-fix2
-  17      24 min  ~23 min  mend      3.2  cargo-liner · port · cargo-liner-port-impl
-  18      24 min  ~25 min  nextest   1.8  cargo-liner · port · cargo-liner-port-impl
-  19      21 min  ~26 min  nextest  11.5  tool-based-ui · inspectors · hana_catalyst-inspectors-fix2
-  20      20 min  ~27 min  mend      7.6  tool-based-ui · demo · tool-based-ui-demo-impl3
-  21      14 min  ~29 min  nextest  10.8  tool-based-ui · startup · tool-based-ui-startup-fix2
-  22      14 min  ~30 min  clippy    6.1  tool-based-ui · geometry-material · organon-w74
-  23      10 min  ~31 min  nextest  12.1  tool-based-ui · hana-migration
-  24      10 min  ~33 min  nextest  12.1  performance · metrics-gathering · tool-based-ui-frame-tim…
-  25       9 min  ~34 min  nextest   1.8  cargo-liner · handler
-  26       8 min  ~35 min  nextest   8.5  performance · metrics-gathering · tool-based-ui-frame-tim…
-  27       8 min  ~37 min  nextest  12.1  performance · benchmark
-  28       6 min  ~38 min  nextest  10.8  cargo-liner · tile · cargo-liner-tile-fixes-impl
-  29       3 min  ~40 min  nextest   1.0  tool-based-ui · lfo · hana_catalyst-lfo-test2
-  30       2 min  ~41 min  nextest  10.8  tool-based-ui · trunk · tool-based-ui-trunk-fix3
-  31       1 min  ~42 min  clippy    6.8  tool-based-ui · fastest · hana_catalyst-build-speed-tests…
-  32       0 min  ~44 min  clippy    6.8  tool-based-ui · assembly · hana_catalyst-assembly-impl
-
-Memory in GiB. starts: an estimate at the last hour's pace, 44 steps an hour.
-One step: /build:queue 4 (or a session name or folder)
+ # showrunner        unit              step    min need
+ 1▸tool-based-ui     cables            nextest   6 ██████▊ 6.8 ↑ ≤14.2 9:18
+ 2▸tool-based-ui     cables            nextest   6 ███████████▌ 11.5
+ 3 tool-based-ui     hana-migration    mend     39 ███████▋ 7.6
+ 4 cargo-liner       berth             clippy   37 ██▉ 2.9
+ 5 tool-based-ui     cables            mend     36 ███████▋ 7.6
+ 6 tool-based-ui     lfo               nextest  35 ██████████▊ 10.8
+ 7 cargo-liner-style modules           doc      35 ███▌ 3.5
+ 8 cargo-liner-style —                 nextest  33 █▊ 1.8
+ 9 performance       metrics-gathering mend     32 ███████▋ 7.6
+10 tool-based-ui     —                 clippy   31 ██████▊ 6.8
+11 cargo-liner-style types             doc      31 ███▌ 3.5
+12 tool-based-ui     geometry-material nextest  30 █ 1.0
+13 tool-based-ui     trunk             doc      30 ████▍ 4.4
+14 cargo-liner       handler           clippy   30 ███ 3.0
+15 tool-based-ui     demo              clippy   27 ██████▊ 6.8
+16 tool-based-ui     trunk             doc      24 ████▍ 4.4
+17 cargo-liner       port              mend     24 ███▎ 3.2
+18 cargo-liner       port              nextest  24 █▊ 1.8
+19 tool-based-ui     inspectors        nextest  21 ███████████▌ 11.5
+20 tool-based-ui     demo              mend     20 ███████▋ 7.6
+21 tool-based-ui     startup           nextest  14 ██████████▊ 10.8
+22 tool-based-ui     geometry-material clippy   14 ██████▏ 6.1
+23 tool-based-ui     hana-migration    nextest  10 ████████████▏ 12.1
+24 performance       metrics-gathering nextest  10 ████████████▏ 12.1
+25 cargo-liner       handler           nextest   9 █▊ 1.8
+26 performance       metrics-gathering nextest   8 ████████▌ 8.5
+27 performance       benchmark         nextest   8 ████████████▏ 12.1
+28 cargo-liner       tile              nextest   6 ██████████▊ 10.8
+29 tool-based-ui     lfo               nextest   3 █ 1.0
+30 tool-based-ui     trunk             nextest   2 ██████████▊ 10.8
+31 tool-based-ui     fastest           clippy    1 ██████▊ 6.8
+32 tool-based-ui     assembly          clippy    0 ██████▊ 6.8

@@ -115,7 +115,7 @@ class HeadFacts:
     joined_at: float
     head_time: HeadTimeNotRecorded | RecordedHeadTime
     bumps: BumpsUnavailable | BumpHistory
-    order: gate.StrictUntil | gate.BackfillUntil
+    order: gate.StrictUntil | gate.BackfillUntil | gate.WindowNotStarted
     has_priority: bool
     token_waits: TokenWaitsNotRecorded | RecordedTokenWaits
     bump: gate.QueueBump | gate.NoBump = gate.NoBump()
@@ -437,6 +437,8 @@ def bump_remainder(facts: HeadFacts) -> str:
 def order_text(facts: HeadFacts, zone: ZoneInfo, *, include_record: bool = True) -> str:
     if not facts.has_priority:
         return "no head priority: younger steps that fit may start"
+    if isinstance(facts.order, gate.WindowNotStarted):
+        return "head priority: window start not recorded; younger steps wait"
     remaining = max(0, int(facts.order.deadline - facts.now))
     minutes, seconds = divmod(remaining, 60)
     text = gate.window_clause(facts.order, facts.budget, facts.head_need, zone)

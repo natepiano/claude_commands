@@ -5,16 +5,16 @@ from dataclasses import replace
 from statistics import median
 import time
 import unittest
-from typing import cast
-from pathlib import Path
 from unittest import mock
 
 from scripts.build_queue import head_facts, queue_view
 from scripts.build_queue.queue_fixture import (
-    GOLDEN, NOW, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
+    ASKING_SESSION, GOLDEN, NOW, QueueFixture, QueueFixtureTests, queue_read_fixture, waiting_rows, with_waiting,
 )
-from scripts.build_queue.queue_lines import plain, terminal_width
+from scripts.build_queue.queue_lines import json_form, plain, terminal_width, wrap
 from scripts.lint import memory_admit as gate
+from scripts.message.unit_labels import UnitLabels
+from scripts.lint.memory_test_support import fake_memory_readings
 
 
 class QueueViewTests(QueueFixtureTests):
@@ -46,6 +46,7 @@ class QueueViewTests(QueueFixtureTests):
                              f"5000 unrelated moves: {indexed:.6f}s; none: {baseline:.6f}s")
         print(f"queue history render: none {baseline:.6f}s; 5000 unrelated {indexed:.6f}s")
 
+
     def test_name_column_stays_aligned_when_places_grow_to_three_digits(self) -> None:
         model = self.fixture.model()
         step = model.reading.view.waiting[0]
@@ -58,205 +59,348 @@ class QueueViewTests(QueueFixtureTests):
         self.assertEqual(terminal_width(rows[98][:rows[98].index("tool-based-ui")]),
                          terminal_width(rows[99][:rows[99].index("tool-based-ui")]))
 
-    def test_captured_queue_matches_golden_at_three_widths(self) -> None:
-        model = self.fixture.model()
-        for columns in (80, 100, 140):
-            with self.subTest(columns=columns):
-                self.assertEqual(plain(queue_view.render_view(model, columns)) + "\n",
-                                 (GOLDEN / f"view_{columns}.txt").read_text())
 
-    def test_every_width_keeps_exactly_one_row_per_step_and_fits_the_edge(self) -> None:
-        model = self.fixture.model()
+    def test_every_width_keeps_one_waiting_row_per_step_without_running_records(self) -> None:
         for columns in (30, 40, 60, 80, 100, 140, 400):
             with self.subTest(columns=columns):
-                lines = queue_view.render_view(model, columns)
-                rows = waiting_rows(lines)
+                rendered = queue_view.render_view(self.fixture.budget_model(), columns)
+                rows = waiting_rows(rendered)
                 self.assertEqual(len(rows), 32)
-                self.assertEqual([int(row[2:4]) for row in rows], list(range(1, 33)))
-                self.assertEqual(sum(plain([line]).startswith("●") for line in lines), 1)
-                self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
+                self.assertEqual([int(row.split()[0]) for row in rows], list(range(1, 33)))
+                self.assertTrue(all(terminal_width(plain([line])) <= columns for line in rendered))
                 self.assertFalse(any(row.startswith("Session:") for row in rows))
-                if columns < 80:
-                    self.assertFalse(any("~" in row for row in rows))
-                    self.assertTrue(all("starts" not in plain([line]) for line in lines
-                                        if "waited" in plain([line])))
-                else:
-                    self.assertIn("~1 min", rows[0])
-                if 80 <= columns < 100:
-                    self.assertNotIn("tool-based-ui", rows[0])
-                    self.assertIn("cables · work-lead", rows[0])
-                    self.assertIn("Waiting by production: tool-based-ui 19", plain(lines))
-                if columns == 40:
-                    self.assertTrue(any(row.endswith("…") for row in rows))
+                for removed in ("●", "Running", "starts", "moved up:", "#1 waits on"):
+                    self.assertNotIn(removed, plain(rendered))
 
-    def test_head_checks_survive_wide_and_narrow_wrapping_with_failure_tones(self) -> None:
+    def test_card_checks_keep_all_numbers_and_failure_tones_when_wrapped(self) -> None:
+        model = self.fixture.model()
         for columns in (400, 60, 30):
             with self.subTest(columns=columns):
-                lines = queue_view.render_view(self.fixture.model(), columns)
-                # Narrow rows can split a word; every nonspace character survives.
+                lines = [row for check in queue_view.check_lines(queue_view.step_checks(model, 1), model)
+                         for row in wrap(check, columns)]
                 text = "".join(plain(lines).split())
                 for fact in ("✗ memory pressure: full avg10 7.7 now; starts below 5.0",
                              "✗ build budget: 11.1 of 21.0 GiB held; needs 11.5; starts when held falls to 9.5",
                              "✓ free memory 24.5 GiB; needs 20.5: this step 11.5 + earlyoom 3.0 + promised not yet used 6.0"):
                     self.assertIn("".join(fact.split()), text)
-                self.assertEqual(sum(span.text.count("✗") for line in lines for span in line
-                                     if span.tone == "error"), 2)
-                self.assertEqual(sum(span.text.count("✓") for line in lines for span in line
-                                     if span.tone == "success"), 1)
+                self.assertEqual(sum(span.text.count("✗") for row in lines for span in row if span.tone == "error"), 2)
+                self.assertEqual(sum(span.text.count("✓") for row in lines for span in row if span.tone == "success"), 1)
 
-    def test_step_columns_align_wide_and_combining_step_names_by_cells(self) -> None:
-        model = self.fixture.model()
+    def test_step_columns_align_wide_and_combining_names_by_cells(self) -> None:
+        model = self.fixture.budget_model()
         first, second = model.reading.view.waiting[:2]
         model = with_waiting(model, [replace(first, step="界e\u0301"), replace(second, step="doc")])
         rows = waiting_rows(queue_view.render_view(model, 140))
-        need_edges = [terminal_width(row[:row.index("11.5") + 4]) for row in rows]
-        name_edges = [terminal_width(row[:row.index("tool-based-ui")]) for row in rows]
-        self.assertEqual(need_edges[0], need_edges[1])
-        self.assertEqual(name_edges[0], name_edges[1])
+        for marker in ("tool-based-ui", "█"):
+            self.assertEqual(terminal_width(rows[0][:rows[0].index(marker)]),
+                             terminal_width(rows[1][:rows[1].index(marker)]))
         self.assertIn("界e\u0301", rows[0])
-        # The same guarantee applies to the running table.
-        run = model.reading.explanation.running[0]
-        other = replace(run, step=replace(run.step, step="界e\u0301"))
-        model = replace(model, reading=replace(model.reading,
-            explanation=replace(model.reading.explanation, running=(run, other))))
-        runs = [plain([line]) for line in queue_view.render_view(model, 140)
-                if plain([line]).startswith("●")]
-        self.assertEqual(terminal_width(runs[0][:runs[0].index("11.1") + 4]),
-                         terminal_width(runs[1][:runs[1].index("11.1") + 4]))
 
-    def test_old_waits_warn_and_session_names_are_inactive(self) -> None:
-        lines = queue_view.render_view(self.fixture.model(), 140)
-        for waited in ("39 min", "37 min", "30 min"):
-            self.assertTrue(any(waited in span.text and span.tone == "warning"
-                                for line in lines for span in line))
-        self.assertTrue(any(span.text == "work-lead" and span.tone == "inactive"
-                            for line in lines for span in line))
-        row = next(line for line in lines if "39 min" in plain([line]))
-        self.assertEqual(plain([row]).count("hana-migration"), 1)
-
-    def test_strict_rest_is_said_once_after_the_head_checks(self) -> None:
-        text = plain(queue_view.render_view(self.fixture.model(), 400))
-        rest = "#2-#32: younger steps may use 9.5 GiB of the budget until 10:56 (9 min 48 s left); 4 of 31 fit now"
-        self.assertEqual(text.count(rest), 1)
-        self.assertLess(text.index("✓ free memory"), text.index(rest))
-        self.assertLess(text.index(rest), text.index("  2 ↑27"))
-
-    def test_mixed_rest_reasons_group_nonadjacent_places_in_first_place_order(self) -> None:
-        model = self.fixture.model()
-        reasons: tuple[gate.WaitReason, ...] = (
-            gate.NeedsBuildBudget(1, 2, 3), gate.NeedsMemory(),
-            gate.NeedsBuildBudget(1, 2, 3), gate.NeedsMemory(), gate.NeedsMemory(),
-            gate.MemoryPressure(7.7), gate.MemoryPressure(0, next_start_at=NOW + 5),
-            gate.ReadyForAdmission(), gate.ReadingUnavailable(),
-        )
-        steps = [model.reading.view.waiting[0], *[
-            replace(step, reason=reason) for step, reason in zip(model.reading.view.waiting[1:], reasons)]]
-        facts = model.facts
-        self.assertIsInstance(facts, head_facts.HeadFacts)
-        assert isinstance(facts, head_facts.HeadFacts)
-        model = replace(with_waiting(model, steps), facts=replace(facts, has_priority=False))
-        self.assertEqual([plain([line]) for line in queue_view.rest_lines(model)], [
-            "#2 #4: build budget", "#3 #5-#6: free memory", "#7: memory pressure",
-            "#8: recovery spacing", "#9: starts at the next check", "#10: memory reading unavailable",
-        ])
-
-    def test_shared_moves_repeat_history_earliest_mark_and_user_actor(self) -> None:
-        model = self.fixture.model()
+    def test_view_ignores_move_head_time_token_history_and_pace(self) -> None:
+        model = self.fixture.budget_model()
         facts = model.facts
         assert isinstance(facts, head_facts.HeadFacts)
-        records = tuple(replace(record, actor="user:nate") if record.session == "id-work-lead" else record
-                        for record in facts.bump_records if record.old_position != 1)
-        model = replace(model, facts=replace(facts, bump_records=records))
-        text = plain(queue_view.render_view(model, 400))
-        self.assertIn("↑ #1 #2 moved up: from #27 by the user at 10:40", text)
-        self.assertIn("■  1 ↑27", text)
-        original = plain(queue_view.render_view(self.fixture.model(), 400))
-        self.assertIn("↑ #1 moved up: from #27 by work-lead at 10:40; from #1 by work-lead at 10:46", original)
-        self.assertLess(original.index("↑ #1 moved up"), original.index("↑ running nextest moved up"))
-        self.assertLess(original.index("↑ running nextest moved up"), original.index("↑ #2 moved up"))
-        self.assertIn("●", original)
-        self.assertIn("↑29", original)
-
-    def test_move_lines_cap_at_five_and_count_remaining_steps(self) -> None:
-        model = self.fixture.model()
-        facts = model.facts
-        assert isinstance(facts, head_facts.HeadFacts)
-        rows = [(path, dict(row)) for path, row in model.reading.ordered]
-        records: list[head_facts.BumpRecord] = []
-        for index, step in enumerate(model.reading.view.waiting[:7]):
-            rows[index][1]["bump_order"] = -10 + index
-            records.append(head_facts.BumpRecord(NOW - 8 + index, "id-work-lead", step.session_id,
-                                                step.step, step.folder, 30 + index))
-        reading = replace(model.reading, ordered=cast(list[tuple[Path, gate.Waiter]], rows))
-        model = replace(model, reading=reading, facts=replace(facts, bump_records=tuple(records)))
-        text = plain(queue_view.move_lines(model))
-        self.assertEqual(text.count("moved up:"), 5)
-        self.assertIn("and 2 more moved-up steps", text)
-        self.assertLess(text.index("#7 moved"), text.index("#6 moved"))
-
-    def test_unrecorded_or_old_moves_keep_only_the_bare_mark(self) -> None:
-        model = self.fixture.model()
-        facts = model.facts
-        assert isinstance(facts, head_facts.HeadFacts)
-        records = tuple(replace(record, at=NOW - 3600) for record in facts.bump_records)
-        model = replace(model, facts=replace(facts, bump_records=records))
-        rows = waiting_rows(queue_view.render_view(model, 140))
-        self.assertIn("■  1 ↑ ", rows[0])
-        self.assertNotIn("↑27", rows[0])
-        self.assertEqual(queue_view.waiting_moves(model, 1), ())
-
-    def test_failed_bump_read_has_no_marks_or_move_lines(self) -> None:
-        model = self.fixture.model()
-        facts = model.facts
-        assert isinstance(facts, head_facts.HeadFacts)
-        model = replace(model, facts=replace(facts, bumps=head_facts.BumpsUnavailable("unreadable")))
-        rows = waiting_rows(queue_view.render_view(model, 140))
-        self.assertTrue(all("↑" not in row for row in rows))
-        self.assertEqual(queue_view.move_lines(model), [])
-
-    def test_unknown_facts_are_silent_and_known_facts_each_add_one_line(self) -> None:
-        model = self.fixture.model()
-        text = plain(queue_view.render_view(model, 400))
-        for unknown in ("unknown", "no bumps since", "no cargo token wait", "Head for"):
-            self.assertNotIn(unknown, text)
-        facts = model.facts
-        assert isinstance(facts, head_facts.HeadFacts)
+        expected = plain(queue_view.render_view(model, 100))
         wait = head_facts.CargoTokenWait("id-work-lead", "nextest", 1001, "1001", NOW - 200,
                                        head_facts.TokenReturned(NOW - 46))
-        model = replace(model, facts=replace(facts, head_time=head_facts.RecordedHeadTime(NOW - 125),
-            token_waits=head_facts.RecordedTokenWaits((wait,), False, (wait,))))
-        text = plain(queue_view.render_view(model, 400))
-        self.assertEqual(text.count("Head for"), 1)
-        self.assertIn("2 min (since 10:44:07)", text)
-        self.assertEqual(text.count("cargo token: waited 154 s (10:42-10:45)"), 1)
+        for changed in (replace(facts, bumps=head_facts.BumpsUnavailable("unreadable")),
+                        replace(facts, bump_records=()),
+                        replace(facts, head_time=head_facts.RecordedHeadTime(NOW - 125),
+                                token_waits=head_facts.RecordedTokenWaits((wait,), False, (wait,)))):
+            for pace in (head_facts.RecordedPace(0), head_facts.PaceUnavailable()):
+                self.assertEqual(plain(queue_view.render_view(replace(model, facts=changed, pace=pace), 100)), expected)
+        for removed in ("unknown", "cargo token:", "Head for", "moved up:", "starts:"):
+            self.assertNotIn(removed, expected)
 
-    def test_no_pace_displays_dashes_and_the_explicit_footer(self) -> None:
-        for pace in (head_facts.RecordedPace(0), head_facts.PaceUnavailable()):
-            with self.subTest(pace=pace):
-                model = replace(self.fixture.model(), pace=pace)
-                text = plain(queue_view.render_view(model, 140))
-                self.assertIn("starts: no step ended in the last hour", text)
-                self.assertFalse(any("~" in row for row in waiting_rows(queue_view.render_view(model, 140))))
+    def test_empty_queue_keeps_budget_and_header_without_invented_steps(self) -> None:
+        model = self.fixture.budget_model()
+        reading = queue_read_fixture(gate.QueueView((), (), 24 * gate.GIB, 0, 3 * gate.GIB, NOW))
+        rendered = queue_view.render_view(replace(model, reading=reading, facts=gate.NoWaiter()), 100)
+        text = plain(rendered)
+        self.assertTrue(text.startswith("Build queue · 10:46\n\n"))
+        self.assertIn("free 21.0 │ taken 0.0", text)
+        self.assertIn("budget 21.0", text)
+        self.assertEqual(waiting_rows(rendered), [])
+        self.assertNotIn("⊘", text)
+        self.assertNotIn("↑", text)
 
-    def test_empty_queue_has_no_head_or_invented_steps(self) -> None:
-        model = self.fixture.model()
-        reading = gate.QueueRead(gate.QueueView((), (), 24 * gate.GIB, 0, 3 * gate.GIB, NOW),
-            replace(model.reading.explanation, running=(), head=gate.NoWaiter()), [])
-        lines = queue_view.render_view(replace(model, reading=reading, facts=gate.NoWaiter()), 100)
-        text = plain(lines)
-        self.assertIn("0 running · 0 waiting · nothing waits", text)
-        self.assertIn("Waiting by production: none", text)
-        self.assertEqual(waiting_rows(lines), [])
-        self.assertNotIn("#1 waits", text)
-        self.assertNotIn("●", text)
-
-    def test_checks_use_admissions_numbers_without_redeciding(self) -> None:
+    def test_card_checks_use_admissions_numbers_without_redeciding(self) -> None:
         model = self.fixture.model()
         with mock.patch.object(gate, "decide", side_effect=AssertionError("admission decides once")), \
              mock.patch.object(gate, "build_charge", side_effect=AssertionError("recorded charge")):
-            text = plain(queue_view.render_view(model, 400))
+            text = plain(queue_view.check_lines(queue_view.step_checks(model, 1), model))
         self.assertIn("11.1 of 21.0 GiB held; needs 11.5", text)
         self.assertIn("needs 20.5", text)
+
+
+
+
+class BudgetViewTests(QueueFixtureTests):
+    def test_compact_page_matches_reviewed_golden_files(self) -> None:
+        for columns in (60, 80, 100, 140):
+            with self.subTest(columns=columns):
+                lines = queue_view.render_view(self.fixture.budget_model(), columns, you=ASKING_SESSION)
+                self.assertEqual(plain(lines) + "\n", (GOLDEN / f"view_{columns}.txt").read_text())
+                self.assertTrue(all(terminal_width(plain([line])) <= columns for line in lines))
+
+    def test_budget_scale_and_row_columns_match_the_sixty_column_page(self) -> None:
+        model = self.fixture.budget_model()
+        lines = queue_view.render_view(model, 60)
+        text = plain(lines).splitlines()
+        self.assertEqual(text[:2], ["Build queue · 10:46", ""])
+        self.assertEqual(text[2], " " * 36 + "free 4.4 │ taken 16.6")
+        self.assertEqual(text[3], "budget 21.0" + " " * 25 + "░" * 4 + "█" * 17)
+        self.assertEqual(text[4], "")
+        rows = waiting_rows(lines)
+        self.assertEqual(len(rows), 32)
+        self.assertEqual(rows[0][36:], "██████▊ 6.8 ↑ ≤14.2 9:18")
+        self.assertEqual(rows[0][3:13], "tool-base…")
+        self.assertEqual(rows[0][14:23], "cables   ")
+        self.assertEqual(rows[0][24:31], "nextest")
+        self.assertEqual(rows[0][32:35], "  6")
+        self.assertNotIn("Running", plain(lines))
+        self.assertNotIn("moved up", plain(lines))
+        self.assertNotIn("starts", plain(lines))
+
+    def test_colour_budget_has_a_free_fraction_on_taken_background(self) -> None:
+        lines = queue_view.render_view(self.fixture.budget_model(), 60, colour=True)
+        budget = lines[3]
+        free = [span for span in budget if span.tone == "success"]
+        taken = [span for span in budget if span.tone == "suggestion"]
+        self.assertEqual("".join(span.text for span in free), "████▍")
+        self.assertEqual("".join(span.text for span in taken), "█" * 16)
+        boundary = next(span for span in free if "▍" in span.text)
+        self.assertEqual(boundary.background, "suggestion")
+        self.assertEqual(terminal_width(plain([budget])) - 36, 21)
+        wire = json_form(lines, 60, NOW)
+        countdowns = [span for row in wire["lines"] for span in row if "until" in span]
+        self.assertEqual([(span["text"], span["until"]) for span in countdowns], [("9:18", NOW + 558)])
+        self.assertEqual([(span["text"], span["background"]) for row in wire["lines"]
+                          for span in row if "background" in span], [("▍", "suggestion")])
+
+    def test_unreadable_meminfo_reports_no_reading_instead_of_low_memory(self) -> None:
+        _ = fake_memory_readings(self.fixture.root, full_avg10=0.0)
+        (self.fixture.root / "meminfo").unlink()
+        reading = gate.locked_queue_read()
+        head = reading.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        self.assertIsInstance(head.waiter.reason, gate.ReadingUnavailable)
+        self.assertFalse(head.free.passes)
+        model = replace(self.fixture.budget_model(), reading=reading)
+        lines = queue_view.render_view(model, 100, colour=True)
+        first = next(line for line in lines if plain([line]).lstrip().startswith("1 "))
+        self.assertTrue(plain([first]).endswith("no reading"))
+        self.assertNotIn("low memory", plain([first]))
+        self.assertNotIn("pressure", plain([first]))
+        self.assertTrue(any("no reading" in span.text and span.tone == "error" for span in first))
+
+    def test_real_head_decision_distinguishes_low_memory_from_a_budget_only_wait(self) -> None:
+        model = self.fixture.budget_model()
+        for available_gib, budget_gib, free_passes, budget_passes in (
+                (2, 21, False, True), (32, 5, True, False)):
+            with self.subTest(available_gib=available_gib, budget_gib=budget_gib), \
+                    QueueFixture(captured=False) as fixture, \
+                    mock.patch.dict("os.environ", {"BUILDLOG_BUILD_BUDGET_GIB": str(budget_gib)}):
+                _ = fake_memory_readings(fixture.root, available_kib=available_gib * gate.GIB // 1024,
+                                         total_kib=60 * gate.GIB // 1024, full_avg10=0.0)
+                if not budget_passes:
+                    fixture.write_running(used=gate.GIB, need=gate.GIB)
+                _ = fixture.write_waiter({"pid": 123, "start_time": "123", "need": 10 * gate.GIB,
+                    "since": NOW - 900, "session_id": "head-session", "session_name": "head",
+                    "step": "nextest", "folder": "/tmp/head"})
+                reading = gate.locked_queue_read()
+                head = reading.explanation.head
+                assert isinstance(head, gate.HeadExplanation)
+                reason = head.waiter.reason
+                assert isinstance(reason, gate.HeadAdmissionStatus)
+                self.assertEqual(reason.decision.state, "hold")
+                self.assertIsInstance(reason.decision.pressure, gate.NoPressureHold)
+                self.assertEqual(head.free.available, available_gib * gate.GIB)
+                self.assertEqual(head.free.passes, free_passes)
+                self.assertEqual(head.budget.passes, budget_passes)
+                lines = queue_view.render_view(replace(model, reading=reading), 100, colour=True)
+                first = lines[6]
+                if free_passes:
+                    for words in ("low memory", "pressure", "no reading"):
+                        self.assertNotIn(words, plain([first]))
+                else:
+                    self.assertTrue(plain([first]).endswith("low memory"))
+                    self.assertTrue(any("low memory" in span.text and span.tone == "error" for span in first))
+                    self.assertNotIn("pressure", plain([first]))
+                    self.assertNotIn("no reading", plain([first]))
+
+    def test_fractional_budget_with_nothing_taken_matches_its_need_bar_and_is_all_free(self) -> None:
+        model = self.fixture.budget_model()
+        host = model.reading.explanation.host
+        head = model.reading.explanation.head
+        assert isinstance(host, gate.HostAvailable)
+        assert isinstance(head, gate.HeadExplanation)
+        budget = int(21.01 * gate.GIB)
+        step = replace(head.waiter, need=budget)
+        model = with_waiting(model, [step])
+        model = replace(model, reading=replace(model.reading,
+            explanation=replace(model.reading.explanation, host=replace(host, budget=budget),
+                totals=replace(model.reading.explanation.totals, charged=0),
+                head=replace(head, waiter=step, budget=replace(head.budget, need=budget, budget=budget)))))
+        lines = queue_view.render_view(model, 100, colour=True)
+        budget_spans = [span for span in lines[3] if span.tone in ("success", "suggestion") and span.text]
+        need_bar = "".join(span.text for span in lines[6] if span.tone == "warning" and "█" in span.text)
+        self.assertEqual(need_bar, "█" * 21)
+        self.assertEqual("".join(span.text for span in budget_spans), need_bar)
+        self.assertTrue(all(span.tone == "success" and span.background == "default" for span in budget_spans))
+        plain_budget = queue_view.render_view(model, 100)[3]
+        self.assertTrue(plain([plain_budget]).endswith("░" * 21))
+        self.assertNotIn("█", plain([plain_budget]))
+
+    def test_countdown_cut_at_fifty_three_columns_cannot_be_repainted_past_the_edge(self) -> None:
+        model = self.fixture.budget_model()
+        head = model.reading.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        step = replace(head.waiter, need=21 * gate.GIB)
+        model = with_waiting(model, [step, *model.reading.view.waiting[1:]])
+        model = replace(model, reading=replace(model.reading,
+            explanation=replace(model.reading.explanation,
+                head=replace(head, waiter=step, budget=replace(head.budget, need=step.need)))))
+        wide = queue_view.render_view(model, 60, colour=True)
+        self.assertEqual([span.until for span in wide[6] if span.until is not None], [NOW + 558])
+        narrow = queue_view.render_view(model, 53, colour=True)
+        first = narrow[6]
+        self.assertTrue(plain([first]).endswith("…"))
+        self.assertTrue(plain([first]).endswith(" ⊘ …"))
+        self.assertLessEqual(terminal_width(plain([first])), 53)
+        self.assertTrue(all(span.until is None for span in first))
+        self.assertTrue(all("until" not in span for span in json_form(narrow, 53, NOW)["lines"][6]))
+
+    def test_row_styles_and_you_marker_match_the_drawn_page(self) -> None:
+        lines = queue_view.render_view(self.fixture.budget_model(), 60, colour=True, you=ASKING_SESSION)
+        rows = [line for line in lines if plain([line]) in waiting_rows(lines)]
+        for position, row in enumerate(rows, 1):
+            with self.subTest(position=position):
+                self.assertTrue(any(str(position) in span.text and span.tone == ("warning" if position == 1 else "inactive")
+                                    for span in row))
+                self.assertTrue(any(span.tone == "suggestion" and ("cables" in span.text or position > 2)
+                                    for span in row))
+                self.assertEqual(sum(span.text.count("▸") for span in row if span.tone == "suggestion"),
+                                 1 if position <= 2 else 0)
+                self.assertTrue(any(span.tone == "warning" and "█" in span.text for span in row))
+        self.assertEqual(lines[0][0].tone, "inactive")
+
+    def test_taken_over_budget_clamps_free_to_zero_without_growing_the_bar(self) -> None:
+        model = self.fixture.budget_model()
+        reading = replace(model.reading, explanation=replace(model.reading.explanation,
+            totals=replace(model.reading.explanation.totals, charged=25 * gate.GIB)))
+        lines = queue_view.render_view(replace(model, reading=reading), 60, colour=True)
+        self.assertIn("free 0.0 │ taken 25.0", plain([lines[2]]))
+        self.assertEqual(plain([lines[3]])[36:], "█" * 21)
+        self.assertTrue(all(terminal_width(plain([line])) <= 60 for line in lines))
+
+    def test_size_bars_use_nearest_eighth_zero_and_budget_cap(self) -> None:
+        model = self.fixture.budget_model()
+        for need, expected in ((6.8, "██████▊"), (0, ""), (25, "█" * 21)):
+            with self.subTest(need=need):
+                step = replace(model.reading.view.waiting[1], need=int(need * gate.GIB))
+                changed = with_waiting(model, [model.reading.view.waiting[0], step])
+                lines = queue_view.render_view(changed, 100, colour=True)
+                row = next(line for line in lines if plain([line]).lstrip().startswith("2 "))
+                self.assertEqual("".join(span.text for span in row if span.tone == "warning"), expected)
+                self.assertTrue(any(f"{need:.1f}" in span.text and span.tone == "inactive" for span in row))
+
+    def test_long_name_growth_prefix_removal_and_missing_unit(self) -> None:
+        model = self.fixture.budget_model()
+        first, second = model.reading.view.waiting[:2]
+        labels = dict(model.labels)
+        labels[first.session_id] = UnitLabels(
+            "session", "performance", "performance-metrics-viewer")
+        second = replace(second, session_id="no-unit")
+        labels[second.session_id] = UnitLabels("other-session", "tool-based-ui", "—")
+        model = replace(with_waiting(model, [first, second]), labels=labels)
+        for columns in (80, 100, 140):
+            with self.subTest(columns=columns):
+                rows = waiting_rows(queue_view.render_view(model, columns))
+                self.assertIn("metrics-viewer", rows[0])
+                self.assertNotIn("performance-metrics-viewer", rows[0])
+                self.assertIn("tool-based-ui", rows[1])
+                self.assertIn("—", rows[1])
+                self.assertEqual(rows[0].index("nextest"), rows[1].index("nextest"))
+
+    def test_head_states_have_recorded_deadlines_or_no_deadline(self) -> None:
+        model = self.fixture.budget_model()
+        head = model.reading.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        cases: tuple[tuple[float, bool, gate.StrictUntil | gate.BackfillUntil | gate.WindowNotStarted,
+                           dict[str, float], str, float | None], ...] = (
+            (7, True, gate.StrictUntil(NOW + 558), {"priority_since": NOW - 42}, "↑ ≤14.0 9:18", NOW + 558),
+            (21, True, gate.StrictUntil(NOW + 558), {"priority_since": NOW - 42}, "⊘ 9:18", NOW + 558),
+            (22, True, gate.StrictUntil(NOW + 558), {"priority_since": NOW - 42}, "⊘ 9:18", NOW + 558),
+            (7, True, gate.StrictUntil(NOW + 720), {"priority_since": NOW}, "↑ ≤14.0 12:00", NOW + 720),
+            (7, True, gate.StrictUntil(NOW - 1), {"priority_since": NOW - 601}, "↑ ≤14.0 0:00", NOW - 1),
+            (7, True, gate.BackfillUntil(NOW + 78), {"priority_since": NOW - 642}, "↑ 1:18", NOW + 78),
+            (7, False, gate.WindowNotStarted(), {}, "↑", None),
+            (7, True, gate.WindowNotStarted(), {}, "⊘", None),
+        )
+        for need, priority, order, fields, expected, until in cases:
+            for elapsed in (0, 60) if until is None else (0,):
+                with self.subTest(priority=priority, order=order, elapsed=elapsed):
+                    row = dict(model.reading.ordered[0][1])
+                    if "priority_since" in row:
+                        del row["priority_since"]
+                    row.update(fields)
+                    step = replace(head.waiter, need=int(need * gate.GIB))
+                    reading = replace(model.reading,
+                        view=replace(model.reading.view, waiting=(step, *model.reading.view.waiting[1:])),
+                        ordered=[(model.reading.ordered[0][0], row), *model.reading.ordered[1:]],
+                        explanation=replace(model.reading.explanation, now=NOW + elapsed,
+                                            head=replace(head, waiter=step, has_priority=priority, order=order)))
+                    lines = queue_view.render_view(replace(model, reading=reading), 100)
+                    first = next(line for line in lines if plain([line]).lstrip().startswith("1 "))
+                    self.assertTrue(plain([first]).endswith(expected))
+                    spans = [span for span in first if span.until is not None]
+                    self.assertEqual([span.until for span in spans], [] if until is None else [until])
+                    symbol = "⊘" if expected.startswith("⊘") else "↑"
+                    self.assertTrue(any(symbol in span.text and span.tone == ("error" if symbol == "⊘" else "success")
+                                        for span in first))
+
+    def test_strict_room_and_low_memory_fit_sixty_columns_with_shared_alignment(self) -> None:
+        model = self.fixture.budget_model()
+        head = model.reading.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        step = replace(head.waiter, need=7 * gate.GIB, reason=gate.NeedsMemory())
+        model = with_waiting(model, [step, model.reading.view.waiting[1]])
+        model = replace(model, reading=replace(model.reading,
+            explanation=replace(model.reading.explanation, head=replace(head, waiter=step))))
+        lines = queue_view.render_view(model, 60, colour=True)
+        rows = waiting_rows(lines)
+        self.assertTrue(rows[0].endswith("↑ ≤14.0 9:18 low memory"))
+        self.assertTrue(all(terminal_width(plain([line])) <= 60 for line in lines))
+        self.assertEqual(rows[0].index("nextest"), rows[1].index("nextest"))
+        self.assertEqual(rows[0].index("█"), rows[1].index("█"))
+        self.assertTrue(any("↑ ≤14.0" in span.text and span.tone == "success" for span in lines[6]))
+        self.assertTrue(any("low memory" in span.text and span.tone == "error" for span in lines[6]))
+
+    def test_host_holds_add_short_words_and_a_large_head_keeps_columns_aligned(self) -> None:
+        model = self.fixture.budget_model()
+        head = model.reading.explanation.head
+        assert isinstance(head, gate.HeadExplanation)
+        for reason, word in ((gate.NeedsMemory(), "low memory"), (gate.MemoryPressure(7.7), "pressure"),
+                             (gate.NeedsBuildBudget(21 * gate.GIB, 16 * gate.GIB, 21 * gate.GIB), "")):
+            with self.subTest(reason=reason):
+                step = replace(head.waiter, reason=reason, need=21 * gate.GIB)
+                changed = with_waiting(model, [step, model.reading.view.waiting[1]])
+                changed = replace(changed, reading=replace(changed.reading,
+                    explanation=replace(changed.reading.explanation, head=replace(head, waiter=step))))
+                lines = queue_view.render_view(changed, 140)
+                first = next(line for line in lines if plain([line]).lstrip().startswith("1 "))
+                if word:
+                    self.assertTrue(plain([first]).endswith(word))
+                    self.assertTrue(any(word in span.text and span.tone == "error" for span in first))
+                else:
+                    self.assertNotIn("low memory", plain([first]))
+                    self.assertNotIn("pressure", plain([first]))
+                narrow = queue_view.render_view(changed, 60)
+                rows = waiting_rows(narrow)
+                self.assertEqual(len(rows), 2)
+                self.assertTrue(all(terminal_width(plain([line])) <= 60 for line in narrow))
+                self.assertEqual(rows[0].index("nextest"), rows[1].index("nextest"))
 
 
 if __name__ == "__main__":

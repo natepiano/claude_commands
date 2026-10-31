@@ -11,6 +11,7 @@ export const DISCOVERY = "/history/runs";
 export const REGISTRY = "/test-home/.local/state/notifier";
 export const CWD = "/test-worktree";
 export const SESSION = "showrunner-session-id";
+export const sessionFixture = { cwd: async () => CWD, id: async () => SESSION };
 export const time = (minutes: number, text: string): BoardTime => ({ at: NOW / 1000 + minutes * 60, text });
 
 export function phase(id: string, status: BoardPhase["status"]): BoardPhase {
@@ -44,12 +45,12 @@ export function fixture(): BoardData {
     }] };
 }
 
-export function hostEngine(on: On, sessionId = () => SESSION) {
+export function hostEngine(on: On, sessionId: () => string | Promise<string> = sessionFixture.id) {
   const panes = new Map<string, UiPane>();
   const opened: string[] = [];
   const closed: string[] = [];
   const forbidden: string[] = [];
-  on("session.id", () => ({ value: sessionId() }));
+  on("session.id", async () => ({ value: await sessionId() }));
   on("session.start", (_$, event) => ({ cwd: event.cwd }));
   on("turn.complete", (_$, event) => ({ text: event.answer }));
   on("command.register", (_$, event) => ({ value: { command: event.name } }));
@@ -85,7 +86,7 @@ export function engineFiles(on: On) {
   on("fs.exists", (_$, e, next) => { stats.push(e.path); return next(e); });
   on("fs.list", (_$, e, next) => { stats.push(e.path); return next(e); });
   on("fs.write", (_$, e, next) => { stats.push(e.path); return next(e); });
-  on("session.cwd", () => ({ value: CWD }));
+  on("session.cwd", async () => ({ value: await sessionFixture.cwd() }));
   on("process.run", (_$, e) => {
     processes.push([...e.argv]);
     if (failure) {
@@ -211,7 +212,7 @@ export function lifecycleHarness() {
       set: async (_key: unknown, value: Record<string, PaneState<BoardData>>) => { calls.push("state"); panes = value; },
     },
     ui: { open: async () => ({ isPlaced: true }) },
-    session: { cwd: async () => CWD, id: async () => SESSION },
+    session: sessionFixture,
     env: { get: async (name: string) => name === "HOME" ? "/test-home" : undefined },
     clock: {
       now: async () => NOW,

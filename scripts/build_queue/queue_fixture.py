@@ -24,6 +24,7 @@ from scripts.build_queue.queue_lines import Line, plain
 
 NOW = datetime(2026, 10, 30, 14, 46, 12, tzinfo=UTC).timestamp()
 ZONE = ZoneInfo("America/New_York")
+ASKING_SESSION = "id-work-lead"
 GOLDEN = Path(__file__).with_name("golden")
 
 # production, unit, session, step, need in GiB, minutes waited, folder
@@ -202,11 +203,7 @@ class QueueFixture(ExitStack):
             self.paths.append(self.write_waiter(row))
         self.labels["id-widget"] = UnitLabels("widget-enhancements-title", "tool-based-ui", "widget")
         self.labels["id-widget-director"] = UnitLabels("widget", "tool-based-ui", "widget")
-        write_process(self.proc, 900, int(5.1 * gate.GIB))
-        self.write_json(self.reservation, {"pid": 900, "start_time": "900", "need": int(11.1 * gate.GIB),
-            "admitted_at": store.utc_iso(NOW - 25), "repo": "hana", "worktree": "/tmp/widget",
-            "sidecar": "", "session_id": "id-widget", "session_name": "widget-enhancements-title",
-            "step": "nextest", "folder": "/tmp/widget"})
+        self.write_running(used=int(5.1 * gate.GIB), need=int(11.1 * gate.GIB))
         self.moves = [self.move(1, NOW - 372, 27), self.move(2, NOW - 372, 27),
             bump_line(NOW - 192, session="id-widget", step="nextest", folder="/tmp/widget",
                       actor="id-widget-director", old_position=29), self.move(1, NOW - 12, 1)]
@@ -217,6 +214,13 @@ class QueueFixture(ExitStack):
     def write_json(path: Path, row: dict[str, object]) -> None:
         if path.write_text(json.dumps(row, separators=(",", ":"))) <= 0:
             raise OSError("empty fixture row")
+
+    def write_running(self, *, used: int, need: int) -> None:
+        write_process(self.proc, 900, used)
+        self.write_json(self.reservation, {"pid": 900, "start_time": "900", "need": need,
+            "admitted_at": store.utc_iso(NOW - 25), "repo": "hana", "worktree": "/tmp/widget",
+            "sidecar": "", "session_id": "id-widget", "session_name": "widget-enhancements-title",
+            "step": "nextest", "folder": "/tmp/widget"})
 
     def write_waiter(self, row: dict[str, object]) -> Path:
         pid = int(str(row["pid"]))
@@ -285,6 +289,27 @@ class QueueFixture(ExitStack):
         return queue_view.QueueModel(reading, self.labels, head_facts.read_head_facts(reading),
                                      head_facts.read_pace(NOW), ZONE)
 
+    def budget_model(self) -> queue_view.QueueModel:
+        """The compact page uses the captured rows and the drawing's budget split."""
+        model = self.model()
+        head = model.reading.explanation.head
+        host = model.reading.explanation.host
+        assert isinstance(head, gate.HeadExplanation)
+        assert isinstance(host, gate.HostAvailable)
+        step = replace(head.waiter, need=int(6.8 * gate.GIB))
+        ordered = [(path, dict(row)) for path, row in model.reading.ordered]
+        ordered[0][1].update(need=step.need, priority_since=NOW - 42)
+        explanation = replace(model.reading.explanation,
+            totals=replace(model.reading.explanation.totals, charged=int(16.6 * gate.GIB)),
+            host=replace(host, pressure=gate.NoPressureHold()),
+            head=replace(head, waiter=step, has_priority=True, order=gate.StrictUntil(NOW + 558),
+                decision=replace(head.decision, pressure=gate.NoPressureHold()),
+                budget=replace(head.budget, need=step.need, charged=int(16.6 * gate.GIB))))
+        reading = replace(model.reading, explanation=explanation,
+            view=replace(model.reading.view, waiting=(step, *model.reading.view.waiting[1:])),
+            ordered=cast(list[tuple[Path, gate.Waiter]], ordered))
+        return replace(model, reading=reading)
+
 
 class QueueFixtureTests(unittest.TestCase):
     fixture: QueueFixture = cast(QueueFixture, cast(object, None))
@@ -306,7 +331,7 @@ def waiting_rows(lines: Sequence[Line]) -> list[str]:
     """Identify step rows by the fixed place column, including a clipped name."""
     import re
     return [text for line in lines
-            if re.match(r"^[■ ] +[0-9]+ (?:↑[0-9]* *)? *[0-9]+ min ", text := plain([line]))]
+            if re.match(r"^ *[0-9]+(?: |▸)", text := plain([line]))]
 
 
 class AdmissionLogTests(unittest.TestCase):

@@ -672,6 +672,11 @@ class StrictUntil:
 
 
 @dataclass(frozen=True)
+class WindowNotStarted:
+    """No recorded priority window has a deadline to display."""
+
+
+@dataclass(frozen=True)
 class HeadAdmissionStatus:
     decision: AdmissionDecision
     need: int
@@ -710,13 +715,19 @@ def head_window(waiter: Waiter, now: float) -> BackfillUntil | StrictUntil:
     return BackfillUntil(cycle_start + cycle)
 
 
+def strict_room(budget: int, head_need: int) -> int:
+    """Budget room available to younger steps during the head's strict window."""
+    return budget - head_need
+
+
 def window_clause(window: BackfillUntil | StrictUntil, budget: int, head_need: int, zone: ZoneInfo) -> str:
     until = datetime.fromtimestamp(window.deadline, zone).strftime("%H:%M")
     if isinstance(window, BackfillUntil):
         return f"younger steps may start until {until}"
-    if head_need >= budget:
+    room = strict_room(budget, head_need)
+    if room <= 0:
         return f"younger steps wait until {until}"
-    return f"younger steps may use {(budget - head_need) / GIB:.1f} GiB of the budget until {until}"
+    return f"younger steps may use {room / GIB:.1f} GiB of the budget until {until}"
 
 
 def head_wait_text(reason: HeadAdmissionStatus, zone: ZoneInfo) -> str:
@@ -860,7 +871,7 @@ class HeadExplanation:
     decision: AdmissionDecision
     budget: BudgetCheck
     free: FreeCheck
-    order: StrictUntil | BackfillUntil
+    order: StrictUntil | BackfillUntil | WindowNotStarted
     has_priority: bool
     bump: QueueBump | NoBump
 
@@ -1086,7 +1097,7 @@ class WaiterGone(FileNotFoundError):
 
 
 class BumpOff(ValueError):
-    """Queue bumps are disabled until user queue priority replaces them."""
+    """Moving a waiting step is disabled."""
 
 
 def blocker_fields(blocker: Blocker) -> dict[str, str]:
@@ -2200,7 +2211,7 @@ def admission_for_waiter(available: int, total: int | UnknownHostTotal, row: Wai
     decision = decide(available, total, row["need"], running, pressure=pressure, limits=limits)
     if (isinstance(head, HeadPriority) and isinstance(head.window, StrictUntil)
             and waiter_order(head.waiter) < waiter_order(row)):
-        room = decision.budget - head.waiter["need"]
+        room = strict_room(decision.budget, head.waiter["need"])
         fits = room_used + row["need"] <= room
         decision = replace(decision, head_room=HeadRoom(head.waiter["need"], room_used, room, fits))
         if decision.state == "admit" and not fits:
@@ -2858,15 +2869,23 @@ def read_queue_pass(directory: Path, processes: dict[int, ProcessIdentity], now:
             if row.get("bump_order", 0) < 0 or row.get("holds_younger", False):
                 bump = QueueBump(row.get("priority_since", row["since"]), row.get("bump_order", 0) < 0,
                                  row.get("holds_younger", False))
+            has_priority = isinstance(head, HeadPriority)
+            order: StrictUntil | BackfillUntil | WindowNotStarted = WindowNotStarted()
+            if (has_priority and "priority_since" in row
+                    or not has_priority and now - row["since"] < HEAD_SECONDS):
+                window = head_window(row, now)
+                if has_priority or isinstance(window, BackfillUntil):
+                    order = window
             first = HeadExplanation(step, source, own,
                 BudgetCheck(own.charged, step.need, own.budget,
                             own.budget - step.need, own.budget_passes),
                 FreeCheck(available, step.need, own.reserve, own.promised, own.threshold, own.free_passes),
-                head_window(row, now), isinstance(head, HeadPriority), bump)
+                order, has_priority, bump)
         else:
-            # Whether this waiter fits the two resource checks, independently of order and pressure.
+            # Resource fit includes host pressure, independently of queue order.
             fit = decide(available, total, row["need"], memory)
-            line.append(LineWaiter(step, not unavailable and fit.budget_passes and fit.free_passes))
+            line.append(LineWaiter(step, not unavailable and not isinstance(pressure, MemoryPressure)
+                                   and fit.budget_passes and fit.free_passes))
     view = QueueView(tuple(waiting), tuple(running), available, totals.promised, totals.reserve, now)
     host_reading = (ReadingUnavailable() if unavailable else
                     HostAvailable(available, total,
@@ -3022,7 +3041,7 @@ def smallest_head_release(explanation: QueueExplanation) -> HeadAfterEnd:
 
 
 def bump_waiter(_selector: str, _actor: str) -> NoReturn:
-    raise BumpOff("only the user can bump; bump is off until /showrunner:bump sets queue priority")
+    raise BumpOff("bump is off; nothing can move a waiting step")
 
 
 def cancel_waiter(pid: int, root: Path | None = None) -> None:

@@ -174,16 +174,34 @@ class SerializationTests(unittest.TestCase):
         expected = {
             "columns": 89, "as_of": 1793360772.25,
             "lines": [
-                [{"text": "Build queue", "tone": "default", "bold": True}], [],
-                [{"text": "●", "tone": "success", "bold": False},
+                [{"text": "Build queue", "bold": True}], [],
+                [{"text": "●", "tone": "success"},
                  {"text": " ■", "tone": "error", "bold": True},
-                 {"text": " ↑27", "tone": "warning", "bold": False},
-                 {"text": " 界e\u0301", "tone": "inactive", "bold": False}],
+                 {"text": " ↑27", "tone": "warning"},
+                 {"text": " 界e\u0301", "tone": "inactive"}],
             ],
         }
         self.assertEqual(result, expected)
         self.assertEqual(cast(object, json.loads(json.dumps(result))), expected)
         self.assertEqual(plain(lines), "Build queue\n\n● ■ ↑27 界e\u0301")
+
+    def test_a_default_span_serializes_only_its_text(self) -> None:
+        self.assertEqual(json_form([(Span("plain queue text"),)], 60, 100.0)["lines"],
+                         [[{"text": "plain queue text"}]])
+
+    def test_cut_spans_lose_their_deadline_while_whole_and_wrapped_spans_keep_it(self) -> None:
+        line = (Span("ab", "success", background="suggestion", until=200.0),
+                Span("cd", "success", background="suggestion", until=201.0))
+        clipped = clip(line, 3)
+        self.assertEqual(plain([clipped]), "ab…")
+        self.assertEqual([(span.background, span.until) for span in clipped],
+                         [("suggestion", 200.0), ("suggestion", None)])
+        wrapped = wrap(line, 2, indent=0)
+        self.assertEqual([plain([row]) for row in wrapped], ["ab", "cd"])
+        wire = json_form(wrapped, 2, 100.0)
+        self.assertEqual([(span.get("background"), span.get("until")) for row in wire["lines"] for span in row],
+                         [("suggestion", 200.0), ("suggestion", 201.0)])
+        self.assertEqual(plain(wrapped), "ab\ncd")
 
     def test_serialized_spans_are_detached_from_the_rendered_lines(self) -> None:
         lines = [(Span("■ 1", "error", True),)]

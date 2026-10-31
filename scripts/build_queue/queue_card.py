@@ -19,7 +19,7 @@ def select_waiters(model: QueueModel, selector: str) -> list[int]:
     shown = shown_waiters(selector, model.reading, model.labels)
     if shown:
         return shown
-    # Part B replaces this admission selector boundary with match_waiters.
+    # No shown mark matched: read the selector as a place or a name.
     if selector.isdecimal():
         place = int(selector)
         return [place] if 1 <= place <= len(model.reading.view.waiting) else []
@@ -33,6 +33,9 @@ def ordinal(number: int) -> str:
 
 def order_check(model: QueueModel, position: int) -> Line:
     reason = model.reading.view.waiting[position - 1].reason
+    if isinstance(reason, gate.BehindOlderFit):
+        labels = model.labels.get(reason.older_session_id)
+        return check_line(False, "queue order      " + gate.older_fit_text(reason, labels.session if labels else ""))
     if isinstance(reason, gate.BehindHead) and isinstance(model.facts, head_facts.HeadFacts):
         return check_line(False, "#1's turn      " + head_facts.order_text(model.facts, model.zone, include_record=False))
     return check_line(True, "queue order")
@@ -87,7 +90,6 @@ def render_card(model: QueueModel, matches: Sequence[int], columns: int) -> list
             add((Span("  "), *order_check(model, position)), 4)
         for check in check_lines(checks, model, pressure_first=False):
             add((Span("  "), *check), 4)
-        # Behind #1, the budget and free checks come from LineWaiter in Part B; Part A prints none.
         if estimate_minutes(model, position):
             add()
             pace = model.pace

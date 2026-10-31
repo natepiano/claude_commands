@@ -5,11 +5,11 @@ import { register } from '../hooks/register';
 import type { QueueLines, QueuePaneState } from '../types/queue';
 import type { AccountsPaneState } from '../types';
 import type { StoredAccountsStatus } from '../types/accounts';
-import { CWD, drawnText, inspectDrawing, NOW } from './kit';
+import { CWD, drawnText, inspectDrawing, NOW, SESSION, sessionFixture } from './kit';
 
 const HOME = '/test-home';
 const ARGV = [`${HOME}/.claude/scripts/lib/py`, `${HOME}/.claude/scripts/build_queue/build_queue.py`];
-const READ = [...ARGV, '--json', '--columns', '100'];
+const READ = [...ARGV, '--json', '--columns', '100', '--you', SESSION];
 const command = (args = ''): CommandRunInput => ({ command: 'build:queue', args,
   origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 170 } });
 const start = { cwd: CWD, surface: null, isInteractive: false } as const;
@@ -22,20 +22,20 @@ function snapshot(): QueueLines {
   return {
     columns: 100, as_of: 1793360772,
     lines: [
-      [{ text: HEAD, tone: 'default', bold: true }],
+      [{ text: HEAD, bold: true }],
       [],
-      [{ text: 'Running', tone: 'default', bold: true }],
-      [{ text: '●', tone: 'success', bold: false },
-        { text: '    ↑29   0 min      5.1  nextest   11.1  tool-based-ui · widget · ', tone: 'default', bold: false },
-        { text: 'widget-enhancements-title', tone: 'inactive', bold: false }],
-      [{ text: 'Waiting', tone: 'default', bold: true }],
-      [{ text: '■', tone: 'error', bold: false },
-        { text: '  1 ↑27   6 min   ~1 min  nextest   11.5  tool-based-ui · cables · ', tone: 'default', bold: false },
-        { text: 'work-lead', tone: 'inactive', bold: false }],
-      [{ text: '         #1 waits on  ', tone: 'default', bold: false },
-        { text: '✗ memory pressure: full avg10 7.7 now; starts below 5.0', tone: 'error', bold: false }],
-      [{ text: '                     ✓ free memory 24.5 GiB; needs 20.5', tone: 'success', bold: false }],
-      [{ text: 'Memory in GiB. starts: an estimate at the last hour\'s pace, 44 steps an hour.', tone: 'warning', bold: false }],
+      [{ text: 'Running', bold: true }],
+      [{ text: '●', tone: 'success' },
+        { text: '    ↑29   0 min      5.1  nextest   11.1  tool-based-ui · widget · ' },
+        { text: 'widget-enhancements-title', tone: 'inactive' }],
+      [{ text: 'Waiting', bold: true }],
+      [{ text: '■', tone: 'error' },
+        { text: '  1 ↑27   6 min   ~1 min  nextest   11.5  tool-based-ui · cables · ' },
+        { text: 'work-lead', tone: 'inactive' }],
+      [{ text: '         #1 waits on  ' },
+        { text: '✗ memory pressure: full avg10 7.7 now; starts below 5.0', tone: 'error' }],
+      [{ text: '                     ✓ free memory 24.5 GiB; needs 20.5', tone: 'success' }],
+      [{ text: 'Memory in GiB. starts: an estimate at the last hour\'s pace, 44 steps an hour.', tone: 'warning' }],
     ],
   };
 }
@@ -72,6 +72,7 @@ function queueHost(on: On) {
   const restorePane = (id: string, title = id) => {
     panes.set(id, { id, title, isShown: true, isFocused: true, isPlaced: true });
   };
+  on('session.id', async () => ({ value: await sessionFixture.id() }));
   on('session.start', (_$, e) => ({ cwd: e.cwd }));
   on('turn.complete', (_$, e) => ({ text: e.answer }));
   on('command.register', (_$, e) => ({ value: { command: e.name } }));
@@ -108,7 +109,7 @@ function queueHost(on: On) {
     if (mode === 'throw') throw new Error('PRIVATE process failure');
     const columns = Number(e.argv[e.argv.indexOf('--columns') + 1]);
     const stdout = mode === 'json' ? 'PRIVATE not JSON' : mode === 'shape'
-      ? JSON.stringify(invalid === undefined ? { ...data, lines: [[{ text: 'PRIVATE malformed span' }]] } : invalid)
+      ? JSON.stringify(invalid === undefined ? { ...data, lines: [[{ text: 'PRIVATE malformed span', tone: 'PRIVATE' }]] } : invalid)
       : JSON.stringify({ ...data, columns });
     return { value: { exitCode: mode === 'exit' ? 1 : 0, stdout, stderr: 'PRIVATE diagnostic',
       isStdoutTruncated: mode === 'truncated', isStderrTruncated: false } };
@@ -161,12 +162,117 @@ describe('build queue pane', () => {
       const tree = await ui.drawn();
       expect(inspectDrawing(tree).lines).toEqual(snapshot().lines.map(line => line.map(part => part.text).join('')));
       expect(inspectDrawing(tree).spans).toEqual(snapshot().lines.flat().map(part => ({
-        text: part.text, color: part.tone, bold: part.bold,
+        text: part.text, color: part.tone ?? 'default', bold: part.bold ?? false,
       })));
       expect(inspectDrawing(tree).textProps.length).toBe(snapshot().lines.flat().length);
       expect(fake.processes).toEqual([READ]);
     });
   }
+
+  test('a span with omitted style fields paints with the default foreground, background and weight', async ($, on) => {
+    const fake = queueHost(on);
+    const data = snapshot();
+    data.lines = [[{ text: 'unstyled queue text' }]];
+    fake.replace(data);
+    await $.command.run(command());
+    const ui = await mount($);
+    const drawing = inspectDrawing(await ui.drawn());
+    expect(drawing.lines).toEqual(['unstyled queue text']);
+    expect(drawing.spans).toEqual([{ text: 'unstyled queue text', color: 'default', bold: false }]);
+    expect(drawing.textProps).toHaveLength(1);
+    const props = drawing.textProps[0];
+    if (!props) throw new Error('The default span must paint one Text element.');
+    expect(props.color ?? 'default').toBe('default');
+    expect(props.backgroundColor ?? 'default').toBe('default');
+    expect(props.bold).toBe(false);
+    expect(fake.processes).toEqual([READ]);
+  });
+
+  test('a countdown repaints every second with its background and no extra script run', async ($, on) => {
+    const fake = queueHost(on);
+    const data = snapshot();
+    data.lines = [[{ text: '▍', tone: 'success', bold: false, background: 'suggestion' },
+      { text: ' ⊘ ', tone: 'error', bold: false },
+      { text: '1:10', tone: 'error', bold: false, until: NOW / 1000 + 70 }]];
+    fake.replace(data);
+    await $.command.run(command());
+    const ui = await mount($);
+    expect(inspectDrawing(await ui.drawn()).lines.join('\n')).toBe('▍ ⊘ 1:10');
+    const boundary = inspectDrawing(await ui.drawn()).textProps.find(props => props.backgroundColor === 'suggestion');
+    expect(boundary).toMatchObject({ color: 'success', backgroundColor: 'suggestion' });
+    await fake.clock.advance(1000);
+    expect(inspectDrawing(await ui.drawn()).lines.join('\n')).toBe('▍ ⊘ 1:09');
+    await fake.clock.advance(8000);
+    expect(inspectDrawing(await ui.drawn()).lines.join('\n')).toBe('▍ ⊘ 1:01');
+    expect(fake.processes).toEqual([READ]);
+    await fake.clock.advance(1000);
+    expect(fake.processes).toEqual([READ, READ]);
+    await $.command.run(command('close'));
+    fake.clear();
+    await fake.clock.advance(5000);
+    expect(fake.processes).toEqual([]);
+    expect(fake.writes).toEqual([]);
+  });
+
+  for (const suspendedRead of ['clock', 'panes'] as const) {
+    test(`closing while a render reads ${suspendedRead} cannot restart its countdown timer`, async ($, on) => {
+      const timerRequests: number[] = [];
+      let signal = () => {};
+      let finish = () => {};
+      let holdRead = false;
+      const started = new Promise<void>(resolve => { signal = resolve; });
+      const pending = new Promise<void>(resolve => { finish = resolve; });
+      // Outer observers leave the shared host's exact event hooks in charge.
+      on('clock.*', async (_$, event, next) => {
+        if (next.event === 'clock.every' && 'ms' in event) timerRequests.push(event.ms);
+        if (next.event === 'clock.now' && suspendedRead === 'clock' && holdRead) {
+          holdRead = false;
+          signal();
+          await pending;
+        }
+        return next(event);
+      });
+      on('ui.*', async (_$, event, next) => {
+        const result = await next(event);
+        if (next.event === 'ui.panes' && suspendedRead === 'panes' && holdRead) {
+          holdRead = false;
+          // Save the open-pane snapshot before close, then return it after close.
+          signal();
+          await pending;
+        }
+        return result;
+      });
+      const fake = queueHost(on);
+      const data = snapshot();
+      data.lines = [[{ text: '1:10', tone: 'error', until: NOW / 1000 + 70 }]];
+      fake.replace(data);
+      await $.command.run(command());
+      holdRead = true;
+      const painting = mount($).then(ui => ui.drawn());
+      await started;
+      try {
+        await $.command.run(command('close'));
+      } finally { finish(); }
+      await painting;
+      expect(timerRequests).toEqual([10_000]);
+      fake.clear();
+      await fake.clock.advance(20_000);
+      expect(fake.processes).toEqual([]);
+      expect(fake.writes).toEqual([]);
+    });
+  }
+
+  test('an expired countdown clamps to zero until the next script refresh', async ($, on) => {
+    const fake = queueHost(on);
+    const data = snapshot();
+    data.lines = [[{ text: '0:01', tone: 'success', bold: false, until: NOW / 1000 + 1 }]];
+    fake.replace(data);
+    await $.command.run(command());
+    const ui = await mount($);
+    await fake.clock.advance(2000);
+    expect(drawnText(await ui.drawn())).toBe('0:00');
+    expect(fake.processes).toEqual([READ]);
+  });
 
   test('a selector opens a card, survives timer refresh and reload, and a bare command restores the view', async ($, on) => {
     const fake = queueHost(on);
@@ -207,7 +313,7 @@ describe('build queue pane', () => {
     await fake.clock.settle();
     await fake.clock.advance(10_000);
     expect(fake.processes[0]).toEqual(READ);
-    expect(fake.processes.at(-1)).toEqual([...ARGV, '--json', '--columns', '89']);
+    expect(fake.processes.at(-1)).toEqual([...ARGV, '--json', '--columns', '89', '--you', SESSION]);
   });
 
   test('repeated renders at a new width join one forced refresh while a read is busy', async ($, on) => {
@@ -225,13 +331,13 @@ describe('build queue pane', () => {
     } finally { held.finish(); }
     await ticking;
     await fake.clock.settle();
-    expect(fake.processes).toEqual([[...READ, '4'], [...ARGV, '--json', '--columns', '89', '4']]);
+    expect(fake.processes).toEqual([[...READ, '4'], [...ARGV, '--json', '--columns', '89', '--you', SESSION, '4']]);
     await ui.redraw();
     await ui.redraw();
     await fake.clock.settle();
     expect(fake.processes.length).toBe(2);
     await fake.clock.advance(10_000);
-    expect(fake.processes.at(-1)).toEqual([...ARGV, '--json', '--columns', '89', '4']);
+    expect(fake.processes.at(-1)).toEqual([...ARGV, '--json', '--columns', '89', '--you', SESSION, '4']);
   });
 
   test('a width change outside a timer tick immediately requests a fresh render', async ($, on) => {
@@ -241,7 +347,7 @@ describe('build queue pane', () => {
     const ui = await mount($, 'terminal', 80);
     await ui.drawn();
     await fake.clock.settle();
-    expect(fake.processes).toEqual([[...ARGV, '--json', '--columns', '80']]);
+    expect(fake.processes).toEqual([[...ARGV, '--json', '--columns', '80', '--you', SESSION]]);
     await ui.drawn();
     await fake.clock.settle();
     expect(fake.processes.length).toBe(1);
@@ -358,9 +464,12 @@ describe('build queue pane', () => {
     ['non-array line', { columns: 100, as_of: 1, lines: ['PRIVATE line'] }],
     ['null span', { columns: 100, as_of: 1, lines: [[null]] }],
     ['numeric text', { columns: 100, as_of: 1, lines: [[{ text: 4, tone: 'default', bold: false }]] }],
-    ['missing tone', { columns: 100, as_of: 1, lines: [[{ text: 'PRIVATE text', bold: false }]] }],
-    ['unknown tone', { columns: 100, as_of: 1, lines: [[{ text: 'PRIVATE text', tone: 'suggestion', bold: false }]] }],
-    ['missing bold', { columns: 100, as_of: 1, lines: [[{ text: 'PRIVATE text', tone: 'default' }]] }],
+    ['null tone', { columns: 100, as_of: 1, lines: [[{ text: 'PRIVATE text', tone: null }]] }],
+    ['unknown tone', { columns: 100, as_of: 1, lines: [[{ text: 'PRIVATE text', tone: 'PRIVATE', bold: false }]] }],
+    ['unknown background', { columns: 100, as_of: 1, lines: [[{ text: 'x', tone: 'default', bold: false, background: 'PRIVATE' }]] }],
+    ['string deadline', { columns: 100, as_of: 1, lines: [[{ text: 'x', tone: 'default', bold: false, until: 'PRIVATE' }]] }],
+    ['null deadline', { columns: 100, as_of: 1, lines: [[{ text: 'x', tone: 'default', bold: false, until: null }]] }],
+    ['null bold', { columns: 100, as_of: 1, lines: [[{ text: 'PRIVATE text', bold: null }]] }],
     ['string bold', { columns: 100, as_of: 1, lines: [[{ text: 'PRIVATE text', tone: 'default', bold: 'yes' }]] }],
   ];
   for (const [name, invalid] of invalidShapes) {
@@ -466,6 +575,7 @@ describe('build queue pane', () => {
         let state: Record<string, QueuePaneState> = {};
         const refusal = "build queue: 'unknown-worker': unknown waiter; matches: none";
         const services = {
+          session: sessionFixture,
           env: { get: async () => HOME },
           ui: { open: async () => ({}) },
           clock: { every: () => ({ cancel: () => {} }) },
@@ -579,6 +689,7 @@ for (const origin of ['person', 'plugin', 'unload'] as const) {
     let runs = 0;
     let forwarded = 0;
     const services = {
+      session: sessionFixture,
       env: { get: async () => HOME },
       ui: { open: async () => ({}) },
       clock: { every: (_ms: number, tick: () => void) => {
@@ -620,6 +731,7 @@ function tablePaneLifetimeHost() {
   let stateReadGate = { pending: Promise.resolve(), started: () => {}, armed: false };
   let accountsGate = { pending: Promise.resolve(), started: () => {} };
   const services = {
+    session: sessionFixture,
     env: { get: async (name: string) => name === 'USER_ZONE' ? 'UTC' : HOME },
     command: { register: async () => ({}) },
     ui: {
