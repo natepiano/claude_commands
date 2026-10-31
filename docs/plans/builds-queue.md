@@ -204,6 +204,16 @@ only I can bump
 
 As built (fe2f920a, on origin/builds cc16b3fe, 2026-10-31): `[memory] build_budget_gib=24` in `config/lint.conf`. One reader, `memory_admit.build_budget_bytes()`: `BUILDLOG_BUILD_BUDGET_GIB` wins, then the config value, then `FALLBACK_BUILD_BUDGET_BYTES` (21 GiB) for a missing or invalid value; read at each check. `head_facts`, `queue_view`, `build_why`, `AdmissionDecision` and the expected-peak cap call it. Tests pin the budget by env. Showrunner ask; the user approved 24 for a one-day trial.
 
+### Phase 4c — The queue snapshot no longer stores the build budget; every reader resolves it live  · status: todo
+**Depends on:** Phase 4b
+**Blocked by:** none (builds showrunner, urgent, 2026-10-31).
+
+#### Work Order
+
+**Goal:** `/build:queue` and `/build:why` show the live budget every time. Today `QueueInputs.limits` (budget and reserve) goes into `admission/queue.json`. A check run from a tree older than 4b writes 21 there, and the views show 21 or 24 at random. Remove `limits` from `QueueInputs`. `queue_read_from(inputs, limits)` takes the limits from its caller, and each caller resolves them live with `resolve_admission_limits`. The snapshot version goes to 2, so a snapshot of the old shape is not read.
+**Files:** `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `scripts/build_queue/queue_fixture.py`, `scripts/build_queue/test_build_queue.py`, `docs/as-built/build-memory-admission.md` and any reader of `QueueInputs.limits`.
+**Acceptance:** with a snapshot that a test writes with budget 21 and config 24, the view reads 24. A version-1 snapshot reads as no snapshot. Tests: test_memory_admit, all scripts/build_queue tests; basedpyright clean.
+
 ### Phase 5 — The queue service, its socket protocol and its client exist and pass in-process tests; no build uses them yet  · status: todo
 **Depends on:** Phase 4
 **Blocked by:** none. This phase adds files only and changes no caller and no admission (builds showrunner, 2026-10-31).
