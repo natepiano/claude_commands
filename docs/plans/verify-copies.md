@@ -206,13 +206,14 @@ Rough duration: half a day each, in parallel with Phase 1.
 - `work` and land copies get task `landed:<unit>/<branch>` and the land target in the record: the production's Merge branch when the unit is in a production, else `origin/main`. A land copy keeps its name until its push.
 - `copies.py hand-over <path> --to <unit> --task <task>` calls `scratch.py hand-over <path> --to <unit> --task <task> [--run-dir <run dir>] [--land-target <land target>]` (resources-unit), which keeps the path; copies.py does not rename the folder or edit the record itself. The land target defaults to `origin/main`.
 - `make` writes nothing to the copy's `.git/info/exclude`: resources-unit Phase 21 adds the entries for the record (`.scratch.json`) and `.claude-busy`.
+- Seed copies and the disk floor (builds ruling 2026-10-31, from resources' floor diagnosis): the seed copies files, never hard-links them, and writes the `.lint-sweep-used` stamp in the copy's target when made. `cp -a` keeps file times, so without the stamp the floor has no use record before the first build (`sweep.py:1854`) and can take the seed early; a hard-linked take frees nothing (`:1446`) but still deletes the copy (`:1526`), a cold build for no space. Resources-unit Phase 37 changes the floor order (empty idle targets first); judge against that order.
 - `verify.sh`: in a tree under `/tmp/claude/copies`, take a shared `flock` on `<tree>/.claude-busy` before the memory wait, so a queued run is busy too, and hold it until the run ends.
 
 **Files:** `scripts/copies/copies.py`, `scripts/copies/test_copies.py`, `scripts/direct/verify.sh` and a verify.sh test in `scripts/direct/`, `docs/as-built/frozen-copies.md`.
 
 **Constraints from prior phases:** Phase 1 verdict; Phase 2 names and scratch layout; dependency: resources-unit Phase 21, "copies root and lifetime" (kept copies root, `.claude-busy` readers, `landed:`, open-phase `phase:`, `borrows_from` child before parent, `scratch.py hand-over --task`, `.scratch.json` record, `.git/info/exclude` entries), ETA 06:00 EDT 2026-10-30.
 
-**Acceptance gate:** tests green (fake roster, fake source repo, the linked-worktree `.git` case, a `.claude-busy` lock held from before the memory wait to the run end, `hand-over` to another unit keeps the path); live: one hana gate copy made, built, and removed by `merge_checkpoint.py` ending its phase task.
+**Acceptance gate:** tests green (fake roster, fake source repo, the linked-worktree `.git` case, a seed copy that holds no hard link to its source and has a fresh `.lint-sweep-used` stamp, a `.claude-busy` lock held from before the memory wait to the run end, `hand-over` to another unit keeps the path); live: one hana gate copy made, built, and removed by `merge_checkpoint.py` ending its phase task.
 
 Rough duration: one day.
 
