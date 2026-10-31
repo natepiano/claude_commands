@@ -132,3 +132,44 @@ Outside a nix shell, `scripts/direct/verify.sh` makes one `nix_env.py exec` of i
 `nix_env.py` results are `NamedTuple`s; `subprocess`, `shlex` and `json` import only where used, and `Mapping` is a type-checking import. `user_zone.CONF` is a `str` and `user_zone.stored_zone(path)` is the one zone reader; `zone.py` `stored` calls it. `user_clock` runs `python3 -S`. `docs/as-built/nix-shell-launch.md` describes the flow.
 
 **Result (natedev, 2026-10-30, child CPU user+sys, mean of 30 runs, parent 8c53e312 → this phase):** `verify.sh` with an unknown verb outside a nix shell: repo with an `.envrc` 649.3 → 468.0 ms, repo without 446.1 → 383.8 ms. `user_zone.py` in `user_clock`'s call form: 26.0 → 16.8 ms. The `verify.sh` numbers include its later `build_targets.py` start, which this phase does not change.
+
+### Phase 12 — The cli aliases run on the signed-in workers account and use the luna word  · status: done
+
+**Source:** showrunner of natedev, 2026-10-30: move commit_prep and merge_branch to luna:high, leave style_fix_review to style's phase 113, and fix the sign-in defect so cli_agent.sh takes the home from `workers_home()` with no copy of the logic. Measured before the ruling (natedev, effort high, 3 runs each, medians): gpt-5.6-luna 9.4 s and 44,045 input tokens; gpt-6-luna 11.4 s and 63,363 input tokens. Plain `codex` read `~/.codex`, which is not signed in, and failed with 401.
+
+#### As-built
+
+`agents_workers_home` in `scripts/agents/agents_config.sh` is the one shell read of `scripts.whoami.agent_accounts.workers_home()`; `agent_exec.sh` and `cli_agent.sh` both call it, and `cli_agent.sh` starts codex under that `CODEX_HOME` in its REPL and skill forms, also when the caller sets another. `config/agents.conf` sets `commit_prep=luna:high` and `merge_branch=luna:high`. `scripts/whoami/account_test_support.write_codex_auth` is the one Codex sign-in test writer. Merged to natedev as 5130db7d.
+
+### Phase 13 — Review-link tables use the window width and never break a number  · status: done
+
+**Source:** showrunner of natedev, 2026-10-30, for the user: "your html tables are hard to read - the price is squished but there is plenty of room on screen". The page style held tables to 48rem and gave every cell `overflow-wrap: anywhere`. Added to the same checkpoint: a `copy_watch.py` left running five hours after a gate (showrunner), and stale nightly-review timer docs (showrunner).
+
+#### As-built
+
+The one style block in `render_markdown` keeps top-level text in a centered 48rem column; a table is `display: block; width: max-content; max-width: 100%` with sideways scroll, and `td, th` wrap only at spaces. Stored snapshots hold rendered HTML, so the five Markdown pages were re-rendered once from their stored `.md`; the service needed no restart. `copy_watch.py`'s `Wakeup` records its parent pid and requests a stop when the parent is gone, checked at least once a second in both loops. Open minors: F002 (a paragraph beside a table in one blockquote or list has no 48rem limit) and F003 (a verify.sh killed before the watcher records its parent is missed). Checkpoint 3a47b79d on branch natedev-efficiency-links.
+
+### Phase 14 — The STE rule loads into every Claude and Codex session context  · status: done
+
+**Source:** the user, 2026-10-18: "everyone needs to use simplified technical english henceforth".
+
+#### As-built
+
+`scripts/hooks/session-start-ste.py` reads `config/simplified-technical-english.md` from its own checkout and returns it as `additionalContext` for `SessionStart` and `SubagentStart`; a bad payload, a missing file or a read error exits 0 with no output. `scripts/hooks/codex_hooks.py` has two rows, `ste` (SessionStart) and `ste-subagent` (SubagentStart), both with matcher `*`; `_select_hooks` picks a hook by command, event and matcher so two events share one script with separate trust. Checkpoint 69374ebc on branch natedev-efficiency. The `settings.json` hook lines for Claude Code and the live Codex install and trust wait for the user.
+
+### Phase 15 — nix_env trusts copies.py copies  · status: done
+
+**Source:** the next item "nix_env trusts copies.py copies", approved by the showrunner of natedev 2026-10-29 and started on its go 2026-10-31 (the record format is `scratch.register_copy` on origin/natedev).
+
+#### As-built
+
+`scripts/lib/nix_env.py` approves the `.envrc` of a copy that `copies.py` registered, through `registered_copy(envrc)`, which `trusted_envrc` calls after `trusted_root` and `registered_worktree`. A copy qualifies when: `.envrc` is a regular file (not a symlink) at the top of a folder for which `scratch.copy_folder` returns that folder; `scratch.read_record` returns a `scratch.Registered` record; the record's `source_path` is a directory for which `trusted_root` is true; and `git hash-object --no-filters` of the copy's file equals `git rev-parse --verify --end-of-options <source_commit>:.envrc`. Both git commands run with the source repository as working directory, a `TIMEOUT_SECONDS` limit, and an environment from `_git_environment()`, which drops every `GIT_*` variable. Any failure, read error included, returns false and direnv keeps its explicit approval. `scratch` and `subprocess` are imported inside `registered_copy`, and the repository root joins `sys.path` once, only if absent, so the no-envrc path stays cheap.
+
+**Files:**
+- `scripts/lib/nix_env.py` — `registered_copy`, `_git_environment`, `trusted_envrc`.
+- `scripts/lib/test_nix_env.py` — `GitNixFixture` (shared git helpers), `RegisteredWorktreeTests`, and `RegisteredCopyTests` (nine real-git tests on `git clone --shared` copies under a temp `COPIES_ENV` root).
+- `docs/as-built/nix-shell-launch.md` — the copy rule and the `flake.nix` limit.
+
+**Gotchas:** files that `.envrc` loads, for example `flake.nix`, are not checked and may differ from the source commit. A `GIT_DIR` in the caller's environment would redirect both git calls to another repository, so `_git_environment()` is the only environment either call gets.
+
+**Ruled out:** a blanket `direnv allow` for every copy; checking the files that `.envrc` loads.
