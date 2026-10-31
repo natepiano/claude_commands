@@ -256,11 +256,16 @@ class UnitWatchdogTests(unittest.TestCase):
         self.assertFalse(pane_record.read("shared")["beta"].get("ended", False))
 
     def test_failed_move_still_allows_watchdog_recovery_on_the_launch_account(self) -> None:
-        _ = self.add_unit("alpha")
+        owner = self.add_unit("alpha")
+        folder = Path(owner["cwd"])
+        target = accounts.account_dir("claude2")
         with (self.stop_process_leaves(), patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": ""}),
+              patch.object(folder_trust, "heal", return_value=herdr.Trusted(
+                  folder, target / ".claude.json", folder)) as trust,
               patch.object(stop_resume, "resume", return_value=stop_resume.ResumeFailed("alpha", "never started"))):
             self.assertEqual(self.shared_move(["alpha"], "claude2", why="account move"),
                              [stop_resume.ResumeFailed("alpha", "never started")])
+        trust.assert_called_once_with(folder, target, accounts.account_dir("claude4"), dry_run=True)
         self.assertFalse(pane_record.read("shared")["alpha"].get("ended", False))
         for minute in (0, 2, 4):
             _ = self.pass_at(minute)

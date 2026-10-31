@@ -213,6 +213,14 @@ def _start_session(tab: herdr.TabSession, entry: pane_record.PaneLaunch, account
     client.run_in_pane(tab.pane_id, command)
 
 
+def _heal_launch_trust(entry: pane_record.PaneLaunch, target_dir: Path, *, dry_run: bool = False
+                       ) -> herdr.Trusted | herdr.TrustCopied | ResumeFailed:
+    trust = folder_trust.heal(Path(entry["cwd"]), target_dir, Path(entry["config_dir"]), dry_run=dry_run)
+    if isinstance(trust, (folder_trust.FolderNotTrusted, folder_trust.FolderTrustUnreadable)):
+        return ResumeFailed(entry["session_id"], f"{trust.reason}. Run: {trust.command}")
+    return trust
+
+
 def resume(session: str, *, why: str, to: str | None = None, requester: str = "",
            restore_missing: bool = False) -> ClaudeUp | ResumeFailed | SessionNotFound:
     began = monotonic()
@@ -251,9 +259,9 @@ def resume(session: str, *, why: str, to: str | None = None, requester: str = ""
         source_label = accounts.claude_config_label(source)
         label = to if to is not None else source_label
         target_dir = accounts.account_dir(label) if to is not None else source
-        trust = folder_trust.heal(Path(entry["cwd"]), target_dir, source)
-        if isinstance(trust, (folder_trust.FolderNotTrusted, folder_trust.FolderTrustUnreadable)):
-            return ResumeFailed(identity, f"{trust.reason}. Run: {trust.command}")
+        trust = _heal_launch_trust(entry, target_dir)
+        if isinstance(trust, ResumeFailed):
+            return trust
         if isinstance(tab, SessionNotFound):
             from scripts.whoami.account import named_account_environment
 
@@ -404,7 +412,7 @@ def _warn_session(session: str, target: str, why: str, seconds: int) -> None:
 
 def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: int = 0,
                   requester: str = "") -> list[MoveResult]:
-    """Interrupt all selected sessions before resuming any; isolate each failure."""
+    """Leave untrusted members running; stop eligible members before resuming any."""
     if not 0 <= warn_seconds <= 15:
         raise ValueError("warn_seconds must be between 0 and 15")
     selected = list(dict.fromkeys(sessions))
@@ -412,6 +420,30 @@ def move_sessions(sessions: list[str], target: str, *, why: str, warn_seconds: i
         return []
     began = monotonic()
     _record_launches(selected)  # Herdr learns a new session's id late; the launch entry knows it now.
+    from scripts.accounts import accounts
+
+    outcomes: dict[str, MoveResult] = {}
+    for session in selected:
+        try:
+            tab = _tab_of(session)
+            if isinstance(tab, SessionNotFound):
+                continue  # The stop path returns the existing missing-session outcome.
+            entry = pane_record.read(herdr.shared_session()).get(tab.pane_id)
+            if entry is not None and entry["session_id"] == tab.session_id:
+                trust = _heal_launch_trust(entry, accounts.account_dir(target), dry_run=True)
+                if isinstance(trust, ResumeFailed):
+                    outcomes[session] = trust
+        except (OSError, ValueError, herdr.HerdrFailure) as error:
+            outcomes[session] = ResumeFailed(session, str(error))
+    eligible = [session for session in selected if session not in outcomes]
+    if eligible:
+        outcomes.update(zip(eligible, _move_eligible(eligible, target, why, warn_seconds, requester, began)))
+    return [outcomes[session] for session in selected]
+
+
+def _move_eligible(selected: list[str], target: str, why: str, warn_seconds: int,
+                   requester: str, began: float) -> list[MoveResult]:
+    """Move eligible members, preserving the batch stop barrier."""
     caller = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if caller:
         try:

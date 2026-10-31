@@ -3272,7 +3272,9 @@ def move(session: str, target: str, *, dry_run: bool = False, why: str = "", ale
         if group != "ungrouped":
             return MoveRefused(f"{owner.name} belongs to {group}; in this terminal: ~/.claude/scripts/lib/py ~/.claude/scripts/accounts/accounts.py move {group} {target}")
         if session_on_account(owner, target):
-            return MoveRefused(f"{owner.name} is already on {checked.destination.label}")
+            line = f"{owner.name} is already on {checked.destination.label}"
+            return (MoveDryRun(owner.session_id, (line,)) if dry_run else
+                    MoveStarted(owner.session_id, target, line + "\n", "", 0))
         reason = why or f"{session_account_label(owner)} is out of usage"
         if dry_run:
             return MoveDryRun(owner.session_id, (*checked.notices, move_preview_line(owner, target)))

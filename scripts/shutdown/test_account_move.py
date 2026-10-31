@@ -226,8 +226,37 @@ class AccountMoveTests(ShutdownTestCase):
             self.refuses_without_change("first target problem")
 
 
-    def test_move_refuses_its_current_login_without_change(self) -> None:
-        self.refuses_without_change("kept name is already on claude1", target="claude1")
+    def test_move_to_its_current_login_succeeds_without_change(self) -> None:
+        from scripts.production import showrunner_move
+
+        before = self.disk_state()
+        environment = dict(os.environ)
+        with (patch.object(subprocess, "run") as process,
+              patch.object(os, "execvpe") as launch,
+              patch.object(stop_resume, "move_sessions") as move,
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
+            result = showrunner_move.main(["session", "move-id", "claude1"])
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "kept name is already on claude1\n")
+        self.assertEqual(error.getvalue(), "")
+        self.assertEqual(self.disk_state(), before)
+        self.assertEqual(dict(os.environ), environment)
+        process.assert_not_called()
+        launch.assert_not_called()
+        move.assert_not_called()
+
+    def test_group_already_on_target_succeeds_without_stopping_any_member(self) -> None:
+        from scripts.production import showrunner_move
+
+        member = replace(self.current_listing()[0], kind="unit")
+        with (patch.object(accounts, "live_group_members", return_value={"units": [member], "showrunners": []}),
+              patch.object(stop_resume, "move_sessions") as move,
+              redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
+            result = showrunner_move.main(["units", "claude1"])
+        self.assertEqual(result, 0)
+        self.assertIn("units: no live session moves", output.getvalue())
+        self.assertEqual(error.getvalue(), "")
+        move.assert_not_called()
 
 
     def test_retired_unit_swap_refuses_before_role_history_shutdown_or_process_changes(self) -> None:

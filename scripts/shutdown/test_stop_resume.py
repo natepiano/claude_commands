@@ -162,10 +162,105 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(line.count("copied folder trust from claude3"), 1)
         self.assertEqual(json.loads(target.read_text())["unrelated"], "keep")
 
+    def test_group_move_leaves_untrusted_member_running_and_moves_the_other_two(self) -> None:
+        self.add_beta()
+        beta = pane_record.read("agents")["w1:p4"]
+        beta["cwd"] = str(self.root / "beta")
+        pane_record.write("agents", beta)
+        gamma = self.entry.copy()
+        gamma.update(pane_id="w1:p6", session_id="sid-gamma", name="gamma")
+        pane_record.write("agents", gamma)
+        self.client.rows.append({"pane_id": "w1:p6", "label": "gamma", "workspace_id": "w1",
+                                 "agent_session": {"kind": "id", "value": "sid-gamma"}})
+        target = self.root / ".claude4"
+        command = accounts.trust_command(Path(beta["cwd"]), accounts.NamedAccount("claude4", target))
+        def liveness(identity: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
+            return sessions.LiveSessionProcess(123) if identity == "sid-beta" else sessions.SessionNotLive()
+        self.live.side_effect = liveness
+        def stopped(identity: str) -> stop_resume.Stopped:
+            return stop_resume.Stopped(identity, 123)
+        for unreadable in (False, True):
+            for caller in ("", "sid-beta"):
+                with self.subTest(unreadable=unreadable, caller=caller):
+                    self.launched.clear()
+                    self.start.reset_mock()
+                    self.detach.reset_mock()
+                    def trust(folder: Path, account_file: Path) -> herdr.Trusted | herdr.Untrusted | herdr.UnreadableTrustFile:
+                        if folder == self.root:
+                            return herdr.Trusted(folder, account_file, folder)
+                        if unreadable and account_file.parent == target:
+                            return herdr.UnreadableTrustFile(folder, account_file, "PermissionError")
+                        return herdr.Untrusted(folder, account_file, (folder,))
+                    with patch.object(herdr, "claude_trust", side_effect=trust), patch.object(
+                            stop_resume, "_stop", side_effect=stopped) as stop, patch.dict(
+                            os.environ, {"CLAUDE_CODE_SESSION_ID": caller}):
+                        results = stop_resume.move_sessions(["alpha", "beta", "gamma"], "claude4", why="limit")
+                    self.assertCountEqual(stop.call_args_list, [call("alpha"), call("gamma")])
+                    self.kill.assert_not_called()
+                    self.assertEqual(self.start.call_count, 2)
+                    self.assertEqual(self.launched, {"sid-alpha", "sid-gamma"})
+                    self.assertEqual(self.observe("sid-beta"), sessions.LiveSessionProcess(123))
+                    self.assertEqual(len(results), 3)
+                    self.assertEqual(results[0], stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4"))
+                    self.assertEqual(results[2], stop_resume.ClaudeUp("sid-gamma", "w1:p6", "claude4"))
+                    result = results[1]
+                    self.assertIsInstance(result, stop_resume.ResumeFailed)
+                    assert isinstance(result, stop_resume.ResumeFailed)
+                    self.assertEqual(result.session_id, "sid-beta")
+                    self.assertIn("cannot read" if unreadable else "Claude has not trusted this folder", result.reason)
+                    self.assertIn(f"Run: {command}", result.reason)
+                    line = accounts.move_result_line(accounts.SessionMoveRefused(result.session_id, result.reason))
+                    self.assertIn("sid-beta: not moved:", line)
+                    self.assertIn(command, line)
+
+    def test_move_preflights_copyable_trust_then_stops_copies_and_resumes(self) -> None:
+        target = self.root / ".claude4"
+        events: list[str] = []
+        copied = False
+        def trust(folder: Path, account_file: Path) -> herdr.Trusted | herdr.Untrusted:
+            if account_file.parent == target and not copied:
+                return herdr.Untrusted(folder, account_file, (folder,))
+            return herdr.Trusted(folder, account_file, folder)
+        def copy(folder: Path, source: Path, destination: Path) -> herdr.Trusted:
+            nonlocal copied
+            self.assertEqual(source.parent, self.root / ".claude3")
+            self.assertEqual(destination.parent, target)
+            events.append("copy")
+            copied = True
+            return herdr.Trusted(folder, destination, folder)
+        heal = herdr.heal_claude_trust
+        def checked(folder: Path, destination: Path, sources: list[tuple[str, Path]], *, dry_run: bool
+                    ) -> herdr.Trusted | herdr.TrustCopied | herdr.Untrusted | herdr.UnreadableTrustFile:
+            events.append("preflight" if dry_run else "heal")
+            return heal(folder, destination, sources, dry_run=dry_run)
+        def stop(_session: str) -> stop_resume.Stopped:
+            self.assertEqual(events, ["preflight"])
+            self.assertFalse(copied)
+            events.append("stop")
+            return stop_resume.Stopped("sid-alpha", 123)
+        def start(*_arguments: str) -> str:
+            self.assertTrue(copied)
+            events.append("resume")
+            return ""
+        self.start.side_effect = start
+        with patch.object(herdr, "claude_trust", side_effect=trust), patch.object(
+                herdr, "copy_claude_trust", side_effect=copy), patch.object(
+                herdr, "heal_claude_trust", side_effect=checked), patch.object(stop_resume, "_stop", side_effect=stop):
+            results = stop_resume.move_sessions(["alpha"], "claude4", why="limit")
+        self.assertEqual(events, ["preflight", "stop", "heal", "copy", "resume"])
+        self.assertEqual(results, [stop_resume.ClaudeUp("sid-alpha", "w1:p2", "claude4")])
+        assert isinstance(results[0], stop_resume.ClaudeUp)
+        self.assertEqual(results[0].trust_copied_from, "claude3")
+
     def test_move_without_trust_refuses_with_target_trust_command_before_start(self) -> None:
         for label in ("claude3", "claude4"):
             _ = (self.root / f".{label}/.claude.json").write_text('{"projects": {}}')
-        results = stop_resume.move_sessions(["alpha"], "claude4", why="usage limit")
+        self.live.return_value = sessions.LiveSessionProcess(123)
+        with patch.object(stop_resume, "_stop", wraps=stop_resume._stop) as stop:  # pyright: ignore[reportPrivateUsage]
+            results = stop_resume.move_sessions(["alpha"], "claude4", why="usage limit")
+        stop.assert_not_called()
+        self.kill.assert_not_called()
+        self.assertEqual(self.observe("sid-alpha"), sessions.LiveSessionProcess(123))
         result = results[0]
         self.assertIsInstance(result, stop_resume.ResumeFailed)
         assert isinstance(result, stop_resume.ResumeFailed)
