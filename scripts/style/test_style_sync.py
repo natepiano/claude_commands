@@ -30,7 +30,10 @@ import style_sync
 import scratch
 import style_ledger
 import style_rules
-from scripts.production import showrunners
+from add_style import standing_style_production
+from scripts.production import session_staff, showrunners, staff
+from scripts.message.sessions import SessionRecord
+from scripts.message import sessions
 from scripts.direct import test_verify_lint_scope as verify_fixture
 
 
@@ -116,6 +119,8 @@ class StyleSyncTests(unittest.TestCase):
     doc: Path = Path()
     tip: str = ""
     lint_temp: Path = Path()
+    live_records: list[SessionRecord] = []
+    staff_record: staff.StaffSnapshot = staff.StaffSnapshot(())
 
     @override
     def setUp(self) -> None:
@@ -160,6 +165,18 @@ class StyleSyncTests(unittest.TestCase):
         self.lint_temp = self.root / "tmp"
         self.lint_temp.mkdir()
         _ = self.enterContext(mock.patch.object(style_sync, "LINT_TEMP_PARENT", self.lint_temp))
+        runner = staff.StaffRow(staff.StaffId("s11111111111"), "showrunner", "sample-style", None)
+        unit = staff.StaffRow(staff.StaffId("s22222222222"), "unit", "names", runner.id)
+        other_runner = staff.StaffRow(staff.StaffId("s33333333333"), "showrunner", "other-style", None)
+        other_unit = staff.StaffRow(staff.StaffId("s44444444444"), "unit", "types", other_runner.id)
+        self.staff_record = staff.StaffSnapshot((runner, unit, other_runner, other_unit))
+        self.live_records = []
+        for pid, row in enumerate((unit, runner, other_unit), start=123):
+            directory = self.root / "proc" / str(pid)
+            directory.mkdir(parents=True)
+            _ = (directory / "environ").write_bytes(f"STAFF_ID={row.id}\0".encode())
+            self.live_records.append(SessionRecord(pid=pid, sessionId=f"session-{pid}", name="renamed",
+                messagingSocketPath="", updatedAt=0, tmux="", formerNames=[]))
 
     def git(self, *arguments: str) -> str:
         return subprocess.run(["git", "-C", str(self.repo), *arguments],
@@ -171,7 +188,11 @@ class StyleSyncTests(unittest.TestCase):
 
     def notice(self, repo: Path | None = None) -> tuple[int, str]:
         output = io.StringIO()
-        with redirect_stdout(output):
+        with (redirect_stdout(output),
+              mock.patch.object(sessions, "running_sessions", return_value=self.live_records),
+              mock.patch.object(staff, "snapshot", return_value=self.staff_record),
+              mock.patch.object(session_staff, "member_sources", return_value=session_staff.MemberSources({}, ())),
+              mock.patch.dict(os.environ, {"HERDR_PROC": str(self.root / "proc")})):
             code = style_sync.main(["notify", "--repo-dir", str(repo or self.repo),
                                     "--branch", "refs/heads/main", "--tip", self.tip])
         return code, output.getvalue()
@@ -444,6 +465,30 @@ class StyleSyncTests(unittest.TestCase):
             "--key", "style-sync:sample-style", "--timeout", "10",
         ])
         self.assertLess(int(arguments[-1]), cast(int, calls.call_args_list[-1].kwargs["timeout"]))
+        self.assertEqual(sum(str(style_sync.SEND) in call.args[0] for call in calls.call_args_list), 1)
+
+    def test_no_live_unit_sends_nothing_even_with_a_live_showrunner_and_another_production(self) -> None:
+        self.production()
+        # Keep the staff unit and its readable environment, but remove its live session.
+        self.live_records = self.live_records[1:]
+        # Resolve the fixture before spying: production discovery itself runs Git.
+        standing = standing_style_production(self.repo)
+        with (mock.patch.object(style_sync, "standing_style_production", return_value=standing),
+              mock.patch("style_sync.subprocess.run", wraps=subprocess.run) as calls):
+            self.assertEqual(self.notice(), (0, ""))
+        self.assertFalse((self.root / "sent.json").exists())
+        self.assertEqual(calls.call_count, 0)
+
+    def test_duplicate_live_unit_holders_still_send_one_sync(self) -> None:
+        self.production()
+        duplicate = self.live_records[0].copy()
+        duplicate.update(pid=126, sessionId="duplicate")
+        self.live_records.append(duplicate)
+        (self.root / "proc/126").mkdir()
+        _ = (self.root / "proc/126/environ").write_bytes((self.root / "proc/123/environ").read_bytes())
+        with mock.patch("style_sync.subprocess.run", wraps=subprocess.run) as calls:
+            self.assertEqual(self.notice(), (0, ""))
+        self.assertEqual(sum(str(style_sync.SEND) in call.args[0] for call in calls.call_args_list), 1)
 
     def test_linked_worktree_notification_finds_the_same_production(self) -> None:
         self.production()

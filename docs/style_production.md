@@ -505,7 +505,9 @@ Every successful parent merge runs the best-effort notification:
 ~/.claude/scripts/lib/py ~/.claude/scripts/style/style_sync.py notify --repo-dir <checkout> --branch <branch point> --tip <new tip>
 ```
 
-A missing production or another branch point sends nothing. Notification
+A missing production, another branch point, or no live staff unit under the style
+showrunner sends nothing. The live-unit check uses the build queue's staff and
+session join. The next sync reads the current branch-point tip. Notification
 failure reports one line and never fails the parent's merge.
 
 On a sync message, run `style_ledger.py tip seen --repo <checkout> --tip <tip>`;

@@ -28,7 +28,8 @@ sys.path.insert(0, str(SCRIPTS / "lib"))
 
 from add_style import NoStyleProduction, standing_style_production
 from production_units import Refusal
-from scripts.production import showrunners
+from scripts.production import session_staff, showrunners
+from scripts.message import sessions
 import style_ledger
 from process_failure import failure_detail
 import scratch
@@ -69,12 +70,23 @@ class ToolLintRecord:
     diagnostics: Mapping[str, int]
 
 
+def has_live_unit(slug: str) -> bool:
+    """Use the queue's live-session/StaffLabels join, never stopped launch records alone."""
+    marks, _ = session_staff.session_staff_and_directors(sessions.running_sessions(), os.environ)
+    # Duplicate live holders are omitted from units and reported as faults;
+    # they still require a sync rather than making an active production quiet.
+    return bool(marks.units.get(slug)
+                or marks.faults.get(slug, {}).keys() & set(marks.members.get(slug, ())))
+
+
 def notify(repo_dir: Path, branch: str, tip: str) -> None:
     """A failed notification must never turn a completed merge into a failure."""
     try:
         standing = standing_style_production(repo_dir)
         branch = branch.removeprefix("refs/heads/")
         if isinstance(standing, NoStyleProduction) or standing.branch_point != branch:
+            return
+        if not has_live_unit(standing.slug):
             return
         address = subprocess.run([str(PYTHON), str(SHOWRUNNERS), "address", standing.slug],
                                  capture_output=True, text=True, check=False, timeout=10)
