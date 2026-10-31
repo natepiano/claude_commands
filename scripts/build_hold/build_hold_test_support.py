@@ -20,6 +20,9 @@ import unittest
 from unittest import mock
 
 import build_hold
+from override_guard import require_checkout
+
+require_checkout(Path(__file__))
 
 if TYPE_CHECKING:
     from ..lib.socket_test_support import short_socket_directory

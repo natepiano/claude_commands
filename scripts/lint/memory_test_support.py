@@ -1,7 +1,17 @@
 """Private memory readings for tests that use the admission gate."""
 
 import os
+import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+if TYPE_CHECKING:
+    from ..build_hold.override_guard import require_checkout
+else:
+    from scripts.build_hold.override_guard import require_checkout
+
+require_checkout(Path(__file__))
 
 
 def gate_isolation_environment(root: Path) -> dict[str, str]:

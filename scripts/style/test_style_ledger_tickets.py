@@ -323,16 +323,16 @@ class StyleLedgerTicketsTests(LedgerTestCase):
         ledger.ticket_add("read-2", "read", "read", "names", "crates/beta", [self.sources[2]], [rule])
         original = mock.Mock(wraps=subprocess.run)
 
-        def fail_diff(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-            if "diff" in command:
+        def fail_changed_paths(command: Sequence[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            if "log" in command and "--name-only" in command:
                 return subprocess.CompletedProcess(command, 128, b"", b"fatal: PRIVATE GIT STDERR")
             return cast(subprocess.CompletedProcess[bytes], original(command, **kwargs))
 
-        with mock.patch.object(subprocess, "run", side_effect=fail_diff):
+        with mock.patch.object(subprocess, "run", side_effect=fail_changed_paths):
             self.assert_git_refusal(ledger, "ticket read-2 assign:", lambda: ledger.ticket_assign("read-2", "main"))
         ledger.ticket_assign("read-2", "main")
         self.record(rule, self.sources[2], self.initial_tip, ticket="read-2")
-        with mock.patch.object(subprocess, "run", side_effect=fail_diff):
+        with mock.patch.object(subprocess, "run", side_effect=fail_changed_paths):
             self.assert_git_refusal(ledger, "ticket read-2 resume check:", lambda: ledger.check_ticket_pipeline("read-2"))
             self.assert_git_refusal(ledger, "ticket read-2 checkpoint:",
                                     lambda: ledger.ticket_checkpoint("read-2", self.initial_tip, "held-run", "8"))
@@ -2042,6 +2042,55 @@ class StyleLedgerTicketsTests(LedgerTestCase):
             self.record(rule, path, self.initial_tip, ticket="read-1")
         ledger.ticket_checkpoint("read-1", self.initial_tip)
         return ledger
+
+    def successor_after_style_fast_forward(self, *, import_docs: bool = True,
+                                           merge_predecessor: bool = True) -> tuple[style_ledger.Ledger, str]:
+        """An assigned beta successor inherits its alpha predecessor and optional imported style work."""
+        ledger = self.checkpointed_read_transition()
+        _ = self.git("branch", "style/main", self.initial_tip)
+        ledger.set_tip(self.initial_tip, "style/main")
+        if not merge_predecessor:
+            self.write(self.sources[0], "pub fn predecessor_work() {}\n")
+            checkpoint = self.commit("Checkpoint predecessor before its merge")
+            ledger.ticket_checkpoint("read-1", checkpoint)
+        rule = ledger.ticket_open("read")[0]["rules"][0]
+        ledger.ticket_add("read-2", "read", "read", "names", "crates/beta", [self.sources[2]], [rule])
+        ledger.ticket_assign("read-2", "main")
+        _ = ledger.ticket_base("read-2")
+        if merge_predecessor:
+            _ = ledger.ticket_merge("read-1")
+        style_tip = self.initial_tip
+        if import_docs:
+            self.write("docs/another-unit.md", "Another unit's merged notes.\n")
+            style_tip = self.commit("Other unit's style work arrives by fast-forward")
+            _ = self.git("branch", "-f", "style/main", style_tip)
+        return ledger, style_tip
+
+    def test_successor_gate_ignores_docs_imported_by_a_style_fast_forward(self) -> None:
+        ledger, _ = self.successor_after_style_fast_forward()
+        self.write(self.sources[2], "pub fn successor_work() {}\n")
+        _ = self.commit("Successor changes only its reserved source")
+        ledger.check_ticket_pipeline("read-2")
+        self.assertEqual(ledger.ticket_open("read")[0]["id"], "read-2")
+
+    def test_successor_own_commit_on_a_predecessor_path_is_refused(self) -> None:
+        ledger, _ = self.successor_after_style_fast_forward(import_docs=False, merge_predecessor=False)
+        self.write(self.sources[0], "pub fn overlapping_work() {}\n")
+        _ = self.commit("Successor changes a path its predecessor protects")
+        with self.assertRaisesRegex(style_ledger.LedgerError, "overlap:.*" + self.sources[0]):
+            ledger.check_ticket_pipeline("read-2")
+
+    def test_successor_disjoint_commit_excludes_its_unmerged_predecessors_commits(self) -> None:
+        ledger, _ = self.successor_after_style_fast_forward(import_docs=False, merge_predecessor=False)
+        self.write(self.sources[2], "pub fn successor_work() {}\n")
+        _ = self.commit("Successor builds on an unmerged predecessor with disjoint work")
+        ledger.check_ticket_pipeline("read-2")
+        self.assertEqual({ticket["state"] for ticket in ledger.ticket_open("read")}, {"checkpointed", "assigned"})
+
+    def test_set_tip_accepts_a_successor_that_imported_another_units_docs(self) -> None:
+        ledger, style_tip = self.successor_after_style_fast_forward()
+        ledger.set_tip(style_tip, "style/main")
+        self.assertEqual(ledger.synced_commit(), style_tip)
 
     def test_transition_audit_checkpoint_missing_commit_names_ticket_and_verb(self) -> None:
         ledger = self.checkpointed_read_transition()

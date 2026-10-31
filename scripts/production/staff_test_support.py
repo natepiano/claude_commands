@@ -92,6 +92,9 @@ def source_environment(source: Path) -> dict[str, str]:
         ("NOTIFIER_STATE_DIR", "notifier"), ("SHOWRUNNER_STATE_DIR", "showrunners"),
         ("HERDR_PANE_RECORD_DIR", "panes"), ("NOTIFIER_SESSIONS_DIR", "sessions"),
         ("XDG_CONFIG_HOME", "config"),
+        ("UNIT_WORKERS_STATE", "unit-workers"), ("ROSTER_RUN_ROOT", "runs"),
+        ("REVIEW_POOL_STATE", "review-pool"), ("ASTRA_ROLES_STATE", "astra-roles"),
+        ("DESIGN_ROLES_STATE", "design-roles"), ("DESIGN_OWNERSHIP_STATE", "design-ownership"),
     )}
 
 
@@ -102,7 +105,7 @@ observe_operation_lock()
 sys.platform = os.environ.get('STAFF_TEST_PLATFORM', 'linux')
 script = sys.argv.pop(1)
 sys.argv[0] = script
-if script.endswith('staff_sources.py'):
+if script.endswith('staff_sources.py') or '--live' in sys.argv:
     from scripts.production import staff_sources
     with isolated_source_readers():
         runpy.run_path(script, run_name='__main__')
@@ -217,6 +220,7 @@ class StaffTestCase(unittest.TestCase):
         write_text_atomic(ssh, f"#!{sys.executable}\n{FAKE_SSH}")
         ssh.chmod(0o755)
         _ = self.enterContext(cast(AbstractContextManager[object], mock.patch.dict(os.environ, {
+            "HOME": str(self.root / "home"),
             "PATH": f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
             "STAFF_TEST_SSH_LOG": str(self.ssh_log),
             "STAFF_TEST_OWNER_FILE": str(self.staff_file),
@@ -330,6 +334,120 @@ class StaffTestCase(unittest.TestCase):
             "flags_read": True, "ended": False, "written_at": written_at,
         }
         self.write_json(path, entries)
+
+    def session_record(self, session_id: str, name: str) -> Path:
+        """A registry record tied to this test's real, private process identity."""
+        from scripts.message import sessions
+
+        path = Path(os.environ["NOTIFIER_SESSIONS_DIR"]) / f"{session_id}.json"
+        self.write_json(path, {
+            "sessionId": session_id, "name": name, "pid": os.getpid(),
+            "procStart": sessions.process_start(os.getpid()), "messagingSocketPath": "",
+            "updatedAt": 1, "formerNames": [], "tmux": "", "entrypoint": "cli",
+        })
+        return path
+
+    def worker_run(self, slug: str, unit: str, director: str) -> Path:
+        """A unit run with actual state, roster, server and director records."""
+        run = Path(os.environ["ROSTER_RUN_ROOT"]) / f"{slug}-{unit}"
+        run.mkdir(parents=True, exist_ok=True)
+        self.write_json(run / "progress_history_state.json", {
+            "production": slug, "unit": unit,
+            "main_agent": {"family": "claude", "session_id": director},
+        })
+        write_text_atomic(run / "director", director + "\n")
+        self.write_json(run / "mesh_roster.json", {})
+        self.write_json(run / "mesh_server.json", {"pid": os.getpid(), "codex_home": str(self.root / "codex")})
+        return run
+
+    def ledger_worker(self, run: Path, slug: str, unit: str, name: str, role: str, identity: str, *,
+                      family: str = "codex", retired: bool = False, staff_id: str = "") -> Path:
+        """Write one unit-ledger entry and its run projection through the shared JSON writer."""
+        path = Path(os.environ["UNIT_WORKERS_STATE"]) / slug / f"{unit}.json"
+        ledger: dict[str, object] = (cast(dict[str, object], json.loads(path.read_text()))
+                                   if path.exists() else {"version": 1, "workers": {}})
+        entries = cast(dict[str, object], ledger["workers"])
+        backend = ({"kind": "CodexThread", "thread_id": identity, "codex_home": str(self.root / "codex")}
+                   if family == "codex" else {"kind": "ClaudeSession", "session_id": identity})
+        entries[name] = {
+            "name": name, "role": role, "family": family, "model": "", "effort": "",
+            "backend": backend, "ownership": {"kind": "Retired"} if retired else {"kind": "HeldBy", "run": str(run)},
+            "access_policy": {}, "events": [], **({"staff_id": staff_id} if staff_id else {}),
+        }
+        self.write_json(path, ledger)
+        _ = self.roster_worker(run, name, role, identity, status="ended" if retired else "done",
+                               family=family, staff_id=staff_id)
+        return path
+
+    def pool_reviewer(self, slug: str, name: str, thread: str, *, unit: str = "", busy_pid: int = 0) -> Path:
+        """A legacy pool source whose holder is its production, independent of its lease."""
+        path = Path(os.environ["REVIEW_POOL_STATE"]) / slug / "pool.json"
+        self.write_json(path, {
+            "generation": 1, "templates": {}, "next_index": {"code": 2},
+            "reviewers": {name: {
+                "type": "code", "thread_id": thread, "prime_hash": "fixture", "reviews": 0,
+                "lease": {"unit": unit, "ordinal": 1} if unit else None,
+                "busy_pid": busy_pid or None, "last_allocated": 1,
+            }},
+        })
+        return path
+
+    def astra_worker(self, run: Path, name: str, thread: str, manager: str) -> Path:
+        """A live mesh Astra hold, using the same run roster as ordinary workers."""
+        from scripts.astra import astra_roles
+
+        _ = self.roster_worker(run, name, "review", thread)
+        _ = astra_roles.hold("reviewer", session_dir=run, worker=name, manager=manager)
+        path = Path(os.environ["ASTRA_ROLES_STATE"]) / f"{thread}.json"
+        return path
+
+    def roster_worker(self, run: Path, name: str, role: str, identity: str, *, status: str = "running",
+                      family: str = "codex", staff_id: str = "") -> Path:
+        """Write the mesh producer's standalone roster shape, without a unit ledger."""
+        path = run / "mesh_roster.json"
+        roster = cast(dict[str, object], json.loads(path.read_text()))
+        roster[name] = {"role": role, "status": status, "family": family,
+                        "thread_id" if family == "codex" else "worker_id": identity,
+                        "launcher_pid": os.getpid(), "port": 12345,
+                        **({"staff_id": staff_id} if staff_id else {})}
+        self.write_json(path, roster)
+        return path
+
+    def legacy_claude_worker(self, run: Path, session_id: str, *, prefix: str,
+                             role: str, kind: str = "impl") -> str:
+        """Use the launcher's name and board registration with agent_bg's TSV ledger."""
+        direct = CHECKOUT / "scripts/direct"
+        named = subprocess.run(
+            ["bash", str(direct / "worker_name.sh"), str(self.root), "impl", kind, prefix],
+            capture_output=True, text=True, check=True, timeout=PROCESS_TIMEOUT,
+        )
+        name = named.stdout.strip()
+        _ = subprocess.run(
+            ["bash", str(direct / "board.sh"), "post", str(run), "impl", "register",
+             f"mesh={name}"], capture_output=True, text=True, check=True, timeout=PROCESS_TIMEOUT,
+        )
+        if role:
+            _ = subprocess.run(
+                ["bash", str(direct / "board.sh"), "role", str(run), "impl", role],
+                capture_output=True, text=True, check=True, timeout=PROCESS_TIMEOUT,
+            )
+        write_text_atomic(run / "workers", f"{session_id[:8]}\t{name}\n")
+        return name
+
+    def worker_design(self, slug: str, name: str, thread: str) -> Path:
+        """Persist the durable design producer's tagged record, without a ledger."""
+        from scripts.astra import design_roles
+
+        design_id = "12345678-1234-5678-1234-567812345678"
+        design = design_roles.HeldDesign(
+            design_roles.DesignPlacement(design_id, design_roles.local_host(), 1),
+            "fixture", str(self.source_root), str(self.source_root / "design.md"), "fixture",
+            "2026-10-31T00:00:00+00:00", design_roles.ShowrunnerHolder(slug), design_roles.DesignUnbound(),
+            (design_roles.RoleInstance("designer", name, design_roles.RoleOpen(thread)),
+             design_roles.RoleInstance("reviewer", "sdlc-design-astra-reviewer", design_roles.RoleNotOpened())),
+        )
+        design_roles._save(design)  # pyright: ignore[reportPrivateUsage]
+        return design_roles.design_directory(design_id) / "design.json"
 
     @contextmanager
     def lock_notice(self, lock: Path) -> Generator[socket.socket]:

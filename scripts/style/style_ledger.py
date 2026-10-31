@@ -3052,7 +3052,10 @@ class Ledger:
             footprints: list[frozenset[str]] = []
             for ticket in (predecessor, successor):
                 end = ticket["checkpoint"] or live[successor["branch"]]
-                paths = _git_bytes(self.repo, "diff", "--name-only", "--no-renames", "-z", ticket["base"], end).stdout
+                # Neither inherited predecessor work nor imported style work belongs to this ticket.
+                revisions = (end, f"^{ticket['base']}", *((f"^{style_tip}",) if style_tip else ()))
+                paths = _git_bytes(self.repo, "log", "--no-merges", "--name-only", "--no-renames", "-z",
+                                   "--format=", *revisions, "--").stdout
                 if paths and not paths.endswith(b"\0"):
                     raise LedgerError("unreadable changed paths")
                 actual = frozenset(os.fsdecode(path) for path in paths.split(b"\0") if path)
@@ -3579,6 +3582,10 @@ class Ledger:
         return ApprovedProposal(Path(ticket["proposal"]), ticket["unit"], tuple(ticket["finding_ids"]),
                                 tuple(widened["path"] for widened in ticket["widened"]), ticket["base"],
                                 tuple(issue for issue in self.ticket_proposals(id) if str(issue) != ticket["proposal"]))
+
+    def ticket_crate(self, id: str) -> str:
+        """The crate whose work the ticket builds or judges."""
+        return self._ticket(id)["crate"]
 
     def ticket_proposals(self, id: str) -> tuple[Path, ...]:
         """Every decision a ticket builds, including the primary decision of a legacy ticket."""

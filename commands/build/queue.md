@@ -1,5 +1,5 @@
 ---
-description: Show the build budget and waiting steps, or one step's place and why it waits. Args - `[<position|session|folder>|close]`.
+description: Show the build budget and waiting steps, or one step's place and why it waits. Args - `[<position|session|folder>|bump <unit>|close]`.
 ---
 
 Run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/build_queue.py $ARGUMENTS`. Show the output as is inside a `text` code block.
@@ -10,4 +10,4 @@ The budget bar shows free (`░`) and taken (`█`) GiB. Each waiting step has o
 
 With `unit-board@nate-local`, the pane refreshes every 10 seconds and redraws the countdown every second without running the script. `close` closes it. Run `/reload-plugins` in sessions started before the mod change.
 
-`bump <position|session|folder>` moves nothing and exits 3 with one stdout line and no stderr: `build queue: bump is off; nothing can move a waiting step`. Waiting steps that fit keep room in queue order; a younger step held by that room shows `behind older step <label>`. Use `/build:status` for holds and target state.
+Queue priority puts one unit first until the user replaces or clears it. The queue shows `queue priority: <unit> (the user's bump)`. `/build:queue bump <unit>` sets that unit's priority with the reason `the user's bump`; a second bump replaces it. It requires a showrunner session. A missing unit or more than one word prints `build queue: use /build:queue bump <unit>` and changes nothing. Other sessions receive `build queue: type /build:queue bump <unit> in a showrunner pane` on stdout with exit 3. Waiting steps that fit keep room in queue order; a younger step held by that room shows `behind older step <label>`. Use `/build:status` for holds and target state.

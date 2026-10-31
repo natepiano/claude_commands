@@ -19,7 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -30,8 +30,11 @@ from typing import TYPE_CHECKING, Literal, Protocol, TextIO, cast
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "production"))
 
 if TYPE_CHECKING:
+    from scripts.production import staff, unit_lookup
+    from scripts.message.sessions import RegistryRead, SessionRecord
     from scripts.direct.review_pool import Pool, ProductionPool, Reviewer
     from scripts.lib.names import JobKey
 
@@ -1518,23 +1521,92 @@ class NoLiveUnitDirector:
     """Neither the registry nor the unit mark identifies a live director."""
 
 
-def live_unit_director(run: Path) -> LiveUnitDirector | NoLiveUnitDirector:
-    """Resolve the run's live director, then its current marked unit after a restart."""
-    from scripts.lib import unit_runs
+def running_director_sessions(registry: RegistryRead) -> list[SessionRecord]:
+    """Running director candidates, newest first, including sessions without sockets."""
     from scripts.message import sessions
-    director = unit_runs.director(run)
-    live = sessions.live_sessions()
-    for session in live:
+
+    return sorted(
+        (item.record for item in registry.entries if sessions.running_session(item.record)),
+        key=lambda session: session["updatedAt"], reverse=True,
+    )
+
+
+def resolve_live_unit_director(
+    run: Path, record: staff.StaffSnapshot, sources: unit_lookup.MemberSources,
+    running: Sequence[SessionRecord], dependencies: Callable[[Path], None],
+) -> LiveUnitDirector | NoLiveUnitDirector:
+    """Resolve the current director once, including restarts on another account.
+
+    Shutdown history carries the unit's stable host/name when a run's director file
+    still names the former session. Run markers and folders are not proof that the
+    director died.
+    """
+    from scripts.lib import unit_runs
+    from scripts.production import unit_lookup
+    from scripts.shutdown.launch_permission import shutdown_state_root
+
+    director = unit_runs.director(run, dependencies=dependencies)
+    for session in running:
         if director and session["sessionId"] == director:
             return LiveUnitDirector(session["sessionId"], session["pid"])
+    dependencies(run / STATE)
     context = _read(run / STATE)
     production, unit = context.get("production"), context.get("unit")
+    names: set[str] = set()
+    for path in shutdown_state_root().glob("*/history/*.json"):
+        dependencies(path)
+        try:
+            saved = _read(path)
+        except (OSError, ValueError, WorkerUnavailable):
+            continue
+        previous = _object(saved.get("session"))
+        host = _object(previous.get("host"))
+        if host.get("kind") not in ("unit", "legacy tmux unit"):
+            continue
+        runs = previous.get("run_dirs")
+        same_run = isinstance(runs, list) and any(
+            isinstance(value, str) and Path(value).resolve() == run.resolve()
+            for value in cast(list[object], runs))
+        same_unit = False
+        if production and unit and host.get("unit") == unit:
+            try:
+                same_unit = unit_lookup.unit_parent(
+                    str(unit), str(previous.get("session_id", "")), record=record, sources=sources).slug == production
+            except OSError:
+                pass
+        if not (same_run or same_unit or (director and previous.get("session_id") == director)):
+            continue
+        for name in (previous.get("name"), host.get("session_name")):
+            if isinstance(name, str) and name:
+                names.add(name)
+        # A restart may resume the original session id rather than create one.
+        for session in running:
+            if session["sessionId"] == previous.get("session_id"):
+                return LiveUnitDirector(session["sessionId"], session["pid"])
+    for session in running:
+        if names.intersection((session["name"], *session["formerNames"])):
+            return LiveUnitDirector(session["sessionId"], session["pid"])
     if isinstance(production, str) and isinstance(unit, str) and production and unit:
-        from scripts.production import unit_lookup
-        marked = unit_lookup.marked_unit(production, unit)
+        try:
+            marked = unit_lookup.marked_unit(production, unit, record=record, sources=sources, running=running)
+        except OSError:
+            return NoLiveUnitDirector()
         if marked is not None and isinstance(marked.claude, unit_lookup.LiveClaude):
             return LiveUnitDirector(marked.claude.session_id, marked.claude.pid)
     return NoLiveUnitDirector()
+
+
+def live_unit_director(run: Path) -> LiveUnitDirector | NoLiveUnitDirector:
+    """Resolve the director across restarts with one owner snapshot."""
+    from scripts.production import staff, unit_lookup
+    from scripts.message import sessions
+
+    dependencies = staff.RecordInputs()
+    record = staff.initial_snapshot()
+    registry = sessions.read_registry(dependencies=dependencies)
+    running = running_director_sessions(registry)
+    return resolve_live_unit_director(run, record, unit_lookup.member_sources(dependencies=dependencies),
+                                      running, dependencies)
 
 
 def run_has_live_director(run: Path) -> bool:

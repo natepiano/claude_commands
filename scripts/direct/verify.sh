@@ -2979,18 +2979,29 @@ note_memory_admission() {
 }
 
 admit_with_token() {
-    local waited=0
+    local waited=0 reservation_before_token token_back_at
     while :; do
+        reservation_before_token=${BUILDLOG_MEM_RESERVATION:-}
+        token_back_at=""
+        if [[ -n "$reservation_before_token" ]]; then
+            # Give memory back without losing this step's queue place. Reuse
+            # its first clock so all passes and token waits count exactly once.
+            BUILDLOG_MEM_WAIT_SINCE=$BUILDLOG_MEM_WAIT_FROM
+            buildlog_token_wait || return $?
+        fi
         acquire_token || return $?
         waited=$(( waited + TOKEN_WAITED ))
+        if [[ -n "$reservation_before_token" ]]; then
+            token_back_at=$(buildlog_memory_python -c 'import time; print(time.time())') || return $?
+        fi
         # The Mac claim hook and every poll share this admission's heartbeat.
-        with_token_renewal buildlog_wait_for_memory_only "$@" || return $?
+        BUILDLOG_MEM_TOKEN_BACK_AT=$token_back_at \
+            with_token_renewal buildlog_wait_for_memory_only "$@" || return $?
         note_memory_admission
         [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || break
         if [[ "${TOKEN_USED}" -eq 0 ]] || renew_token; then break; fi
-        # Ownership was lost before any command ran. Never wait for the token
-        # with a memory promise that could prevent its new holder from running.
-        buildlog_release_memory 0
+        # Ownership was lost before any command ran. The next pass gives
+        # memory back before waiting for its new holder's token.
         TOKEN_HELD=0
     done
     TOKEN_WAITED=$waited
@@ -3017,7 +3028,6 @@ buildlog_wait_for_memory() {
         note_memory_admission
         [[ "$BUILDLOG_MEM_OUTCOME" != LeftQueue ]] || return 0
         if ! try_token_now; then
-            buildlog_release_memory 0
             admit_with_token "$@" || return $?
         fi
     fi

@@ -129,7 +129,9 @@ def socket_for(target: str) -> str | None:
     return result.stdout.strip() if result.returncode == 0 and result.stdout.strip() else None
 
 
-def _fields(path: Path) -> dict[str, str]:
+def _fields(path: Path, *, dependencies: Callable[[Path], None] | None = None) -> dict[str, str]:
+    if dependencies is not None:
+        dependencies(path)
     return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
 
 
@@ -184,14 +186,16 @@ def _session_name(session_id: str) -> str:
     raise ValueError(f"session {session_id} has no live named process")
 
 
-def _source(instance: Path) -> ShowrunnerSource:
-    fields = _fields(instance / "conf")
+def _source(instance: Path, *, dependencies: Callable[[Path], None] | None = None) -> ShowrunnerSource:
+    fields = _fields(instance / "conf", dependencies=dependencies)
     target = fields["TARGET"]
     if not target.startswith("session:") or not target[8:]:
         raise ValueError("invalid TARGET")
     doc = _checked_doc(fields.get("CHECK"))
     if isinstance(doc, NoCheckedDoc):
         raise ValueError(doc.reason)
+    if dependencies is not None:
+        dependencies(doc.path)
     try:
         document = doc.path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as error:
@@ -212,14 +216,15 @@ class UnreadableTimerPolicy(Enum):
 
 
 def read_sources(state_dir: Path | None = None, *,
-                 unreadable: UnreadableTimerPolicy) -> list[ShowrunnerSource]:
+                 unreadable: UnreadableTimerPolicy,
+                 dependencies: Callable[[Path], None] | None = None) -> list[ShowrunnerSource]:
     """Read each timer/doc once, applying the caller's policy to unreadable timers."""
     found: list[ShowrunnerSource] = []
     for instance in sorted((state_dir or NOTIFIER_STATE_DIR).glob("showrunner-*")):
         if not instance.is_dir():
             continue
         try:
-            found.append(_source(instance))
+            found.append(_source(instance, dependencies=dependencies))
         except (OSError, KeyError, ValueError, UnicodeError) as error:
             if isinstance(error, OSError) and unreadable is UnreadableTimerPolicy.RAISE:
                 raise
