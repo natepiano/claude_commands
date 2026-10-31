@@ -204,15 +204,9 @@ only I can bump
 
 As built (fe2f920a, on origin/builds cc16b3fe, 2026-10-31): `[memory] build_budget_gib=24` in `config/lint.conf`. One reader, `memory_admit.build_budget_bytes()`: `BUILDLOG_BUILD_BUDGET_GIB` wins, then the config value, then `FALLBACK_BUILD_BUDGET_BYTES` (21 GiB) for a missing or invalid value; read at each check. `head_facts`, `queue_view`, `build_why`, `AdmissionDecision` and the expected-peak cap call it. Tests pin the budget by env. Showrunner ask; the user approved 24 for a one-day trial.
 
-### Phase 4c — The queue snapshot no longer stores the build budget; every reader resolves it live  · status: todo
-**Depends on:** Phase 4b
-**Blocked by:** none (builds showrunner, urgent, 2026-10-31).
+### Phase 4c — The queue snapshot no longer stores the build budget; every reader resolves it live  · status: done
 
-#### Work Order
-
-**Goal:** `/build:queue` and `/build:why` show the live budget every time. Today `QueueInputs.limits` (budget and reserve) goes into `admission/queue.json`. A check run from a tree older than 4b writes 21 there, and the views show 21 or 24 at random. Remove `limits` from `QueueInputs`. `queue_read_from(inputs, limits)` takes the limits from its caller, and each caller resolves them live with `resolve_admission_limits`. The snapshot version goes to 2, so a snapshot of the old shape is not read.
-**Files:** `scripts/lint/memory_admit.py`, `scripts/lint/test_memory_admit.py`, `scripts/build_queue/queue_fixture.py`, `scripts/build_queue/test_build_queue.py`, `docs/as-built/build-memory-admission.md` and any reader of `QueueInputs.limits`.
-**Acceptance:** with a snapshot that a test writes with budget 21 and config 24, the view reads 24. A version-1 snapshot reads as no snapshot. Tests: test_memory_admit, all scripts/build_queue tests; basedpyright clean.
+As built (b20effdf, on origin/builds e2773be6, 2026-10-31; builds showrunner, urgent): a `verify.sh lint` in a worktree from before Phase 4b ran its own `memory_admit.py` and wrote budget 21 into `admission/queue.json`, so `/build:queue` showed 21.0 or 24.0 at random. `QueueInputs` has no `limits`; `queue_read_from(inputs, limits)` takes them from its caller, and the private `_queue_read_live` resolves them once per reading for `queue_read` and `read_queue_pass`. The snapshot is version 2; a version-1 snapshot reads as absent and the reader takes the bounded locked read. A check from an old tree still decides its own step with its own budget until that tree merges builds.
 
 ### Phase 5 — The queue service, its socket protocol and its client exist and pass in-process tests; no build uses them yet  · status: todo
 **Depends on:** Phase 4
@@ -678,6 +672,18 @@ No-copies rule (user, 2026-10-30): one place for each thing. A second copy of se
 - 24 h after the cut-over: no earlyoom kill caused by admission (earlyoom's journal), and the median and p90 of `steps.mem_wait_s` against the 24 h before. The summary gives the numbers.
 - The notice has `also touches` lines for `memory_admit.py`, `test_memory_admit.py`, `memory_gate.sh`, `pre-tool-use-brp-launch-gate.sh`, `build_hold.py`, `override_guard.py`, `override_guard.sh` and their tests, and for the carry of resources Phase 26's state if this phase does it (resources-unit reviewed the diff; trial-merged against `origin/builds-resources`); `invoke.sh`, `verify.sh`, `mac_idle.py` and their tests (verify-unit, against `origin/natedev-verify`); `merge_gate.py`, `stop.py` and their tests (the natedev showrunner, against `origin/natedev`); `push_catalog.py` and `queue.test.ts` (natedev messaging-unit and unit-board-unit, against `origin/natedev`); and `outage_alerts.py` if it changed (its owner as the builds showrunner names it).
 - Change-Review line: builds wait on the queue service, and the polling admission is gone | on natedev while steps wait, type `/build:queue`, then run `~/.claude/scripts/lib/py ~/.claude/scripts/build_queue/admission_client.py view` | the queue answers in under a quarter second, and each waiting step's output shows the same wait line as before.
+
+### Phase 11 — Every later step of one verify.sh run keeps the queue place of the run's first step  · status: todo
+**Depends on:** Phase 10 (the queue service holds the queue and the place record)
+**Blocked by:** none past Phase 10. Builds showrunner ask, 2026-10-31.
+
+#### Work Order
+
+**Goal:** berth measured one `verify.sh lint` at about 45 min of queue time over three steps (10:21, 21:47, about 15) for a few minutes of work. Each step joined the back of the queue. After this phase, every later step of one `verify.sh` run takes the queue place of the run's first step. A step takes memory only while it runs; no memory is held between steps. The place ends when the run ends.
+**What verify passes:** the outermost `verify.sh` sets `BUILDLOG_RUN=<pid>:<start time>` once, from its own pid and the start-time field of `/proc/<pid>/stat`. A nested `verify.sh` keeps the value it got. `memory_gate.sh` sends it with each waiter. The pid and start time together never match a reused pid.
+**Rule:** the service keeps one record per run: the `since` of the run's first waiter. A later waiter with the same run takes that `since` as its place. The record goes when no live process has that pid and start time. A run never holds a reservation or a token between steps. The user's rulings stay: one place in line across memory and the CPU token, no head_since, a bump has no end time.
+**Files:** `scripts/direct/verify.sh`, `scripts/lint/memory_gate.sh`, the queue service files, their tests, `docs/as-built/build-memory-admission.md`.
+**Acceptance:** in a service test, a run's second step that arrives after two other waiters goes before them, and goes back to normal order after its run's pid ends. A live check: one `verify.sh lint` with three steps waits for its queue place once, not three times.
 
 ### Phase 7 — A promote never refuses a step that already waits for memory  · status: done
 
