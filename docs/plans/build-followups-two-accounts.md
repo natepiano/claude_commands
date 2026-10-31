@@ -3017,21 +3017,8 @@ User 2026-10-31 07:5x EDT: claude3 showed a red dot on the Mac board while signe
 
 **As-built:** launchd job `account-usage` (`/etc/nixos/modules/darwin/account-usage.nix`, every 120 s, at login, Aqua session) runs `agent_notes.py usage-only`, which reads usage and sends no alerts and changes no routing; a read that cannot reach credentials (signed-out CLI answer, exit 1 over ssh) records CREDENTIALS_UNAVAILABLE and keeps the last good outcome. Review: two lenses found F001 (signed-out exit 1 still stored ERROR); one fix round; closure approved.
 
-### Phase 101i — A failed CI point names its failing step and log  · status: done
+### Phase 101i — A failed CI point names its failing step and log  · status: done · b3a0ca39
 
-Showrunner defect 2026-10-31 09:3x EDT, reported by hana: a CI point's validation line opened with memory-wait lines and hid a killed nextest. Confirmed: a 25-line memory wait gives a 2.6 KB line whose first 2.3 KB are wait lines; the failing step and the kill are at its end, and no log is kept, because the output lived only in the temporary copy.
+Showrunner defect 2026-10-31 09:3x EDT, reported by hana: the validation line opened with memory-wait lines and hid a killed nextest; no log was kept.
 
-**Depends on:** none.
-
-#### Work Order
-
-- `ci_points.ci_start` writes validation's whole output, stdout and stderr in order (`stderr=subprocess.STDOUT`), to `<state dir>/ci_validation.log`, replaced at each start. The log stays after the copy is removed, pass or fail.
-- On a failed validation the line reads `validation: failed — step <label> failed; log <path>`, where `<label>` is the last `!!! VALIDATION FAILED at step: <label> !!!` line in the log (`validate_ci.sh` `run_step`). With no such line: `validation: failed — exit <code>, no step named; log <path>`. No wait line and no output tail goes in the report line; the log holds them.
-- An `OSError` opening the log or starting the command is still a `PointFailure("validation", …)`.
-- Docs: Phase 101c and 101d text that says validation failures keep `failure_detail`, and any as-built or command doc that describes the validation line (`docs/as-built/merge-gate-and-test-speed.md`, `commands/showrunner/produce.md`, `commands/unit/ci.md`), match the new line.
-- Tests (`scripts/production/test_ci_points.py`): replace `test_validation_failure_names_the_failed_check_when_stderr_only_reports_memory_waits` with a stub that prints memory-wait lines to stderr, then a kill line and the `run_step` marker to stdout: the report names the step and the log path and holds no wait line; the log holds every line in order. Add the no-marker case. Add a passing run that still leaves the log.
-- Out of scope: `merge_checkpoint.push_validate` (`--quick`, runs in the checkout, no state dir).
-
-**Files:** `scripts/production/ci_points.py`, `scripts/production/test_ci_points.py`, the docs named above.
-
-**Checks:** `python3 -m unittest scripts.production.test_ci_points` from the repo root; basedpyright 0/0 on both files.
+**As-built:** `ci_start` writes validation's stdout and stderr, in order, to `<state dir>/ci_validation.log`, replaced at each start and kept after the copy is removed. A failure reads `validation: failed — step <label> failed; log <path>` from the last `!!! VALIDATION FAILED at step: <label> !!!` line (`validate_ci.sh` `run_step`), or `exit <code>, no step named; log <path>`. The scan uses `errors="replace"`, so bytes that are not UTF-8 never hide the step. An `OSError` stays a `PointFailure("validation", …)`. `merge_checkpoint.push_validate` keeps `failure_detail`. Review: two lenses found F001 (strict UTF-8 scan); one fix round; closure approved.
