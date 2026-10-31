@@ -289,7 +289,7 @@ def resume(session: str, *, why: str, to: str | None = None, requester: str = ""
             if not generation:
                 return ResumeFailed(identity, f"process identity unreadable for pid {live.pid}")
             _detach(["stay", "--session", identity, "--pane", tab.pane_id,
-                     "--account", label, "--pid", str(live.pid), "--generation", generation,
+                     "--account", label, "--pid", str(live.pid), "--generation", generation, "--why", why,
                      *(["--requester", requester] if requester else [])], "stay")
             return ClaudeUp(identity, tab.pane_id, label, monotonic() - began)
         return ResumeFailed(identity, reason)
@@ -332,7 +332,8 @@ def _handoff_batch(selected: list[str], target: str, why: str, warn_seconds: int
              "--", *selected], "move")
 
 
-def _check_stay(identity: str, pane: str, account: str, pid: int, generation: str, requester: str = "") -> str:
+def _check_stay(identity: str, pane: str, account: str, pid: int, generation: str,
+                requester: str = "", why: str = "") -> str:
     """Observe the started generation after the command returns; recovery belongs to the watchdog."""
     began = monotonic()
     while _same_claude(pid, generation):
@@ -340,15 +341,12 @@ def _check_stay(identity: str, pane: str, account: str, pid: int, generation: st
         if remaining <= 0:
             return ""
         time.sleep(min(0.1, remaining))
-    cause = f"{identity}: ended after {monotonic() - began:g} s"
-    if requester:
-        _early_exit(identity, pane, account, cause, requester=requester)
-    else:
-        _early_exit(identity, pane, account, cause)
-    return cause
+    return _early_exit(identity, pane, account, monotonic() - began, requester=requester, why=why)
 
 
-def _early_exit(identity: str, pane: str, account: str, cause: str, *, requester: str = "") -> None:
+def _early_exit(identity: str, pane: str, account: str, elapsed: float, *, requester: str = "",
+                why: str = "") -> str:
+    """Build one actionable outcome for the showrunner, user push and stay log."""
     from scripts.production import showrunners, staff_sources
     from scripts.accounts import unit_watchdog
     from scripts.notify.push_texts import render
@@ -358,29 +356,38 @@ def _early_exit(identity: str, pane: str, account: str, cause: str, *, requester
     from restart_support import local_machine
 
     entry = pane_record.read(herdr.shared_session()).get(pane)
-    environment = entry["environment"] if entry and entry["session_id"] == identity else {}
-    unit = environment.get("SHOWRUNNER_UNIT_ID", "")
+    entry = entry if entry and entry["session_id"] == identity else None
+    environment = entry["environment"] if entry else {}
+    name = entry["name"] if entry else ""
     try:
-        slug = (staff_sources.unit_parent(unit, identity).slug if unit else
-                requester or environment.get("SHOWRUNNER_UNIT", ""))
+        tab = _tab_of(identity)
+        if isinstance(tab, herdr.TabSession):
+            name = tab.label or name
+    except (OSError, ValueError, herdr.HerdrFailure):
+        pass  # The saved launch name still identifies a session whose pane is gone.
+    name = name or identity
+    unit = environment.get("SHOWRUNNER_UNIT_ID", "")
+    if unit:
+        try:
+            recovery = unit_watchdog.run(datetime.now(timezone.utc), dry_run=False)
+            next_step = "; ".join(recovery) if recovery else "watchdog reported no recovery action"
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            next_step = f"watchdog could not recover it: {error}"
+    else:
+        command = shlex.join(["python3", "scripts/shutdown/shutdown.py", "resume", name,
+                              "--to", account, "--why", why or "retry after early exit"])
+        next_step = f"resume it: cd ~/.claude && {command}"
+    cause = f"{name} stopped {elapsed:.1f} s after its move or resume to {account}; {next_step}"
+    try:
+        slug = staff_sources.unit_parent(unit, identity).slug if unit else requester
         if slug:
-            print(showrunners.tell(slug, f"resume-ended-{identity}-{uuid4().hex}", cause))
-        else:
-            delivery = showrunners.tell_others(
-                {runner["slug"]: cause for runner in showrunners.registered_showrunners()},
-                f"resume-ended-{identity}-{uuid4().hex}")
-            for line in delivery.lines:
-                print(line)
+            print(showrunners.tell(slug, f"resume-ended-{identity}-{uuid4().hex}", cause, sender="shutdown"))
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"{identity}: could not tell showrunner: {error}")
-    try:
-        if environment.get(PROBE_ENV) != "1":
-            _ = quota_alert.tell_user(render("shutdown.restart_failed", account=account, machine=local_machine(),
-                                            stopped=identity, cause=cause))
-    finally:
-        if unit:
-            for line in unit_watchdog.run(datetime.now(timezone.utc), dry_run=False):
-                print(line)
+    if environment.get(PROBE_ENV) != "1":
+        _ = quota_alert.tell_user(render("shutdown.restart_failed", account=account, machine=local_machine(),
+                                        stopped=name, cause=cause))
+    return cause
 
 
 def claude_up_line(result: ClaudeUp) -> str:
@@ -556,6 +563,7 @@ def main(argv: list[str] | None = None) -> int:
     for option in ("session", "pane", "account", "generation"):
         _ = stay.add_argument("--" + option, required=True)
     _ = stay.add_argument("--requester", default="")
+    _ = stay.add_argument("--why", default="")
     _ = stay.add_argument("--pid", type=int, required=True)
     _ = stay.add_argument("--log", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -565,7 +573,7 @@ def main(argv: list[str] | None = None) -> int:
     if cast(str, args.command) == "stay":
         with log.open("a", encoding="utf-8") as output, redirect_stdout(output):
             cause = _check_stay(cast(str, args.session), cast(str, args.pane), cast(str, args.account),
-                                cast(int, args.pid), cast(str, args.generation), cast(str, args.requester))
+                                cast(int, args.pid), cast(str, args.generation), cast(str, args.requester), cast(str, args.why))
             _ = output.write(cause + "\n")
         return int(bool(cause))
     with log.open("a", encoding="utf-8") as output:

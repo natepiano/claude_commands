@@ -321,35 +321,111 @@ class StopResumeTests(unittest.TestCase):
         self.assertEqual(arguments[:3], ["stay", "--session", "sid-alpha"])
         self.assertEqual(arguments[arguments.index("--pid") + 1], "456")
         self.assertIn("generation-1", arguments)
+        self.assertEqual(arguments[arguments.index("--why") + 1], "maintenance")
         self.start.assert_called_once()
 
-    def test_detached_stay_check_alerts_on_early_exit_without_restarting(self) -> None:
+    def run_stay_child(self, *, requester: str = "", why: str = "usage limit") -> tuple[int, str]:
         def exits_soon(_pid: int, _generation: str) -> sessions.LiveSessionProcess | sessions.SessionNotLive:
-            return sessions.LiveSessionProcess(456) if self.clock.elapsed < 1.0 else sessions.SessionNotLive()
+            return sessions.LiveSessionProcess(456) if self.clock.elapsed < 0.6 else sessions.SessionNotLive()
         self.process.side_effect = exits_soon
-        with patch.object(stop_resume, "_early_exit") as alert:
-            cause = stop_resume._check_stay("sid-alpha", "w1:p2", "claude3", 456, "generation-1")  # pyright: ignore[reportPrivateUsage]
-        self.assertIn("ended after", cause)
+        log = self.root / "stay.log"
+        result = stop_resume.main(["stay", "--session", "sid-alpha", "--pane", "w1:p2",
+            "--account", "claude3", "--pid", "456", "--generation", "generation-1",
+            "--requester", requester, "--why", why, "--log", str(log)])
+        return result, log.read_text(encoding="utf-8")
+
+    def test_detached_stay_check_alerts_on_early_exit_without_restarting(self) -> None:
+        import quota_alert
+        with patch.object(quota_alert, "tell_user") as push:
+            result, log = self.run_stay_child()
+        self.assertEqual(result, 1)
+        self.assertIn("stopped 0.6 s", log)
         self.assertLess(self.clock.elapsed, stop_resume.STAY_SECONDS)
-        alert.assert_called_once_with("sid-alpha", "w1:p2", "claude3", cause)
+        push.assert_called_once()
         self.start.assert_not_called()
 
     def test_early_exit_tells_showrunner_pushes_except_probe_and_enters_watchdog(self) -> None:
         from scripts.production import showrunners, staff_sources
         from scripts.accounts import unit_watchdog
+        from scripts.notify.push_texts import RenderedPush
         import quota_alert
         self.entry["environment"]["SHOWRUNNER_UNIT_ID"] = "alpha-unit"
         for probe in (False, True):
-            self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1" if probe else "0"
-            pane_record.write("agents", self.entry)
-            with (patch.object(staff_sources, "unit_parent", return_value=staff_sources.UnitProduction("demo", str(self.root / "production.md"))),
-                  patch.object(showrunners, "tell") as tell, patch.object(quota_alert, "tell_user") as push,
-                  patch.object(unit_watchdog, "run", return_value=[]) as recovery):
-                stop_resume._early_exit("sid-alpha", "w1:p2", "claude3", "ended after 1 s")  # pyright: ignore[reportPrivateUsage]
-                tell.assert_called_once()
-                self.assertIn("ended after 1 s", tell.call_args.args)
+            for outcome in ("watchdog: alpha-unit restarted on claude3",
+                            "watchdog: alpha-unit: folder no longer exists; restore dropped"):
+                with self.subTest(probe=probe, outcome=outcome):
+                    self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1" if probe else "0"
+                    pane_record.write("agents", self.entry)
+                    with (patch.object(staff_sources, "unit_parent", return_value=staff_sources.UnitProduction("demo", str(self.root / "production.md"))),
+                          patch.object(showrunners, "tell", return_value="told demo") as tell,
+                          patch.object(quota_alert, "tell_user") as push,
+                          patch.object(unit_watchdog, "run", return_value=[outcome]) as recovery):
+                        result, log = self.run_stay_child(requester="other")
+                        self.assertEqual(result, 1)
+                        tell.assert_called_once()
+                        self.assertEqual(tell.call_args.args[0], "demo")
+                        line = cast(str, tell.call_args.args[2])
+                        self.assertEqual(line, f"alpha stopped 0.6 s after its move or resume to claude3; {outcome}")
+                        self.assertIn(line, log)
+                        self.assertEqual(push.call_count, 0 if probe else 1)
+                        if not probe:
+                            self.assertEqual(cast(RenderedPush, push.call_args.args[0]).values["cause"], line)
+                        recovery.assert_called_once()
+                    self.clock.elapsed = 0.0
+
+    def test_named_probe_reports_rounded_time_account_retry_and_shutdown_sender(self) -> None:
+        from scripts.production import showrunners
+        import quota_alert
+        self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1"
+        pane_record.write("agents", self.entry)
+        with (patch.object(showrunners, "current_address", return_value="session:requester"),
+              patch.object(showrunners, "send_to_address", return_value=showrunners.NoticeDelivery(("told requester",))) as send,
+              patch.object(quota_alert, "tell_user") as push):
+            result, log = self.run_stay_child(requester="requester")
+        self.assertEqual(result, 1)
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0], "session:requester")
+        self.assertEqual(send.call_args.kwargs, {"recipient": "requester", "sender": "shutdown"})
+        line = cast(str, send.call_args.args[2])
+        self.assertEqual(line, "alpha stopped 0.6 s after its move or resume to claude3; resume it: "
+                         + "cd ~/.claude && python3 scripts/shutdown/shutdown.py resume alpha --to claude3 --why 'usage limit'")
+        self.assertIn(line, log)
+        push.assert_not_called()
+
+    def test_unnamed_session_uses_its_id_in_alert_and_retry(self) -> None:
+        from scripts.production import showrunners
+        from scripts.notify.push_texts import RenderedPush
+        import quota_alert
+        self.entry["name"] = ""
+        self.client.rows[0]["label"] = None
+        pane_record.write("agents", self.entry)
+        with (patch.object(showrunners, "tell", return_value="told requester") as tell,
+              patch.object(quota_alert, "tell_user") as push):
+            result, log = self.run_stay_child(requester="requester")
+        self.assertEqual(result, 1)
+        line = cast(str, tell.call_args.args[2])
+        self.assertEqual(line, "sid-alpha stopped 0.6 s after its move or resume to claude3; resume it: "
+                         + "cd ~/.claude && python3 scripts/shutdown/shutdown.py resume sid-alpha --to claude3 --why 'usage limit'")
+        self.assertIn(line, log)
+        self.assertEqual(cast(RenderedPush, push.call_args.args[0]).values["cause"], line)
+
+    def test_no_requester_or_unit_never_tells_showrunners_and_only_pushes_non_probes(self) -> None:
+        from scripts.production import showrunners
+        import quota_alert
+        for probe in (False, True):
+            with self.subTest(probe=probe):
+                self.entry["environment"]["CLAUDE_PROBE_SESSION"] = "1" if probe else "0"
+                pane_record.write("agents", self.entry)
+                with (patch.object(showrunners, "tell") as tell,
+                      patch.object(showrunners, "tell_others") as broadcast,
+                      patch.object(quota_alert, "tell_user") as push):
+                    result, log = self.run_stay_child()
+                self.assertEqual(result, 1)
+                self.assertIn("alpha stopped 0.6 s", log)
+                tell.assert_not_called()
+                broadcast.assert_not_called()
                 self.assertEqual(push.call_count, 0 if probe else 1)
-                recovery.assert_called_once()
+                self.clock.elapsed = 0.0
 
     def test_non_unit_early_exit_tells_only_the_requesting_showrunner(self) -> None:
         from scripts.production import showrunners
